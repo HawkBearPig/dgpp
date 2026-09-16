@@ -972,6 +972,47 @@ std::string post_chat(ServiceRig& rig, const std::string& body,
   return until.empty() ? c.read_available(800) : c.read_until(until, budget_ms);
 }
 
+void expect_invalid_request(const std::string& resp, const std::string& param) {
+  require(resp.find("400 Bad Request\r\n") != std::string::npos,
+          "expected 400 for " + param + ": " + resp);
+  const size_t body = resp.find("\r\n\r\n");
+  require(body != std::string::npos, "complete response headers");
+  const auto parsed = dgpp::minijson::parse(std::string_view(resp).substr(body + 4));
+  const auto& error = parsed.root.at("error");
+  require(error.at("type").as_string() == "invalid_request_error",
+          "invalid request error type: " + resp);
+  require(error.at("param").as_string() == param, "error names " + param + ": " + resp);
+}
+
+DGPP_TEST(serve_chatStream_usageRequiresOptIn) {
+  ServiceRig rig;
+  for (const std::string options :
+       {"", ",\"stream_options\":{}", ",\"stream_options\":{\"include_usage\":false}"}) {
+    // Read through the HTTP chunk terminator, not just an early content delta.
+    const std::string resp =
+        post_chat(rig, chat_body("abcd", 3, ",\"stream\":true" + options), "\r\n0\r\n\r\n", 5000);
+    require(resp.find("200 OK\r\n") != std::string::npos && resp.ends_with("\r\n0\r\n\r\n") &&
+                resp.find("data: [DONE]\n\n") != std::string::npos,
+            "completed stream for options " + options + ": " + resp);
+    require(resp.find("\"usage\":{") == std::string::npos,
+            "no usage object without opt-in: " + resp);
+    require(resp.find("\"choices\":[]") == std::string::npos,
+            "no usage-only chunk without opt-in: " + resp);
+  }
+}
+
+DGPP_TEST(serve_streamOptions_invalidTypesNameTheField) {
+  ServiceRig rig;
+  for (const auto& [options, param] :
+       {std::pair{"false", "stream_options"},
+        std::pair{"{\"include_usage\":null}", "stream_options.include_usage"}}) {
+    expect_invalid_request(
+        post_chat(rig, chat_body("abcd", 3,
+                                 ",\"stream\":true,\"stream_options\":" + std::string(options))),
+        param);
+  }
+}
+
 bool same_float(float a, float b) {
   return std::memcmp(&a, &b, sizeof(float)) == 0;
 }
@@ -1272,6 +1313,14 @@ DGPP_TEST(serve_tools_requestSideRendersThroughTheTemplateAndRefusesByName) {
   require(g.find("{\"role\":\"tool\",\"content\":[{\"tool_call_id\":\"call_2\","
                  "\"output\":\"20C\"}]}") != std::string::npos,
           "the tool output list passes through: " + g);
+
+  // Missing non-assistant content must not inherit assistant normalization.
+  for (const std::string message :
+       {"{\"role\":\"user\"}", "{\"role\":\"user\",\"content\":null}", "{\"role\":\"tool\"}"}) {
+    expect_invalid_request(
+        post_chat(rig, "{\"model\":\"" + kModel + "\",\"messages\":[" + message + "]}"),
+        "messages[0].content");
+  }
 
   // The refusals name the field.
   const auto refused = [&](const std::string& body, const std::string& needle) {
