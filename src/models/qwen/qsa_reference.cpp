@@ -5,6 +5,7 @@
 #include <numeric>
 
 #include "common/dtypes.hpp"
+#include "kernels/rope_scaling.hpp"
 
 namespace dgpp::qwen_ref {
 namespace {
@@ -21,8 +22,16 @@ void rope_inv_freq(double theta, int rotary_dim, std::vector<float>& inv_freq) {
   }
 }
 
+void rope_inv_freq_yarn(double theta, int rotary_dim, int64_t correction_max_position,
+                        double factor, double beta_fast, double beta_slow,
+                        std::vector<float>& inv_freq) {
+  inv_freq.assign(static_cast<size_t>(rotary_dim / 2), 0.f);
+  yarn_rope_inv_freq_host(rotary_dim, theta, correction_max_position, factor, beta_fast,
+                          beta_slow, inv_freq.data());
+}
+
 void qsa_norm_rope(const uint16_t* x, const uint16_t* w, int64_t pos, const float* inv_freq,
-                   uint16_t* out, int dim, int rotary_dim, float eps) {
+                   uint16_t* out, int dim, int rotary_dim, float eps, float mscale) {
   std::vector<float> xn(static_cast<size_t>(dim));
   float ss = 0.f;
   for (int d = 0; d < dim; ++d) {
@@ -40,8 +49,8 @@ void qsa_norm_rope(const uint16_t* x, const uint16_t* w, int64_t pos, const floa
     }
     const int i = d < half ? d : d - half;
     const float ang = static_cast<float>(pos) * inv_freq[i];
-    const float c = rb(std::cos(ang));
-    const float s = rb(std::sin(ang));
+    const float c = rb(std::cos(ang) * mscale);
+    const float s = rb(std::sin(ang) * mscale);
     const float rot = d < half ? -xn[static_cast<size_t>(d + half)] : xn[static_cast<size_t>(d - half)];
     const float t1 = rb(xn[static_cast<size_t>(d)] * c);
     const float t2 = rb(rot * s);
@@ -50,14 +59,15 @@ void qsa_norm_rope(const uint16_t* x, const uint16_t* w, int64_t pos, const floa
 }
 
 void qsa_index_compress(const uint16_t* raw, int kpool, const uint16_t* w_k, const float* inv_freq,
-                        int64_t pos, uint16_t* out, int dim, int rotary_dim, float eps) {
+                        int64_t pos, uint16_t* out, int dim, int rotary_dim, float eps,
+                        float mscale) {
   std::vector<uint16_t> mean(static_cast<size_t>(dim));
   for (int d = 0; d < dim; ++d) {
     float acc = 0.f;
     for (int s = 0; s < kpool; ++s) acc += bf16_bits_to_float(raw[static_cast<int64_t>(s) * dim + d]);
     mean[static_cast<size_t>(d)] = float_to_bf16_bits(acc / static_cast<float>(kpool));
   }
-  qsa_norm_rope(mean.data(), w_k, pos, inv_freq, out, dim, rotary_dim, eps);
+  qsa_norm_rope(mean.data(), w_k, pos, inv_freq, out, dim, rotary_dim, eps, mscale);
 }
 
 float qsa_index_score(const uint16_t* q, const uint16_t* c, int heads) {

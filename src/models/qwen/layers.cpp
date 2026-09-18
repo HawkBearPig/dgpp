@@ -14,6 +14,7 @@
 #include "kernels/dsa.hpp"
 #include "kernels/kda.hpp"
 #include "kernels/qsa.hpp"
+#include "kernels/rope_scaling.hpp"
 #include "kernels/qwen_gr.hpp"
 #include "kernels/fp8_dequant.hpp"
 #include "kernels/scale_gemm.hpp"
@@ -405,7 +406,18 @@ QwenQsaLayer::QwenQsaLayer(const QwenQsaResident& w, const QwenGemmWorkspace& ge
   if (max_pools_ <= 0) throw std::invalid_argument("QwenQsaLayer: max_pools must be positive");
   scale_ = static_cast<float>(std::pow(static_cast<double>(dim_), -0.5));
   std::vector<float> inv(static_cast<size_t>(rotary_ / 2));
-  qsa_rope_inv_freq(cfg.rope_theta, rotary_, inv.data());
+  // The rope table: the plain one, or the YaRN ramp the engine knob asks
+  // for (vLLM's YaRNScalingRotaryEmbedding._compute_inv_freq, verified
+  // against the recipe's stack — see kernels/rope_scaling.hpp).
+  if (cfg.rope_scaling.has_value()) {
+    const RopeScaling& rs = *cfg.rope_scaling;
+    rs.validate("rope_scaling");
+    yarn_rope_inv_freq_host(rotary_, cfg.rope_theta, rs.correction_max_position(), rs.factor,
+                            rs.beta_fast, rs.beta_slow, inv.data());
+    mscale_ = rs.mscale();
+  } else {
+    qsa_rope_inv_freq(cfg.rope_theta, rotary_, inv.data());
+  }
   d_inv_freq_ = dev_alloc<float>(inv.size());
   DGPP_CUDA_OK(cudaMemcpy(d_inv_freq_, inv.data(), inv.size() * 4, cudaMemcpyHostToDevice));
   const size_t M = static_cast<size_t>(max_tokens_);
@@ -499,11 +511,12 @@ void QwenQsaLayer::enqueue(const uint16_t* x, int tokens, const QwenQsaRows& row
   }
   // Norm + RoPE: q (the [q | gate] interleave), k, the indexer q.
   qsa_norm_rope_bf16(q_, QW, 2 * D, w_.q_norm, d_pos, d_inv_freq_, qn_, static_cast<int64_t>(lh_) * D,
-                     T, lh_, D, rotary_, eps_, stream);
+                     T, lh_, D, rotary_, eps_, mscale_, stream);
   qsa_norm_rope_bf16(k_, KW, D, w_.k_norm, d_pos, d_inv_freq_, kn_, KW, T, lkv_, D, rotary_, eps_,
-                     stream);
+                     mscale_, stream);
   qsa_norm_rope_bf16(idx_, IW, Di, w_.index_q_norm, d_pos, d_inv_freq_, qi_,
-                     static_cast<int64_t>(idx_heads_) * Di, T, idx_heads_, Di, rotary_, eps_, stream);
+                     static_cast<int64_t>(idx_heads_) * Di, T, idx_heads_, Di, rotary_, eps_,
+                     mscale_, stream);
   // The caches: K/V rows, then the compressed keys and the ring.
   qsa_kv_append(kn_, KW, v_, KW, d_req, d_pos, T, cache.block_tables, cache.blocks_per_request,
                 cache.block_tokens, lkv_, D, cache.k_cache, cache.v_cache, stream);
@@ -513,13 +526,13 @@ void QwenQsaLayer::enqueue(const uint16_t* x, int tokens, const QwenQsaRows& row
     qsa_index_decode_update(raw_k, IW, w_.index_k_norm, d_inv_freq_, d_req, d_pos, rows.spans,
                             rows.num_requests, cache.block_tables, cache.blocks_per_request,
                             cache.ring, cache.index_cache, pools_per_block, kpool_, Di, rotary_,
-                            eps_, stream, rows.ring_snapshots);
+                            eps_, mscale_, stream, rows.ring_snapshots);
   } else {
     const int32_t* table =
         cache.block_tables + static_cast<int64_t>(rows.request) * cache.blocks_per_request;
     qsa_index_compress_write(raw_k, IW, w_.index_k_norm, d_inv_freq_, table, pools_per_block,
                              rows.pos0 / kpool_, T / kpool_, cache.index_cache, kpool_, Di, rotary_,
-                             eps_, stream);
+                             eps_, mscale_, stream);
     qsa_index_tail_seed(raw_k, IW, d_req, d_pos, T, cache.ring, kpool_, Di, stream);
   }
   // Score every row's visible pools, select, attend.

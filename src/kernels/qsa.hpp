@@ -34,9 +34,17 @@
 namespace dgpp {
 
 // inv_freq[i] = 1 / theta^(2i / rotary_dim), i < rotary_dim / 2, in fp32 as
-// the reference computes it (host helper; upload the result).
+// the reference computes it (host helper; upload the result). The YaRN
+// variant of the table is yarn_rope_inv_freq_host (kernels/rope_scaling.hpp),
+// which the layer builds instead when engine.rope_scaling is set.
 void qsa_rope_inv_freq(double theta, int rotary_dim, float* inv_freq);
 
+// Every rotation below takes `mscale`: the YaRN attention factor the cos
+// and sin are built with (vLLM bakes it into its cos/sin cache — its
+// attention scale stays head_dim^-0.5). 1.0f is the plain rope, bit for
+// bit: the kernel multiplies the fp32 cosf/sinf by it before the bf16
+// rounding, and x * 1.0f is exact.
+//
 // out[r, h, :] = RoPE(RMSNorm_dim(x[r, h, :]) x (1 + w), pos[r]) for heads
 // [0, heads): x head h of row r at x + r * x_row_stride + h * x_head_stride
 // (the attention's [q | gate] interleave: head stride 2 * dim); out rows
@@ -44,7 +52,7 @@ void qsa_rope_inv_freq(double theta, int rotary_dim, float* inv_freq);
 void qsa_norm_rope_bf16(const uint16_t* x, int64_t x_row_stride, int64_t x_head_stride,
                         const uint16_t* w, const int64_t* pos, const float* inv_freq,
                         uint16_t* out, int64_t out_row_stride, int rows, int heads,
-                        int dim, int rotary_dim, float eps, cudaStream_t stream);
+                        int dim, int rotary_dim, float eps, float mscale, cudaStream_t stream);
 
 // k / v: bf16 [rows, kv_heads * dim] (row strides in elements) into the
 // caches at each row's physical slot (block_tables[req][pos / block_tokens]
@@ -63,7 +71,7 @@ void qsa_index_compress_write(const uint16_t* raw_k, int64_t k_stride, const uin
                               const float* inv_freq, const int32_t* block_table,
                               int pools_per_block, int64_t first_pool, int n_pools,
                               uint16_t* index_cache, int kpool, int dim, int rotary_dim,
-                              float eps, cudaStream_t stream);
+                              float eps, float mscale, cudaStream_t stream);
 
 // Seed each request's ring (bf16 [max_requests, kpool, dim]) with its last
 // kpool raw keys of the batch (the ahead-check rule of the DSA seed).
@@ -84,7 +92,7 @@ void qsa_index_decode_update(const uint16_t* raw_k, int64_t k_stride, const uint
                              const int64_t* pos, const int32_t* req_spans, int num_requests,
                              const int32_t* block_tables, int blocks_per_request,
                              uint16_t* ring, uint16_t* index_cache, int pools_per_block,
-                             int kpool, int dim, int rotary_dim, float eps,
+                             int kpool, int dim, int rotary_dim, float eps, float mscale,
                              cudaStream_t stream, uint16_t* ring_snapshots = nullptr);
 
 // keys_ws[r * ws_stride + b] = (~sortable(score) << kIdxBits) | b for every

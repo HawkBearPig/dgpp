@@ -222,7 +222,13 @@ QwenTextConfig QwenTextConfig::parse(const minijson::Value& tc,
       reject("rope_parameters.partial_rotary_factor", "rotary dim must be a positive even integer");
     c.rotary_dim = static_cast<int>(rd);
     if (const std::string rt = optional_string(*rp, "rope_type", "default"); rt != "default")
-      reject("rope_parameters.rope_type", "only the default rope is implemented, got " + rt);
+      // The checkpoint's own rope must be plain: the YaRN ramp this family
+      // serves 512K with is the ENGINE's knob (engine.rope_scaling,
+      // kernels/rope_scaling.hpp), because the NVFP4 release carries no
+      // scaling and vLLM's recipe applies it from --hf-overrides. A
+      // checkpoint that bakes one in would otherwise be mis-scaled twice.
+      reject("rope_parameters.rope_type",
+             "the checkpoint's rope must be default (the YaRN ramp is the engine's rope_scaling knob), got " + rt);
     c.mrope_interleaved = optional_bool(*rp, "mrope_interleaved", false);
     if (const minijson::Value* ms = rp->find("mrope_section"); ms && !ms->is_null()) {
       for (const int64_t v : require_int_array(*rp, "mrope_section"))

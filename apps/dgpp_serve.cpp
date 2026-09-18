@@ -233,6 +233,13 @@ struct ServeFamily {
   // Empty when a pool of `pool_tokens` fits the family's id spaces.
   virtual std::string pool_check(int64_t pool_tokens) const = 0;
   virtual const char* kv_format_name() const = 0;
+  // The model's positional ceiling: the largest context the family's rope
+  // can address. 0 = the family has no bound of its own (the others hold
+  // theirs in the checkpoint's max_position_embeddings and keep the pool
+  // note silent). A pool above it is legal — it seats concurrent
+  // requests — but a single request can never pass it, so the launcher
+  // says so out loud.
+  virtual int64_t position_limit() const { return 0; }
   // The decode rows the family serves in one fixed batch at most (2026-09-10,
   // engine/decode_outputs.hpp): the session-core families take the derived
   // shape up to kDecodeRowsMax; GLM-5.3-Flash keeps its build-time 8, and
@@ -338,9 +345,31 @@ struct QwenFamily final : ServeFamily {
   dgpp::QwenTextConfig cfg;
   std::string ckpt;
   std::unique_ptr<dgpp::QwenModel> model;
-  explicit QwenFamily(const std::string& checkpoint)
+  QwenFamily(const std::string& checkpoint, const std::optional<dgpp::RopeScaling>& rope_scaling)
       : cfg(dgpp::QwenTextConfig::from_json_file((fs::path(checkpoint) / "config.json").string())),
-        ckpt(checkpoint) {}
+        ckpt(checkpoint) {
+    // The engine's opt-in YaRN ramp (engine.rope_scaling): it rides the
+    // parsed config, so the layer's table, the session's max_context()
+    // and the memory plan's context line all take it from one place.
+    if (rope_scaling.has_value()) {
+      rope_scaling->validate("engine.rope_scaling");
+      cfg.rope_scaling = *rope_scaling;
+      if (rope_scaling->original_max_position_embeddings != cfg.max_position_embeddings)
+        DGPP_LOG_WARN(
+            "engine.rope_scaling: original_max_position_embeddings {} differs from the "
+            "checkpoint's max_position_embeddings {} — the ramp band is computed from the "
+            "knob's value",
+            rope_scaling->original_max_position_embeddings, cfg.max_position_embeddings);
+      DGPP_LOG_INFO(
+          "qwen4_exp: YaRN rope on — factor {}, original {} positions, correction band from {} "
+          "(mrope cache x{}), beta_fast {} beta_slow {}, attention factor {:.10g} (mscale {:.10g}); "
+          "context cap {}",
+          rope_scaling->factor, rope_scaling->original_max_position_embeddings,
+          rope_scaling->correction_max_position(), rope_scaling->mrope_cache_factor,
+          rope_scaling->beta_fast, rope_scaling->beta_slow, rope_scaling->attn_factor,
+          static_cast<double>(rope_scaling->mscale()), cfg.context_limit());
+    }
+  }
   const char* name() const override { return "qwen4_exp"; }
   int64_t vocab_size() const override { return cfg.vocab_size; }
   std::vector<int64_t>& eos_token_ids() override { return cfg.eos_token_ids; }
@@ -352,6 +381,8 @@ struct QwenFamily final : ServeFamily {
     return "";
   }
   const char* kv_format_name() const override { return "bf16"; }
+  // The YaRN-scaled ceiling (or the checkpoint's when the knob is off).
+  int64_t position_limit() const override { return cfg.context_limit(); }
   // The small-row kernels keep their dispatch; wider batches use the
   // general shared-expert tail and runtime-sized session scratch.
   int decode_rows_cap() const override { return dgpp::QwenModel::decode_rows_cap(); }
@@ -594,11 +625,12 @@ struct Dsv41Family final : ServeFamily {
   }
 };
 
-std::unique_ptr<ServeFamily> make_family(const std::string& ckpt, int world, dgpp::LatentFormat kv_format) {
+std::unique_ptr<ServeFamily> make_family(const std::string& ckpt, int world, dgpp::LatentFormat kv_format,
+                                         const std::optional<dgpp::RopeScaling>& rope_scaling) {
   const dgpp::ModelArchitecture arch =
       dgpp::detect_architecture_file((fs::path(ckpt) / "config.json").string());
   if (arch == dgpp::ModelArchitecture::DeepseekV41) return std::make_unique<Dsv41Family>(ckpt);
-  if (arch == dgpp::ModelArchitecture::Qwen4Exp) return std::make_unique<QwenFamily>(ckpt);
+  if (arch == dgpp::ModelArchitecture::Qwen4Exp) return std::make_unique<QwenFamily>(ckpt, rope_scaling);
   if (arch == dgpp::ModelArchitecture::Glm4Moe) return std::make_unique<Glm4Family>(ckpt);
   if (arch == dgpp::ModelArchitecture::GlmMoeDsa) return std::make_unique<GlmDsaFamily>(ckpt, world, kv_format);
   return std::make_unique<GlmFamily>(ckpt, world, kv_format);
@@ -929,6 +961,11 @@ int main(int argc, char** argv) {
       "    bounded runs the decoder over the last window rows of each prompt\n"
       "    (the model's own serving recipe, half the prefill work), exact every\n"
       "    layer over every row (the parity mode)\n"
+      "  [config: engine.rope_scaling {factor, original_max_position_embeddings,\n"
+      "    beta_fast, beta_slow, attn_factor, mrope_cache_factor}]: the opt-in\n"
+      "    YaRN rope ramp (qwen4_exp), off when absent. factor 2 with original\n"
+      "    262144 and mrope_cache_factor 4 is the vLLM 512K recipe (the QSA\n"
+      "    rope table, its attention mscale and the 524288-token context cap)\n"
       "  [--max-concurrency N (default 8, the decode-row bound)]\n"
       "  [--queue-limit N (default 64)] [--default-max-tokens N (256)]\n"
       "  [--max-connections N (default 64)] [--no-eos]\n"
@@ -981,6 +1018,9 @@ int main(int argc, char** argv) {
   std::string ngram_table = "resident";  // the Qwen n-gram table: resident | mmap
   std::string dense_weights = "checkpoint";  // the Qwen dense stack: checkpoint | fp8
   std::string prefill = "bounded";  // the DeepSeek-V4.1 prefill: bounded | exact
+  // The opt-in YaRN rope ramp (engine.rope_scaling): absent = the plain
+  // table, the default and the behaviour every earlier build had.
+  std::optional<dgpp::RopeScaling> rope_scaling;
   std::string embed_sharding = "replicated";  // the full GLM-5.3's embedding: replicated | vocab
   int max_concurrency = 8, queue_limit = 64, default_max_tokens = 256;
   int graph_batch_min_live = 0;  // 0 = min(2, max_concurrency) (the batch family, 2026-09-07)
@@ -998,6 +1038,7 @@ int main(int argc, char** argv) {
   int bulk_inflight = -1;
   int max_connections = 64;
   int world = 1, rank = 0, rendezvous_timeout_ms = 120000;
+  std::string served_model_name;  // the API's model name (display only; checkpoint resolution is untouched)
   bool no_eos = false, decode_graph = false, mtp = false;
   int mtp_depth = 1;  // draft tokens per step (needs --mtp; 1..5)
   bool mtp_depth_explicit = false;  // named by the flag or the file (else the family's default)
@@ -1054,9 +1095,11 @@ int main(int argc, char** argv) {
     ngram_table = e.ngram_table;
     dense_weights = e.dense_weights;
     prefill = e.prefill;
+    rope_scaling = e.rope_scaling;
     embed_sharding = e.embed_sharding;
     default_max_tokens = e.default_max_tokens;
     queue_limit = e.queue_limit;
+    served_model_name = e.served_model_name;
     max_connections = e.max_connections;
     no_eos = e.no_eos;
     decode_graph = e.decode_graph;
@@ -1107,6 +1150,7 @@ int main(int argc, char** argv) {
     else if (a == "--memory-plan") memory_plan_only = true;
     else if (a == "--max-concurrency") max_concurrency = std::stoi(next());
     else if (a == "--queue-limit") queue_limit = std::stoi(next());
+    else if (a == "--served-model-name") served_model_name = next();
     else if (a == "--default-max-tokens") default_max_tokens = std::stoi(next());
     else if (a == "--max-connections") max_connections = std::stoi(next());
     else if (a == "--no-eos") no_eos = true;
@@ -1201,7 +1245,7 @@ int main(int argc, char** argv) {
     return std::format(
         "model={} world={} fabric={} journal={} conc={} kv={} kvdt={} ngt={} dw={} pf={} emsh={} maxtok={} queue={} "
         "eos={} graph={} mtp={} mtpd={} mss={} msrow={} msbase={} mslam={} msmin={} msad={} batchmin={} cand={} "
-        "pcgib={} adm={} win={} pfbudget={} pfidle={} pace={} inflight={} reasoning_in_content={}",
+        "pcgib={} adm={} win={} pfbudget={} pfidle={} pace={} inflight={} reasoning_in_content={} rs={}",
         model_id.empty() ? ckpt : model_id, world, fabric_port, journal_port,
         max_concurrency, kv_capacity, kv_dtype, ngram_table, dense_weights, prefill, embed_sharding, default_max_tokens,
         queue_limit,
@@ -1209,7 +1253,12 @@ int main(int argc, char** argv) {
         mtp_schedule_base_ms, mtp_schedule_lambda, mtp_schedule_min_depth, mtp_schedule_adapt ? 1 : 0,
         graph_batch_min_live,
         sampling_candidates, prefix_cache_gib, admission_mode, admission_window, prefill_budget_tokens, prefill_idle_budget_tokens,
-        bulk_pace_gbps, bulk_inflight, reasoning_in_content ? 1 : 0);
+        bulk_pace_gbps, bulk_inflight, reasoning_in_content ? 1 : 0,
+        rope_scaling ? std::format("yarn:{}:{}:{}:{}:{}:{}", rope_scaling->factor,
+                                   rope_scaling->original_max_position_embeddings,
+                                   rope_scaling->beta_fast, rope_scaling->beta_slow,
+                                   rope_scaling->attn_factor, rope_scaling->mrope_cache_factor)
+                     : "off");
   };
   if ((world > 1 || rank > 0) && !memory_plan_only) {
     try {
@@ -1238,6 +1287,7 @@ int main(int argc, char** argv) {
         ws.ngram_table = ngram_table;
         ws.dense_weights = dense_weights;
         ws.prefill = prefill;
+        ws.rope_scaling = rope_scaling;
         ws.embed_sharding = embed_sharding;
         ws.default_max_tokens = default_max_tokens;
         ws.queue_limit = queue_limit;
@@ -1287,6 +1337,7 @@ int main(int argc, char** argv) {
         ngram_table = ws.ngram_table;
         dense_weights = ws.dense_weights;
         prefill = ws.prefill;
+        rope_scaling = ws.rope_scaling;
         default_max_tokens = ws.default_max_tokens;
         queue_limit = ws.queue_limit;
         no_eos = ws.no_eos;
@@ -1480,7 +1531,12 @@ int main(int argc, char** argv) {
     const auto t_boot = std::chrono::steady_clock::now();
     // The family from config.json's architecture (loaders/architecture.hpp):
     // everything below the engine interface comes from it.
-    std::unique_ptr<ServeFamily> family = make_family(ckpt, world, kv_format);
+    std::unique_ptr<ServeFamily> family = make_family(ckpt, world, kv_format, rope_scaling);
+    if (rope_scaling.has_value() && std::string(family->name()) != "qwen4_exp")
+      DGPP_LOG_WARN(
+          "engine.rope_scaling applies to the qwen4_exp family's QSA rope; {} keeps its own rope "
+          "(and its checkpoint's context)",
+          family->name());
     if (embed_sharding == "vocab" && std::string(family->name()) != "glm_moe_dsa" &&
         std::string(family->name()) != "deepseek_v41")
       DGPP_LOG_WARN("engine.embed_sharding = vocab applies to the full GLM-5.3 and DeepSeek-V4.1; {} keeps its "
@@ -1590,6 +1646,17 @@ int main(int argc, char** argv) {
                                  block_tokens) * block_tokens;
     if (const std::string why = family->pool_check(pool_tokens); !why.empty())
       throw std::runtime_error("--kv-capacity " + std::to_string(kv_capacity) + " " + why);
+    // The positional ceiling (the family's rope table's reach; the Qwen
+    // knob lifts it). A pool past it is allowed — it seats concurrent
+    // requests — but one request can never exceed the ceiling, so say so
+    // rather than let an operator take the pool for the context.
+    if (const int64_t limit = family->position_limit(); limit > 0 && pool_tokens > limit)
+      DGPP_LOG_WARN(
+          "--kv-capacity {} (a {}-token pool) exceeds the {} family's {}-token positional "
+          "ceiling: no single request can pass {} tokens. Enable engine.rope_scaling "
+          "(original_max_position_embeddings x factor) to lift the ceiling, or accept the "
+          "pool as concurrency headroom.",
+          kv_capacity, pool_tokens, family->name(), limit, limit);
     const int forward_rows = static_cast<int>(std::min<int64_t>(
         pool_tokens, family->prefill_chunk_tokens()));
     // The pre-flight memory check's inputs (see check_memory_plan): the
@@ -1628,9 +1695,11 @@ int main(int argc, char** argv) {
     }
     std::vector<int64_t> eos =
         no_eos ? std::vector<int64_t>{} : family->eos_token_ids();
-    const std::string model_display = model_id.empty()
-                                          ? fs::path(ckpt).filename().string()
-                                          : model_id;
+    const std::string model_display = !served_model_name.empty()
+                                          ? served_model_name
+                                          : model_id.empty()
+                                                ? fs::path(ckpt).filename().string()
+                                                : model_id;
     // Constrained decoding (M6 6g): every rank builds the grammar's token
     // table from the same tokenizer.json, so the masks it derives from a
     // journal record are identical on every rank. Peers keep no tokenizer

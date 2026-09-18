@@ -48,10 +48,13 @@ __device__ inline float block_sum(float v, float* scratch) {
 // The (1+w) RMSNorm of the bf16 values in xs[0, dim) (one rounding) then
 // RoPE on [0, rotary_dim) at `pos` with the reference's bf16 ops; every
 // thread owns dim d = threadIdx.x. scratch: smem [33] floats.
+// `mscale` is the YaRN attention factor the cos/sin tables are built with
+// (vLLM bakes it into its bf16 cos/sin cache): exactly 1.0f off the knob,
+// and x * 1.0f is bit-exact, so the plain path is the one it always was.
 __device__ inline uint16_t norm_rope_thread(float* xs, const uint16_t* __restrict__ w,
                                             int64_t pos, const float* __restrict__ inv_freq,
                                             int dim, int rotary_dim, float eps,
-                                            float* scratch) {
+                                            float* scratch, float mscale) {
   const int d = threadIdx.x;
   const float x = d < dim ? xs[d] : 0.f;
   const float ss = block_sum(x * x, scratch);
@@ -66,8 +69,8 @@ __device__ inline uint16_t norm_rope_thread(float* xs, const uint16_t* __restric
   const int half = rotary_dim / 2;
   const int i = d < half ? d : d - half;
   const float ang = __fmul_rn(static_cast<float>(pos), inv_freq[i]);
-  const float c = round_bf16(cosf(ang));
-  const float s = round_bf16(sinf(ang));
+  const float c = round_bf16(cosf(ang) * mscale);
+  const float s = round_bf16(sinf(ang) * mscale);
   const float rot = d < half ? -xs[d + half] : xs[d - half];
   const float t1 = round_bf16(xn * c);
   const float t2 = round_bf16(rot * s);
@@ -79,7 +82,7 @@ __global__ void norm_rope_kernel(const uint16_t* __restrict__ x, int64_t x_row_s
                                  const int64_t* __restrict__ pos,
                                  const float* __restrict__ inv_freq, uint16_t* __restrict__ out,
                                  int64_t out_row_stride, int heads, int dim, int rotary_dim,
-                                 float eps) {
+                                 float eps, float mscale) {
   extern __shared__ float xs[];
   __shared__ float scratch[33];
   const int64_t r = blockIdx.x / heads;
@@ -89,7 +92,7 @@ __global__ void norm_rope_kernel(const uint16_t* __restrict__ x, int64_t x_row_s
   const int d = threadIdx.x;
   if (d < dim) xs[d] = bf16_bits_to_float(x[r * x_row_stride + h * x_head_stride + d]);
   __syncthreads();
-  const uint16_t o = norm_rope_thread(xs, w, p, inv_freq, dim, rotary_dim, eps, scratch);
+  const uint16_t o = norm_rope_thread(xs, w, p, inv_freq, dim, rotary_dim, eps, scratch, mscale);
   if (d < dim) out[r * out_row_stride + static_cast<int64_t>(h) * dim + d] = o;
 }
 
@@ -116,9 +119,9 @@ __global__ void kv_append_kernel(const uint16_t* __restrict__ k, int64_t k_row_s
 // RoPE at `pos`) goes to out.
 __device__ inline void compress_finish(float* xs, const uint16_t* __restrict__ w,
                                        const float* __restrict__ inv_freq, int64_t pos, int dim,
-                                       int rotary_dim, float eps, float* scratch,
+                                       int rotary_dim, float eps, float mscale, float* scratch,
                                        uint16_t* __restrict__ out) {
-  const uint16_t o = norm_rope_thread(xs, w, pos, inv_freq, dim, rotary_dim, eps, scratch);
+  const uint16_t o = norm_rope_thread(xs, w, pos, inv_freq, dim, rotary_dim, eps, scratch, mscale);
   if (threadIdx.x < dim) out[threadIdx.x] = o;
 }
 
@@ -128,7 +131,7 @@ __global__ void index_compress_write_kernel(const uint16_t* __restrict__ raw_k, 
                                             const int32_t* __restrict__ block_table,
                                             int pools_per_block, int64_t first_pool, int n_pools,
                                             uint16_t* __restrict__ index_cache, int kpool, int dim,
-                                            int rotary_dim, float eps) {
+                                            int rotary_dim, float eps, float mscale) {
   extern __shared__ float xs[];
   __shared__ float scratch[33];
   const int i = blockIdx.x;
@@ -144,7 +147,7 @@ __global__ void index_compress_write_kernel(const uint16_t* __restrict__ raw_k, 
     xs[d] = round_bf16(acc / static_cast<float>(kpool));
   }
   __syncthreads();
-  compress_finish(xs, w_k, inv_freq, pool * kpool, dim, rotary_dim, eps, scratch,
+  compress_finish(xs, w_k, inv_freq, pool * kpool, dim, rotary_dim, eps, mscale, scratch,
                   index_cache + slot * dim);
 }
 
@@ -171,7 +174,7 @@ __global__ void index_decode_update_kernel(
     const int64_t* __restrict__ pos, const int32_t* __restrict__ req_spans,
     const int32_t* __restrict__ block_tables, int blocks_per_request, uint16_t* __restrict__ ring,
     uint16_t* __restrict__ index_cache, int pools_per_block, int kpool, int dim, int rotary_dim,
-    float eps, uint16_t* __restrict__ ring_snapshots) {
+    float eps, float mscale, uint16_t* __restrict__ ring_snapshots) {
   extern __shared__ float xs[];
   __shared__ float scratch[33];
   const int span = blockIdx.x;
@@ -206,7 +209,7 @@ __global__ void index_decode_update_kernel(
       const int32_t blk = block_tables[static_cast<int64_t>(req) * blocks_per_request +
                                        pool / pools_per_block];
       const int64_t phys = static_cast<int64_t>(blk) * pools_per_block + pool % pools_per_block;
-      compress_finish(xs, w_k, inv_freq, pool_start, dim, rotary_dim, eps, scratch,
+      compress_finish(xs, w_k, inv_freq, pool_start, dim, rotary_dim, eps, mscale, scratch,
                       index_cache + phys * dim);
       __syncthreads();
     }
@@ -472,7 +475,7 @@ void qsa_rope_inv_freq(double theta, int rotary_dim, float* inv_freq) {
 void qsa_norm_rope_bf16(const uint16_t* x, int64_t x_row_stride, int64_t x_head_stride,
                         const uint16_t* w, const int64_t* pos, const float* inv_freq,
                         uint16_t* out, int64_t out_row_stride, int rows, int heads, int dim,
-                        int rotary_dim, float eps, cudaStream_t stream) {
+                        int rotary_dim, float eps, float mscale, cudaStream_t stream) {
   if (rows <= 0) return;
   if (!x || !w || !pos || !inv_freq || !out) throw std::invalid_argument("qsa_norm_rope: null pointer");
   if (dim <= 0 || dim > 1024 || rotary_dim < 0 || rotary_dim > dim || rotary_dim % 2 != 0)
@@ -481,7 +484,7 @@ void qsa_norm_rope_bf16(const uint16_t* x, int64_t x_row_stride, int64_t x_head_
   const int threads = block_threads_for(dim);
   norm_rope_kernel<<<static_cast<unsigned>(blocks), threads, dim * sizeof(float), stream>>>(
       x, x_row_stride, x_head_stride, w, pos, inv_freq, out, out_row_stride, heads, dim,
-      rotary_dim, eps);
+      rotary_dim, eps, mscale);
   DGPP_CUDA_OK(cudaGetLastError());
 }
 
@@ -503,7 +506,7 @@ void qsa_index_compress_write(const uint16_t* raw_k, int64_t k_stride, const uin
                               const float* inv_freq, const int32_t* block_table,
                               int pools_per_block, int64_t first_pool, int n_pools,
                               uint16_t* index_cache, int kpool, int dim, int rotary_dim, float eps,
-                              cudaStream_t stream) {
+                              float mscale, cudaStream_t stream) {
   if (n_pools <= 0) return;
   if (!raw_k || !w_k || !inv_freq || !block_table || !index_cache)
     throw std::invalid_argument("qsa_index_compress: null pointer");
@@ -511,7 +514,7 @@ void qsa_index_compress_write(const uint16_t* raw_k, int64_t k_stride, const uin
   const int threads = block_threads_for(dim);
   index_compress_write_kernel<<<static_cast<unsigned>(n_pools), threads, dim * sizeof(float), stream>>>(
       raw_k, k_stride, w_k, inv_freq, block_table, pools_per_block, first_pool, n_pools,
-      index_cache, kpool, dim, rotary_dim, eps);
+      index_cache, kpool, dim, rotary_dim, eps, mscale);
   DGPP_CUDA_OK(cudaGetLastError());
 }
 
@@ -530,7 +533,7 @@ void qsa_index_decode_update(const uint16_t* raw_k, int64_t k_stride, const uint
                              const int32_t* req_spans, int num_requests,
                              const int32_t* block_tables, int blocks_per_request, uint16_t* ring,
                              uint16_t* index_cache, int pools_per_block, int kpool, int dim,
-                             int rotary_dim, float eps, cudaStream_t stream,
+                             int rotary_dim, float eps, float mscale, cudaStream_t stream,
                              uint16_t* ring_snapshots) {
   if (num_requests <= 0) return;
   if (!raw_k || !w_k || !inv_freq || !req_ids || !pos || !req_spans || !block_tables || !ring ||
@@ -540,7 +543,7 @@ void qsa_index_decode_update(const uint16_t* raw_k, int64_t k_stride, const uint
   const int threads = block_threads_for(dim);
   index_decode_update_kernel<<<static_cast<unsigned>(num_requests), threads, dim * sizeof(float), stream>>>(
       raw_k, k_stride, w_k, inv_freq, req_ids, pos, req_spans, block_tables, blocks_per_request,
-      ring, index_cache, pools_per_block, kpool, dim, rotary_dim, eps, ring_snapshots);
+      ring, index_cache, pools_per_block, kpool, dim, rotary_dim, eps, mscale, ring_snapshots);
   DGPP_CUDA_OK(cudaGetLastError());
 }
 

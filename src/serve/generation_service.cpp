@@ -1067,7 +1067,9 @@ bool GenerationService::parse_chat(const dgpp::minijson::Value& body,
     if (role == nullptr || !role->is_string())
       return refuse(where + ".role is required and must be a string",
                     where + ".role");
-    const std::string_view r = role->as_string();
+    // OpenAI's "developer" role is the renamed "system"; render it as such.
+    const std::string_view raw_role = role->as_string();
+    const std::string_view r = raw_role == "developer" ? "system" : raw_role;
     if (r != "system" && r != "user" && r != "assistant" && r != "tool")
       return refuse(where + ".role '" + std::string(r) +
                         "' is not one this template renders (system, user, "
@@ -1191,6 +1193,11 @@ bool GenerationService::parse_chat(const dgpp::minijson::Value& body,
                       where + ".content");
       for (const Member& m : msg.members()) members.push_back(m);
     }
+    // The normalized role must reach the template (developer -> system);
+    // the member copies above carried the original value.
+    if (r != raw_role)
+      for (Member& mm : members)
+        if (mm.key == "role") mm.value = Value::make_owned_string("system");
     msgs.push_back(Value::make_object(std::move(members)));
   }
 

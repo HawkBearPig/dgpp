@@ -176,7 +176,47 @@ ClusterConfig parse_cluster_config(const std::string& json, const std::string& w
           if (e.prefill != "bounded" && e.prefill != "exact")
             fail(what, "'" + ek + "' must be \"bounded\" or \"exact\"");
         }
+        else if (p.key == "rope_scaling") {
+          if (!x.is_object()) fail(what, "'" + ek + "' must be an object");
+          dgpp::RopeScaling rs;
+          bool saw_factor = false, saw_original = false;
+          for (const Member& q : x.members()) {
+            const std::string rk = ek + "." + q.key;
+            const Value& y = q.value;
+            if (q.key == "rope_type" || q.key == "type") {
+              const std::string rt = text(y, rk, what);
+              if (rt != "yarn")
+                fail(what, "'" + rk + "' must be \"yarn\" (the only ramp this engine builds)");
+            } else if (q.key == "factor") {
+              rs.factor = number(y, rk, what);
+              saw_factor = true;
+            } else if (q.key == "original_max_position_embeddings") {
+              rs.original_max_position_embeddings = integer(y, rk, what, 1, 1ll << 40);
+              saw_original = true;
+            } else if (q.key == "beta_fast") {
+              rs.beta_fast = number(y, rk, what);
+            } else if (q.key == "beta_slow") {
+              rs.beta_slow = number(y, rk, what);
+            } else if (q.key == "attn_factor") {
+              rs.attn_factor = number(y, rk, what);
+            } else if (q.key == "mrope_cache_factor") {
+              rs.mrope_cache_factor = number(y, rk, what);
+            } else {
+              fail(what, "unknown key '" + rk + "'");
+            }
+          }
+          if (!saw_factor) fail(what, "'" + ek + ".factor' is required");
+          if (!saw_original)
+            fail(what, "'" + ek + ".original_max_position_embeddings' is required");
+          try {
+            rs.validate(ek);
+          } catch (const std::runtime_error& err) {
+            fail(what, err.what());
+          }
+          e.rope_scaling = rs;
+        }
         else if (p.key == "default_max_tokens") e.default_max_tokens = static_cast<int>(integer(x, ek, what, 1, 1 << 30));
+        else if (p.key == "served_model_name") e.served_model_name = text(x, ek, what);
         else if (p.key == "queue_limit") e.queue_limit = static_cast<int>(integer(x, ek, what, 1, 1 << 30));
         else if (p.key == "max_connections") e.max_connections = static_cast<int>(integer(x, ek, what, 1, 1 << 20));
         else if (p.key == "no_eos") e.no_eos = boolean(x, ek, what);

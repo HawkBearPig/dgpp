@@ -68,3 +68,4 @@ deploy/cluster_*.json
 # kept outside the repository; this entry is here so a copy dropped back into
 # scripts/ is not committed by accident.
 scripts/maximize-cluster-memory.sh
+.pi/

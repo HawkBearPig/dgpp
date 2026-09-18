@@ -78,7 +78,7 @@ QwenModel::QwenModel(const QwenTextConfig& cfg, const std::string& checkpoint_di
     sp.hidden = H;
     sp.lm_vocab_begin = globals_.lm_vocab_begin;
     sp.lm_vocab_count = globals_.lm_vocab_count > 0 ? globals_.lm_vocab_count : cfg_.vocab_size;
-    sp.max_position_embeddings = cfg_.max_position_embeddings;
+    sp.max_position_embeddings = cfg_.context_limit();
     sp.block_tokens = kBlockTokens;
     sp.snapshot_align = cfg_.indexer_compress_ratio;
     sp.draft_width = W;
@@ -207,7 +207,7 @@ QwenModel::MemoryPlan QwenModel::plan_memory(const QwenTextConfig& cfg, int max_
   const int64_t cache_tokens =
       ((std::max<int64_t>(max_cache_tokens, max_tokens) + kBlockTokens - 1) / kBlockTokens) * kBlockTokens;
   MemoryPlan plan;
-  plan.context_tokens = std::min<int64_t>(cache_tokens, cfg.max_position_embeddings);
+  plan.context_tokens = std::min<int64_t>(cache_tokens, cfg.context_limit());
   const size_t M = static_cast<size_t>(max_tokens);
   const size_t R = static_cast<size_t>(max_requests);
   // The fixed batch's row ceiling, floored as the session core floors it.

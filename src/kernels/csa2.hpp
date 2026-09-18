@@ -53,6 +53,9 @@ void csa2_rmsnorm_bf16(const void* x, int64_t x_stride, const void* w, void* y,
 // the YaRN mix — dims whose wavelength fits the training context keep
 // their frequency, those far beyond it are divided by `factor`, the
 // beta_fast..beta_slow band in between fades linearly. out: [rope_dim/2].
+// The one builder lives in kernels/rope_scaling.cpp (yarn_rope_inv_freq_host),
+// which the Qwen QSA rope shares; this name and these arguments are the
+// CSA2 callers' (original_seq_len is that builder's correction max position).
 void csa2_rope_inv_freq_host(int rope_dim, double theta, int64_t original_seq_len,
                              double factor, double beta_fast, double beta_slow,
                              float* out);

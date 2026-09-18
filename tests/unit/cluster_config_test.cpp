@@ -22,7 +22,68 @@ std::string refusal(const std::string& json) {
   return "";
 }
 
+// A minimal deployment with one engine override spliced in.
+std::string engine_json(const std::string& engine) {
+  return "{\"model\":\"m\",\"nodes\":[\"h\",\"w\"],\"engine\":" + engine + "}";
+}
+
 }  // namespace
+
+DGPP_TEST(cluster_config_parses_engine_rope_scaling) {
+  // Absent (the default): the Qwen family's plain rope, bit for bit what
+  // every earlier build served.
+  const dgpp::serve::ClusterConfig off =
+      dgpp::serve::parse_cluster_config(engine_json("{\"kv_capacity\":8192}"), "t");
+  require(!off.engine.rope_scaling.has_value(), "off by default");
+  // The recipe's knob: factor 2 over the release's 262144 positions. The
+  // correction band's mrope enlargement (4) and the attention factor (1)
+  // are the defaults vLLM runs with, so they are absent here too.
+  const dgpp::serve::ClusterConfig on = dgpp::serve::parse_cluster_config(
+      engine_json("{\"rope_scaling\":{\"factor\":2.0,"
+                  "\"original_max_position_embeddings\":262144}}"),
+      "t");
+  require(on.engine.rope_scaling.has_value(), "the knob is parsed");
+  require(on.engine.rope_scaling->correction_max_position() == 1048576,
+          "the band's default mrope cache is 4x");
+  require(on.engine.rope_scaling->context_limit() == 524288, "the 512K ceiling");
+  require(on.engine.rope_scaling->beta_fast == 32.0 &&
+              on.engine.rope_scaling->beta_slow == 1.0 &&
+              on.engine.rope_scaling->attn_factor == 1.0,
+          "vLLM's YaRN defaults");
+  // Every field is settable and checked by name.
+  const dgpp::serve::ClusterConfig full = dgpp::serve::parse_cluster_config(
+      engine_json("{\"rope_scaling\":{\"rope_type\":\"yarn\",\"factor\":4.0,"
+                  "\"original_max_position_embeddings\":262144,\"beta_fast\":16,"
+                  "\"beta_slow\":2,\"attn_factor\":1.5,\"mrope_cache_factor\":1}}"),
+      "t");
+  require(full.engine.rope_scaling->factor == 4.0 && full.engine.rope_scaling->beta_fast == 16.0 &&
+              full.engine.rope_scaling->beta_slow == 2.0 &&
+              full.engine.rope_scaling->attn_factor == 1.5 &&
+              full.engine.rope_scaling->mrope_cache_factor == 1.0 &&
+              full.engine.rope_scaling->context_limit() == 1048576,
+          "every field");
+  require(refusal(engine_json("{\"rope_scaling\":{\"factor\":0.5,"
+                              "\"original_max_position_embeddings\":262144}}"))
+                  .find("factor") != std::string::npos,
+          "a sub-unity factor refused by name");
+  require(refusal(engine_json("{\"rope_scaling\":{\"factor\":2.0}}")).find(
+              "original_max_position_embeddings") != std::string::npos,
+          "a missing original context refused by name");
+  require(refusal(engine_json("{\"rope_scaling\":{\"original_max_position_embeddings\":262144}}"))
+                  .find("factor") != std::string::npos,
+          "a missing factor refused by name");
+  require(refusal(engine_json("{\"rope_scaling\":{\"factor\":2.0,"
+                              "\"original_max_position_embeddings\":262144,"
+                              "\"mscale\":2.0}}"))
+                  .find("mscale") != std::string::npos,
+          "an unknown field refused by name (vLLM spells it attn_factor)");
+  require(refusal(engine_json("{\"rope_scaling\":[2.0]}")).find("object") != std::string::npos,
+          "a non-object refused");
+  require(refusal(engine_json("{\"rope_scaling\":{\"rope_type\":\"linear\",\"factor\":2.0,"
+                              "\"original_max_position_embeddings\":262144}}"))
+                  .find("rope_type") != std::string::npos,
+          "only yarn");
+}
 
 DGPP_TEST(cluster_config_parses_fills_defaults_and_derives_the_world) {
   const std::string json = R"({
