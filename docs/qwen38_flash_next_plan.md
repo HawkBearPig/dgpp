@@ -261,6 +261,59 @@ untied. `R_0 = embed(x)` on every branch. RoPE: `inv_freq_i = 1e7^(−2i/64)`,
 i < 32, applied to the first 64 of 256 dims (attention) and the first 64 of
 128 dims (indexer) in neox halves.
 
+### 1.9.1 YaRN at 512 K (`engine.rope_scaling`, 2026-09-18)
+
+The engine's opt-in YaRN mode, verified against the vLLM stack the user's
+recipe runs (`vllm/vllm-openai:qwen38-flash-next`, start.sh with
+`YARN_ENABLE=true YARN_FACTOR=2.0 MAX_MODEL_LEN=524288`). Off by default:
+with no `engine.rope_scaling` the table is `qsa_rope_inv_freq`'s, every
+kernel argument is 1.0f and the ceiling is the checkpoint's 262144 — the
+bits the 2026-09-17 build produced (pinned by
+`tests/unit/qwen_rope_scaling_test.cpp` and `tests/cuda/qsa_test.cu`).
+
+```json
+"engine": {"rope_scaling": {"factor": 2.0,
+                          "original_max_position_embeddings": 262144}}
+```
+
+| field | default | meaning |
+| --- | --- | --- |
+| `factor` | required, >= 1 | YaRN's scale; `original x factor` is the new ceiling (524 288) |
+| `original_max_position_embeddings` | required | the native context the ramp is measured from |
+| `beta_fast` / `beta_slow` | 32 / 1 | the rotation band's edges (vLLM's names) |
+| `attn_factor` | 1 | vLLM's `attn_factor`; the effective scale is `yarn_get_mscale(factor) * attn_factor` |
+| `mrope_cache_factor` | 4 | vLLM's MRotaryEmbedding enlarges its cache 4x and YaRN's correction band is computed from **that** value: 4 reproduces the recipe, 1 uses the native context |
+
+Three findings the implementation turns on, each read off the image's own
+source and checked bit for bit in a container:
+
+1. **The recipe merges, it does not replace.** `ModelConfig._update_nested`
+   recurses into `text_config.rope_parameters`, so the checkpoint's
+   `mrope_section: [11, 11, 10]` survives `--hf-overrides` and `get_rope`
+   builds an `MRotaryEmbedding`, whose `cache_max_position_num =
+   max_position_embeddings * 4` feeds `yarn_find_correction_range`. The
+   band is therefore low/high = **16/24**, not 14/22; the two tables differ
+   from lane 15 on. `mrope_cache_factor` is exactly this knob.
+2. **The attention factor rides the rotation, not the softmax scale.**
+   vLLM keeps `self.scaling = head_dim**-0.5` (nvidia/qsa.py) and bakes
+   `mscale` into the bf16 cos/sin cache (`freqs.cos() * mscale`, then the
+   query dtype), which scales only the 64 rotated lanes of q·k (by
+   mscale²) and leaves the other 192 untouched. The kernels here do the
+   same: `round_bf16(cosf(ang) * mscale)`, in `norm_rope_thread` and the
+   two indexer rotations. `mscale` = 1.0693147182 (f32 `0x3f88df4e`).
+3. **Text positions make the MRoPE layout the identity.** The three
+   position rows are equal for text, so `apply_interleaved_rope`'s
+   per-lane section pick selects the text row everywhere and the YaRN
+   table's lane i is the lane the neox pairs use — no per-lane remapping
+   (`mrope_interleaved_is_the_identity_for_text_positions`).
+
+What the mode does not touch: the QSA softmax scale, the pool's size (a
+pool is sized by `engine.kv_capacity`, so the knob lifts what a request may
+reach without moving a byte — `qwen_plan_check` asserts that), and every
+other family (the launcher warns that the knob applies to `qwen4_exp` only).
+The knob rides the settings record (`"rs"`) so a peer can never rope at
+different frequencies from rank 0, and the canonical config digest.
+
 ### 1.10 Tokenizer, template, tool format
 
 `tokenizer.json`: byte-level BPE, 248 044 vocabulary + 33 added tokens,

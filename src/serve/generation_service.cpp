@@ -1248,9 +1248,9 @@ bool GenerationService::parse_chat(const dgpp::minijson::Value& body,
     if (role == nullptr || !role->is_string())
       return refuse(where + ".role is required and must be a string",
                     where + ".role");
-    std::string_view r = role->as_string();
-    // These checkpoints use system for application/developer instructions.
-    if (r == "developer") r = "system";
+    // OpenAI's "developer" role is the renamed "system"; render it as such.
+    const std::string_view raw_role = role->as_string();
+    const std::string_view r = raw_role == "developer" ? "system" : raw_role;
     if (r != "system" && r != "user" && r != "assistant" && r != "tool")
       return refuse(where + ".role '" + std::string(r) +
                         "' is not one this template renders (developer, system, user, "
@@ -1458,8 +1458,11 @@ bool GenerationService::parse_chat(const dgpp::minijson::Value& body,
       for (const Member& m : msg.members())
         members.push_back(m.key == "content" ? Member{"content", *content} : m);
     }
-    for (auto& m : members)
-      if (m.key == "role" && role->as_string() == "developer") m.value = Value::make_string("system");
+    // The normalized role must reach the template (developer -> system);
+    // the member copies above carried the original value.
+    if (r != raw_role)
+      for (Member& mm : members)
+        if (mm.key == "role") mm.value = Value::make_owned_string("system");
     if (r == "assistant" && refusal)
       for (auto& m : members)
         if (m.key == "content" && (!msg.find("content") || msg.find("content")->is_null())) m.value = *content;

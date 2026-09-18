@@ -4,7 +4,8 @@
 // split all bitwise one another (and the ring snapshots the ring's own
 // history), within two ulps of the reference; the indexer scores and the
 // selection bitwise; the listed attention (one and three splits) with its
-// gate within two ulps.
+// gate within two ulps. Plus the frozen plain rope table and the YaRN
+// table + mscale the engine's knob (engine.rope_scaling) builds.
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -21,6 +22,7 @@
 #include "kda_test_helpers.hpp"
 #include "kernels/dsa.hpp"
 #include "kernels/qsa.hpp"
+#include "kernels/rope_scaling.hpp"
 #include "models/qwen/qsa_reference.hpp"
 
 using namespace dgpp::kda_test;
@@ -78,6 +80,58 @@ std::vector<int32_t> identity_table(const Geo& g) {
 
 }  // namespace
 
+DGPP_TEST(qsa_rope_inv_freq_is_frozen_and_yarn_rides_the_cos_sin) {
+  // The plain table, frozen from the build that predates the YaRN knob
+  // (2026-09-17): the knob must not move it.
+  const uint32_t plain[32] = {
+      0x3f800000, 0x3f1ab32b, 0x3ebaf81b, 0x3e61f835, 0x3e088d77, 0x3da50956, 0x3d47763f,
+      0x3cf11177, 0x3c91ad39, 0x3c301052, 0x3bd4ca15, 0x3b80967d, 0x3b1b690d, 0x3abbd3ed,
+      0x3a6301e2, 0x3a092e02, 0x39a5cb60, 0x394860c1, 0x38f22ce2, 0x3892587e, 0x3830df52,
+      0x37d5c441, 0x37812dab, 0x371c1fc4, 0x36bcb0c1, 0x36640cc6, 0x3609cf4a, 0x35a68e4c,
+      0x35494c57, 0x34f3499d, 0x3493048e, 0x3431af44};
+  std::vector<float> f(32);
+  dgpp::qsa_rope_inv_freq(1e7, 64, f.data());
+  for (int i = 0; i < 32; ++i) {
+    uint32_t u = 0;
+    std::memcpy(&u, &f[static_cast<size_t>(i)], 4);
+    require(u == plain[i], "the plain rope table moved");
+  }
+  // The YaRN rope the knob builds is the same kernel, cos/sin scaled by
+  // the attention factor before their bf16 rounding: the reference (built
+  // with the mscale) is the gate's oracle for it, bit for bit.
+  Geo g;
+  const int rows = 4, heads = 2;
+  // 524287 is the recipe's last position at factor 2 over 262144: the
+  // largest argument the cosf/sinf reduction sees at 512K.
+  const std::vector<int64_t> pos{0, 5, 4096, 524287};
+  const int64_t x_head_stride = 2 * g.dim, x_row_stride = heads * x_head_stride;
+  const std::vector<uint16_t> x = random_bf16_normal(0x31, rows * x_row_stride, 1.0f);
+  const std::vector<uint16_t> w = random_bf16_uniform(0x32, g.dim, 0.5f);
+  const float mscale = dgpp::RopeScaling{2.0, 262144, 32.0, 1.0, 1.0, 4.0}.mscale();
+  require(mscale > 1.0f, "the recipe's attention factor");
+  std::vector<float> yarn(32);
+  dgpp::yarn_rope_inv_freq_host(64, 1e7, 262144 * 4, 2.0, 32.0, 1.0, yarn.data());
+  std::vector<uint16_t> ref(static_cast<size_t>(rows) * heads * g.dim);
+  for (int r = 0; r < rows; ++r)
+    for (int h = 0; h < heads; ++h)
+      dgpp::qwen_ref::qsa_norm_rope(x.data() + r * x_row_stride + h * x_head_stride, w.data(),
+                                    pos[static_cast<size_t>(r)], yarn.data(),
+                                    ref.data() + (static_cast<size_t>(r) * heads + h) * g.dim, g.dim,
+                                    g.rotary, g.eps, mscale);
+  DevBuf dx = up(x), dw = up(w), dpos = up(pos), dinv = up(yarn), dout(ref.size() * 2);
+  cudaStream_t st = test_stream();
+  dgpp::qsa_norm_rope_bf16(ptr<uint16_t>(dx), x_row_stride, x_head_stride, ptr<uint16_t>(dw),
+                           ptr<int64_t>(dpos), ptr<float>(dinv), mptr<uint16_t>(dout),
+                           static_cast<int64_t>(heads) * g.dim, rows, heads, g.dim, g.rotary, g.eps,
+                           mscale, st);
+  DGPP_CUDA_OK(cudaStreamSynchronize(st));
+  const std::vector<uint16_t> got = down<uint16_t>(dout, ref.size());
+  const Stats s = compare_bf16(got, ref, 2);
+  std::printf("[ .. ] yarn norm+rope: max_rel %.3g l2_rel %.3g mismatches %ld/%ld\n", s.max_rel,
+              s.l2_rel, s.mismatches, s.n);
+  require_bf16("yarn norm+rope", s, 2e-3, 0.01);
+}
+
 DGPP_TEST(qsa_norm_rope_matches_the_reference) {
   Geo g;
   const int rows = 5, heads = 3;
@@ -97,7 +151,8 @@ DGPP_TEST(qsa_norm_rope_matches_the_reference) {
   cudaStream_t st = test_stream();
   dgpp::qsa_norm_rope_bf16(ptr<uint16_t>(dx), x_row_stride, x_head_stride, ptr<uint16_t>(dw),
                            ptr<int64_t>(dpos), ptr<float>(dinv), mptr<uint16_t>(dout),
-                           static_cast<int64_t>(heads) * g.dim, rows, heads, g.dim, g.rotary, g.eps, st);
+                           static_cast<int64_t>(heads) * g.dim, rows, heads, g.dim, g.rotary, g.eps,
+                           1.0f, st);
   DGPP_CUDA_OK(cudaStreamSynchronize(st));
   const std::vector<uint16_t> got = down<uint16_t>(dout, ref.size());
   const Stats s = compare_bf16(got, ref, 2);
@@ -149,7 +204,7 @@ struct IndexFixture {
                                     ptr<uint16_t>(dwk), ptr<float>(dinv), ptr<int32_t>(dreq),
                                     ptr<int64_t>(dpos), ptr<int32_t>(dspans), 1, ptr<int32_t>(dtable),
                                     g.blocks_per_request, mptr<uint16_t>(dring), mptr<uint16_t>(dcache),
-                                    g.pools_per_block(), g.kpool, g.idx_dim, g.rotary, g.eps, st,
+                                    g.pools_per_block(), g.kpool, g.idx_dim, g.rotary, g.eps, 1.0f, st,
                                     snapshots);
       DGPP_CUDA_OK(cudaStreamSynchronize(st));
     }
@@ -170,7 +225,7 @@ DGPP_TEST(qsa_index_compression_prefill_decode_and_split_agree) {
   const int n_pools = g.seq / g.kpool;
   dgpp::qsa_index_compress_write(ptr<uint16_t>(f.draw), g.idx_dim, ptr<uint16_t>(f.dwk), ptr<float>(f.dinv),
                                  ptr<int32_t>(f.dtable), g.pools_per_block(), 0, n_pools,
-                                 mptr<uint16_t>(c_prefill), g.kpool, g.idx_dim, g.rotary, g.eps, st);
+                                 mptr<uint16_t>(c_prefill), g.kpool, g.idx_dim, g.rotary, g.eps, 1.0f, st);
   DGPP_CUDA_OK(cudaStreamSynchronize(st));
   const std::vector<uint16_t> prefill = down<uint16_t>(c_prefill, cache_elems);
   // 2. Decode token by token from an empty ring.
@@ -187,7 +242,7 @@ DGPP_TEST(qsa_index_compression_prefill_decode_and_split_agree) {
   DGPP_CUDA_OK(cudaMemset(ring2.p, 0, ring_elems * 2));
   dgpp::qsa_index_compress_write(ptr<uint16_t>(f.draw), g.idx_dim, ptr<uint16_t>(f.dwk), ptr<float>(f.dinv),
                                  ptr<int32_t>(f.dtable), g.pools_per_block(), 0, cut / g.kpool,
-                                 mptr<uint16_t>(c_split), g.kpool, g.idx_dim, g.rotary, g.eps, st);
+                                 mptr<uint16_t>(c_split), g.kpool, g.idx_dim, g.rotary, g.eps, 1.0f, st);
   {
     std::vector<int32_t> req_ids(static_cast<size_t>(cut), 0);
     std::vector<int64_t> pos(static_cast<size_t>(cut));
@@ -223,7 +278,7 @@ DGPP_TEST(qsa_index_compression_prefill_decode_and_split_agree) {
                                   ptr<uint16_t>(f.dwk), ptr<float>(f.dinv), ptr<int32_t>(dreq),
                                   ptr<int64_t>(dpos), ptr<int32_t>(dspans), 1, ptr<int32_t>(f.dtable),
                                   g.blocks_per_request, mptr<uint16_t>(ring2), mptr<uint16_t>(c_split),
-                                  g.pools_per_block(), g.kpool, g.idx_dim, g.rotary, g.eps, st,
+                                  g.pools_per_block(), g.kpool, g.idx_dim, g.rotary, g.eps, 1.0f, st,
                                   mptr<uint16_t>(snaps));
     DGPP_CUDA_OK(cudaStreamSynchronize(st));
     const std::vector<uint16_t> got_snaps = down<uint16_t>(snaps, static_cast<size_t>(n) * ring_elems);
@@ -268,7 +323,7 @@ struct SelectFixture {
     DGPP_CUDA_OK(cudaMemset(dcache.p, 0, cache_elems * 2));
     dgpp::qsa_index_compress_write(ptr<uint16_t>(f.draw), g.idx_dim, ptr<uint16_t>(f.dwk), ptr<float>(f.dinv),
                                    ptr<int32_t>(f.dtable), g.pools_per_block(), 0, g.seq / g.kpool,
-                                   mptr<uint16_t>(dcache), g.kpool, g.idx_dim, g.rotary, g.eps, st);
+                                   mptr<uint16_t>(dcache), g.kpool, g.idx_dim, g.rotary, g.eps, 1.0f, st);
     DGPP_CUDA_OK(cudaStreamSynchronize(st));
     cache = down<uint16_t>(dcache, cache_elems);
     dq = up(q);

@@ -101,6 +101,25 @@ DGPP_TEST(qwen_config_parses_the_release) {
   require(c.hyper_width() == 10240, "4 x 2560");
   require(c.eos_token_ids.size() == 1 && c.eos_token_ids[0] == 248044, "eos");
   require(c.experts_fp8 && c.ngram_table_fp8, "fp8 classes");
+  // The rope knob is the engine's, never the checkpoint's: the parsed
+  // config carries none and reports the checkpoint's own ceiling.
+  require(!c.rope_scaling.has_value(), "no rope scaling from the checkpoint");
+  require(c.context_limit() == 262144, "the checkpoint's ceiling");
+}
+
+DGPP_TEST(qwen_config_rope_scaling_knob_lifts_the_ceiling) {
+  // The parsed config is the plain one; the serving layer sets
+  // cfg.rope_scaling from engine.rope_scaling, and everything that bounds
+  // a context reads context_limit() instead of the raw field.
+  dgpp::QwenTextConfig c = parse(text_json());
+  require(c.max_position_embeddings == 262144 && c.context_limit() == 262144, "plain");
+  dgpp::RopeScaling rs;
+  rs.factor = 2.0;
+  rs.original_max_position_embeddings = 262144;
+  c.rope_scaling = rs;
+  require(c.context_limit() == 524288, "the 512K ceiling");
+  c.rope_scaling->factor = 4.0;
+  require(c.context_limit() == 1048576, "1M");
 }
 
 DGPP_TEST(qwen_config_derives_the_ngram_table_the_checkpoint_stores) {
@@ -146,6 +165,12 @@ DGPP_TEST(qwen_config_refuses_what_the_engine_does_not_implement) {
           "a 64-block release refused");
   require(refusal(text_json(), "null").find("quantization_config") != std::string::npos,
           "the BF16 release refused (no BF16 expert path)");
+  // The checkpoint's own rope must be plain: a scaled one is the engine's
+  // knob to apply (engine.rope_scaling), and taking it from here would
+  // scale twice.
+  require(refusal(text_json("\"rope_type\": \"default\"", "\"rope_type\": \"yarn\""))
+                  .find("rope_type") != std::string::npos,
+          "a checkpoint that bakes in a rope scaling refused");
   // A file without the PLE parses too (the geometry is then empty).
   const dgpp::QwenTextConfig no_ple = parse(text_json("\"ple_layer_ids\": [2]", "\"ple_layer_ids\": []"));
   require(no_ple.ple_layer() == -1 && no_ple.ngram_geometry().heads == 0, "no PLE");

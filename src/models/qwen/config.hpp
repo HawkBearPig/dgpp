@@ -6,9 +6,11 @@
 // supported value or rejected with a message naming the field, at load
 // time. The reference is transformers' modular_qwen4_exp.py (5.8).
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
+#include "kernels/rope_scaling.hpp"
 #include "loaders/minijson.hpp"
 
 namespace dgpp {
@@ -70,6 +72,13 @@ struct QwenTextConfig {
   int indexer_head_dim = 128;
   int indexer_budget = 2048;
   int indexer_compress_ratio = 4;
+  // The opt-in YaRN ramp (engine.rope_scaling, 2026-09-18), set by the
+  // serving layer on the parsed config — never by the checkpoint, whose
+  // rope_parameters must stay `rope_type: default` (the NVIDIA NVFP4
+  // release declares no scaling at all; vLLM applies YaRN from the
+  // launcher's --hf-overrides). Empty = the plain table, bit for bit
+  // what this family built before the knob existed.
+  std::optional<RopeScaling> rope_scaling;
 
   // --- MoE ------------------------------------------------------------------
   int num_experts = 512;
@@ -115,6 +124,15 @@ struct QwenTextConfig {
   // The zero-indexed layer carrying the PLE (exactly one in this family).
   int ple_layer() const { return ple_layer_ids.empty() ? -1 : ple_layer_ids[0] - 1; }
   int indexer_block_topk() const { return indexer_budget / indexer_compress_ratio; }
+  // The model's positional ceiling: the checkpoint's
+  // max_position_embeddings, or the YaRN-scaled value (original x factor)
+  // when the knob is on. Everything that bounds a context — the session
+  // core's max_context(), the memory plan's context line, the pool gate —
+  // reads this, not the raw field.
+  int64_t context_limit() const {
+    return rope_scaling.has_value() ? rope_scaling->context_limit()
+                                    : static_cast<int64_t>(max_position_embeddings);
+  }
   int hyper_width() const { return hc_count * hidden_size; }
   // The n-gram table's derivation (§1.7).
   QwenNgramGeometry ngram_geometry() const;
