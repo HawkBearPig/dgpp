@@ -280,7 +280,9 @@ class Cluster:
         for rank, host in self.peers:
             # The stage dir may live in /tmp (a reboot empties it); a previous
             # run's op stream must never be hashed as this run's evidence.
-            if not self.ssh(host, f"mkdir -p {self.stage_dir} && rm -f {self.stage_dir}/serve_rank*.ops"):
+            # Quoted: the remote login shell may be zsh, where an unexpanded
+            # glob aborts the whole command with "no matches found".
+            if not self.ssh(host, f"mkdir -p {self.stage_dir} && rm -f '{self.stage_dir}/serve_rank*.ops'"):
                 say(f"STAGE FAILED to {host} (ssh)")
                 return False
             if not self.installed and not self.scp_to(host, self.bin, f"{self.stage_dir}/dgpp-serve"):
