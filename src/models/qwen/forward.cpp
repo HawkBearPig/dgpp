@@ -368,8 +368,13 @@ size_t QwenModel::dense_bridge_bytes(const QwenTextConfig& cfg, const QwenLocalG
 void QwenModel::lm_head_logits(const uint16_t* hidden, int rows, cudaStream_t stream) {
   const int H = cfg_.hidden_size;
   if (globals_.lm_head_fp8.payload)
+    // Wider decode heads reuse each weight tile across the verification
+    // rows instead of rereading it for every four-row GEMV chunk. Keep
+    // the small-row path and prefill shapes outside the decode bound.
+    // MMA preserves the weight values but changes FP32 accumulation order.
     launch_scale_gemm_f32(hidden, static_cast<size_t>(H), globals_.lm_head_fp8.payload, globals_.lm_head_fp8.scales,
-                          logits_, rows, lm_vocab_count_, H, stream, static_cast<size_t>(lm_vocab_count_));
+                          logits_, rows, lm_vocab_count_, H, stream, static_cast<size_t>(lm_vocab_count_),
+                          rows <= max_decode_rows_ ? dense_gemv_rows() + 1 : 0);
   else
     gemm_.matmul(hidden, globals_.lm_head, logits_, rows, lm_vocab_count_, H, DType::BF16, GemmOut::F32,
                  static_cast<size_t>(H), gemm_ws_, gemm_ws_bytes_, stream);
@@ -998,8 +1003,11 @@ void QwenModel::mtp_run_rows(int req, const int64_t* tokens, int64_t first_pos, 
   qwen_mtp_hidden_projection(gw_, mtp_hn_, globals_.mtp_fc_hidden, mtp_enc_, T, hc, H, decode_row, stream_);
   qwen_mtp_embed_gather_bf16(globals_.embed, tokens, mtp_e_, T, H, stream_);
   qwen_rmsnorm_bf16(mtp_e_, globals_.mtp_pre_fc_norm_embedding, mtp_en_, T, H, eps, stream_);
-  gemm_.matmul(mtp_en_, globals_.mtp_fc_embedding, mtp_ein_, T, H, H, DType::BF16, GemmOut::BF16,
-               static_cast<size_t>(H), gemm_ws_, gemm_ws_bytes_, stream_);
+  // At 48/64 rows, the embedding projection's Lt algorithm can capture
+  // a memset node, just like the wider hidden projection. Use the
+  // kernel-only projection with one branch for those decode shapes.
+  qwen_mtp_hidden_projection(gw_, mtp_en_, globals_.mtp_fc_embedding, mtp_ein_,
+                             T, 1, H, decode_row && T > 32, stream_);
   qwen_mtp_fuse_bf16(mtp_ein_, mtp_enc_, mtp_r_, T, hc, H, stream_);
 
   // ---- the draft layer (the stack's objects rebound to its weights) ------

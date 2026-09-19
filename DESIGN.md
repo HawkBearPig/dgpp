@@ -2011,10 +2011,12 @@ reaches `graph_batch_min_live`; the default threshold is
 `min(2, max_concurrency)`. Sparse occupancy can require a wider batch
 than the live count alone suggests. Closed slots use inactive positions.
 
-The application allows eight request slots. GLM-5.3 and Qwen support eight
-batched decode rows, while GLM-4.7 supports up to 32. MTP uses
-`1 + depth` rows per request. GLM-5.3 and Qwen replay scalar graphs
-past depth 1; GLM-4.7 can capture deeper batched draft chains. Each graph
+The request capacity is sixteen slots. Qwen supports up to 64 batched
+decode rows, including C16/MTP3; GLM-4.7 retains its 32-row cap. MTP uses
+`1 + depth` rows per request. Intermediate graph families cover
+2/3/4/6/8/12 slots where they fit below the full family. Qwen uses
+1024-token prefill chunks, also defining regular prefix-cache cuts.
+Each graph
 variant owns its bus generation cells and parity-specific buffers so a
 shape switch preserves collective ordering.
 

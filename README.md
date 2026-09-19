@@ -12,6 +12,10 @@ It uses the CUDA runtime, cuBLASLt and libibverbs. Rank 0 coordinates
 requests through an admission journal; peers check their operation streams
 against it throughout a run.
 
+Qwen supports up to 64 decode rows (C16/MTP3). See the
+[implementation and validation record](benchmarks/results/2026-09-17-qwen-spark-decode/README.md)
+for the Spark optimizations, focused tests and performance limitations.
+
 ## Supported models and configurations
 
 These serving configurations have deployment templates and recorded

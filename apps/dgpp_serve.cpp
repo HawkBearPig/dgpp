@@ -452,7 +452,7 @@ struct Glm4Family final : ServeFamily {
   // The row walk, the attention's split scratch, the MoE slot path and the
   // draft window all take the runtime ceiling (the batched depth >= 2
   // chain, 2026-09-10).
-  int decode_rows_cap() const override { return dgpp::kDecodeRowsMax; }
+  int decode_rows_cap() const override { return 32; }
   // The widest fold the decode graph records: a block output [rows, hidden].
   size_t lat_slot_bytes(int decode_rows) const override {
     return static_cast<size_t>(decode_rows) * static_cast<size_t>(cfg.hidden_size) * 2;
@@ -1574,8 +1574,8 @@ int main(int argc, char** argv) {
     // batch holds every slot's verify rows — max_concurrency x (1 + the
     // MTP depth) — floored at kDecodeRows so every existing recipe keeps
     // its exact shape (4 slots x 2 rows = 8). The family's cap bounds it:
-    // GLM-4.7 supports the derived shape up to 32 rows, the full GLM-5.3
-    // and Qwen up to 16. Fitting batch families remain available when
+    // Qwen supports up to 64 rows, GLM-4.7 up to 32, and the full
+    // GLM-5.3 up to 16. Fitting batch families remain available when
     // a deeper configuration exceeds the full-batch ceiling.
     // Reject configurations whose depth-1 batch already exceeds the cap.
     const int graph_rows_per_request = mtp ? 1 + mtp_depth : 1;

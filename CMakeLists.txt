@@ -1121,6 +1121,27 @@ add_test(NAME qwen_engine_row_independent
           $<TARGET_FILE:qwen_engine_test>)
 set_tests_properties(qwen_engine_test qwen_engine_row_independent PROPERTIES RESOURCE_LOCK qwen_engine_world)
 set_tests_properties(qwen_engine_row_independent PROPERTIES LABELS "gpu;rdma")
+add_test(NAME qwen_engine_fp8_wide
+  COMMAND ${CMAKE_COMMAND} -E env DGPP_DENSE_GEMV_ROWS=4 DGPP_TEST_DENSE_FP8=1 DGPP_TEST_FILTER=wide
+          $<TARGET_FILE:qwen_engine_test>)
+set_tests_properties(qwen_engine_fp8_wide PROPERTIES RESOURCE_LOCK qwen_engine_world LABELS "gpu;rdma")
+add_test(NAME qwen_engine_fp8_mtp3_rows32
+  COMMAND ${CMAKE_COMMAND} -E env DGPP_DENSE_GEMV_ROWS=4 DGPP_TEST_DENSE_FP8=1
+          DGPP_TEST_QWEN_ROWS32=1 DGPP_TEST_FILTER=wide $<TARGET_FILE:qwen_engine_test>)
+add_test(NAME qwen_engine_mtp3_rows32_row_independent
+  COMMAND ${CMAKE_COMMAND} -E env DGPP_DENSE_GEMV_ROWS=256 DGPP_TEST_DENSE_FP8=1
+          DGPP_TEST_QWEN_ROWS32=1 DGPP_TEST_FILTER=wide $<TARGET_FILE:qwen_engine_test>)
+set_tests_properties(qwen_engine_fp8_mtp3_rows32 qwen_engine_mtp3_rows32_row_independent
+  PROPERTIES RESOURCE_LOCK qwen_engine_world LABELS "gpu;rdma")
+
+add_test(NAME qwen_engine_fp8_mtp3_rows64
+  COMMAND ${CMAKE_COMMAND} -E env DGPP_DENSE_GEMV_ROWS=4 DGPP_TEST_DENSE_FP8=1
+          DGPP_TEST_QWEN_ROWS64=1 DGPP_TEST_FILTER=wide $<TARGET_FILE:qwen_engine_test>)
+add_test(NAME qwen_engine_mtp3_rows64_row_independent
+  COMMAND ${CMAKE_COMMAND} -E env DGPP_DENSE_GEMV_ROWS=256 DGPP_TEST_DENSE_FP8=1
+          DGPP_TEST_QWEN_ROWS64=1 DGPP_TEST_FILTER=wide $<TARGET_FILE:qwen_engine_test>)
+set_tests_properties(qwen_engine_fp8_mtp3_rows64 qwen_engine_mtp3_rows64_row_independent
+  PROPERTIES RESOURCE_LOCK qwen_engine_world LABELS "gpu;rdma")
 
 add_executable(qwen_forward_check apps/qwen_forward_check.cpp)
 target_link_libraries(qwen_forward_check PRIVATE dgpp_models_qwen_layers dgpp_bus dgpp_loaders CUDA::cudart Threads::Threads)

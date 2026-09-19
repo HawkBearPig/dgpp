@@ -36,14 +36,14 @@ namespace dgpp {
 // recipe keeps its exact shape). kDecodeRowsMax is the build-time bound
 // the fixed arrays carry (the pick kernels' per-thread winners,
 // PickVerdict::winners — kernels/pick.hpp's kPickMaxRows mirrors it):
-// eight request slots at the deepest MTP, kSpecRows rows each.
+// sixteen request slots at MTP3 (four verification rows each).
 // kDecodeRows (8) is the floor and the default; GLM-5.3-Flash's own
 // decode model keeps it as its fixed batch (models/glm/forward.hpp).
 // kSpecRows bounds one request's verify rows (the pending token plus up
 // to kSpecRows - 1 drafts; kernels/glm_spec.hpp's kSpecMaxDrafts mirrors
 // it).
 constexpr int kDecodeRows = 8;
-constexpr int kDecodeRowsMax = 32;
+constexpr int kDecodeRowsMax = 64;
 constexpr int kSpecRows = 6;  // 2026-09-13: the DSpark block (5 drafts + the pending token)
 
 // One forward's rows as the engines read them.

@@ -299,7 +299,7 @@ class GraphEngineAdapter final : public sched::SchedulerEngine {
       // against the four-slot template's 38–43 — until the 4-slot family
       // covered them), then every slot. The bus bounds the variants:
       // 2 x slots + 2 x families (x the scheduled depth options) <= kBusMaxGraphVariants (64).
-      for (const int k : {2, 3, 4, 6})
+      for (const int k : {2, 3, 4, 6, 8, 12})
         if (k < batch_slots) {
           BatchFamily f;
           f.requests = k;

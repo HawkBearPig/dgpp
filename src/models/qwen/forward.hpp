@@ -118,7 +118,7 @@ class QwenModel : public SessionModel<QwenModel> {
 
   int64_t kv_block_tokens() const { return num_qsa_ > 0 ? kBlockTokens : 0; }
   static constexpr int prefill_chunk_tokens() { return kPrefillChunkTokens; }
-  static constexpr int decode_rows_cap() { return 16; }
+  static constexpr int decode_rows_cap() { return kDecodeRowsMax; }
   static constexpr bool kResumablePrefill = true;
   static constexpr int kv_block_tokens_static() { return kBlockTokens; }
   // The same number for a shape that is not built yet (the memory plan).
@@ -163,7 +163,7 @@ class QwenModel : public SessionModel<QwenModel> {
 
  private:
   static constexpr int kBlockTokens = 64;
-  static constexpr int kPrefillChunkTokens = 2048;
+  static constexpr int kPrefillChunkTokens = 1024;
 
   void build_layer_objects(const QwenLayerResident& r);
   void lm_head_logits(const uint16_t* hidden, int rows, cudaStream_t stream);

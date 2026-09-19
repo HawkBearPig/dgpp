@@ -660,3 +660,14 @@ the prompts. Its artifacts land under `build-ci/fabric-runs/failure_drill_*`.
 | peer binary, config and logs | `<stage_dir>/dgpp-serve`, `<stage_dir>/cluster.json`, `<stage_dir>/serve_r<rank>.log`, `<stage_dir>/serve_rank<rank>.ops` (fetched into the log dir by `down`) |
 | rank 0 log, pid and op stream | `<log_dir>/serve_r0.log`, `<log_dir>/r0.pid`, `<log_dir>/serve_rank0.ops`, written as the run records it (flushed at every retire) |
 | exit statuses | 0 orderly stop; 1 a startup or contract error (a configuration that differs from rank 0's included); 2 rank 0 after an engine failure; 3 a peer released by its in-tick watch |
+
+### Qwen 64-row decode
+
+Qwen supports `max_concurrency: 16` with `engine.mtp_depth: 3` (MTP enabled),
+using 64 verification rows. Smaller graph families are selected to cover
+the occupied slots. Request capacity remains 16 even at lower MTP depths.
+Qwen prefill uses 1024-token chunks. Wider graphs increase working and
+capture memory; validate the startup memory plan on your deployment.
+Upgrade all ranks together because the internal picker layout changed.
+See the [implementation and validation record](../benchmarks/results/2026-09-17-qwen-spark-decode/README.md)
+for tests, numerical caveats and measurement limits.

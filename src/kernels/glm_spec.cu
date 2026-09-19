@@ -452,9 +452,9 @@ void glm_device_copy(void* dst, const void* src, size_t bytes,
 
 void glm_spec_positions(const int64_t* session_pos, int rows,
                         int64_t* step_pos, cudaStream_t stream) {
-  if (rows < 1 || rows > 32)
+  if (rows < 1 || rows > kPickMaxRows)
     throw std::invalid_argument("glm_spec_positions: rows");
-  spec_positions_kernel<<<1, 32, 0, stream>>>(session_pos, rows, step_pos);
+  spec_positions_kernel<<<1, kPickMaxRows, 0, stream>>>(session_pos, rows, step_pos);
   DGPP_CUDA_OK(cudaGetLastError());
 }
 
@@ -467,7 +467,7 @@ void glm_spec_positions_batched(const int64_t* session_pos,
   if (rows < 1 || rows > kPickMaxRows || rows_per_request < 1 ||
       rows % rows_per_request != 0)
     throw std::invalid_argument("glm_spec_positions_batched: row shape");
-  spec_positions_batched_kernel<<<1, 32, 0, stream>>>(
+  spec_positions_batched_kernel<<<1, kPickMaxRows, 0, stream>>>(
       session_pos, request_ids, rows, rows_per_request, step_pos);
   DGPP_CUDA_OK(cudaGetLastError());
 }
@@ -481,7 +481,7 @@ void glm_spec_draft_rows(const PickVerdict* verdict, int rows,
   if (rows < 1 || rows > kPickMaxRows)
     throw std::invalid_argument("glm_spec_draft_rows: rows outside [1, " +
                                 std::to_string(kPickMaxRows) + "]");
-  spec_draft_rows_kernel<<<1, 32, 0, stream>>>(verdict, rows, block_pos,
+  spec_draft_rows_kernel<<<1, kPickMaxRows, 0, stream>>>(verdict, rows, block_pos,
                                                step_pos, tokens, next_out);
   DGPP_CUDA_OK(cudaGetLastError());
 }
