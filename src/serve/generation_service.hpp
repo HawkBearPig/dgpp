@@ -161,8 +161,14 @@ class ModelFrontend {
 
 struct ServiceConfig {
   FileInputConfig file_inputs;
-  // What /v1/models reports and what requests must name in "model".
+  // The checkpoint's model id: what requests may name in "model" and the
+  // fallback /v1/models reports when no alias is set.
   std::string model_id;
+  // The served-model alias (the cluster config's engine.served_model_name,
+  // the A/B lanes' stable gateway name). When set, /v1/models reports it
+  // and a request may name it (or the checkpoint id) in "model". Absent:
+  // the checkpoint id alone is served, exactly as before.
+  std::string served_model_name;
   int default_max_tokens = 256;  // when the request omits max_tokens
   int queue_limit = 64;          // admission bound; beyond → 503
   dgpp::sched::AdmissionPolicy admission;  // full-reserve unless told otherwise
@@ -200,6 +206,18 @@ struct ServiceConfig {
   std::optional<dgpp::RopeScaling> rope_scaling;
   int64_t position_ceiling = 0;
   int64_t kv_pool_tokens = 0;
+
+  // The name /v1/models reports (and the 404s name): the alias when set,
+  // else the checkpoint's model id.
+  std::string display_model_id() const {
+    return served_model_name.empty() ? model_id : served_model_name;
+  }
+  // A request names the served model when it carries the checkpoint id or
+  // the alias (absent: the checkpoint id alone).
+  bool model_matches(std::string_view name) const {
+    return name == model_id ||
+           (!served_model_name.empty() && name == served_model_name);
+  }
 };
 
 // The stop-string scanner (OpenAI's `stop`, 2026-09-06). Fed the visible

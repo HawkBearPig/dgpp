@@ -145,6 +145,10 @@ struct ServeKnobs {
   int max_connections = 64;
   int queue_limit = 64;
   int default_max_tokens = 256;
+  // The served-model alias (the cluster config's engine.served_model_name):
+  // when set, /v1/models reports it and requests may name it; absent:
+  // the checkpoint's model id alone.
+  std::string served_model_name;
   dgpp::sample::Params sampling_defaults = dgpp::sample::greedy_params();
   std::optional<uint64_t> fixed_seed;
   bool reasoning_in_content = false;
@@ -766,6 +770,7 @@ int serve_openai(dgpp::sched::SchedulerEngine* engine, int64_t vocab_size,
   dgpp::serve::ServiceConfig scfg;
   scfg.file_inputs = k.file_inputs;
   scfg.model_id = model_display;
+  scfg.served_model_name = k.served_model_name;
   scfg.default_max_tokens = k.default_max_tokens;
   scfg.queue_limit = k.queue_limit;
   scfg.sampling_defaults = k.sampling_defaults;
@@ -1043,6 +1048,7 @@ int main(int argc, char** argv) {
       "    (DGPP_LOG_LEVEL=debug)\n";
 
   std::string ckpt, model_id, peer;
+  std::string served_model_name;  // the served-model alias; empty: the checkpoint id
   uint16_t port = 8080, fabric_port = 29970, journal_port = 29971;
   int64_t kv_capacity = 8192;
   int64_t http_max_body_bytes = dgpp::serve::kDefaultHttpMaxBodyBytes;
@@ -1132,6 +1138,7 @@ int main(int argc, char** argv) {
     embed_sharding = e.embed_sharding;
     default_max_tokens = e.default_max_tokens;
     file_inputs = e.file_inputs;
+    served_model_name = e.served_model_name;
     queue_limit = e.queue_limit;
     max_connections = e.max_connections;
     no_eos = e.no_eos;
@@ -1810,6 +1817,7 @@ int main(int argc, char** argv) {
     knobs.http_max_body_bytes = http_max_body_bytes;
     knobs.max_connections = max_connections;
     knobs.queue_limit = queue_limit;
+    knobs.served_model_name = served_model_name;
     knobs.admission.mode = admission_mode == "grow"
                                ? dgpp::sched::AdmissionPolicy::Mode::kGrowOnDemand
                                : dgpp::sched::AdmissionPolicy::Mode::kFullReserve;

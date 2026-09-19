@@ -1622,6 +1622,8 @@ void GenerationService::handle(const HttpRequest& req,
 }
 
 void GenerationService::route_health(HttpResponseWriter& w) const {
+  // /health keeps the checkpoint id (as do the completion records); only
+  // /v1/models reports the display alias (served_model_name, when set).
   std::string failure;
   {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -1770,10 +1772,10 @@ void GenerationService::route_chat_completions(const HttpRequest& req,
                   "invalid_request_error", "model");
     return;
   }
-  if (model->as_string() != cfg_.model_id) {
+  if (!cfg_.model_matches(model->as_string())) {
     respond_error(w, 404, "the model '" + std::string(model->as_string()) +
                               "' does not exist on this server (serving '" +
-                              cfg_.model_id + "')",
+                              cfg_.display_model_id() + "')",
                   "invalid_request_error", "model", "model_not_found");
     return;
   }
@@ -1930,6 +1932,8 @@ void GenerationService::route_chat_completions(const HttpRequest& req,
     record->choice = choice;
     record->group = group;
     record->call_seed = tag ^ (static_cast<uint64_t>(choice) << 48);
+    // The record keeps the checkpoint id (as does /health); /v1/models
+    // reports the display alias (served_model_name, when set).
     record->model = cfg_.model_id;
     record->created_unix = created;
     record->chat = true;
@@ -1998,9 +2002,10 @@ void GenerationService::route_completions(const HttpRequest& req,
                   "invalid_request_error", "model");
     return;
   }
-  if (model->as_string() != cfg_.model_id) {
+  if (!cfg_.model_matches(model->as_string())) {
     respond_error(w, 404, "the model '" + std::string(model->as_string()) +
-                              "' does not exist on this server",
+                              "' does not exist on this server (serving '" +
+                              cfg_.display_model_id() + "')",
                   "invalid_request_error", "model", "model_not_found");
     return;
   }
@@ -2104,6 +2109,8 @@ void GenerationService::route_completions(const HttpRequest& req,
   record->group->choices.resize(1);
   record->call_seed = record->tag;
   record->stop.stops = stops;
+  // The record keeps the checkpoint id (as does /health); /v1/models
+  // reports the display alias (served_model_name, when set).
   record->model = cfg_.model_id;
   record->created_unix = std::time(nullptr);
   record->chat = false;
@@ -2139,7 +2146,7 @@ void GenerationService::route_models(const HttpRequest& req,
   if (req.path == "/v1/models") {
     w.respond(200, "application/json",
               "{\"object\":\"list\",\"data\":[" +
-                  model_object(cfg_, cfg_.model_id, created, sampling_available_,
+                  model_object(cfg_, cfg_.display_model_id(), created, sampling_available_,
                                cfg_.sampling_defaults, tool_calls_available(),
                                constraints_available(),
                                cfg_.reasoning_in_content, *frontend_, frontend_->supports_images() && engine_->supports_images()) +
@@ -2147,9 +2154,9 @@ void GenerationService::route_models(const HttpRequest& req,
     return;
   }
   const std::string id = req.path.substr(std::string("/v1/models/").size());
-  if (id == cfg_.model_id) {
+  if (cfg_.model_matches(id)) {
     w.respond(200, "application/json",
-              model_object(cfg_, id, created, sampling_available_,
+              model_object(cfg_, cfg_.display_model_id(), created, sampling_available_,
                            cfg_.sampling_defaults, tool_calls_available(),
                            constraints_available(), cfg_.reasoning_in_content, *frontend_, frontend_->supports_images() && engine_->supports_images()));
     return;
