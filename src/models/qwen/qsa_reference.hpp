@@ -12,13 +12,20 @@
 namespace dgpp::qwen_ref {
 
 void rope_inv_freq(double theta, int rotary_dim, std::vector<float>& inv_freq);
+// The YaRN table the engine builds under engine.rope_scaling
+// (kernels/rope_scaling.hpp): the oracle has to follow the engine there,
+// or a YaRN run's parity gate would compare against the plain rope.
+void rope_inv_freq_yarn(double theta, int rotary_dim, int64_t correction_max_position,
+                        double factor, double beta_fast, double beta_slow,
+                        std::vector<float>& inv_freq);
 // out[dim] = RoPE(RMSNorm(x) x (1 + w), pos) — bf16 bits in and out.
+// `mscale` scales the cos/sin before their bf16 rounding (1.0f = plain).
 void qsa_norm_rope(const uint16_t* x, const uint16_t* w, int64_t pos, const float* inv_freq,
-                   uint16_t* out, int dim, int rotary_dim, float eps);
+                   uint16_t* out, int dim, int rotary_dim, float eps, float mscale = 1.0f);
 // The compressed key of kpool raw keys (rows of `dim`) at position pos.
 void qsa_index_compress(const uint16_t* raw, int kpool, const uint16_t* w_k,
                         const float* inv_freq, int64_t pos, uint16_t* out, int dim,
-                        int rotary_dim, float eps);
+                        int rotary_dim, float eps, float mscale = 1.0f);
 // sum_h relu(<q_h, c>) / sqrt(128) in the device's order; q [heads, 128]
 // (heads <= 4), c [128].
 float qsa_index_score(const uint16_t* q, const uint16_t* c, int heads = 4);

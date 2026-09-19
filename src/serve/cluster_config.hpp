@@ -17,9 +17,11 @@
 
 #include <cstdint>
 #include <map>
+#include <optional>
 #include <string>
 #include <vector>
 
+#include "kernels/rope_scaling.hpp"
 #include "serve/http_limits.hpp"
 
 namespace dgpp::serve {
@@ -61,6 +63,16 @@ struct ClusterConfig {
     // recipe, half the prefill work) or "exact" (every layer over every
     // row, the parity mode).
     std::string prefill = "bounded";
+    // The opt-in YaRN rope ramp (2026-09-18, the Qwen3.8-Flash-Next 512K
+    // recipe): absent is the default and leaves every table and every
+    // kernel argument exactly as they were; present builds the Qwen QSA
+    // rope from the YaRN inverse frequencies, scales its cos/sin by the
+    // vLLM attention factor (yarn_get_mscale(factor) * attn_factor) and
+    // lifts the context cap from max_position_embeddings to
+    // original_max_position_embeddings x factor. The checkpoint's own
+    // config never carries it — the NVFP4 release declares no scaling and
+    // the A/B target applies YaRN from the launcher's --hf-overrides.
+    std::optional<dgpp::RopeScaling> rope_scaling;
     int default_max_tokens = 256;
     FileInputConfig file_inputs;
     int queue_limit = 64;

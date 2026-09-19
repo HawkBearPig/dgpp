@@ -217,6 +217,10 @@ class QwenQsaLayer {
   int max_tokens_;
   int64_t max_pools_;
   float eps_, scale_;
+  // The YaRN attention factor the cos/sin are built with (1.0f off the
+  // knob): vLLM bakes mscale into its cos/sin cache, its softmax scale
+  // staying head_dim^-0.5 (nvidia/qsa.py: self.scaling).
+  float mscale_ = 1.0f;
   float* d_inv_freq_ = nullptr;    // [rotary/2]
   uint16_t* q_ = nullptr;          // [M, lh * 2D]
   uint16_t* k_ = nullptr;          // [M, lkv * D]

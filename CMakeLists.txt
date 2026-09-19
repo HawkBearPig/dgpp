@@ -140,6 +140,14 @@ add_library(dgpp_loaders STATIC
 target_link_libraries(dgpp_loaders PUBLIC dgpp_core)
 dgpp_set_common(dgpp_loaders)
 
+# The host-side rope tables (kernels/rope_scaling.hpp): the YaRN builder the
+# DeepSeek-V4.1 CSA2 layers and the Qwen QSA rope share. Host-only, so the
+# unit gate links it without dragging the CUDA kernels in.
+add_library(dgpp_rope_scaling STATIC src/kernels/rope_scaling.cpp)
+target_include_directories(dgpp_rope_scaling PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(dgpp_rope_scaling PUBLIC dgpp_common)
+dgpp_set_common(dgpp_rope_scaling)
+
 add_library(dgpp_kernels STATIC
   src/kernels/gemm_cublaslt.cpp
   src/kernels/kernels.cu
@@ -172,7 +180,7 @@ add_library(dgpp_kernels STATIC
   src/kernels/qsa.cu
   src/kernels/qsa_prefill.cu
   src/kernels/glm4_attn.cu)
-target_link_libraries(dgpp_kernels PUBLIC CUDA::cudart CUDA::cublasLt dgpp_core)
+target_link_libraries(dgpp_kernels PUBLIC CUDA::cudart CUDA::cublasLt dgpp_core dgpp_rope_scaling)
 dgpp_set_common(dgpp_kernels)
 # The device sampler mirrors the host oracle bit for bit: no contraction of
 # its multiplies and adds (the host builds with -ffp-contract=off).
@@ -334,7 +342,7 @@ add_library(dgpp_models_qwen STATIC
   src/models/qwen/ple_reference.cpp
   src/models/qwen/qsa_reference.cpp)
 target_include_directories(dgpp_models_qwen PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(dgpp_models_qwen PUBLIC dgpp_loaders dgpp_common)
+target_link_libraries(dgpp_models_qwen PUBLIC dgpp_loaders dgpp_common dgpp_rope_scaling)
 dgpp_set_common(dgpp_models_qwen)
 
 # The Qwen resident loader (Q2): the shared weight builder at the family's
@@ -364,8 +372,16 @@ target_link_libraries(qwen_forward_test PRIVATE dgpp_models_qwen_layers dgpp_mod
 dgpp_set_common(qwen_forward_test)
 set(QWEN_FORWARD_FIXTURE ${CMAKE_CURRENT_BINARY_DIR}/qwen_forward_fixture)
 add_test(NAME qwen_forward_fixture COMMAND qwen_forward_test --write-fixture ${QWEN_FORWARD_FIXTURE})
+add_test(NAME qwen_plan_check COMMAND qwen_forward_test --plan-check)
 add_test(NAME qwen_forward_smoke COMMAND qwen_forward_test --smoke ${QWEN_FORWARD_FIXTURE})
 set_tests_properties(qwen_forward_smoke PROPERTIES DEPENDS qwen_forward_fixture)
+# The same model under the engine's YaRN knob (engine.rope_scaling, factor 2
+# over the fixture's 4096 native positions): the table, the mscale and the
+# lifted ceiling through a whole forward, and logits that differ from the
+# plain rope's.
+add_test(NAME qwen_forward_smoke_yarn
+  COMMAND qwen_forward_test --smoke ${QWEN_FORWARD_FIXTURE} --rope-scaling 2.0:4096)
+set_tests_properties(qwen_forward_smoke_yarn PROPERTIES DEPENDS qwen_forward_fixture)
 add_test(NAME qwen_forward_generate
   COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/qwen_reference_dump.py
           gen-pure --checkpoint-dir ${QWEN_FORWARD_FIXTURE}
@@ -601,6 +617,7 @@ add_executable(unit_tests
   tests/unit/cluster_config_test.cpp
   tests/unit/qwen_config_test.cpp
   tests/unit/qwen_binding_test.cpp
+  tests/unit/qwen_rope_scaling_test.cpp
   tests/unit/glm4_config_test.cpp
   tests/unit/glm4_binding_test.cpp
   tests/unit/glm_dsa_config_test.cpp
@@ -614,6 +631,7 @@ target_include_directories(unit_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(unit_tests PRIVATE CUDA::cudart dgpp_loaders
                                         dgpp_models_glm dgpp_models_qwen dgpp_models_glm4
                                         dgpp_models_glm_dsa dgpp_models_dsv41
+                                        dgpp_rope_scaling
                                         dgpp_net dgpp_serve Threads::Threads)
 target_compile_definitions(unit_tests PRIVATE DGPP_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
 dgpp_set_common(unit_tests)
