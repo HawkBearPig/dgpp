@@ -419,6 +419,10 @@ def main():
                          f"run asks for {max(args.lengths)}: engine.rope_scaling did not reach the "
                          f"process (deploy/README.md, the YaRN template). Refusing to write a "
                          f"record that would measure truncation.")
+    if reported is not None and reported < args.expect_limit:
+        raise SystemExit(f"the DGPP endpoint advertises a {reported}-token request limit, below "
+                         f"the {args.expect_limit} the run expects (--expect-limit): the verdict "
+                         f"would measure a different ceiling than the record's tag claims.")
     if len(lanes) == 2 and not args.allow_ceiling_mismatch:
         other = lanes[1].reported_limit()
         if reported is not None and other is not None and reported != other:

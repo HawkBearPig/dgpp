@@ -100,10 +100,13 @@ struct RopeScaling {
     // context_limit() / correction_max_position() is undefined (the
     // products are compared in the double they land in; 2^63 is exact).
     const double original = static_cast<double>(original_max_position_embeddings);
-    if (original * factor > 9.223372036854775808e18)
+    // >=, not >: a product of EXACTLY 2^63 (original 2^62 x factor 2, or
+    // INT64_MAX x 1.0 rounded up in the double) still overflows the int64
+    // llround below (the 2026-09-19 review, F2).
+    if (original * factor >= 9.223372036854775808e18)
       throw std::runtime_error(
           what + ": original_max_position_embeddings x factor exceeds 2^63 (the context limit)");
-    if (original * mrope_cache_factor > 9.223372036854775808e18)
+    if (original * mrope_cache_factor >= 9.223372036854775808e18)
       throw std::runtime_error(what +
                                ": original_max_position_embeddings x mrope_cache_factor exceeds 2^63 "
                                "(the correction band)");

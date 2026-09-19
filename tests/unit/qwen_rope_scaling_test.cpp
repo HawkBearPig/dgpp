@@ -339,6 +339,16 @@ DGPP_TEST(rope_scaling_knob_refuses_what_cannot_work) {
   rs.original_max_position_embeddings = INT64_MAX;
   rs.factor = 2.0;
   require(refuses(rs), "an original x factor product past 2^63 (the context limit's llround)");
+  // The exact-2^63 edges (the 2026-09-19 review, F2): a product of EXACTLY
+  // 2^63 still overflows the int64 llround, so the bound is >=, not >.
+  rs = recipe();
+  rs.original_max_position_embeddings = 1LL << 62;
+  rs.factor = 2.0;
+  require(refuses(rs), "an original x factor product of exactly 2^63");
+  rs = recipe();
+  rs.original_max_position_embeddings = INT64_MAX;
+  rs.factor = 1.0;
+  require(refuses(rs), "an INT64_MAX original x 1.0 (rounds to 2^63 in the double)");
   // The knob is the model's positional ceiling: with it on, the Qwen config
   // reports the scaled limit and the memory plan's context line follows.
   dgpp::QwenTextConfig cfg;
@@ -347,4 +357,28 @@ DGPP_TEST(rope_scaling_knob_refuses_what_cannot_work) {
   require(cfg.context_limit() == 524288, "the YaRN ceiling");
   cfg.rope_scaling->mrope_cache_factor = 1.0;
   require(cfg.context_limit() == 524288, "the ceiling is original x factor, not the band");
+}
+
+DGPP_TEST(yarn_inv_freq_builder_refuses_degenerate_theta) {
+  // The table builder's theta edges (the 2026-09-19 review, F1): validate()
+  // cannot see theta (a checkpoint field), so the builder guards its own
+  // arithmetic — theta == 1.0 zeroes the correction band's log(theta)
+  // division (±inf/NaN into the int casts), and a subnormal theta underflows
+  // the plain table's pow to 0 (1/0 = inf).
+  const auto throws = [](double theta) {
+    std::vector<float> out(32);
+    try {
+      dgpp::yarn_rope_inv_freq_host(64, theta, 262144 * 4, 2.0, 32.0, 1.0, out.data());
+    } catch (const std::invalid_argument&) {
+      return true;
+    }
+    return false;
+  };
+  require(throws(1.0), "theta == 1.0 zeroes the band's log(theta) division");
+  require(throws(1e-308), "a subnormal theta underflows the table's pow");
+  // The recipe's theta still builds a finite table (the frozen values pin it).
+  std::vector<float> out(32);
+  dgpp::yarn_rope_inv_freq_host(64, 1e7, 262144 * 4, 2.0, 32.0, 1.0, out.data());
+  require(std::all_of(out.begin(), out.end(), [](float v) { return std::isfinite(v) && v > 0; }),
+          "the recipe's theta builds a finite table");
 }
