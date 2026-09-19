@@ -496,6 +496,45 @@ DGPP_TEST(scheduler_chunked_prefill_bounds_work_and_keeps_decode_running) {
           "no double counting or reservation leak");
 }
 
+DGPP_TEST(scheduler_chunked_images_keep_decode_running_and_cancel_cleanly) {
+  class ImageChunks : public ChunkFakeEngine {
+   public:
+    bool supports_images() const override { return true; }
+    bool supports_image_prefix_cache() const override { return true; }
+    bool supports_image_chunked_prefill() const override { return true; }
+    void begin_prefill(int req, const std::vector<int64_t>& prompt, int64_t reserved,
+                        int64_t budget, const PrefixPrefill& plan) override {
+      require(plan.images && plan.images->size() == 12, "all historical images reach the cursor");
+      require(plan.images->back().offset == 23 && plan.images->back().rgb[0] == 123,
+              "image spans and pixels survive admission");
+      ChunkFakeEngine::begin_prefill(req, prompt, reserved, budget, plan);
+    }
+  } engine;
+  engine.arm(0, {10, 11, 12, 13, 14, 15, 16, 17}, 8);
+  engine.arm(1, {20, 21, 22}, 3);
+  dgpp::sched::AdmissionPolicy policy;
+  policy.prefill_budget_tokens = 4;
+  Scheduler sched(&engine, {}, 0, policy);
+  sched.submit(make_request("decode", 2, 8));
+  sched.tick();
+  auto request = make_request("images", 25, 3);
+  for (int i = 0; i < 12; ++i)
+    request.images.push_back({2 * i + 1, 1, 28, 28, std::vector<uint8_t>(28 * 28 * 3, 123)});
+  sched.submit(request);
+  for (int i = 0; i < 3; ++i) {
+    const auto tokens = sched.meters().tokens_generated;
+    sched.tick();
+    require(sched.meters().tokens_generated == tokens + 1, "decode continues during image prefill");
+    require(sched.find("images")->steps_done == 0, "unfinished images cannot decode");
+  }
+  require(sched.cancel("images"), "image prefill can be cancelled at a yield");
+  sched.tick();
+  require(sched.meters().prefilling == 0 && engine.prefill_monitor()->snapshot().empty(),
+          "cancelled image cursor released");
+  while (sched.tick()) {}
+  require(sched.meters().pool_blocks_in_use == 0, "image cancellation releases reservation");
+}
+
 DGPP_TEST(scheduler_chunked_prefill_yields_reservation_to_older_decode) {
   ChunkFakeEngine engine(10);
   engine.arm(0, {10, 11, 12, 13, 14, 15, 16, 17}, 8);
@@ -2417,4 +2456,126 @@ DGPP_TEST(scheduler_images_bypass_token_cache_and_grouping) {
     threw = true;
   }
   require(threw, "text engine cannot silently discard image data");
+}
+
+DGPP_TEST(prefix_cache_image_identity_and_partial_prefixes) {
+  using Cache = dgpp::sched::PrefixCache;
+  Cache cache({8, 1, 4});
+  const std::vector<int64_t> ids(24, 154854);
+  std::vector<dgpp::ImageInput> images{{8, 2, 28, 56, std::vector<uint8_t>(28 * 56 * 3, 123)}};
+  auto red = cache.image_keys(images);
+  const auto hash = [&](int64_t n, const Cache::Images& keys) {
+    return Cache::with_images(Cache::hash_prefix(ids.data(), n), n, keys);
+  };
+  const int before = cache.insert(ids.data(), 4, cache.take_free_slot(), 1, red);
+  const int at = cache.insert(ids.data(), 8, cache.take_free_slot(), 2, red);
+  const int inside = cache.insert(ids.data(), 9, cache.take_free_slot(), 3, red);
+  const int after = cache.insert(ids.data(), 16, cache.take_free_slot(), 4, red);
+  auto repeated = cache.image_keys(images);
+  require(repeated[0].input == red[0].input, "repeated pixels share immutable storage");
+  require(cache.lookup(ids, {4, 8, 9, 16}, {hash(4, red), hash(8, red), hash(9, red), hash(16, red)},
+                       repeated) == after, "identical image attaches after its span");
+  require(cache.find_exact(ids.data(), 4, hash(4, {})) == before, "text before image is reusable");
+  require(cache.find_exact(ids.data(), 8, hash(8, {})) < 0, "MTP lookahead at image start is keyed");
+  require(cache.find_exact(ids.data(), 9, hash(9, repeated), repeated) == inside,
+          "a snapshot inside an image retains its whole identity");
+  require(cache.find_exact(ids.data(), 8, hash(8, repeated), repeated) == at, "image-start hit");
+  images[0].rgb.back() ^= 1;
+  auto changed = cache.image_keys(images);
+  require(cache.lookup(ids, {4, 8, 9, 16}, {hash(4, changed), hash(8, changed), hash(9, changed), hash(16, changed)},
+                       changed) == before, "changed pixels reuse only the earlier text prefix");
+  // Deliberately collide the image hashes: byte comparison must still refuse.
+  changed[0].hash = red[0].hash;
+  require(cache.find_exact(ids.data(), 16, hash(16, changed), changed) < 0,
+          "image hash collisions cannot produce a cache hit");
+  images[0].rgb.back() ^= 1;
+  std::swap(images[0].width, images[0].height);
+  auto reshaped = cache.image_keys(images);
+  require(cache.find_exact(ids.data(), 16, hash(16, reshaped), reshaped) < 0,
+          "identical RGB bytes with changed geometry must miss");
+  images = {*red[0].input};
+  images.push_back({20, 1, 28, 28, std::vector<uint8_t>(28 * 28 * 3, 45)});
+  auto appended = cache.image_keys(images);
+  require(cache.find_exact(ids.data(), 16, hash(16, appended), appended) == after,
+          "a new suffix image preserves the cached prefix");
+  images[0].offset = 7;
+  auto moved = cache.image_keys(images);
+  require(cache.find_exact(ids.data(), 16, hash(16, moved), moved) < 0,
+          "image position participates in identity");
+  require(cache.nearest(ids, moved).common == 7, "miss diagnostics account for image changes");
+  const int occupied = cache.take_free_slot();
+  require(cache.insert(ids.data(), 16, occupied, 5, repeated) < 0, "same image entry deduplicates");
+  cache.give_back_slot(occupied);
+  for (int i = 0; i < 4; ++i) require(cache.evict_lru() >= 0, "image entries remain evictable");
+  require(cache.live_entries() == 0 && red[0].input->rgb.back() == 123,
+          "eviction releases entries without invalidating a request's image key");
+}
+
+DGPP_TEST(scheduler_images_reuse_prefill_and_generated_continuations) {
+  class CachedImages : public FakeEngine {
+   public:
+    CachedImages() : FakeEngine(1, 1000, 4) {}
+    bool supports_images() const override { return true; }
+    bool supports_image_prefix_cache() const override { return true; }
+    std::vector<int64_t> attaches;
+    int32_t prefill_cached(int req, const std::vector<int64_t>& prompt, PrefixPrefill* plan) override {
+      require(plan->images && plan->images->size() == 1, "cached prefill receives image embeddings' inputs");
+      attaches.push_back(plan->attach_position);
+      return FakeEngine::prefill_cached(req, prompt, plan);
+    }
+  } engine;
+  engine.set_prefix_arena(12, 4, 2048);
+  for (int i = 0; i < 4; ++i) engine.arm(0, {30, 31, 32, 33}, 4);
+  Scheduler sched(&engine, {});
+  auto first = make_cached_request("image-first", counted_prompt(21), {5, 13}, 4);
+  first.images.push_back({2, 1, 28, 28, std::vector<uint8_t>(28 * 28 * 3, 123)});
+  sched.submit(first);
+  while (sched.tick()) {}
+  auto next = first;
+  next.id = "image-continuation";
+  next.prompt.insert(next.prompt.end(), {30, 31, 32, 33, 40, 41});
+  next.boundaries.push_back(25);
+  sched.submit(next);
+  while (sched.tick()) {}
+  require(engine.attaches == std::vector<int64_t>({0, 24}),
+          "generated continuation survives retirement and attaches on the next turn");
+  next.id = "image-changed";
+  next.images[0].rgb[0] = 45;
+  sched.submit(next);
+  while (sched.tick()) {}
+  require(engine.attaches.back() == 0, "same token ids with different pixels cannot attach");
+  first.id = "image-repeated";
+  sched.submit(first);
+  while (sched.tick()) {}
+  require(engine.attaches.back() == 12, "the earlier image's snapshot remains reusable");
+}
+
+DGPP_TEST(prefix_cache_image_byte_budget_shares_identity_and_preserves_entries) {
+  using Cache = dgpp::sched::PrefixCache;
+  Cache::Config config;
+  config.slots = 4;
+  config.image_bytes = 28 * 28 * 3;
+  Cache cache(config);
+  std::vector<int64_t> tokens(12, 7);
+  std::vector<dgpp::ImageInput> images{{1, 1, 28, 28, std::vector<uint8_t>(config.image_bytes, 123)}};
+  const auto first = cache.image_keys(images);
+  const int a = cache.insert(tokens.data(), 4, cache.take_free_slot(), 1, first);
+  require(a >= 0, "first image fits byte budget");
+  cache.attach(a, 2);
+  const auto repeat = cache.image_keys(images);
+  require(first[0].input == repeat[0].input, "shared image identity");
+  const int b = cache.insert(tokens.data(), 8, cache.take_free_slot(), 3, repeat);
+  require(b >= 0 && cache.image_bytes() == config.image_bytes, "second prefix does not double count pixels");
+  images[0].rgb[0] ^= 1;
+  const auto changed = cache.image_keys(images);
+  const int spare = cache.take_free_slot();
+  require(cache.insert(tokens.data(), 12, spare, 4, changed) < 0, "new pixels exceed the byte budget");
+  cache.give_back_slot(spare);
+  require(cache.entry(a).live && cache.entry(b).live && cache.entry(a).attached == 1,
+          "image storage pressure preserves existing and attached prefixes");
+  require(cache.stats().skipped_image_bytes == 1, "image storage pressure is observable");
+  require(cache.evict_lru() >= 0 && cache.image_bytes() == config.image_bytes,
+          "shared pixels stay while an entry references them");
+  cache.detach(a);
+  require(cache.evict_lru() >= 0 && cache.image_bytes() == 0, "last eviction releases image identity");
 }

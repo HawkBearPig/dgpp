@@ -61,6 +61,42 @@ DGPP_TEST(image_inputs_reject_invalid_sources_and_spans) {
   rejects([&] { dgpp::validate_image_inputs({im}, 3); });
 }
 
+DGPP_TEST(image_inputs_history_uses_context_and_bytes_instead_of_image_count) {
+  std::vector<dgpp::ImageInput> images;
+  int64_t end = 1;
+  for (int i = 0; i < 16; ++i) {
+    images.push_back({end, 1024, 896, 896, std::vector<uint8_t>(896 * 896 * 3, 123)});
+    end += 1026;
+    dgpp::validate_image_inputs(images, end);
+  }
+  auto extra = images.back();
+  extra.offset = end;
+  images.push_back(extra);
+  dgpp::validate_image_inputs(images, end + 1024);
+  rejects([&] { dgpp::validate_image_inputs(images, end + 1023); });
+  images.pop_back();
+  images.back().tokens = 1025;
+  rejects([&] { dgpp::validate_image_inputs(images, end); });
+}
+
+DGPP_TEST(image_inputs_reject_geometry_overflow_and_decoded_byte_exhaustion) {
+  dgpp::ImageInput im{0, 1, 28, 28, std::vector<uint8_t>(28 * 28 * 3)};
+  im.offset = std::numeric_limits<int64_t>::max();
+  rejects([&] { dgpp::validate_image_inputs({im}, std::numeric_limits<int64_t>::max()); });
+  im.offset = 0;
+  im.tokens = 2;
+  rejects([&] { dgpp::validate_image_inputs({im}, 2); });
+  std::vector<dgpp::ImageInput> images;
+  const size_t image_bytes = 896 * 896 * 3;
+  const size_t count = dgpp::kMaxRequestImageBytes / image_bytes;
+  for (size_t i = 0; i <= count; ++i)
+    images.push_back({static_cast<int64_t>(i * 1024), 1024, 896, 896,
+                      std::vector<uint8_t>(image_bytes)});
+  rejects([&] { dgpp::validate_image_inputs(images, images.size() * 1024); });
+  images.pop_back();
+  dgpp::validate_image_inputs(images, images.size() * 1024);
+}
+
 DGPP_TEST(image_png_decode_and_detail_validation) {
   using V = dgpp::minijson::Value;
   const auto png = V::make_string(

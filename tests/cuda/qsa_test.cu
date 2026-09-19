@@ -2,10 +2,12 @@
 // geometry: per-head norm+RoPE within two bf16 ulps; the index compression
 // through the prefill kernel, the decode ring and a prefill-then-decode
 // split all bitwise one another (and the ring snapshots the ring's own
-// history), within two ulps of the reference; the indexer scores and the
-// selection bitwise; the listed attention (one and three splits) with its
-// gate within two ulps. Plus the frozen plain rope table and the YaRN
-// table + mscale the engine's knob (engine.rope_scaling) builds.
+// history), within two ulps of the reference — under BOTH rope tables the
+// engine can run them with, the plain one and the YaRN one the
+// engine.rope_scaling knob builds; the indexer scores and the selection
+// bitwise; the listed attention (one and three splits) with its gate
+// within two ulps. Plus the frozen plain rope table and the YaRN cos/sin
+// scale itself.
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -77,6 +79,53 @@ std::vector<int32_t> identity_table(const Geo& g) {
   for (int i = 0; i < g.blocks_per_request; ++i) t[static_cast<size_t>(i)] = i;
   return t;
 }
+
+// The two rope states a compressed index cache is ever built under. The
+// plain one is the checkpoint's own table with mscale 1.0f — bit for bit
+// what every QSA path ran before engine.rope_scaling existed. The YaRN one
+// is what the knob builds for the 512K recipe: factor 2 over 262144, the
+// correction band from the mrope-enlarged 4 x 262144, and the attention
+// factor riding the cos/sin, exactly as
+// qsa_rope_inv_freq_is_frozen_and_yarn_rides_the_cos_sin freezes them.
+// Table and mscale travel together: one without the other is a state the
+// engine never runs.
+//
+// The serving-path half of the reviewer's ask (the Qwen decode, CUDA
+// graph, speculative-decoding, prefix-reuse and tensor-parallel checks
+// with rope_scaling on) is a noted follow-up: those fixtures live in
+// tests/cuda/qwen_*_test.cpp, and this PR's YaRN coverage there is the
+// forward smoke test only.
+struct RopeMode {
+  const char* name;
+  bool yarn = false;
+};
+
+constexpr RopeMode kPlain{"plain", false};
+constexpr RopeMode kYarn{"yarn", true};
+
+// The recipe's ramp as a spec — the same six fields the cluster config
+// parses into cfg.rope_scaling.
+dgpp::RopeScaling recipe() {
+  dgpp::RopeScaling rs;
+  rs.factor = 2.0;
+  rs.original_max_position_embeddings = 262144;
+  rs.beta_fast = 32.0;
+  rs.beta_slow = 1.0;
+  rs.attn_factor = 1.0;
+  rs.mrope_cache_factor = 4.0;
+  return rs;
+}
+
+std::vector<float> rope_table(const Geo& g, const RopeMode& m) {
+  if (!m.yarn) return inv_freq_host(g);  // host bits, gated against the device's
+  const dgpp::RopeScaling rs = recipe();
+  std::vector<float> f(static_cast<size_t>(g.rotary / 2), 0.f);
+  dgpp::yarn_rope_inv_freq_host(g.rotary, g.theta, rs.correction_max_position(), rs.factor,
+                                rs.beta_fast, rs.beta_slow, f.data());
+  return f;
+}
+
+float rope_mscale(const RopeMode& m) { return m.yarn ? recipe().mscale() : 1.0f; }
 
 }  // namespace
 
@@ -165,15 +214,18 @@ namespace {
 
 struct IndexFixture {
   Geo g;
+  RopeMode mode;
+  float mscale = 1.0f;
   std::vector<uint16_t> raw;   // [seq, idx_dim]
   std::vector<uint16_t> w_k;   // [idx_dim]
   std::vector<float> inv;
   std::vector<int32_t> table;
   DevBuf draw, dwk, dinv, dtable;
-  explicit IndexFixture(uint64_t seed) {
+  explicit IndexFixture(uint64_t seed, const RopeMode& m = kPlain)
+      : mode(m), mscale(rope_mscale(m)) {
     raw = random_bf16_normal(seed, static_cast<int64_t>(g.seq) * g.idx_dim, 1.0f);
     w_k = random_bf16_uniform(seed + 1, g.idx_dim, 0.5f);
-    inv = inv_freq_host(g);
+    inv = rope_table(g, mode);
     table = identity_table(g);
     draw = up(raw);
     dwk = up(w_k);
@@ -187,7 +239,7 @@ struct IndexFixture {
       dgpp::qwen_ref::qsa_index_compress(raw.data() + static_cast<size_t>(p) * g.kpool * g.idx_dim, g.kpool,
                                          w_k.data(), inv.data(), static_cast<int64_t>(p) * g.kpool,
                                          c.data() + static_cast<size_t>(p) * g.idx_dim, g.idx_dim, g.rotary,
-                                         g.eps);
+                                         g.eps, mscale);
     return c;
   }
   // Decode updates over tokens [t0, t1) one span each, into cache/ring.
@@ -204,17 +256,20 @@ struct IndexFixture {
                                     ptr<uint16_t>(dwk), ptr<float>(dinv), ptr<int32_t>(dreq),
                                     ptr<int64_t>(dpos), ptr<int32_t>(dspans), 1, ptr<int32_t>(dtable),
                                     g.blocks_per_request, mptr<uint16_t>(dring), mptr<uint16_t>(dcache),
-                                    g.pools_per_block(), g.kpool, g.idx_dim, g.rotary, g.eps, 1.0f, st,
+                                    g.pools_per_block(), g.kpool, g.idx_dim, g.rotary, g.eps, mscale, st,
                                     snapshots);
       DGPP_CUDA_OK(cudaStreamSynchronize(st));
     }
   }
 };
 
-}  // namespace
-
-DGPP_TEST(qsa_index_compression_prefill_decode_and_split_agree) {
-  IndexFixture f(10);
+// The fixture's whole sequence — prefill, token-by-token decode, the
+// prefill-then-decode split with its ring snapshots, and the host oracle —
+// under one rope state, returning a checksum of the cache it built so the
+// caller can prove the two states really differ. Every invariant is a
+// bitwise one; the only tolerance is the two-ulp reference comparison.
+uint64_t index_compression_agreement(const RopeMode& mode) {
+  IndexFixture f(10, mode);
   const Geo& g = f.g;
   cudaStream_t st = test_stream();
   const size_t cache_elems = static_cast<size_t>(g.pool_slots()) * g.idx_dim;
@@ -225,7 +280,8 @@ DGPP_TEST(qsa_index_compression_prefill_decode_and_split_agree) {
   const int n_pools = g.seq / g.kpool;
   dgpp::qsa_index_compress_write(ptr<uint16_t>(f.draw), g.idx_dim, ptr<uint16_t>(f.dwk), ptr<float>(f.dinv),
                                  ptr<int32_t>(f.dtable), g.pools_per_block(), 0, n_pools,
-                                 mptr<uint16_t>(c_prefill), g.kpool, g.idx_dim, g.rotary, g.eps, 1.0f, st);
+                                 mptr<uint16_t>(c_prefill), g.kpool, g.idx_dim, g.rotary, g.eps,
+                                 f.mscale, st);
   DGPP_CUDA_OK(cudaStreamSynchronize(st));
   const std::vector<uint16_t> prefill = down<uint16_t>(c_prefill, cache_elems);
   // 2. Decode token by token from an empty ring.
@@ -242,7 +298,8 @@ DGPP_TEST(qsa_index_compression_prefill_decode_and_split_agree) {
   DGPP_CUDA_OK(cudaMemset(ring2.p, 0, ring_elems * 2));
   dgpp::qsa_index_compress_write(ptr<uint16_t>(f.draw), g.idx_dim, ptr<uint16_t>(f.dwk), ptr<float>(f.dinv),
                                  ptr<int32_t>(f.dtable), g.pools_per_block(), 0, cut / g.kpool,
-                                 mptr<uint16_t>(c_split), g.kpool, g.idx_dim, g.rotary, g.eps, 1.0f, st);
+                                 mptr<uint16_t>(c_split), g.kpool, g.idx_dim, g.rotary, g.eps,
+                                 f.mscale, st);
   {
     std::vector<int32_t> req_ids(static_cast<size_t>(cut), 0);
     std::vector<int64_t> pos(static_cast<size_t>(cut));
@@ -278,7 +335,7 @@ DGPP_TEST(qsa_index_compression_prefill_decode_and_split_agree) {
                                   ptr<uint16_t>(f.dwk), ptr<float>(f.dinv), ptr<int32_t>(dreq),
                                   ptr<int64_t>(dpos), ptr<int32_t>(dspans), 1, ptr<int32_t>(f.dtable),
                                   g.blocks_per_request, mptr<uint16_t>(ring2), mptr<uint16_t>(c_split),
-                                  g.pools_per_block(), g.kpool, g.idx_dim, g.rotary, g.eps, 1.0f, st,
+                                  g.pools_per_block(), g.kpool, g.idx_dim, g.rotary, g.eps, f.mscale, st,
                                   mptr<uint16_t>(snaps));
     DGPP_CUDA_OK(cudaStreamSynchronize(st));
     const std::vector<uint16_t> got_snaps = down<uint16_t>(snaps, static_cast<size_t>(n) * ring_elems);
@@ -300,9 +357,28 @@ DGPP_TEST(qsa_index_compression_prefill_decode_and_split_agree) {
   const size_t used = static_cast<size_t>(n_pools) * g.idx_dim;
   const Stats s = compare_bf16(std::vector<uint16_t>(prefill.begin(), prefill.begin() + used),
                                std::vector<uint16_t>(oracle.begin(), oracle.begin() + used), 2);
-  std::printf("[ .. ] compressed keys: max_rel %.3g l2_rel %.3g mismatches %ld/%ld\n", s.max_rel, s.l2_rel,
-              s.mismatches, s.n);
+  std::printf("[ .. ] compressed keys (%s rope): max_rel %.3g l2_rel %.3g mismatches %ld/%ld\n",
+              mode.name, s.max_rel, s.l2_rel, s.mismatches, s.n);
   require_bf16("compressed keys", s, 2e-3, 0.01);
+  uint64_t sum = 1469598103934665603ull;  // FNV-1a over the cache this run built
+  for (const uint16_t v : prefill) sum = (sum ^ static_cast<uint64_t>(v)) * 1099511628211ull;
+  return sum;
+}
+
+}  // namespace
+
+DGPP_TEST(qsa_index_compression_prefill_decode_and_split_agree) {
+  // Both rope states, every invariant: the plain table with mscale 1.0f
+  // (bit-identical to the build before the engine.rope_scaling knob — the
+  // frozen table above is what keeps that honest) and the YaRN table with
+  // the recipe's attention factor. The compression kernels take the table
+  // and the mscale as arguments, so a fixture that only ever passed 1.0f
+  // never touched the new ones on the prefill, decode, split or snapshot
+  // path.
+  const uint64_t plain = index_compression_agreement(kPlain);
+  const uint64_t yarn = index_compression_agreement(kYarn);
+  require(plain != yarn, "the YaRN run rebuilt the plain cache: the mode is inert");
+  std::printf("[ .. ] compressed keys: prefill, decode, split and snapshots agree under both tables\n");
 }
 
 namespace {

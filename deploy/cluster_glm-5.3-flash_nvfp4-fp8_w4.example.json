@@ -10,6 +10,8 @@
     "queue_limit": 8,
     "max_connections": 64,
     "decode_graph": true,
+    "prefill_budget_tokens": 256,
+    "prefill_idle_budget_tokens": 2048,
     "mtp": true,
     "prefix_cache_gib": 8,
     "admission": "full",

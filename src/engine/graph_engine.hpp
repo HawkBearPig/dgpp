@@ -28,6 +28,7 @@
 #include "engine/decode_outputs.hpp"
 #include "engine/eager_engine.hpp"
 #include "engine/graph_check.hpp"
+#include "engine/image_prefill.hpp"
 #include "engine/prefix_arena.hpp"
 #include "engine/speculative.hpp"
 #include "engine/step_timing.hpp"
@@ -958,6 +959,9 @@ class GraphEngineAdapter final : public sched::SchedulerEngine {
     if constexpr (requires { model_->supports_images(); }) return model_->supports_images();
     return false;
   }
+  bool supports_image_prefix_cache() const override {
+    return supports_images() && kImagePrefixCache<Model>;
+  }
   int32_t prefill_images(int req, const std::vector<int64_t>& prompt,
                          const std::vector<ImageInput>& images) override {
     if constexpr (requires { model_->session_prefill_images(req, prompt, images); })
@@ -978,6 +982,16 @@ class GraphEngineAdapter final : public sched::SchedulerEngine {
     }
     return 0;
   }
+  bool supports_image_chunked_prefill() const override {
+    if constexpr (requires { typename Model::PrefillCursor; }) {
+      if constexpr (requires(int req, const std::vector<int64_t>& prompt,
+                              const std::vector<ImageInput>* images) {
+        model_->session_prefill_begin(req, prompt, int64_t{}, int64_t{}, prompt,
+                                      nullptr, int64_t{}, images);
+      }) return supports_images() && prefill_chunk_alignment() > 0;
+    }
+    return false;
+  }
   void begin_prefill(int req, const std::vector<int64_t>& prompt, int64_t reserve_tokens,
                      int64_t chunk_tokens, const sched::SchedulerEngine::PrefixPrefill& plan) override {
     if constexpr (requires { typename Model::PrefillCursor; }) {
@@ -992,6 +1006,8 @@ class GraphEngineAdapter final : public sched::SchedulerEngine {
       if (plan.boundaries) task->boundaries = *plan.boundaries;
       task->plan = plan;
       task->plan.boundaries = &task->boundaries;
+      if (plan.images) task->images = *plan.images;
+      task->plan.images = &task->images;
       try {
         open_slot_grammar(req, prompt);
         typename Model::SnapshotRequest* snap = nullptr;
@@ -1004,9 +1020,18 @@ class GraphEngineAdapter final : public sched::SchedulerEngine {
             throw std::logic_error("graph engine: attached prefix differs from the plan");
           arena_.attach(req, plan.attach_slot);
         }
-        auto cursor = std::make_shared<typename Model::PrefillCursor>(model_->session_prefill_begin(
-            req, task->prompt, std::min<int64_t>(reserve_tokens + std::max(0, depth_ - 1), model_->max_context()),
-            chunk_tokens, task->boundaries, snap, plan.attach_position));
+        auto cursor = std::make_shared<typename Model::PrefillCursor>([&] {
+          const auto reserved = std::min<int64_t>(reserve_tokens + std::max(0, depth_ - 1), model_->max_context());
+          if constexpr (requires { model_->session_prefill_begin(req, task->prompt, reserved,
+              chunk_tokens, task->boundaries, snap, plan.attach_position, &task->images); }) {
+            return model_->session_prefill_begin(req, task->prompt, reserved, chunk_tokens,
+                task->boundaries, snap, plan.attach_position, &task->images);
+          } else {
+            if (!task->images.empty()) throw std::logic_error("graph engine: image prefill cannot yield");
+            return model_->session_prefill_begin(req, task->prompt, reserved, chunk_tokens,
+                task->boundaries, snap, plan.attach_position);
+          }
+        }());
         task->advance = [this, req, cursor, task = task.get()](int64_t budget) {
           const int64_t start = cursor->next;
           const bool done = model_->session_prefill_advance(*cursor, budget);
@@ -1126,10 +1151,11 @@ class GraphEngineAdapter final : public sched::SchedulerEngine {
         arena_.attach(req, plan->attach_slot);
         const std::vector<int64_t> suffix(prompt.begin() + plan->attach_position,
                                           prompt.end());
-        out = model_->session_prefill_resume(req, suffix, *plan->boundaries,
-                                             snap_ptr);
+        out = cached_model_prefill(model_, req, suffix, *plan->boundaries,
+                                   snap_ptr, plan->images, true);
       } else {
-        out = model_->session_prefill(req, prompt, *plan->boundaries, snap_ptr);
+        out = cached_model_prefill(model_, req, prompt, *plan->boundaries,
+                                   snap_ptr, plan->images, false);
       }
       if (snap_ptr != nullptr) {
         arena_.commit(plan->snap_slot, snap);
@@ -1416,6 +1442,7 @@ class GraphEngineAdapter final : public sched::SchedulerEngine {
  private:
   struct PendingPrefill {
     std::vector<int64_t> prompt, boundaries;
+    std::vector<ImageInput> images;
     sched::SchedulerEngine::PrefixPrefill plan;
     typename Model::SnapshotRequest snap;
     std::function<sched::SchedulerEngine::PrefillProgress(int64_t)> advance;

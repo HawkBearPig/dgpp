@@ -310,9 +310,64 @@ source and checked bit for bit in a container:
 What the mode does not touch: the QSA softmax scale, the pool's size (a
 pool is sized by `engine.kv_capacity`, so the knob lifts what a request may
 reach without moving a byte — `qwen_plan_check` asserts that), and every
-other family (the launcher warns that the knob applies to `qwen4_exp` only).
-The knob rides the settings record (`"rs"`) so a peer can never rope at
-different frequencies from rank 0, and the canonical config digest.
+other family — a world that sets `engine.rope_scaling` for a family other than
+`qwen4_exp` refuses to start and names the family, rather than serving with the
+operator's setting quietly unapplied. The knob rides the settings record (`"rs"`)
+so a peer can never rope at different frequencies from rank 0, and the canonical
+config digest.
+
+**Plain checkpoints only (and deliberately so).** The loader
+(`src/models/qwen/config.cpp`) rejects a checkpoint whose
+`text_config.rope_parameters.rope_type` is anything but `"default"`, so the
+ramp has exactly one author. Both shipped releases are plain; a checkpoint that
+already declares YaRN — the usual shape from a `--hf-overrides` merge baked and
+saved, or a release that adopts the recipe upstream — is turned away at load
+even though nothing else about it is wrong. The reason is double-scaling: that
+checkpoint's own table is YaRN's, and applying `engine.rope_scaling` on top
+would divide the frequencies by `factor` twice and put the correction band past
+the end of the table. It fails loudly at the config, which is the cheap place,
+instead of quietly at 300 K tokens, which is not.
+
+The follow-up (not this change) is to accept those checkpoints and say what
+wins: read the checkpoint's `rope_parameters` as the default, let an explicit
+`engine.rope_scaling` override it field by field, and log the merged ramp the
+same way the plain case logs the knob — with the two rules the current
+rejection protects: never scale a table that is already scaled, and never let a
+rank and its peer disagree about which one did.
+
+Where the setting shows up, for the operator:
+
+- `deploy/cluster_qwen-3.8-flash-next_nvfp4_w2_yarn512k.example.json`: the
+  recipe as a ready-to-run template — the ramp spelled out field by field, two
+  request slots and a 532 480-token pool (the ceiling plus room for an answer),
+  ~51.73 GiB per rank at TP=2 under the 4 GiB headroom. The KV-pool and
+  headroom notes, and the ceiling-versus-pool point, are in `deploy/README.md`.
+- the startup log: `serve: request context limit N tokens — the lesser of the
+  positional ceiling (…) and the K/V pool …`, next to the YaRN line the
+  `QwenFamily` constructor already prints.
+- `GET /v1/models`: additively, `rope_scaling` (the active settings, in the
+  deployment's own field names, with `mscale`, the correction band and the
+  scaled ceiling) and `context` (`request_limit_tokens` — the same minimum the
+  log prints — with `position_ceiling_tokens`, `kv_pool_tokens` and
+  `limited_by` beside it). A build with the knob off sends neither field.
+- `scripts/qwen_yarn_release_check.py` (`docs/qwen_yarn_release_check.md`): the
+  opt-in release check — a real-checkpoint run at 262 144 and 524 288 tokens
+  that exercises long prefill, incremental decode, prefix-cache reuse and
+  concurrent streams, records peak memory, latency and needle-retrieval rate,
+  and can replay the same prompts against the vLLM lane so a retrieval miss is
+  attributed to the model/recipe or to DGPP rather than guessed at.
+
+The oracle is offline-checkable. `tests/python/qwen_yarn_oracle.py --emit`
+runs inside the recipe's container and records vLLM's own numbers — the
+YaRN table, the mscale, the bf16 cos/sin cache rows and rotated Q/K (with
+one attention logit) at several positions — for five parameter
+combinations (the recipe, factor 4, a 16/2 band, an `attn_factor` of 1.2,
+the 1x mrope cache), under the digest of the image that produced them, in
+`tests/data/qwen_yarn_oracle.json`. `tests/unit/qwen_yarn_fixture_test.cpp`
+then compares the engine's builder and rotation against that file with no
+vLLM, no container and no GPU: 160 table lanes, 21 cos/sin rows and 42
+rotated rows, every one of them bit-for-bit. Re-run `--emit` and `--check`
+in the container when the recipe or vLLM's yarn code moves.
 
 ### 1.10 Tokenizer, template, tool format
 

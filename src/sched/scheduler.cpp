@@ -200,7 +200,7 @@ int Scheduler::free_slot() const {
 Scheduler::PrefixPlan Scheduler::plan_prefix(const Request& r) const {
   PrefixPlan plan;
   if (!cache_on(r)) return plan;
-  const int e = cache_.lookup(r.spec.prompt, r.cuts, r.cut_hashes);
+  const int e = cache_.lookup(r.spec.prompt, r.cuts, r.cut_hashes, r.cache_images);
   if (e >= 0) {
     plan.attach_entry = e;
     plan.attach_position = cache_.entry(e).position;
@@ -377,6 +377,7 @@ bool Scheduler::try_submit(SchedulerRequest request) {
   Request r;
   r.spec = std::move(request);
   if (cache_on(r)) {
+    r.cache_images = cache_.image_keys(r.spec.images);
     // The prompt's cuts and their prefix hashes, once: the lookups at every
     // tick this request waits are then O(cuts) probes.
     r.cuts = cache_.cuts(static_cast<int64_t>(r.spec.prompt.size()),
@@ -386,7 +387,7 @@ bool Scheduler::try_submit(SchedulerRequest request) {
     int64_t done = 0;
     for (const int64_t c : r.cuts) {
       for (; done < c; ++done) h = PrefixCache::extend_hash(h, r.spec.prompt[static_cast<size_t>(done)]);
-      r.cut_hashes.push_back(h);
+      r.cut_hashes.push_back(PrefixCache::with_images(h, c, r.cache_images));
     }
   }
   requests_.push_back(std::move(r));
@@ -554,6 +555,7 @@ void Scheduler::admit(int arrival) {
     const PrefixPlan plan = plan_prefix(r);
     SchedulerEngine::PrefixPrefill pp;
     pp.boundaries = &r.spec.boundaries;
+    pp.images = &r.spec.images;
     int snap_slot = -1;
     if (plan.attach_entry >= 0) {
       // Attach first: an attached entry is never evicted, and the snapshot
@@ -599,7 +601,7 @@ void Scheduler::admit(int arrival) {
         cache_.give_back_slot(snap_slot);
       } else {
         const int e = cache_.insert(r.spec.prompt.data(), plan.snap_position,
-                                    snap_slot, ticks_);
+                                    snap_slot, ticks_, r.cache_images);
         if (e < 0) {
           free_arena_slot(snap_slot);
         } else {
@@ -621,6 +623,7 @@ void Scheduler::begin_prefill(int arrival, int64_t budget) {
   const int slot = admit_prepare(arrival);
   SchedulerEngine::PrefixPrefill pp;
   pp.boundaries = &r.spec.boundaries;
+  pp.images = &r.spec.images;
   r.admitted_at = std::chrono::steady_clock::now();
   try {
     if (cache_on(r)) {
@@ -701,7 +704,7 @@ void Scheduler::advance_prefill(int arrival, int64_t budget) {
     const int slot = r.prefill_snap_slot;
     r.prefill_snap_slot = -1;
     if (progress.snap_taken) {
-      const int entry = cache_.insert(r.spec.prompt.data(), r.prefill_snap_position, slot, ticks_);
+      const int entry = cache_.insert(r.spec.prompt.data(), r.prefill_snap_position, slot, ticks_, r.cache_images);
       if (entry < 0) free_arena_slot(slot);
       else {
         ++cache_.stats().snapshots;
@@ -959,7 +962,7 @@ void Scheduler::retire(int arrival, Result::Status status,
       if (gen > 0)
         ids.insert(ids.end(), r.generated.begin(), r.generated.begin() + gen);
       if (static_cast<int64_t>(ids.size()) == position) {
-        const int e = cache_.insert(ids.data(), position, slot, ticks_);
+        const int e = cache_.insert(ids.data(), position, slot, ticks_, r.cache_images);
         if (e >= 0) {
           kept = true;
           ++cache_.stats().close_entries;
@@ -1028,6 +1031,7 @@ void Scheduler::release_retired(Request& r, Result& res) {
   // size. Every read of a retired record elsewhere is of the tombstone.
   std::vector<int64_t>().swap(r.spec.prompt);
   std::vector<ImageInput>().swap(r.spec.images);
+  PrefixCache::Images().swap(r.cache_images);
   std::vector<int64_t>().swap(r.spec.boundaries);
   std::vector<LogitBias>().swap(r.spec.logit_bias);
   r.spec.grammar = text::GrammarSpec{};
@@ -1140,7 +1144,8 @@ bool Scheduler::quantum() {
     const std::vector<int> group = admissible_group(admit_arrival, budget);
     if (group.size() >= 2)
       admit_group(group);
-    else if (budget > 0 && requests_[admit_arrival].spec.images.empty() &&
+    else if (budget > 0 && (requests_[admit_arrival].spec.images.empty() ||
+                           engine_->supports_image_chunked_prefill()) &&
              static_cast<int64_t>(requests_[admit_arrival].spec.prompt.size()) > budget) {
       begin_prefill(admit_arrival, budget);
       advance_prefill(admit_arrival, budget);
@@ -1257,6 +1262,8 @@ Scheduler::Meters Scheduler::meters() const {
   m.prefix_duplicates = cache_.stats().duplicates;
   m.prefix_skipped = cache_.stats().skipped_no_slot;
   m.prefix_skipped_no_block = cache_.stats().skipped_no_block;
+  m.prefix_skipped_image_bytes = cache_.stats().skipped_image_bytes;
+  m.prefix_image_bytes = static_cast<int64_t>(cache_.image_bytes());
   m.prefix_blocks_pinned = cache_.blocks_pinned(prefix_info_.block_tokens);
   return m;
 }
@@ -1368,7 +1375,7 @@ void Scheduler::log_prefix_miss(const Request& r) const {
         cache_.slots());
     return;
   }
-  const PrefixCache::Nearest near = cache_.nearest(r.spec.prompt);
+  const PrefixCache::Nearest near = cache_.nearest(r.spec.prompt, r.cache_images);
   if (near.entry < 0) return;
   const PrefixCache::Entry& e = cache_.entry(near.entry);
   const int64_t n = static_cast<int64_t>(r.spec.prompt.size());

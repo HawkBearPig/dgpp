@@ -1424,9 +1424,12 @@ The prefix cache reuses exact session snapshots at valid prefill cuts.
 snapshot, attach and release operations, so snapshot size and cache
 contents depend on its state representation.
 
-Image requests bypass this token-only index. Equal placeholder IDs do not
-imply equal image embeddings; safe reuse requires image content and geometry
-in the prefix identity, including for generated continuation snapshots.
+Image-capable cache adapters also key snapshots by processed RGB pixels,
+geometry and token positions, with exact comparisons after hash lookup.
+Immutable image data is shared across matching entries and conversation turns.
+Identity includes an image starting at the cut because an MTP snapshot can
+already contain its shifted embedding. Generated continuation snapshots keep
+the same identity; suffix prefill restores embeddings for remaining images.
 
 For GLM-5.3, a snapshot contains KDA recurrent and convolution state, DSA
 tail rings and the draft block's last hidden row. Complete cache blocks
@@ -1463,6 +1466,15 @@ Entries hold references to their cache blocks, which count against pool
 usage. Admission can evict the least-recently-used eligible entry when it
 needs blocks or an arena slot. Entries attached to live requests are
 protected, and blocks are freed only when their references reach zero.
+
+Image identities share immutable RGB storage across matching entries and
+have a separate 256 MiB host-byte budget. An insertion that would exceed it
+is skipped without rejecting the request or evicting an attached entry.
+GLM stages image embeddings in fixed storage for one image and one prefill
+chunk plus MTP lookahead. Visual tokens occupy normal context positions;
+there is no history-wide image-count or visual-token limit. Resumable GLM
+prefill preserves main/MTP state per request and masks unfinished device
+positions between scheduler ticks so padded decode graphs cannot alter them.
 
 **Rank agreement.** Every scheduler derives lookup, snapshot and eviction
 decisions from the same journaled inputs. The warm record supplies rank
@@ -1980,8 +1992,9 @@ during prefill. The MTP prompt pass applies its embedding norm to the same
 features at its shifted token positions. This handles image spans across
 language-model prefill chunks. Eager and graph adapters share normal slot
 opening and sampling; decode graphs consume ordinary generated token IDs.
-Image admissions currently run individually and bypass prefix-cache lookup,
-insertion and resumable prefill.
+Image admissions run individually and support prefix-cache lookup and
+insertion. The GLM graph engine supports resumable image prefill with a
+configured token budget; image requests do not use grouped prefill.
 
 ### Admission journal
 

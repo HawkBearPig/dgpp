@@ -24,6 +24,9 @@ struct Buffer {
     p = next;
     bytes = size;
   }
+  void require_capacity(size_t size) const {
+    if (size > bytes) throw std::logic_error("GLM vision: startup workspace is too small");
+  }
   uint16_t* b() const { return static_cast<uint16_t*>(p); }
 };
 std::string read_text(const std::filesystem::path& p) {
@@ -38,7 +41,8 @@ struct GlmVisionEncoder::Impl {
   CublasLtGemm gemm;
   std::map<std::string, std::unique_ptr<Buffer>> weights;
   uint64_t hash = 14695981039346656037ull;
-  Buffer rgb, patches, x, norm, tmp, qkv, q, k, v, attn, gate, up, scores, probs, work, result;
+  Buffer rgb, patches, x, norm, tmp, qkv, q, k, v, attn, gate, up, scores, probs, work, result, window;
+  ImageInput resident_image;  // owned identity of the single-image output
   Impl(const GlmVisionConfig& cfg, const std::string& checkpoint, cudaStream_t s)
       : c(cfg), stream(s) {
     namespace fs = std::filesystem;
@@ -127,7 +131,8 @@ struct GlmVisionEncoder::Impl {
                             static_cast<size_t>(kMaxImageTokens) * c.projection}) *
                   4);
     probs.resize(n * n * 2);
-    result.resize(static_cast<size_t>(kMaxRequestImageTokens) * c.output * 2);
+    result.resize(static_cast<size_t>(kMaxImageTokens) * c.output * 2);
+    window.resize(static_cast<size_t>(GlmVisionConfig::kWindowTokens) * c.output * 2);
     work.resize(64ull << 20);
   }
   const uint16_t* w(const std::string& name) const { return weights.at(name)->b(); }
@@ -148,19 +153,19 @@ struct GlmVisionEncoder::Impl {
         image.tokens != (image.width / 28) * (image.height / 28))
       throw std::invalid_argument("GLM vision: image grid and token count disagree");
     const size_t rows = std::max(static_cast<size_t>(n) * h, static_cast<size_t>(image.tokens) * o);
-    rgb.resize(image.rgb.size());
-    patches.resize(static_cast<size_t>(n) * 1176 * 2);
-    x.resize(rows * 2);
-    norm.resize(std::max(rows, static_cast<size_t>(n) * h) * 2);
-    tmp.resize(rows * 2);
-    qkv.resize(static_cast<size_t>(n) * h * 6);
-    for (auto* buf : {&q, &k, &v, &attn}) buf->resize(static_cast<size_t>(n) * h * 2);
+    rgb.require_capacity(image.rgb.size());
+    patches.require_capacity(static_cast<size_t>(n) * 1176 * 2);
+    x.require_capacity(rows * 2);
+    norm.require_capacity(std::max(rows, static_cast<size_t>(n) * h) * 2);
+    tmp.require_capacity(rows * 2);
+    qkv.require_capacity(static_cast<size_t>(n) * h * 6);
+    for (auto* buf : {&q, &k, &v, &attn}) buf->require_capacity(static_cast<size_t>(n) * h * 2);
     for (auto* buf : {&gate, &up})
-      buf->resize(std::max(static_cast<size_t>(n) * c.intermediate,
+      buf->require_capacity(std::max(static_cast<size_t>(n) * c.intermediate,
                            static_cast<size_t>(image.tokens) * c.projection) *
                   2);
-    scores.resize(static_cast<size_t>(n) * n * 4);
-    probs.resize(static_cast<size_t>(n) * n * 2);
+    scores.require_capacity(static_cast<size_t>(n) * n * 4);
+    probs.require_capacity(static_cast<size_t>(n) * n * 2);
     DGPP_CUDA_OK(
         cudaMemcpyAsync(rgb.p, image.rgb.data(), image.rgb.size(), cudaMemcpyHostToDevice, stream));
     vision_patchify(static_cast<const uint8_t*>(rgb.p), patches.b(), image.width, image.height,
@@ -248,23 +253,41 @@ GlmVisionEncoder::~GlmVisionEncoder() = default;
 uint64_t GlmVisionEncoder::digest() const {
   return impl_->hash;
 }
-const uint16_t* GlmVisionEncoder::encode(const std::vector<ImageInput>& images, Trace trace) {
-  validate_image_inputs(images, images.empty() ? 0 : images.back().offset + images.back().tokens);
-  size_t rows = 0;
-  for (const auto& im : images) rows += im.tokens;
-  impl_->result.resize(rows * impl_->c.output * 2);
+const uint16_t* GlmVisionEncoder::encode(const ImageInput& image, Trace trace) {
+  validate_image_pixels(image);
+  // Invalidate before writing: a failed encode cannot leave a reusable result.
+  impl_->resident_image = {};
   impl_->observer = std::move(trace);
-  size_t offset = 0;
   try {
-    for (const auto& im : images) {
-      impl_->encode_one(im, impl_->result.b() + offset * impl_->c.output);
-      offset += im.tokens;
-    }
+    impl_->encode_one(image, impl_->result.b());
+    impl_->resident_image = image;
   } catch (...) {
     impl_->observer = {};
     throw;
   }
   impl_->observer = {};
   return impl_->result.b();
+}
+const uint16_t* GlmVisionEncoder::stage(const std::vector<ImageInput>& images,
+                                      int64_t first, int64_t end) {
+  if (first < 0 || end < first || end - first > GlmVisionConfig::kWindowTokens)
+    throw std::invalid_argument("GLM vision: image window exceeds the preallocated workspace");
+  // Spans are validated once at admission. Seek past fully cached images.
+  auto it = std::lower_bound(images.begin(), images.end(), first,
+      [](const ImageInput& im, int64_t pos) { return im.offset + im.tokens <= pos; });
+  for (; it != images.end() && it->offset < end; ++it) {
+    const auto& im = *it;
+    const auto& resident = impl_->resident_image;
+    if (resident.tokens != im.tokens || resident.width != im.width ||
+        resident.height != im.height || resident.rgb != im.rgb)
+      encode(im);
+    const int64_t begin = std::max(first, im.offset);
+    const int64_t stop = std::min(end, im.offset + im.tokens);
+    const size_t h = impl_->c.output;
+    DGPP_CUDA_OK(cudaMemcpyAsync(impl_->window.b() + (begin - first) * h,
+        impl_->result.b() + (begin - im.offset) * h, (stop - begin) * h * sizeof(uint16_t),
+        cudaMemcpyDeviceToDevice, impl_->stream));
+  }
+  return impl_->window.b();
 }
 }  // namespace dgpp

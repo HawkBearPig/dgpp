@@ -289,6 +289,7 @@ GlmDiagnosticModel::GlmDiagnosticModel(const GlmTextConfig& cfg,
         kda_geo_.conv_committed_bytes));
   }
   session_pos_.assign(static_cast<size_t>(max_requests_), 0);
+  prefill_epochs_.assign(static_cast<size_t>(max_requests_), 0);
   // Speculative verify snapshots (one in-flight verify; see the header).
   if (kda_cfg_.num_kda_layers > 0) {
     const size_t per_row = static_cast<size_t>(kda_cfg_.num_kda_layers);

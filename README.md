@@ -89,8 +89,8 @@ record the modes measured for each deployment.
   for supported options and model-dependent limitations.
 - **GLM-5.3-Flash image inputs**: PNG/JPEG data URIs in Chat Completions,
   using the checkpoint's native vision encoder. Multiple images, streaming
-  and MTP work together; see [image inputs](docs/vision.md) for examples,
-  memory requirements and the current prefix-cache restriction.
+  and MTP work together, with image-aware prefix caching; see
+  [image inputs](docs/vision.md) for examples and memory requirements.
 - **Deterministic across ranks**: admissions journaled from the head, every
   tick's operation-stream digest checked on every peer, and all ranks'
   complete streams compared at shutdown.
@@ -381,7 +381,7 @@ Startup checks the combined memory plan before loading.
 | `engine.prefix_cache_gib` | no | Memory budget per rank for reusable prefix-state snapshots. Repeated conversation prefixes can skip prefill work; larger budgets retain more snapshots but leave less memory for other state. Set 0 to disable. This is not the on-disk resident weight cache. | 1.5 GiB |
 | `engine.admission` | no | When to reserve context space. `full` reserves prompt plus the requested answer budget before admitting a request. `grow` starts with a smaller reservation and extends it during generation; if space runs out, the youngest request is shed. Use `full` for predictable reservations, `grow` to trade that guarantee for denser occupancy. | `full` |
 | `engine.admission_window` | no | Answer-token reservation increment used by `grow` admission. Larger increments reduce growth frequency but reserve more space ahead of use. Has no effect under `full`. Must be positive. | 256 tokens |
-| `engine.prefill_budget_tokens` | no | Qwen graph engine: maximum prefill tokens per scheduler tick, with a decode pass between chunks. Use an aligned budget no larger than the model's prefill chunk limit. 0 keeps full-prompt admission. | 0 (disabled) |
+| `engine.prefill_budget_tokens` | no | Qwen and GLM-5.3-Flash graph engines: maximum prefill tokens per scheduler tick, with a decode pass between chunks. Use an aligned budget no larger than the model's prefill chunk limit. 0 keeps full-prompt admission. | 0 (disabled) |
 | `engine.prefill_idle_budget_tokens` | no | Larger prefill budget when no request is actively decoding. Requires an enabled busy budget, must be at least that budget, aligned and within the same prefill limit. Rechecked after each chunk. 0 uses the busy budget for all chunks. | 0 (disabled) |
 
 ### Execution and performance

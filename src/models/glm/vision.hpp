@@ -20,7 +20,10 @@ class GlmVisionEncoder {
                    cudaStream_t stream);
   ~GlmVisionEncoder();
   using Trace = std::function<void(const std::string&, const void*, size_t, DType)>;
-  const uint16_t* encode(const std::vector<ImageInput>& images, Trace trace = {});
+  const uint16_t* encode(const ImageInput& image, Trace trace = {});
+  // Stage only image rows in [first, end). Non-image rows are unspecified.
+  // Uses fixed storage, valid until the next stage() call on the same stream.
+  const uint16_t* stage(const std::vector<ImageInput>& images, int64_t first, int64_t end);
   uint64_t digest() const;
 
  private:

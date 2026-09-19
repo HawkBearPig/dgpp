@@ -56,6 +56,25 @@ int main() {
       threw = true;
     }
     require(threw, "raw image token cannot steal a visual embedding span");
+    // An 896x896 one-bit black PNG: each decoded image uses 1024 visual
+    // tokens. Spread the images across turns, as a screenshot client does.
+    const std::string large_png =
+        "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAA4AAAAOAAQAAAABDTyD6AAAAeUlEQVR4nO3BMQEAAADC"
+        "oPVPbQsvoAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAvgaLjwABbzzxhwAAAABJRU5ErkJggg==";
+    const auto history = [&](int count) {
+      std::string body = "{\"messages\":[";
+      for (int i = 0; i < count; ++i) {
+        if (i) body += ',';
+        body += "{\"role\":\"user\",\"content\":[{\"type\":\"image_url\",\"image_url\":{\"url\":\"" +
+                large_png + "\"}}]}";
+      }
+      return body + "]}";
+    };
+    const auto large = vision.prepare_chat(dgpp::minijson::parse(history(16)).root);
+    require(large.images.size() == 16 &&
+                std::count(large.tokens.begin(), large.tokens.end(), 154854) == 16384,
+            "image history expands into ordinary context positions without a count/token cap");
     std::cout << "GLM vision frontend checks passed\n";
   } catch (const std::exception& e) {
     std::cerr << e.what() << '\n';

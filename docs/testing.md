@@ -285,7 +285,11 @@ that pass by scheduling luck, undersized test buffers that made a graph test
 pass vacuously) are pinned in `DESIGN.md` §12.
 
 Cross-node RoCE and NIC→GPU checks are intentionally manual/deployment tests;
-they require a peer and are documented under `benchmarks/README.md`.
+they require a peer and are documented under `benchmarks/README.md`. The same
+holds for the release checks: long, real-checkpoint cluster runs that no CI job
+starts, each behind an explicit acknowledgement — today
+`scripts/qwen_yarn_release_check.py` (`docs/qwen_yarn_release_check.md`), the
+YaRN acceptance run near 256K and 512K.
 
 ## Vision arithmetic
 

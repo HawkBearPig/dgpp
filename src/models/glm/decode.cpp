@@ -175,82 +175,81 @@ std::vector<int64_t> GlmDiagnosticModel::prefill_cuts(
   return cuts;
 }
 
-GlmDiagnosticModel::Outputs GlmDiagnosticModel::session_prefill_chunks(
+GlmDiagnosticModel::PrefillCursor GlmDiagnosticModel::prefill_cursor(
     int req, const int64_t* ids, int64_t start, int64_t count,
     const std::vector<int64_t>& boundaries, SnapshotRequest* snap) {
-  const int64_t end = start + count;
-  const std::vector<int64_t> cuts = prefill_cuts(start, end, boundaries);
+  PrefillCursor cursor;
+  cursor.req = req;
+  cursor.ids = ids;
+  cursor.images = prefill_images_;
+  cursor.start = cursor.next = start;
+  cursor.end = start + count;
+  cursor.cuts = prefill_cuts(start, cursor.end, boundaries);
+  cursor.snap = snap;
   if (snap != nullptr) {
     if (snap->dst == nullptr || snap->meta == nullptr)
       throw std::invalid_argument("session_prefill: snapshot request without a buffer");
-    const bool at_cut =
-        std::binary_search(cuts.begin(), cuts.end(), snap->position) ||
-        snap->position == end;
-    if (!at_cut)
-      throw std::invalid_argument(
-          "session_prefill: the snapshot position is not a chunk end");
+    if (!std::binary_search(cursor.cuts.begin(), cursor.cuts.end(), snap->position) &&
+        snap->position != cursor.end)
+      throw std::invalid_argument("session_prefill: the snapshot position is not a chunk end");
   }
-  Outputs out;  // last row's logits/final_hidden; routes cover ALL rows
-  int64_t c0 = start;
-  size_t ci = 0;
-  while (c0 < end) {
-    const int64_t c1 = ci < cuts.size() ? cuts[ci++] : end;
-    if (c1 - c0 > max_tokens_)
-      throw std::invalid_argument(
-          "session_prefill: a chunk of " + std::to_string(c1 - c0) +
-          " rows exceeds max_tokens " + std::to_string(max_tokens_));
-    Outputs chunk = session_run_rows(
-        req, std::vector<int64_t>(ids + (c0 - start), ids + (c1 - start)), c0,
-        /*decode_row=*/false);
-    out.logits = std::move(chunk.logits);
-    out.final_hidden_bits = std::move(chunk.final_hidden_bits);
-    out.lm_vocab_begin = chunk.lm_vocab_begin;
-    out.lm_vocab_count = chunk.lm_vocab_count;
-    session_merge_routes(&out, std::move(chunk));
-    session_pos_[static_cast<size_t>(req)] = c1;
-    push_position(req);
-    // The draft block over this chunk's rows — row q embeds tok_{q+1}, so
-    // the rows stop one short of the prompt end (the first generated token
-    // is that row's input). Interleaving it per chunk keeps its state at
-    // every cut, where a snapshot may be taken.
-    if (mtp_) {
-      const int64_t r1 = std::min<int64_t>(c1, end - 1);
-      if (r1 > c0) mtp_prefill_rows(req, c0, r1, ids + (c0 + 1 - start));
-      mtp_pos_[static_cast<size_t>(req)] = std::max<int64_t>(mtp_pos_[static_cast<size_t>(req)], r1);
-      push_mtp_position(req);
-    }
-    if (snap != nullptr && !snap->taken && snap->position == c1) {
-      *snap->meta = session_snapshot(req, snap->dst);
-      snap->taken = true;
-    }
-    c0 = c1;
-    report_prefill_progress(req, c1);
-  }
-  return out;
+  return cursor;
 }
 
-GlmDiagnosticModel::Outputs GlmDiagnosticModel::session_prefill(
-    int req, const std::vector<int64_t>& prompt_ids,
-    const std::vector<int64_t>& boundaries, SnapshotRequest* snap) {
-  if (req < 0 || req >= max_requests_)
-    throw std::out_of_range("session_prefill: request slot " +
-                           std::to_string(req));
-  const int64_t P = static_cast<int64_t>(prompt_ids.size());
-  if (P <= 0) throw std::invalid_argument("session_prefill: empty prompt");
-  if (P > max_context_)
-    throw std::invalid_argument("session_prefill: prompt exceeds the context bound");
-  if (P > max_tokens_ && max_tokens_ < kPrefillChunkTokens)
-    throw std::invalid_argument(
-        "session_prefill: prompt exceeds max_tokens and the model cannot chunk it "
-        "(max_tokens is below the prefill chunk)");
-  for (int64_t id : prompt_ids)
-    if (id < 0 || id >= cfg_.vocab_size)
-      throw std::invalid_argument("session_prefill: token id out of range");
-  if (dsa_cfg_.num_dsa_layers > 0 &&
-      kPrefillChunkTokens % dsa_cfg_.index_kpool != 0)
-    throw std::runtime_error(
-        "session_prefill: the chunk size broke the kpool-alignment contract");
+void GlmDiagnosticModel::prefill_chunk(PrefillCursor& cursor, int64_t budget) {
+  const int req = cursor.req;
+  const int64_t* ids = cursor.ids;
+  const int64_t start = cursor.start, end = cursor.end, c0 = cursor.next;
+  auto* snap = cursor.snap;
+  auto& out = cursor.output;
+  int64_t c1 = cursor.cut_index < cursor.cuts.size() ? cursor.cuts[cursor.cut_index] : end;
+  if (budget > 0) c1 = std::min(c1, (c0 / budget + 1) * budget);
+  if (cursor.cut_index < cursor.cuts.size() && c1 == cursor.cuts[cursor.cut_index]) ++cursor.cut_index;
+  if (c1 <= c0 || c1 - c0 > max_tokens_)
+    throw std::invalid_argument("session_prefill: chunk outside the model's row capacity");
+  // This borrow is scoped to one synchronous main+MTP chunk. Decode graphs
+  // and other requests never inherit its images or device window.
+  struct ImageScope {
+    GlmDiagnosticModel& model;
+    const std::vector<ImageInput>* previous;
+    ~ImageScope() { model.prefill_images_ = previous; model.image_embeddings_ = nullptr; }
+  } scope{*this, prefill_images_};
+  prefill_images_ = cursor.images;
+  stage_image_embeddings(c0, std::min(c1 + (mtp_ ? 1 : 0), end));
+  if (cursor.catchup) {
+    (void)session_draft(req, {ids[0]});
+    cursor.catchup = false;
+  }
+  Outputs chunk = session_run_rows(
+      req, std::vector<int64_t>(ids + (c0 - start), ids + (c1 - start)), c0,
+      /*decode_row=*/false);
+  out.logits = std::move(chunk.logits);
+  out.final_hidden_bits = std::move(chunk.final_hidden_bits);
+  out.lm_vocab_begin = chunk.lm_vocab_begin;
+  out.lm_vocab_count = chunk.lm_vocab_count;
+  session_merge_routes(&out, std::move(chunk));
+  session_pos_[static_cast<size_t>(req)] = c1;
+  push_position(req);
+  // The draft block over this chunk's rows — row q embeds tok_{q+1}, so
+  // the rows stop one short of the prompt end (the first generated token
+  // is that row's input). Interleaving it per chunk keeps its state at
+  // every cut, where a snapshot may be taken.
+  if (mtp_) {
+    const int64_t r1 = std::min<int64_t>(c1, end - 1);
+    if (r1 > c0) mtp_prefill_rows(req, c0, r1, ids + (c0 + 1 - start));
+    mtp_pos_[static_cast<size_t>(req)] = std::max<int64_t>(mtp_pos_[static_cast<size_t>(req)], r1);
+    push_mtp_position(req);
+  }
+  if (snap != nullptr && !snap->taken && snap->position == c1) {
+    *snap->meta = session_snapshot(req, snap->dst);
+    snap->taken = true;
+  }
+  cursor.next = c1;
+  report_prefill_progress(req, c1);
+}
 
+void GlmDiagnosticModel::reset_prefill_session(int req) {
+  ++prefill_epochs_[static_cast<size_t>(req)];
   // Open THIS slot only — other slots' sessions are untouched (the Stage
   // 2b concurrency contract). Slot 0's zeroed state is the same starting
   // state run_stack builds, so a single-chunk prefill there still runs
@@ -275,6 +274,110 @@ GlmDiagnosticModel::Outputs GlmDiagnosticModel::session_prefill(
   if (dsa_cfg_.num_dsa_layers > 0) pool_.reset_request(req, stream_);
   session_pos_[static_cast<size_t>(req)] = 0;
   if (mtp_) mtp_pos_[static_cast<size_t>(req)] = 0;
+}
+
+GlmDiagnosticModel::PrefillCursor GlmDiagnosticModel::session_prefill_begin(
+    int req, const std::vector<int64_t>& prompt, int64_t reserve_tokens, int64_t chunk_tokens,
+    const std::vector<int64_t>& boundaries, SnapshotRequest* snap, int64_t attach_position,
+    const std::vector<ImageInput>* images) {
+  if (req < 0 || req >= max_requests_) throw std::out_of_range("GLM prefill: request slot");
+  const int64_t end = static_cast<int64_t>(prompt.size());
+  const int64_t align = session_snapshot_align();
+  if (end <= 0 || end > max_context_ || reserve_tokens < end || reserve_tokens > max_context_)
+    throw std::invalid_argument("GLM prefill: prompt/reservation outside context bounds");
+  if (chunk_tokens < align || chunk_tokens > max_tokens_ || chunk_tokens % align != 0)
+    throw std::invalid_argument("GLM prefill: invalid aligned chunk budget");
+  if (attach_position < 0 || attach_position >= end || attach_position % align != 0)
+    throw std::invalid_argument("GLM prefill: invalid attach position");
+  for (const auto id : prompt)
+    if (id < 0 || id >= cfg_.vocab_size) throw std::invalid_argument("GLM prefill: token id out of range");
+  if (images && !images->empty()) {
+    if (!vision_) throw std::invalid_argument("GLM: checkpoint has no vision encoder");
+    validate_image_inputs(*images, prompt.size());
+    for (const auto& im : *images)
+      for (int64_t pos = im.offset; pos < im.offset + im.tokens; ++pos)
+        if (prompt[static_cast<size_t>(pos)] != 154854)
+          throw std::invalid_argument("GLM: image span does not contain image tokens");
+  }
+  auto cuts = boundaries;
+  if (snap && snap->position > attach_position && snap->position < end &&
+      snap->position % chunk_tokens == 0) cuts.push_back(snap->position);
+  auto cursor = prefill_cursor(req, prompt.data() + attach_position, attach_position,
+                               end - attach_position, cuts, snap);
+  cursor.images = images;
+  cursor.budget_tokens = chunk_tokens;
+  if (attach_position == 0) reset_prefill_session(req);
+  else if (session_pos_[static_cast<size_t>(req)] != attach_position)
+    throw std::logic_error("GLM prefill: slot differs from attached prefix");
+  cursor.epoch = ++prefill_epochs_[static_cast<size_t>(req)];
+  session_reserve_blocks(req, reserve_tokens);
+  if (attach_position > 0 && mtp_) {
+    const auto pos = mtp_pos_[static_cast<size_t>(req)];
+    cursor.catchup = pos == attach_position - 1;
+    if (!cursor.catchup && pos != attach_position)
+      throw std::logic_error("GLM prefill: draft differs from attached prefix");
+  }
+  return cursor;
+}
+
+bool GlmDiagnosticModel::session_prefill_advance(PrefillCursor& cursor, int64_t chunk_tokens) {
+  if (cursor.req < 0 || cursor.req >= max_requests_ || cursor.next >= cursor.end ||
+      prefill_epochs_[static_cast<size_t>(cursor.req)] != cursor.epoch ||
+      session_pos_[static_cast<size_t>(cursor.req)] != cursor.next)
+    throw std::logic_error("GLM prefill: completed or stale cursor");
+  const int64_t budget = chunk_tokens == 0 ? cursor.budget_tokens : chunk_tokens;
+  const int64_t align = session_snapshot_align();
+  if (budget < align || budget > max_tokens_ || budget % align != 0)
+    throw std::invalid_argument("GLM prefill: invalid aligned chunk budget");
+  if (cursor.suspended) {
+    push_position(cursor.req);
+    if (mtp_) push_mtp_position(cursor.req);
+    cursor.suspended = false;
+  }
+  prefill_chunk(cursor, budget);
+  const bool done = cursor.next == cursor.end;
+  if (!done) {
+    // Batched graphs include padding slots. Hide an unfinished prefill's
+    // device positions while retaining its host counters and model state.
+    DGPP_CUDA_OK(cudaMemsetAsync(d_session_pos_ + cursor.req, 0xff, sizeof(int64_t), stream_));
+    if (mtp_) DGPP_CUDA_OK(cudaMemsetAsync(d_mtp_pos_ + cursor.req, 0xff, sizeof(int64_t), stream_));
+    cursor.suspended = true;
+  }
+  DGPP_CUDA_OK(cudaStreamSynchronize(stream_));
+  return done;
+}
+
+GlmDiagnosticModel::Outputs GlmDiagnosticModel::session_prefill_chunks(
+    int req, const int64_t* ids, int64_t start, int64_t count,
+    const std::vector<int64_t>& boundaries, SnapshotRequest* snap) {
+  auto cursor = prefill_cursor(req, ids, start, count, boundaries, snap);
+  while (cursor.next < cursor.end) prefill_chunk(cursor);
+  return std::move(cursor.output);
+}
+
+GlmDiagnosticModel::Outputs GlmDiagnosticModel::session_prefill(
+    int req, const std::vector<int64_t>& prompt_ids,
+    const std::vector<int64_t>& boundaries, SnapshotRequest* snap) {
+  if (req < 0 || req >= max_requests_)
+    throw std::out_of_range("session_prefill: request slot " +
+                           std::to_string(req));
+  const int64_t P = static_cast<int64_t>(prompt_ids.size());
+  if (P <= 0) throw std::invalid_argument("session_prefill: empty prompt");
+  if (P > max_context_)
+    throw std::invalid_argument("session_prefill: prompt exceeds the context bound");
+  if (P > max_tokens_ && max_tokens_ < kPrefillChunkTokens)
+    throw std::invalid_argument(
+        "session_prefill: prompt exceeds max_tokens and the model cannot chunk it "
+        "(max_tokens is below the prefill chunk)");
+  for (int64_t id : prompt_ids)
+    if (id < 0 || id >= cfg_.vocab_size)
+      throw std::invalid_argument("session_prefill: token id out of range");
+  if (dsa_cfg_.num_dsa_layers > 0 &&
+      kPrefillChunkTokens % dsa_cfg_.index_kpool != 0)
+    throw std::runtime_error(
+        "session_prefill: the chunk size broke the kpool-alignment contract");
+
+  reset_prefill_session(req);
 
   // Chunking (M7's contract, 2026-09-05): cuts at every kPrefillChunkTokens
   // multiple and at the pool-aligned image of every boundary; chunk starts
@@ -414,8 +517,10 @@ GlmDiagnosticModel::Outputs GlmDiagnosticModel::session_prefill_resume(
   // A close-time snapshot leaves the draft block one row behind (row P0-1
   // wants tok_{P0}, the suffix's first token): catch it up through the
   // decode-path draft, whose row is exactly that one.
-  if (mtp_ && mtp_pos_[static_cast<size_t>(req)] == P0 - 1)
+  if (mtp_ && mtp_pos_[static_cast<size_t>(req)] == P0 - 1) {
+    stage_image_embeddings(P0, P0 + 1);
     (void)session_draft(req, std::vector<int64_t>{suffix_ids[0]});
+  }
   if (mtp_ && mtp_pos_[static_cast<size_t>(req)] != P0)
     throw std::logic_error("session_prefill_resume: the draft block's row counter is "
                            "not at the attach position");
@@ -1108,6 +1213,7 @@ void GlmDiagnosticModel::session_close(int req) {
   if (req < 0 || req >= max_requests_)
     throw std::out_of_range("session_close: request slot " +
                             std::to_string(req));
+  ++prefill_epochs_[static_cast<size_t>(req)];
   if (dsa_cfg_.num_dsa_layers > 0) {
     // The listed attention's guarded gather: an anomaly is a
     // bug survived, logged loudly with its first values. Reported here so
@@ -1652,16 +1758,37 @@ void GlmDiagnosticModel::session_merge_routes(Outputs* out,
 
 GlmDiagnosticModel::Outputs GlmDiagnosticModel::session_prefill_images(
     int req, const std::vector<int64_t>& prompt, const std::vector<ImageInput>& images) {
+  return session_prefill_images(req, prompt, images, {}, nullptr);
+}
+
+GlmDiagnosticModel::Outputs GlmDiagnosticModel::session_prefill_images(
+    int req, const std::vector<int64_t>& prompt, const std::vector<ImageInput>& images,
+    const std::vector<int64_t>& boundaries, SnapshotRequest* snap) {
+  return session_prefill_with_images(req, prompt, images, boundaries, snap, false);
+}
+
+GlmDiagnosticModel::Outputs GlmDiagnosticModel::session_prefill_resume_images(
+    int req, const std::vector<int64_t>& suffix, const std::vector<ImageInput>& images,
+    const std::vector<int64_t>& boundaries, SnapshotRequest* snap) {
+  return session_prefill_with_images(req, suffix, images, boundaries, snap, true);
+}
+
+GlmDiagnosticModel::Outputs GlmDiagnosticModel::session_prefill_with_images(
+    int req, const std::vector<int64_t>& ids, const std::vector<ImageInput>& images,
+    const std::vector<int64_t>& boundaries, SnapshotRequest* snap, bool resume) {
   if (!vision_) throw std::invalid_argument("GLM: checkpoint has no vision encoder");
-  validate_image_inputs(images, prompt.size());
+  if (req < 0 || req >= max_requests_) throw std::out_of_range("GLM image prefill: request slot");
+  const int64_t start = resume ? session_pos_[static_cast<size_t>(req)] : 0;
+  if (start < 0) throw std::invalid_argument("GLM image prefill: closed session");
+  validate_image_inputs(images, start + ids.size());
   for (const auto& im : images)
-    for (int j = 0; j < im.tokens; ++j)
-      if (prompt[im.offset + j] != 154854)
+    for (int64_t pos = std::max(start, im.offset); pos < im.offset + im.tokens; ++pos)
+      if (ids[static_cast<size_t>(pos - start)] != 154854)
         throw std::invalid_argument("GLM: image span does not contain image tokens");
-  image_embeddings_ = vision_->encode(images);
   prefill_images_ = &images;
   try {
-    auto out = session_prefill(req, prompt);
+    auto out = resume ? session_prefill_resume(req, ids, boundaries, snap)
+                      : session_prefill(req, ids, boundaries, snap);
     prefill_images_ = nullptr;
     image_embeddings_ = nullptr;
     return out;
@@ -1671,16 +1798,23 @@ GlmDiagnosticModel::Outputs GlmDiagnosticModel::session_prefill_images(
     throw;
   }
 }
+void GlmDiagnosticModel::stage_image_embeddings(int64_t first, int64_t end) {
+  image_window_first_ = first;
+  image_window_end_ = end;
+  image_embeddings_ = prefill_images_ && !prefill_images_->empty()
+      ? vision_->stage(*prefill_images_, first, end) : nullptr;
+}
 void GlmDiagnosticModel::apply_image_embeddings(uint16_t* dst, int64_t first, int rows,
                                                 const uint16_t* mtp_norm) {
   if (!prefill_images_) return;
   const int h = cfg_.hidden_size;
-  size_t image_row = 0;
   for (const auto& im : *prefill_images_) {
     const int64_t begin = std::max(first, im.offset),
                   end = std::min(first + rows, im.offset + im.tokens);
     if (end > begin) {
-      const auto* source = image_embeddings_ + (image_row + begin - im.offset) * h;
+      if (!image_embeddings_ || begin < image_window_first_ || end > image_window_end_)
+        throw std::logic_error("GLM: image consumer escaped its staged window");
+      const auto* source = image_embeddings_ + (begin - image_window_first_) * h;
       const int n = static_cast<int>(end - begin);
       if (mtp_norm) {
         glm_rmsnorm_bf16(source, mtp_norm, normed_, n, h, cfg_.rms_norm_eps, stream_);
@@ -1690,7 +1824,6 @@ void GlmDiagnosticModel::apply_image_embeddings(uint16_t* dst, int64_t first, in
       } else
         vision_broadcast(source, dst + (begin - first) * 4 * h, n, h, stream_);
     }
-    image_row += im.tokens;
   }
 }
 

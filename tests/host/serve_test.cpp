@@ -86,6 +86,7 @@ class FakeEngine : public SchedulerEngine {
   std::atomic<bool> images_available{false};
   std::atomic<int> image_prefills{0};
   bool supports_images() const override { return images_available; }
+  bool supports_image_prefix_cache() const override { return images_available; }
   int32_t prefill_images(int req, const std::vector<int64_t>& prompt, const std::vector<dgpp::ImageInput>& images) override {
     require(!images.empty() && images[0].rgb.size() == 112 * 112 * 3, "decoded image reaches the engine");
     ++image_prefills;
@@ -192,6 +193,11 @@ class FakeEngine : public SchedulerEngine {
   }
   int32_t prefill_cached(int req, const std::vector<int64_t>& prompt,
                          dgpp::sched::SchedulerEngine::PrefixPrefill* plan) override {
+    if (plan->images && !plan->images->empty()) {
+      require(images_available && plan->images->front().rgb.size() == 112 * 112 * 3,
+              "image payload survives cached admission");
+      ++image_prefills;
+    }
     if (plan->attach_slot >= 0) {
       std::lock_guard<std::mutex> lock(armed_mu_);
       prefix_ops_.push_back("X:" + std::to_string(req) + ":" +
@@ -605,7 +611,11 @@ struct ServiceRig {
                       bool reasoning_in_content = false,
                       dgpp::sched::AdmissionPolicy admission = {},
                       int prefix_slots = 0,
-                      dgpp::serve::FileInputConfig file_inputs = {})
+                      dgpp::serve::FileInputConfig file_inputs = {},
+                      // The request-context surface (review item 7): the rig's
+                      // rope ramp and its two bounds, advertised on /v1/models.
+                      std::optional<dgpp::RopeScaling> rope_scaling = std::nullopt,
+                      int64_t position_ceiling = 0, int64_t kv_pool_tokens = 0)
       : engine(kSlots, /*total_blocks=*/100, /*block_tokens=*/4, can_sample),
         frontend(with_markers),
         cfg([&] {
@@ -618,6 +628,9 @@ struct ServiceRig {
           c.reasoning_in_content = reasoning_in_content;
           c.admission = admission;
           c.vocab_size = 512;  // the fake's ids are bytes and markers
+          c.rope_scaling = rope_scaling;
+          c.position_ceiling = position_ceiling;
+          c.kv_pool_tokens = kv_pool_tokens;
           c.file_inputs = std::move(file_inputs);
           return c;
         }()),
@@ -3299,4 +3312,75 @@ DGPP_TEST(serve_images_capability_validation_and_streaming) {
   response = post_chat(rig, body("data:image/png;base64,AAAA", false), "invalid_image");
   require(response.find("messages[0].content[1].image_url.url") != std::string::npos,
           "invalid image names the precise field");
+}
+
+DGPP_TEST(serve_models_reports_the_active_rope_and_the_effective_limit) {
+  // The request-context surface (review item 7, 2026-09-18): what ramp is in
+  // force, and what one request may actually reach. Both fields are additive —
+  // a build with the knob off, or a rig that names neither bound, sends
+  // exactly the model object it sent before.
+  {
+    ServiceRig rig;
+    Client models(rig.port());
+    models.send_all("GET /v1/models HTTP/1.1\r\nHost: t\r\n\r\n");
+    const std::string ml = models.read_available(800);
+    require(ml.find("\"rope_scaling\"") == std::string::npos &&
+                ml.find("\"context\"") == std::string::npos,
+            "nothing advertised when nothing is set: " + ml.substr(0, 600));
+  }
+  // The 512K recipe: YaRN x2 over 262 144 positions, in a 1 048 576-token
+  // pool. The ramp rides the deployment's own field names with the values it
+  // derives, and the limit is the MINIMUM of the two bounds — the ceiling
+  // here, because the pool clears it.
+  {
+    ServiceRig rig(8, dgpp::sample::greedy_params(), false, std::nullopt, false, false, {}, 0, {},
+                   dgpp::RopeScaling{2.0, 262144, 32.0, 1.0, 1.0, 4.0}, 524288, 1048576);
+    Client models(rig.port());
+    models.send_all("GET /v1/models HTTP/1.1\r\nHost: t\r\n\r\n");
+    const std::string ml = models.read_available(800);
+    require(ml.find("\"rope_scaling\":{\"rope_type\":\"yarn\",\"factor\":2") != std::string::npos &&
+                ml.find("\"original_max_position_embeddings\":262144") != std::string::npos &&
+                ml.find("\"scaled_max_position_embeddings\":524288") != std::string::npos,
+            "the active ramp: " + ml);
+    require(ml.find("\"context\":{\"request_limit_tokens\":524288,"
+                    "\"position_ceiling_tokens\":524288,\"kv_pool_tokens\":1048576,"
+                    "\"limited_by\":\"position-ceiling\"}") != std::string::npos,
+            "the ceiling is the smaller bound: " + ml);
+  }
+  // The other half of the sentence: a pool SHORTER than the ceiling (an
+  // engine.kv_capacity below the YaRN limit) is what bounds the request, and
+  // the response says so — and with the knob unset the ramp stays off the
+  // wire, so a client can never read a YaRN it is not getting.
+  {
+    ServiceRig rig(8, dgpp::sample::greedy_params(), false, std::nullopt, false, false, {}, 0, {},
+                   std::nullopt, 524288, 262144);
+    Client models(rig.port());
+    models.send_all("GET /v1/models HTTP/1.1\r\nHost: t\r\n\r\n");
+    const std::string ml = models.read_available(800);
+    require(ml.find("\"rope_scaling\"") == std::string::npos, "plain rope: " + ml);
+    require(ml.find("\"request_limit_tokens\":262144") != std::string::npos &&
+                ml.find("\"limited_by\":\"kv-pool\"") != std::string::npos,
+            "the pool is the smaller bound: " + ml);
+  }
+}
+
+DGPP_TEST(serve_images_prefix_cache_defaults_on_and_respects_opt_out) {
+  ServiceRig rig(8, dgpp::sample::greedy_params(), false, std::nullopt, false, false, {}, 4);
+  rig.frontend.images_available = true;
+  rig.engine.images_available = true;
+  const std::string body =
+      R"({"model":"glm-5.3-flash-fp8","max_tokens":1,"messages":[{"role":"user","content":[)"
+      R"({"type":"text","text":"ab|cd|ef"},{"type":"image_url","image_url":{"url":)"
+      R"("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a0ioAAAAASUVORK5CYII="}}]}]})";
+  const auto first = post_chat(rig, body, "usage");
+  const auto second = post_chat(rig, body, "usage");
+  require(first.find("200 OK") != std::string::npos && second.find("\"cached_tokens\":4") != std::string::npos,
+          "image request uses its available prefix by default: " + second);
+  const auto operations = rig.engine.prefix_ops();
+  const auto disabled = body.substr(0, body.size() - 1) + ",\"prefix_cache\":false}";
+  const auto uncached = post_chat(rig, disabled, "usage");
+  require(uncached.find("\"cached_tokens\":0") != std::string::npos &&
+              rig.engine.prefix_ops() == operations && rig.engine.image_prefills == 3,
+          "explicit opt-out still performs image prefill without cache operations");
+
 }

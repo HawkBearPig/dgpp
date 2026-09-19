@@ -77,6 +77,50 @@ struct RopeScaling {
     if (!(attn_factor > 0)) throw std::runtime_error(what + ": attn_factor must be > 0");
     if (!(mrope_cache_factor >= 1.0))
       throw std::runtime_error(what + ": mrope_cache_factor must be >= 1");
+    // The derived arithmetic's representable ranges (the 2026-09-18
+    // review): the cluster-config JSON leaves every field an unbounded
+    // number(), so an inf slips through the comparisons above (a NaN is
+    // already refused by them, but be explicit), and the table builder
+    // and the context products below must not see one.
+    if (!std::isfinite(factor)) throw std::runtime_error(what + ": factor must be finite");
+    if (!std::isfinite(beta_fast)) throw std::runtime_error(what + ": beta_fast must be finite");
+    if (!std::isfinite(beta_slow)) throw std::runtime_error(what + ": beta_slow must be finite");
+    if (!std::isfinite(attn_factor)) throw std::runtime_error(what + ": attn_factor must be finite");
+    if (!std::isfinite(mrope_cache_factor))
+      throw std::runtime_error(what + ": mrope_cache_factor must be finite");
+    // The scale the cos/sin table is built with: an inf (attn_factor 1e40
+    // overflows the float) or a 0 (1e-46 underflows it) both leave the
+    // table degenerate — at position zero the rotated lanes are
+    // non-finite or identically unscaled.
+    const float m = mscale();
+    if (!std::isfinite(m) || !(m > 0.0f))
+      throw std::runtime_error(
+          what + ": the mscale (yarn_get_mscale(factor) x attn_factor) must be a finite positive float");
+    // The two llrounds' products: past 2^63 the llround in
+    // context_limit() / correction_max_position() is undefined (the
+    // products are compared in the double they land in; 2^63 is exact).
+    const double original = static_cast<double>(original_max_position_embeddings);
+    if (original * factor > 9.223372036854775808e18)
+      throw std::runtime_error(
+          what + ": original_max_position_embeddings x factor exceeds 2^63 (the context limit)");
+    if (original * mrope_cache_factor > 9.223372036854775808e18)
+      throw std::runtime_error(what +
+                               ": original_max_position_embeddings x mrope_cache_factor exceeds 2^63 "
+                               "(the correction band)");
+    // The correction band's argument, the builder's
+    // corrected_dim(beta) = dim * log(correction_max / (beta x 2 pi)) /
+    // (2 log theta) (rope_scaling.cpp): beta_fast 1e308 overflows
+    // beta x 2 pi to inf, the argument collapses to 0, log(0) = -inf and
+    // floor(-inf) is undefined; a subnormal beta_slow pushes the argument
+    // to +inf. Both must be a positive finite before the table is built.
+    const double kPi = 3.14159265358979323846;  // the builder's literal, not M_PI
+    const auto band_argument = [&](double beta) {
+      return static_cast<double>(correction_max_position()) / (beta * 2.0 * kPi);
+    };
+    if (!std::isfinite(band_argument(beta_fast)) || !(band_argument(beta_fast) > 0.0))
+      throw std::runtime_error(what + ": beta_fast's correction band argument must be a positive finite");
+    if (!std::isfinite(band_argument(beta_slow)) || !(band_argument(beta_slow) > 0.0))
+      throw std::runtime_error(what + ": beta_slow's correction band argument must be a positive finite");
   }
   bool operator==(const RopeScaling&) const = default;
 };

@@ -56,7 +56,7 @@ def main():
             texts = [c['message']['content'] for c in reply['choices']]
             assert len(texts) == n
             usage = reply['usage']
-        assert usage['prompt_tokens_details']['cached_tokens'] == 0
+        assert 0 <= usage['prompt_tokens_details']['cached_tokens'] < usage['prompt_tokens']
         for text in texts:
             cursor = 0
             for name in names:

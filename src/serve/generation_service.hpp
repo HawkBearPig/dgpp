@@ -1,6 +1,9 @@
 #pragma once
 #include <future>
+#include <optional>
 #include "serve/file_inputs.hpp"
+
+#include "kernels/rope_scaling.hpp"  // ServiceConfig's rope surface (what /v1/models reports)
 // OpenAI-compatible text-generation service over the scheduler.
 // Supported fields are validated before admission. Known unsupported API
 // features return 400 naming the parameter; unknown top-level client
@@ -51,7 +54,11 @@
 //                               An engine without masks refuses those
 //                               fields (constrained_decoding_unsupported).
 //   POST /v1/completions        the legacy prompt API (string prompt).
-//   GET  /v1/models, /v1/models/{id}
+//   GET  /v1/models, /v1/models/{id}   the model object with the sampling
+//                               defaults and, additively, the rope ramp in
+//                               force and the effective request context
+//                               limit (the lesser of the positional ceiling
+//                               and the K/V pool).
 //   GET  /health               liveness (the fabric harnesses' probe).
 //   GET  /metrics, /v1/metrics  JSON counters and live prefill progress (ours).
 // See docs/openai-compatibility.md for the complete capability profile.
@@ -181,6 +188,18 @@ struct ServiceConfig {
   // The vocabulary bound for logit_bias ids: the model's
   // vocab_size; 0 refuses logit_bias (the bound is unknown).
   int64_t vocab_size = 0;
+  // The request-context surface (review item 7, 2026-09-18): the rope ramp
+  // this process serves with (engine.rope_scaling, absent = the
+  // checkpoint's plain rope) and the two bounds on one request — the
+  // family's positional ceiling (what its rope table can address) and the
+  // K/V pool a request seats in. /v1/models reports the ramp, both bounds
+  // and the effective limit, which is their MINIMUM: a YaRN ramp lifts what
+  // a request may reach and enlarges nothing (docs/qwen38_flash_next_plan.md
+  // §1.9.1). 0 = the family does not state it; the field stays off the
+  // response (every field here is additive to the model object).
+  std::optional<dgpp::RopeScaling> rope_scaling;
+  int64_t position_ceiling = 0;
+  int64_t kv_pool_tokens = 0;
 };
 
 // The stop-string scanner (OpenAI's `stop`, 2026-09-06). Fed the visible

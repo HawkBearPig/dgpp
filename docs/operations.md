@@ -172,10 +172,12 @@ automatically. `/v1/models` reports `input_modalities: ["text", "image"]`.
 Send PNG/JPEG data URIs in user `image_url` content parts; the
 [image input guide](vision.md) gives a complete request and limits.
 
-The startup plan reserves 1.05 GiB of vision weights and 0.34 GiB of workspace
+The startup plan reserves 1.05 GiB of vision weights and 0.33 GiB of workspace
 per rank, including for text traffic. Account for this when sizing KV capacity.
-Image requests bypass prefix caching and grouped/continuation prefill; decode
-graphs and MTP remain supported. Before changing a serving deployment, run
+Image requests reuse prefixes with matching processed pixels and geometry,
+including generated continuations. With a configured prefill budget, the GLM
+graph engine yields between image-prefill chunks so active decodes continue.
+Image requests bypass grouped prefill. Before changing a serving deployment, run
 `python3 scripts/vision_api_check.py --url http://127.0.0.1:18080` on idle test
 hardware, then compare rank operation streams after shutdown.
 For numerical validation, stop the serving world before running the CUDA
@@ -303,7 +305,9 @@ node, available context also depends on draft weights, request slots,
 cache format and arena size. Use the startup plan for the configured limit.
 
 **Budgeted prefill** (`engine.prefill_budget_tokens`, `--prefill-budget-tokens`)
-is opt-in on the Qwen graph engine. Zero preserves full-prompt admission.
+is supported on Qwen and GLM-5.3-Flash graph engines, including GLM image
+requests. Zero preserves full-prompt admission. The four-rank GLM-5.3-Flash
+deployment enables 256-token busy and 2,048-token idle budgets.
 A positive budget executes one aligned prefill chunk per tick, followed by
 a decode pass for active requests. Try 256 or 512 tokens; the budget must
 be a multiple of the snapshot alignment and fit the prefill scratch limit.

@@ -307,6 +307,38 @@ DGPP_TEST(rope_scaling_knob_refuses_what_cannot_work) {
   rs.factor = 1.0;
   require(rs.mscale() == 1.0f && rs.context_limit() == 262144,
           "factor 1 is the plain table and the native ceiling");
+  // The derived arithmetic's representable ranges (the 2026-09-18 review):
+  // the cluster-config JSON's number() leaves the fields unbounded, so the
+  // validation must refuse what the table builder and the context
+  // arithmetic cannot represent — overflow and underflow, not just the
+  // lower bounds. Each case below passed the lower-bound checks (and the
+  // JSON parser) and reached the derived values before it was caught.
+  rs = recipe();
+  rs.attn_factor = 1e40;
+  require(refuses(rs), "an attn_factor that overflows the mscale to infinity");
+  rs = recipe();
+  rs.attn_factor = 1e-46;
+  require(refuses(rs), "an attn_factor that underflows the mscale to zero");
+  rs = recipe();
+  rs.factor = 1e300;
+  require(refuses(rs), "a factor whose context product (original x factor) overflows 2^63");
+  rs = recipe();
+  rs.mrope_cache_factor = 1e300;
+  require(refuses(rs), "an mrope_cache_factor whose correction-band product overflows 2^63");
+  rs = recipe();
+  rs.beta_fast = 1e308;
+  // beta_fast x 2 pi overflows to inf: the band argument collapses to 0,
+  // log(0) = -inf, floor(-inf) is undefined in the table builder.
+  require(refuses(rs), "a beta_fast whose band argument collapses to zero");
+  rs = recipe();
+  rs.beta_slow = 5e-324;  // the smallest positive subnormal: it passes beta_slow > 0
+  // beta_slow x 2 pi underflows to a subnormal: the band argument diverges
+  // to +inf.
+  require(refuses(rs), "a subnormal beta_slow whose band argument diverges to infinity");
+  rs = recipe();
+  rs.original_max_position_embeddings = INT64_MAX;
+  rs.factor = 2.0;
+  require(refuses(rs), "an original x factor product past 2^63 (the context limit's llround)");
   // The knob is the model's positional ceiling: with it on, the Qwen config
   // reports the scaled limit and the memory plan's context line follows.
   dgpp::QwenTextConfig cfg;

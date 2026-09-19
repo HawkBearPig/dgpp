@@ -6,11 +6,23 @@ The history by milestone. The dated engineering record in
 
 ## Unreleased
 
+- **Streaming images and GLM prefill scheduling** (2026-09-19): remove
+  history-wide image count/token caps. Stage visual embeddings through fixed
+  single-image and chunk buffers, including MTP lookahead and cached suffixes.
+  Bound decoded request pixels and retained prefix identities by bytes.
+  Enable GLM-5.3-Flash graph prefill continuations: active decodes run between
+  bounded chunks, with cancellation and prefix snapshots preserved. The
+  four-rank deployment uses 256-token busy and 2,048-token idle budgets.
+  Scan incoming journal frames incrementally so large pixel payloads do not
+  delay admission with repeated scans of the entire buffered prefix.
+- **Image-aware prefix caching** (2026-09-18): reuse GLM image prompts and
+  generated continuations across turns instead of reprocessing the entire
+  conversation. Compare pixels, geometry and token positions exactly, account
+  for MTP lookahead, and restore uncached image embeddings during suffix prefill.
 - **GLM-5.3-Flash image inputs** (2026-09-18): accept PNG/JPEG data URIs
   through Chat Completions, journal processed pixels across ranks, and run
   the native BF16 vision encoder before prompt prefill, including MTP.
-  Report model input modalities and visual prompt-token usage. Image requests
-  bypass the token-only prefix cache. Add encoder reference checks, API tests
+  Report model input modalities and visual prompt-token usage. Add encoder reference checks, API tests
   and [usage documentation](docs/vision.md). Match the CUDA BF16 eager reference
   bitwise across the pinned regression corpus after correcting rounding and
   reduction arithmetic; see the [numerical investigation](benchmarks/results/2026-09-18-glm-vision-numerics.md).

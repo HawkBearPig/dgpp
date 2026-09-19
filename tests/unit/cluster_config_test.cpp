@@ -1,6 +1,8 @@
 // The cluster config: the schema is checked by name, the
 // engine defaults are the binary's own, the launcher's resolved configuration
 // parses, and the digest is stable and sensitive.
+#include <fstream>
+#include <regex>
 #include <stdexcept>
 #include <string>
 
@@ -227,4 +229,46 @@ DGPP_TEST(cluster_config_theResolvedFileParsesAndTheDigestIsStable) {
   } catch (const std::runtime_error& e) {
     require(std::string(e.what()).find("cannot read") != std::string::npos, e.what());
   }
+}
+
+DGPP_TEST(cluster_config_the_yarn512k_template_is_a_deployment_the_engine_reads) {
+  // deploy/cluster_qwen-3.8-flash-next_nvfp4_w2_yarn512k.example.json, the
+  // ready-to-run 512K shape (review item 6, 2026-09-18). A template is the
+  // launcher's input, so the one edit applied here is the resolver's own:
+  // `world_size` becomes that many `nodes` (site_env_test.py checks that leg,
+  // portability_test.py the filename). What this checks is the leg that matters
+  // for the knob — every field name in the file is one this parser reads (an
+  // unknown one is a hard failure), the ramp it builds reaches the 512K
+  // ceiling, and the pool the template seats requests in clears it. A YaRN
+  // ramp raises the positional ceiling and enlarges nothing else, so a ceiling
+  // above the pool would be a template whose longest request its own pool
+  // refuses: the invariant the last two lines check.
+  const std::string path = std::string(DGPP_SOURCE_DIR) +
+                           "/deploy/cluster_qwen-3.8-flash-next_nvfp4_w2_yarn512k.example.json";
+  std::ifstream in(path);
+  require(in.good(), "the tracked template is readable: " + path);
+  std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  std::smatch world;
+  require(std::regex_search(text, world, std::regex("\"world_size\"\\s*:\\s*([0-9]+)")),
+          "the template names its world");
+  std::string nodes = "\"nodes\": [";
+  for (int i = 0; i < std::stoi(world[1]); ++i)
+    nodes += (i ? ", " : "") + std::string("\"rank") + std::to_string(i) + "\"";
+  nodes += "]";
+  const dgpp::serve::ClusterConfig c = dgpp::serve::parse_cluster_config(
+      std::regex_replace(text, std::regex("\"world_size\"\\s*:\\s*[0-9]+"), nodes), path);
+  const dgpp::RopeScaling& rs = *c.engine.rope_scaling;
+  require(c.model == "nvidia/Qwen3.8-Flash-Next-NVFP4" && c.world() == 2,
+          "the two-Spark Qwen deployment");
+  require(c.engine.rope_scaling.has_value() && rs.factor == 2.0 &&
+              rs.original_max_position_embeddings == 262144 && rs.beta_fast == 32.0 &&
+              rs.beta_slow == 1.0 && rs.attn_factor == 1.0 && rs.mrope_cache_factor == 4.0 &&
+              rs.context_limit() == 524288 && rs.correction_max_position() == 1048576,
+          "the recipe's ramp, spelled out field by field");
+  require(c.engine.decode_graph && c.engine.mtp && c.engine.max_concurrency == 2,
+          "the template rules (MTP, the decode graph) and two request slots");
+  require(c.engine.kv_capacity % 64 == 0, "a whole number of KV blocks");
+  require(c.engine.kv_capacity > rs.context_limit() + c.engine.default_max_tokens,
+          "the pool clears the ceiling with room for an answer: a 524288-token "
+          "request must be admissible in this template");
 }

@@ -66,7 +66,10 @@ void GlmDiagnosticModel::mtp_run_rows(int req, int64_t first_pos, int T,
                        decode_row ? d_step_pos_ : nullptr, first_pos, r.enorm,
                        r.hnorm, mtp_cat_, T, H, eps, stream_);
   }
-  if (!decode_row) apply_image_embeddings(mtp_cat_, first_pos + 1, T, r.enorm);
+  // An attached close snapshot can need one eager draft row before the
+  // suffix. Its shifted token can be an image token too.
+  if (!decode_row || (prefill_images_ && !capture_mode && !batched))
+    apply_image_embeddings(mtp_cat_, first_pos + 1, T, r.enorm);
   if (!capture_mode) debug_sync("mtp input", -1, decode_row);
   gemm_.matmul(mtp_cat_, r.eh_proj, mtp_x_, T, H, 2 * H, DType::BF16,
                GemmOut::BF16, static_cast<size_t>(2 * H), gemm_ws_,

@@ -13,7 +13,7 @@ ModelFrontend::ChatInput GlmVisionFrontend::prepare_chat(const minijson::Value& 
   using V = minijson::Value;
   ChatInput out;
   std::vector<V> messages;
-  int total_tokens = 0;
+  size_t image_bytes = 0;
   const auto& original = globals.at("messages").items();
   for (size_t i = 0; i < original.size(); ++i) {
     const auto& msg = original[i];
@@ -33,12 +33,10 @@ ModelFrontend::ChatInput GlmVisionFrontend::prepare_chat(const minijson::Value& 
         }
         const std::string where =
             "messages[" + std::to_string(i) + "].content[" + std::to_string(j) + "].image_url";
-        if (out.images.size() >= kMaxInputImages)
-          throw ImageInputError("too many input images", where);
         auto image = prepare_glm_image(part.at("image_url"), where);
-        total_tokens += image.tokens;
-        if (total_tokens > kMaxRequestImageTokens)
-          throw ImageInputError("too many image tokens in request", where);
+        if (image.rgb.size() > kMaxRequestImageBytes - image_bytes)
+          throw ImageInputError("decoded image data exceeds the 256 MiB request byte limit", where);
+        image_bytes += image.rgb.size();
         std::string placeholder = "<|begin_of_image|>";
         for (int k = 0; k < image.tokens; ++k) placeholder += "<|image|>";
         placeholder += "<|end_of_image|>";

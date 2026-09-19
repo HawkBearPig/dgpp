@@ -48,12 +48,13 @@ print(json.load(urlopen(request))["choices"][0]["message"])
 | --- | --- |
 | Source | `data:image/png;base64,...` or `data:image/jpeg;base64,...`; remote URLs, local paths and file IDs are rejected |
 | Size | Up to 20 MiB of decoded PNG/JPEG file bytes, 32 megapixels and 16,384 pixels per source dimension |
-| Count | Up to eight images and 4,096 visual tokens per request |
+| History | Image tokens use the ordinary context budget; no separate image-count or aggregate visual-token cap |
+| Decoded data | Up to 256 MiB of resized RGB pixels per request, independently of compressed upload size |
 | Detail | `auto` and `high` allow up to 1,024 visual tokens per image; `low` allows 256 |
 | Preprocessing | RGB conversion, aspect-preserving antialiased bicubic resize, black right/bottom padding to a 28-pixel grid, CLIP normalization and temporal patch duplication |
 | Usage | Each merged 28×28 patch contributes one prompt token; image delimiters also count. Normal context and admission limits still apply |
-| Prefix cache | Image requests currently bypass lookup and insertion, including generated continuations; `cached_tokens` is zero |
-| Scheduling | Image prefill runs as an individual admission. Text grouping and continuation remain available for text requests |
+| Prefix cache | Identical image content, geometry and token positions can reuse prompt and generated-continuation snapshots; `cached_tokens` reports reuse |
+| Scheduling | GLM graph prefill can yield between bounded chunks for both image and text requests; active decodes run after each chunk |
 
 The processor targets at least 16 visual tokens for small images. Aspect
 ratio and grid alignment determine the actual count. DGPP's 1,024-token
@@ -65,15 +66,28 @@ profiles. PDF file inputs still extract text only; page rasterization is not
 part of this feature. Video and audio inputs are unsupported.
 
 Images of the same dimensions have identical placeholder token IDs but
-different embeddings. The current token-only prefix index cannot distinguish
-them. Safe image caching requires content and geometry in the prefix identity,
-plus suffix prefill that restores image embeddings after an attach. This is
-an implementation restriction, not a model limitation.
+different embeddings. Cache lookups compare processed RGB pixels, geometry
+and token positions as well as the text prefix; a hash match alone is not
+enough. Repeated turns share immutable image data in the index. A changed or
+new image can still reuse an earlier prefix, before that image affects model
+state. Suffix prefill encodes only images that are not wholly covered by the
+attached snapshot, including images straddling the attach position. The
+cache identity includes MTP's next-token image dependency at a snapshot cut.
+The prefix index shares immutable pixels and retains at most 256 MiB of unique
+pixel identities. When this budget is full, new cache insertions are skipped;
+requests still execute. Metrics expose `image_bytes` and `skipped_image_bytes`.
+
+The encoder reuses one image-output buffer and a 2,049-row staging window
+(one prefill chunk plus MTP lookahead). Main-model and MTP consumers finish
+before the window is reused. An image crossing a chunk or attachment boundary
+is encoded in full, then only the required rows are staged. The single-image
+output can serve successive chunks without re-encoding. Historical images
+already represented by an attached prefix need no encoder work.
 
 ## Deployment and validation
 
 Each rank loads approximately 1.05 GiB of replicated vision weights and
-reserves 0.34 GiB of workspace. The startup memory plan includes both, even
+reserves 0.33 GiB of workspace. The startup memory plan includes both, even
 for text-only traffic. Workspace is allocated before collective execution
 starts; image requests do not allocate CUDA buffers while another rank may
 be spinning in a collective. Resized RGB bytes and token offsets travel in
@@ -84,6 +98,10 @@ On an idle test deployment, run:
 ```bash
 python3 scripts/vision_api_check.py --help
 python3 scripts/vision_api_check.py --url http://127.0.0.1:18080
+python3 scripts/vision_prefix_cache_check.py --url http://127.0.0.1:18080
+python3 scripts/prefill_fairness_check.py --url http://127.0.0.1:18080
+python3 scripts/prefill_fairness_check.py --url http://127.0.0.1:18080 --images
+python3 scripts/prefill_fairness_check.py --url http://127.0.0.1:18080 --images --image-count 12 --decoders 2
 ```
 
 The check generates its own images and exercises different image content,
@@ -94,6 +112,12 @@ operation-stream hashes as described in [operations](operations.md).
 For encoder arithmetic, build `glm_vision_check` and set `CKPT` to the
 GLM-5.3-Flash snapshot directory. The optional oracle requires NumPy and
 PyTorch; serving does not.
+
+`glm_vision_stream_test` compares staged rows bitwise with whole-image
+encoder outputs across 12 full-size images, 256/2,048-token windows, MTP
+lookahead and an attachment inside an image. It uses the cached serving
+checkpoint, or `DGPP_VISION_TEST_CHECKPOINT` when set. Run this GPU test
+with serving stopped.
 
 ```bash
 cmake --build build-ci -j 4 --target glm_vision_check

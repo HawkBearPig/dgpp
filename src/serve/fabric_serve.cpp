@@ -667,8 +667,9 @@ JournalRecord decode_journal_line(std::string_view line) {
       }
 
       if (const auto* images = item.find("images")) {
-        if (!images->is_array() || images->items().size() > kMaxInputImages)
+        if (!images->is_array() || images->items().size() > r.prompt.size())
           throw std::runtime_error("journal: invalid image list");
+        size_t image_bytes = 0;
         for (const auto& entry : images->items()) {
           if (!entry.is_array() || entry.items().size() != 5)
             throw std::runtime_error("journal: invalid image entry");
@@ -683,7 +684,9 @@ JournalRecord decode_journal_line(std::string_view line) {
           im.tokens = static_cast<int>(a[1].as_int());
           im.width = static_cast<int>(a[2].as_int());
           im.height = static_cast<int>(a[3].as_int());
-          const auto bytes = decode_base64(a[4].as_string(), kMaxImagePixels * 3);
+          const auto bytes = decode_base64(a[4].as_string(),
+              std::min(kMaxImagePixels * 3, kMaxRequestImageBytes - image_bytes));
+          image_bytes += bytes.size();
           im.rgb.assign(bytes.begin(), bytes.end());
           r.images.push_back(std::move(im));
         }
@@ -1012,8 +1015,9 @@ JournalReader::JournalReader(const std::string& host, uint16_t port,
 
 bool JournalReader::read_line(const std::function<bool()>& should_stop,
                               std::string* line) {
+  size_t searched = 0;
   for (;;) {
-    const size_t nl = pending_.find('\n');
+    const size_t nl = pending_.find('\n', searched);
     if (nl != std::string::npos) {
       // A complete record is honored even when the stop flag already
       // fired — the stop RECORD itself arrives this way.
@@ -1021,6 +1025,10 @@ bool JournalReader::read_line(const std::function<bool()>& should_stop,
       pending_.erase(0, nl + 1);
       return true;
     }
+    // Pixel-bearing records can be tens of MiB. Re-scanning their full
+    // prefix after every socket read makes admission quadratic and stalls
+    // every rank before the scheduler can yield to active decodes.
+    searched = pending_.size();
     if (should_stop()) return false;
     // 250ms slices keep SIGINT latency bounded while idle blocking
     // stays cheap; read_some does the one-syscall-per-record work.

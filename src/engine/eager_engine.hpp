@@ -22,6 +22,7 @@
 
 #include "common/dtypes.hpp"
 #include "engine/decode_outputs.hpp"
+#include "engine/image_prefill.hpp"
 #include "engine/prefix_arena.hpp"
 #include "sample/sampler.hpp"
 #include "sched/scheduler.hpp"
@@ -130,6 +131,9 @@ class EagerEngineAdapter : public sched::SchedulerEngine {
     if constexpr (requires { model_->supports_images(); }) return model_->supports_images();
     return false;
   }
+  bool supports_image_prefix_cache() const override {
+    return supports_images() && kImagePrefixCache<Model>;
+  }
   int32_t prefill_images(int req, const std::vector<int64_t>& prompt,
                          const std::vector<ImageInput>& images) override {
     if constexpr (requires { model_->session_prefill_images(req, prompt, images); })
@@ -166,13 +170,15 @@ class EagerEngineAdapter : public sched::SchedulerEngine {
         try {
           const std::vector<int64_t> suffix(
               prompt.begin() + plan->attach_position, prompt.end());
-          out = model_->session_prefill_resume(req, suffix, *plan->boundaries, snap_ptr);
+          out = cached_model_prefill(model_, req, suffix, *plan->boundaries,
+                                   snap_ptr, plan->images, true);
         } catch (...) {
           model_->session_close(req);  // the attach opened it
           throw;
         }
       } else {
-        out = model_->session_prefill(req, prompt, *plan->boundaries, snap_ptr);
+        out = cached_model_prefill(model_, req, prompt, *plan->boundaries,
+                                   snap_ptr, plan->images, false);
       }
       if (snap_ptr != nullptr) {
         arena_.commit(plan->snap_slot, snap);

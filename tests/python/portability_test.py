@@ -216,8 +216,21 @@ class PortabilityTest(unittest.TestCase):
                 engine = cfg["engine"]
                 self.assertTrue(engine["mtp"], "every template enables MTP (the plain world is --no-mtp)")
                 self.assertTrue(engine["decode_graph"])
-                stem = f"cluster_{models[cfg['model']]}_w{cfg['world_size']}"
-                self.assertNotIn(stem, seen, "one template per model, quant and world")
+                # The name is the shape: cluster_<model>_<quant>_w<n>, with an
+                # optional trailing _<variant> for a template that deviates from
+                # that shape in one documented engine setting (today the Qwen
+                # 512K YaRN ramp) instead of in its size. A base shape stays
+                # unique, and a variant may repeat one only with its suffix;
+                # deploy/README.md carries the rule and the catalogue.
+                shape = re.fullmatch(
+                    rf"cluster_{re.escape(models[cfg['model']])}_w([0-9]+)(_[a-z0-9]+)?",
+                    path.name.removesuffix(".example.json"))
+                self.assertIsNotNone(
+                    shape, f"a template is named cluster_<model>_<quant>_w<n>[_variant]: {path.name}")
+                self.assertEqual(int(shape.group(1)), cfg["world_size"],
+                                 "the world size in the name is the JSON's")
+                stem = f"cluster_{models[cfg['model']]}_w{cfg['world_size']}{shape.group(2) or ''}"
+                self.assertNotIn(stem, seen, "one template per model, quant, world and variant")
                 seen.add(stem)
                 self.assertEqual(path.name, stem + ".example.json")
                 self.assertIn(f"]({path.name})", index)

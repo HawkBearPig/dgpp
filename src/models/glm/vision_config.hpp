@@ -10,6 +10,8 @@
 
 namespace dgpp {
 struct GlmVisionConfig {
+  // One language-model chunk plus MTP's next-token lookahead.
+  static constexpr int kWindowTokens = 2049;
   int depth = 24, hidden = 1024, heads = 16, intermediate = 4096;
   int output = 4096, projection = 10240;
   float eps = 1e-5f, swiglu_limit = 10.0f;
@@ -78,7 +80,7 @@ struct GlmVisionConfig {
                      static_cast<size_t>(kMaxImageTokens) * projection}) *
                4 +
            kMaxImagePixels * 3 + (64ull << 20) +
-           static_cast<size_t>(kMaxRequestImageTokens) * output * 2;
+           static_cast<size_t>(kMaxImageTokens + kWindowTokens) * output * 2;
   }
 };
 }  // namespace dgpp

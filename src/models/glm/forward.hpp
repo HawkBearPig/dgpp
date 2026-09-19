@@ -220,9 +220,35 @@ class GlmDiagnosticModel : public PrefillReporting {
     SessionSnapshotMeta* meta = nullptr;
     bool taken = false;
   };
+  static constexpr bool kResumablePrefill = true;
+  // The engine owns ids/images/snap for the cursor's entire lifetime.
+  // No shared GPU scratch or image pointer survives an advance.
+  struct PrefillCursor {
+    int req = -1;
+    const int64_t* ids = nullptr;
+    const std::vector<ImageInput>* images = nullptr;
+    int64_t start = 0, end = 0, next = 0, budget_tokens = 0;
+    uint64_t epoch = 0;
+    std::vector<int64_t> cuts;
+    size_t cut_index = 0;
+    bool suspended = false, catchup = false;
+    SnapshotRequest* snap = nullptr;
+    Outputs output;
+  };
+  PrefillCursor session_prefill_begin(int req, const std::vector<int64_t>& prompt,
+      int64_t reserve_tokens, int64_t chunk_tokens, const std::vector<int64_t>& boundaries = {},
+      SnapshotRequest* snap = nullptr, int64_t attach_position = 0,
+      const std::vector<ImageInput>* images = nullptr);
+  bool session_prefill_advance(PrefillCursor& cursor, int64_t chunk_tokens = 0);
   Outputs session_prefill(int req, const std::vector<int64_t>& prompt_ids,
                           const std::vector<int64_t>& boundaries,
                           SnapshotRequest* snap = nullptr);
+  Outputs session_prefill_images(int req, const std::vector<int64_t>& prompt_ids,
+                                 const std::vector<ImageInput>& images,
+                                 const std::vector<int64_t>& boundaries, SnapshotRequest* snap);
+  Outputs session_prefill_resume_images(int req, const std::vector<int64_t>& suffix_ids,
+                                        const std::vector<ImageInput>& images,
+                                        const std::vector<int64_t>& boundaries, SnapshotRequest* snap);
   // Snapshot an open session as it stands (between steps): the position
   // must be a multiple of kpool. Stream-ordered on the model stream.
   SessionSnapshotMeta session_snapshot(int req, void* dst);
@@ -775,6 +801,10 @@ class GlmDiagnosticModel : public PrefillReporting {
                                  int64_t count,
                                  const std::vector<int64_t>& boundaries,
                                  SnapshotRequest* snap);
+  PrefillCursor prefill_cursor(int req, const int64_t* ids, int64_t start, int64_t count,
+      const std::vector<int64_t>& boundaries, SnapshotRequest* snap);
+  void prefill_chunk(PrefillCursor& cursor, int64_t budget = 0);
+  void reset_prefill_session(int req);
   // The draft's host half: validation, positions/tokens staging, uploads.
   void mtp_decode_host_prep(int req, const std::vector<int64_t>& tokens,
                             bool upload);
@@ -815,7 +845,13 @@ class GlmDiagnosticModel : public PrefillReporting {
 
   std::unique_ptr<GlmVisionEncoder> vision_;
   const std::vector<ImageInput>* prefill_images_ = nullptr;
+  Outputs session_prefill_with_images(int req, const std::vector<int64_t>& ids,
+                                      const std::vector<ImageInput>& images,
+                                      const std::vector<int64_t>& boundaries, SnapshotRequest* snap,
+                                      bool resume);
   const uint16_t* image_embeddings_ = nullptr;
+  int64_t image_window_first_ = 0, image_window_end_ = 0;
+  void stage_image_embeddings(int64_t first, int64_t end);
   void apply_image_embeddings(uint16_t* dst, int64_t first, int rows, const uint16_t* mtp_norm = nullptr);
   GlmReplicatedDigest boot_digest_{};
   double boot_digest_ms_ = 0;
@@ -892,6 +928,7 @@ class GlmDiagnosticModel : public PrefillReporting {
   // select-kernel bound and the fixed graph's physical row ceiling.
   int max_requests_ = 1;
   std::vector<int64_t> session_pos_;  // [max_requests]; 0 = closed slot
+  std::vector<uint64_t> prefill_epochs_;  // invalidate cursors on close/reopen
   int64_t* d_session_pos_ = nullptr;  // device [max_requests] — the
                                       // device-driven graph's position
   int64_t* h_session_pos_ = nullptr;  // pinned upload mirror

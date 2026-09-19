@@ -5183,6 +5183,111 @@ DGPP_TEST(glm_tp_first_run_is_bitwise_the_second_run) {
   }
 }
 
+DGPP_TEST(glm_tp_resumable_prefill_matches_main_draft_and_interleaved_decode) {
+  const auto cfg = glm_tp_test_config();
+  const std::string dir = "glm_tp_fixture";
+  glm_tp_write_fixture(dir);
+  GlmDiagnosticModel reference(cfg, dir, 64, 1024, nullptr, 0, 1,
+      GlmResidency::Resident, GlmHeadSharding::Full, 3, true);
+  GlmDiagnosticModel yielded(cfg, dir, 64, 1024, nullptr, 0, 1,
+      GlmResidency::Resident, GlmHeadSharding::Full, 3, true);
+  const auto prompt = make_tokens(43, cfg.vocab_size);
+  const auto peer = make_tokens(13, cfg.vocab_size);
+  const std::vector<int64_t> cuts{8, 16, 24, 32, 40};
+  const auto pick = [](const GlmDiagnosticModel::Outputs& out) {
+    return local_max(out.logits.data(), out.lm_vocab_count, out.lm_vocab_begin).id;
+  };
+  const auto expected = reference.session_prefill(0, prompt, cuts);
+  auto peer_ref = reference.session_prefill(1, peer);
+  auto peer_got = yielded.session_prefill(1, peer);
+  require(peer_ref.logits == peer_got.logits, "peer starts identically");
+  auto cursor = yielded.session_prefill_begin(0, prompt, 64, 8);
+  int chunks = 0;
+  while (!yielded.session_prefill_advance(cursor)) {
+    require(cursor.next == 8 * ++chunks, "prefill obeys the token budget");
+    const auto token = pick(peer_ref);
+    const auto draft_ref = reference.session_draft(1, {token});
+    const auto draft_got = yielded.session_draft(1, {token});
+    require(draft_ref.logits == draft_got.logits, "prefill preserves peer draft state");
+    peer_ref = reference.session_step(1, token);
+    peer_got = yielded.session_step(1, token);
+    require(peer_ref.logits == peer_got.logits, "peer decode survives every yield bitwise");
+  }
+  require(cursor.output.logits == expected.logits, "resumable target logits match identical cold cuts");
+  const auto first = pick(expected);
+  require(reference.session_draft(0, {first}).logits == yielded.session_draft(0, {first}).logits,
+          "resumable MTP state matches cold prefill bitwise");
+  require(reference.session_step(0, first).logits == yielded.session_step(0, first).logits,
+          "decode continues from identical prefill state");
+  yielded.session_close(0);
+  auto cancelled = yielded.session_prefill_begin(0, prompt, 64, 8);
+  require(!yielded.session_prefill_advance(cancelled), "cancel target yields");
+  yielded.session_close(0);
+  auto reused = yielded.session_prefill_begin(0, prompt, 64, 8);
+  require(!yielded.session_prefill_advance(reused), "reused slot reaches same position");
+  bool rejected = false;
+  try { yielded.session_prefill_advance(cancelled); }
+  catch (const std::logic_error&) { rejected = true; }
+  require(rejected, "old cursor cannot advance a reused slot at the same position");
+  while (!yielded.session_prefill_advance(reused)) {}
+  require(reused.output.logits == expected.logits, "cancellation leaves no stale main state");
+  reference.session_close(0);
+  reference.session_prefill(0, prompt, cuts);
+  require(yielded.session_draft(0, {first}).logits == reference.session_draft(0, {first}).logits,
+          "cancellation leaves no stale draft state");
+  for (int req : {0, 1}) { reference.session_close(req); yielded.session_close(req); }
+  require(yielded.kv_blocks_in_use() == 0, "all prefill reservations released");
+}
+
+DGPP_TEST(glm_tp_resumable_prefill_snapshots_and_close_catchup) {
+  const auto cfg = glm_tp_test_config();
+  const std::string dir = "glm_tp_fixture";
+  glm_tp_write_fixture(dir);
+  GlmDiagnosticModel model(cfg, dir, 64, 1024, nullptr, 0, 1,
+      GlmResidency::Resident, GlmHeadSharding::Full, 3, true);
+  const auto prompt = make_tokens(43, cfg.vocab_size);
+  const std::vector<int64_t> cuts{8, 16, 24, 32, 40};
+  void* buffer = nullptr;
+  DGPP_CUDA_OK(cudaMalloc(&buffer, model.session_snapshot_bytes()));
+  GlmDiagnosticModel::SessionSnapshotMeta meta;
+  GlmDiagnosticModel::SnapshotRequest snap{16, buffer, &meta, false};
+  auto cursor = model.session_prefill_begin(0, prompt, 64, 8, {}, &snap);
+  while (!model.session_prefill_advance(cursor)) {}
+  require(snap.taken && meta.position == 16, "snapshot taken at scheduled cut");
+  model.session_attach(1, buffer, meta);
+  auto attached = model.session_prefill_begin(1, prompt, 64, 8, {}, nullptr, 16);
+  while (!model.session_prefill_advance(attached)) {}
+  require(attached.output.logits == cursor.output.logits, "attached cursor matches original cold walk");
+  const auto token = local_max(cursor.output.logits.data(), cfg.vocab_size, 0).id;
+  require(model.session_draft(0, {token}).logits == model.session_draft(1, {token}).logits,
+          "attached cursor preserves snapshot MTP lookahead");
+  model.session_close(0);
+  model.session_close(1);
+  model.session_release_snapshot(meta);
+  // A closed prompt's snapshot has a lagging MTP row. Compare scheduled
+  // catch-up against the synchronous resume with the same suffix cuts.
+  const std::vector<int64_t> prefix(prompt.begin(), prompt.begin() + 24);
+  model.session_prefill(0, prefix, cuts);
+  meta = model.session_snapshot(0, buffer);
+  require(meta.mtp_position == 23, "close snapshot needs next-token catch-up");
+  model.session_close(0);
+  model.session_attach(0, buffer, meta);
+  model.session_attach(1, buffer, meta);
+  const std::vector<int64_t> suffix(prompt.begin() + 24, prompt.end());
+  const auto reference = model.session_prefill_resume(0, suffix, cuts);
+  auto resumed = model.session_prefill_begin(1, prompt, 64, 8, {}, nullptr, 24);
+  while (!model.session_prefill_advance(resumed)) {}
+  require(resumed.output.logits == reference.logits, "close snapshot target catch-up parity");
+  const auto next = local_max(reference.logits.data(), cfg.vocab_size, 0).id;
+  require(model.session_draft(0, {next}).logits == model.session_draft(1, {next}).logits,
+          "close snapshot draft catch-up parity");
+  model.session_close(0);
+  model.session_close(1);
+  model.session_release_snapshot(meta);
+  require(model.kv_blocks_in_use() == 0, "snapshot reservations released after resumable prefill");
+  DGPP_CUDA_OK(cudaFree(buffer));
+}
+
 DGPP_TEST(glm_tp_prefix_snapshot_hot_matches_cold_bitwise) {
   const GlmTextConfig cfg = glm_tp_test_config();
   const std::string dir = "glm_tp_fixture";

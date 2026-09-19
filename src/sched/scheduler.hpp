@@ -5,11 +5,11 @@
 // container iteration: engine operations include collectives whose order
 // must match across ranks.
 //
-// Each tick admits at most one fitting queued request, completes its prefill,
-// then runs one decode step. Admission chooses the oldest request that fits,
+// Each tick admits at most one fitting queued request and performs prefill
+// work, then runs one decode step. A configured budget bounds prefill work. Admission chooses the oldest request that fits,
 // so a smaller request can pass a larger one; sustained small requests can
-// starve a large request. Prefill blocks decode for the duration of that
-// admission, even though the model processes the prompt in chunks.
+// starve a large request. With a zero budget prefill blocks decode for the
+// full admission; supported engines yield between chunks with a positive budget.
 //
 // Full admission reserves prompt plus maximum completion. Grow admission
 // reserves a window and extends it before decode, ending the youngest
@@ -70,6 +70,7 @@ class SchedulerEngine {
   // generated token. Returns a token id in [0, vocab).
   virtual int32_t prefill(int req, const std::vector<int64_t>& prompt) = 0;
   virtual bool supports_images() const { return false; }
+  virtual bool supports_image_prefix_cache() const { return false; }
   virtual int32_t prefill_images(int, const std::vector<int64_t>&, const std::vector<ImageInput>&) {
     throw std::invalid_argument("this engine does not support image inputs");
   }
@@ -78,6 +79,7 @@ class SchedulerEngine {
   // token budget passed to begin; it returns a first token only on completion.
   virtual int64_t prefill_chunk_alignment() const { return 0; }
   virtual int64_t prefill_chunk_limit() const { return 0; }
+  virtual bool supports_image_chunked_prefill() const { return false; }
   // Several requests' cold prompts in one forward (the scheduler admits a
   // group per tick when the engine allows it): each prompt within
   // prefill_group_span_limit() tokens, the group within
@@ -233,6 +235,7 @@ class SchedulerEngine {
   // snap_taken. Returns the first token, exactly as prefill() does.
   struct PrefixPrefill {
     const std::vector<int64_t>* boundaries = nullptr;
+    const std::vector<ImageInput>* images = nullptr;  // absolute prompt offsets
     int attach_slot = -1;
     int64_t attach_position = 0;
     int snap_slot = -1;
@@ -428,6 +431,8 @@ class Scheduler {
     int64_t prefix_duplicates = 0;
     int64_t prefix_skipped = 0;
     int64_t prefix_skipped_no_block = 0;
+    int64_t prefix_skipped_image_bytes = 0;
+    int64_t prefix_image_bytes = 0;
     int64_t prefix_blocks_pinned = 0;
   };
 
@@ -551,6 +556,7 @@ class Scheduler {
     int64_t rolling_position = -1;
     int64_t hop_armed = -1;    // the aligned position armed for the next step
     bool cache_off = false;    // the pool cannot hold the cache's blocks for it
+    PrefixCache::Images cache_images;
     // The retire line's numbers: the admission clock, the
     // prefill's wall and the prompt tokens an attach skipped, and the
     // decode passes this request rode (each shared with every other live
@@ -573,7 +579,8 @@ class Scheduler {
     int64_t snap_position = 0;
   };
   bool cache_on(const Request& r) const {
-    return cache_.enabled() && r.spec.images.empty() && !r.spec.no_cache && !r.cache_off;
+    return cache_.enabled() && !r.spec.no_cache && !r.cache_off &&
+           (r.spec.images.empty() || engine_->supports_image_prefix_cache());
   }
   PrefixPlan plan_prefix(const Request& r) const;
   // The pool block a snapshot's private partial-block copy takes: one when

@@ -226,9 +226,20 @@ QwenTextConfig QwenTextConfig::parse(const minijson::Value& tc,
       // serves 512K with is the ENGINE's knob (engine.rope_scaling,
       // kernels/rope_scaling.hpp), because the NVFP4 release carries no
       // scaling and vLLM's recipe applies it from --hf-overrides. A
-      // checkpoint that bakes one in would otherwise be mis-scaled twice.
+      // checkpoint that bakes one in would otherwise be mis-scaled twice —
+      // its table is already the ramped one, and the band would land past
+      // the end of it. The reason rides the message as well as the comment
+      // (review item 9): an operator holding an otherwise compatible
+      // checkpoint reads this as "the engine will not scale it twice", not
+      // as "unimplemented". Accepting such a checkpoint, with an explicit
+      // checkpoint-vs-engine precedence, is the follow-up
+      // (docs/qwen38_flash_next_plan.md §1.9.1).
       reject("rope_parameters.rope_type",
-             "the checkpoint's rope must be default (the YaRN ramp is the engine's rope_scaling knob), got " + rt);
+             "the checkpoint's rope must be \"default\": the YaRN ramp is the engine's "
+             "rope_scaling knob, and applying it over a checkpoint that already declares "
+             "YaRN would scale the rope twice — the follow-up in "
+             "docs/qwen38_flash_next_plan.md §1.9.1. rope_type = " + rt + " is not "
+             "implemented for this family");
     c.mrope_interleaved = optional_bool(*rp, "mrope_interleaved", false);
     if (const minijson::Value* ms = rp->find("mrope_section"); ms && !ms->is_null()) {
       for (const int64_t v : require_int_array(*rp, "mrope_section"))

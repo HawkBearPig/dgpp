@@ -14,21 +14,31 @@
 // snapshots preserve aligned positions reached during decode, including
 // positions crossed by an MTP step. Entries are local to the process.
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
+
+#include "common/image_input.hpp"
 
 namespace dgpp::sched {
 
 class PrefixCache {
  public:
+  struct ImageKey {
+    std::shared_ptr<const ImageInput> input;
+    uint64_t hash = 0;
+  };
+  using Images = std::vector<ImageKey>;
   struct Config {
     int slots = 0;              // arena slots the engine holds (0: off)
     int64_t align = 1;          // kpool: every entry position is a multiple
     int64_t chunk_tokens = 2048;  // the cold prefill's chunk length
+    size_t image_bytes = kMaxRequestImageBytes;  // shared immutable pixel identities
   };
   struct Entry {
     std::vector<int64_t> ids;   // the first `position` ids of the sequence
+    Images images;             // immutable pixels shared across matching entries
     int64_t position = 0;
     int slot = -1;              // the arena slot; -1 once evicted
     uint64_t hash = 0;
@@ -48,6 +58,7 @@ class PrefixCache {
     int64_t duplicates = 0;     // an entry already existed at the position
     int64_t skipped_no_slot = 0;  // a snapshot wanted, no slot free or evictable
     int64_t skipped_no_block = 0;  // a snapshot wanted, no pool block for its partial copy
+    int64_t skipped_image_bytes = 0;
   };
 
   PrefixCache() = default;
@@ -58,6 +69,7 @@ class PrefixCache {
   int slots() const { return cfg_.slots; }
   int free_slots() const { return static_cast<int>(free_.size()); }
   int live_entries() const;
+  size_t image_bytes() const;
   const Stats& stats() const { return stats_; }
   Stats& stats() { return stats_; }
 
@@ -75,14 +87,20 @@ class PrefixCache {
   static uint64_t extend_hash(uint64_t h, int64_t id);
   static constexpr uint64_t kSeed = 0xcbf29ce484222325ull;
 
+  // Hashes narrow the search; hits also compare all pixels and geometry.
+  // Include images starting AT the cut: an MTP snapshot can already have
+  // consumed the next token's image embedding in its shifted input.
+  Images image_keys(const std::vector<ImageInput>& images) const;
+  static uint64_t with_images(uint64_t token_hash, int64_t position, const Images& images);
+
   // The deepest live entry whose position is one of `cuts` (all < the
   // prompt's length) and whose ids equal the prompt's first `position`
   // ids. `cut_hashes[i]` is hash_prefix(prompt, cuts[i]). -1: none.
   int lookup(const std::vector<int64_t>& prompt,
              const std::vector<int64_t>& cuts,
-             const std::vector<uint64_t>& cut_hashes) const;
+             const std::vector<uint64_t>& cut_hashes, const Images& images = {}) const;
   // Whether a live entry with exactly these ids exists (the dedupe check).
-  int find_exact(const int64_t* ids, int64_t n, uint64_t hash) const;
+  int find_exact(const int64_t* ids, int64_t n, uint64_t hash, const Images& images = {}) const;
   // The miss diagnostic: the live entry sharing the longest
   // prefix with the prompt, and that length — where a prompt that should
   // have attached first differs from what the cache holds (an agent
@@ -92,7 +110,7 @@ class PrefixCache {
     int entry = -1;
     int64_t common = 0;  // ids shared with the entry, from the start
   };
-  Nearest nearest(const std::vector<int64_t>& prompt) const;
+  Nearest nearest(const std::vector<int64_t>& prompt, const Images& images = {}) const;
   // The ghosts: the last kGhosts evicted entries by (hash,
   // position, last use, eviction ordinal), so a miss can say "an entry at
   // this prompt's cut was evicted" — the case the nearest entry cannot
@@ -123,9 +141,9 @@ class PrefixCache {
 
   // ---- entries -----------------------------------------------------------
   // Inserts an entry over ids[0..position) in `slot`. Returns its index,
-  // or -1 when an identical entry is live (the caller keeps the slot out
+  // or -1 when an identical entry is live or pixel storage is full (the caller keeps the slot out
   // of the entry and gives it back).
-  int insert(const int64_t* ids, int64_t position, int slot, uint64_t now);
+  int insert(const int64_t* ids, int64_t position, int slot, uint64_t now, const Images& images = {});
   const Entry& entry(int index) const { return entries_.at(static_cast<size_t>(index)); }
   void attach(int index, uint64_t now);
   void detach(int index);

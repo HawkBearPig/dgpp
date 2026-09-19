@@ -60,7 +60,7 @@ int main(int argc, char** argv) {
           if (!f) throw std::runtime_error("cannot write vision trace");
         };
       }
-      const auto* output = encoder.encode({image}, trace);
+      const auto* output = encoder.encode(image, trace);
       std::vector<uint16_t> data(static_cast<size_t>(image.tokens) * cfg.hidden_size);
       DGPP_CUDA_OK(
           cudaMemcpyAsync(data.data(), output, data.size() * 2, cudaMemcpyDeviceToHost, stream));

@@ -1370,6 +1370,7 @@ void test_op_stream_file_mode() {
 
 int main() {
   dgpp::set_log_level_from_env("DGPP_LOG_LEVEL");
+  if (const int result = dgpp::test::run_all(); result != 0) return result;
   try {
     test_journal_codec();
     test_settings_handshake();
@@ -1451,4 +1452,57 @@ DGPP_TEST(journal_images_roundtrip_and_validation) {
     threw = true;
   }
   require(threw, "mismatched pixel dimensions rejected");
+}
+
+DGPP_TEST(journal_image_history_exceeds_old_count_and_token_caps) {
+  dgpp::serve::GenerationService::PassEvents events;
+  dgpp::sched::SchedulerRequest request;
+  request.id = "image-history";
+  request.prompt.assign(12 * 1024, 154854);
+  for (int i = 0; i < 12; ++i)
+    request.images.push_back({i * 1024, 1024, 896, 896, std::vector<uint8_t>(896 * 896 * 3, i)});
+  events.submits.push_back(std::move(request));
+  const auto decoded = dgpp::serve::decode_journal_line(dgpp::serve::encode_journal_tick(events));
+  require(decoded.submits[0].images.size() == 12, "whole image history reaches peers");
+  for (int i = 0; i < 12; ++i) {
+    const auto& image = decoded.submits[0].images[i];
+    require(image.offset == i * 1024 && image.tokens == 1024 && image.rgb.back() == i,
+            "ordered image pixels and context positions roundtrip");
+  }
+}
+
+DGPP_TEST(journal_large_fragmented_record_scans_linearly_and_preserves_following_lines) {
+  auto listener = dgpp::net::TcpListener::bind(0);
+  const std::string payload(64ull << 20, 'x');
+  std::string sender_error;
+  std::jthread sender([&] {
+    try {
+      auto peer = listener.accept(5000);
+      peer.set_io_deadline_ms(15000);
+      char hello[8];
+      require(peer.read_exact(hello, sizeof(hello)) && std::string(hello, sizeof(hello)) == "hello 1\n",
+              "journal reader handshake");
+      require(peer.write_all(payload.data(), payload.size()), "large record write");
+      const std::string tail = "\n\nshort\nunterminated";
+      require(peer.write_all(tail.data(), tail.size()), "following records write");
+    } catch (const std::exception& e) { sender_error = e.what(); }
+  });
+  bool complete = false, empty = false, following = false, eof = false;
+  {
+    dgpp::serve::JournalReader reader("127.0.0.1", listener.port(), 5000, 1);
+    std::string line;
+    // A generous deadline catches the old O(bytes^2 / read_size) scan.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    const auto stopped = [&] { return std::chrono::steady_clock::now() > deadline; };
+    complete = reader.read_line(stopped, &line) && line == payload;
+    if (complete) {
+      empty = reader.read_line(stopped, &line) && line.empty();
+      following = reader.read_line(stopped, &line) && line == "short";
+      eof = !reader.read_line(stopped, &line);
+    }
+  }
+  sender.join();
+  require(complete, "large fragmented journal record exceeded deadline or changed bytes");
+  require(sender_error.empty(), sender_error);
+  require(empty && following && eof, "journal reader lost buffered lines or accepted a partial EOF record");
 }
