@@ -51,6 +51,7 @@ Some older scripts start work immediately and do not implement `--help`.
 | File | What it does | When to use it |
 | --- | --- | --- |
 | [README.md](README.md) | This directory's file index and operating notes. | Start here to choose a launcher, client, or report. |
+| [spark-cross](spark-cross) | Builds an x86 Docker toolchain and cross-compiles the ARM64/GB10 server. | Build on an x86 Linux workstation; see [cross-compiling](../docs/cross-compiling.md) for staging and target validation. |
 | [ci-local.sh](ci-local.sh) | Configures CMake, builds, and runs CTest; defaults to the `ci` preset and `build-ci/`. | Validate a local code change. `DGPP_PRESET` selects `build-<preset>/`; `DGPP_BUILD_DIR` explicitly overrides the directory. |
 | [release.sh](release.sh) | Builds or reuses the release build, stages the install layout, and packages a versioned tarball with checksums under `dist/`. Rejects testing build directories and binaries with debug information or sanitizer instrumentation. | Prepare an artifact for installation; `--no-build` repackages an existing release build. Uses `DGPP_BUILD_DIR` or `build-release/`. |
 | [dgpp-cluster](dgpp-cluster) | Combines site settings with a deployment JSON; starts, stops, and inspects ranks, installs releases, and lists installed versions. | Manage a serving deployment. `resolve` prints the merged runtime JSON without SSH or startup. |

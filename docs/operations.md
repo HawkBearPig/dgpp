@@ -93,6 +93,10 @@ and `--knobs "FLAGS"` appends server flags after the file settings.
 The compatibility wrapper `scripts/serve_run.sh` maps
 `DGPP_SERVE_KNOBS` and `DGPP_SERVE_LOG` to those options.
 
+For builds made on x86 Linux, follow [cross-compiling](cross-compiling.md)
+to stage the ARM64 server and its CUDA libraries before transferring them to
+the Spark. Cross-compilation does not launch or update a deployment.
+
 Rank 0 reads the shared engine settings, applies flag overrides and sends
 the result to peers before model construction. Peers use their files for
 bootstrap addresses and local paths; they log differences from the

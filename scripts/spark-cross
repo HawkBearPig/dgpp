@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+set -euo pipefail
+repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+image=${DGPP_CROSS_IMAGE:-dgpp-spark-cross:cuda13}
+case "${1:-build}" in
+  -h|--help)
+    echo "Usage: $0 {image|build [build options]|shell|command [args...]}"
+    exit 0
+    ;;
+  image)
+    exec docker build --platform linux/amd64 -t "$image" -f "$repo/dev/Dockerfile.spark-cross" "$repo/dev"
+    ;;
+  build)
+    if [[ ! ${DGPP_BUILD_JOBS:-2} =~ ^[1-9][0-9]*$ ]]; then
+      echo "DGPP_BUILD_JOBS must be a positive integer" >&2
+      exit 2
+    fi
+    if [[ $# -gt 0 ]]; then shift; fi
+    set -- bash -c 'cmake --preset spark-cross && cmake --build --preset spark-cross --parallel "${DGPP_BUILD_JOBS:-2}" "$@"' bash "$@"
+    ;;
+  shell)
+    shift
+    set -- bash "$@"
+    ;;
+  command)
+    shift
+    if [[ $# -eq 0 ]]; then echo "command requires a program" >&2; exit 2; fi
+    ;;
+  *)
+    echo "Usage: $0 {image|build [build options]|shell|command [args...]}" >&2
+    exit 2
+    ;;
+esac
+if ! docker image inspect "$image" >/dev/null 2>&1; then
+  echo "Build the development image first: $repo/scripts/spark-cross image" >&2
+  exit 1
+fi
+interactive=()
+if [[ -t 0 && -t 1 ]]; then interactive=(-it); fi
+# Linked worktrees keep objects and refs outside the source mount. Git needs
+# those paths for the build's revision stamp, but does not need write access.
+git_mount=()
+if [[ -f "$repo/.git" ]]; then
+  git_common=$(git -C "$repo" rev-parse --path-format=absolute --git-common-dir)
+  git_mount=(--volume "$git_common:$git_common:ro")
+fi
+exec docker run --rm "${interactive[@]}" --platform linux/amd64 \
+  --user "$(id -u):$(id -g)" --env HOME=/tmp --env "DGPP_BUILD_JOBS=${DGPP_BUILD_JOBS:-2}" \
+  --volume "$repo:$repo" "${git_mount[@]}" --workdir "$repo" "$image" "$@"

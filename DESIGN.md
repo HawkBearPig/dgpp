@@ -2205,7 +2205,12 @@ disagree by hours; `scripts/fabric_xrank.py`).
 | `tests/` | Unit, host, CUDA and Python tests |
 | `tools/`, `scripts/` | Reference generators, checkpoint tools, deployment and measurement commands |
 | `deploy/` | Example cluster configurations |
+| `cmake/`, `dev/` | Build configuration and the x86-to-ARM64 Spark cross-build container |
 | `benchmarks/`, `docs/` | Workloads, probes, dated measurements and documentation |
+
+The [Spark cross-build](docs/cross-compiling.md) uses native x86 build tools
+with an AArch64 host compiler and CUDA SBSA target libraries. It inherits the
+release configuration; target execution and deployment remain separate steps.
 
 ## 14. Validation scope
 

@@ -1,0 +1,47 @@
+FROM ubuntu:24.04
+
+# Native build tools and the Ubuntu 24.04 ARM64 ABI used by DGX OS.
+RUN sed -i '/^Types: deb/a Architectures: amd64' /etc/apt/sources.list.d/ubuntu.sources \
+    && dpkg --add-architecture arm64 \
+    && printf '%s\n' 'deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports noble main universe' \
+       'deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports noble-updates main universe' \
+       'deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports noble-security main universe' \
+       > /etc/apt/sources.list.d/arm64.list \
+    && apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+       ca-certificates curl gnupg cmake ninja-build git python3 file \
+       gcc-13-aarch64-linux-gnu g++-13-aarch64-linux-gnu \
+       libibverbs-dev:arm64 \
+    && rm -rf /var/lib/apt/lists/*
+
+# x86 nvcc generates device code; SBSA packages supply ARM64 target libraries.
+# Install only the CUDA components this project uses, rather than the full SDK.
+RUN curl -fsSL https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/3bf863cc.pub \
+       | gpg --dearmor -o /usr/share/keyrings/cuda.gpg \
+    && printf '%s\n' \
+       'deb [arch=amd64 signed-by=/usr/share/keyrings/cuda.gpg] https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/ /' \
+       'deb [signed-by=/usr/share/keyrings/cuda.gpg] https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/cross-linux-sbsa/ /' \
+       > /etc/apt/sources.list.d/cuda.list \
+    && apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+       cuda-nvcc-13-0 cuda-nvcc-cross-sbsa-13-0 libcublas-cross-sbsa-13-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Cross cuBLAS contains a link stub, not the shared runtime. Staging this
+# project's install layout requires the real ARM64 library as well. Extract only
+# cuBLASLt: the runtime package overlaps cross-package libnvblas files.
+RUN printf '%s\n' \
+       'deb [arch=arm64 signed-by=/usr/share/keyrings/cuda.gpg] https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/sbsa/ /' \
+       > /etc/apt/sources.list.d/cuda-sbsa.list \
+    && apt-get update \
+    && mkdir /tmp/cublas-runtime \
+    && cd /tmp/cublas-runtime \
+    && apt-get download libcublas-13-0:arm64 \
+    && dpkg-deb -x ./*.deb extracted \
+    && cp -a extracted/usr/local/cuda-13.0/targets/sbsa-linux/lib/libcublasLt.so.* /usr/local/cuda-13.0/targets/sbsa-linux/lib/ \
+    && ln -s libcublasLt.so.13 /usr/local/cuda-13.0/targets/sbsa-linux/lib/libcublasLt.so \
+    && cd / \
+    && rm -rf /tmp/cublas-runtime /var/lib/apt/lists/*
+
+ENV PATH=/usr/local/cuda-13.0/bin:${PATH}
+WORKDIR /workspace

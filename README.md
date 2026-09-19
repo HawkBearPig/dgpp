@@ -166,6 +166,8 @@ Run the remaining commands in this same shell, after installing the
 This example serves GLM-5.3-Flash on four Sparks; choose a different
 [deployment template](deploy/README.md) for another model or node count.
 See [Getting started](docs/getting-started.md) for the full walkthrough and troubleshooting guidance.
+For an x86 Linux build workstation, use the Docker-based
+[Spark cross-build](docs/cross-compiling.md); run the resulting binaries on a Spark.
 
 ### 1. Configure your deployment
 

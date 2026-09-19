@@ -83,6 +83,10 @@ Their implementation and evaluation records are maintained separately:
 
 ## Remaining work
 
+The [Docker cross-build](docs/cross-compiling.md) provides x86-to-ARM64/GB10
+compilation and install staging. Its [validation record](benchmarks/results/2026-09-19-spark-cross-build.md)
+tracks host checks separately from target execution on idle Spark hardware.
+
 Qwen graph serving can interleave prefill chunks with decode using
 `engine.prefill_budget_tokens`; zero preserves monolithic admission.
 An optional `engine.prefill_idle_budget_tokens` increases chunk size when
