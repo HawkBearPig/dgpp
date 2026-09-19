@@ -615,12 +615,18 @@ struct ServiceRig {
                       // The request-context surface (review item 7): the rig's
                       // rope ramp and its two bounds, advertised on /v1/models.
                       std::optional<dgpp::RopeScaling> rope_scaling = std::nullopt,
-                      int64_t position_ceiling = 0, int64_t kv_pool_tokens = 0)
+                      int64_t position_ceiling = 0, int64_t kv_pool_tokens = 0,
+                      // The served-model alias (the cluster config's
+                      // engine.served_model_name): when set, /v1/models
+                      // reports it and requests may name it (or the
+                      // checkpoint id). Empty: the checkpoint id alone.
+                      std::string served_model_name = "")
       : engine(kSlots, /*total_blocks=*/100, /*block_tokens=*/4, can_sample),
         frontend(with_markers),
         cfg([&] {
           ServiceConfig c;
           c.model_id = "glm-5.3-flash-fp8";
+          c.served_model_name = served_model_name;
           c.default_max_tokens = 8;
           c.queue_limit = queue_limit;
           c.sampling_defaults = sampling_defaults;
@@ -3383,4 +3389,83 @@ DGPP_TEST(serve_images_prefix_cache_defaults_on_and_respects_opt_out) {
               rig.engine.prefix_ops() == operations && rig.engine.image_prefills == 3,
           "explicit opt-out still performs image prefill without cache operations");
 
+}
+
+DGPP_TEST(serve_servedModelName_aliasServesBesideTheCheckpointId) {
+  // GIVEN a service that serves the checkpoint under a stable alias (the
+  // cluster config's served_model_name: the A/B lanes' gateway name),
+  ServiceRig rig(8, dgpp::sample::greedy_params(), false, std::nullopt, false, false, {}, 0, {},
+                 std::nullopt, 0, 0, "stable-alias");
+
+  // WHEN a client names the alias, the checkpoint id, or an unknown model,
+  // THEN the alias and the checkpoint id are both served, and the unknown
+  // model is 404 with the error naming the alias (the name actually served).
+  const std::string alias_body =
+      "{\"model\":\"stable-alias\",\"messages\":[{\"role\":\"user\","
+      "\"content\":\"abcd\"}],\"max_tokens\":2}";
+  const std::string alias_resp = post_until_usage(rig, alias_body);
+  require(alias_resp.find("200 OK") != std::string::npos,
+          "the alias is served: " + alias_resp.substr(0, 200));
+  const std::string ckpt_resp = post_until_usage(rig, chat_body("abcd", 2));
+  require(ckpt_resp.find("200 OK") != std::string::npos,
+          "the checkpoint id is still served beside the alias: " + ckpt_resp.substr(0, 200));
+  const std::string wrong_body =
+      "{\"model\":\"nope\",\"messages\":[{\"role\":\"user\","
+      "\"content\":\"abcd\"}],\"max_tokens\":2}";
+  const std::string wrong_resp = post_chat(rig, wrong_body);
+  require(wrong_resp.find("404 Not Found") != std::string::npos &&
+              wrong_resp.find("\"code\":\"model_not_found\"") != std::string::npos &&
+              wrong_resp.find("(serving 'stable-alias')") != std::string::npos,
+          "the unknown model is 404 naming the alias: " + wrong_resp.substr(0, 300));
+
+  // The legacy prompt API accepts the alias too.
+  Client legacy(rig.port());
+  const std::string legacy_body =
+      "{\"model\":\"stable-alias\",\"prompt\":\"hello\",\"max_tokens\":2}";
+  legacy.send_all("POST /v1/completions HTTP/1.1\r\nHost: t\r\n"
+                  "Content-Type: application/json\r\nContent-Length: " +
+                  std::to_string(legacy_body.size()) + "\r\n\r\n" + legacy_body);
+  const std::string legacy_resp = legacy.read_until("usage", 5000);
+  require(legacy_resp.find("200 OK") != std::string::npos &&
+              legacy_resp.find("\"object\":\"text_completion\"") != std::string::npos,
+          "the legacy API serves the alias: " + legacy_resp.substr(0, 200));
+
+  // /v1/models reports the alias as the id (and never the checkpoint id),
+  // /v1/models/<id> accepts the alias or the checkpoint id, and an unknown
+  // id is 404.
+  Client models(rig.port());
+  models.send_all("GET /v1/models HTTP/1.1\r\nHost: t\r\n\r\n");
+  const std::string ml = models.read_available(800);
+  require(ml.find("\"id\":\"stable-alias\"") != std::string::npos &&
+              ml.find(kModel) == std::string::npos,
+          "the list reports the alias as the id: " + ml.substr(0, 300));
+  models.send_all("GET /v1/models/stable-alias HTTP/1.1\r\nHost: t\r\n\r\n");
+  const std::string alias_get = models.read_available(800);
+  require(alias_get.find("200 OK") != std::string::npos &&
+              alias_get.find("\"id\":\"stable-alias\"") != std::string::npos,
+          "/v1/models/<alias> is served: " + alias_get.substr(0, 300));
+  models.send_all("GET /v1/models/" + kModel + " HTTP/1.1\r\nHost: t\r\n\r\n");
+  const std::string ckpt_get = models.read_available(800);
+  require(ckpt_get.find("200 OK") != std::string::npos &&
+              ckpt_get.find("\"id\":\"stable-alias\"") != std::string::npos,
+          "/v1/models/<checkpoint id> is served too: " + ckpt_get.substr(0, 300));
+  models.send_all("GET /v1/models/nope HTTP/1.1\r\nHost: t\r\n\r\n");
+  const std::string none_get = models.read_available(800);
+  require(none_get.find("404 Not Found") != std::string::npos &&
+              none_get.find("\"code\":\"model_not_found\"") != std::string::npos,
+          "/v1/models/<unknown> is 404: " + none_get.substr(0, 300));
+
+  // The non-regression half: without an alias, the checkpoint id alone is
+  // served and reported — exactly today's behavior.
+  ServiceRig plain;
+  Client plain_models(plain.port());
+  plain_models.send_all("GET /v1/models HTTP/1.1\r\nHost: t\r\n\r\n");
+  const std::string plain_ml = plain_models.read_available(800);
+  require(plain_ml.find("\"id\":\"" + kModel + "\"") != std::string::npos &&
+              plain_ml.find("stable-alias") == std::string::npos,
+          "absent alias: the checkpoint id is reported: " + plain_ml.substr(0, 300));
+  const std::string plain_wrong = post_chat(plain, wrong_body);
+  require(plain_wrong.find("404 Not Found") != std::string::npos &&
+              plain_wrong.find("\"code\":\"model_not_found\"") != std::string::npos,
+          "absent alias: the unknown model is 404: " + plain_wrong.substr(0, 300));
 }
