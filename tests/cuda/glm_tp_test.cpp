@@ -4545,7 +4545,7 @@ static void run_mtp_depth_sampling_gate(int depth, int port) {
 }
 
 DGPP_TEST(glm_tp_serving_mtp_depth1_graph_sampling_counts_fallback) {
-  run_mtp_depth_sampling_gate(1, 29935);
+  run_mtp_depth_sampling_gate(1, 29941);
 }
 
 // The sampled verdict's chain at depth 2: the T=3 verify's

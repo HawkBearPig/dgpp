@@ -2250,6 +2250,7 @@ void GenerationService::route_metrics(HttpResponseWriter& w) {
   }
   out.append("}}");
   // Engine-lifetime verification counters, published by the scheduler.
+  // num_drafts_total counts request verification rounds, not draft tokens.
   // Sum position attempts: scheduled verification depth can vary between rounds.
   out.append(",\"spec_decode\":{\"depth\":");
   append_json_int(&out, m.mtp.depth);

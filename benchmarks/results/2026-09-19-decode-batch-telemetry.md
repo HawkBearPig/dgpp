@@ -41,7 +41,7 @@ Their target execution is recorded below.
 
 ## Native Spark and two-rank validation
 
-Commit `8557e02df841` was cloned into `/home/jon/dgpp-decode-batch-pr` on
+Commit `8557e02df841` was cloned into `<checkout>/dgpp-decode-batch-pr` on
 Spark 1 and built natively with `cmake --preset ci` followed by
 `cmake --build --preset ci -j 4`. The complete build passed before testing.
 The user confirmed exclusive handoff after another thread's maintenance.

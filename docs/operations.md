@@ -694,7 +694,12 @@ rows per request adds one replay, twelve rows and two padded rows. Speculative
 draft-chain work is excluded; rejected draft tokens are not padding.
 `replays_by_slots` counts launches by graph capacity, with keys `"1"` through
 `"16"`; bucket `"1"` includes scalar fallback. Zero buckets do not establish
-which graph families an engine supports. Non-graph engines report zeros.
+which graph families an engine supports. The fixed sixteen-bucket shape is
+intentional so scrapers see the same keys across deployments, independent of
+the configured slot count. Non-graph engines report zeros.
+
+For draft attempts and acceptance, see
+[speculative decoding counters](openai-compatibility.md#speculative-decoding-counters).
 
 For an interval, divide the increase in `padded_rows` by the increase in `rows`
 when that denominator is positive. This measures verification-row padding,

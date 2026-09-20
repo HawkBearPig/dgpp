@@ -2160,6 +2160,7 @@ class GraphEngineAdapter final : public sched::SchedulerEngine {
                     "(inflight {})",
                     rank_, r.req, r.parity, variant, inflight_.size());
     DGPP_CUDA_OK(cudaGraphLaunch(exec, model_->stream()));
+    DGPP_CUDA_OK(cudaEventRecord(end_event(r), model_->stream()));
     const int slots = r.batched ? families_.at(static_cast<size_t>(r.family)).requests : 1;
     decode_batch_stats_.slots = slots;
     decode_batch_stats_.active = static_cast<int>(r.reqs.size());
@@ -2169,7 +2170,6 @@ class GraphEngineAdapter final : public sched::SchedulerEngine {
     decode_batch_stats_.rows += slots * r.rows;
     decode_batch_stats_.padded_rows += (slots - static_cast<int>(r.reqs.size())) * r.rows;
 
-    DGPP_CUDA_OK(cudaEventRecord(end_event(r), model_->stream()));
     if (trace_)
       DGPP_LOG_INFO("rank {}: pipeline launched slot {} parity {}", rank_,
                     r.req, r.parity);

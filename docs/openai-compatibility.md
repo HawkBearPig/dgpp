@@ -196,7 +196,9 @@ watch -n 2 'curl -fsS http://192.168.50.221:18080/metrics | jq "{prefill, schedu
 ### Speculative decoding counters
 
 `scheduler.spec_decode` exposes the engine's cumulative MTP verification
-counters on both metrics routes:
+counters on both metrics routes. Graph capacity and padding are reported
+separately by
+[`scheduler.decode_batch`](operations.md#decode-graph-batch-counters).
 
 | Field | Meaning |
 | --- | --- |
