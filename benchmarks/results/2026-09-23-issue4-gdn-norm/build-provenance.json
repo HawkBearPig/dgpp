@@ -1,0 +1,7 @@
+{
+  "base_commit": "d318815984fd2ab1f0a67a6b830b57730a57439a",
+  "binary_sha256": "f30d420ec0a25f76fb0291a9a9f392dfc5a7d7e0a003e6a0aa8e413ae58a41be",
+  "patch_sha256": "32dee92e17a0fc15e16fe9665423ba6f18ee9116fb7768f574327feeb164094c",
+  "unit_binary_sha256": "28f07a885f76b61af313fb349431c5c2723334353261f6610d6d5c119f7dafec",
+  "source": "Prior GR/SwiGLU/checkpoint-dense W4A16 control plus FP32 GDN gated-normalization intermediates"
+}

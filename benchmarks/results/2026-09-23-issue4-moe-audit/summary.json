@@ -1,0 +1,25 @@
+{
+  "rows": 576,
+  "folds": 288,
+  "local_chain_failures": 0,
+  "folded_chain_failures": 0,
+  "exact_fold_failures": 0,
+  "rank_input_or_routing_failures": 0,
+  "router_budget_failures": 0,
+  "route_or_segment_failures": 0,
+  "stage_max_relative_l2": {
+    "router_logits": 0.0,
+    "router_weights": 0.0,
+    "gate": 0.00029406670449832724,
+    "up": 0.00028875633712973107,
+    "activation": 0.0,
+    "down_from_captured_activation": 4.295908790180845e-07,
+    "accumulation": 0.0,
+    "shared_down_from_captured_activation": 5.600707236439402e-07,
+    "shared_gate": 0.0007338372436846071,
+    "shared_up": 0.0020661041241823905,
+    "shared_activation": 0.0,
+    "shared_weight": 0.0,
+    "complete_local_chain": 0.0020504223004419765
+  }
+}

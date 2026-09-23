@@ -1,0 +1,4 @@
+[ OK ] qwen_rmsnorm_matches_the_oracle_within_an_ulp
+[ OK ] qwen_group_rmsnorm_normalizes_every_branch_on_its_own
+[ OK ] gdn_gated_rmsnorm_matches_fp64_without_intermediate_rounding
+3 tests, 0 failed

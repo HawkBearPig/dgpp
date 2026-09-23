@@ -25,7 +25,9 @@ consistency patch is not a prerequisite for the investigation.
 | [Checkpoint rebuild](2026-09-23-issue4-uncached/README.md) | Same 5/6 answer and usage, with resident images bypassed on both ranks | Cached weights do not explain the observed failure |
 | [Uncached arithmetic control](2026-09-23-issue4-postscale-uncached/README.md) | 5/6; full answer and token counts match deterministic reference exactly | Correct scale integration changes the wrong answer, but does not repair retrieval |
 | [W4A16 reference](2026-09-23-issue4-reference-w4a16/README.md) | Two identical 6/6 answers, 187 completion tokens | Repeatable successful reference in the tested world; other arithmetic differences remain |
-| [W4A16 DGPP rounding control](2026-09-23-issue4-reference-rounding-w4a16/README.md) | Built, not yet run | Tests GR/SwiGLU reference rounding with checkpoint dense projections |
+| [W4A16 DGPP rounding control](2026-09-23-issue4-reference-rounding-w4a16/README.md) | 5/6, same original wrong answer and 184 output tokens | GR/SwiGLU reference rounding with checkpoint dense projections is insufficient |
+| [Real-fixture expert replay](2026-09-23-issue4-moe-audit/README.md) | Exact capture parity; 576 local and 288 folded chains pass | No detected routed/shared expert error on sampled inputs |
+| [GDN normalization policy](2026-09-23-issue4-gdn-norm/README.md) | Built; original request campaign running | Keeps normalization/affine intermediates in FP32, following the pinned reference |
 
 [Draft PR #34](https://github.com/HawkBearPig/dgpp/pull/34) separates generation
 stop IDs from trained model EOS, preserving PLE semantics. The release build,
@@ -58,8 +60,10 @@ smoke test. Raw captures and receipts remain local under each record's ignored
 `raw/` directory. The EOS fix is on branch `fix/qwen-model-eos`; separate diagnostic branches
 use `/tmp/dgpp-issue4-20260923`. The user's original tracked source is unchanged.
 
-The next direct operator audit is [real-fixture MoE](2026-09-23-issue4-moe-audit/README.md):
-read-only capture build and independent host-format checks passed. The first
-capture used the wrong control configuration and was quarantined; the exact
-forced-prefix configuration is now running. It covers routed/shared expert calculations missing
-from the earlier attention/history audit.
+The [real-fixture MoE audit](2026-09-23-issue4-moe-audit/README.md) passed all
+576 local and 288 folded chains, including routing/segmentation invariants. Its
+first, incorrectly configured attempt was quarantined; the valid capture has
+exact prediction/logprob/usage parity with the clean forced-prefix control.
+The next diagnostic changes GDN normalization to the pinned reference’s FP32
+intermediates; it has lower independent FP64 error in all 72 sampled rank/layer
+cases, but its effect on retrieval is not yet known.

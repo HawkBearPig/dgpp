@@ -1,4 +1,4 @@
-# DGPP W4A16 with closer reference rounding — prepared, not run
+# DGPP W4A16 with closer reference rounding — 5/6, original wrong answer
 
 This diagnostic removes activation FP4 rounding and restores the original
 weight-only global scale from the prior post-dot arithmetic combination. It
@@ -17,3 +17,7 @@ intermediates also remain implementation-specific.
 Native original request runs first; bounded prefill runs only if native passes.
 Any success needs repetition, ablation and broader numerical-quality validation
 before promoting an arithmetic policy change.
+
+Executed result: 5/6, `val_5dac9ed720abddaf`, 184 completion tokens, 209.544
+seconds. Bounded prefill was skipped after the native failure. Production binary,
+configuration and inference restoration passed on all four nodes.
