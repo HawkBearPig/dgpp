@@ -144,6 +144,11 @@ finding, not a DGPP retrieval fix.
 
 The [canonical grouping control](2026-09-23-issue4-reference-canonical-moe/README.md)
 passes 60 GPU/CPU-oracle cases and repeats exactly in 40 real-operand replays
-across fresh processes and both ranks. The full TP2 campaign is now running two
+across fresh processes and both ranks. The full TP2 campaign completed two
 unchanged original requests with canonical grouping, deterministic QSA and
-pinned GDN launch choices. BF16 auto state is retained for this control.
+pinned GDN launch choices, retaining BF16 auto state. Both return the original
+5/6 answer with identical full text/usage (184 completion tokens). All 267480
+captured fields across both ranks repeat exactly, with no missing final fields;
+all 534960 saved payloads pass shape, length and SHA256 checks. Production
+restoration passed. The explicit FP32-state comparison is now running with the
+same deterministic controls; no state-control accuracy verdict is available yet.

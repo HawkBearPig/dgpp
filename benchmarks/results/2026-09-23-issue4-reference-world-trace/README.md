@@ -9,8 +9,8 @@ binaries/configuration and inference smoke test passed after restoration.
 Read-only captures retain full tensors for layers 0–3 in the first two chunks,
 last rows otherwise, and prepared GDN inputs/core outputs throughout prefill.
 Each rank has 312 forward calls and 133740 captured fields. Every binary payload
-matches its recorded length and SHA256 (3341280080 bytes total). The second fresh
-trace is running to compare numerical boundaries and actual launch selections.
+matches its recorded length and SHA256 (3341280080 bytes total). The [second fresh trace](../2026-09-23-issue4-reference-world-trace-repeat/README.md)
+also fails and first differs at layer-0 MoE output with unchanged GDN launch choices.
 Instrumentation can affect scheduling; output parity above limits that caveat.
 
 **New state-storage observation:** the first three GDN layers on both ranks

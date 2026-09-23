@@ -1,4 +1,4 @@
-# Canonical Marlin grouping — operator validation passed; original request starting
+# Canonical Marlin grouping — stable operators; original request still fails
 
 Frozen real-operand replays identify nondeterministic token grouping as a source
 of Marlin expert output variation. This diagnostic control retains the original
@@ -15,7 +15,14 @@ of 5242880 routed-sum elements on ranks 0 and 1 respectively (relative L2 errors
 5.05e-6 and 6.65e-6). See `alignment-tests.json` and `unit-summary.json`.
 
 The unit campaign restored production and passed its smoke test. The full TP2
-campaign is running two unchanged original requests. It retains BF16 auto state,
+campaign completed two unchanged original requests. It retains BF16 auto state,
 pins the previously measured GDN launch choices per rank, and applies deterministic
-QSA plus canonical expert grouping. Stable operator outputs alone do not establish
-a retrieval fix; the full-request verdicts are pending.
+QSA plus canonical expert grouping. Both score 5/6, returning the original wrong value `val_5dac9ed720abddaf`
+with 261120 prompt and 184 completion tokens (316.779 and 324.704 seconds).
+Full text and usage repeat exactly and match the preceding uncontrolled-grouping
+trace. Production restoration passed. Both ranks repeat all 133740 captured fields
+exactly, with no token drift or incomplete tail. All 534960 saved payloads pass length, shape and SHA256 validation
+(6682560160 bytes total; no orphan payloads). Single-configuration GDN autotuners
+bypass cache selection, so their cache receipts are empty; the allowed launch
+choices are fixed by the verified helper and `pinned-gdn-configs.json`.
+There is no retrieval fix.

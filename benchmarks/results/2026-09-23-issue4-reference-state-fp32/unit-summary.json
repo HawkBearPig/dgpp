@@ -1,0 +1,66 @@
+{
+  "all_pass": true,
+  "grouping_cpu_oracle_cases": 60,
+  "canonical_replays": 40,
+  "frozen_replays": 40,
+  "cross_process_canonical_exact": true,
+  "alignment_sha256": "30ad4ef648d60afb92ee7056d5065d6413137865e71b0e9a44ebbcf566b59a54",
+  "cases": [
+    {
+      "case": "rank0-process1",
+      "canonical_unique_outputs": 1,
+      "canonical_output_sha256": "b58ac6e61cbfc202b9affb3f399a443058766606cbea41ab7411c6c6d88bad29",
+      "versus_original_grouping": {
+        "bitwise_exact": false,
+        "different_elements": 32,
+        "elements": 5242880,
+        "finite": true,
+        "relative_l2": 5.046497957129243e-06,
+        "max_absolute": 0.0001220703125
+      },
+      "frozen_exact_to_capture": true
+    },
+    {
+      "case": "rank0-process2",
+      "canonical_unique_outputs": 1,
+      "canonical_output_sha256": "b58ac6e61cbfc202b9affb3f399a443058766606cbea41ab7411c6c6d88bad29",
+      "versus_original_grouping": {
+        "bitwise_exact": false,
+        "different_elements": 32,
+        "elements": 5242880,
+        "finite": true,
+        "relative_l2": 5.046497957129243e-06,
+        "max_absolute": 0.0001220703125
+      },
+      "frozen_exact_to_capture": true
+    },
+    {
+      "case": "rank1-process1",
+      "canonical_unique_outputs": 1,
+      "canonical_output_sha256": "22e1ba2c2d642c0ee03b7986ce999652c2e73876bf0bbcbcd336fb6a8c8939df",
+      "versus_original_grouping": {
+        "bitwise_exact": false,
+        "different_elements": 49,
+        "elements": 5242880,
+        "finite": true,
+        "relative_l2": 6.647043967087343e-06,
+        "max_absolute": 0.0001220703125
+      },
+      "frozen_exact_to_capture": true
+    },
+    {
+      "case": "rank1-process2",
+      "canonical_unique_outputs": 1,
+      "canonical_output_sha256": "22e1ba2c2d642c0ee03b7986ce999652c2e73876bf0bbcbcd336fb6a8c8939df",
+      "versus_original_grouping": {
+        "bitwise_exact": false,
+        "different_elements": 49,
+        "elements": 5242880,
+        "finite": true,
+        "relative_l2": 6.647043967087343e-06,
+        "max_absolute": 0.0001220703125
+      },
+      "frozen_exact_to_capture": true
+    }
+  ]
+}

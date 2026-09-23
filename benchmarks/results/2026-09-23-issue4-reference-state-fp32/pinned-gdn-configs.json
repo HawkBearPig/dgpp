@@ -1,0 +1,94 @@
+{
+  "0": {
+    "chunk_scaled_dot_kkt_fwd_kernel": {
+      "(24, 128, 64, True, 'torch.bfloat16', 'torch.float32', 'torch.float32', 'torch.float32', 'torch.int32', 'torch.int32')": {
+        "kwargs": {
+          "BK": 128
+        },
+        "num_warps": 8,
+        "num_stages": 3
+      }
+    },
+    "recompute_w_u_fwd_kernel": {
+      "(24, 128, 128, 64, 64, 64, True, 'torch.bfloat16', 'torch.bfloat16', 'torch.float32', 'torch.bfloat16', 'torch.bfloat16', 'torch.bfloat16', 'torch.float32', 'torch.int32', 'torch.int32')": {
+        "kwargs": {},
+        "num_warps": 8,
+        "num_stages": 4
+      }
+    },
+    "chunk_gated_delta_rule_fwd_kernel_h_blockdim64": {
+      "(24, 128, 128, 64, 'torch.bfloat16', 'torch.bfloat16', 'torch.bfloat16', 'torch.bfloat16', 'torch.float32', 'torch.bfloat16', 'torch.bfloat16', 'torch.float32', 'torch.int32', 'torch.int64')": {
+        "kwargs": {
+          "BV": 64
+        },
+        "num_warps": 4,
+        "num_stages": 3
+      }
+    },
+    "chunk_fwd_kernel_o": {
+      "(24, 128, 128, 64, 'torch.bfloat16', 'torch.bfloat16', 'torch.bfloat16', 'torch.bfloat16', 'torch.float32', 'torch.bfloat16', 'torch.int32', 'torch.int32')": {
+        "kwargs": {
+          "BK": 64,
+          "BV": 64
+        },
+        "num_warps": 4,
+        "num_stages": 2
+      }
+    },
+    "solve_tril_16x16_kernel": {},
+    "merge_16x16_to_32x32_inverse_kernel": {},
+    "merge_16x16_to_64x64_inverse_kernel": {
+      "(24, 64, True, 'torch.float32', 'torch.bfloat16', 'torch.int32', 'torch.int32')": {
+        "kwargs": {},
+        "num_warps": 4,
+        "num_stages": 2
+      }
+    }
+  },
+  "1": {
+    "chunk_scaled_dot_kkt_fwd_kernel": {
+      "(24, 128, 64, True, 'torch.bfloat16', 'torch.float32', 'torch.float32', 'torch.float32', 'torch.int32', 'torch.int32')": {
+        "kwargs": {
+          "BK": 32
+        },
+        "num_warps": 2,
+        "num_stages": 3
+      }
+    },
+    "recompute_w_u_fwd_kernel": {
+      "(24, 128, 128, 64, 64, 64, True, 'torch.bfloat16', 'torch.bfloat16', 'torch.float32', 'torch.bfloat16', 'torch.bfloat16', 'torch.bfloat16', 'torch.float32', 'torch.int32', 'torch.int32')": {
+        "kwargs": {},
+        "num_warps": 8,
+        "num_stages": 4
+      }
+    },
+    "chunk_gated_delta_rule_fwd_kernel_h_blockdim64": {
+      "(24, 128, 128, 64, 'torch.bfloat16', 'torch.bfloat16', 'torch.bfloat16', 'torch.bfloat16', 'torch.float32', 'torch.bfloat16', 'torch.bfloat16', 'torch.float32', 'torch.int32', 'torch.int64')": {
+        "kwargs": {
+          "BV": 64
+        },
+        "num_warps": 4,
+        "num_stages": 3
+      }
+    },
+    "chunk_fwd_kernel_o": {
+      "(24, 128, 128, 64, 'torch.bfloat16', 'torch.bfloat16', 'torch.bfloat16', 'torch.bfloat16', 'torch.float32', 'torch.bfloat16', 'torch.int32', 'torch.int32')": {
+        "kwargs": {
+          "BK": 64,
+          "BV": 64
+        },
+        "num_warps": 4,
+        "num_stages": 2
+      }
+    },
+    "solve_tril_16x16_kernel": {},
+    "merge_16x16_to_32x32_inverse_kernel": {},
+    "merge_16x16_to_64x64_inverse_kernel": {
+      "(24, 64, True, 'torch.float32', 'torch.bfloat16', 'torch.int32', 'torch.int32')": {
+        "kwargs": {},
+        "num_warps": 2,
+        "num_stages": 4
+      }
+    }
+  }
+}
