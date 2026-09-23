@@ -1,0 +1,7 @@
+{
+  "base_commit": "d318815984fd2ab1f0a67a6b830b57730a57439a",
+  "binary_sha256": "c36427269e2f882c4b1fdbb8db7f33d2613551dae0fb71ae8722718b86e46d15",
+  "patch_sha256": "3a40c409f67eae6308174732578bf07adc5afb0dd636e35a2fd4d109bb7588ac",
+  "unit_binary_sha256": "7c2c530781137dda37bdb7d06584ec2fcfd6861c833f4b410066d70bb2edcff5",
+  "source": "Previous normalized-Q/K control plus explicit weighted-expert and shared-tail BF16 stores. Diagnostic generic FP32 routed path also affects MiMo."
+}

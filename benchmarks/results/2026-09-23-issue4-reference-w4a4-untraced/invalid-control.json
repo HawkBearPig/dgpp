@@ -1,0 +1,195 @@
+{
+  "valid_control": false,
+  "reason": "Explicit --moe-backend flashinfer_cutlass changed the vLLM cache identity from b54dae... to 85e315...; the process used newly tuned tactics instead of the preflight-checked retained cache. Aborted during first request; no accuracy conclusion.",
+  "changed_tactics": [
+    {
+      "key": "('trtllm::fused_moe::gemm1', 'MoERunner', ((1, 1280), (512, 640, 160), (0,), (512, 2560, 20), (0,)), ())",
+      "expected": [
+        "MoERunner",
+        16
+      ],
+      "actual": [
+        "MoERunner",
+        18
+      ]
+    },
+    {
+      "key": "('trtllm::fused_moe::gemm1', 'MoERunner', ((1024, 1280), (512, 640, 160), (0,), (512, 2560, 20), (0,)), ())",
+      "expected": [
+        "MoERunner",
+        18
+      ],
+      "actual": [
+        "MoERunner",
+        16
+      ]
+    },
+    {
+      "key": "('trtllm::fused_moe::gemm1', 'MoERunner', ((128, 1280), (512, 640, 160), (0,), (512, 2560, 20), (0,)), ())",
+      "expected": [
+        "MoERunner",
+        18
+      ],
+      "actual": [
+        "MoERunner",
+        0
+      ]
+    },
+    {
+      "key": "('trtllm::fused_moe::gemm1', 'MoERunner', ((3072, 1280), (512, 640, 160), (0,), (512, 2560, 20), (0,)), ())",
+      "expected": [
+        "MoERunner",
+        0
+      ],
+      "actual": [
+        "MoERunner",
+        18
+      ]
+    },
+    {
+      "key": "('trtllm::fused_moe::gemm1', 'MoERunner', ((3584, 1280), (512, 640, 160), (0,), (512, 2560, 20), (0,)), ())",
+      "expected": [
+        "MoERunner",
+        0
+      ],
+      "actual": [
+        "MoERunner",
+        10
+      ]
+    },
+    {
+      "key": "('trtllm::fused_moe::gemm1', 'MoERunner', ((512, 1280), (512, 640, 160), (0,), (512, 2560, 20), (0,)), ())",
+      "expected": [
+        "MoERunner",
+        18
+      ],
+      "actual": [
+        "MoERunner",
+        16
+      ]
+    },
+    {
+      "key": "('trtllm::fused_moe::gemm1', 'MoERunner', ((768, 1280), (512, 640, 160), (0,), (512, 2560, 20), (0,)), ())",
+      "expected": [
+        "MoERunner",
+        18
+      ],
+      "actual": [
+        "MoERunner",
+        16
+      ]
+    },
+    {
+      "key": "('trtllm::fused_moe::gemm2', 'MoERunner', ((1, 1280), (512, 640, 160), (0,), (512, 2560, 20), (0,)), ())",
+      "expected": [
+        "MoERunner",
+        36
+      ],
+      "actual": [
+        "MoERunner",
+        37
+      ]
+    },
+    {
+      "key": "('trtllm::fused_moe::gemm2', 'MoERunner', ((128, 1280), (512, 640, 160), (0,), (512, 2560, 20), (0,)), ())",
+      "expected": [
+        "MoERunner",
+        32
+      ],
+      "actual": [
+        "MoERunner",
+        36
+      ]
+    },
+    {
+      "key": "('trtllm::fused_moe::gemm2', 'MoERunner', ((1280, 1280), (512, 640, 160), (0,), (512, 2560, 20), (0,)), ())",
+      "expected": [
+        "MoERunner",
+        36
+      ],
+      "actual": [
+        "MoERunner",
+        38
+      ]
+    },
+    {
+      "key": "('trtllm::fused_moe::gemm2', 'MoERunner', ((16, 1280), (512, 640, 160), (0,), (512, 2560, 20), (0,)), ())",
+      "expected": [
+        "MoERunner",
+        36
+      ],
+      "actual": [
+        "MoERunner",
+        37
+      ]
+    },
+    {
+      "key": "('trtllm::fused_moe::gemm2', 'MoERunner', ((1792, 1280), (512, 640, 160), (0,), (512, 2560, 20), (0,)), ())",
+      "expected": [
+        "MoERunner",
+        20
+      ],
+      "actual": [
+        "MoERunner",
+        38
+      ]
+    },
+    {
+      "key": "('trtllm::fused_moe::gemm2', 'MoERunner', ((256, 1280), (512, 640, 160), (0,), (512, 2560, 20), (0,)), ())",
+      "expected": [
+        "MoERunner",
+        36
+      ],
+      "actual": [
+        "MoERunner",
+        38
+      ]
+    },
+    {
+      "key": "('trtllm::fused_moe::gemm2', 'MoERunner', ((3072, 1280), (512, 640, 160), (0,), (512, 2560, 20), (0,)), ())",
+      "expected": [
+        "MoERunner",
+        38
+      ],
+      "actual": [
+        "MoERunner",
+        30
+      ]
+    },
+    {
+      "key": "('trtllm::fused_moe::gemm2', 'MoERunner', ((3584, 1280), (512, 640, 160), (0,), (512, 2560, 20), (0,)), ())",
+      "expected": [
+        "MoERunner",
+        38
+      ],
+      "actual": [
+        "MoERunner",
+        20
+      ]
+    },
+    {
+      "key": "('trtllm::fused_moe::gemm2', 'MoERunner', ((4096, 1280), (512, 640, 160), (0,), (512, 2560, 20), (0,)), ())",
+      "expected": [
+        "MoERunner",
+        38
+      ],
+      "actual": [
+        "MoERunner",
+        28
+      ]
+    },
+    {
+      "key": "('trtllm::fused_moe::gemm2', 'MoERunner', ((8192, 1280), (512, 640, 160), (0,), (512, 2560, 20), (0,)), ())",
+      "expected": [
+        "MoERunner",
+        38
+      ],
+      "actual": [
+        "MoERunner",
+        39
+      ]
+    }
+  ],
+  "interrupted_pid": 4033855,
+  "time_utc": "2026-09-23T10:55:01.110892+00:00"
+}

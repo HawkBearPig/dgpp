@@ -1,0 +1,23 @@
+[ .. ] yarn norm+rope: max_rel 0 l2_rel 0 mismatches 0/2048
+[ OK ] qsa_rope_inv_freq_is_frozen_and_yarn_rides_the_cos_sin
+[ .. ] FP32 main RoPE: all 4096 exact; old policy differs at 167 values
+[ OK ] qsa_main_rope_matches_fp32_rotation_storage
+[ .. ] norm+rope: max_rel 0 l2_rel 0 mismatches 0/3840
+[ OK ] qsa_norm_rope_matches_the_reference
+[ .. ] compressed keys (plain rope): max_rel 0 l2_rel 0 mismatches 0/6400
+[ .. ] compressed keys (yarn rope): max_rel 0 l2_rel 0 mismatches 0/6400
+[ .. ] compressed keys: prefill, decode, split and snapshots agree under both tables
+[ OK ] qsa_index_compression_prefill_decode_and_split_agree
+[ .. ] select: 8 rows, lists of 4 5 8 32 33 35 32 0 tokens, keys and lists bitwise
+[ OK ] qsa_index_score_and_select_match_the_reference_bitwise
+[ .. ] 65322 pools, 64-token permuted paging: every key/token and graph replay exact
+[ .. ] 131071 pools, 64-token permuted paging: every key/token and graph replay exact
+[ OK ] qsa_index_large_paged_pools_match_every_host_key_and_token
+[ OK ] qsa_select_long_ties_boundaries_and_graph_shape_changes
+[ .. ] attention n_split=1: max_abs 0 l2_rel 0 mismatches 0/12288 (rms 0.222)
+[ .. ] attention n_split=3: max_abs 0.00781 l2_rel 0.00175 mismatches 0/12288 (rms 0.222)
+[ .. ] attention n_split=1: max_abs 0 l2_rel 0 mismatches 0/12288 (rms 0.222)
+[ .. ] attention n_split=3: max_abs 0.00781 l2_rel 0.00175 mismatches 0/12288 (rms 0.222)
+[ OK ] qsa_listed_attention_and_gate_match_the_reference
+[ OK ] qsa_prefill_partials_preserve_arithmetic_and_graph_replay
+9 tests, 0 failed

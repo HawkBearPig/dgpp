@@ -1,0 +1,5 @@
+{
+  "image": "sha256:d464f3b466fa9c45ddbff8a812e80564503b6879a9fd95c1a47514f3f0df5a4a",
+  "path": "vllm/model_executor/layers/fused_qk_norm_rope.py",
+  "sha256": "182a13b20ac5857674a368d030268161ae0d4f358a38114cded804c1791abcaa"
+}

@@ -1,15 +1,16 @@
-# Deterministic W4A4 reference without tracing — running
+# Untraced W4A4 reference — invalid control, aborted before verdict
 
-This repeats the deterministic W4A4 reference with boundary captures and read-only
-top-k probes removed. The QSA helper and QSA overlay are byte-identical to the
-successful W4A16 reference. The CUTLASS expert overlay still disables fused
-finalization and uses the same retained post-finalization-change tactic cache.
-Both ranks must pass the cache hash check before stopping production.
+The explicit `--moe-backend flashinfer_cutlass` option changed vLLM's cache
+identity even though the backend matched the previous auto selection. Startup
+used a new cache and retuned 17 of 42 tactics instead of using the retained
+cache checked during preflight. See `invalid-control.json`.
 
-Two unchanged original requests run in one fresh TP2 world. Compared with the
-prior deterministic W4A4 campaign, only tracing/probes are removed. Compared
-with the successful W4A16 world, the expert backend and its associated staging
-and activation quantization differ. This does not isolate activation quantization
-from every other backend arithmetic difference.
+The first request was interrupted before a response. No accuracy conclusion
+is drawn. The full source/configuration, expected and effective caches, logs
+and restoration receipt are retained in `raw/`. Both reference containers were
+removed, and the exact production binary/configuration and inference were
+independently verified after restoration.
 
-Production restoration and independent binary/config/inference checks run in finally.
+A valid retry must retain the original default backend selection and verify
+the runtime cache identity and tactics before issuing the request. Merely
+checking that the expected cache file exists is insufficient.

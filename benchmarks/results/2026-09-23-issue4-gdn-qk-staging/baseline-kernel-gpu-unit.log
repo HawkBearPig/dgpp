@@ -1,0 +1,2 @@
+[FAIL] gdn_recurrent_matches_the_host_oracle: gdn out vs fp32 oracle (T=1): max_abs=0.000122 max_rel=0.439024 l2_rel=0.002435 mismatches=42/1536
+1 tests, 1 failed

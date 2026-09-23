@@ -1,0 +1,7 @@
+{
+  "base_commit": "d318815984fd2ab1f0a67a6b830b57730a57439a",
+  "binary_sha256": "e1ef574aa4cab5739f2c39a4c9cbeeefa4a988508f5d7f707eaa5c3d66692937",
+  "patch_sha256": "12d61ab4be98b95bb528d495aa2da9ccba0d0341e132c591f9055bb1cbd997d7",
+  "unit_binary_sha256": "155f503208a457a115172e3490cbdc9072529f02ad3f30eba1cf548ffa7b169b",
+  "source": "Previous expert staging control plus FP32 rotation products for main attention Q/K only; indexer keeps old policy."
+}

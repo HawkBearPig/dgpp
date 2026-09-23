@@ -29,8 +29,10 @@ consistency patch is not a prerequisite for the investigation.
 | [Real-fixture expert replay](2026-09-23-issue4-moe-audit/README.md) | Exact capture parity; 576 local and 288 folded chains pass | No detected routed/shared expert error on sampled inputs |
 | [GDN normalization policy](2026-09-23-issue4-gdn-norm/README.md) | Focused GPU tests pass; same original 5/6 answer | Lower operator error is insufficient to repair retrieval |
 | [FP32 routing weights](2026-09-23-issue4-router-fp32/README.md) | GPU router oracle passes; original request still 5/6 | Extra BF16 route-weight rounding is insufficient to explain the failure |
-| [Untraced deterministic W4A4 reference](2026-09-23-issue4-reference-w4a4-untraced/README.md) | Running | Removes the tracing/probe difference from the reference comparison |
-| [GDN normalized Q/K boundary](2026-09-23-issue4-gdn-qk-staging/README.md) | Built; four GPU tests pass; original request pending | Tests the reference prefill normalized-Q/K BF16 boundary in DGPP |
+| [Untraced deterministic W4A4 reference](2026-09-23-issue4-reference-w4a4-untraced/README.md) | Invalid; aborted before verdict | Explicit backend option changed the cache identity and retuned 17 tactics |
+| [GDN normalized Q/K boundary](2026-09-23-issue4-gdn-qk-staging/README.md) | Four GPU tests pass; unchanged original answer remains 5/6 | Normalized-Q/K BF16 rounding is insufficient to repair the failure |
+| [Expert output storage](2026-09-23-issue4-moe-staging/README.md) | Focused GPU check passes; same original 5/6 answer | Weighted-expert/shared BF16 stores are insufficient |
+| [Main Q/K rotation storage](2026-09-23-issue4-qsa-rope-staging/README.md) | Nine GPU tests pass; original replay pending | Tests FP32 products in the active fused reference RoPE path |
 
 [Draft PR #34](https://github.com/HawkBearPig/dgpp/pull/34) separates generation
 stop IDs from trained model EOS, preserving PLE semantics. The release build,
@@ -71,5 +73,9 @@ GDN normalization with FP32 intermediates has lower independent FP64 error in
 all 72 sampled rank/layer cases, but still returns the original 5/6 answer.
 FP32 expert routing weights also leave the original answer unchanged. The next
 DGPP control adds the reference prefill’s normalized-Q/K BF16 boundary; all four
-GDN GPU tests pass, and its original-request replay is pending. An untraced
-deterministic W4A4 reference is currently running.
+GDN GPU tests pass and the old kernel fails the new-boundary oracle, but the
+original request still produces the identical 5/6 answer. The next control
+adds the main Q/K reference rotation policy. Marlin-like expert output storage
+boundaries also leave the original 5/6 answer unchanged. The untraced W4A4 attempt was aborted because
+an explicit backend option changed the runtime cache identity and retuned
+17 tactics; no accuracy conclusion is drawn from that invalid comparison.

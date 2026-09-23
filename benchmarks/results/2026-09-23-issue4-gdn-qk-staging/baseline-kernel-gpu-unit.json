@@ -1,0 +1,8 @@
+{
+  "node": "192.168.88.13",
+  "binary_sha256": "fa1c8ff82e3a4e633912867b81e5e227ced07bbfc8592d860789b927c509a88a",
+  "idle_before": true,
+  "returncode": 1,
+  "wall_seconds": 0.7550468599656597,
+  "scope": "Original d318815 kda.cu linked against the new explicit-QK-boundary host oracle; same test input as passing candidate"
+}
