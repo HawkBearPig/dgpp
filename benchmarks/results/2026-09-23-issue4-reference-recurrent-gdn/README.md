@@ -1,4 +1,4 @@
-# Successful W4A16 reference with recurrent GDN prefill — prepared, not run
+# Successful W4A16 reference with recurrent GDN prefill — running
 
 Relative to the successful two-request untraced Marlin W4A16 reference, the
 only model-source change replaces the chunked GDN prefill call with the
@@ -30,3 +30,8 @@ A failure after this swap would be a lead, not a complete causal verdict: the
 unmodified Marlin baseline must then repeat successfully in another fresh
 world (A/B/A) before attributing the change to GDN arithmetic. The existing
 6/6 baseline consists of two requests in one world.
+
+The GPU adapter check passed: input state preserved, optional output buffer
+exact, direct-operator result exact, and repeated calls bitwise identical at
+1194 tokens and the real 8/24 head geometry. The isolated container was removed;
+both model workers are loading the pinned Marlin reference with the GDN overlay.

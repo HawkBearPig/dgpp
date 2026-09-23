@@ -1,0 +1,10 @@
+[
+  {
+    "file": "router.npz",
+    "sha256": "b83018771f92af3c1a5c18ec473fd673a8428d7f801e035a8794cb22b3be6a4b",
+    "rows": 576,
+    "experts": 512,
+    "topk": 10,
+    "cutoff_ties": 264
+  }
+]

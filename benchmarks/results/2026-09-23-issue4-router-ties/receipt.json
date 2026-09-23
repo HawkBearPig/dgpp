@@ -1,0 +1,8 @@
+{
+  "node": "stephen@192.168.88.13",
+  "image": "sha256:d464f3b466fa9c45ddbff8a812e80564503b6879a9fd95c1a47514f3f0df5a4a",
+  "script_sha256": "dbd4b0dda00c79f2bfe230634fcba24186280a5d060fc6c9b52c0f47da253b01",
+  "idle_verified": true,
+  "wall_seconds": 21.395187273970805,
+  "returncode": 0
+}

@@ -100,6 +100,10 @@ stopped = False
 try:
     stopped = True
     run('production-down', [sys.executable, str(ROOT / 'scripts/dgpp-cluster'), 'down', '--config', str(PROD)], timeout=120)
+    router = ROOT/'benchmarks/results/2026-09-23-issue4-router-ties'
+    run('router-tie-test',[sys.executable,str(router/'run.py')],timeout=420)
+    routing = json.loads((router/'comparison.json').read_text())
+    assert routing['selected_sets_match_dgpp'] and routing['call_shapes_exact'], 'Reference router differs; inspect before full-model GDN test'
     run('adapter-gpu-test',[sys.executable,str(RECORD/'run_adapter.py')],timeout=420)
     unit = json.loads((RECORD/'receipt.json').read_text())
     assert unit['returncode'] == 0 and unit['overlay_sha256'] == GDN_HASH

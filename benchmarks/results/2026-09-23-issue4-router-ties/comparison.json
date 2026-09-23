@@ -1,0 +1,26 @@
+{
+  "rows": 576,
+  "cutoff_ties": 264,
+  "call_shapes_exact": true,
+  "results": {
+    "1194": {
+      "differing_sets": 0,
+      "swaps": [],
+      "max_weight_sum_error": 2.384185791015625e-07,
+      "bf16_weights_exact": true
+    },
+    "2048": {
+      "differing_sets": 0,
+      "swaps": [],
+      "max_weight_sum_error": 2.384185791015625e-07,
+      "bf16_weights_exact": true
+    },
+    "1": {
+      "differing_sets": 0,
+      "swaps": [],
+      "max_weight_sum_error": 2.384185791015625e-07,
+      "bf16_weights_exact": true
+    }
+  },
+  "selected_sets_match_dgpp": true
+}

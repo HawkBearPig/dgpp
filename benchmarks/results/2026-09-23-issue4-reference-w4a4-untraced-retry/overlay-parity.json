@@ -1,0 +1,14 @@
+{
+  "issue4_topk.py": {
+    "w4a4": "09adcdbf0de0f14f8589d6d08098f16a76c5d376ccc3c472cb59a5aa1478ed68",
+    "w4a16": "09adcdbf0de0f14f8589d6d08098f16a76c5d376ccc3c472cb59a5aa1478ed68"
+  },
+  "raw/qsa.py": {
+    "w4a4": "d7a0c7690cae4a59a4f621b6b5b8abc904205371635c1c1fdef9d9bd3a682647",
+    "w4a16": "d7a0c7690cae4a59a4f621b6b5b8abc904205371635c1c1fdef9d9bd3a682647"
+  },
+  "raw/ple_layer.py": {
+    "w4a4": "9410518f08adc844c318af0f21518ebcb0cd7fd9e3b95a8448356cf52dec68dc",
+    "w4a16": "9410518f08adc844c318af0f21518ebcb0cd7fd9e3b95a8448356cf52dec68dc"
+  }
+}

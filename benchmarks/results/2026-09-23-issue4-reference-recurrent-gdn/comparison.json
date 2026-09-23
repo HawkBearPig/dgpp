@@ -1,0 +1,12 @@
+{
+  "pass": true,
+  "tokens": 1194,
+  "key_heads": 8,
+  "value_heads": 24,
+  "input_state_unchanged": true,
+  "optional_output_buffer_exact": true,
+  "direct_operator_exact": true,
+  "repeat_exact": true,
+  "warm_wall_seconds": 0.002750658997683786,
+  "scope": "Replicated frozen inputs test adapter shapes/state routing; not a model accuracy result."
+}
