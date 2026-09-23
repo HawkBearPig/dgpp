@@ -1,0 +1,26 @@
+{
+  "completed": true,
+  "recurrence_tokens_per_rank": 261290,
+  "ranks": 2,
+  "value_heads": 48,
+  "selfcheck_passed": true,
+  "cpu_only": true,
+  "production_left_online": true,
+  "recurrence_wall_seconds": 32.98,
+  "recurrence_peak_rss_kib": 33824,
+  "files_sha256": {
+    "prepare.py": "5dd68e9c5d4b12935f55831547d782fae989d15ff58991c1aaaf3d8c161f6e41",
+    "recur.cpp": "66eb687c4591830eac5abfaa3f194dcc48c4bf6fa4cc3938f8ea991a295aa4ef",
+    "check_recur.py": "71e7966a11460bf52f3769ef600a33e068b195c686b78323a1c6b9fc42eae4a0",
+    "analyze.py": "18e40e5019a054eb9fdfd67923f64202e1939b017bd55bd3024176d4037e6550",
+    "preparation.json": "d1c57016f17ea4e35d3e54d9dbaaa0026cf1515fdda9e0f93af2ee8b78c2ed63",
+    "selfcheck.json": "451da707121299c221dd145653bdde8c0c100365a45011b17b41498012197817",
+    "replay.json": "162f220e30d6aad0bd6275ef86d2ba57165926dedbfaed1d0c67c5cde82892ec"
+  },
+  "log_sha256": {
+    "prepare": "36e11bb0b356c52c16489a14a53a5b3cb2742bf28e58744b2ba55431b690d13a",
+    "selfcheck": "451da707121299c221dd145653bdde8c0c100365a45011b17b41498012197817",
+    "recur": "90eb1bca4a5612960a23f13ac55ce3d05bb77716c878c1e173688caead9cb7ba",
+    "analyze": "22533d8bf293531db5a2a25ff5f8b58646bcf3022bceb8e5c70a692d67d9d3c0"
+  }
+}

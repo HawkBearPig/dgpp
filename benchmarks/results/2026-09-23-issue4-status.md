@@ -252,3 +252,19 @@ using a bounded export from freshly rehashed complete post-PLE files. This
 checks the failed row's residual boundaries, not the whole prompt's earlier
 construction. The retrieval root cause and a causally supported fix remain
 unresolved; no additional reporter artifact is required for further local work.
+
+The [first-layer attention reconstruction](2026-09-23-issue4-first-layer/README.md)
+now starts directly from all 261290 diagnostic-prefix tokens and checkpoint
+weights. It independently reconstructs the GR input mixer and projections,
+then replays convolution and recurrence from zero for all 48 value heads.
+No captured activation or recurrent state seeds the calculation. A separate
+1201-token NumPy cross-check matches all BF16 outputs and agrees with FP64 state
+to within 8e-15 maximum absolute error. The full CPU recurrence takes 32.98 s
+and 33824 KiB peak RSS. Both final-chunk boundary states and all 1194 final
+rows are compared with native captures; folded attention-output relative L2
+is 0.002316724, with no nonfinite values. These measurements do not establish
+a violated numerical contract or a retrieval cause. Production remains online.
+The next bounded extension is to carry this independent first-layer history
+through its residual/expert computation at the relevant record and outlier
+positions, comparing with the saved pre-PLE residuals. Subsequent layers'
+earlier input construction remains outside this reconstruction.

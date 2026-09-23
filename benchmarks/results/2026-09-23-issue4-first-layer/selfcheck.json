@@ -1,0 +1,24 @@
+{
+  "passed": true,
+  "cases": [
+    {
+      "rank": 0,
+      "heads": 24,
+      "tokens": 1201,
+      "checkpoint_position": 7,
+      "state_max_abs_error": 6.217248937900877e-15,
+      "all_bf16_outputs_exact": true
+    },
+    {
+      "rank": 1,
+      "heads": 24,
+      "tokens": 1201,
+      "checkpoint_position": 7,
+      "state_max_abs_error": 7.993605777301127e-15,
+      "all_bf16_outputs_exact": true
+    }
+  ],
+  "executable_sha256": "f523060965a4434f02abf80319b7922a1e0a63d107c7ff4cd76dd4ec4fda8254",
+  "cpp_sha256": "66eb687c4591830eac5abfaa3f194dcc48c4bf6fa4cc3938f8ea991a295aa4ef",
+  "script_sha256": "71e7966a11460bf52f3769ef600a33e068b195c686b78323a1c6b9fc42eae4a0"
+}

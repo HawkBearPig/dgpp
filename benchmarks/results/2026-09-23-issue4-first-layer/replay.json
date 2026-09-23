@@ -1,0 +1,4547 @@
+{
+  "completed": true,
+  "tokens_replayed_from_zero": 261290,
+  "value_heads": 48,
+  "layers": 1,
+  "checkpoints": [
+    260096,
+    261290
+  ],
+  "final_chunk_rows_compared": 1194,
+  "checks": {
+    "rank0/state_before": {
+      "elements": 393216,
+      "relative_l2": 0.0027240767627614688,
+      "max_abs": 0.01451177336189069,
+      "bitwise_equal_elements": 0,
+      "two_bf16_relative_mismatches": 24130,
+      "mismatch_fraction": 0.061365763346354164,
+      "nonfinite": 0,
+      "worst_rows": [
+        {
+          "position": 9,
+          "relative_l2": 0.004989082405001185,
+          "max_abs": 0.005951508883450751,
+          "mismatches": 3985
+        },
+        {
+          "position": 19,
+          "relative_l2": 0.004729982810116273,
+          "max_abs": 0.007454154924103645,
+          "mismatches": 2943
+        },
+        {
+          "position": 18,
+          "relative_l2": 0.004101337640023578,
+          "max_abs": 0.013807436494377323,
+          "mismatches": 3264
+        },
+        {
+          "position": 5,
+          "relative_l2": 0.0026470738518973034,
+          "max_abs": 0.005727960335985771,
+          "mismatches": 2391
+        },
+        {
+          "position": 15,
+          "relative_l2": 0.0025552598181744143,
+          "max_abs": 0.01451177336189069,
+          "mismatches": 1678
+        },
+        {
+          "position": 0,
+          "relative_l2": 0.0020535570457131795,
+          "max_abs": 0.0021756567023381024,
+          "mismatches": 1566
+        },
+        {
+          "position": 14,
+          "relative_l2": 0.0018556124585614186,
+          "max_abs": 0.003035391790804365,
+          "mismatches": 281
+        },
+        {
+          "position": 11,
+          "relative_l2": 0.0013976137214299878,
+          "max_abs": 0.0008188506944338675,
+          "mismatches": 799
+        },
+        {
+          "position": 17,
+          "relative_l2": 0.001391836577608217,
+          "max_abs": 0.0011879912158527794,
+          "mismatches": 114
+        },
+        {
+          "position": 23,
+          "relative_l2": 0.0010709835628895943,
+          "max_abs": 0.0005152514451004786,
+          "mismatches": 767
+        }
+      ]
+    },
+    "rank0/state_after": {
+      "elements": 393216,
+      "relative_l2": 0.002200959616112763,
+      "max_abs": 0.014790332140673712,
+      "bitwise_equal_elements": 0,
+      "two_bf16_relative_mismatches": 12899,
+      "mismatch_fraction": 0.032803853352864586,
+      "nonfinite": 0,
+      "worst_rows": [
+        {
+          "position": 9,
+          "relative_l2": 0.004271817217315056,
+          "max_abs": 0.005389406732544733,
+          "mismatches": 3699
+        },
+        {
+          "position": 18,
+          "relative_l2": 0.0029085390831357647,
+          "max_abs": 0.009177155413679361,
+          "mismatches": 2791
+        },
+        {
+          "position": 23,
+          "relative_l2": 0.00253245004798635,
+          "max_abs": 0.0021136659203820907,
+          "mismatches": 812
+        },
+        {
+          "position": 15,
+          "relative_l2": 0.0023410868568935557,
+          "max_abs": 0.014790332140673712,
+          "mismatches": 1494
+        },
+        {
+          "position": 19,
+          "relative_l2": 0.002085042266126444,
+          "max_abs": 0.0018932556248953958,
+          "mismatches": 1738
+        },
+        {
+          "position": 4,
+          "relative_l2": 0.0005055662425386284,
+          "max_abs": 0.003627139811506863,
+          "mismatches": 455
+        },
+        {
+          "position": 21,
+          "relative_l2": 0.0004908860759735008,
+          "max_abs": 0.00020814470670776908,
+          "mismatches": 511
+        },
+        {
+          "position": 11,
+          "relative_l2": 0.00043467469726613623,
+          "max_abs": 0.0009713107030189239,
+          "mismatches": 91
+        },
+        {
+          "position": 5,
+          "relative_l2": 0.0003752990105465463,
+          "max_abs": 0.001209960198720994,
+          "mismatches": 436
+        },
+        {
+          "position": 7,
+          "relative_l2": 0.0003304930942690887,
+          "max_abs": 4.6540329499623195e-05,
+          "mismatches": 212
+        }
+      ]
+    },
+    "rank0/conv_before": {
+      "elements": 15360,
+      "relative_l2": 8.203188612066129e-05,
+      "max_abs": 0.015625,
+      "bitwise_equal_elements": 15337,
+      "two_bf16_relative_mismatches": 1,
+      "mismatch_fraction": 6.510416666666667e-05,
+      "nonfinite": 0,
+      "worst_rows": [
+        {
+          "position": 260095,
+          "relative_l2": 0.00011672474295886732,
+          "max_abs": 0.015625,
+          "mismatches": 0
+        },
+        {
+          "position": 260094,
+          "relative_l2": 6.563326051059118e-05,
+          "max_abs": 0.0078125,
+          "mismatches": 1
+        },
+        {
+          "position": 260093,
+          "relative_l2": 4.0519263720924455e-05,
+          "max_abs": 0.00390625,
+          "mismatches": 0
+        }
+      ]
+    },
+    "rank0/conv_after": {
+      "elements": 15360,
+      "relative_l2": 5.2154791092174416e-05,
+      "max_abs": 0.0078125,
+      "bitwise_equal_elements": 15345,
+      "two_bf16_relative_mismatches": 0,
+      "mismatch_fraction": 0.0,
+      "nonfinite": 0,
+      "worst_rows": [
+        {
+          "position": 261287,
+          "relative_l2": 6.705384955010199e-05,
+          "max_abs": 0.0078125,
+          "mismatches": 0
+        },
+        {
+          "position": 261288,
+          "relative_l2": 5.6722220341819026e-05,
+          "max_abs": 0.0078125,
+          "mismatches": 0
+        },
+        {
+          "position": 261289,
+          "relative_l2": 7.436196738782031e-06,
+          "max_abs": 0.0009765625,
+          "mismatches": 0
+        }
+      ]
+    },
+    "rank0/qkvc": {
+      "elements": 6113280,
+      "relative_l2": 0.0003427021883443426,
+      "max_abs": 0.03125,
+      "bitwise_equal_elements": 5931623,
+      "two_bf16_relative_mismatches": 22379,
+      "mismatch_fraction": 0.0036607189593802344,
+      "nonfinite": 0,
+      "worst_rows": [
+        {
+          "position": 261231,
+          "relative_l2": 0.003519306501832547,
+          "max_abs": 0.03125,
+          "mismatches": 259
+        },
+        {
+          "position": 261077,
+          "relative_l2": 0.003519306501832547,
+          "max_abs": 0.03125,
+          "mismatches": 259
+        },
+        {
+          "position": 261060,
+          "relative_l2": 0.0020422297729555884,
+          "max_abs": 0.03125,
+          "mismatches": 24
+        },
+        {
+          "position": 260629,
+          "relative_l2": 0.0015726442896371944,
+          "max_abs": 0.015625,
+          "mismatches": 126
+        },
+        {
+          "position": 261089,
+          "relative_l2": 0.001556753109691553,
+          "max_abs": 0.015625,
+          "mismatches": 99
+        },
+        {
+          "position": 261261,
+          "relative_l2": 0.001556753109691553,
+          "max_abs": 0.015625,
+          "mismatches": 99
+        },
+        {
+          "position": 260891,
+          "relative_l2": 0.0015326624356063133,
+          "max_abs": 0.015625,
+          "mismatches": 116
+        },
+        {
+          "position": 261232,
+          "relative_l2": 0.0011992267805365185,
+          "max_abs": 0.015625,
+          "mismatches": 141
+        },
+        {
+          "position": 261078,
+          "relative_l2": 0.0011992267805365185,
+          "max_abs": 0.015625,
+          "mismatches": 141
+        },
+        {
+          "position": 261114,
+          "relative_l2": 0.00118839904233326,
+          "max_abs": 0.015625,
+          "mismatches": 36
+        }
+      ]
+    },
+    "rank0/core": {
+      "elements": 3667968,
+      "relative_l2": 0.0020191549573922367,
+      "max_abs": 0.0078125,
+      "bitwise_equal_elements": 3097500,
+      "two_bf16_relative_mismatches": 65573,
+      "mismatch_fraction": 0.01787720067350642,
+      "nonfinite": 0,
+      "worst_rows": [
+        {
+          "position": 261133,
+          "relative_l2": 0.006010374122062813,
+          "max_abs": 0.0078125,
+          "mismatches": 52
+        },
+        {
+          "position": 261016,
+          "relative_l2": 0.00582382168172363,
+          "max_abs": 0.0078125,
+          "mismatches": 47
+        },
+        {
+          "position": 261138,
+          "relative_l2": 0.005772759895507972,
+          "max_abs": 0.0078125,
+          "mismatches": 60
+        },
+        {
+          "position": 260515,
+          "relative_l2": 0.005600077967438762,
+          "max_abs": 0.0078125,
+          "mismatches": 57
+        },
+        {
+          "position": 260590,
+          "relative_l2": 0.005560156809312164,
+          "max_abs": 0.0078125,
+          "mismatches": 50
+        },
+        {
+          "position": 260513,
+          "relative_l2": 0.0055225139177360934,
+          "max_abs": 0.0078125,
+          "mismatches": 59
+        },
+        {
+          "position": 260969,
+          "relative_l2": 0.005521961034332745,
+          "max_abs": 0.0078125,
+          "mismatches": 52
+        },
+        {
+          "position": 261232,
+          "relative_l2": 0.005515688669684138,
+          "max_abs": 0.0078125,
+          "mismatches": 89
+        },
+        {
+          "position": 261018,
+          "relative_l2": 0.005466625330174454,
+          "max_abs": 0.0078125,
+          "mismatches": 41
+        },
+        {
+          "position": 260296,
+          "relative_l2": 0.00544366769229087,
+          "max_abs": 0.0078125,
+          "mismatches": 47
+        }
+      ]
+    },
+    "rank0/gated_norm": {
+      "elements": 3667968,
+      "relative_l2": 0.0016312895701674078,
+      "max_abs": 0.0078125,
+      "bitwise_equal_elements": 3108195,
+      "two_bf16_relative_mismatches": 90734,
+      "mismatch_fraction": 0.02473685702819654,
+      "nonfinite": 0,
+      "worst_rows": [
+        {
+          "position": 261119,
+          "relative_l2": 0.0052654791836469145,
+          "max_abs": 0.0078125,
+          "mismatches": 80
+        },
+        {
+          "position": 261112,
+          "relative_l2": 0.005080665282715209,
+          "max_abs": 0.0078125,
+          "mismatches": 139
+        },
+        {
+          "position": 261117,
+          "relative_l2": 0.00438985744802367,
+          "max_abs": 0.0078125,
+          "mismatches": 82
+        },
+        {
+          "position": 261077,
+          "relative_l2": 0.0043351423395205915,
+          "max_abs": 0.00390625,
+          "mismatches": 438
+        },
+        {
+          "position": 261232,
+          "relative_l2": 0.004192346728239787,
+          "max_abs": 0.0078125,
+          "mismatches": 143
+        },
+        {
+          "position": 261231,
+          "relative_l2": 0.004160183698280033,
+          "max_abs": 0.00390625,
+          "mismatches": 424
+        },
+        {
+          "position": 260946,
+          "relative_l2": 0.0038520342577932336,
+          "max_abs": 0.0078125,
+          "mismatches": 156
+        },
+        {
+          "position": 261078,
+          "relative_l2": 0.0037792176209635185,
+          "max_abs": 0.0078125,
+          "mismatches": 145
+        },
+        {
+          "position": 260734,
+          "relative_l2": 0.0035695610398596305,
+          "max_abs": 0.0078125,
+          "mismatches": 58
+        },
+        {
+          "position": 260194,
+          "relative_l2": 0.003504104758814089,
+          "max_abs": 0.0078125,
+          "mismatches": 71
+        }
+      ]
+    },
+    "rank1/state_before": {
+      "elements": 393216,
+      "relative_l2": 0.0012136737418574758,
+      "max_abs": 0.012816967347610841,
+      "bitwise_equal_elements": 0,
+      "two_bf16_relative_mismatches": 12717,
+      "mismatch_fraction": 0.03234100341796875,
+      "nonfinite": 0,
+      "worst_rows": [
+        {
+          "position": 45,
+          "relative_l2": 0.002171559139104745,
+          "max_abs": 0.003312054425468336,
+          "mismatches": 1030
+        },
+        {
+          "position": 46,
+          "relative_l2": 0.001979981176359872,
+          "max_abs": 0.0032443533827237955,
+          "mismatches": 1801
+        },
+        {
+          "position": 44,
+          "relative_l2": 0.0015513286777406917,
+          "max_abs": 0.0013097955747894963,
+          "mismatches": 148
+        },
+        {
+          "position": 29,
+          "relative_l2": 0.0015455509938319437,
+          "max_abs": 0.012816967347610841,
+          "mismatches": 1852
+        },
+        {
+          "position": 30,
+          "relative_l2": 0.001271830099842356,
+          "max_abs": 0.003903739743448653,
+          "mismatches": 1490
+        },
+        {
+          "position": 43,
+          "relative_l2": 0.00118078313060321,
+          "max_abs": 0.0013153311121443245,
+          "mismatches": 123
+        },
+        {
+          "position": 35,
+          "relative_l2": 0.0011546546369439218,
+          "max_abs": 0.0017518792388102403,
+          "mismatches": 1240
+        },
+        {
+          "position": 39,
+          "relative_l2": 0.0009440788972491981,
+          "max_abs": 0.005645124500796239,
+          "mismatches": 989
+        },
+        {
+          "position": 36,
+          "relative_l2": 0.000604194501318981,
+          "max_abs": 0.0006501880813216676,
+          "mismatches": 924
+        },
+        {
+          "position": 31,
+          "relative_l2": 0.0005977594925453842,
+          "max_abs": 0.0006934594752928125,
+          "mismatches": 532
+        }
+      ]
+    },
+    "rank1/state_after": {
+      "elements": 393216,
+      "relative_l2": 0.001025796901723865,
+      "max_abs": 0.012525814191246099,
+      "bitwise_equal_elements": 0,
+      "two_bf16_relative_mismatches": 6615,
+      "mismatch_fraction": 0.01682281494140625,
+      "nonfinite": 0,
+      "worst_rows": [
+        {
+          "position": 29,
+          "relative_l2": 0.001505916388658742,
+          "max_abs": 0.012525814191246099,
+          "mismatches": 1787
+        },
+        {
+          "position": 46,
+          "relative_l2": 0.0010670135721252195,
+          "max_abs": 0.0016615487007183294,
+          "mismatches": 1121
+        },
+        {
+          "position": 35,
+          "relative_l2": 0.0007670127643731862,
+          "max_abs": 0.0014970224532481757,
+          "mismatches": 951
+        },
+        {
+          "position": 39,
+          "relative_l2": 0.0006554701596648677,
+          "max_abs": 0.00352717797567903,
+          "mismatches": 763
+        },
+        {
+          "position": 47,
+          "relative_l2": 0.0006503926557928057,
+          "max_abs": 0.000877388556934644,
+          "mismatches": 583
+        },
+        {
+          "position": 31,
+          "relative_l2": 0.0004670524792877628,
+          "max_abs": 0.0011121481905125297,
+          "mismatches": 263
+        },
+        {
+          "position": 32,
+          "relative_l2": 0.0003748808229490516,
+          "max_abs": 0.0005303431350459631,
+          "mismatches": 465
+        },
+        {
+          "position": 40,
+          "relative_l2": 0.0001805219308271273,
+          "max_abs": 0.00038054833195415305,
+          "mismatches": 0
+        },
+        {
+          "position": 30,
+          "relative_l2": 0.00017556328580424147,
+          "max_abs": 0.000356579567930837,
+          "mismatches": 269
+        },
+        {
+          "position": 27,
+          "relative_l2": 0.0001634863096410123,
+          "max_abs": 0.00016983772941969733,
+          "mismatches": 146
+        }
+      ]
+    },
+    "rank1/conv_before": {
+      "elements": 15360,
+      "relative_l2": 0.00025177477141279775,
+      "max_abs": 0.0625,
+      "bitwise_equal_elements": 15345,
+      "two_bf16_relative_mismatches": 0,
+      "mismatch_fraction": 0.0,
+      "nonfinite": 0,
+      "worst_rows": [
+        {
+          "position": 260093,
+          "relative_l2": 0.00040806380672279725,
+          "max_abs": 0.0625,
+          "mismatches": 0
+        },
+        {
+          "position": 260094,
+          "relative_l2": 0.00019003731176242726,
+          "max_abs": 0.03125,
+          "mismatches": 0
+        },
+        {
+          "position": 260095,
+          "relative_l2": 4.4584633670665174e-05,
+          "max_abs": 0.0078125,
+          "mismatches": 0
+        }
+      ]
+    },
+    "rank1/conv_after": {
+      "elements": 15360,
+      "relative_l2": 0.00013664512153696874,
+      "max_abs": 0.03125,
+      "bitwise_equal_elements": 15336,
+      "two_bf16_relative_mismatches": 1,
+      "mismatch_fraction": 6.510416666666667e-05,
+      "nonfinite": 0,
+      "worst_rows": [
+        {
+          "position": 261289,
+          "relative_l2": 0.00022862099237623104,
+          "max_abs": 0.03125,
+          "mismatches": 1
+        },
+        {
+          "position": 261288,
+          "relative_l2": 8.681327201715953e-05,
+          "max_abs": 0.0078125,
+          "mismatches": 0
+        },
+        {
+          "position": 261287,
+          "relative_l2": 2.1691792461807248e-05,
+          "max_abs": 0.00390625,
+          "mismatches": 0
+        }
+      ]
+    },
+    "rank1/qkvc": {
+      "elements": 6113280,
+      "relative_l2": 0.00040342831038477084,
+      "max_abs": 0.03125,
+      "bitwise_equal_elements": 5966613,
+      "two_bf16_relative_mismatches": 18146,
+      "mismatch_fraction": 0.0029682919807370186,
+      "nonfinite": 0,
+      "worst_rows": [
+        {
+          "position": 261231,
+          "relative_l2": 0.0023246469322617015,
+          "max_abs": 0.015625,
+          "mismatches": 184
+        },
+        {
+          "position": 261077,
+          "relative_l2": 0.0023246469322617015,
+          "max_abs": 0.015625,
+          "mismatches": 184
+        },
+        {
+          "position": 260491,
+          "relative_l2": 0.0022624522471717716,
+          "max_abs": 0.03125,
+          "mismatches": 99
+        },
+        {
+          "position": 260964,
+          "relative_l2": 0.0022475634862221356,
+          "max_abs": 0.03125,
+          "mismatches": 62
+        },
+        {
+          "position": 260933,
+          "relative_l2": 0.002231919625639706,
+          "max_abs": 0.03125,
+          "mismatches": 8
+        },
+        {
+          "position": 261144,
+          "relative_l2": 0.0022110902228956552,
+          "max_abs": 0.03125,
+          "mismatches": 22
+        },
+        {
+          "position": 260284,
+          "relative_l2": 0.0022047712615948438,
+          "max_abs": 0.03125,
+          "mismatches": 20
+        },
+        {
+          "position": 260179,
+          "relative_l2": 0.0022030834766866656,
+          "max_abs": 0.03125,
+          "mismatches": 84
+        },
+        {
+          "position": 260302,
+          "relative_l2": 0.002195710484358522,
+          "max_abs": 0.03125,
+          "mismatches": 20
+        },
+        {
+          "position": 261235,
+          "relative_l2": 0.002188045499311191,
+          "max_abs": 0.03125,
+          "mismatches": 21
+        }
+      ]
+    },
+    "rank1/core": {
+      "elements": 3667968,
+      "relative_l2": 0.0016839493474688882,
+      "max_abs": 0.0078125,
+      "bitwise_equal_elements": 3342769,
+      "two_bf16_relative_mismatches": 27176,
+      "mismatch_fraction": 0.007409006839754327,
+      "nonfinite": 0,
+      "worst_rows": [
+        {
+          "position": 260855,
+          "relative_l2": 0.005613244686781333,
+          "max_abs": 0.0078125,
+          "mismatches": 20
+        },
+        {
+          "position": 260922,
+          "relative_l2": 0.005547072464064558,
+          "max_abs": 0.0078125,
+          "mismatches": 22
+        },
+        {
+          "position": 260568,
+          "relative_l2": 0.005027426783144128,
+          "max_abs": 0.0078125,
+          "mismatches": 23
+        },
+        {
+          "position": 260589,
+          "relative_l2": 0.004974117440965863,
+          "max_abs": 0.0078125,
+          "mismatches": 10
+        },
+        {
+          "position": 261095,
+          "relative_l2": 0.0048938175875615254,
+          "max_abs": 0.0078125,
+          "mismatches": 18
+        },
+        {
+          "position": 260223,
+          "relative_l2": 0.004859927999127074,
+          "max_abs": 0.0078125,
+          "mismatches": 19
+        },
+        {
+          "position": 260198,
+          "relative_l2": 0.00477747799148339,
+          "max_abs": 0.0078125,
+          "mismatches": 37
+        },
+        {
+          "position": 261122,
+          "relative_l2": 0.004773289701788086,
+          "max_abs": 0.0078125,
+          "mismatches": 19
+        },
+        {
+          "position": 260097,
+          "relative_l2": 0.004745224307651305,
+          "max_abs": 0.0078125,
+          "mismatches": 27
+        },
+        {
+          "position": 260343,
+          "relative_l2": 0.00465012010176712,
+          "max_abs": 0.0078125,
+          "mismatches": 37
+        }
+      ]
+    },
+    "rank1/gated_norm": {
+      "elements": 3667968,
+      "relative_l2": 0.0013523611373475622,
+      "max_abs": 0.01171875,
+      "bitwise_equal_elements": 3334687,
+      "two_bf16_relative_mismatches": 37937,
+      "mismatch_fraction": 0.01034278379745952,
+      "nonfinite": 0,
+      "worst_rows": [
+        {
+          "position": 261231,
+          "relative_l2": 0.004855620809812538,
+          "max_abs": 0.0078125,
+          "mismatches": 319
+        },
+        {
+          "position": 261077,
+          "relative_l2": 0.00464816815096774,
+          "max_abs": 0.0078125,
+          "mismatches": 310
+        },
+        {
+          "position": 261234,
+          "relative_l2": 0.004047730744365224,
+          "max_abs": 0.0078125,
+          "mismatches": 106
+        },
+        {
+          "position": 261080,
+          "relative_l2": 0.003778838630970636,
+          "max_abs": 0.0078125,
+          "mismatches": 125
+        },
+        {
+          "position": 261078,
+          "relative_l2": 0.0037622892348199485,
+          "max_abs": 0.01171875,
+          "mismatches": 141
+        },
+        {
+          "position": 261232,
+          "relative_l2": 0.0036144239490687436,
+          "max_abs": 0.01171875,
+          "mismatches": 145
+        },
+        {
+          "position": 260284,
+          "relative_l2": 0.0036094909158126604,
+          "max_abs": 0.0078125,
+          "mismatches": 51
+        },
+        {
+          "position": 261112,
+          "relative_l2": 0.003537953872887242,
+          "max_abs": 0.0078125,
+          "mismatches": 40
+        },
+        {
+          "position": 260933,
+          "relative_l2": 0.003504314255942125,
+          "max_abs": 0.0078125,
+          "mismatches": 40
+        },
+        {
+          "position": 260376,
+          "relative_l2": 0.00349148920807691,
+          "max_abs": 0.0078125,
+          "mismatches": 70
+        }
+      ]
+    },
+    "folded_attention_output": {
+      "elements": 3056640,
+      "relative_l2": 0.0023167241272429476,
+      "max_abs": 0.0078125,
+      "bitwise_equal_elements": 2085160,
+      "two_bf16_relative_mismatches": 169858,
+      "mismatch_fraction": 0.055570168551088775,
+      "nonfinite": 0,
+      "worst_rows": [
+        {
+          "position": 261231,
+          "relative_l2": 0.005712026368756484,
+          "max_abs": 0.00390625,
+          "mismatches": 419
+        },
+        {
+          "position": 261077,
+          "relative_l2": 0.005530202165180621,
+          "max_abs": 0.00390625,
+          "mismatches": 454
+        },
+        {
+          "position": 261112,
+          "relative_l2": 0.0052804842102886105,
+          "max_abs": 0.0048828125,
+          "mismatches": 399
+        },
+        {
+          "position": 261119,
+          "relative_l2": 0.004824150472892904,
+          "max_abs": 0.00390625,
+          "mismatches": 356
+        },
+        {
+          "position": 261117,
+          "relative_l2": 0.004465036966372519,
+          "max_abs": 0.00390625,
+          "mismatches": 303
+        },
+        {
+          "position": 261228,
+          "relative_l2": 0.004116165011791553,
+          "max_abs": 0.0078125,
+          "mismatches": 262
+        },
+        {
+          "position": 261234,
+          "relative_l2": 0.0040261956976022145,
+          "max_abs": 0.0078125,
+          "mismatches": 316
+        },
+        {
+          "position": 261074,
+          "relative_l2": 0.003958819534985685,
+          "max_abs": 0.0078125,
+          "mismatches": 305
+        },
+        {
+          "position": 261061,
+          "relative_l2": 0.0037082910642023638,
+          "max_abs": 0.00390625,
+          "mismatches": 231
+        },
+        {
+          "position": 261029,
+          "relative_l2": 0.003698897974417615,
+          "max_abs": 0.00390625,
+          "mismatches": 226
+        }
+      ]
+    }
+  },
+  "per_head_core": [
+    {
+      "rank": 0,
+      "head": 0,
+      "core": {
+        "elements": 152832,
+        "relative_l2": 0.0006323901068489331,
+        "max_abs": 0.0001220703125,
+        "bitwise_equal_elements": 138677,
+        "two_bf16_relative_mismatches": 109,
+        "mismatch_fraction": 0.0007132014237855946,
+        "nonfinite": 0,
+        "worst_rows": [
+          {
+            "position": 260457,
+            "relative_l2": 0.007095627629602115,
+            "max_abs": 0.0001220703125,
+            "mismatches": 1
+          },
+          {
+            "position": 260246,
+            "relative_l2": 0.0063323838199078235,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 260099,
+            "relative_l2": 0.0063227552537768105,
+            "max_abs": 0.0001220703125,
+            "mismatches": 0
+          },
+          {
+            "position": 261268,
+            "relative_l2": 0.006246498743772598,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 261056,
+            "relative_l2": 0.006097193974029933,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 1
+          },
+          {
+            "position": 261262,
+            "relative_l2": 0.0058715388996567934,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 261055,
+            "relative_l2": 0.005770753702958713,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 260165,
+            "relative_l2": 0.005578397815610544,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 261234,
+            "relative_l2": 0.005551541380712279,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 260893,
+            "relative_l2": 0.005106918673681689,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 2
+          }
+        ]
+      }
+    },
+    {
+      "rank": 0,
+      "head": 1,
+      "core": {
+        "elements": 152832,
+        "relative_l2": 0.0005619424487867797,
+        "max_abs": 0.0001220703125,
+        "bitwise_equal_elements": 140447,
+        "two_bf16_relative_mismatches": 173,
+        "mismatch_fraction": 0.00113196189279732,
+        "nonfinite": 0,
+        "worst_rows": [
+          {
+            "position": 260452,
+            "relative_l2": 0.0065177668689971715,
+            "max_abs": 0.0001220703125,
+            "mismatches": 3
+          },
+          {
+            "position": 260768,
+            "relative_l2": 0.006114407207895925,
+            "max_abs": 0.0001220703125,
+            "mismatches": 0
+          },
+          {
+            "position": 260516,
+            "relative_l2": 0.0056667111318679155,
+            "max_abs": 3.0517578125e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 260455,
+            "relative_l2": 0.005585977946889166,
+            "max_abs": 0.0001220703125,
+            "mismatches": 3
+          },
+          {
+            "position": 260148,
+            "relative_l2": 0.005515927306428864,
+            "max_abs": 0.0001220703125,
+            "mismatches": 0
+          },
+          {
+            "position": 261075,
+            "relative_l2": 0.0054917896813256005,
+            "max_abs": 0.0001220703125,
+            "mismatches": 0
+          },
+          {
+            "position": 260896,
+            "relative_l2": 0.005308802955868936,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 261235,
+            "relative_l2": 0.004644995405805291,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 5
+          },
+          {
+            "position": 260648,
+            "relative_l2": 0.004578085504634232,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 261081,
+            "relative_l2": 0.004278682296703652,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 6
+          }
+        ]
+      }
+    },
+    {
+      "rank": 0,
+      "head": 2,
+      "core": {
+        "elements": 152832,
+        "relative_l2": 0.000690061847904015,
+        "max_abs": 0.0001220703125,
+        "bitwise_equal_elements": 143116,
+        "two_bf16_relative_mismatches": 170,
+        "mismatch_fraction": 0.0011123324958123952,
+        "nonfinite": 0,
+        "worst_rows": [
+          {
+            "position": 261016,
+            "relative_l2": 0.0067690805377344935,
+            "max_abs": 0.0001220703125,
+            "mismatches": 0
+          },
+          {
+            "position": 261252,
+            "relative_l2": 0.0065214022726103665,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 260250,
+            "relative_l2": 0.005876006642540623,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 261079,
+            "relative_l2": 0.0057779175235678215,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 5
+          },
+          {
+            "position": 260446,
+            "relative_l2": 0.005625344542077684,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 260785,
+            "relative_l2": 0.005339307575977052,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 1
+          },
+          {
+            "position": 260799,
+            "relative_l2": 0.005232074394320588,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 261001,
+            "relative_l2": 0.005099427773180821,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 261077,
+            "relative_l2": 0.004677511051344363,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 4
+          },
+          {
+            "position": 261231,
+            "relative_l2": 0.0046725752291980616,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 4
+          }
+        ]
+      }
+    },
+    {
+      "rank": 0,
+      "head": 3,
+      "core": {
+        "elements": 152832,
+        "relative_l2": 0.0007518738924072968,
+        "max_abs": 0.000244140625,
+        "bitwise_equal_elements": 145026,
+        "two_bf16_relative_mismatches": 419,
+        "mismatch_fraction": 0.002741572445561139,
+        "nonfinite": 0,
+        "worst_rows": [
+          {
+            "position": 260648,
+            "relative_l2": 0.007680002125062551,
+            "max_abs": 0.000244140625,
+            "mismatches": 0
+          },
+          {
+            "position": 260135,
+            "relative_l2": 0.006660591814093814,
+            "max_abs": 0.000244140625,
+            "mismatches": 0
+          },
+          {
+            "position": 261077,
+            "relative_l2": 0.006392614900092758,
+            "max_abs": 0.000244140625,
+            "mismatches": 8
+          },
+          {
+            "position": 261231,
+            "relative_l2": 0.006392614900092758,
+            "max_abs": 0.000244140625,
+            "mismatches": 8
+          },
+          {
+            "position": 260194,
+            "relative_l2": 0.00637704777694063,
+            "max_abs": 0.000244140625,
+            "mismatches": 0
+          },
+          {
+            "position": 260930,
+            "relative_l2": 0.006131711324107183,
+            "max_abs": 0.000244140625,
+            "mismatches": 0
+          },
+          {
+            "position": 260325,
+            "relative_l2": 0.0060923561143791825,
+            "max_abs": 0.000244140625,
+            "mismatches": 0
+          },
+          {
+            "position": 260929,
+            "relative_l2": 0.005994489099364991,
+            "max_abs": 0.000244140625,
+            "mismatches": 0
+          },
+          {
+            "position": 261078,
+            "relative_l2": 0.005937905598048259,
+            "max_abs": 0.000244140625,
+            "mismatches": 2
+          },
+          {
+            "position": 261232,
+            "relative_l2": 0.005937905598048259,
+            "max_abs": 0.000244140625,
+            "mismatches": 2
+          }
+        ]
+      }
+    },
+    {
+      "rank": 0,
+      "head": 4,
+      "core": {
+        "elements": 152832,
+        "relative_l2": 0.0008643224572307029,
+        "max_abs": 0.00390625,
+        "bitwise_equal_elements": 126548,
+        "two_bf16_relative_mismatches": 2197,
+        "mismatch_fraction": 0.014375261725293133,
+        "nonfinite": 0,
+        "worst_rows": [
+          {
+            "position": 260406,
+            "relative_l2": 0.00766192454031301,
+            "max_abs": 0.00390625,
+            "mismatches": 2
+          },
+          {
+            "position": 260801,
+            "relative_l2": 0.007604361780959783,
+            "max_abs": 0.00390625,
+            "mismatches": 2
+          },
+          {
+            "position": 260734,
+            "relative_l2": 0.007491400959098136,
+            "max_abs": 0.00390625,
+            "mismatches": 4
+          },
+          {
+            "position": 260259,
+            "relative_l2": 0.007011954963346458,
+            "max_abs": 0.00390625,
+            "mismatches": 2
+          },
+          {
+            "position": 260311,
+            "relative_l2": 0.0064602133072678624,
+            "max_abs": 0.00390625,
+            "mismatches": 2
+          },
+          {
+            "position": 260885,
+            "relative_l2": 0.0061061902433291685,
+            "max_abs": 0.00390625,
+            "mismatches": 2
+          },
+          {
+            "position": 260324,
+            "relative_l2": 0.0059618849537251125,
+            "max_abs": 0.00390625,
+            "mismatches": 5
+          },
+          {
+            "position": 260748,
+            "relative_l2": 0.005954697764254751,
+            "max_abs": 0.00390625,
+            "mismatches": 1
+          },
+          {
+            "position": 260322,
+            "relative_l2": 0.005949451910515955,
+            "max_abs": 0.00390625,
+            "mismatches": 4
+          },
+          {
+            "position": 260491,
+            "relative_l2": 0.005888888171845971,
+            "max_abs": 0.00390625,
+            "mismatches": 3
+          }
+        ]
+      }
+    },
+    {
+      "rank": 0,
+      "head": 5,
+      "core": {
+        "elements": 152832,
+        "relative_l2": 0.0007848080489546543,
+        "max_abs": 0.001953125,
+        "bitwise_equal_elements": 133349,
+        "two_bf16_relative_mismatches": 1826,
+        "mismatch_fraction": 0.011947759631490787,
+        "nonfinite": 0,
+        "worst_rows": [
+          {
+            "position": 260127,
+            "relative_l2": 0.005811949879346276,
+            "max_abs": 0.001953125,
+            "mismatches": 6
+          },
+          {
+            "position": 260129,
+            "relative_l2": 0.005256782616811221,
+            "max_abs": 0.001953125,
+            "mismatches": 9
+          },
+          {
+            "position": 260615,
+            "relative_l2": 0.005053005544320762,
+            "max_abs": 0.001953125,
+            "mismatches": 2
+          },
+          {
+            "position": 260128,
+            "relative_l2": 0.004988409178538424,
+            "max_abs": 0.001953125,
+            "mismatches": 4
+          },
+          {
+            "position": 260124,
+            "relative_l2": 0.004969309263639995,
+            "max_abs": 0.001953125,
+            "mismatches": 3
+          },
+          {
+            "position": 260173,
+            "relative_l2": 0.0049415445717329925,
+            "max_abs": 0.001953125,
+            "mismatches": 1
+          },
+          {
+            "position": 260163,
+            "relative_l2": 0.004899492830911638,
+            "max_abs": 0.001953125,
+            "mismatches": 1
+          },
+          {
+            "position": 260252,
+            "relative_l2": 0.004846583376231052,
+            "max_abs": 0.001953125,
+            "mismatches": 2
+          },
+          {
+            "position": 260917,
+            "relative_l2": 0.004794971726060392,
+            "max_abs": 0.001953125,
+            "mismatches": 3
+          },
+          {
+            "position": 260723,
+            "relative_l2": 0.004681797169519316,
+            "max_abs": 0.001953125,
+            "mismatches": 0
+          }
+        ]
+      }
+    },
+    {
+      "rank": 0,
+      "head": 6,
+      "core": {
+        "elements": 152832,
+        "relative_l2": 0.0006298634071071039,
+        "max_abs": 7.62939453125e-06,
+        "bitwise_equal_elements": 142192,
+        "two_bf16_relative_mismatches": 71,
+        "mismatch_fraction": 0.00046456239530988277,
+        "nonfinite": 0,
+        "worst_rows": [
+          {
+            "position": 261060,
+            "relative_l2": 0.007872328219187891,
+            "max_abs": 7.62939453125e-06,
+            "mismatches": 0
+          },
+          {
+            "position": 260907,
+            "relative_l2": 0.0045389912796687144,
+            "max_abs": 7.62939453125e-06,
+            "mismatches": 3
+          },
+          {
+            "position": 261061,
+            "relative_l2": 0.0045219928335725485,
+            "max_abs": 3.814697265625e-06,
+            "mismatches": 0
+          },
+          {
+            "position": 261194,
+            "relative_l2": 0.004100054141124896,
+            "max_abs": 3.814697265625e-06,
+            "mismatches": 0
+          },
+          {
+            "position": 261077,
+            "relative_l2": 0.0034335533151358716,
+            "max_abs": 3.814697265625e-06,
+            "mismatches": 3
+          },
+          {
+            "position": 260222,
+            "relative_l2": 0.003090752476027442,
+            "max_abs": 3.814697265625e-06,
+            "mismatches": 0
+          },
+          {
+            "position": 260400,
+            "relative_l2": 0.0028490331559242288,
+            "max_abs": 3.814697265625e-06,
+            "mismatches": 0
+          },
+          {
+            "position": 260492,
+            "relative_l2": 0.0028293348392190634,
+            "max_abs": 3.814697265625e-06,
+            "mismatches": 0
+          },
+          {
+            "position": 261158,
+            "relative_l2": 0.002770649993092984,
+            "max_abs": 3.814697265625e-06,
+            "mismatches": 0
+          },
+          {
+            "position": 260414,
+            "relative_l2": 0.0026560153378887004,
+            "max_abs": 3.814697265625e-06,
+            "mismatches": 0
+          }
+        ]
+      }
+    },
+    {
+      "rank": 0,
+      "head": 7,
+      "core": {
+        "elements": 152832,
+        "relative_l2": 0.0008062274216385617,
+        "max_abs": 7.62939453125e-06,
+        "bitwise_equal_elements": 141349,
+        "two_bf16_relative_mismatches": 79,
+        "mismatch_fraction": 0.0005169074539363484,
+        "nonfinite": 0,
+        "worst_rows": [
+          {
+            "position": 261060,
+            "relative_l2": 0.007536295756980136,
+            "max_abs": 7.62939453125e-06,
+            "mismatches": 2
+          },
+          {
+            "position": 260889,
+            "relative_l2": 0.006168964161689649,
+            "max_abs": 7.62939453125e-06,
+            "mismatches": 1
+          },
+          {
+            "position": 260376,
+            "relative_l2": 0.005842266033255943,
+            "max_abs": 7.62939453125e-06,
+            "mismatches": 0
+          },
+          {
+            "position": 261194,
+            "relative_l2": 0.005631620467005945,
+            "max_abs": 7.62939453125e-06,
+            "mismatches": 0
+          },
+          {
+            "position": 260590,
+            "relative_l2": 0.005593149887777171,
+            "max_abs": 7.62939453125e-06,
+            "mismatches": 0
+          },
+          {
+            "position": 260699,
+            "relative_l2": 0.005583256870283497,
+            "max_abs": 7.62939453125e-06,
+            "mismatches": 0
+          },
+          {
+            "position": 260261,
+            "relative_l2": 0.005562043895486574,
+            "max_abs": 7.62939453125e-06,
+            "mismatches": 0
+          },
+          {
+            "position": 261152,
+            "relative_l2": 0.005153957640611764,
+            "max_abs": 7.62939453125e-06,
+            "mismatches": 0
+          },
+          {
+            "position": 261114,
+            "relative_l2": 0.003968124321502499,
+            "max_abs": 3.814697265625e-06,
+            "mismatches": 0
+          },
+          {
+            "position": 261270,
+            "relative_l2": 0.0038199020014690692,
+            "max_abs": 3.814697265625e-06,
+            "mismatches": 0
+          }
+        ]
+      }
+    },
+    {
+      "rank": 0,
+      "head": 8,
+      "core": {
+        "elements": 152832,
+        "relative_l2": 0.0005599682941371721,
+        "max_abs": 3.0517578125e-05,
+        "bitwise_equal_elements": 140131,
+        "two_bf16_relative_mismatches": 94,
+        "mismatch_fraction": 0.0006150544388609715,
+        "nonfinite": 0,
+        "worst_rows": [
+          {
+            "position": 261060,
+            "relative_l2": 0.008058568897917739,
+            "max_abs": 3.0517578125e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 260768,
+            "relative_l2": 0.006967900604663963,
+            "max_abs": 3.0517578125e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 261194,
+            "relative_l2": 0.006398362861050475,
+            "max_abs": 3.0517578125e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 261010,
+            "relative_l2": 0.006336052367146062,
+            "max_abs": 1.52587890625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 261077,
+            "relative_l2": 0.0043581833760646775,
+            "max_abs": 1.52587890625e-05,
+            "mismatches": 3
+          },
+          {
+            "position": 260928,
+            "relative_l2": 0.004184374366711581,
+            "max_abs": 1.52587890625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 260143,
+            "relative_l2": 0.0038826905437927815,
+            "max_abs": 1.52587890625e-05,
+            "mismatches": 2
+          },
+          {
+            "position": 260261,
+            "relative_l2": 0.0038676847555335903,
+            "max_abs": 1.52587890625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 260463,
+            "relative_l2": 0.0037809449028541626,
+            "max_abs": 1.52587890625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 261118,
+            "relative_l2": 0.003614576982404808,
+            "max_abs": 7.62939453125e-06,
+            "mismatches": 0
+          }
+        ]
+      }
+    },
+    {
+      "rank": 0,
+      "head": 9,
+      "core": {
+        "elements": 152832,
+        "relative_l2": 0.0028958278911056148,
+        "max_abs": 0.00048828125,
+        "bitwise_equal_elements": 58719,
+        "two_bf16_relative_mismatches": 16744,
+        "mismatch_fraction": 0.10955820770519263,
+        "nonfinite": 0,
+        "worst_rows": [
+          {
+            "position": 261113,
+            "relative_l2": 0.00825500494235517,
+            "max_abs": 0.000244140625,
+            "mismatches": 19
+          },
+          {
+            "position": 261119,
+            "relative_l2": 0.007942682863252849,
+            "max_abs": 0.0001220703125,
+            "mismatches": 26
+          },
+          {
+            "position": 261117,
+            "relative_l2": 0.007903426683276548,
+            "max_abs": 0.0001220703125,
+            "mismatches": 28
+          },
+          {
+            "position": 261231,
+            "relative_l2": 0.0074647452065365084,
+            "max_abs": 0.00048828125,
+            "mismatches": 19
+          },
+          {
+            "position": 261220,
+            "relative_l2": 0.007153373566607373,
+            "max_abs": 0.00048828125,
+            "mismatches": 11
+          },
+          {
+            "position": 261081,
+            "relative_l2": 0.007134430989944256,
+            "max_abs": 0.00048828125,
+            "mismatches": 15
+          },
+          {
+            "position": 260672,
+            "relative_l2": 0.007131322382380974,
+            "max_abs": 0.00048828125,
+            "mismatches": 6
+          },
+          {
+            "position": 261141,
+            "relative_l2": 0.006879840070202264,
+            "max_abs": 0.00048828125,
+            "mismatches": 14
+          },
+          {
+            "position": 261207,
+            "relative_l2": 0.0068113942048217855,
+            "max_abs": 0.00048828125,
+            "mismatches": 13
+          },
+          {
+            "position": 260249,
+            "relative_l2": 0.006804526272278216,
+            "max_abs": 0.00048828125,
+            "mismatches": 12
+          }
+        ]
+      }
+    },
+    {
+      "rank": 0,
+      "head": 10,
+      "core": {
+        "elements": 152832,
+        "relative_l2": 0.0007363950314987821,
+        "max_abs": 0.0001220703125,
+        "bitwise_equal_elements": 145218,
+        "two_bf16_relative_mismatches": 119,
+        "mismatch_fraction": 0.0007786327470686767,
+        "nonfinite": 0,
+        "worst_rows": [
+          {
+            "position": 260585,
+            "relative_l2": 0.007421168288125356,
+            "max_abs": 0.0001220703125,
+            "mismatches": 0
+          },
+          {
+            "position": 260617,
+            "relative_l2": 0.005590559993893238,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 260696,
+            "relative_l2": 0.005570182930073699,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 260834,
+            "relative_l2": 0.00519566491506972,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 261084,
+            "relative_l2": 0.005191499798260635,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 261077,
+            "relative_l2": 0.005172401260037036,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 1
+          },
+          {
+            "position": 260291,
+            "relative_l2": 0.005169045811958885,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 261227,
+            "relative_l2": 0.005149840482840453,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 261045,
+            "relative_l2": 0.005149509734243802,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 261231,
+            "relative_l2": 0.005130239935035168,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 1
+          }
+        ]
+      }
+    },
+    {
+      "rank": 0,
+      "head": 11,
+      "core": {
+        "elements": 152832,
+        "relative_l2": 0.000916972655588055,
+        "max_abs": 6.103515625e-05,
+        "bitwise_equal_elements": 144085,
+        "two_bf16_relative_mismatches": 101,
+        "mismatch_fraction": 0.000660856365159129,
+        "nonfinite": 0,
+        "worst_rows": [
+          {
+            "position": 260366,
+            "relative_l2": 0.008180409167820441,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 260328,
+            "relative_l2": 0.007685110528303438,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 260926,
+            "relative_l2": 0.007597679541561052,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 260183,
+            "relative_l2": 0.0075676059577253684,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 260898,
+            "relative_l2": 0.007253364234108088,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 261227,
+            "relative_l2": 0.007182674832671571,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 260618,
+            "relative_l2": 0.007040410636931087,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 260692,
+            "relative_l2": 0.007023560064937458,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 260217,
+            "relative_l2": 0.006860245688188442,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 260865,
+            "relative_l2": 0.006464470796064739,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          }
+        ]
+      }
+    },
+    {
+      "rank": 0,
+      "head": 12,
+      "core": {
+        "elements": 152832,
+        "relative_l2": 0.0006246462900247759,
+        "max_abs": 0.000244140625,
+        "bitwise_equal_elements": 144122,
+        "two_bf16_relative_mismatches": 231,
+        "mismatch_fraction": 0.001511463567839196,
+        "nonfinite": 0,
+        "worst_rows": [
+          {
+            "position": 260812,
+            "relative_l2": 0.007595508784942642,
+            "max_abs": 0.0001220703125,
+            "mismatches": 0
+          },
+          {
+            "position": 261011,
+            "relative_l2": 0.007579929160149399,
+            "max_abs": 0.000244140625,
+            "mismatches": 0
+          },
+          {
+            "position": 261126,
+            "relative_l2": 0.00652114234594113,
+            "max_abs": 0.0001220703125,
+            "mismatches": 3
+          },
+          {
+            "position": 260136,
+            "relative_l2": 0.005498678972609742,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 260282,
+            "relative_l2": 0.005336395506242889,
+            "max_abs": 0.0001220703125,
+            "mismatches": 1
+          },
+          {
+            "position": 261146,
+            "relative_l2": 0.005299064254278301,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 13
+          },
+          {
+            "position": 260908,
+            "relative_l2": 0.005101911843280294,
+            "max_abs": 0.0001220703125,
+            "mismatches": 1
+          },
+          {
+            "position": 260880,
+            "relative_l2": 0.005072748147350919,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 260953,
+            "relative_l2": 0.0049332295608919855,
+            "max_abs": 0.0001220703125,
+            "mismatches": 0
+          },
+          {
+            "position": 261219,
+            "relative_l2": 0.004875651222759989,
+            "max_abs": 0.0001220703125,
+            "mismatches": 0
+          }
+        ]
+      }
+    },
+    {
+      "rank": 0,
+      "head": 13,
+      "core": {
+        "elements": 152832,
+        "relative_l2": 0.0004969823344384154,
+        "max_abs": 0.0001220703125,
+        "bitwise_equal_elements": 143213,
+        "two_bf16_relative_mismatches": 283,
+        "mismatch_fraction": 0.0018517064489112227,
+        "nonfinite": 0,
+        "worst_rows": [
+          {
+            "position": 261246,
+            "relative_l2": 0.006919913351111171,
+            "max_abs": 0.0001220703125,
+            "mismatches": 0
+          },
+          {
+            "position": 261237,
+            "relative_l2": 0.006853003991536639,
+            "max_abs": 0.0001220703125,
+            "mismatches": 0
+          },
+          {
+            "position": 261117,
+            "relative_l2": 0.006368333527988604,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 260214,
+            "relative_l2": 0.006251960389244756,
+            "max_abs": 0.0001220703125,
+            "mismatches": 0
+          },
+          {
+            "position": 260217,
+            "relative_l2": 0.006209807069899318,
+            "max_abs": 0.0001220703125,
+            "mismatches": 0
+          },
+          {
+            "position": 260282,
+            "relative_l2": 0.005491238114409959,
+            "max_abs": 0.0001220703125,
+            "mismatches": 0
+          },
+          {
+            "position": 261232,
+            "relative_l2": 0.004742261848325736,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 1
+          },
+          {
+            "position": 260924,
+            "relative_l2": 0.004434834405940672,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 1
+          },
+          {
+            "position": 260629,
+            "relative_l2": 0.004166637775087245,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 2
+          },
+          {
+            "position": 261012,
+            "relative_l2": 0.004158120498714779,
+            "max_abs": 0.0001220703125,
+            "mismatches": 4
+          }
+        ]
+      }
+    },
+    {
+      "rank": 0,
+      "head": 14,
+      "core": {
+        "elements": 152832,
+        "relative_l2": 0.0006714571901659216,
+        "max_abs": 0.0001220703125,
+        "bitwise_equal_elements": 142382,
+        "two_bf16_relative_mismatches": 191,
+        "mismatch_fraction": 0.0012497382747068677,
+        "nonfinite": 0,
+        "worst_rows": [
+          {
+            "position": 260267,
+            "relative_l2": 0.007331602595859988,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 261177,
+            "relative_l2": 0.0072815584370037835,
+            "max_abs": 0.0001220703125,
+            "mismatches": 0
+          },
+          {
+            "position": 260567,
+            "relative_l2": 0.007072751781438508,
+            "max_abs": 0.0001220703125,
+            "mismatches": 0
+          },
+          {
+            "position": 260315,
+            "relative_l2": 0.006871967571339387,
+            "max_abs": 0.0001220703125,
+            "mismatches": 0
+          },
+          {
+            "position": 261078,
+            "relative_l2": 0.006386428788714593,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 261232,
+            "relative_l2": 0.006385432354504538,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 260251,
+            "relative_l2": 0.006120455210664624,
+            "max_abs": 0.0001220703125,
+            "mismatches": 0
+          },
+          {
+            "position": 261011,
+            "relative_l2": 0.00566516255569877,
+            "max_abs": 0.0001220703125,
+            "mismatches": 0
+          },
+          {
+            "position": 261231,
+            "relative_l2": 0.005640181174461944,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 3
+          },
+          {
+            "position": 260494,
+            "relative_l2": 0.005609053111785,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 7
+          }
+        ]
+      }
+    },
+    {
+      "rank": 0,
+      "head": 15,
+      "core": {
+        "elements": 152832,
+        "relative_l2": 0.0022348265033105682,
+        "max_abs": 0.0078125,
+        "bitwise_equal_elements": 112397,
+        "two_bf16_relative_mismatches": 5728,
+        "mismatch_fraction": 0.03747906197654941,
+        "nonfinite": 0,
+        "worst_rows": [
+          {
+            "position": 260969,
+            "relative_l2": 0.007168229655565839,
+            "max_abs": 0.0078125,
+            "mismatches": 6
+          },
+          {
+            "position": 261016,
+            "relative_l2": 0.007063004441031989,
+            "max_abs": 0.0078125,
+            "mismatches": 7
+          },
+          {
+            "position": 261133,
+            "relative_l2": 0.007014365046200762,
+            "max_abs": 0.0078125,
+            "mismatches": 4
+          },
+          {
+            "position": 260892,
+            "relative_l2": 0.0066430161445429885,
+            "max_abs": 0.0078125,
+            "mismatches": 6
+          },
+          {
+            "position": 260782,
+            "relative_l2": 0.006636357915913892,
+            "max_abs": 0.0078125,
+            "mismatches": 6
+          },
+          {
+            "position": 260515,
+            "relative_l2": 0.006592115217301038,
+            "max_abs": 0.0078125,
+            "mismatches": 2
+          },
+          {
+            "position": 260951,
+            "relative_l2": 0.00651136492762477,
+            "max_abs": 0.0078125,
+            "mismatches": 4
+          },
+          {
+            "position": 260101,
+            "relative_l2": 0.00646927150195924,
+            "max_abs": 0.0078125,
+            "mismatches": 4
+          },
+          {
+            "position": 260138,
+            "relative_l2": 0.006465260107690881,
+            "max_abs": 0.0078125,
+            "mismatches": 5
+          },
+          {
+            "position": 260110,
+            "relative_l2": 0.006426257238941674,
+            "max_abs": 0.0078125,
+            "mismatches": 7
+          }
+        ]
+      }
+    },
+    {
+      "rank": 0,
+      "head": 16,
+      "core": {
+        "elements": 152832,
+        "relative_l2": 0.0007661673591525236,
+        "max_abs": 0.0001220703125,
+        "bitwise_equal_elements": 143985,
+        "two_bf16_relative_mismatches": 98,
+        "mismatch_fraction": 0.0006412269681742044,
+        "nonfinite": 0,
+        "worst_rows": [
+          {
+            "position": 261247,
+            "relative_l2": 0.00970789841468075,
+            "max_abs": 4.76837158203125e-06,
+            "mismatches": 2
+          },
+          {
+            "position": 260646,
+            "relative_l2": 0.007124292224955528,
+            "max_abs": 3.0517578125e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 260401,
+            "relative_l2": 0.006925372878991916,
+            "max_abs": 3.0517578125e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 261202,
+            "relative_l2": 0.006883409140757072,
+            "max_abs": 0.0001220703125,
+            "mismatches": 0
+          },
+          {
+            "position": 261069,
+            "relative_l2": 0.006883409140757072,
+            "max_abs": 0.0001220703125,
+            "mismatches": 0
+          },
+          {
+            "position": 261055,
+            "relative_l2": 0.006787528245054904,
+            "max_abs": 0.0001220703125,
+            "mismatches": 0
+          },
+          {
+            "position": 261169,
+            "relative_l2": 0.006787528245054904,
+            "max_abs": 0.0001220703125,
+            "mismatches": 0
+          },
+          {
+            "position": 260963,
+            "relative_l2": 0.006603602330901519,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 260829,
+            "relative_l2": 0.006484188767377507,
+            "max_abs": 3.0517578125e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 260776,
+            "relative_l2": 0.006434130096890655,
+            "max_abs": 3.0517578125e-05,
+            "mismatches": 0
+          }
+        ]
+      }
+    },
+    {
+      "rank": 0,
+      "head": 17,
+      "core": {
+        "elements": 152832,
+        "relative_l2": 0.0006488169318615913,
+        "max_abs": 0.0001220703125,
+        "bitwise_equal_elements": 143840,
+        "two_bf16_relative_mismatches": 69,
+        "mismatch_fraction": 0.00045147613065326633,
+        "nonfinite": 0,
+        "worst_rows": [
+          {
+            "position": 260467,
+            "relative_l2": 0.007623024567733138,
+            "max_abs": 0.0001220703125,
+            "mismatches": 0
+          },
+          {
+            "position": 260178,
+            "relative_l2": 0.007565538504012423,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 260615,
+            "relative_l2": 0.006361833516540683,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 261169,
+            "relative_l2": 0.006280754849465521,
+            "max_abs": 0.0001220703125,
+            "mismatches": 0
+          },
+          {
+            "position": 261055,
+            "relative_l2": 0.006280754849465521,
+            "max_abs": 0.0001220703125,
+            "mismatches": 0
+          },
+          {
+            "position": 261193,
+            "relative_l2": 0.006273937388031424,
+            "max_abs": 0.0001220703125,
+            "mismatches": 0
+          },
+          {
+            "position": 260196,
+            "relative_l2": 0.0056434985352759245,
+            "max_abs": 3.0517578125e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 260545,
+            "relative_l2": 0.005614519636825545,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 260402,
+            "relative_l2": 0.0055185581141794435,
+            "max_abs": 3.0517578125e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 260479,
+            "relative_l2": 0.005488207565985482,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          }
+        ]
+      }
+    },
+    {
+      "rank": 0,
+      "head": 18,
+      "core": {
+        "elements": 152832,
+        "relative_l2": 0.0016463325344086475,
+        "max_abs": 0.001953125,
+        "bitwise_equal_elements": 70262,
+        "two_bf16_relative_mismatches": 16752,
+        "mismatch_fraction": 0.10961055276381909,
+        "nonfinite": 0,
+        "worst_rows": [
+          {
+            "position": 261112,
+            "relative_l2": 0.007203744726788338,
+            "max_abs": 0.001953125,
+            "mismatches": 13
+          },
+          {
+            "position": 261030,
+            "relative_l2": 0.006696551960297896,
+            "max_abs": 0.001953125,
+            "mismatches": 10
+          },
+          {
+            "position": 261117,
+            "relative_l2": 0.006542331497312925,
+            "max_abs": 0.001953125,
+            "mismatches": 16
+          },
+          {
+            "position": 261225,
+            "relative_l2": 0.006130843130840756,
+            "max_abs": 0.001953125,
+            "mismatches": 11
+          },
+          {
+            "position": 260999,
+            "relative_l2": 0.00595260608940191,
+            "max_abs": 0.001953125,
+            "mismatches": 12
+          },
+          {
+            "position": 261238,
+            "relative_l2": 0.005951458746951712,
+            "max_abs": 0.001953125,
+            "mismatches": 19
+          },
+          {
+            "position": 260445,
+            "relative_l2": 0.005929067182367855,
+            "max_abs": 0.001953125,
+            "mismatches": 11
+          },
+          {
+            "position": 260459,
+            "relative_l2": 0.005879843545057083,
+            "max_abs": 0.001953125,
+            "mismatches": 11
+          },
+          {
+            "position": 261012,
+            "relative_l2": 0.005815401841791671,
+            "max_abs": 0.001953125,
+            "mismatches": 17
+          },
+          {
+            "position": 261015,
+            "relative_l2": 0.005785242369458375,
+            "max_abs": 0.001953125,
+            "mismatches": 13
+          }
+        ]
+      }
+    },
+    {
+      "rank": 0,
+      "head": 19,
+      "core": {
+        "elements": 152832,
+        "relative_l2": 0.003446192027696432,
+        "max_abs": 0.0009765625,
+        "bitwise_equal_elements": 71209,
+        "two_bf16_relative_mismatches": 14531,
+        "mismatch_fraction": 0.09507825586264657,
+        "nonfinite": 0,
+        "worst_rows": [
+          {
+            "position": 260961,
+            "relative_l2": 0.00773332188054239,
+            "max_abs": 0.0009765625,
+            "mismatches": 11
+          },
+          {
+            "position": 260256,
+            "relative_l2": 0.00773172407213469,
+            "max_abs": 0.0009765625,
+            "mismatches": 18
+          },
+          {
+            "position": 260622,
+            "relative_l2": 0.007730639702017533,
+            "max_abs": 0.0009765625,
+            "mismatches": 16
+          },
+          {
+            "position": 260294,
+            "relative_l2": 0.007730466903551382,
+            "max_abs": 0.0009765625,
+            "mismatches": 23
+          },
+          {
+            "position": 260733,
+            "relative_l2": 0.007729445253093845,
+            "max_abs": 0.0009765625,
+            "mismatches": 15
+          },
+          {
+            "position": 260937,
+            "relative_l2": 0.007727606561219227,
+            "max_abs": 0.0009765625,
+            "mismatches": 10
+          },
+          {
+            "position": 260835,
+            "relative_l2": 0.007725711935409799,
+            "max_abs": 0.0009765625,
+            "mismatches": 16
+          },
+          {
+            "position": 260329,
+            "relative_l2": 0.007725626797910793,
+            "max_abs": 0.0009765625,
+            "mismatches": 10
+          },
+          {
+            "position": 260923,
+            "relative_l2": 0.007675253196094664,
+            "max_abs": 0.0009765625,
+            "mismatches": 15
+          },
+          {
+            "position": 260155,
+            "relative_l2": 0.007613596023038587,
+            "max_abs": 0.0009765625,
+            "mismatches": 16
+          }
+        ]
+      }
+    },
+    {
+      "rank": 0,
+      "head": 20,
+      "core": {
+        "elements": 152832,
+        "relative_l2": 0.0008903232544262992,
+        "max_abs": 0.000244140625,
+        "bitwise_equal_elements": 145872,
+        "two_bf16_relative_mismatches": 333,
+        "mismatch_fraction": 0.002178863065326633,
+        "nonfinite": 0,
+        "worst_rows": [
+          {
+            "position": 260514,
+            "relative_l2": 0.006673388226218488,
+            "max_abs": 0.000244140625,
+            "mismatches": 0
+          },
+          {
+            "position": 260857,
+            "relative_l2": 0.006105902231211106,
+            "max_abs": 0.000244140625,
+            "mismatches": 2
+          },
+          {
+            "position": 261243,
+            "relative_l2": 0.0057632870420622154,
+            "max_abs": 0.000244140625,
+            "mismatches": 4
+          },
+          {
+            "position": 260569,
+            "relative_l2": 0.00531343071848171,
+            "max_abs": 0.000244140625,
+            "mismatches": 0
+          },
+          {
+            "position": 260926,
+            "relative_l2": 0.005281419702024477,
+            "max_abs": 0.000244140625,
+            "mismatches": 0
+          },
+          {
+            "position": 260343,
+            "relative_l2": 0.00511437669166046,
+            "max_abs": 0.000244140625,
+            "mismatches": 2
+          },
+          {
+            "position": 260790,
+            "relative_l2": 0.004898356223966186,
+            "max_abs": 0.000244140625,
+            "mismatches": 0
+          },
+          {
+            "position": 260303,
+            "relative_l2": 0.004734727574218871,
+            "max_abs": 0.000244140625,
+            "mismatches": 0
+          },
+          {
+            "position": 260399,
+            "relative_l2": 0.004685602729599351,
+            "max_abs": 0.000244140625,
+            "mismatches": 0
+          },
+          {
+            "position": 261003,
+            "relative_l2": 0.0046693411015375315,
+            "max_abs": 0.0001220703125,
+            "mismatches": 0
+          }
+        ]
+      }
+    },
+    {
+      "rank": 0,
+      "head": 21,
+      "core": {
+        "elements": 152832,
+        "relative_l2": 0.0006528987785220176,
+        "max_abs": 6.103515625e-05,
+        "bitwise_equal_elements": 130890,
+        "two_bf16_relative_mismatches": 745,
+        "mismatch_fraction": 0.004874633584589614,
+        "nonfinite": 0,
+        "worst_rows": [
+          {
+            "position": 261027,
+            "relative_l2": 0.005979140367972493,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 261021,
+            "relative_l2": 0.0059746340801199475,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 260259,
+            "relative_l2": 0.005798435165639464,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 261004,
+            "relative_l2": 0.005593892415693367,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 260977,
+            "relative_l2": 0.00558358374302067,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 260806,
+            "relative_l2": 0.005553020727993459,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 260609,
+            "relative_l2": 0.004430443007065719,
+            "max_abs": 3.0517578125e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 260346,
+            "relative_l2": 0.004240294348784597,
+            "max_abs": 3.0517578125e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 260630,
+            "relative_l2": 0.004169618753168827,
+            "max_abs": 3.0517578125e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 260500,
+            "relative_l2": 0.004018688295361691,
+            "max_abs": 3.0517578125e-05,
+            "mismatches": 1
+          }
+        ]
+      }
+    },
+    {
+      "rank": 0,
+      "head": 22,
+      "core": {
+        "elements": 152832,
+        "relative_l2": 0.000464063386180762,
+        "max_abs": 7.62939453125e-06,
+        "bitwise_equal_elements": 147813,
+        "two_bf16_relative_mismatches": 58,
+        "mismatch_fraction": 0.00037950167504187605,
+        "nonfinite": 0,
+        "worst_rows": [
+          {
+            "position": 261262,
+            "relative_l2": 0.0046679273708816514,
+            "max_abs": 7.62939453125e-06,
+            "mismatches": 0
+          },
+          {
+            "position": 261090,
+            "relative_l2": 0.0046679273708816514,
+            "max_abs": 7.62939453125e-06,
+            "mismatches": 0
+          },
+          {
+            "position": 260900,
+            "relative_l2": 0.0046031938218679186,
+            "max_abs": 7.62939453125e-06,
+            "mismatches": 0
+          },
+          {
+            "position": 260148,
+            "relative_l2": 0.0046031938218679186,
+            "max_abs": 7.62939453125e-06,
+            "mismatches": 0
+          },
+          {
+            "position": 260585,
+            "relative_l2": 0.0046031938218679186,
+            "max_abs": 7.62939453125e-06,
+            "mismatches": 0
+          },
+          {
+            "position": 261001,
+            "relative_l2": 0.0028592275428755494,
+            "max_abs": 3.814697265625e-06,
+            "mismatches": 0
+          },
+          {
+            "position": 260416,
+            "relative_l2": 0.002542902922802609,
+            "max_abs": 3.814697265625e-06,
+            "mismatches": 0
+          },
+          {
+            "position": 260367,
+            "relative_l2": 0.0024836565620120644,
+            "max_abs": 3.814697265625e-06,
+            "mismatches": 2
+          },
+          {
+            "position": 260956,
+            "relative_l2": 0.0018469975621252792,
+            "max_abs": 3.814697265625e-06,
+            "mismatches": 0
+          },
+          {
+            "position": 260715,
+            "relative_l2": 0.0017842565602307094,
+            "max_abs": 1.9073486328125e-06,
+            "mismatches": 0
+          }
+        ]
+      }
+    },
+    {
+      "rank": 0,
+      "head": 23,
+      "core": {
+        "elements": 152832,
+        "relative_l2": 0.0004975040540470964,
+        "max_abs": 6.103515625e-05,
+        "bitwise_equal_elements": 102658,
+        "two_bf16_relative_mismatches": 4452,
+        "mismatch_fraction": 0.02913002512562814,
+        "nonfinite": 0,
+        "worst_rows": [
+          {
+            "position": 261161,
+            "relative_l2": 0.005415968132054432,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 1
+          },
+          {
+            "position": 261080,
+            "relative_l2": 0.005394263427631408,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 14
+          },
+          {
+            "position": 261102,
+            "relative_l2": 0.005215405065222808,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 2
+          },
+          {
+            "position": 261278,
+            "relative_l2": 0.005161262655362287,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 3
+          },
+          {
+            "position": 261248,
+            "relative_l2": 0.005025238285901517,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 4
+          },
+          {
+            "position": 261259,
+            "relative_l2": 0.004937153780301016,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 3
+          },
+          {
+            "position": 260119,
+            "relative_l2": 0.004812937954897822,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 260334,
+            "relative_l2": 0.004587157038054403,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 261089,
+            "relative_l2": 0.004453696433603352,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 16
+          },
+          {
+            "position": 261116,
+            "relative_l2": 0.004405630541203708,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 6
+          }
+        ]
+      }
+    },
+    {
+      "rank": 1,
+      "head": 0,
+      "core": {
+        "elements": 152832,
+        "relative_l2": 0.0006070319452930739,
+        "max_abs": 7.62939453125e-06,
+        "bitwise_equal_elements": 146783,
+        "two_bf16_relative_mismatches": 111,
+        "mismatch_fraction": 0.0007262876884422111,
+        "nonfinite": 0,
+        "worst_rows": [
+          {
+            "position": 260891,
+            "relative_l2": 0.004713011204506999,
+            "max_abs": 7.62939453125e-06,
+            "mismatches": 0
+          },
+          {
+            "position": 261063,
+            "relative_l2": 0.004598154216779218,
+            "max_abs": 7.62939453125e-06,
+            "mismatches": 0
+          },
+          {
+            "position": 261231,
+            "relative_l2": 0.004531022835753352,
+            "max_abs": 3.814697265625e-06,
+            "mismatches": 4
+          },
+          {
+            "position": 261077,
+            "relative_l2": 0.004517821599128508,
+            "max_abs": 3.814697265625e-06,
+            "mismatches": 6
+          },
+          {
+            "position": 261196,
+            "relative_l2": 0.004204194380372627,
+            "max_abs": 7.62939453125e-06,
+            "mismatches": 0
+          },
+          {
+            "position": 261194,
+            "relative_l2": 0.004175478705037868,
+            "max_abs": 3.814697265625e-06,
+            "mismatches": 0
+          },
+          {
+            "position": 261078,
+            "relative_l2": 0.0038632896942965536,
+            "max_abs": 3.814697265625e-06,
+            "mismatches": 21
+          },
+          {
+            "position": 261061,
+            "relative_l2": 0.0037768715850352887,
+            "max_abs": 3.814697265625e-06,
+            "mismatches": 0
+          },
+          {
+            "position": 261232,
+            "relative_l2": 0.003761694379795972,
+            "max_abs": 3.814697265625e-06,
+            "mismatches": 22
+          },
+          {
+            "position": 261193,
+            "relative_l2": 0.003716286663030526,
+            "max_abs": 3.814697265625e-06,
+            "mismatches": 0
+          }
+        ]
+      }
+    },
+    {
+      "rank": 1,
+      "head": 1,
+      "core": {
+        "elements": 152832,
+        "relative_l2": 0.00038433725452364045,
+        "max_abs": 6.103515625e-05,
+        "bitwise_equal_elements": 146928,
+        "two_bf16_relative_mismatches": 202,
+        "mismatch_fraction": 0.001321712730318258,
+        "nonfinite": 0,
+        "worst_rows": [
+          {
+            "position": 261234,
+            "relative_l2": 0.007357863555030197,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 25
+          },
+          {
+            "position": 261060,
+            "relative_l2": 0.004620450716571798,
+            "max_abs": 3.0517578125e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 261077,
+            "relative_l2": 0.004390594682990607,
+            "max_abs": 3.0517578125e-05,
+            "mismatches": 4
+          },
+          {
+            "position": 261231,
+            "relative_l2": 0.004350466269902732,
+            "max_abs": 3.0517578125e-05,
+            "mismatches": 3
+          },
+          {
+            "position": 261078,
+            "relative_l2": 0.0040059063100293295,
+            "max_abs": 3.0517578125e-05,
+            "mismatches": 22
+          },
+          {
+            "position": 261232,
+            "relative_l2": 0.003995326257477601,
+            "max_abs": 3.0517578125e-05,
+            "mismatches": 23
+          },
+          {
+            "position": 261194,
+            "relative_l2": 0.0019076037388754726,
+            "max_abs": 7.62939453125e-06,
+            "mismatches": 0
+          },
+          {
+            "position": 260891,
+            "relative_l2": 0.0017039827866481426,
+            "max_abs": 7.62939453125e-06,
+            "mismatches": 0
+          },
+          {
+            "position": 261061,
+            "relative_l2": 0.001559012093835163,
+            "max_abs": 7.62939453125e-06,
+            "mismatches": 0
+          },
+          {
+            "position": 261062,
+            "relative_l2": 0.001398774845372215,
+            "max_abs": 7.62939453125e-06,
+            "mismatches": 0
+          }
+        ]
+      }
+    },
+    {
+      "rank": 1,
+      "head": 2,
+      "core": {
+        "elements": 152832,
+        "relative_l2": 0.0011198110188471767,
+        "max_abs": 7.62939453125e-06,
+        "bitwise_equal_elements": 147117,
+        "two_bf16_relative_mismatches": 181,
+        "mismatch_fraction": 0.0011843069514237857,
+        "nonfinite": 0,
+        "worst_rows": [
+          {
+            "position": 260891,
+            "relative_l2": 0.005602384142782726,
+            "max_abs": 3.814697265625e-06,
+            "mismatches": 2
+          },
+          {
+            "position": 260597,
+            "relative_l2": 0.005004349644515181,
+            "max_abs": 7.62939453125e-06,
+            "mismatches": 0
+          },
+          {
+            "position": 260171,
+            "relative_l2": 0.004940701648521778,
+            "max_abs": 7.62939453125e-06,
+            "mismatches": 0
+          },
+          {
+            "position": 260174,
+            "relative_l2": 0.0048902266649927875,
+            "max_abs": 7.62939453125e-06,
+            "mismatches": 0
+          },
+          {
+            "position": 260211,
+            "relative_l2": 0.004854092418330812,
+            "max_abs": 7.62939453125e-06,
+            "mismatches": 0
+          },
+          {
+            "position": 260848,
+            "relative_l2": 0.00481964595763354,
+            "max_abs": 7.62939453125e-06,
+            "mismatches": 0
+          },
+          {
+            "position": 261186,
+            "relative_l2": 0.004816629836125927,
+            "max_abs": 7.62939453125e-06,
+            "mismatches": 0
+          },
+          {
+            "position": 260263,
+            "relative_l2": 0.004791010089311868,
+            "max_abs": 7.62939453125e-06,
+            "mismatches": 0
+          },
+          {
+            "position": 260580,
+            "relative_l2": 0.0047349876884392045,
+            "max_abs": 7.62939453125e-06,
+            "mismatches": 0
+          },
+          {
+            "position": 260161,
+            "relative_l2": 0.004731397321117869,
+            "max_abs": 7.62939453125e-06,
+            "mismatches": 0
+          }
+        ]
+      }
+    },
+    {
+      "rank": 1,
+      "head": 3,
+      "core": {
+        "elements": 152832,
+        "relative_l2": 0.0006713998007913101,
+        "max_abs": 0.00048828125,
+        "bitwise_equal_elements": 140445,
+        "two_bf16_relative_mismatches": 505,
+        "mismatch_fraction": 0.003304281825795645,
+        "nonfinite": 0,
+        "worst_rows": [
+          {
+            "position": 260550,
+            "relative_l2": 0.007084238570034519,
+            "max_abs": 0.00048828125,
+            "mismatches": 1
+          },
+          {
+            "position": 260265,
+            "relative_l2": 0.006607813862688889,
+            "max_abs": 0.00048828125,
+            "mismatches": 1
+          },
+          {
+            "position": 261129,
+            "relative_l2": 0.006342902888310095,
+            "max_abs": 0.00048828125,
+            "mismatches": 1
+          },
+          {
+            "position": 260190,
+            "relative_l2": 0.005951487839021368,
+            "max_abs": 0.000244140625,
+            "mismatches": 0
+          },
+          {
+            "position": 261221,
+            "relative_l2": 0.005323355300487914,
+            "max_abs": 0.000244140625,
+            "mismatches": 0
+          },
+          {
+            "position": 260250,
+            "relative_l2": 0.0052192330689269165,
+            "max_abs": 0.000244140625,
+            "mismatches": 0
+          },
+          {
+            "position": 260725,
+            "relative_l2": 0.0050394461439016314,
+            "max_abs": 0.000244140625,
+            "mismatches": 2
+          },
+          {
+            "position": 260670,
+            "relative_l2": 0.004651463518587287,
+            "max_abs": 0.000244140625,
+            "mismatches": 0
+          },
+          {
+            "position": 260562,
+            "relative_l2": 0.004566821374549892,
+            "max_abs": 0.000244140625,
+            "mismatches": 1
+          },
+          {
+            "position": 260708,
+            "relative_l2": 0.004261422577956039,
+            "max_abs": 0.000244140625,
+            "mismatches": 0
+          }
+        ]
+      }
+    },
+    {
+      "rank": 1,
+      "head": 4,
+      "core": {
+        "elements": 152832,
+        "relative_l2": 0.0006667992673711201,
+        "max_abs": 0.000244140625,
+        "bitwise_equal_elements": 144872,
+        "two_bf16_relative_mismatches": 71,
+        "mismatch_fraction": 0.00046456239530988277,
+        "nonfinite": 0,
+        "worst_rows": [
+          {
+            "position": 260452,
+            "relative_l2": 0.006619634680277396,
+            "max_abs": 0.0001220703125,
+            "mismatches": 0
+          },
+          {
+            "position": 260444,
+            "relative_l2": 0.006478398942996402,
+            "max_abs": 0.000244140625,
+            "mismatches": 1
+          },
+          {
+            "position": 261127,
+            "relative_l2": 0.0061225394034363535,
+            "max_abs": 0.0001220703125,
+            "mismatches": 2
+          },
+          {
+            "position": 260291,
+            "relative_l2": 0.005971369223054601,
+            "max_abs": 0.0001220703125,
+            "mismatches": 1
+          },
+          {
+            "position": 261020,
+            "relative_l2": 0.005664743974540508,
+            "max_abs": 0.0001220703125,
+            "mismatches": 0
+          },
+          {
+            "position": 260936,
+            "relative_l2": 0.005553046959564,
+            "max_abs": 3.0517578125e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 260568,
+            "relative_l2": 0.0052732117322368665,
+            "max_abs": 1.52587890625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 261003,
+            "relative_l2": 0.005257535231246134,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 260584,
+            "relative_l2": 0.005147660222860266,
+            "max_abs": 0.0001220703125,
+            "mismatches": 0
+          },
+          {
+            "position": 260467,
+            "relative_l2": 0.004915141135910061,
+            "max_abs": 0.0001220703125,
+            "mismatches": 0
+          }
+        ]
+      }
+    },
+    {
+      "rank": 1,
+      "head": 5,
+      "core": {
+        "elements": 152832,
+        "relative_l2": 0.0021930349704854034,
+        "max_abs": 0.0078125,
+        "bitwise_equal_elements": 101215,
+        "two_bf16_relative_mismatches": 6623,
+        "mismatch_fraction": 0.04333516541038526,
+        "nonfinite": 0,
+        "worst_rows": [
+          {
+            "position": 261095,
+            "relative_l2": 0.007439765063887549,
+            "max_abs": 0.0078125,
+            "mismatches": 7
+          },
+          {
+            "position": 260568,
+            "relative_l2": 0.007383024097819624,
+            "max_abs": 0.0078125,
+            "mismatches": 6
+          },
+          {
+            "position": 260223,
+            "relative_l2": 0.007068990656747801,
+            "max_abs": 0.0078125,
+            "mismatches": 2
+          },
+          {
+            "position": 260589,
+            "relative_l2": 0.0068146672154266496,
+            "max_abs": 0.0078125,
+            "mismatches": 2
+          },
+          {
+            "position": 261083,
+            "relative_l2": 0.006670616103295353,
+            "max_abs": 0.0078125,
+            "mismatches": 7
+          },
+          {
+            "position": 260258,
+            "relative_l2": 0.0065590260216375745,
+            "max_abs": 0.0078125,
+            "mismatches": 5
+          },
+          {
+            "position": 260296,
+            "relative_l2": 0.006554007502583197,
+            "max_abs": 0.0078125,
+            "mismatches": 4
+          },
+          {
+            "position": 260117,
+            "relative_l2": 0.0065530868600092405,
+            "max_abs": 0.0078125,
+            "mismatches": 4
+          },
+          {
+            "position": 260097,
+            "relative_l2": 0.006535082133868756,
+            "max_abs": 0.0078125,
+            "mismatches": 2
+          },
+          {
+            "position": 261009,
+            "relative_l2": 0.006487844285662786,
+            "max_abs": 0.0078125,
+            "mismatches": 13
+          }
+        ]
+      }
+    },
+    {
+      "rank": 1,
+      "head": 6,
+      "core": {
+        "elements": 152832,
+        "relative_l2": 0.001102257253633196,
+        "max_abs": 0.0009765625,
+        "bitwise_equal_elements": 129144,
+        "two_bf16_relative_mismatches": 2770,
+        "mismatch_fraction": 0.018124476549413734,
+        "nonfinite": 0,
+        "worst_rows": [
+          {
+            "position": 260387,
+            "relative_l2": 0.007414229420427393,
+            "max_abs": 0.0009765625,
+            "mismatches": 7
+          },
+          {
+            "position": 260272,
+            "relative_l2": 0.007398376807912007,
+            "max_abs": 0.0009765625,
+            "mismatches": 5
+          },
+          {
+            "position": 261044,
+            "relative_l2": 0.00707111789343706,
+            "max_abs": 0.0009765625,
+            "mismatches": 0
+          },
+          {
+            "position": 260110,
+            "relative_l2": 0.006683917098470213,
+            "max_abs": 0.0009765625,
+            "mismatches": 5
+          },
+          {
+            "position": 260119,
+            "relative_l2": 0.006659972521644666,
+            "max_abs": 0.0009765625,
+            "mismatches": 6
+          },
+          {
+            "position": 260213,
+            "relative_l2": 0.0063839568945414996,
+            "max_abs": 0.0009765625,
+            "mismatches": 8
+          },
+          {
+            "position": 260606,
+            "relative_l2": 0.006328869740606795,
+            "max_abs": 0.0009765625,
+            "mismatches": 1
+          },
+          {
+            "position": 260384,
+            "relative_l2": 0.006298352763781047,
+            "max_abs": 0.0009765625,
+            "mismatches": 3
+          },
+          {
+            "position": 260598,
+            "relative_l2": 0.006293846104107203,
+            "max_abs": 0.0009765625,
+            "mismatches": 5
+          },
+          {
+            "position": 260427,
+            "relative_l2": 0.006257192576139504,
+            "max_abs": 0.0009765625,
+            "mismatches": 4
+          }
+        ]
+      }
+    },
+    {
+      "rank": 1,
+      "head": 7,
+      "core": {
+        "elements": 152832,
+        "relative_l2": 0.0005360598432465854,
+        "max_abs": 0.00048828125,
+        "bitwise_equal_elements": 141209,
+        "two_bf16_relative_mismatches": 795,
+        "mismatch_fraction": 0.0052017902010050255,
+        "nonfinite": 0,
+        "worst_rows": [
+          {
+            "position": 260110,
+            "relative_l2": 0.00576831493223362,
+            "max_abs": 0.00048828125,
+            "mismatches": 0
+          },
+          {
+            "position": 260096,
+            "relative_l2": 0.005276343044345634,
+            "max_abs": 0.00048828125,
+            "mismatches": 3
+          },
+          {
+            "position": 260198,
+            "relative_l2": 0.005009745296957271,
+            "max_abs": 0.00048828125,
+            "mismatches": 1
+          },
+          {
+            "position": 260581,
+            "relative_l2": 0.0048749599930996935,
+            "max_abs": 0.00048828125,
+            "mismatches": 0
+          },
+          {
+            "position": 260745,
+            "relative_l2": 0.004841029797857578,
+            "max_abs": 0.00048828125,
+            "mismatches": 1
+          },
+          {
+            "position": 260542,
+            "relative_l2": 0.004585300543097171,
+            "max_abs": 0.00048828125,
+            "mismatches": 1
+          },
+          {
+            "position": 261221,
+            "relative_l2": 0.004579896782155974,
+            "max_abs": 0.00048828125,
+            "mismatches": 1
+          },
+          {
+            "position": 260797,
+            "relative_l2": 0.004448986683911509,
+            "max_abs": 0.00048828125,
+            "mismatches": 1
+          },
+          {
+            "position": 261077,
+            "relative_l2": 0.004351677080273052,
+            "max_abs": 0.00048828125,
+            "mismatches": 2
+          },
+          {
+            "position": 260492,
+            "relative_l2": 0.0041439395722857614,
+            "max_abs": 0.00048828125,
+            "mismatches": 2
+          }
+        ]
+      }
+    },
+    {
+      "rank": 1,
+      "head": 8,
+      "core": {
+        "elements": 152832,
+        "relative_l2": 0.0006467119287104226,
+        "max_abs": 0.001953125,
+        "bitwise_equal_elements": 136938,
+        "two_bf16_relative_mismatches": 1455,
+        "mismatch_fraction": 0.009520257537688441,
+        "nonfinite": 0,
+        "worst_rows": [
+          {
+            "position": 260988,
+            "relative_l2": 0.007258904507918686,
+            "max_abs": 0.0009765625,
+            "mismatches": 0
+          },
+          {
+            "position": 260295,
+            "relative_l2": 0.007225084894585892,
+            "max_abs": 0.0009765625,
+            "mismatches": 1
+          },
+          {
+            "position": 261237,
+            "relative_l2": 0.0068708234862439954,
+            "max_abs": 0.001953125,
+            "mismatches": 3
+          },
+          {
+            "position": 260114,
+            "relative_l2": 0.005825026556555316,
+            "max_abs": 0.0009765625,
+            "mismatches": 0
+          },
+          {
+            "position": 261157,
+            "relative_l2": 0.005755689243050067,
+            "max_abs": 0.0009765625,
+            "mismatches": 1
+          },
+          {
+            "position": 261059,
+            "relative_l2": 0.005595597053165322,
+            "max_abs": 0.0009765625,
+            "mismatches": 2
+          },
+          {
+            "position": 260727,
+            "relative_l2": 0.005290076161393701,
+            "max_abs": 0.0009765625,
+            "mismatches": 3
+          },
+          {
+            "position": 260923,
+            "relative_l2": 0.005122597199436905,
+            "max_abs": 0.0009765625,
+            "mismatches": 0
+          },
+          {
+            "position": 260660,
+            "relative_l2": 0.00491933760963387,
+            "max_abs": 0.0009765625,
+            "mismatches": 0
+          },
+          {
+            "position": 260674,
+            "relative_l2": 0.004906622222129884,
+            "max_abs": 0.0009765625,
+            "mismatches": 0
+          }
+        ]
+      }
+    },
+    {
+      "rank": 1,
+      "head": 9,
+      "core": {
+        "elements": 152832,
+        "relative_l2": 0.00100519301368958,
+        "max_abs": 0.000244140625,
+        "bitwise_equal_elements": 145758,
+        "two_bf16_relative_mismatches": 170,
+        "mismatch_fraction": 0.0011123324958123952,
+        "nonfinite": 0,
+        "worst_rows": [
+          {
+            "position": 261116,
+            "relative_l2": 0.007417748623709305,
+            "max_abs": 0.000244140625,
+            "mismatches": 0
+          },
+          {
+            "position": 260728,
+            "relative_l2": 0.006675965126304226,
+            "max_abs": 0.000244140625,
+            "mismatches": 1
+          },
+          {
+            "position": 260726,
+            "relative_l2": 0.006590522829549178,
+            "max_abs": 0.000244140625,
+            "mismatches": 0
+          },
+          {
+            "position": 261222,
+            "relative_l2": 0.006542838476526524,
+            "max_abs": 0.0001220703125,
+            "mismatches": 0
+          },
+          {
+            "position": 260324,
+            "relative_l2": 0.006177760100032054,
+            "max_abs": 0.000244140625,
+            "mismatches": 0
+          },
+          {
+            "position": 261144,
+            "relative_l2": 0.006173358196727397,
+            "max_abs": 0.000244140625,
+            "mismatches": 0
+          },
+          {
+            "position": 260544,
+            "relative_l2": 0.006021625575551357,
+            "max_abs": 0.000244140625,
+            "mismatches": 0
+          },
+          {
+            "position": 260932,
+            "relative_l2": 0.005988516650804079,
+            "max_abs": 0.000244140625,
+            "mismatches": 0
+          },
+          {
+            "position": 260683,
+            "relative_l2": 0.005965083209619612,
+            "max_abs": 0.000244140625,
+            "mismatches": 0
+          },
+          {
+            "position": 260581,
+            "relative_l2": 0.005821415882993598,
+            "max_abs": 0.000244140625,
+            "mismatches": 0
+          }
+        ]
+      }
+    },
+    {
+      "rank": 1,
+      "head": 10,
+      "core": {
+        "elements": 152832,
+        "relative_l2": 0.00079057687851074,
+        "max_abs": 0.000244140625,
+        "bitwise_equal_elements": 145295,
+        "two_bf16_relative_mismatches": 131,
+        "mismatch_fraction": 0.0008571503350083752,
+        "nonfinite": 0,
+        "worst_rows": [
+          {
+            "position": 260530,
+            "relative_l2": 0.006410267457724706,
+            "max_abs": 0.000244140625,
+            "mismatches": 0
+          },
+          {
+            "position": 260683,
+            "relative_l2": 0.005565366226546967,
+            "max_abs": 0.0001220703125,
+            "mismatches": 1
+          },
+          {
+            "position": 260546,
+            "relative_l2": 0.005267339730586656,
+            "max_abs": 0.0001220703125,
+            "mismatches": 0
+          },
+          {
+            "position": 260382,
+            "relative_l2": 0.0052457981339414156,
+            "max_abs": 0.0001220703125,
+            "mismatches": 1
+          },
+          {
+            "position": 260290,
+            "relative_l2": 0.0048176548621982045,
+            "max_abs": 0.0001220703125,
+            "mismatches": 0
+          },
+          {
+            "position": 260599,
+            "relative_l2": 0.004809317920649448,
+            "max_abs": 0.0001220703125,
+            "mismatches": 1
+          },
+          {
+            "position": 260947,
+            "relative_l2": 0.004685721377282969,
+            "max_abs": 0.0001220703125,
+            "mismatches": 1
+          },
+          {
+            "position": 260598,
+            "relative_l2": 0.004524823609048759,
+            "max_abs": 0.0001220703125,
+            "mismatches": 0
+          },
+          {
+            "position": 260545,
+            "relative_l2": 0.00445639482429075,
+            "max_abs": 0.0001220703125,
+            "mismatches": 0
+          },
+          {
+            "position": 260579,
+            "relative_l2": 0.0043170230980660055,
+            "max_abs": 0.0001220703125,
+            "mismatches": 1
+          }
+        ]
+      }
+    },
+    {
+      "rank": 1,
+      "head": 11,
+      "core": {
+        "elements": 152832,
+        "relative_l2": 0.0008699641926511492,
+        "max_abs": 0.001953125,
+        "bitwise_equal_elements": 123831,
+        "two_bf16_relative_mismatches": 3538,
+        "mismatch_fraction": 0.023149602177554438,
+        "nonfinite": 0,
+        "worst_rows": [
+          {
+            "position": 260462,
+            "relative_l2": 0.0048048767465531635,
+            "max_abs": 0.001953125,
+            "mismatches": 1
+          },
+          {
+            "position": 260594,
+            "relative_l2": 0.004794699013162704,
+            "max_abs": 0.001953125,
+            "mismatches": 5
+          },
+          {
+            "position": 260652,
+            "relative_l2": 0.0047619807672813624,
+            "max_abs": 0.001953125,
+            "mismatches": 2
+          },
+          {
+            "position": 261169,
+            "relative_l2": 0.004720167519964024,
+            "max_abs": 0.001953125,
+            "mismatches": 3
+          },
+          {
+            "position": 261048,
+            "relative_l2": 0.0045760128219119855,
+            "max_abs": 0.001953125,
+            "mismatches": 3
+          },
+          {
+            "position": 261234,
+            "relative_l2": 0.004084960041074668,
+            "max_abs": 0.001953125,
+            "mismatches": 5
+          },
+          {
+            "position": 261149,
+            "relative_l2": 0.0040297998767320825,
+            "max_abs": 0.001953125,
+            "mismatches": 6
+          },
+          {
+            "position": 261143,
+            "relative_l2": 0.0038660765108415674,
+            "max_abs": 0.001953125,
+            "mismatches": 5
+          },
+          {
+            "position": 260346,
+            "relative_l2": 0.003682068123606715,
+            "max_abs": 0.0009765625,
+            "mismatches": 5
+          },
+          {
+            "position": 260943,
+            "relative_l2": 0.0035259055226936663,
+            "max_abs": 0.0009765625,
+            "mismatches": 3
+          }
+        ]
+      }
+    },
+    {
+      "rank": 1,
+      "head": 12,
+      "core": {
+        "elements": 152832,
+        "relative_l2": 0.001193254869554924,
+        "max_abs": 6.103515625e-05,
+        "bitwise_equal_elements": 148448,
+        "two_bf16_relative_mismatches": 73,
+        "mismatch_fraction": 0.00047764865996649915,
+        "nonfinite": 0,
+        "worst_rows": [
+          {
+            "position": 260282,
+            "relative_l2": 0.006939786997230283,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 1
+          },
+          {
+            "position": 260832,
+            "relative_l2": 0.006757469265218168,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 260275,
+            "relative_l2": 0.00668271976632149,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 1
+          },
+          {
+            "position": 260728,
+            "relative_l2": 0.006623184861126497,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 2
+          },
+          {
+            "position": 261127,
+            "relative_l2": 0.00658100807996056,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 2
+          },
+          {
+            "position": 261034,
+            "relative_l2": 0.0065796339205802,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 2
+          },
+          {
+            "position": 260178,
+            "relative_l2": 0.006552811506979719,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 260830,
+            "relative_l2": 0.006491542289346,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 260545,
+            "relative_l2": 0.00641521830338482,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 261036,
+            "relative_l2": 0.006410101936924274,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          }
+        ]
+      }
+    },
+    {
+      "rank": 1,
+      "head": 13,
+      "core": {
+        "elements": 152832,
+        "relative_l2": 0.0005985010068193637,
+        "max_abs": 0.0001220703125,
+        "bitwise_equal_elements": 145817,
+        "two_bf16_relative_mismatches": 252,
+        "mismatch_fraction": 0.0016488693467336683,
+        "nonfinite": 0,
+        "worst_rows": [
+          {
+            "position": 261245,
+            "relative_l2": 0.0073541569272203,
+            "max_abs": 0.0001220703125,
+            "mismatches": 1
+          },
+          {
+            "position": 261026,
+            "relative_l2": 0.007257578180597952,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 261077,
+            "relative_l2": 0.007168806376818022,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 1
+          },
+          {
+            "position": 261231,
+            "relative_l2": 0.007155532340116816,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 261007,
+            "relative_l2": 0.0061799495812024435,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 260936,
+            "relative_l2": 0.00596067459599271,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 2
+          },
+          {
+            "position": 261110,
+            "relative_l2": 0.005679391521586099,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 1
+          },
+          {
+            "position": 260800,
+            "relative_l2": 0.005366560656657101,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 261233,
+            "relative_l2": 0.005334793974786798,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 5
+          },
+          {
+            "position": 260834,
+            "relative_l2": 0.004965347292725586,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          }
+        ]
+      }
+    },
+    {
+      "rank": 1,
+      "head": 14,
+      "core": {
+        "elements": 152832,
+        "relative_l2": 0.0004943624754170176,
+        "max_abs": 6.103515625e-05,
+        "bitwise_equal_elements": 148500,
+        "two_bf16_relative_mismatches": 15,
+        "mismatch_fraction": 9.814698492462312e-05,
+        "nonfinite": 0,
+        "worst_rows": [
+          {
+            "position": 260899,
+            "relative_l2": 0.005677807707503189,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 260584,
+            "relative_l2": 0.005677807707503189,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 260952,
+            "relative_l2": 0.005627060149427584,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 261017,
+            "relative_l2": 0.005551070094199272,
+            "max_abs": 3.0517578125e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 260291,
+            "relative_l2": 0.005517160003897871,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 261006,
+            "relative_l2": 0.004985912637595269,
+            "max_abs": 3.0517578125e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 260383,
+            "relative_l2": 0.004877249909789509,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 260232,
+            "relative_l2": 0.004823417116185225,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 261231,
+            "relative_l2": 0.0043744596862912025,
+            "max_abs": 3.0517578125e-05,
+            "mismatches": 1
+          },
+          {
+            "position": 261077,
+            "relative_l2": 0.0043744596862912025,
+            "max_abs": 3.0517578125e-05,
+            "mismatches": 1
+          }
+        ]
+      }
+    },
+    {
+      "rank": 1,
+      "head": 15,
+      "core": {
+        "elements": 152832,
+        "relative_l2": 0.0008552493437904706,
+        "max_abs": 0.0078125,
+        "bitwise_equal_elements": 122018,
+        "two_bf16_relative_mismatches": 4374,
+        "mismatch_fraction": 0.028619660804020102,
+        "nonfinite": 0,
+        "worst_rows": [
+          {
+            "position": 260172,
+            "relative_l2": 0.007037782106138883,
+            "max_abs": 0.0078125,
+            "mismatches": 6
+          },
+          {
+            "position": 260643,
+            "relative_l2": 0.006865356642827943,
+            "max_abs": 0.0078125,
+            "mismatches": 5
+          },
+          {
+            "position": 260266,
+            "relative_l2": 0.006656951237365011,
+            "max_abs": 0.0078125,
+            "mismatches": 6
+          },
+          {
+            "position": 260104,
+            "relative_l2": 0.00653002073738785,
+            "max_abs": 0.0078125,
+            "mismatches": 3
+          },
+          {
+            "position": 260949,
+            "relative_l2": 0.006514764754841289,
+            "max_abs": 0.0078125,
+            "mismatches": 4
+          },
+          {
+            "position": 260275,
+            "relative_l2": 0.006381135441228751,
+            "max_abs": 0.0078125,
+            "mismatches": 10
+          },
+          {
+            "position": 260136,
+            "relative_l2": 0.006308619821230572,
+            "max_abs": 0.0078125,
+            "mismatches": 5
+          },
+          {
+            "position": 260922,
+            "relative_l2": 0.006277232795859437,
+            "max_abs": 0.0078125,
+            "mismatches": 6
+          },
+          {
+            "position": 260156,
+            "relative_l2": 0.006180550182073572,
+            "max_abs": 0.0078125,
+            "mismatches": 5
+          },
+          {
+            "position": 260855,
+            "relative_l2": 0.0061235256234715,
+            "max_abs": 0.0078125,
+            "mismatches": 9
+          }
+        ]
+      }
+    },
+    {
+      "rank": 1,
+      "head": 16,
+      "core": {
+        "elements": 152832,
+        "relative_l2": 0.0006457594206310365,
+        "max_abs": 0.000244140625,
+        "bitwise_equal_elements": 147496,
+        "two_bf16_relative_mismatches": 243,
+        "mismatch_fraction": 0.0015899811557788944,
+        "nonfinite": 0,
+        "worst_rows": [
+          {
+            "position": 260922,
+            "relative_l2": 0.007272858428275186,
+            "max_abs": 0.000244140625,
+            "mismatches": 0
+          },
+          {
+            "position": 260542,
+            "relative_l2": 0.007174475396489361,
+            "max_abs": 0.0001220703125,
+            "mismatches": 0
+          },
+          {
+            "position": 261002,
+            "relative_l2": 0.007171760561892151,
+            "max_abs": 0.000244140625,
+            "mismatches": 0
+          },
+          {
+            "position": 261232,
+            "relative_l2": 0.00705610099907778,
+            "max_abs": 0.000244140625,
+            "mismatches": 1
+          },
+          {
+            "position": 261078,
+            "relative_l2": 0.00705610099907778,
+            "max_abs": 0.000244140625,
+            "mismatches": 1
+          },
+          {
+            "position": 260954,
+            "relative_l2": 0.006012917119697379,
+            "max_abs": 0.0001220703125,
+            "mismatches": 1
+          },
+          {
+            "position": 260527,
+            "relative_l2": 0.005893365848404463,
+            "max_abs": 0.0001220703125,
+            "mismatches": 1
+          },
+          {
+            "position": 261133,
+            "relative_l2": 0.005697921901148945,
+            "max_abs": 0.0001220703125,
+            "mismatches": 1
+          },
+          {
+            "position": 261040,
+            "relative_l2": 0.005697921901148945,
+            "max_abs": 0.0001220703125,
+            "mismatches": 1
+          },
+          {
+            "position": 260541,
+            "relative_l2": 0.005003001391082772,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          }
+        ]
+      }
+    },
+    {
+      "rank": 1,
+      "head": 17,
+      "core": {
+        "elements": 152832,
+        "relative_l2": 0.0015259695208284599,
+        "max_abs": 0.00048828125,
+        "bitwise_equal_elements": 148019,
+        "two_bf16_relative_mismatches": 148,
+        "mismatch_fraction": 0.0009683835845896147,
+        "nonfinite": 0,
+        "worst_rows": [
+          {
+            "position": 260889,
+            "relative_l2": 0.01310017740456208,
+            "max_abs": 0.00048828125,
+            "mismatches": 0
+          },
+          {
+            "position": 260964,
+            "relative_l2": 0.012443353795186863,
+            "max_abs": 0.00048828125,
+            "mismatches": 0
+          },
+          {
+            "position": 260376,
+            "relative_l2": 0.012359498833910519,
+            "max_abs": 0.00048828125,
+            "mismatches": 0
+          },
+          {
+            "position": 260284,
+            "relative_l2": 0.012069311808893942,
+            "max_abs": 0.00048828125,
+            "mismatches": 1
+          },
+          {
+            "position": 261235,
+            "relative_l2": 0.011176616248317974,
+            "max_abs": 0.00048828125,
+            "mismatches": 0
+          },
+          {
+            "position": 261081,
+            "relative_l2": 0.011176616248317974,
+            "max_abs": 0.00048828125,
+            "mismatches": 0
+          },
+          {
+            "position": 260875,
+            "relative_l2": 0.010483304964722776,
+            "max_abs": 0.00048828125,
+            "mismatches": 0
+          },
+          {
+            "position": 260776,
+            "relative_l2": 0.010458528701495783,
+            "max_abs": 0.00048828125,
+            "mismatches": 0
+          },
+          {
+            "position": 260239,
+            "relative_l2": 0.010116473995787774,
+            "max_abs": 0.00048828125,
+            "mismatches": 0
+          },
+          {
+            "position": 260573,
+            "relative_l2": 0.008998863181592761,
+            "max_abs": 0.00048828125,
+            "mismatches": 0
+          }
+        ]
+      }
+    },
+    {
+      "rank": 1,
+      "head": 18,
+      "core": {
+        "elements": 152832,
+        "relative_l2": 0.0006054006706190079,
+        "max_abs": 6.103515625e-05,
+        "bitwise_equal_elements": 149126,
+        "two_bf16_relative_mismatches": 12,
+        "mismatch_fraction": 7.85175879396985e-05,
+        "nonfinite": 0,
+        "worst_rows": [
+          {
+            "position": 261022,
+            "relative_l2": 0.007175274663348254,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 261023,
+            "relative_l2": 0.006246881582924015,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 260789,
+            "relative_l2": 0.006199340032074162,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 260270,
+            "relative_l2": 0.006013372734881638,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 261234,
+            "relative_l2": 0.0058493700179218355,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 261080,
+            "relative_l2": 0.0058493700179218355,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 260745,
+            "relative_l2": 0.005537865638041245,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 260876,
+            "relative_l2": 0.005388257726416407,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 260322,
+            "relative_l2": 0.005215394765094879,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 260777,
+            "relative_l2": 0.00521064898097819,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          }
+        ]
+      }
+    },
+    {
+      "rank": 1,
+      "head": 19,
+      "core": {
+        "elements": 152832,
+        "relative_l2": 0.000534338058684682,
+        "max_abs": 6.103515625e-05,
+        "bitwise_equal_elements": 147401,
+        "two_bf16_relative_mismatches": 41,
+        "mismatch_fraction": 0.0002682684254606365,
+        "nonfinite": 0,
+        "worst_rows": [
+          {
+            "position": 260452,
+            "relative_l2": 0.006083583480063834,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 260767,
+            "relative_l2": 0.005707372708895474,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 261233,
+            "relative_l2": 0.005653251261224606,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 261079,
+            "relative_l2": 0.005650947661203939,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 261002,
+            "relative_l2": 0.005610895302408155,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 260183,
+            "relative_l2": 0.0055330355889227105,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 261080,
+            "relative_l2": 0.0055121801941145545,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 261234,
+            "relative_l2": 0.005512180189812117,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 261163,
+            "relative_l2": 0.005443621013505738,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 260109,
+            "relative_l2": 0.004894662874304266,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          }
+        ]
+      }
+    },
+    {
+      "rank": 1,
+      "head": 20,
+      "core": {
+        "elements": 152832,
+        "relative_l2": 0.0005847018901581558,
+        "max_abs": 6.103515625e-05,
+        "bitwise_equal_elements": 147912,
+        "two_bf16_relative_mismatches": 16,
+        "mismatch_fraction": 0.00010469011725293132,
+        "nonfinite": 0,
+        "worst_rows": [
+          {
+            "position": 261080,
+            "relative_l2": 0.0057180245958632645,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 261234,
+            "relative_l2": 0.0057180245958632645,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 260369,
+            "relative_l2": 0.005703090078120072,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 260962,
+            "relative_l2": 0.005620792744488928,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 261023,
+            "relative_l2": 0.005173898911269486,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 261004,
+            "relative_l2": 0.005099485961382878,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 260835,
+            "relative_l2": 0.0050544780209260416,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 260242,
+            "relative_l2": 0.004457413317891806,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 260866,
+            "relative_l2": 0.004379521598198952,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          },
+          {
+            "position": 261110,
+            "relative_l2": 0.004335877780459255,
+            "max_abs": 6.103515625e-05,
+            "mismatches": 0
+          }
+        ]
+      }
+    },
+    {
+      "rank": 1,
+      "head": 21,
+      "core": {
+        "elements": 152832,
+        "relative_l2": 0.001279063267217481,
+        "max_abs": 0.00048828125,
+        "bitwise_equal_elements": 137599,
+        "two_bf16_relative_mismatches": 1125,
+        "mismatch_fraction": 0.007361023869346734,
+        "nonfinite": 0,
+        "worst_rows": [
+          {
+            "position": 260714,
+            "relative_l2": 0.007482297921062966,
+            "max_abs": 0.000244140625,
+            "mismatches": 0
+          },
+          {
+            "position": 261127,
+            "relative_l2": 0.007480044880929158,
+            "max_abs": 0.000244140625,
+            "mismatches": 2
+          },
+          {
+            "position": 260962,
+            "relative_l2": 0.007455449452625975,
+            "max_abs": 0.00048828125,
+            "mismatches": 1
+          },
+          {
+            "position": 260858,
+            "relative_l2": 0.0074428402335839335,
+            "max_abs": 0.00048828125,
+            "mismatches": 1
+          },
+          {
+            "position": 260284,
+            "relative_l2": 0.007103884418909979,
+            "max_abs": 0.00048828125,
+            "mismatches": 2
+          },
+          {
+            "position": 260209,
+            "relative_l2": 0.0069445902577370735,
+            "max_abs": 0.00048828125,
+            "mismatches": 2
+          },
+          {
+            "position": 260383,
+            "relative_l2": 0.006930111641796513,
+            "max_abs": 0.00048828125,
+            "mismatches": 5
+          },
+          {
+            "position": 261126,
+            "relative_l2": 0.006836752085050569,
+            "max_abs": 0.000244140625,
+            "mismatches": 4
+          },
+          {
+            "position": 260281,
+            "relative_l2": 0.006608751994685096,
+            "max_abs": 0.00048828125,
+            "mismatches": 1
+          },
+          {
+            "position": 261148,
+            "relative_l2": 0.006550138046821589,
+            "max_abs": 0.00048828125,
+            "mismatches": 2
+          }
+        ]
+      }
+    },
+    {
+      "rank": 1,
+      "head": 22,
+      "core": {
+        "elements": 152832,
+        "relative_l2": 0.001640790765920377,
+        "max_abs": 0.0009765625,
+        "bitwise_equal_elements": 116181,
+        "two_bf16_relative_mismatches": 3121,
+        "mismatch_fraction": 0.020421115996649915,
+        "nonfinite": 0,
+        "worst_rows": [
+          {
+            "position": 260695,
+            "relative_l2": 0.007413401679315918,
+            "max_abs": 0.00048828125,
+            "mismatches": 5
+          },
+          {
+            "position": 260331,
+            "relative_l2": 0.007296222817921819,
+            "max_abs": 0.00048828125,
+            "mismatches": 5
+          },
+          {
+            "position": 261232,
+            "relative_l2": 0.00720561001840465,
+            "max_abs": 0.00048828125,
+            "mismatches": 6
+          },
+          {
+            "position": 261139,
+            "relative_l2": 0.006848119632623672,
+            "max_abs": 0.00048828125,
+            "mismatches": 3
+          },
+          {
+            "position": 260193,
+            "relative_l2": 0.0068260282431311945,
+            "max_abs": 0.00048828125,
+            "mismatches": 6
+          },
+          {
+            "position": 260958,
+            "relative_l2": 0.006671077123243106,
+            "max_abs": 0.00048828125,
+            "mismatches": 3
+          },
+          {
+            "position": 260996,
+            "relative_l2": 0.006624983721676584,
+            "max_abs": 0.0009765625,
+            "mismatches": 3
+          },
+          {
+            "position": 260921,
+            "relative_l2": 0.0065732444804367145,
+            "max_abs": 0.00048828125,
+            "mismatches": 2
+          },
+          {
+            "position": 260519,
+            "relative_l2": 0.006437174628688198,
+            "max_abs": 0.00048828125,
+            "mismatches": 5
+          },
+          {
+            "position": 260427,
+            "relative_l2": 0.006396863088798756,
+            "max_abs": 0.00048828125,
+            "mismatches": 1
+          }
+        ]
+      }
+    },
+    {
+      "rank": 1,
+      "head": 23,
+      "core": {
+        "elements": 152832,
+        "relative_l2": 0.0006924312315193204,
+        "max_abs": 0.00048828125,
+        "bitwise_equal_elements": 134717,
+        "two_bf16_relative_mismatches": 1204,
+        "mismatch_fraction": 0.007877931323283082,
+        "nonfinite": 0,
+        "worst_rows": [
+          {
+            "position": 260652,
+            "relative_l2": 0.0067344922951449275,
+            "max_abs": 0.00048828125,
+            "mismatches": 0
+          },
+          {
+            "position": 260620,
+            "relative_l2": 0.0063270046343192905,
+            "max_abs": 0.00048828125,
+            "mismatches": 2
+          },
+          {
+            "position": 261071,
+            "relative_l2": 0.006192890248923452,
+            "max_abs": 0.00048828125,
+            "mismatches": 0
+          },
+          {
+            "position": 261033,
+            "relative_l2": 0.0055077340137231695,
+            "max_abs": 0.000244140625,
+            "mismatches": 2
+          },
+          {
+            "position": 261261,
+            "relative_l2": 0.005455685593437816,
+            "max_abs": 0.000244140625,
+            "mismatches": 3
+          },
+          {
+            "position": 260345,
+            "relative_l2": 0.004952485501747284,
+            "max_abs": 0.000244140625,
+            "mismatches": 1
+          },
+          {
+            "position": 260467,
+            "relative_l2": 0.004775895358004866,
+            "max_abs": 0.000244140625,
+            "mismatches": 0
+          },
+          {
+            "position": 260494,
+            "relative_l2": 0.004456025225752264,
+            "max_abs": 0.000244140625,
+            "mismatches": 1
+          },
+          {
+            "position": 260593,
+            "relative_l2": 0.004357934484703106,
+            "max_abs": 0.000244140625,
+            "mismatches": 1
+          },
+          {
+            "position": 260798,
+            "relative_l2": 0.004337937022659515,
+            "max_abs": 0.000244140625,
+            "mismatches": 2
+          }
+        ]
+      }
+    }
+  ],
+  "captured_and_output_sha256": {
+    "raw/output/state_before0.bin": "287094738dd3e26df67d0c861656326bd9f2a0f0a2d9468f6809792d33b23122",
+    "2026-09-23-issue4-operators/raw/captures/rank0/layer0/state_before.bin": "e715b47f1084f64f0fede8e473b0d3bbf09970a5274f53a8d26fb57145093321",
+    "raw/output/state_after0.bin": "55682e7ac5336668cf3a8c8dcf3573a4f8a7d6a60012011224a9581fdfbe5546",
+    "2026-09-23-issue4-operators/raw/captures/rank0/layer0/state_after.bin": "550e329702d8c7d0ad3049ac3b36e65c94d452c0bb197bd8e0f29859bc0e1edb",
+    "raw/output/conv_before0.bin": "4f24594402a4f2ad95ad0f744144d31c89e5a1c7eaaae173250c7d6557d78511",
+    "2026-09-23-issue4-operators/raw/captures/rank0/layer0/conv_before.bin": "73172624aede4a00ad12de0841f468892870211706fe939dffcc5109b870e7ac",
+    "raw/output/conv_after0.bin": "410f8d5d579ad0963c299146809a40328140d310277cd70b71f6f128f6ee130a",
+    "2026-09-23-issue4-operators/raw/captures/rank0/layer0/conv_after.bin": "03eca99c6d672e6bb80b47dbfce807d7f57918e31f589776f901a0f6b6044ebc",
+    "raw/output/qkvc0.bin": "3f30fadb32e90579c7370725b02668a28de2c6b73b03ed8efa88098221968fae",
+    "2026-09-23-issue4-operators/raw/captures/rank0/layer0/qkvc.bin": "6417f5aaa8fc25b6aa6e3fb5c2ac9ab6836f4b7f9fd634e7005e6b2684d26036",
+    "raw/output/core0.bin": "a65ec300d88cc78ea1f45d37f736ebab278e06774974008195fb75c9f736a747",
+    "2026-09-23-issue4-operators/raw/captures/rank0/layer0/core.bin": "458c2f4399968b2c00bb1848317e6e17e7a4070e122eb1f6896db56451f0cffe",
+    "2026-09-23-issue4-operators/raw/captures/rank0/layer0/normed.bin": "f729a6665b168776d6b79f8b93ba72c6e8e598510aa58e4a0699c9b23b9dc3e7",
+    "raw/output/state_before1.bin": "44308d67473ddd3e6cff6517869b43855253b8867c0514ca886c5349b4e31cd3",
+    "2026-09-23-issue4-operators/raw/captures/rank1/layer0/state_before.bin": "165a356ad36762b02903fa8cf0b51a372e4a7003f3a24ac8ff6d26848512efc2",
+    "raw/output/state_after1.bin": "7b52425271f658cf2abb55ceb7bc21c662bb1175d92c298482d71b8702903ce0",
+    "2026-09-23-issue4-operators/raw/captures/rank1/layer0/state_after.bin": "ccbe8b1cfbd77e9ca1233bc8757578a773457a1f72f3e8917954dac48d81372d",
+    "raw/output/conv_before1.bin": "299c5e9c4e3e7c9c7e56a3f1824a6474945f0388affd38d19614cdf3fe74eb93",
+    "2026-09-23-issue4-operators/raw/captures/rank1/layer0/conv_before.bin": "8ca9aee43160f974eac128c989548ea021ac2eb343797b7c2cf7a6b8d675a3d1",
+    "raw/output/conv_after1.bin": "43b56955e7900c841d808d88a649c509b97b70dac0bd48ebd08ac9199aaedadd",
+    "2026-09-23-issue4-operators/raw/captures/rank1/layer0/conv_after.bin": "d12ab47ed1b5c0954f1e667fe0fac9f48092086af4745a89996d1fa94a33b40b",
+    "raw/output/qkvc1.bin": "aa0f5a4486f61d4cb94af195298a0ddc90434a7d852b31c3371e766ef560eeae",
+    "2026-09-23-issue4-operators/raw/captures/rank1/layer0/qkvc.bin": "f3c5d65a18d5c213c030070eb9023a3c18e678e607ca14284d2669ebf3448edf",
+    "raw/output/core1.bin": "ab62098ec8a10bb9acdd04dce91e3bfcf6291425f1b0040217f654f6082cb694",
+    "2026-09-23-issue4-operators/raw/captures/rank1/layer0/core.bin": "fe5a45439ab37c08df9f11f87ae2013449e2306585bba63e0273519f07be0033",
+    "2026-09-23-issue4-operators/raw/captures/rank1/layer0/normed.bin": "e2a9de4b9ad24b3fefee65c319928085ed84167eb8f9c1eea196107b306456b0",
+    "2026-09-23-issue4-operators/raw/captures/rank0/layer0/attention_folded.bin": "5da43d367489b6fd2e9ec85f9fad7ddf191bc721c140d84d971321bc83cf4b26",
+    "2026-09-23-issue4-operators/raw/captures/rank1/layer0/attention_folded.bin": "5da43d367489b6fd2e9ec85f9fad7ddf191bc721c140d84d971321bc83cf4b26"
+  },
+  "preparation_sha256": "d1c57016f17ea4e35d3e54d9dbaaa0026cf1515fdda9e0f93af2ee8b78c2ed63",
+  "selfcheck_sha256": "451da707121299c221dd145653bdde8c0c100365a45011b17b41498012197817",
+  "script_sha256": "18e40e5019a054eb9fdfd67923f64202e1939b017bd55bd3024176d4037e6550",
+  "analysis_seconds": 0.9107470799935982,
+  "scope": "Original tokens and checkpoint -> GR input mix -> native-policy dense projections -> complete convolution/recurrent history from zero -> gated norm -> output projection/TP2 fold. No captured activations or state seed this computation. FP64 arithmetic retains specified BF16 storage boundaries; not bitwise GPU emulation or a complete model execution."
+}
