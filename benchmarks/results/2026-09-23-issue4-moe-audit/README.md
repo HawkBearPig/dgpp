@@ -1,4 +1,4 @@
-# Real-fixture MoE audit — prepared, not run
+# Real-fixture MoE audit — capture running
 
 Read-only capture on master c6ca191: three rows in the first and final native
 chunks of the retained 261290-token forced prefix, all 48 layers, both ranks.
@@ -25,3 +25,5 @@ and rank-fold invariants are checked independently.
 Host checks compare all 256 E4M3 encodings, BF16 rounding and partial 128x128
 block FP8 quantization against Torch. Production restoration and identity checks
 execute before collecting the peer captures.
+
+The first capture attempt was invalid: it accidentally used the original chat configuration (MTP enabled and 1.5 GiB prefix cache), rather than the forced-prefix control (MTP disabled and no prefix cache). Its response and raw captures are retained under `raw/invalid-config-*`; `invalid-config-parity.json` records the mismatch. No operator conclusions are drawn from that attempt. The retry uses byte-identical control settings and asserts them before stopping production.

@@ -128,6 +128,10 @@ def ordered_sum(down, weights):
     return result
 
 
+def ulp_at(values):
+    return np.maximum(2.**-133, np.exp2(np.floor(np.log2(np.maximum(np.abs(values),2.**-126)))-7))
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--captures', type=Path, default=ROOT/'raw/captures')
@@ -157,7 +161,23 @@ def main():
                     expected_weights = rounded(probabilities/probabilities.sum())
                     independent_logits = rounded(router@x)
                     independent_ids = np.sort(np.lexsort((np.arange(experts), -independent_logits))[:topk])
+                    only_actual = np.setdiff1d(ids, independent_ids)
+                    only_expected = np.setdiff1d(independent_ids, ids)
+                    certified = all(abs(float(independent_logits[a])-float(independent_logits[b])) <=
+                                    1.01*float(ulp_at(max(abs(independent_logits[a]),abs(independent_logits[b]))))
+                                    for a,b in zip(only_actual,only_expected))
+                    logit_ulps = float((np.abs(logits.astype(np.float64)-independent_logits)/ulp_at(independent_logits)).max())
+                    weight_ulps = int(np.abs((expected_weights.view(np.uint32)>>16).astype(np.int32)-
+                                            (router_weights.view(np.uint32)>>16).astype(np.int32)).max())
+                    route_valid = (len(set(ids)) == topk and np.array_equal(np.sort(ids),ids)
+                                   and np.all(router_weights>0) and np.all(router_weights<=1)
+                                   and abs(float(router_weights.sum())-1)<.02
+                                   and np.array_equal(rounded(logits),logits)
+                                   and np.array_equal(rounded(router_weights),router_weights))
                     checks = {'router_logits': stats(independent_logits, logits),
+                              'router_budget': {'logit_ulps':logit_ulps,'weights_ulps_from_captured_logits':weight_ulps,
+                                                'changed_ids':len(only_actual),'swaps_certified':bool(certified),
+                                                'pass':bool(route_valid and certified and logit_ulps<=1 and weight_ulps<=1)},
                               'router_ids_from_independent_logits_exact': bool(np.array_equal(ids,independent_ids)),
                               'router_independent_id_difference': [int(e) for e in np.setxor1d(ids,independent_ids)],
                               'router_ids_from_captured_logits_exact': bool(np.array_equal(ids, expected_ids)),
@@ -202,11 +222,13 @@ def main():
                     checks['shared_weight'] = stats(np.asarray([shared_gate]),got('shared_weight','<f4'))
                     combined = rounded((routed.astype(np.float64)+shared['down'].astype(np.float64)*shared_gate).astype(np.float32))
                     checks['complete_local_chain'] = chain_budget(combined,got('local_combined'))
-                    partials[rank,row] = combined, got('local_combined'), got('moe_folded')
+                    partials[rank,row] = combined, got('local_combined'), got('moe_folded'), x, ids, router_weights
                     results.append({'layer':layer,'rank':rank,'position':position+row,'checks':checks})
             for row in (0, int(tokens)//2, int(tokens)-1):
                 a,b = partials[0,row],partials[1,row]
                 folds.append({'layer':layer,'position':position+row,
+                              'rank_inputs_equal':bool(np.array_equal(a[3],b[3])),
+                              'rank_routing_equal':bool(np.array_equal(a[4],b[4]) and np.array_equal(a[5],b[5])),
                               'captured_fold_exact':bool(np.array_equal(rounded(a[1]+b[1]),a[2]) and np.array_equal(a[2],b[2])),
                               'independent_chain_fold':chain_budget(rounded(a[0]+b[0]),a[2])})
         (ROOT/'audit.json').write_text(json.dumps({'rows':results,'folds':folds},indent=2)+'\n')
@@ -216,7 +238,12 @@ def main():
              'local_chain_failures':sum(not r['checks']['complete_local_chain']['pass'] for r in results),
              'folded_chain_failures':sum(not r['independent_chain_fold']['pass'] for r in folds),
              'exact_fold_failures':sum(not r['captured_fold_exact'] for r in folds),
+             'rank_input_or_routing_failures':sum(not r['rank_inputs_equal'] or not r['rank_routing_equal'] for r in folds),
+             'router_budget_failures':sum(not r['checks']['router_budget']['pass'] for r in results),
              'route_or_segment_failures':sum(not r['checks']['router_ids_from_captured_logits_exact'] or not r['checks']['segmented_source_rows_exact'] for r in results)}
+    summary['stage_max_relative_l2']={name:max(r['checks'][name]['relative_l2'] for r in results)
+                                    for name,val in results[0]['checks'].items()
+                                    if isinstance(val,dict) and 'relative_l2' in val}
     (ROOT/'summary.json').write_text(json.dumps(summary,indent=2)+'\n')
     print(summary)
 

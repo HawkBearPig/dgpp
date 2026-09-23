@@ -1,0 +1,6 @@
+{
+  "base_commit": "d318815984fd2ab1f0a67a6b830b57730a57439a",
+  "binary_sha256": "60fc526cb7106f5daf8dc02f6c87d4e2ce7026e631334ee1ff3d625720758498",
+  "patch_sha256": "c09831fa32aff7bc6038d11920d7aab2a59568891ea20ce902b3487522c36693",
+  "source": "EOS correction plus FP32 GR, single-rounding SwiGLU and resident-image bypass; original W4A16 expert arithmetic and globals"
+}

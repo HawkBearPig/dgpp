@@ -24,7 +24,8 @@ consistency patch is not a prerequisite for the investigation.
 | [FP8 checkpoint control](2026-09-23-issue4-fp8-control/README.md) | 5/6, different wrong value, 174 output tokens; input and all checked non-expert language tensors match | Higher expert weight precision alone does not repair the failure |
 | [Checkpoint rebuild](2026-09-23-issue4-uncached/README.md) | Same 5/6 answer and usage, with resident images bypassed on both ranks | Cached weights do not explain the observed failure |
 | [Uncached arithmetic control](2026-09-23-issue4-postscale-uncached/README.md) | 5/6; full answer and token counts match deterministic reference exactly | Correct scale integration changes the wrong answer, but does not repair retrieval |
-| [W4A16 reference](2026-09-23-issue4-reference-w4a16/README.md) | Running | Removes the reference activation-precision difference |
+| [W4A16 reference](2026-09-23-issue4-reference-w4a16/README.md) | Two identical 6/6 answers, 187 completion tokens | Repeatable successful reference in the tested world; other arithmetic differences remain |
+| [W4A16 DGPP rounding control](2026-09-23-issue4-reference-rounding-w4a16/README.md) | Built, not yet run | Tests GR/SwiGLU reference rounding with checkpoint dense projections |
 
 [Draft PR #34](https://github.com/HawkBearPig/dgpp/pull/34) separates generation
 stop IDs from trained model EOS, preserving PLE semantics. The release build,
@@ -58,6 +59,7 @@ smoke test. Raw captures and receipts remain local under each record's ignored
 use `/tmp/dgpp-issue4-20260923`. The user's original tracked source is unchanged.
 
 The next direct operator audit is [real-fixture MoE](2026-09-23-issue4-moe-audit/README.md):
-read-only capture build and independent host-format checks passed; capture is
-prepared but not yet run. It covers routed/shared expert calculations missing
+read-only capture build and independent host-format checks passed. The first
+capture used the wrong control configuration and was quarantined; the exact
+forced-prefix configuration is now running. It covers routed/shared expert calculations missing
 from the earlier attention/history audit.

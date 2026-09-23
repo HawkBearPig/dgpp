@@ -1,0 +1,113 @@
+diff --git a/src/kernels/glm_moe.cu b/src/kernels/glm_moe.cu
+index 2e3b799..701e129 100644
+--- a/src/kernels/glm_moe.cu
++++ b/src/kernels/glm_moe.cu
+@@ -335,10 +335,7 @@ __global__ void moe_swiglu_clamp_kernel(const uint16_t* __restrict__ gate,
+   float u = bf16_bits_to_float(up[i]);
+   if (g > limit) g = limit;  // gate: NO lower clamp (reference asymmetry)
+   u = fminf(fmaxf(u, -limit), limit);
+-  const uint16_t t =
+-      float_to_bf16_bits(g * sigmoidf_acc(g));  // rounding 1 (silu)
+-  out[i] =
+-      float_to_bf16_bits(bf16_bits_to_float(t) * u);  // rounding 2 (product)
++  out[i] = float_to_bf16_bits((g * sigmoidf_acc(g)) * u);  // diagnostic: one rounding
+ }
+ 
+ __global__ void moe_gather_rows_kernel(const uint16_t* __restrict__ src,
+@@ -1763,8 +1760,7 @@ __global__ void moe_slot_gate_up_swiglu_fp4_kernel(
+     }
+     if (g > limit) g = limit;
+     u = fminf(fmaxf(u, -limit), limit);
+-    const uint16_t tt = float_to_bf16_bits(g * sigmoidf_acc(g));
+-    act_row[row] = float_to_bf16_bits(bf16_bits_to_float(tt) * u);
++    act_row[row] = float_to_bf16_bits((g * sigmoidf_acc(g)) * u);
+   }
+ }
+ 
+diff --git a/src/kernels/qwen_gr.cu b/src/kernels/qwen_gr.cu
+index ec5ceb7..e5a969e 100644
+--- a/src/kernels/qwen_gr.cu
++++ b/src/kernels/qwen_gr.cu
+@@ -37,8 +37,8 @@ __global__ void mix_finish_kernel(const uint16_t* __restrict__ logits,
+   float acc = 0.0f;
+   for (int i = 0; i < hc; ++i) {
+     const int64_t at = base + static_cast<int64_t>(i) * hidden;
+-    const float g = round_bf16(sigmoid_f(bf16_bits_to_float(logits[at])));
+-    acc += round_bf16(g * bf16_bits_to_float(rn[at]));
++    const float g = sigmoid_f(bf16_bits_to_float(logits[at]));
++    acc = fmaf(g, bf16_bits_to_float(rn[at]), acc);
+   }
+   x[row * hidden + j] = float_to_bf16_bits(acc * inv_hc);
+ }
+@@ -94,7 +94,7 @@ __global__ void combine_dots_kernel(const uint16_t* __restrict__ rn,
+                                        width, lane);
+   if (lane == 0) {
+     const float dot = round_bf16(acc);          // the linear's bf16 output
+-    gates[row * hc + warp] = 2.0f * round_bf16(sigmoid_f(dot * inv_hc));
++    gates[row * hc + warp] = 2.0f * sigmoid_f(dot * inv_hc);
+   }
+ }
+ 
+@@ -109,9 +109,9 @@ __global__ void combine_apply_kernel(uint16_t* __restrict__ r_state,
+   if (idx >= width) return;
+   const int i = idx / hidden, j = idx - i * hidden;
+   const float g = gates[row * hc + i];
+-  const float inj = round_bf16(bf16_bits_to_float(y[row * hidden + j]) * g);
++  const float block = bf16_bits_to_float(y[row * hidden + j]);
+   uint16_t* r = r_state + row * width + idx;
+-  *r = float_to_bf16_bits(bf16_bits_to_float(*r) + inj);
++  *r = float_to_bf16_bits(fmaf(block, g, bf16_bits_to_float(*r)));
+ }
+ 
+ // ---- the site's GEMVs with their producers folded into the staging ----------
+@@ -200,7 +200,7 @@ __global__ void __launch_bounds__(kGrGemvThreads)
+       if (lane == 0) {
+         const float dot = round_bf16(acc);  // the linear's bf16 output
+         gates[static_cast<size_t>(row) * hc + i] =
+-            2.0f * round_bf16(sigmoid_f(dot * inv_hc));
++            2.0f * sigmoid_f(dot * inv_hc);
+       }
+     }
+     return;
+@@ -245,7 +245,7 @@ __global__ void __launch_bounds__(kGrGemvThreads)
+       if (lane == 0) {
+         const float dot = round_bf16(acc);  // the linear's bf16 output
+         gates[static_cast<size_t>(row) * hc + i] =
+-            2.0f * round_bf16(sigmoid_f(dot * inv_hc));
++            2.0f * sigmoid_f(dot * inv_hc);
+       }
+     }
+     return;
+diff --git a/src/kernels/qwen_moe.cu b/src/kernels/qwen_moe.cu
+index 728576b..2f2ee52 100644
+--- a/src/kernels/qwen_moe.cu
++++ b/src/kernels/qwen_moe.cu
+@@ -105,9 +105,8 @@ __global__ void shared_gate_up_swiglu_kernel(const uint16_t* __restrict__ x, siz
+     float uv = round_bf16(ua[r]);  // the up GEMV's
+     if (gv > limit) gv = limit;
+     uv = fminf(fmaxf(uv, -limit), limit);
+-    const uint16_t t = float_to_bf16_bits(gv * (1.0f / (1.0f + expf(-gv))));  // rounding 1
+     act[static_cast<size_t>(r) * S + row] =
+-        float_to_bf16_bits(bf16_bits_to_float(t) * uv);  // rounding 2
++        float_to_bf16_bits((gv * (1.0f / (1.0f + expf(-gv)))) * uv);
+   }
+ }
+ 
+diff --git a/src/models/qwen/loader.cpp b/src/models/qwen/loader.cpp
+index 27731d3..743edaf 100644
+--- a/src/models/qwen/loader.cpp
++++ b/src/models/qwen/loader.cpp
+@@ -680,7 +680,12 @@ size_t QwenLayerStream::ngram_table_bytes(const QwenTextConfig& cfg, int rank, i
+ void QwenLayerStream::set_resident_image_dir(const std::string& dir) {
+   resident_image_dir_storage() = dir;
+ }
+-const std::string& QwenLayerStream::resident_image_dir() { return resident_image_dir_storage(); }
++const std::string& QwenLayerStream::resident_image_dir() {
++  // Diagnostic: force construction from checkpoint, without reading/writing
++  // the persistent image cache. The production cache and payloads stay intact.
++  static const std::string disabled;
++  return disabled;
++}
+ 
+ // ---- the n-gram table ----------------------------------------------------------
+ 

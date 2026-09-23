@@ -9,8 +9,6 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
-import time
-import shlex
 import urllib.request
 
 ROOT = Path('/home/stephen/workspace/dgpp')
@@ -18,7 +16,7 @@ WORK = Path('/tmp/dgpp-issue4-20260923')
 RECORD = Path(__file__).resolve().parent
 RAW = RECORD / 'raw/campaign'
 PROD = ROOT / 'deploy/cluster_glm-5.3-flash_nvfp4-fp8_w4.json'
-BINARY = RECORD / 'raw/moe-capture-dgpp-serve'
+BINARY = RECORD / 'raw/reference-rounding-w4a16-dgpp-serve'
 TEST_ENV = dict(os.environ, DGPP_ENV_FILE=str(WORK / 'benchmarks/results/2026-09-23-issue4-exact/raw/site.env'))
 PROD_ENV = dict(os.environ, DGPP_ENV_FILE=str(ROOT / '.env'))
 EXPECTED_PROD = '4638e3c595a2765d6d50c4626a9fef3aa2aa82936c6c50e3d0eec871fcde8e00'
@@ -56,7 +54,6 @@ def production_identity():
     return result
 
 
-assert json.loads((RAW/'baseline.json').read_text()) == json.loads((ROOT/'benchmarks/results/2026-09-23-issue4-operators/forced.json').read_text()), 'Capture requires the exact forced-prefix control configuration'
 assert sha(ROOT / 'build-release/dgpp-serve') == EXPECTED_PROD
 before = metrics(18080)
 assert before['scheduler']['active'] == before['scheduler']['queued'] == 0
@@ -67,35 +64,21 @@ assert sha(BINARY) == build['binary_sha256']
 assert sha(RECORD/'diagnostic.patch') == build['patch_sha256']
 build['request_sha256'] = sha(RAW/'request.json')
 (RAW/'build.json').write_text(json.dumps(build,indent=2)+'\n')
-CAPTURE = Path('/tmp/dgpp-issue4-moe-capture-20260923')
-CAPTURE_STORAGE = RECORD/'raw/captures'
-assert not CAPTURE.exists() and not CAPTURE_STORAGE.exists()
-CAPTURE_STORAGE.mkdir()
-CAPTURE.symlink_to(CAPTURE_STORAGE, target_is_directory=True)
-run('peer-capture-dir',['ssh','-o','BatchMode=yes','stephen@192.168.88.12', 'mkdir '+shlex.quote(str(CAPTURE))])
 stopped = active = False
 try:
     stopped = True
     run('production-down', [sys.executable, str(ROOT / 'scripts/dgpp-cluster'), 'down', '--config', str(PROD)], timeout=120)
-    for mode, config in [('native', 'baseline.json')]:
+    for mode, config in [('native', 'baseline.json'), ('bounded', 'bounded.json')]:
         active = True
         active_config = RAW / config
         active_log = RAW / (mode + '-world')
         run(mode + '-up', [sys.executable, str(WORK / 'scripts/dgpp-cluster'), 'up', '--config', str(active_config), '--log-dir', str(active_log), '--bin', str(BINARY)], TEST_ENV, WORK)
-        before = metrics(18084)
-        assert before['service']['requests_total'] == 0 and before['scheduler']['active'] == 0
-        started_at = time.monotonic()
-        payload = (RAW/'request.json').read_bytes()
-        request = urllib.request.Request('http://127.0.0.1:18084/v1/completions', data=payload, headers={'Content-Type':'application/json'})
-        response = json.load(urllib.request.urlopen(request,timeout=1800))
-        (RAW/'response.json').write_text(json.dumps(response,indent=2)+'\n')
-        expected = json.loads((ROOT/'benchmarks/results/2026-09-23-issue4-operators/raw/clean-response.json').read_text())
-        verdict = {'same_choices_and_logprobs': response['choices']==expected['choices'],
-                   'same_usage':response['usage']==expected['usage'],
-                   'wall_seconds':time.monotonic()-started_at}
-        verdict['pass'] = verdict['same_choices_and_logprobs'] and verdict['same_usage']
-        (RECORD/'capture-parity.json').write_text(json.dumps(verdict,indent=2)+'\n')
-        print('Capture parity',verdict,flush=True)
+        command = [sys.executable, str(RECORD / 'replay.py'), '--request', str(RAW / 'request.json'), '--oracle', str(RAW / 'oracle.json'), '--out', str(RAW / (mode + '-run'))]
+        with (RAW / (mode + '-replay.log')).open('w') as f:
+            result = subprocess.run(command, cwd=WORK, env=TEST_ENV, stdout=f, stderr=subprocess.STDOUT, timeout=1900)
+        assert result.returncode in (0, 1)
+        verdict = json.loads((RAW / (mode + '-run/verdict.json')).read_text())
+        print(mode, 'verdict:', verdict, flush=True)
         run(mode + '-down', [sys.executable, str(WORK / 'scripts/dgpp-cluster'), 'down', '--config', str(active_config), '--log-dir', str(active_log)], TEST_ENV, WORK, 120)
         active = False
         if not verdict['pass']:
@@ -119,7 +102,4 @@ finally:
             (RAW / 'restoration.json').write_text(json.dumps({'binaries': binaries, 'config_matches': True, 'smoke': response, 'idle': True}, indent=2))
             print('Production restored and independently verified', flush=True)
 
-run('copy-peer-captures',['bash','-o','pipefail','-c',
-    'ssh -o BatchMode=yes stephen@192.168.88.12 tar -C '+shlex.quote(str(CAPTURE))+' -cf - rank1 | tar --no-same-owner --no-same-permissions -C '+shlex.quote(str(CAPTURE_STORAGE))+' -xf -'])
-assert verdict['pass'], 'Read-only capture changed the diagnostic output'
-print('MoE fixture capture complete',flush=True)
+print('W4A16 reference-rounding control complete', flush=True)
