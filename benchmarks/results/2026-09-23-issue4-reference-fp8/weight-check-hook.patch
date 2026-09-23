@@ -1,0 +1,10 @@
+--- a/traced-model.py
++++ b/traced-model.py
+@@ -327,6 +327,7 @@
+         _issue4.capture("mlp_in", block_input)
+         _issue4.capture("residual", hidden_states)
+         _issue4.capture("mlp_injection", injection)
++        _issue4.check_fp8_weights(self.mlp)
+         mlp_out = self.mlp(block_input)
+         _issue4.capture("mlp_out", mlp_out)
+         return hidden_states, mlp_out, injection

@@ -1,0 +1,17 @@
+{
+  "campaign.py": "c3c822cc795c4c2b901a20a81c0b899f14a6af92ff71a8ba591be8cef4c8ea93",
+  "issue4_moe_align.py": "30ad4ef648d60afb92ee7056d5065d6413137865e71b0e9a44ebbcf566b59a54",
+  "issue4_fp8_weights.py": "bf668b032e327bd23209a8ff327eede2d86964f08c7e6bd1858cb7c3d9ec962c",
+  "issue4_trace.py": "188340a3c050d3773b1e289cd12f98da4456f11fcd390f11eb39fc974a111503",
+  "issue4_topk.py": "09adcdbf0de0f14f8589d6d08098f16a76c5d376ccc3c472cb59a5aa1478ed68",
+  "pinned-gdn-configs.json": "f72c04239fa5a57ef899a410db8fef958d14a3a346f55c343b9b4bff355dc0f3",
+  "alignment-validation.json": "21a812ce9f934d4e689b39ba4d9b6197f7bcc895ba95cce1a02028d3b809a603",
+  "raw/model.py": "f0288bde4899f6c5215808690598000bf900056232982dd38f98df4f458d28c8",
+  "raw/qwen_gdn_linear_attn.py": "e2ce8c0ee99fecbcdd03a29684564b7b026d2fda3aa6322aeb61bda2823d3112",
+  "raw/fused_moe.py": "0284d76847380a0d1af4eba63e90db8838d4a29785856c8c478e3ead26b4ccab",
+  "raw/triton_moe.py": "1ace6e60427c94fc17f16490475637f6988f88e7e4796f58a752a753dd7fd397",
+  "raw/fp8.py": "de1f475609b6d5adc149e7c2c2d95bbe1be4ef45ff39abbdd524d785d3c69d41",
+  "raw/fp8_oracle.py": "a4cab17ac95c380dc74df908fb554def104a75a9cce8d78363bd3e31a832083c",
+  "raw/qsa.py": "d7a0c7690cae4a59a4f621b6b5b8abc904205371635c1c1fdef9d9bd3a682647",
+  "raw/ple_layer.py": "9410518f08adc844c318af0f21518ebcb0cd7fd9e3b95a8448356cf52dec68dc"
+}

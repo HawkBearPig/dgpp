@@ -1,0 +1,16 @@
+{
+  "utc": "2026-09-23T15:06:51.815096+00:00",
+  "binaries": {
+    "192.168.88.11": "4638e3c595a2765d6d50c4626a9fef3aa2aa82936c6c50e3d0eec871fcde8e00  /proc/77789/exe\n",
+    "192.168.88.12": "4638e3c595a2765d6d50c4626a9fef3aa2aa82936c6c50e3d0eec871fcde8e00  /proc/491293/exe\n",
+    "192.168.88.13": "4638e3c595a2765d6d50c4626a9fef3aa2aa82936c6c50e3d0eec871fcde8e00  /proc/1300275/exe\n",
+    "192.168.88.14": "4638e3c595a2765d6d50c4626a9fef3aa2aa82936c6c50e3d0eec871fcde8e00  /proc/790134/exe\n"
+  },
+  "config_matches": true,
+  "active": 1,
+  "queued": 0,
+  "requests_total": 14,
+  "requests_failed": 0,
+  "engine_failed": false,
+  "last_restoration": "../2026-09-23-issue4-reference-state-fp32/restoration.json"
+}

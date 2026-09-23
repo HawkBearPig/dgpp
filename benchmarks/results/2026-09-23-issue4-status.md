@@ -150,5 +150,20 @@ pinned GDN launch choices, retaining BF16 auto state. Both return the original
 5/6 answer with identical full text/usage (184 completion tokens). All 267480
 captured fields across both ranks repeat exactly, with no missing final fields;
 all 534960 saved payloads pass shape, length and SHA256 checks. Production
-restoration passed. The explicit FP32-state comparison is now running with the
-same deterministic controls; no state-control accuracy verdict is available yet.
+restoration passed.
+
+The [FP32-state comparison](2026-09-23-issue4-reference-state-fp32/README.md)
+also returns the original 5/6 answer twice, with identical text/usage. All 267480
+captured fields repeat exactly and all 534960 payloads pass integrity checks.
+Both ranks match the BF16-state control by value throughout the first chunk;
+the first numerical difference is the layer-0 state read at position 2048.
+All 12 checked handoffs preserve FP32 state exactly. The intended state-storage
+change affects later computation but does not repair retrieval. Production
+restoration passed. An independent comparison of the already-cached FP8 checkpoint
+is prepared; it changes both expert weight precision and reference backend, so it
+will not isolate a single NVFP4 arithmetic difference.
+
+The [FP8 reference](2026-09-23-issue4-reference-fp8/README.md) launch stopped at
+the idle-production guard before any service interruption or test inference.
+Production is receiving live work; an exclusive GPU window is pending. The
+comparison is prepared, not an executed accuracy result.

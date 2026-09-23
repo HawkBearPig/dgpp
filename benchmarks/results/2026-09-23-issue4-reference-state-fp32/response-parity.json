@@ -1,0 +1,4 @@
+{
+  "same_assistant_text_as_bf16_state": true,
+  "same_usage_as_bf16_state": true
+}

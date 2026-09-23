@@ -1,0 +1,16 @@
+{
+  "exit_code": 1,
+  "phase": "idle-service precondition before production-down",
+  "production_stopped": false,
+  "reference_world_started": false,
+  "inference_requests_sent": 0,
+  "reason": "active and queued production counts were not both zero; exact failed-sample counts were not retained",
+  "later_observation": {
+    "utc": "2026-09-23T15:05:39.357227+00:00",
+    "active": 0,
+    "queued": 0,
+    "requests_total": 9,
+    "engine_failed": false
+  },
+  "empty_peer_capture_directory_removed": true
+}

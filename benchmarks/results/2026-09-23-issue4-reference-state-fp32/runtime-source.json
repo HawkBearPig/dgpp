@@ -1,0 +1,14 @@
+{
+  "0": {
+    "gdn_sha256": "e2ce8c0ee99fecbcdd03a29684564b7b026d2fda3aa6322aeb61bda2823d3112",
+    "marlin_selected": true,
+    "canonical_marlin_sha256": "96db567cc084a3c8feb5a4bab3555026848ff233d6028306d45ca0c6c17e48f2",
+    "align_sha256": "30ad4ef648d60afb92ee7056d5065d6413137865e71b0e9a44ebbcf566b59a54"
+  },
+  "1": {
+    "gdn_sha256": "e2ce8c0ee99fecbcdd03a29684564b7b026d2fda3aa6322aeb61bda2823d3112",
+    "marlin_selected": true,
+    "canonical_marlin_sha256": "96db567cc084a3c8feb5a4bab3555026848ff233d6028306d45ca0c6c17e48f2",
+    "align_sha256": "30ad4ef648d60afb92ee7056d5065d6413137865e71b0e9a44ebbcf566b59a54"
+  }
+}
