@@ -1,0 +1,26 @@
+[
+  {
+    "rank": 0,
+    "source": "issue4_fp8_weights.py",
+    "sha256": "bbaf746b35a5b7e5128eed92cd946f93a921695f5d543b9aeb6f629933be9145",
+    "exact": true
+  },
+  {
+    "rank": 0,
+    "source": "raw/fp8.py",
+    "sha256": "de1f475609b6d5adc149e7c2c2d95bbe1be4ef45ff39abbdd524d785d3c69d41",
+    "exact": true
+  },
+  {
+    "rank": 1,
+    "source": "issue4_fp8_weights.py",
+    "sha256": "bbaf746b35a5b7e5128eed92cd946f93a921695f5d543b9aeb6f629933be9145",
+    "exact": true
+  },
+  {
+    "rank": 1,
+    "source": "raw/fp8.py",
+    "sha256": "de1f475609b6d5adc149e7c2c2d95bbe1be4ef45ff39abbdd524d785d3c69d41",
+    "exact": true
+  }
+]

@@ -1,0 +1,296 @@
+[
+  {
+    "rank": 0,
+    "compared_fields": 18,
+    "first_difference": "layer0_mlp_out",
+    "only_mlp_output_differs": true,
+    "fields": [
+      {
+        "field": "layer-1_ngram_context",
+        "equal": true
+      },
+      {
+        "field": "layer-1_query_start_loc",
+        "equal": true
+      },
+      {
+        "field": "layer-1_embedding",
+        "equal": true
+      },
+      {
+        "field": "layer0_attn_in",
+        "equal": true
+      },
+      {
+        "field": "layer0_attn_injection",
+        "equal": true
+      },
+      {
+        "field": "layer0_gdn_q",
+        "equal": true
+      },
+      {
+        "field": "layer0_gdn_k",
+        "equal": true
+      },
+      {
+        "field": "layer0_gdn_v",
+        "equal": true
+      },
+      {
+        "field": "layer0_gdn_g",
+        "equal": true
+      },
+      {
+        "field": "layer0_gdn_beta",
+        "equal": true
+      },
+      {
+        "field": "layer0_gdn_initial_state",
+        "equal": true
+      },
+      {
+        "field": "layer0_gdn_core",
+        "equal": true
+      },
+      {
+        "field": "layer0_gdn_final_state",
+        "equal": true
+      },
+      {
+        "field": "layer0_attn_out",
+        "equal": true
+      },
+      {
+        "field": "layer0_mlp_in",
+        "equal": true
+      },
+      {
+        "field": "layer0_residual",
+        "equal": true
+      },
+      {
+        "field": "layer0_mlp_injection",
+        "equal": true
+      },
+      {
+        "field": "layer0_mlp_out",
+        "equal": false,
+        "difference": {
+          "position": 0,
+          "field": "layer0_mlp_out",
+          "shape": [
+            2048,
+            2560
+          ],
+          "different_elements": 4898640,
+          "elements": 5242880,
+          "nonfinite": 0,
+          "relative_l2": 0.030155173901684103,
+          "max_absolute": 0.03125,
+          "first_indices": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            14,
+            15,
+            16
+          ],
+          "first_values": [
+            0.06103515625,
+            -0.01953125,
+            0.048583984375,
+            -0.00830078125,
+            0.07470703125,
+            0.2578125,
+            -0.007568359375,
+            -0.041015625,
+            0.0673828125,
+            -0.0120849609375,
+            0.087890625,
+            -0.0303955078125,
+            -0.028564453125,
+            -0.0198974609375,
+            0.04443359375,
+            0.06298828125
+          ],
+          "second_values": [
+            0.05517578125,
+            -0.0220947265625,
+            0.05126953125,
+            -0.0087890625,
+            0.07568359375,
+            0.26171875,
+            -0.005859375,
+            -0.0400390625,
+            0.06787109375,
+            -0.01220703125,
+            0.0859375,
+            -0.03271484375,
+            -0.029052734375,
+            -0.02001953125,
+            0.04052734375,
+            0.06494140625
+          ]
+        }
+      }
+    ]
+  },
+  {
+    "rank": 1,
+    "compared_fields": 18,
+    "first_difference": "layer0_mlp_out",
+    "only_mlp_output_differs": true,
+    "fields": [
+      {
+        "field": "layer-1_ngram_context",
+        "equal": true
+      },
+      {
+        "field": "layer-1_query_start_loc",
+        "equal": true
+      },
+      {
+        "field": "layer-1_embedding",
+        "equal": true
+      },
+      {
+        "field": "layer0_attn_in",
+        "equal": true
+      },
+      {
+        "field": "layer0_attn_injection",
+        "equal": true
+      },
+      {
+        "field": "layer0_gdn_q",
+        "equal": true
+      },
+      {
+        "field": "layer0_gdn_k",
+        "equal": true
+      },
+      {
+        "field": "layer0_gdn_v",
+        "equal": true
+      },
+      {
+        "field": "layer0_gdn_g",
+        "equal": true
+      },
+      {
+        "field": "layer0_gdn_beta",
+        "equal": true
+      },
+      {
+        "field": "layer0_gdn_initial_state",
+        "equal": true
+      },
+      {
+        "field": "layer0_gdn_core",
+        "equal": true
+      },
+      {
+        "field": "layer0_gdn_final_state",
+        "equal": true
+      },
+      {
+        "field": "layer0_attn_out",
+        "equal": true
+      },
+      {
+        "field": "layer0_mlp_in",
+        "equal": true
+      },
+      {
+        "field": "layer0_residual",
+        "equal": true
+      },
+      {
+        "field": "layer0_mlp_injection",
+        "equal": true
+      },
+      {
+        "field": "layer0_mlp_out",
+        "equal": false,
+        "difference": {
+          "position": 0,
+          "field": "layer0_mlp_out",
+          "shape": [
+            2048,
+            2560
+          ],
+          "different_elements": 4898640,
+          "elements": 5242880,
+          "nonfinite": 0,
+          "relative_l2": 0.030155173901684103,
+          "max_absolute": 0.03125,
+          "first_indices": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            14,
+            15,
+            16
+          ],
+          "first_values": [
+            0.06103515625,
+            -0.01953125,
+            0.048583984375,
+            -0.00830078125,
+            0.07470703125,
+            0.2578125,
+            -0.007568359375,
+            -0.041015625,
+            0.0673828125,
+            -0.0120849609375,
+            0.087890625,
+            -0.0303955078125,
+            -0.028564453125,
+            -0.0198974609375,
+            0.04443359375,
+            0.06298828125
+          ],
+          "second_values": [
+            0.05517578125,
+            -0.0220947265625,
+            0.05126953125,
+            -0.0087890625,
+            0.07568359375,
+            0.26171875,
+            -0.005859375,
+            -0.0400390625,
+            0.06787109375,
+            -0.01220703125,
+            0.0859375,
+            -0.03271484375,
+            -0.029052734375,
+            -0.02001953125,
+            0.04052734375,
+            0.06494140625
+          ]
+        }
+      }
+    ]
+  }
+]

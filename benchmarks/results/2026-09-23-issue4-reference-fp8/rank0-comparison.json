@@ -1,0 +1,26 @@
+{
+  "rank": 0,
+  "equal_fields": 128640,
+  "different_fields": 0,
+  "first_difference": null,
+  "first_input_difference": null,
+  "incomplete_tail": null,
+  "early_differences": [],
+  "kernel_config_comparisons": [
+    {
+      "position": 0,
+      "equal": true,
+      "different": {}
+    },
+    {
+      "position": 2048,
+      "equal": true,
+      "different": {}
+    },
+    {
+      "position": 260096,
+      "equal": true,
+      "different": {}
+    }
+  ]
+}

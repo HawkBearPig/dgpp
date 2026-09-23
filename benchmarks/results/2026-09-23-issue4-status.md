@@ -38,6 +38,9 @@ consistency patch is not a prerequisite for the investigation.
 | [W4A16 recurrent-GDN reference](2026-09-23-issue4-reference-recurrent-gdn/README.md) | Two identical 5/6 answers, exact DGPP text/token counts | A2 also fails: GDN causal attribution is not established |
 | [Fresh W4A16 repeat](2026-09-23-issue4-reference-w4a16-repeat/README.md) | Two original 5/6 answers with unchanged GDN | Earlier W4A16 success is not stable across fresh worlds |
 | [Expert router ties](2026-09-23-issue4-router-ties/README.md) | All 576 captured rows agree across prefill/decode batch shapes | No reference/DGPP expert-set differences on identical logits |
+| [Canonical reference grouping](2026-09-23-issue4-reference-canonical-moe/README.md) | Two original 5/6 failures; all captured fields repeat exactly | Removing measured reference grouping variation does not repair retrieval |
+| [Reference FP32 state](2026-09-23-issue4-reference-state-fp32/README.md) | Two original 5/6 failures; actual FP32 handoffs verified | BF16 reference state storage is insufficient to explain the failure |
+| [Independent FP8 reference](2026-09-23-issue4-reference-fp8/README.md) | Two 5/6 failures with the original wrong association, 169 output tokens; 257280 fields repeat exactly | Higher expert precision in the independent engine is insufficient |
 
 [Draft PR #34](https://github.com/HawkBearPig/dgpp/pull/34) separates generation
 stop IDs from trained model EOS, preserving PLE semantics. The release build,
@@ -159,22 +162,21 @@ Both ranks match the BF16-state control by value throughout the first chunk;
 the first numerical difference is the layer-0 state read at position 2048.
 All 12 checked handoffs preserve FP32 state exactly. The intended state-storage
 change affects later computation but does not repair retrieval. Production
-restoration passed. An independent comparison of the already-cached FP8 checkpoint
-is prepared; it changes both expert weight precision and reference backend, so it
-will not isolate a single NVFP4 arithmetic difference.
+restoration passed.
 
-The initial [FP8 reference](2026-09-23-issue4-reference-fp8/README.md) launch
-stopped at the idle-production guard before any service interruption or test
-inference. The user subsequently authorized cluster testing. The retry passed
-both recorded idle checks, stopped production at 15:12 UTC and is loading the
-reference. Accuracy results are pending. A CPU-only check confirms both
-checkpoints have the same effective routing normalization, PLE seed and
-convolution width in the pinned reference.
+The [independent FP8 reference](2026-09-23-issue4-reference-fp8/README.md)
+now completes the original input twice: 5/6, original wrong association,
+169 completion tokens, identical full text and usage. All 48 sampled actual
+loaded weight/scale checks pass. Both ranks match the NVFP4 reference in all
+17 captured fields before the first expert output; that output is the first
+numerical difference. All 257280 captured fields across ranks repeat exactly,
+all 514560 saved payloads pass integrity checks, and all 12 checked state handoffs
+preserve FP32 bits. Production restoration and peer capture collection passed.
+Higher expert precision with this independent backend does not repair retrieval.
+An earlier diagnostic assertion about checkpoint scale dtype was corrected and
+that aborted attempt is explicitly excluded from accuracy evidence.
 
-The first authorized FP8 run loaded successfully but stopped in a diagnostic
-assertion: checkpoint scales are BF16, while runtime scales are FP32. This is an
-excluded checker error before the first expert computation, not an accuracy
-result. Production restoration passed. The corrected checker preserves exact
-value comparisons, passes 48 independently constructed CPU checks and rejects
-corrupted scales on both ranks. All 17 captured preceding fields match the
-NVFP4 reference on each rank. A corrected serial retry is starting.
+A full BF16 checkpoint is available, with identical text configuration to FP8,
+but no BF16 weights have been downloaded and no BF16 inference has run. It is
+an optional broader quantization control, not a prerequisite for a DGPP fix.
+Its result alone would not identify a specific engine defect.

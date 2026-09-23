@@ -1,0 +1,24 @@
+[
+  {
+    "request": 1,
+    "assistant_text_sha256": "d563425d26aa33da6526686fa8169dc9d2135449c9be498b9bb3a991c8742d9c",
+    "same_text_as_native_fp8": false,
+    "same_text_as_nvfp4_reference": false,
+    "same_parsed_answer_as_native_fp8": false,
+    "same_parsed_answer_as_nvfp4_reference": true,
+    "completion_tokens": 169,
+    "correct": 5,
+    "failed_key_value": "val_5dac9ed720abddaf"
+  },
+  {
+    "request": 2,
+    "assistant_text_sha256": "d563425d26aa33da6526686fa8169dc9d2135449c9be498b9bb3a991c8742d9c",
+    "same_text_as_native_fp8": false,
+    "same_text_as_nvfp4_reference": false,
+    "same_parsed_answer_as_native_fp8": false,
+    "same_parsed_answer_as_nvfp4_reference": true,
+    "completion_tokens": 169,
+    "correct": 5,
+    "failed_key_value": "val_5dac9ed720abddaf"
+  }
+]

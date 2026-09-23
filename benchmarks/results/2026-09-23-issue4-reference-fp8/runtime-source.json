@@ -1,0 +1,14 @@
+{
+  "0": {
+    "gdn_sha256": "e2ce8c0ee99fecbcdd03a29684564b7b026d2fda3aa6322aeb61bda2823d3112",
+    "triton_fp8_selected": true,
+    "canonical_fused_moe_sha256": "0284d76847380a0d1af4eba63e90db8838d4a29785856c8c478e3ead26b4ccab",
+    "align_sha256": "30ad4ef648d60afb92ee7056d5065d6413137865e71b0e9a44ebbcf566b59a54"
+  },
+  "1": {
+    "gdn_sha256": "e2ce8c0ee99fecbcdd03a29684564b7b026d2fda3aa6322aeb61bda2823d3112",
+    "triton_fp8_selected": true,
+    "canonical_fused_moe_sha256": "0284d76847380a0d1af4eba63e90db8838d4a29785856c8c478e3ead26b4ccab",
+    "align_sha256": "30ad4ef648d60afb92ee7056d5065d6413137865e71b0e9a44ebbcf566b59a54"
+  }
+}

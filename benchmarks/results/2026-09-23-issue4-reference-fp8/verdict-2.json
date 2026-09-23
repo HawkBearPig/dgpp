@@ -1,0 +1,44 @@
+{
+  "checks": {
+    "key_a3ea1faf8458": true,
+    "key_5c7ad6586dd6": true,
+    "key_ecf0ce89497b": true,
+    "key_3ee7709ef005": true,
+    "key_0769e0226c63": false,
+    "key_1ccd2debc518": true
+  },
+  "correct": 5,
+  "total": 6,
+  "actual": {
+    "key_3ee7709ef005": "val_00648ee398573f64",
+    "key_5c7ad6586dd6": "val_e08802eec5f6c596",
+    "key_ecf0ce89497b": "val_58e1450aa7c54384",
+    "key_a3ea1faf8458": "val_d2efb323f0ac0eab",
+    "key_1ccd2debc518": null,
+    "key_0769e0226c63": "val_5dac9ed720abddaf"
+  },
+  "expected": {
+    "key_a3ea1faf8458": "val_d2efb323f0ac0eab",
+    "key_5c7ad6586dd6": "val_e08802eec5f6c596",
+    "key_ecf0ce89497b": "val_58e1450aa7c54384",
+    "key_3ee7709ef005": "val_00648ee398573f64",
+    "key_0769e0226c63": "val_aed39758a1abf065",
+    "key_1ccd2debc518": null
+  },
+  "usage": {
+    "prompt_tokens": 261120,
+    "total_tokens": 261289,
+    "completion_tokens": 169,
+    "prompt_tokens_details": null,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    }
+  },
+  "finish_reason": "stop",
+  "semantic_pass": false,
+  "protocol_pass": true,
+  "raw_protocol_pass": false,
+  "wall_seconds": 369.18639400199754,
+  "native_tokens_exact": true,
+  "prefix_cache_disabled": true
+}

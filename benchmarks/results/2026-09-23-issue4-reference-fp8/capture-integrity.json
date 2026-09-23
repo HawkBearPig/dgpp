@@ -1,0 +1,34 @@
+[
+  {
+    "rank": "rank0",
+    "request": "request1",
+    "fields": 128640,
+    "payload_bytes": 1645471732,
+    "calls": 297,
+    "orphan_payloads": []
+  },
+  {
+    "rank": "rank0",
+    "request": "request2",
+    "fields": 128640,
+    "payload_bytes": 1645471732,
+    "calls": 297,
+    "orphan_payloads": []
+  },
+  {
+    "rank": "rank1",
+    "request": "request1",
+    "fields": 128640,
+    "payload_bytes": 1645471732,
+    "calls": 297,
+    "orphan_payloads": []
+  },
+  {
+    "rank": "rank1",
+    "request": "request2",
+    "fields": 128640,
+    "payload_bytes": 1645471732,
+    "calls": 297,
+    "orphan_payloads": []
+  }
+]

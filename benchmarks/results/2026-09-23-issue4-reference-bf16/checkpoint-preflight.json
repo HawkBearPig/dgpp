@@ -1,0 +1,10 @@
+{
+  "checkpoint": "Qwen/Qwen3.8-Flash-Next",
+  "revision": "de4b8e4d43b917e7706784d8bb445c9af86a3540",
+  "tensor_bytes": 359999963128,
+  "weight_file_bytes": 360000192888,
+  "weight_files": 131,
+  "text_config_differences_from_fp8": {},
+  "api_url": "https://huggingface.co/api/models/Qwen/Qwen3.8-Flash-Next/revision/de4b8e4d43b917e7706784d8bb445c9af86a3540?blobs=true",
+  "weights_download_started": false
+}
