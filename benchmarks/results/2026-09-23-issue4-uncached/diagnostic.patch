@@ -1,0 +1,18 @@
+diff --git a/src/models/qwen/loader.cpp b/src/models/qwen/loader.cpp
+index 27731d3..743edaf 100644
+--- a/src/models/qwen/loader.cpp
++++ b/src/models/qwen/loader.cpp
+@@ -680,7 +680,12 @@ size_t QwenLayerStream::ngram_table_bytes(const QwenTextConfig& cfg, int rank, i
+ void QwenLayerStream::set_resident_image_dir(const std::string& dir) {
+   resident_image_dir_storage() = dir;
+ }
+-const std::string& QwenLayerStream::resident_image_dir() { return resident_image_dir_storage(); }
++const std::string& QwenLayerStream::resident_image_dir() {
++  // Diagnostic: force construction from checkpoint, without reading/writing
++  // the persistent image cache. The production cache and payloads stay intact.
++  static const std::string disabled;
++  return disabled;
++}
+ 
+ // ---- the n-gram table ----------------------------------------------------------
+ 

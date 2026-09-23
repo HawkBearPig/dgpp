@@ -1,0 +1,10 @@
+{
+  "tar_stream_exit_code": 0,
+  "post_restore_scp_replaced": true,
+  "both_rank_comparisons_complete": true,
+  "compared_fields_per_rank": [
+    101660,
+    101660
+  ],
+  "production_restored": true
+}

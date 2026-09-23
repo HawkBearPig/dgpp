@@ -1,0 +1,14 @@
+[
+  {
+    "chunk_start": 0,
+    "equal_fields": 340,
+    "different_fields": [],
+    "scope": "full rows for layers -1..3, last row otherwise"
+  },
+  {
+    "chunk_start": 2048,
+    "equal_fields": 340,
+    "different_fields": [],
+    "scope": "full rows for layers -1..3, last row otherwise"
+  }
+]

@@ -1,0 +1,6 @@
+{
+  "base_commit": "d318815984fd2ab1f0a67a6b830b57730a57439a",
+  "binary_sha256": "62f32d7396fee781d5191c0a55351205d6b56015527fcd17dd8aca8bcef42f0a",
+  "patch_sha256": "227e0edf3fc7c2e90aba9b93b00dcb9dfc116e6f198e08af9dc894daab5151d2",
+  "purpose": "EOS correction plus resident image bypass; otherwise original NVFP4 arithmetic"
+}

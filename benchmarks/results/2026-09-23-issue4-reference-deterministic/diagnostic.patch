@@ -1,0 +1,33 @@
+--- a/vllm/models/qwen3_8_flash_next/nvidia/ops/qsa.py
++++ b/vllm/models/qwen3_8_flash_next/nvidia/ops/qsa.py
+@@ -7,6 +7,8 @@
+ import math
+ 
+ import torch
++from .. import issue4_trace as _issue4
++from ..issue4_topk import select as _issue4_topk
+ 
+ from vllm.platforms import current_platform
+ from vllm.triton_utils import HAS_TRITON, tl, triton
+@@ -764,7 +766,7 @@
+ 
+     columns = page_table.shape[1] * k_cache.shape[1]
+     block_topk = token_topk // compress_ratio
+-    rows_per_chunk = max(1, _LOGITS_WORKSPACE_BYTES // max(columns * 4, 1))
++    rows_per_chunk = min(128, max(1, _LOGITS_WORKSPACE_BYTES // max(columns * 4, 1)))
+     chunk_rows = min(rows, rows_per_chunk)
+     blocks_buffer = torch.empty(
+         (chunk_rows, block_topk), dtype=torch.int32, device=q.device
+@@ -796,7 +798,11 @@
+             if use_cooperative_topk
+             else torch.ops._C.persistent_topk
+         )
+-        topk_op(logits, visible_blocks, blocks, topk_workspace, block_topk, columns)
++        if _issue4.active and _issue4.layer == 3 and _issue4.position in (0, 2048):
++            topk_op(logits, visible_blocks, blocks, topk_workspace, block_topk, columns)
++            _issue4.probe_topk(logits, visible_blocks, blocks, topk_op,
++                              topk_workspace, block_topk, columns, row_start)
++        blocks = _issue4_topk(logits, visible_blocks, block_topk)
+         expand_qsa_block_indices_cuda(
+             blocks,
+             query_positions[row_slice],

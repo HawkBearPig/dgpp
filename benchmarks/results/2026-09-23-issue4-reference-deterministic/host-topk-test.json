@@ -1,0 +1,23 @@
+[
+  {
+    "width": 512,
+    "k": 512,
+    "rows": 12,
+    "oracle": "numpy.lexsort((-score,index)), then index ordering",
+    "passed": true
+  },
+  {
+    "width": 1024,
+    "k": 512,
+    "rows": 12,
+    "oracle": "numpy.lexsort((-score,index)), then index ordering",
+    "passed": true
+  },
+  {
+    "width": 65536,
+    "k": 512,
+    "rows": 12,
+    "oracle": "numpy.lexsort((-score,index)), then index ordering",
+    "passed": true
+  }
+]

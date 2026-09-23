@@ -1,0 +1,22 @@
+{
+  "valid_accuracy_control": false,
+  "reason": "The changed loader scale conversion was bypassed by a previously built resident weight image. Activations used the new scaled representation but weights retained old globals.",
+  "resident_image": "cc6d8bd32bd3a2b5.img",
+  "loaded_cached_layers": 49,
+  "response_finish_reason": "length",
+  "response_usage": {
+    "prompt_tokens": 261120,
+    "completion_tokens": 1024,
+    "total_tokens": 262144,
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    }
+  },
+  "response_json_valid": false,
+  "scorer_error": "JSONDecodeError; no verdict.json written",
+  "production_restored": true,
+  "production_restoration": "benchmarks/results/2026-09-23-issue4-postscale/raw/campaign/restoration.json"
+}

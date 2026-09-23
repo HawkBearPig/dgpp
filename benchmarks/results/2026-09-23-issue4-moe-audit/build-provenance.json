@@ -1,0 +1,7 @@
+{
+  "base_commit": "c6ca191863d620360f3b4370c0156f9e26a2631f",
+  "binary_sha256": "0a02b2feab9e050a745e07951c9f64616675f44a150146b2218c75ee032b2263",
+  "patch_sha256": "53b2b364410032386a6ef4abbe7f1fb62c218f34a30b23a6bc06a3d6861e47ad",
+  "capture_header_sha256": "c918cd54913f9b175112e3ae251e76037acab228d4f9a3587e4a29b50e652144",
+  "purpose": "Read-only MoE capture, original master arithmetic; compare exact diagnostic response to clean retained binary"
+}

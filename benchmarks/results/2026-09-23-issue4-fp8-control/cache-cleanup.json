@@ -1,0 +1,7 @@
+{
+  "path": "/home/stephen/.cache/dgpp/resident/2f42121aa9c1bbb2.img",
+  "size": 54868420352,
+  "mtime": 1790155326.7595742,
+  "reason": "New partial resident image created by this campaign exhausted disk during layer42; log confirms cache disabled. Remove this disposable incomplete image only. Weight load continued directly from verified checkpoint.",
+  "timestamp": "2026-09-23T09:25:37.334345+00:00"
+}

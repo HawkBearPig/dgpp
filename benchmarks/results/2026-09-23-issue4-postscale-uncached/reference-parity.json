@@ -1,0 +1,5 @@
+{
+  "same_assistant_text_as_deterministic_reference": true,
+  "same_token_counts": true,
+  "no_resident_image_open_both_ranks": true
+}

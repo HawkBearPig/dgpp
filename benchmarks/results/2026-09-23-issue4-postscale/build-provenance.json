@@ -1,0 +1,8 @@
+{
+  "base_commit": "d318815984fd2ab1f0a67a6b830b57730a57439a",
+  "binary_sha256": "0955520ebf4fecf412a7ac39e09dd51554832db1afa947d758404d7137fa1f02",
+  "patch_sha256": "188a03aad2a959df7045f4f5cb4823fc8013018ea41d6bffbb9cde5e6fbcfa5d",
+  "build_target": "dgpp_serve_app",
+  "build_exit_code": 0,
+  "diagnostic_only": true
+}

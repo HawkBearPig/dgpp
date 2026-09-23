@@ -1,0 +1,100 @@
+diff --git a/src/models/glm/moe_layer.cpp b/src/models/glm/moe_layer.cpp
+index 7f033f1..b8cbfc7 100644
+--- a/src/models/glm/moe_layer.cpp
++++ b/src/models/glm/moe_layer.cpp
+@@ -1,4 +1,5 @@
+ #include "models/glm/moe_layer.hpp"
++#include "models/qwen/issue4_moe_capture.hpp"
+ 
+ #include <algorithm>
+ #include <cmath>
+@@ -598,6 +599,29 @@ void GlmMoeLayer::enqueue_prefill_f32(const uint16_t* hidden, float* out, int to
+                        tokens, tk, stream);
+   launch_moe_accum_ordered_f32(out, d_down_, H, d_slot_row_, d_ids_, d_weights_,
+                                /*shared_row0=*/-1, tokens, K, H, stream);
++  if (issue4_moe::active) {
++    if (!w_.experts_fp4) throw std::runtime_error("MoE audit expects NVFP4 experts");
++    const int I = static_cast<int>(w_.experts_fp4[0].rows);
++    issue4_moe::write("geometry", std::vector<int32_t>{tokens, H, I, E, K});
++    issue4_moe::sample("input", hidden, H, stream);
++    issue4_moe::sample("ids", d_ids_, K, stream);
++    issue4_moe::sample("weights", d_weights_, K, stream);
++    issue4_moe::sample("scores", d_scores_, E, stream);
++    issue4_moe::sample("logits", d_biased_, E, stream);
++    issue4_moe::sample("routed", out, H, stream);
++    for (int row : issue4_moe::rows) {
++      const std::string prefix = "row" + std::to_string(row) + "_";
++      const auto slots = issue4_moe::read(d_slot_row_ + row * K, K, stream);
++      for (int slot : slots) if (slot < 0 || slot >= tokens * K)
++        throw std::runtime_error("invalid captured routed slot");
++      issue4_moe::write(prefix + "slots", slots);
++      issue4_moe::mapped(prefix + "source_rows", d_rows_, 1, slots, stream);
++      issue4_moe::mapped(prefix + "gate", d_gate_, I, slots, stream);
++      issue4_moe::mapped(prefix + "up", d_up_, I, slots, stream);
++      issue4_moe::mapped(prefix + "act", d_act_, I, slots, stream);
++      issue4_moe::mapped(prefix + "down", d_down_, H, slots, stream);
++    }
++  }
+ }
+ 
+ void GlmMoeLayer::grouped_expert_chain(MoeExpertKernel kernel,
+diff --git a/src/models/qwen/forward.cpp b/src/models/qwen/forward.cpp
+index 08d048e..d892e2b 100644
+--- a/src/models/qwen/forward.cpp
++++ b/src/models/qwen/forward.cpp
+@@ -1,4 +1,5 @@
+ #include "models/qwen/forward.hpp"
++#include "models/qwen/issue4_moe_capture.hpp"
+ 
+ #include "kernels/scale_gemm.hpp"
+ 
+@@ -686,6 +687,7 @@ QwenModel::Outputs QwenModel::run_rows(const RowRun& run) {
+   const bool traces = !run.decode && route_traces_;
+   int gdn_ordinal = 0, qsa_ordinal = 0;
+   for (int layer = 0; layer < cfg_.num_hidden_layers; ++layer) {
++    issue4_moe::context(rank_, layer, run.pos0, T, run.decode, run.capture);
+     const QwenLayerResident& r = loader_.load_layer(layer);
+     build_layer_objects(r);
+     if (r.has_ple) {
+@@ -799,6 +801,7 @@ QwenModel::Outputs QwenModel::run_rows(const RowRun& run) {
+     }
+     if (run.decode) prefetch_attention_side(layer + 1);
+     fold(ffn_out, H);  // block boundary 2: the experts' sliced down projections
++    issue4_moe::sample("moe_folded", ffn_out, H, stream_);
+     mlp_gr_->combine(r_, ffn_out, T, stream_);
+     if (run.capture_layers) {
+       DGPP_CUDA_OK(cudaStreamSynchronize(stream_));
+@@ -811,6 +814,7 @@ QwenModel::Outputs QwenModel::run_rows(const RowRun& run) {
+   // same m=T GEMM the diagnostic forward runs (the prefill == forward
+   // bitwise gate), not an m=1 GEMV.
+   mixer_->mix(r_, h_, T, stream_);
++  issue4_moe::active = false;
+   lm_head_logits(h_, T, stream_);
+   // The draft block's input: the last rows' hyper states into the slots'
+   // windows by position (the last window rows of a prefill chunk, every
+diff --git a/src/models/qwen/moe_layer.cpp b/src/models/qwen/moe_layer.cpp
+index 1d27eeb..0806434 100644
+--- a/src/models/qwen/moe_layer.cpp
++++ b/src/models/qwen/moe_layer.cpp
+@@ -1,4 +1,5 @@
+ #include "models/qwen/moe_layer.hpp"
++#include "models/qwen/issue4_moe_capture.hpp"
+ 
+ #include "kernels/fp8_dequant.hpp"
+ #include "kernels/scale_gemm.hpp"
+@@ -211,6 +212,15 @@ void QwenMoeLayer::shared_tail(const uint16_t* hidden, uint16_t* out, int tokens
+   qwen_moe_shared_gate_bf16(hidden, w_.shared_gate, d_sw_, tokens, H, stream);
+   launch_moe_accum(d_acc_, d_sdown_, d_rows_, d_sw_, tokens, H, stream);
+   launch_moe_round_bf16(out, d_acc_, static_cast<int64_t>(tokens) * H, stream);
++  if (issue4_moe::active) {
++    issue4_moe::write("shared_geometry", std::vector<int32_t>{S, w_.shared_fp8 ? 1 : 0});
++    issue4_moe::sample("shared_gate", d_sgate_, S, stream);
++    issue4_moe::sample("shared_up", d_sup_, S, stream);
++    issue4_moe::sample("shared_act", d_sact_, S, stream);
++    issue4_moe::sample("shared_down", d_sdown_, H, stream);
++    issue4_moe::sample("shared_weight", d_sw_, 1, stream);
++    issue4_moe::sample("local_combined", out, H, stream);
++  }
+ }
+ 
+ size_t QwenMoeLayer::scratch_bytes(const GlmMoeConfig& cfg, int64_t shared_inter,

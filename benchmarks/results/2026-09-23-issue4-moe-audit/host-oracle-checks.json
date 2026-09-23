@@ -1,0 +1,6 @@
+{
+  "e4m3_decode_all_256_codes_matches_torch": true,
+  "partial_block_fp8_320x640_matches_torch": true,
+  "bf16_rounding_204800_values_matches_torch": true,
+  "identity_chain_budget_passes": true
+}

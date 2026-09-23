@@ -29,3 +29,9 @@ wrong association to `val_51bf3e137245e273`, with 189 output tokens, zero cached
 prompt tokens and a normal stop. The bounded run was skipped. This intervention
 does not by itself explain or resolve the failure. `campaign.py` restores
 production on exit with independent binary/config identity and an HTTP smoke.
+
+Precision limitation: this diagnostic rounds activations to NVFP4, then restores
+them to BF16 before the W4A16 dot product. Native W4A4 hardware applies the
+combined global input/weight scale after the dot product. The two paths are not
+arithmetically identical, so this negative result does not exclude an exact
+native W4A4 implementation.

@@ -1,0 +1,32 @@
+[
+  {
+    "layer": 0,
+    "relative_l2": 8.630239470173882e-05,
+    "different_fraction": 0.0008794784545898438
+  },
+  {
+    "layer": 3,
+    "relative_l2": 0.09860652816117231,
+    "different_fraction": 0.9778511047363281
+  },
+  {
+    "layer": 7,
+    "relative_l2": 0.12861870594697045,
+    "different_fraction": 0.9826896667480469
+  },
+  {
+    "layer": 15,
+    "relative_l2": 0.33578394439497405,
+    "different_fraction": 0.9930902481079101
+  },
+  {
+    "layer": 31,
+    "relative_l2": 0.6860220823380635,
+    "different_fraction": 0.9964145660400391
+  },
+  {
+    "layer": 47,
+    "relative_l2": 0.1974476876538169,
+    "different_fraction": 0.9833169937133789
+  }
+]

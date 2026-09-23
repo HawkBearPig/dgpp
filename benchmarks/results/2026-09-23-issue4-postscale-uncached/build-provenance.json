@@ -1,0 +1,7 @@
+{
+  "base_commit": "d318815984fd2ab1f0a67a6b830b57730a57439a",
+  "binary_sha256": "ae1dbc7ed20bd1352e6e8cd85ad78f386f99e3d73f0b2baa21736856a3e82b10",
+  "patch_sha256": "1306f1fe8162ae241173eafe4f4b2d8bfd779976c77c6e86246f7070746127c1",
+  "scales_header_sha256": "b11235e5e7eb8ed2b573911512e8f2bfcfb180d920623a678553fceb95c42b31",
+  "source": "EOS correction plus post-dot activation scale/GR/SwiGLU diagnostic and complete resident image bypass"
+}

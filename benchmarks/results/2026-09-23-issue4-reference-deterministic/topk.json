@@ -1,0 +1,1615 @@
+{
+  "totals": {
+    "rows": 16384,
+    "order_variable_rows": 8180,
+    "set_variable_rows": 2,
+    "invalid_rows": 0,
+    "wrong_value_rows": 0,
+    "tied_threshold_rows": 4,
+    "canonical_set_mismatch_rows": 2
+  },
+  "files": [
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request1/position0/qsa_topk_0.pt",
+      "rows": 128,
+      "order_variable_rows": 0,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request1/position0/qsa_topk_1024.pt",
+      "rows": 128,
+      "order_variable_rows": 0,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request1/position0/qsa_topk_1152.pt",
+      "rows": 128,
+      "order_variable_rows": 0,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request1/position0/qsa_topk_128.pt",
+      "rows": 128,
+      "order_variable_rows": 0,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request1/position0/qsa_topk_1280.pt",
+      "rows": 128,
+      "order_variable_rows": 0,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request1/position0/qsa_topk_1408.pt",
+      "rows": 128,
+      "order_variable_rows": 0,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request1/position0/qsa_topk_1536.pt",
+      "rows": 128,
+      "order_variable_rows": 0,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request1/position0/qsa_topk_1664.pt",
+      "rows": 128,
+      "order_variable_rows": 0,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request1/position0/qsa_topk_1792.pt",
+      "rows": 128,
+      "order_variable_rows": 0,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request1/position0/qsa_topk_1920.pt",
+      "rows": 128,
+      "order_variable_rows": 0,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request1/position0/qsa_topk_256.pt",
+      "rows": 128,
+      "order_variable_rows": 0,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request1/position0/qsa_topk_384.pt",
+      "rows": 128,
+      "order_variable_rows": 0,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request1/position0/qsa_topk_512.pt",
+      "rows": 128,
+      "order_variable_rows": 0,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request1/position0/qsa_topk_640.pt",
+      "rows": 128,
+      "order_variable_rows": 0,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request1/position0/qsa_topk_768.pt",
+      "rows": 128,
+      "order_variable_rows": 0,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request1/position0/qsa_topk_896.pt",
+      "rows": 128,
+      "order_variable_rows": 0,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request1/position2048/qsa_topk_0.pt",
+      "rows": 128,
+      "order_variable_rows": 125,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request1/position2048/qsa_topk_1024.pt",
+      "rows": 128,
+      "order_variable_rows": 128,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request1/position2048/qsa_topk_1152.pt",
+      "rows": 128,
+      "order_variable_rows": 128,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request1/position2048/qsa_topk_128.pt",
+      "rows": 128,
+      "order_variable_rows": 128,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request1/position2048/qsa_topk_1280.pt",
+      "rows": 128,
+      "order_variable_rows": 128,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request1/position2048/qsa_topk_1408.pt",
+      "rows": 128,
+      "order_variable_rows": 128,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request1/position2048/qsa_topk_1536.pt",
+      "rows": 128,
+      "order_variable_rows": 128,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request1/position2048/qsa_topk_1664.pt",
+      "rows": 128,
+      "order_variable_rows": 128,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request1/position2048/qsa_topk_1792.pt",
+      "rows": 128,
+      "order_variable_rows": 128,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request1/position2048/qsa_topk_1920.pt",
+      "rows": 128,
+      "order_variable_rows": 128,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request1/position2048/qsa_topk_256.pt",
+      "rows": 128,
+      "order_variable_rows": 128,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request1/position2048/qsa_topk_384.pt",
+      "rows": 128,
+      "order_variable_rows": 128,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request1/position2048/qsa_topk_512.pt",
+      "rows": 128,
+      "order_variable_rows": 128,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request1/position2048/qsa_topk_640.pt",
+      "rows": 128,
+      "order_variable_rows": 128,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request1/position2048/qsa_topk_768.pt",
+      "rows": 128,
+      "order_variable_rows": 128,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request1/position2048/qsa_topk_896.pt",
+      "rows": 128,
+      "order_variable_rows": 128,
+      "set_variable_rows": 1,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 1,
+      "canonical_set_mismatch_rows": 1
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request2/position0/qsa_topk_0.pt",
+      "rows": 128,
+      "order_variable_rows": 0,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request2/position0/qsa_topk_1024.pt",
+      "rows": 128,
+      "order_variable_rows": 0,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request2/position0/qsa_topk_1152.pt",
+      "rows": 128,
+      "order_variable_rows": 0,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request2/position0/qsa_topk_128.pt",
+      "rows": 128,
+      "order_variable_rows": 0,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request2/position0/qsa_topk_1280.pt",
+      "rows": 128,
+      "order_variable_rows": 0,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request2/position0/qsa_topk_1408.pt",
+      "rows": 128,
+      "order_variable_rows": 0,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request2/position0/qsa_topk_1536.pt",
+      "rows": 128,
+      "order_variable_rows": 0,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request2/position0/qsa_topk_1664.pt",
+      "rows": 128,
+      "order_variable_rows": 0,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request2/position0/qsa_topk_1792.pt",
+      "rows": 128,
+      "order_variable_rows": 0,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request2/position0/qsa_topk_1920.pt",
+      "rows": 128,
+      "order_variable_rows": 0,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request2/position0/qsa_topk_256.pt",
+      "rows": 128,
+      "order_variable_rows": 0,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request2/position0/qsa_topk_384.pt",
+      "rows": 128,
+      "order_variable_rows": 0,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request2/position0/qsa_topk_512.pt",
+      "rows": 128,
+      "order_variable_rows": 0,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request2/position0/qsa_topk_640.pt",
+      "rows": 128,
+      "order_variable_rows": 0,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request2/position0/qsa_topk_768.pt",
+      "rows": 128,
+      "order_variable_rows": 0,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request2/position0/qsa_topk_896.pt",
+      "rows": 128,
+      "order_variable_rows": 0,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request2/position2048/qsa_topk_0.pt",
+      "rows": 128,
+      "order_variable_rows": 125,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request2/position2048/qsa_topk_1024.pt",
+      "rows": 128,
+      "order_variable_rows": 128,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request2/position2048/qsa_topk_1152.pt",
+      "rows": 128,
+      "order_variable_rows": 128,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request2/position2048/qsa_topk_128.pt",
+      "rows": 128,
+      "order_variable_rows": 128,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request2/position2048/qsa_topk_1280.pt",
+      "rows": 128,
+      "order_variable_rows": 128,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request2/position2048/qsa_topk_1408.pt",
+      "rows": 128,
+      "order_variable_rows": 128,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request2/position2048/qsa_topk_1536.pt",
+      "rows": 128,
+      "order_variable_rows": 128,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request2/position2048/qsa_topk_1664.pt",
+      "rows": 128,
+      "order_variable_rows": 128,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request2/position2048/qsa_topk_1792.pt",
+      "rows": 128,
+      "order_variable_rows": 128,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request2/position2048/qsa_topk_1920.pt",
+      "rows": 128,
+      "order_variable_rows": 128,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request2/position2048/qsa_topk_256.pt",
+      "rows": 128,
+      "order_variable_rows": 128,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request2/position2048/qsa_topk_384.pt",
+      "rows": 128,
+      "order_variable_rows": 128,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request2/position2048/qsa_topk_512.pt",
+      "rows": 128,
+      "order_variable_rows": 128,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request2/position2048/qsa_topk_640.pt",
+      "rows": 128,
+      "order_variable_rows": 128,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request2/position2048/qsa_topk_768.pt",
+      "rows": 128,
+      "order_variable_rows": 128,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request2/position2048/qsa_topk_896.pt",
+      "rows": 128,
+      "order_variable_rows": 128,
+      "set_variable_rows": 1,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 1,
+      "canonical_set_mismatch_rows": 1
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request1/position0/qsa_topk_0.pt",
+      "rows": 128,
+      "order_variable_rows": 0,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request1/position0/qsa_topk_1024.pt",
+      "rows": 128,
+      "order_variable_rows": 0,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request1/position0/qsa_topk_1152.pt",
+      "rows": 128,
+      "order_variable_rows": 0,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request1/position0/qsa_topk_128.pt",
+      "rows": 128,
+      "order_variable_rows": 0,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request1/position0/qsa_topk_1280.pt",
+      "rows": 128,
+      "order_variable_rows": 0,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request1/position0/qsa_topk_1408.pt",
+      "rows": 128,
+      "order_variable_rows": 0,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request1/position0/qsa_topk_1536.pt",
+      "rows": 128,
+      "order_variable_rows": 0,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request1/position0/qsa_topk_1664.pt",
+      "rows": 128,
+      "order_variable_rows": 0,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request1/position0/qsa_topk_1792.pt",
+      "rows": 128,
+      "order_variable_rows": 0,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request1/position0/qsa_topk_1920.pt",
+      "rows": 128,
+      "order_variable_rows": 0,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request1/position0/qsa_topk_256.pt",
+      "rows": 128,
+      "order_variable_rows": 0,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request1/position0/qsa_topk_384.pt",
+      "rows": 128,
+      "order_variable_rows": 0,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request1/position0/qsa_topk_512.pt",
+      "rows": 128,
+      "order_variable_rows": 0,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request1/position0/qsa_topk_640.pt",
+      "rows": 128,
+      "order_variable_rows": 0,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request1/position0/qsa_topk_768.pt",
+      "rows": 128,
+      "order_variable_rows": 0,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request1/position0/qsa_topk_896.pt",
+      "rows": 128,
+      "order_variable_rows": 0,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request1/position2048/qsa_topk_0.pt",
+      "rows": 128,
+      "order_variable_rows": 125,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request1/position2048/qsa_topk_1024.pt",
+      "rows": 128,
+      "order_variable_rows": 128,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request1/position2048/qsa_topk_1152.pt",
+      "rows": 128,
+      "order_variable_rows": 128,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request1/position2048/qsa_topk_128.pt",
+      "rows": 128,
+      "order_variable_rows": 128,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request1/position2048/qsa_topk_1280.pt",
+      "rows": 128,
+      "order_variable_rows": 128,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request1/position2048/qsa_topk_1408.pt",
+      "rows": 128,
+      "order_variable_rows": 128,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request1/position2048/qsa_topk_1536.pt",
+      "rows": 128,
+      "order_variable_rows": 128,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request1/position2048/qsa_topk_1664.pt",
+      "rows": 128,
+      "order_variable_rows": 128,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request1/position2048/qsa_topk_1792.pt",
+      "rows": 128,
+      "order_variable_rows": 128,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request1/position2048/qsa_topk_1920.pt",
+      "rows": 128,
+      "order_variable_rows": 128,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request1/position2048/qsa_topk_256.pt",
+      "rows": 128,
+      "order_variable_rows": 128,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request1/position2048/qsa_topk_384.pt",
+      "rows": 128,
+      "order_variable_rows": 128,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request1/position2048/qsa_topk_512.pt",
+      "rows": 128,
+      "order_variable_rows": 128,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request1/position2048/qsa_topk_640.pt",
+      "rows": 128,
+      "order_variable_rows": 128,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request1/position2048/qsa_topk_768.pt",
+      "rows": 128,
+      "order_variable_rows": 128,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request1/position2048/qsa_topk_896.pt",
+      "rows": 128,
+      "order_variable_rows": 128,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 1,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request2/position0/qsa_topk_0.pt",
+      "rows": 128,
+      "order_variable_rows": 0,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request2/position0/qsa_topk_1024.pt",
+      "rows": 128,
+      "order_variable_rows": 0,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request2/position0/qsa_topk_1152.pt",
+      "rows": 128,
+      "order_variable_rows": 0,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request2/position0/qsa_topk_128.pt",
+      "rows": 128,
+      "order_variable_rows": 0,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request2/position0/qsa_topk_1280.pt",
+      "rows": 128,
+      "order_variable_rows": 0,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request2/position0/qsa_topk_1408.pt",
+      "rows": 128,
+      "order_variable_rows": 0,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request2/position0/qsa_topk_1536.pt",
+      "rows": 128,
+      "order_variable_rows": 0,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request2/position0/qsa_topk_1664.pt",
+      "rows": 128,
+      "order_variable_rows": 0,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request2/position0/qsa_topk_1792.pt",
+      "rows": 128,
+      "order_variable_rows": 0,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request2/position0/qsa_topk_1920.pt",
+      "rows": 128,
+      "order_variable_rows": 0,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request2/position0/qsa_topk_256.pt",
+      "rows": 128,
+      "order_variable_rows": 0,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request2/position0/qsa_topk_384.pt",
+      "rows": 128,
+      "order_variable_rows": 0,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request2/position0/qsa_topk_512.pt",
+      "rows": 128,
+      "order_variable_rows": 0,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request2/position0/qsa_topk_640.pt",
+      "rows": 128,
+      "order_variable_rows": 0,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request2/position0/qsa_topk_768.pt",
+      "rows": 128,
+      "order_variable_rows": 0,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request2/position0/qsa_topk_896.pt",
+      "rows": 128,
+      "order_variable_rows": 0,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request2/position2048/qsa_topk_0.pt",
+      "rows": 128,
+      "order_variable_rows": 125,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request2/position2048/qsa_topk_1024.pt",
+      "rows": 128,
+      "order_variable_rows": 128,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request2/position2048/qsa_topk_1152.pt",
+      "rows": 128,
+      "order_variable_rows": 128,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request2/position2048/qsa_topk_128.pt",
+      "rows": 128,
+      "order_variable_rows": 128,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request2/position2048/qsa_topk_1280.pt",
+      "rows": 128,
+      "order_variable_rows": 128,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request2/position2048/qsa_topk_1408.pt",
+      "rows": 128,
+      "order_variable_rows": 128,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request2/position2048/qsa_topk_1536.pt",
+      "rows": 128,
+      "order_variable_rows": 128,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request2/position2048/qsa_topk_1664.pt",
+      "rows": 128,
+      "order_variable_rows": 128,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request2/position2048/qsa_topk_1792.pt",
+      "rows": 128,
+      "order_variable_rows": 128,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request2/position2048/qsa_topk_1920.pt",
+      "rows": 128,
+      "order_variable_rows": 128,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request2/position2048/qsa_topk_256.pt",
+      "rows": 128,
+      "order_variable_rows": 128,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request2/position2048/qsa_topk_384.pt",
+      "rows": 128,
+      "order_variable_rows": 128,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request2/position2048/qsa_topk_512.pt",
+      "rows": 128,
+      "order_variable_rows": 128,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request2/position2048/qsa_topk_640.pt",
+      "rows": 128,
+      "order_variable_rows": 128,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request2/position2048/qsa_topk_768.pt",
+      "rows": 128,
+      "order_variable_rows": 128,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 0,
+      "canonical_set_mismatch_rows": 0
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request2/position2048/qsa_topk_896.pt",
+      "rows": 128,
+      "order_variable_rows": 128,
+      "set_variable_rows": 0,
+      "invalid_rows": 0,
+      "wrong_value_rows": 0,
+      "tied_threshold_rows": 1,
+      "canonical_set_mismatch_rows": 0
+    }
+  ],
+  "input_parity": [
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request1/position0/qsa_topk_0.pt",
+      "same_scores": true,
+      "same_lengths": true
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request1/position0/qsa_topk_1024.pt",
+      "same_scores": true,
+      "same_lengths": true
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request1/position0/qsa_topk_1152.pt",
+      "same_scores": true,
+      "same_lengths": true
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request1/position0/qsa_topk_128.pt",
+      "same_scores": true,
+      "same_lengths": true
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request1/position0/qsa_topk_1280.pt",
+      "same_scores": true,
+      "same_lengths": true
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request1/position0/qsa_topk_1408.pt",
+      "same_scores": true,
+      "same_lengths": true
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request1/position0/qsa_topk_1536.pt",
+      "same_scores": true,
+      "same_lengths": true
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request1/position0/qsa_topk_1664.pt",
+      "same_scores": true,
+      "same_lengths": true
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request1/position0/qsa_topk_1792.pt",
+      "same_scores": true,
+      "same_lengths": true
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request1/position0/qsa_topk_1920.pt",
+      "same_scores": true,
+      "same_lengths": true
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request1/position0/qsa_topk_256.pt",
+      "same_scores": true,
+      "same_lengths": true
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request1/position0/qsa_topk_384.pt",
+      "same_scores": true,
+      "same_lengths": true
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request1/position0/qsa_topk_512.pt",
+      "same_scores": true,
+      "same_lengths": true
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request1/position0/qsa_topk_640.pt",
+      "same_scores": true,
+      "same_lengths": true
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request1/position0/qsa_topk_768.pt",
+      "same_scores": true,
+      "same_lengths": true
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request1/position0/qsa_topk_896.pt",
+      "same_scores": true,
+      "same_lengths": true
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request1/position2048/qsa_topk_0.pt",
+      "same_scores": true,
+      "same_lengths": true
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request1/position2048/qsa_topk_1024.pt",
+      "same_scores": true,
+      "same_lengths": true
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request1/position2048/qsa_topk_1152.pt",
+      "same_scores": true,
+      "same_lengths": true
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request1/position2048/qsa_topk_128.pt",
+      "same_scores": true,
+      "same_lengths": true
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request1/position2048/qsa_topk_1280.pt",
+      "same_scores": true,
+      "same_lengths": true
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request1/position2048/qsa_topk_1408.pt",
+      "same_scores": true,
+      "same_lengths": true
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request1/position2048/qsa_topk_1536.pt",
+      "same_scores": true,
+      "same_lengths": true
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request1/position2048/qsa_topk_1664.pt",
+      "same_scores": true,
+      "same_lengths": true
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request1/position2048/qsa_topk_1792.pt",
+      "same_scores": true,
+      "same_lengths": true
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request1/position2048/qsa_topk_1920.pt",
+      "same_scores": true,
+      "same_lengths": true
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request1/position2048/qsa_topk_256.pt",
+      "same_scores": true,
+      "same_lengths": true
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request1/position2048/qsa_topk_384.pt",
+      "same_scores": true,
+      "same_lengths": true
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request1/position2048/qsa_topk_512.pt",
+      "same_scores": true,
+      "same_lengths": true
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request1/position2048/qsa_topk_640.pt",
+      "same_scores": true,
+      "same_lengths": true
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request1/position2048/qsa_topk_768.pt",
+      "same_scores": true,
+      "same_lengths": true
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank0/request1/position2048/qsa_topk_896.pt",
+      "same_scores": true,
+      "same_lengths": true
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request1/position0/qsa_topk_0.pt",
+      "same_scores": true,
+      "same_lengths": true
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request1/position0/qsa_topk_1024.pt",
+      "same_scores": true,
+      "same_lengths": true
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request1/position0/qsa_topk_1152.pt",
+      "same_scores": true,
+      "same_lengths": true
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request1/position0/qsa_topk_128.pt",
+      "same_scores": true,
+      "same_lengths": true
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request1/position0/qsa_topk_1280.pt",
+      "same_scores": true,
+      "same_lengths": true
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request1/position0/qsa_topk_1408.pt",
+      "same_scores": true,
+      "same_lengths": true
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request1/position0/qsa_topk_1536.pt",
+      "same_scores": true,
+      "same_lengths": true
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request1/position0/qsa_topk_1664.pt",
+      "same_scores": true,
+      "same_lengths": true
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request1/position0/qsa_topk_1792.pt",
+      "same_scores": true,
+      "same_lengths": true
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request1/position0/qsa_topk_1920.pt",
+      "same_scores": true,
+      "same_lengths": true
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request1/position0/qsa_topk_256.pt",
+      "same_scores": true,
+      "same_lengths": true
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request1/position0/qsa_topk_384.pt",
+      "same_scores": true,
+      "same_lengths": true
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request1/position0/qsa_topk_512.pt",
+      "same_scores": true,
+      "same_lengths": true
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request1/position0/qsa_topk_640.pt",
+      "same_scores": true,
+      "same_lengths": true
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request1/position0/qsa_topk_768.pt",
+      "same_scores": true,
+      "same_lengths": true
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request1/position0/qsa_topk_896.pt",
+      "same_scores": true,
+      "same_lengths": true
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request1/position2048/qsa_topk_0.pt",
+      "same_scores": true,
+      "same_lengths": true
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request1/position2048/qsa_topk_1024.pt",
+      "same_scores": true,
+      "same_lengths": true
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request1/position2048/qsa_topk_1152.pt",
+      "same_scores": true,
+      "same_lengths": true
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request1/position2048/qsa_topk_128.pt",
+      "same_scores": true,
+      "same_lengths": true
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request1/position2048/qsa_topk_1280.pt",
+      "same_scores": true,
+      "same_lengths": true
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request1/position2048/qsa_topk_1408.pt",
+      "same_scores": true,
+      "same_lengths": true
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request1/position2048/qsa_topk_1536.pt",
+      "same_scores": true,
+      "same_lengths": true
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request1/position2048/qsa_topk_1664.pt",
+      "same_scores": true,
+      "same_lengths": true
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request1/position2048/qsa_topk_1792.pt",
+      "same_scores": true,
+      "same_lengths": true
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request1/position2048/qsa_topk_1920.pt",
+      "same_scores": true,
+      "same_lengths": true
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request1/position2048/qsa_topk_256.pt",
+      "same_scores": true,
+      "same_lengths": true
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request1/position2048/qsa_topk_384.pt",
+      "same_scores": true,
+      "same_lengths": true
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request1/position2048/qsa_topk_512.pt",
+      "same_scores": true,
+      "same_lengths": true
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request1/position2048/qsa_topk_640.pt",
+      "same_scores": true,
+      "same_lengths": true
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request1/position2048/qsa_topk_768.pt",
+      "same_scores": true,
+      "same_lengths": true
+    },
+    {
+      "path": "benchmarks/results/2026-09-23-issue4-reference-deterministic/raw/captures/rank1/request1/position2048/qsa_topk_896.pt",
+      "same_scores": true,
+      "same_lengths": true
+    }
+  ]
+}
