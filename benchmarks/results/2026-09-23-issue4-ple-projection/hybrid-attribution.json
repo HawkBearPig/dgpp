@@ -1,0 +1,397 @@
+{
+  "actual_all": {
+    "error_vs_captured": {
+      "elements": 296960,
+      "relative_l2": 0.0,
+      "max_abs": 0.0,
+      "bitwise_equal_elements": 296960,
+      "two_bf16_relative_mismatches": 0,
+      "mismatch_fraction": 0.0,
+      "nonfinite": 0,
+      "worst_rows": [
+        {
+          "position": 253221,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 155831,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 20486,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 46321,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 58309,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 75193,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 80174,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 90700,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 97329,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 106334,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        }
+      ]
+    },
+    "worst_position_136732_scalars": [
+      0.03173828125,
+      0.00506591796875,
+      0.048828125,
+      0.006683349609375
+    ]
+  },
+  "oracle_key_chain_only": {
+    "error_vs_captured": {
+      "elements": 296960,
+      "relative_l2": 0.01302499984149266,
+      "max_abs": 0.000732421875,
+      "bitwise_equal_elements": 225296,
+      "two_bf16_relative_mismatches": 39509,
+      "mismatch_fraction": 0.13304485452586207,
+      "nonfinite": 0,
+      "worst_rows": [
+        {
+          "position": 136732,
+          "relative_l2": 0.01876519097790274,
+          "max_abs": 0.000213623046875,
+          "mismatches": 2544
+        },
+        {
+          "position": 20486,
+          "relative_l2": 0.01733190183614756,
+          "max_abs": 0.000213623046875,
+          "mismatches": 2533
+        },
+        {
+          "position": 220287,
+          "relative_l2": 0.017054099909443336,
+          "max_abs": 0.00030517578125,
+          "mismatches": 2507
+        },
+        {
+          "position": 155831,
+          "relative_l2": 0.01663000770277029,
+          "max_abs": 0.00048828125,
+          "mismatches": 2094
+        },
+        {
+          "position": 212825,
+          "relative_l2": 0.0159852954679733,
+          "max_abs": 0.000213623046875,
+          "mismatches": 2533
+        },
+        {
+          "position": 106334,
+          "relative_l2": 0.01523639713665361,
+          "max_abs": 0.000244140625,
+          "mismatches": 1737
+        },
+        {
+          "position": 8915,
+          "relative_l2": 0.014381353535617423,
+          "max_abs": 0.000152587890625,
+          "mismatches": 2161
+        },
+        {
+          "position": 179328,
+          "relative_l2": 0.014183308856998153,
+          "max_abs": 0.0003662109375,
+          "mismatches": 680
+        },
+        {
+          "position": 245114,
+          "relative_l2": 0.014122117070555721,
+          "max_abs": 0.000732421875,
+          "mismatches": 724
+        },
+        {
+          "position": 80174,
+          "relative_l2": 0.014027839829540286,
+          "max_abs": 0.00018310546875,
+          "mismatches": 1300
+        }
+      ]
+    },
+    "worst_position_136732_scalars": [
+      0.0306396484375,
+      0.00506591796875,
+      0.048828125,
+      0.006683349609375
+    ]
+  },
+  "oracle_query_norm_only": {
+    "error_vs_captured": {
+      "elements": 296960,
+      "relative_l2": 0.0023932503755526927,
+      "max_abs": 0.00048828125,
+      "bitwise_equal_elements": 294400,
+      "two_bf16_relative_mismatches": 1189,
+      "mismatch_fraction": 0.00400390625,
+      "nonfinite": 0,
+      "worst_rows": [
+        {
+          "position": 158304,
+          "relative_l2": 0.01506517497106752,
+          "max_abs": 0.00048828125,
+          "mismatches": 1189
+        },
+        {
+          "position": 155831,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 20486,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 46321,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 58309,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 75193,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 80174,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 90700,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 97329,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 106334,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        }
+      ]
+    },
+    "worst_position_136732_scalars": [
+      0.03173828125,
+      0.00506591796875,
+      0.048828125,
+      0.006683349609375
+    ]
+  },
+  "oracle_value_projection_only": {
+    "error_vs_captured": {
+      "elements": 296960,
+      "relative_l2": 4.5952784509447554e-05,
+      "max_abs": 1.52587890625e-05,
+      "bitwise_equal_elements": 296832,
+      "two_bf16_relative_mismatches": 1,
+      "mismatch_fraction": 3.367456896551724e-06,
+      "nonfinite": 0,
+      "worst_rows": [
+        {
+          "position": 80174,
+          "relative_l2": 0.0001628721535455552,
+          "max_abs": 3.814697265625e-06,
+          "mismatches": 0
+        },
+        {
+          "position": 90700,
+          "relative_l2": 0.00012754493164118867,
+          "max_abs": 1.52587890625e-05,
+          "mismatches": 0
+        },
+        {
+          "position": 220287,
+          "relative_l2": 0.00012313976237498058,
+          "max_abs": 3.814697265625e-06,
+          "mismatches": 0
+        },
+        {
+          "position": 208700,
+          "relative_l2": 8.851384339352037e-05,
+          "max_abs": 1.9073486328125e-06,
+          "mismatches": 0
+        },
+        {
+          "position": 253221,
+          "relative_l2": 8.651157491548632e-05,
+          "max_abs": 1.9073486328125e-06,
+          "mismatches": 0
+        },
+        {
+          "position": 227885,
+          "relative_l2": 8.651157491548632e-05,
+          "max_abs": 1.9073486328125e-06,
+          "mismatches": 0
+        },
+        {
+          "position": 155831,
+          "relative_l2": 7.297458495973542e-05,
+          "max_abs": 3.814697265625e-06,
+          "mismatches": 0
+        },
+        {
+          "position": 58309,
+          "relative_l2": 7.180051819563654e-05,
+          "max_abs": 3.814697265625e-06,
+          "mismatches": 0
+        },
+        {
+          "position": 46321,
+          "relative_l2": 7.097319293697571e-05,
+          "max_abs": 1.9073486328125e-06,
+          "mismatches": 0
+        },
+        {
+          "position": 162716,
+          "relative_l2": 6.899731581672172e-05,
+          "max_abs": 1.9073486328125e-06,
+          "mismatches": 0
+        }
+      ]
+    },
+    "worst_position_136732_scalars": [
+      0.03173828125,
+      0.00506591796875,
+      0.048828125,
+      0.006683349609375
+    ]
+  },
+  "oracle_norm_given_actual_key": {
+    "error_vs_captured": {
+      "elements": 296960,
+      "relative_l2": 0.0,
+      "max_abs": 0.0,
+      "bitwise_equal_elements": 296960,
+      "two_bf16_relative_mismatches": 0,
+      "mismatch_fraction": 0.0,
+      "nonfinite": 0,
+      "worst_rows": [
+        {
+          "position": 253221,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 155831,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 20486,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 46321,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 58309,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 75193,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 80174,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 90700,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 97329,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 106334,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        }
+      ]
+    },
+    "worst_position_136732_scalars": [
+      0.03173828125,
+      0.00506591796875,
+      0.048828125,
+      0.006683349609375
+    ]
+  }
+}

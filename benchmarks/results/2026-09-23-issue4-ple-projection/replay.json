@@ -1,0 +1,261 @@
+{
+  "rows": 774,
+  "checks": {
+    "checkpoint_to_gate": {
+      "elements": 7925760,
+      "relative_l2": 0.0005750936279368556,
+      "max_abs": 0.0009765625,
+      "bitwise_equal_elements": 7913453,
+      "two_bf16_relative_mismatches": 4986,
+      "mismatch_fraction": 0.0006290879360465116,
+      "nonfinite": 0,
+      "worst_rows": [
+        {
+          "position": 43007,
+          "relative_l2": 0.008143416800392973,
+          "max_abs": 0.0009765625,
+          "mismatches": 1
+        },
+        {
+          "position": 22527,
+          "relative_l2": 0.008106429932142346,
+          "max_abs": 0.00048828125,
+          "mismatches": 0
+        },
+        {
+          "position": 139263,
+          "relative_l2": 0.0023418690976786203,
+          "max_abs": 5.340576171875e-05,
+          "mismatches": 2510
+        },
+        {
+          "position": 130637,
+          "relative_l2": 0.0017218562466057136,
+          "max_abs": 6.103515625e-05,
+          "mismatches": 2388
+        },
+        {
+          "position": 261231,
+          "relative_l2": 0.00047406477861856584,
+          "max_abs": 3.0517578125e-05,
+          "mismatches": 0
+        },
+        {
+          "position": 261145,
+          "relative_l2": 0.0003769224944874791,
+          "max_abs": 6.103515625e-05,
+          "mismatches": 0
+        },
+        {
+          "position": 2650,
+          "relative_l2": 0.00035938735770777564,
+          "max_abs": 6.103515625e-05,
+          "mismatches": 0
+        },
+        {
+          "position": 2653,
+          "relative_l2": 0.00035432705790727645,
+          "max_abs": 3.0517578125e-05,
+          "mismatches": 0
+        },
+        {
+          "position": 261234,
+          "relative_l2": 0.0003490714233517066,
+          "max_abs": 3.0517578125e-05,
+          "mismatches": 0
+        },
+        {
+          "position": 54272,
+          "relative_l2": 0.00032437076477985835,
+          "max_abs": 0.0001220703125,
+          "mismatches": 0
+        }
+      ]
+    },
+    "checkpoint_to_conv_norm": {
+      "elements": 7925760,
+      "relative_l2": 0.0002474827676618882,
+      "max_abs": 0.125,
+      "bitwise_equal_elements": 7916791,
+      "two_bf16_relative_mismatches": 5273,
+      "mismatch_fraction": 0.0006652989744832041,
+      "nonfinite": 0,
+      "worst_rows": [
+        {
+          "position": 22527,
+          "relative_l2": 0.003579128174981622,
+          "max_abs": 0.125,
+          "mismatches": 0
+        },
+        {
+          "position": 139263,
+          "relative_l2": 0.003332783222172869,
+          "max_abs": 0.0546875,
+          "mismatches": 2560
+        },
+        {
+          "position": 43007,
+          "relative_l2": 0.0027723028280058092,
+          "max_abs": 0.0625,
+          "mismatches": 0
+        },
+        {
+          "position": 130637,
+          "relative_l2": 0.0025111204200129623,
+          "max_abs": 0.046875,
+          "mismatches": 2558
+        },
+        {
+          "position": 261234,
+          "relative_l2": 0.0005705894833076139,
+          "max_abs": 0.015625,
+          "mismatches": 0
+        },
+        {
+          "position": 261231,
+          "relative_l2": 0.0005570160767226894,
+          "max_abs": 0.0234375,
+          "mismatches": 0
+        },
+        {
+          "position": 261145,
+          "relative_l2": 0.0005227396216352828,
+          "max_abs": 0.015625,
+          "mismatches": 0
+        },
+        {
+          "position": 2650,
+          "relative_l2": 0.0004959605806097112,
+          "max_abs": 0.015625,
+          "mismatches": 0
+        },
+        {
+          "position": 2653,
+          "relative_l2": 0.00042690518305378924,
+          "max_abs": 0.015625,
+          "mismatches": 0
+        },
+        {
+          "position": 160768,
+          "relative_l2": 0.0003936343406136625,
+          "max_abs": 0.015625,
+          "mismatches": 1
+        }
+      ]
+    },
+    "isolated_conv_norm": {
+      "elements": 7925760,
+      "relative_l2": 1.1657606707946251e-05,
+      "max_abs": 0.0078125,
+      "bitwise_equal_elements": 7925727,
+      "two_bf16_relative_mismatches": 0,
+      "mismatch_fraction": 0.0,
+      "nonfinite": 0,
+      "worst_rows": [
+        {
+          "position": 4096,
+          "relative_l2": 0.0001470952512667313,
+          "max_abs": 0.0078125,
+          "mismatches": 0
+        },
+        {
+          "position": 261286,
+          "relative_l2": 0.00013386294634293083,
+          "max_abs": 0.00390625,
+          "mismatches": 0
+        },
+        {
+          "position": 59392,
+          "relative_l2": 8.723155822020402e-05,
+          "max_abs": 0.00390625,
+          "mismatches": 0
+        },
+        {
+          "position": 148480,
+          "relative_l2": 8.629982919705968e-05,
+          "max_abs": 0.00390625,
+          "mismatches": 0
+        },
+        {
+          "position": 179200,
+          "relative_l2": 8.44203253916086e-05,
+          "max_abs": 0.00390625,
+          "mismatches": 0
+        },
+        {
+          "position": 80896,
+          "relative_l2": 8.412918631403162e-05,
+          "max_abs": 0.00390625,
+          "mismatches": 0
+        },
+        {
+          "position": 130641,
+          "relative_l2": 7.689345470887995e-05,
+          "max_abs": 0.00390625,
+          "mismatches": 0
+        },
+        {
+          "position": 65391,
+          "relative_l2": 5.979484756277996e-05,
+          "max_abs": 0.00390625,
+          "mismatches": 0
+        },
+        {
+          "position": 261228,
+          "relative_l2": 5.453719523856093e-05,
+          "max_abs": 0.001953125,
+          "mismatches": 0
+        },
+        {
+          "position": 114688,
+          "relative_l2": 5.324863554659721e-05,
+          "max_abs": 0.001953125,
+          "mismatches": 0
+        }
+      ]
+    }
+  },
+  "rank_inputs_and_outputs_equal": true,
+  "projections": [
+    {
+      "projection": "key_proj",
+      "rank": 0,
+      "reconstructed_dequant_weight_sha256": "4475e5644f56f1e5a1554385c846571632e918582e104ca1cb2d70971d02d297",
+      "partial_sha256": "287ec58cb99c7caa94e026f0dcada28959e15e455fdc89baa9edf2f1eadd1fd2"
+    },
+    {
+      "projection": "key_proj",
+      "rank": 1,
+      "reconstructed_dequant_weight_sha256": "269dc70fdc949e34e168297cc2f0996713a2043bb3336f28540d1546f8f1c65b",
+      "partial_sha256": "e2b8f54140eb5d268a8fefa4c4f1031061dac0d9dde4cdd81c53cd4da80a7a35"
+    },
+    {
+      "projection": "value_proj",
+      "rank": 0,
+      "reconstructed_dequant_weight_sha256": "7167c44663bf22feee664235499e63d1ca08694caa899eb9c8ce3e5487063d2e",
+      "partial_sha256": "b378c52ae82bea9943405413a0f7d9c96ac8ee2650d18b9462945de495b880bf"
+    },
+    {
+      "projection": "value_proj",
+      "rank": 1,
+      "reconstructed_dequant_weight_sha256": "7632af4a95a81a06960d9c37d2ec9c7bba251cac61db8dfc3bd9fadf509926a7",
+      "partial_sha256": "01d98a937e2ef0ef24466568cd2b244b5281d8c0129fcd667187cf42dc7d7195"
+    }
+  ],
+  "tensor_sha256": {
+    "model.language_model.layers.1.ple.key_proj.weight": "f431e2b51311b4bbea97ea0e02b6c35944033490dd5dc76bb5cc5b594f7af7de",
+    "model.language_model.layers.1.ple.value_proj.weight": "d25aabbce09091bf133d776b41d5b3e0802c4d2523b9ca97003491c28db3c437",
+    "model.language_model.layers.1.ple.norm_key.weight": "516e94b36bec727c0d219282d9166ab7a6ad6684680d1f4f186b5738d2d5a6d6",
+    "model.language_model.layers.1.ple.norm_query.weight": "f5a531160c93e1345f15a02803fdefb5df59e830e7259d28f0cce8ca87fb121d",
+    "model.language_model.layers.1.ple.norm_conv.weight": "30ffcc1dfc34a7008f54447d199d9001dd534d8e04911976b587d2773575f705"
+  },
+  "gate_range": [
+    0.00170135498046875,
+    0.890625
+  ],
+  "elapsed_seconds": 3.1015687069739215,
+  "script_sha256": "d78851a9e809da2554cc9d6581760b600a26183b80ce945613333ec1ae8a3e4f",
+  "export_receipt_sha256": "a1fd892f86b3252bc5da3639adb61f17caea05e5beb938d8364ea7ef0a0a5a54",
+  "scope": "Independent checkpoint-to-gate chain on 774 captured rows. Starts from captured table embeddings and pre-PLE residuals. Does not validate earlier residual construction, unsampled rows, or end-to-end retrieval.",
+  "comparison_policy": "Report complete numerical errors without tuning a tolerance to this fixture. Existing isolated PLE gate test uses 0.002 L2 and 1% two-BF16-relative mismatches, but does not include this sharded FP8 projection chain."
+}

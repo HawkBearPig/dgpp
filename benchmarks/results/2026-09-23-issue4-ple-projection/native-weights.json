@@ -1,0 +1,40 @@
+{
+  "checks": [
+    {
+      "projection": "key_proj",
+      "rank": 0,
+      "elements": 13107200,
+      "mismatches": 0,
+      "dequantized_bf16_sha256": "9c6da58c51c9bc52e47bf4907512ebf5865779c3259e3adf17390fdbc1bab300"
+    },
+    {
+      "projection": "key_proj",
+      "rank": 1,
+      "elements": 13107200,
+      "mismatches": 0,
+      "dequantized_bf16_sha256": "ab76cf471d8bb86e5b4a9020e5a3a1550a12ddc87efcab20ea26e409339e738c"
+    },
+    {
+      "projection": "value_proj",
+      "rank": 0,
+      "elements": 3276800,
+      "mismatches": 0,
+      "dequantized_bf16_sha256": "545e3c4df205064651c171031bbfb7f564947843dec7a6c28679006230b3d893"
+    },
+    {
+      "projection": "value_proj",
+      "rank": 1,
+      "elements": 3276800,
+      "mismatches": 0,
+      "dequantized_bf16_sha256": "dc60d86f0702afad712f238802b4eb920e5099064e01b754917938588361a406"
+    }
+  ],
+  "all_exact": true,
+  "total_elements": 32768000,
+  "tensor_sha256": {
+    "model.language_model.layers.1.ple.key_proj.weight": "f431e2b51311b4bbea97ea0e02b6c35944033490dd5dc76bb5cc5b594f7af7de",
+    "model.language_model.layers.1.ple.value_proj.weight": "d25aabbce09091bf133d776b41d5b3e0802c4d2523b9ca97003491c28db3c437"
+  },
+  "native_library_sha256": "0a6b60a5a69a64f822616475340dbf738e46491df7b6ea03ff201636a222ed87",
+  "script_sha256": "b326ff2292cb38c11aebeec54955867d0adc7eb70cc19a95ac1db1310acbc2b7"
+}

@@ -1,0 +1,48 @@
+{
+  "scripts": {
+    "gpu_campaign.py": "56b79940a19452601d2774e6bce099cca7b3fa8c8a9c490ff90147a824c36623",
+    "analyze_gpu.py": "e3ab995a05ce7531963cda4341c216eeac6fd5d7df802a8066dd6c3db4bbb0cf",
+    "export_rows.py": "369d78c74002e2726e300fb70422770adcb14b2ea2c1f23d691f1cd273ebbb08",
+    "stream_all.py": "52efc698921f2b2549f120a44ac8f0060acfc03ce86169a8ea9a859f60e5810d",
+    "gpu_probe.cpp": "cfa7ab75520e97ce84365b1106535df2092b22991c6c8dc03e1e53d69548d7d8",
+    "check_oracle.py": "de0408bfc6ad59cd09578bf1f460d3f29d4be91fed08ac51182c5780b5977e3f",
+    "qsa_keys.py": "fd5bd1ade33f9995de4fac9eae7a120760da83bdc6fea0efa007b00913f4554d",
+    "native_fp8.cpp": "22256f7d4a23f4111d7cf4d202b018eff63dcd4d948b62277392b5392993ba02",
+    "prepare_gpu.py": "e0b8eb783ea27b5bd3f0199d6565f79f4e63b1e73c9888bba770f3ddd2092c41",
+    "probe_outliers.py": "8aa5f183beaec6db591da2dda6d39c54c94df34bc83c4e780f2a2422687e66fb",
+    "prepare_weights.py": "b73af7052db5dba98de42c19ff050f220590676bc99b51f71255928d632c79f3",
+    "check_native_weights.py": "b326ff2292cb38c11aebeec54955867d0adc7eb70cc19a95ac1db1310acbc2b7",
+    "replay.py": "d78851a9e809da2554cc9d6581760b600a26183b80ce945613333ec1ae8a3e4f"
+  },
+  "sampled_replay_exit_code": 0,
+  "qsa_keys_exit_code": 0,
+  "oracle_checks_exit_code": 0,
+  "full_replay": "completed",
+  "production_stopped": true,
+  "numpy_version": "2.5.3",
+  "cpu_threads": 4,
+  "cpu_affinity": [
+    0,
+    1,
+    2,
+    3
+  ],
+  "nice": 10,
+  "full_replay_exit_code": 0,
+  "native_weight_check_exit_code": 0,
+  "outlier_cpu_probe_exit_code": 0,
+  "production_note": "CPU audits kept production online; subsequent bounded GPU replay uses authorized serial stop/restore.",
+  "gpu_probe_build_exit_code": 0,
+  "gpu_campaign_exit_code": 0,
+  "gpu_analysis_exit_code": 0,
+  "production_restored_and_verified": true,
+  "full_replay_source_hashes_verified": true,
+  "linked_libraries": {
+    "libdgpp_kernels.a": "4c1a0afdde80d85cf5eda7fbb772d032a614bc5bf44e5b3f8bdfe9829727dba1",
+    "libdgpp_core.a": "eeb005fc041499cc8201aa11501d3c2329784ec6b1e594db74d65232df7a0dc2"
+  },
+  "native_encoder_sources": {
+    "src/loaders/fp8_quant.hpp": "f2d0285b2c20c60a583b0cd3b39461e2641f42824d69aa00bb89444f85fd43ac",
+    "src/common/dtypes.hpp": "2796f19eb0652d7e93ad575b563d85dd62013f5fab1ad5b89dcec721f0ec9c14"
+  }
+}

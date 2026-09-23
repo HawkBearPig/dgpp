@@ -1,0 +1,59 @@
+{
+  "checkpoint": "/home/stephen/.cache/huggingface/hub/models--nvidia--Qwen3.8-Flash-Next-NVFP4/snapshots/fc694b54fb0174e0913e6adf86691ef85a4ead47",
+  "tensor_sha256": {
+    "model.language_model.layers.1.ple.key_proj.weight": "f431e2b51311b4bbea97ea0e02b6c35944033490dd5dc76bb5cc5b594f7af7de",
+    "model.language_model.layers.1.ple.value_proj.weight": "d25aabbce09091bf133d776b41d5b3e0802c4d2523b9ca97003491c28db3c437",
+    "model.language_model.layers.1.ple.norm_key.weight": "516e94b36bec727c0d219282d9166ab7a6ad6684680d1f4f186b5738d2d5a6d6",
+    "model.language_model.layers.1.ple.norm_query.weight": "f5a531160c93e1345f15a02803fdefb5df59e830e7259d28f0cce8ca87fb121d",
+    "model.language_model.layers.1.ple.norm_conv.weight": "30ffcc1dfc34a7008f54447d199d9001dd534d8e04911976b587d2773575f705"
+  },
+  "bundle_sha256": "7d667e9e75ef7967c18f86ec24815a8e2481b3779b3714d8a60877f84b0047fa",
+  "arrays": {
+    "key_proj0": {
+      "shape": [
+        10240,
+        1280
+      ],
+      "dtype": "float32"
+    },
+    "key_proj1": {
+      "shape": [
+        10240,
+        1280
+      ],
+      "dtype": "float32"
+    },
+    "value_proj0": {
+      "shape": [
+        2560,
+        1280
+      ],
+      "dtype": "float32"
+    },
+    "value_proj1": {
+      "shape": [
+        2560,
+        1280
+      ],
+      "dtype": "float32"
+    },
+    "norm_key": {
+      "shape": [
+        10240
+      ],
+      "dtype": "float32"
+    },
+    "norm_query": {
+      "shape": [
+        10240
+      ],
+      "dtype": "float32"
+    },
+    "norm_conv": {
+      "shape": [
+        10240
+      ],
+      "dtype": "float32"
+    }
+  }
+}

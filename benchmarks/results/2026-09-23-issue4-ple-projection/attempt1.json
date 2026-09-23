@@ -1,0 +1,9 @@
+{
+  "completed": false,
+  "excluded_from_full_coverage": true,
+  "reason": "Stopped explicitly after observing growing resident file-backed pages. Replaced memmap reader with fixed-size buffered reads; no arithmetic changed.",
+  "rows_completed": 98816,
+  "peak_rss_kib": 12912596,
+  "ssh_exit_code": 255,
+  "script_sha256": "216f79f0e3c4d20a71367370742b6c93b0f905da894b259171e10e8e4921ef5e"
+}

@@ -42,6 +42,7 @@ consistency patch is not a prerequisite for the investigation.
 | [Reference FP32 state](2026-09-23-issue4-reference-state-fp32/README.md) | Two original 5/6 failures; actual FP32 handoffs verified | BF16 reference state storage is insufficient to explain the failure |
 | [Independent FP8 reference](2026-09-23-issue4-reference-fp8/README.md) | Two 5/6 failures with the original wrong association, 169 output tokens; 257280 fields repeat exactly | Higher expert precision in the independent engine is insufficient |
 | [FP8 experts + BF16 PLE table](2026-09-23-issue4-fp8-ple-precision/README.md) | A/B/A all 5/6; table precision changes the wrong value; baselines repeat exactly | Combined higher expert/table precision is insufficient |
+| [Full PLE projection/gate and QSA keys](2026-09-23-issue4-ple-projection/README.md) | All 261290 PLE rows; 24 QSA key chains; exact frozen GPU reproduction of 29 outliers | Local key-projection differences are amplified by the gate; retrieval causality remains untested |
 
 [Draft PR #34](https://github.com/HawkBearPig/dgpp/pull/34) separates generation
 stop IDs from trained model EOS, preserving PLE semantics. The release build,
@@ -211,3 +212,22 @@ state. All four tested expert/table precision combinations fail the same key.
 This rules out those precision changes as sufficient repairs, not every
 quantization effect or every possible engine defect. No full BF16 model was
 run. The retrieval root cause and a causally supported fix remain unresolved.
+
+The [complete PLE projection/gate audit](2026-09-23-issue4-ple-projection/README.md)
+closes the earlier checkpoint-to-gate coverage gap across all 261290 saved rows.
+All eight source hashes and replicated rank fields match. Aggregate gate error
+against independent FP64 projection arithmetic is 0.0257%, but the worst row
+has 1.8765% relative error. All 32.8 million PLE projection weight conversions
+match the production encoder bit-for-bit. A bounded GPU replay at native row
+placement exactly reproduces all gate and normalized outputs for the 29 worst
+rows. The gate itself agrees bit-for-bit when given actual GPU intermediates;
+isolated key normalization cannot explain the outliers. The dominant difference
+comes from projected keys and their nonlinear amplification. An FP32-output
+control with the original BF16 partial boundaries returns identical outputs.
+The separate final-chunk QSA key-projection/norm/RoPE audit covers 7.34 million
+values, with worst per-layer/rank L2 0.0242% and exact cached-tail copies.
+Production was restored and verified after the bounded GPU probe. These are
+operator findings, not proof of the retrieval cause. The next causal comparison
+should change only the PLE key projection to validated higher-accuracy arithmetic
+and replay the unchanged original request on real TP2; no such accuracy result
+or retrieval fix is yet established.

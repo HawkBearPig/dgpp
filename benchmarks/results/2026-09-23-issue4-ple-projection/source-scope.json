@@ -1,0 +1,21 @@
+{
+  "capture_base": "c6ca191863d620360f3b4370c0156f9e26a2631f",
+  "current_head": "7d8bb61aeb8f9b3278567fda5d95501b4d966cfb",
+  "files_unchanged": [
+    "src/kernels/qwen_ple.cu",
+    "src/kernels/qwen_norm.cu",
+    "src/models/qwen/layers.cpp",
+    "src/models/qwen/loader.cpp",
+    "src/models/qwen/forward.cpp"
+  ],
+  "captured_eos": 248046,
+  "trained_eos": 248044,
+  "known_eos_bug": "Already corrected separately; this replay uses actual captured embedding/residual operands to isolate downstream projection/gate arithmetic.",
+  "source_hashes": {
+    "src/kernels/qwen_ple.cu": "38231ed4c3867978afb604eb5d8df742969d34e736790d93b62ab9662366b4a3",
+    "src/kernels/qwen_norm.cu": "96c3d956598e942c9e21118449a2a772f288a62904cbe0d5def552a3d0102aad",
+    "src/models/qwen/layers.cpp": "bcfd01f23e45615b21e3a2eea43e9f45acce49e074b09998cb6033871759592d",
+    "src/models/qwen/loader.cpp": "ab78507f7cbbb6398b9abbaf2276eb8383b304ebac6a1573c44f6e970386d245",
+    "src/models/qwen/forward.cpp": "a1e12ef6d769d56baf6093e78d9ca5b1b03fff0ed2b34b76f4b25f7b09776ceb"
+  }
+}

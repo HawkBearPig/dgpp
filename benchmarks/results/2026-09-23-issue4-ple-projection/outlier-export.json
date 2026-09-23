@@ -1,0 +1,114 @@
+{
+  "archive": "/home/stephen/dgpp-issue4-archive-20260923/history-captures",
+  "selection": {
+    "tokens": 261290,
+    "positions": [
+      8915,
+      20486,
+      46321,
+      58309,
+      75193,
+      80174,
+      90700,
+      97329,
+      106334,
+      121089,
+      133125,
+      136732,
+      144704,
+      155831,
+      158304,
+      162716,
+      172612,
+      179328,
+      179884,
+      189878,
+      205052,
+      208700,
+      212825,
+      220287,
+      222304,
+      227885,
+      235560,
+      245114,
+      253221
+    ],
+    "selection": "Union of the 20 worst rows in each full PLE chain comparison."
+  },
+  "files": [
+    {
+      "source": "rank0/layer1/ple_embedding.bin",
+      "source_bytes": 668902400,
+      "previously_verified_source_sha256": "e30edc9270c1991af01fc69e462d078e8a9a2afdb06d413dd8abb3e2e0bb935f",
+      "source_mtime_ns": 1790145652270572333,
+      "width": 1280,
+      "sample_bytes": 74240,
+      "sample_sha256": "6b3758ef5905ae1daf27d3eb7f64993e5b98892e5638a73836e1f899cbaea7ee"
+    },
+    {
+      "source": "rank0/layer1/ple_residual_before.bin",
+      "source_bytes": 5351219200,
+      "previously_verified_source_sha256": "884c1ffd84af02604c414afcefa3d7e6dd75401b25cf68234e7bf340d836d9be",
+      "source_mtime_ns": 1790145652299572435,
+      "width": 10240,
+      "sample_bytes": 593920,
+      "sample_sha256": "5d04cd2eb0368a01baecc429731b8faae934b89aa2eafc27c73f365336c8ef7a"
+    },
+    {
+      "source": "rank0/layer1/ple_gv.bin",
+      "source_bytes": 5351219200,
+      "previously_verified_source_sha256": "4f0c821eff43fdd220b91853e12959a8fb96785fdc5b5f32add8d2d6f4bb85c3",
+      "source_mtime_ns": 1790145652288572396,
+      "width": 10240,
+      "sample_bytes": 593920,
+      "sample_sha256": "f0e0fd390c3d4794a3529823daf52c0faee53c5b57ef4f6d4c705d22a0d10fe9"
+    },
+    {
+      "source": "rank0/layer1/ple_un.bin",
+      "source_bytes": 5351219200,
+      "previously_verified_source_sha256": "3fa209610cd4d48fab1959840565e8221b0c9aa58d08e132d5f4ea84e133f81f",
+      "source_mtime_ns": 1790145652278572361,
+      "width": 10240,
+      "sample_bytes": 593920,
+      "sample_sha256": "c0ef9a0b32f03be3b08978857630e2c84f422dc9fd784ebf44999f4cb03f5825"
+    },
+    {
+      "source": "rank1/layer1/ple_embedding.bin",
+      "source_bytes": 668902400,
+      "previously_verified_source_sha256": "088c32b48995e8edf8971c59e783db67d493367fccc0730948d2648b8ffe99f7",
+      "source_mtime_ns": 1790145783628113209,
+      "width": 1280,
+      "sample_bytes": 74240,
+      "sample_sha256": "e540bac75df9839eef27bf22a92493ceb70cd8e55117952f6f79b26a5b675912"
+    },
+    {
+      "source": "rank1/layer1/ple_residual_before.bin",
+      "source_bytes": 5351219200,
+      "previously_verified_source_sha256": "884c1ffd84af02604c414afcefa3d7e6dd75401b25cf68234e7bf340d836d9be",
+      "source_mtime_ns": 1790145798901185090,
+      "width": 10240,
+      "sample_bytes": 593920,
+      "sample_sha256": "5d04cd2eb0368a01baecc429731b8faae934b89aa2eafc27c73f365336c8ef7a"
+    },
+    {
+      "source": "rank1/layer1/ple_gv.bin",
+      "source_bytes": 5351219200,
+      "previously_verified_source_sha256": "4f0c821eff43fdd220b91853e12959a8fb96785fdc5b5f32add8d2d6f4bb85c3",
+      "source_mtime_ns": 1790145752322971349,
+      "width": 10240,
+      "sample_bytes": 593920,
+      "sample_sha256": "f0e0fd390c3d4794a3529823daf52c0faee53c5b57ef4f6d4c705d22a0d10fe9"
+    },
+    {
+      "source": "rank1/layer1/ple_un.bin",
+      "source_bytes": 5351219200,
+      "previously_verified_source_sha256": "3fa209610cd4d48fab1959840565e8221b0c9aa58d08e132d5f4ea84e133f81f",
+      "source_mtime_ns": 1790145766391034169,
+      "width": 10240,
+      "sample_bytes": 593920,
+      "sample_sha256": "c0ef9a0b32f03be3b08978857630e2c84f422dc9fd784ebf44999f4cb03f5825"
+    }
+  ],
+  "full_archive_rehashed": false,
+  "note": "Reuses prior complete archive verification; current bounded reads check source sizes and stability plus all exported payload hashes."
+}

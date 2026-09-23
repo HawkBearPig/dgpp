@@ -1,0 +1,18 @@
+{
+  "cpu_only": true,
+  "bf16_values": 10005,
+  "bf16_matches_torch_bits": true,
+  "fp8_matrix_values": 65536,
+  "fp8_block_dequant_matches_torch_bits": true,
+  "streaming_statistics_equal_to_whole": true,
+  "injected_errors_detected": 2,
+  "cases": [
+    "normal values",
+    "varying block scale",
+    "zero block",
+    "subnormals",
+    "signed zero"
+  ],
+  "script_sha256": "de0408bfc6ad59cd09578bf1f460d3f29d4be91fed08ac51182c5780b5977e3f",
+  "oracle_sha256": "d78851a9e809da2554cc9d6581760b600a26183b80ce945613333ec1ae8a3e4f"
+}
