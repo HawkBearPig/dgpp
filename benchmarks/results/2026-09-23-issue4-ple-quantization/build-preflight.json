@@ -1,7 +1,7 @@
 {
   "base_commit": "d318815984fd2ab1f0a67a6b830b57730a57439a",
-  "diagnostic_patch_sha256": "bf084322f8bc50fcdd36124c486747411816a9f595d0cf2ee4a52fa743a4427b",
-  "binary_sha256": "63f83f7472c1e04827af7f75c2e96cbc2f6abf3269a5267291cf87931a77adc8",
+  "diagnostic_patch_sha256": "a5b546f31635fbe7c2bdb14cd4ea91b5ecb52ec1a68e4cb861c15ba400a81fef",
+  "binary_sha256": "ea1a66ed60278d2d4f08d8fc7374c78cbd036fc07c6d33460b69ce11192fee8c",
   "release_server_build_passed": true,
   "test_executables_built": [
     "qwen_loader_test",
@@ -19,7 +19,9 @@
   "original_request_run": false,
   "test_executable_sha256": {
     "qwen_loader_test": "6ef747012e6dd5d58ff613b8479e11cf10f7449d07b92d8ffb4d337e6120c5e6",
-    "qwen_engine_test": "5e82962e855a8a3cf6ece474c167b0956d7bdb5cd2cf7acd2b5cb3aeabb6bc9b",
+    "qwen_engine_test": "e3d384bbc81cce76cb4e781845d8413b86d7e2507cf4ab4cd64cbad3c5f57236",
     "qwen_ple_test": "46c2a55ee97af7d8746ab4440104594ec24e5aa646200ce0df375364146e86ca"
-  }
+  },
+  "bf16_copy": "existing copy_rows_bf16 kernel (capture-safe staged host-memory reads)",
+  "excluded_attempt": "attempt1.json"
 }

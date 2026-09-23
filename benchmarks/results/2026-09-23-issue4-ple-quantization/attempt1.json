@@ -1,0 +1,50 @@
+{
+  "exit_code": 1,
+  "reason": "BF16 storage control hit CUDA error 901 during graph capture with the diagnostic host-to-device memcpy path",
+  "loader_tests_passed": 3,
+  "fp8_storage_control_completed": true,
+  "bf16_storage_control_passed": false,
+  "original_request_runs": 0,
+  "accuracy_result_valid": false,
+  "production_restored": true,
+  "restoration": {
+    "binaries": {
+      "192.168.88.11": "4638e3c595a2765d6d50c4626a9fef3aa2aa82936c6c50e3d0eec871fcde8e00  /proc/170093/exe\n",
+      "192.168.88.12": "4638e3c595a2765d6d50c4626a9fef3aa2aa82936c6c50e3d0eec871fcde8e00  /proc/635851/exe\n",
+      "192.168.88.13": "4638e3c595a2765d6d50c4626a9fef3aa2aa82936c6c50e3d0eec871fcde8e00  /proc/1367444/exe\n",
+      "192.168.88.14": "4638e3c595a2765d6d50c4626a9fef3aa2aa82936c6c50e3d0eec871fcde8e00  /proc/803060/exe\n"
+    },
+    "config_matches": true,
+    "smoke": {
+      "id": "chatcmpl-9674b2f2a62ae1d2",
+      "object": "chat.completion",
+      "created": 1790182655,
+      "model": "HawkBearPig/GLM-5.3-Flash-NVFP4-FP8",
+      "system_fingerprint": null,
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "OK",
+            "refusal": null
+          },
+          "logprobs": null,
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 16,
+        "completion_tokens": 3,
+        "total_tokens": 19,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 1
+        }
+      }
+    },
+    "idle": true
+  }
+}

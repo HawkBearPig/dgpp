@@ -1,0 +1,12 @@
+[ OK ] qwen_ple_hash_ids_match_the_reference_and_stay_in_range
+[ OK ] qwen_ple_gather_is_bitwise_at_world_1_and_on_a_head_slice
+[ .. ] gate: max_rel 0 l2_rel 0 mismatches 0/37888
+[ OK ] qwen_ple_gate_matches_the_reference_within_two_ulps
+[ OK ] qwen_ple_conv_is_bitwise_and_chunk_invariant
+[ .. ] ple end to end n=3: out max_rel 0 l2_rel 0 mismatches 0/3072; state l2_rel 3.01e-06
+[ OK ] qwen_ple_layer_end_to_end_at_decode_shape
+[ .. ] ple end to end n=37: out max_rel 0.00521 l2_rel 1.82e-05 mismatches 0/37888; state l2_rel 6.13e-05
+[ OK ] qwen_ple_layer_end_to_end_at_prefill_shape
+[ OK ] the staged gather is bitwise the table gather over 37 rows x 16 heads
+[ OK ] qwen_ple_staged_gather_is_bitwise_the_table_gather
+7 tests, 0 failed

@@ -21,7 +21,7 @@ class Tensors:
         if path not in self.headers:
             with path.open('rb') as stream:
                 length, = struct.unpack('<Q', stream.read(8))
-                if length > 1024 * 1024:
+                if length > 64 * 1024 * 1024:
                     raise ValueError('Unexpected safetensors header length')
                 self.headers[path] = (8 + length, json.loads(stream.read(length)))
         start, header = self.headers[path]

@@ -1,8 +1,16 @@
 diff --git a/src/models/qwen/layers.cpp b/src/models/qwen/layers.cpp
-index 3279424..3e4e8d4 100644
+index 3279424..81ee6c1 100644
 --- a/src/models/qwen/layers.cpp
 +++ b/src/models/qwen/layers.cpp
-@@ -636,7 +636,7 @@ QwenPleLayer::QwenPleLayer(const QwenPleResident& w, const QwenNgramTableResiden
+@@ -14,6 +14,7 @@
+ #include "kernels/mma_gemv.hpp"
+ #include "kernels/dsa.hpp"
+ #include "kernels/kda.hpp"
++#include "kernels/kernels.hpp"
+ #include "kernels/qsa.hpp"
+ #include "kernels/rope_scaling.hpp"
+ #include "kernels/qwen_gr.hpp"
+@@ -636,7 +637,7 @@ QwenPleLayer::QwenPleLayer(const QwenPleResident& w, const QwenNgramTableResiden
      DGPP_CUDA_OK(cudaHostAlloc(reinterpret_cast<void**>(&h_ids_), M * static_cast<size_t>(heads_) * 4,
                                 cudaHostAllocMapped));
      DGPP_CUDA_OK(cudaHostGetDevicePointer(reinterpret_cast<void**>(&ids_), h_ids_, 0));
@@ -11,7 +19,7 @@ index 3279424..3e4e8d4 100644
                                 cudaHostAllocMapped));
      DGPP_CUDA_OK(cudaStreamCreateWithFlags(&side_, cudaStreamNonBlocking));
      DGPP_CUDA_OK(cudaEventCreateWithFlags(&fork_, cudaEventDisableTiming));
-@@ -724,7 +724,9 @@ size_t QwenPleLayer::staging_bytes(const QwenTextConfig& cfg, int hash_heads, in
+@@ -724,7 +725,9 @@ size_t QwenPleLayer::staging_bytes(const QwenTextConfig& cfg, int hash_heads, in
    const size_t M = static_cast<size_t>(std::max(max_tokens, 0));
    const size_t heads = static_cast<size_t>((cfg.ngram_size - 1) * cfg.heads_per_ngram);
    const size_t hd = static_cast<size_t>(cfg.ple_embed_dim) / std::max<size_t>(heads, 1);
@@ -22,14 +30,13 @@ index 3279424..3e4e8d4 100644
  }
  
  void QwenPleLayer::stage(const int64_t* tokens, int rows, const int32_t* req_ids, const int64_t* pos,
-@@ -769,7 +771,12 @@ void QwenPleLayer::embed(const int64_t* tokens, int rows, const int32_t* req_ids
+@@ -769,7 +772,11 @@ void QwenPleLayer::embed(const int64_t* tokens, int rows, const int32_t* req_ids
    if (staged()) {
      if (staged_rows_ != rows) throw std::logic_error("QwenPleLayer: embed() without a matching stage()");
      DGPP_CUDA_OK(cudaStreamWaitEvent(stream, join_, 0));
 -    qwen_ple_gather_staged_bf16(staged_, table_.scale, rows, w_.hash_heads, head_dim_, e_, stream);
 +    if (table_.mmap->element_bytes() == 2) {
-+      const size_t bytes = static_cast<size_t>(rows) * w_.hash_heads * head_dim_ * sizeof(uint16_t);
-+      DGPP_CUDA_OK(cudaMemcpyAsync(e_, staged_, bytes, cudaMemcpyHostToDevice, stream));
++      copy_rows_bf16(e_, staged_, rows, w_.hash_heads * head_dim_, stream);
 +    } else {
 +      qwen_ple_gather_staged_bf16(staged_, table_.scale, rows, w_.hash_heads, head_dim_, e_, stream);
 +    }
