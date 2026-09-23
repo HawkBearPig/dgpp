@@ -1,0 +1,21 @@
+{
+  "ranks": [
+    {
+      "rank": 0,
+      "positions": 312,
+      "fields_verified": 133678,
+      "bytes_verified": 1670271264,
+      "orphaned_tail_payloads": []
+    },
+    {
+      "rank": 1,
+      "positions": 312,
+      "fields_verified": 133678,
+      "bytes_verified": 1670271264,
+      "orphaned_tail_payloads": []
+    }
+  ],
+  "all_metadata_payload_hashes_match": true,
+  "wall_seconds": 43.69595005502924,
+  "coverage": "Final call at 261303 is incomplete on both ranks; comparison explicitly stops at its shared fields."
+}

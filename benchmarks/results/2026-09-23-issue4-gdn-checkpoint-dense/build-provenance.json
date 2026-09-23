@@ -1,0 +1,6 @@
+{
+  "base_commit": "d318815984fd2ab1f0a67a6b830b57730a57439a",
+  "binary_sha256": "2da43e4a54678c87b58a55ed358cd921a2207c1156673be947aaddb04350fcf8",
+  "patch_sha256": "44d9f7839d0c4273a475c402714f11c7a186540e2673ff1da5aa6d07f31d6c21",
+  "source": "Native chunked GDN plus checkpoint dense projections; resident images bypassed. No other diagnostic arithmetic changes."
+}

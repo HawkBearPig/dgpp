@@ -119,6 +119,16 @@ text/usage. All 267480 captured fields across both ranks pass payload-hash
 verification. It confirms BF16 state storage between reference calls despite
 FP32 within-call accumulation; DGPP and the checkpoint require FP32 state.
 This is an additional numerical-policy difference, not a localized retrieval
-cause. A second fresh trace is running. An explicit FP32-state reference control
-with measured GDN configurations pinned and a native block-GDN/checkpoint-dense
-control are prepared but have not run.
+cause. The second fresh trace also fails 5/6, with identical full text/usage, but its
+first layer-0 MoE output differs on both ranks in 14/5242880 elements under
+identical captured preceding inputs and identical recorded GDN configurations.
+The detailed [cross-world comparison](2026-09-23-issue4-reference-world-trace-repeat/README.md)
+accounts explicitly for an incomplete final trace call. This localizes reference
+variation to MoE, not yet to a specific internal operation or the retrieval cause.
+An explicit FP32-state reference control and a bounded internal-MoE probe are
+prepared. The [native block-GDN/checkpoint-dense control](2026-09-23-issue4-gdn-checkpoint-dense/README.md)
+still returns the original 5/6 answer (184 completion tokens). Both rank loader
+receipts confirm checkpoint dense weights and no resident image loads. The
+bounded follow-up was skipped and production restoration passed. An earlier
+pre-inference log-collection guard failure was corrected and is excluded from
+accuracy results. The bounded Marlin internal-MoE probe is now running.

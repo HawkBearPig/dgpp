@@ -31,12 +31,21 @@ def stats(left,right,a,b):
 def compare(first,second,rank):
     first=first/f'rank{rank}'/'request1';second=second/f'rank{rank}'/'request1'
     result=dict(rank=rank,equal_fields=0,different_fields=0,first_difference=None,
-                first_input_difference=None,early_differences=[],kernel_config_comparisons=[])
+                first_input_difference=None,incomplete_tail=None,early_differences=[],kernel_config_comparisons=[])
     for left in sorted(first.glob('position*'),key=lambda p:int(p.name[8:])):
         right=second/left.name
         if not right.exists() or json.loads((left/'input.json').read_text())!=json.loads((right/'input.json').read_text()):
             result['first_input_difference']=dict(position=int(left.name[8:]),reason='missing call or token/position drift');break
-        for p in sorted(left.glob('layer*.json'),key=ordering):
+        left_fields={p.name for p in left.glob('layer*.json')}
+        right_fields={p.name for p in right.glob('layer*.json')}
+        incomplete = left_fields != right_fields
+        if incomplete:
+            last_left=max(int(p.name[8:]) for p in first.glob('position*'))
+            last_right=max(int(p.name[8:]) for p in second.glob('position*'))
+            assert int(left.name[8:])==min(last_left,last_right), 'Missing field before final trace call'
+            result['incomplete_tail']=dict(position=int(left.name[8:]),
+                missing_in_second=sorted(left_fields-right_fields),missing_in_first=sorted(right_fields-left_fields))
+        for p in sorted((left/name for name in left_fields & right_fields),key=ordering):
             other=right/p.name;a=json.loads(p.read_text());b=json.loads(other.read_text())
             assert all(a[k]==b[k] for k in ('dtype','saved_shape','original_shape')),(p,other)
             if a['sha256']==b['sha256']:result['equal_fields']+=1;continue
@@ -49,6 +58,8 @@ def compare(first,second,rank):
             a=json.loads(config.read_text());b=json.loads((right/config.name).read_text())
             result['kernel_config_comparisons'].append(dict(position=int(left.name[8:]),equal=a==b,
                 different={k:dict(first=a[k],second=b[k]) for k in a if a[k]!=b[k]}))
+        if incomplete:
+            break
     return result
 
 if __name__=='__main__':

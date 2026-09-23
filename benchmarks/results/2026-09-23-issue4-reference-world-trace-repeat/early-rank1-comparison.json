@@ -1,0 +1,14 @@
+[
+  {
+    "position": 0,
+    "same_fields": 30,
+    "different_fields": 532,
+    "first_difference": "layer0_mlp_out.json"
+  },
+  {
+    "position": 2048,
+    "same_fields": 29,
+    "different_fields": 533,
+    "first_difference": "layer0_mlp_out.json"
+  }
+]
