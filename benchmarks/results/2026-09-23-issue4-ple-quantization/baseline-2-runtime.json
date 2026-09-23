@@ -1,0 +1,14 @@
+[
+  {
+    "node": "192.168.88.11",
+    "pid": 179246,
+    "binary_sha256": "ea1a66ed60278d2d4f08d8fc7374c78cbd036fc07c6d33460b69ce11192fee8c",
+    "ple_override": []
+  },
+  {
+    "node": "192.168.88.12",
+    "pid": 649185,
+    "binary_sha256": "ea1a66ed60278d2d4f08d8fc7374c78cbd036fc07c6d33460b69ce11192fee8c",
+    "ple_override": []
+  }
+]

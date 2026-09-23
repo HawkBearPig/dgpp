@@ -1,0 +1,35 @@
+{
+  "engine": "native DGPP, real TP2",
+  "controls": [
+    {
+      "experts": "NVFP4",
+      "table": "FP8",
+      "correct": 5,
+      "total": 6,
+      "target_value": "val_5dac9ed720abddaf",
+      "record": "2026-09-23-issue4-ple-quantization/baseline-1-verdict.json"
+    },
+    {
+      "experts": "FP8",
+      "table": "FP8",
+      "correct": 5,
+      "total": 6,
+      "target_value": "val_51bf3e137245e273",
+      "record": "2026-09-23-issue4-fp8-control/verdict.json"
+    },
+    {
+      "experts": "NVFP4",
+      "table": "BF16",
+      "correct": 5,
+      "total": 6,
+      "target_value": "val_5dac9ed720abddaf",
+      "record": "2026-09-23-issue4-ple-quantization/bf16-1-verdict.json"
+    },
+    {
+      "experts": "FP8",
+      "table": "BF16",
+      "status": "not run"
+    }
+  ],
+  "next_control": "Combine the already cached FP8 experts and BF16 tables to test the missing precision interaction without a full BF16 model run."
+}

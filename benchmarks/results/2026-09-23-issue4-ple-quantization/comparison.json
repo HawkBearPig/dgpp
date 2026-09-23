@@ -1,0 +1,97 @@
+{
+  "modes": [
+    {
+      "mode": "baseline-1",
+      "correct": 5,
+      "total": 6,
+      "failed_key_value": "val_5dac9ed720abddaf",
+      "completion_tokens": 184,
+      "wall_seconds": 218.76946481899358,
+      "pass_original_request": false
+    },
+    {
+      "mode": "bf16-1",
+      "correct": 5,
+      "total": 6,
+      "failed_key_value": "val_5dac9ed720abddaf",
+      "completion_tokens": 184,
+      "wall_seconds": 219.4111589989625,
+      "pass_original_request": false
+    },
+    {
+      "mode": "baseline-2",
+      "correct": 5,
+      "total": 6,
+      "failed_key_value": "val_5dac9ed720abddaf",
+      "completion_tokens": 184,
+      "wall_seconds": 219.21720702794846,
+      "pass_original_request": false
+    }
+  ],
+  "original_request_bytes_identical": true,
+  "baseline_full_text_and_usage_repeat": true,
+  "effective_configuration_equal": true,
+  "actual_binary_equal_on_both_ranks": true,
+  "bf16_override_only_in_middle_run": true,
+  "bf16_full_text_and_usage_equal_to_baseline": true,
+  "loader_receipts": [
+    {
+      "mode": "baseline-1",
+      "rank": 0,
+      "launches_in_log": 1,
+      "launch_start": "2026-09-23 17:00:17.842 INFO  dgpp-serve 0.1.0+gd318815984fd.dirty (git d318815984fd)",
+      "log_sha256": "a81a5cc753596b3b41a95c03fe671a042f592fa7a8ab0cdfd4e104b133a8abc1",
+      "current_launch_sha256": "604b457529b46501cd78faa75fde5812669a71b08bc798752595971815e02914",
+      "bf16_rows_enabled": false
+    },
+    {
+      "mode": "baseline-1",
+      "rank": 1,
+      "launches_in_log": 1,
+      "launch_start": "2026-09-23 17:00:38.664 INFO  dgpp-serve 0.1.0+gd318815984fd.dirty (git d318815984fd)",
+      "log_sha256": "815b26699832f56029f1e9168a9e42d2e722bba09ed8d1c4257cfa45a3bdeb16",
+      "current_launch_sha256": "b6d1f141fcff5c1417d6bff437815663cf1a403c032901d524a6caaad84a16db",
+      "bf16_rows_enabled": false
+    },
+    {
+      "mode": "bf16-1",
+      "rank": 0,
+      "launches_in_log": 1,
+      "launch_start": "2026-09-23 17:04:27.660 INFO  dgpp-serve 0.1.0+gd318815984fd.dirty (git d318815984fd)",
+      "log_sha256": "014553187dbad7890b474cf9f9de0e91d9e13704456f5b546ccec8d779702d9c",
+      "current_launch_sha256": "e5e7e584d3c5dd3a6e816d5dde78e18b2674c27c010a10d1488f47301d22700b",
+      "bf16_rows_enabled": true
+    },
+    {
+      "mode": "bf16-1",
+      "rank": 1,
+      "launches_in_log": 2,
+      "launch_start": "2026-09-23 17:04:48.503 INFO  dgpp-serve 0.1.0+gd318815984fd.dirty (git d318815984fd)",
+      "log_sha256": "5f5c6cf84aeca2946b26c08561f43b05d73b987296de624fe6c579d08f7bfbbd",
+      "current_launch_sha256": "be144f67421edf177a267f132bb3f2239cf547500d17886b595682e964d7c1ec",
+      "bf16_rows_enabled": true
+    },
+    {
+      "mode": "baseline-2",
+      "rank": 0,
+      "launches_in_log": 1,
+      "launch_start": "2026-09-23 17:08:38.328 INFO  dgpp-serve 0.1.0+gd318815984fd.dirty (git d318815984fd)",
+      "log_sha256": "71b47d3d337da31d2c7e3d6816de9ff424b4f0745b6f85a5f0db084cad4e867a",
+      "current_launch_sha256": "c5dc1150e3c48b8de278673187ea0fafe25efb086d525ac9a6f379590ab37302",
+      "bf16_rows_enabled": false
+    },
+    {
+      "mode": "baseline-2",
+      "rank": 1,
+      "launches_in_log": 3,
+      "launch_start": "2026-09-23 17:08:59.172 INFO  dgpp-serve 0.1.0+gd318815984fd.dirty (git d318815984fd)",
+      "log_sha256": "cca9bf550bc8abec06a6a1fc3117384661875e9aaa24c63848fb4e088f4e1918",
+      "current_launch_sha256": "ce6c3f9eb3241e52fd56139de7309439531f4afe2a50fdf14ea261d5a68fe026",
+      "bf16_rows_enabled": false
+    }
+  ],
+  "production_restored_and_verified": true,
+  "script_sha256": "bfbe6ab221ed4544ef651c918ca6cd56e58bb4445fe3d896381d434e0eabb934",
+  "scorer_sha256": "c176424d40b2488fbfb06cb604f2db4e9dd3a9111e7ae4e90e76b554212e0ae7",
+  "interpretation": "This changes only n-gram table values in the native NVFP4 TP2 execution; it does not test unquantized experts."
+}

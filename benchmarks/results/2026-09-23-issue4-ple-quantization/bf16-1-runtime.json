@@ -1,0 +1,18 @@
+[
+  {
+    "node": "192.168.88.11",
+    "pid": 176210,
+    "binary_sha256": "ea1a66ed60278d2d4f08d8fc7374c78cbd036fc07c6d33460b69ce11192fee8c",
+    "ple_override": [
+      "/home/stephen/.cache/dgpp/issue4-bf16-ple-de4b8e4d/manifest.json"
+    ]
+  },
+  {
+    "node": "192.168.88.12",
+    "pid": 644566,
+    "binary_sha256": "ea1a66ed60278d2d4f08d8fc7374c78cbd036fc07c6d33460b69ce11192fee8c",
+    "ple_override": [
+      "/home/stephen/.cache/dgpp/issue4-bf16-ple-de4b8e4d/manifest.json"
+    ]
+  }
+]

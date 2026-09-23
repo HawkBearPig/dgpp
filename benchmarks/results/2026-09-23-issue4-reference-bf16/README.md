@@ -8,8 +8,10 @@ quantization config and contains 359999963128 tensor bytes in 131 weight files
 The initial feasibility check read only public metadata, configuration, index
 and model card. No full BF16 checkpoint download or full BF16 inference has
 started. A later [PLE-only precision experiment](../2026-09-23-issue4-ple-quantization/README.md)
-has sampled BF16 table values and is fetching the 33 files containing the tables
-to isolate their precision while retaining the native NVFP4 TP2 engine.
+downloaded and verified the 33 files containing the tables, then completed a
+native NVFP4 TP2 A/B/A comparison. Replacing only table values with BF16 leaves
+the original 5/6 answer unchanged; all three texts and usage objects match.
+Production restoration passed. No full BF16 model inference was performed.
 
 A full BF16 control could test whether the original association also fails
 without quantized expert weights and n-gram tables. It would require a separate

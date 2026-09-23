@@ -180,12 +180,17 @@ A full BF16 checkpoint is available, with identical text configuration to FP8.
 It is an optional broader quantization control, not a prerequisite for a DGPP
 fix; no full BF16 model run has started. The narrower
 [PLE precision comparison](2026-09-23-issue4-ple-quantization/README.md) is now
-running. Small BF16 table samples show no large conversion/scaling
+complete. Small BF16 table samples show no large conversion/scaling
 discrepancy, but have a measured 2.67% relative FP8 quantization difference.
-The diagnostic will replace only n-gram table values while retaining native
+The diagnostic replaces only n-gram table values while retaining native
 NVFP4 TP2 execution. Its server builds and all 11 focused GPU/loader checks pass,
 including an eager/MTP-graph storage control. All selected table files and the
 capture relocation pass full checksum verification. The original-request A/B/A
-comparison is running; no retrieval verdict is available yet. An earlier failed
+comparison returns the exact original failure in all three runs: 5/6, 184
+completion tokens, identical full text and usage. Both current-launch loader
+logs and actual process environments confirm the precision change only in the
+middle run. Effective configuration and actual binaries match, and the campaign
+exits 0 after verified production restoration. Higher table precision alone
+does not repair the native NVFP4 failure. An earlier failed
 diagnostic copy path was corrected before any original request ran and is
 excluded from accuracy evidence; that attempt restored production successfully.

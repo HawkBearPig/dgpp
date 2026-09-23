@@ -1,0 +1,9 @@
+{
+  "session_id": 56686,
+  "command": "python3 benchmarks/results/2026-09-23-issue4-ple-quantization/campaign.py",
+  "observed_exit_code": 0,
+  "campaign_log_sha256": "cb959395f9a45c014d77f6cdeac7d8cd6c6346af10f6547ac95105af6b0bae68",
+  "comparison_sha256": "d7da737095f2afb99905becc65e3528abb1da897552eec81367e4773b88cb78d",
+  "restoration_sha256": "0d15d9a1e6b9a3f9879c8af28222ef89f453657b817023a5ce894fda9bf66439",
+  "recorded_utc": "2026-09-23T17:19:02.834716+00:00"
+}

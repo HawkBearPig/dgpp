@@ -1,10 +1,38 @@
-# PLE precision isolation — GPU validation passed, request comparison running
+# PLE precision isolation — original failure unchanged in A/B/A
 
 The independent FP8 reference still shares its quantized n-gram table with the
 NVFP4 checkpoint. This experiment isolates that remaining shared quantization:
 retain the original NVFP4 experts, dense projections, native TP2 arithmetic,
 configuration and unchanged request, replacing only table lookup values with
 the original BF16 rows. This is a diagnostic hypothesis, not a retrieval fix.
+
+The complete native TP2 A/B/A campaign returns the original wrong association
+in every run. All three assistant texts and usage objects are identical:
+261120 prompt tokens, 184 completion tokens, zero cached tokens, normal stop.
+
+| Table values | Correct checks | Failed-key value | Seconds |
+| --- | --- | --- | --- |
+| Original FP8, first baseline | 5/6 | `val_5dac9ed720abddaf` | 218.769 |
+| Original BF16 | 5/6 | `val_5dac9ed720abddaf` | 219.411 |
+| Original FP8, final baseline | 5/6 | `val_5dac9ed720abddaf` | 219.217 |
+
+Restoring table precision alone therefore does not repair #4 with these native
+NVFP4 experts. This does not test the combination of FP8 experts and BF16 tables,
+or fully unquantized experts, and does not establish a retrieval-causing engine
+defect. The diagnostic is not proposed as a production fix.
+
+`precision-matrix.json` records the remaining combination: native FP8 experts
+with BF16 n-gram tables has not run. Both ingredients are already cached, so
+this can test their interaction without downloading the full BF16 model.
+
+`summarize.py` independently rescores retained responses, verifies unchanged
+request bytes, and checks equal effective configuration and actual binaries on
+both ranks. The only resolved-config difference is each run's log directory.
+Both process environments and current-launch loader logs confirm BF16 lookup
+only in the middle run. Peer logs append across launches; the verifier checks
+the current launch window and retains hashes of both the whole log and window.
+The campaign exits 0, restores all four original production binaries and the
+resolved configuration, and passes an inference smoke test.
 
 ## Completed CPU checks
 
@@ -22,7 +50,7 @@ The sampled shared projection weights and complete hash/norm buffers all match.
 This finds no large scaling/conversion discrepancy in those samples. It neither
 audits every table row nor establishes whether this quantization affects retrieval.
 
-## Diagnostic implementation and pending validation
+## Diagnostic implementation and validation
 
 `diagnostic.patch` applies to EOS-corrected base
 `d318815984fd2ab1f0a67a6b830b57730a57439a`, which already reproduces the original
@@ -38,9 +66,7 @@ cross-shard rows, head selection, absent nonlocal shards and rank bounds.
 A GPU integration control also passes: store the original FP8-derived values
 as BF16 and compare eager/MTP graph transcripts on a synthetic TP2 fixture.
 All 11 focused checks pass (three loader tests, one storage integration control
-and seven PLE kernel tests). The unchanged-request A/B/A campaign is running:
-original FP8 tables, original BF16 tables, then original FP8 tables again.
-No retrieval verdict is available yet.
+and seven PLE kernel tests), before the completed unchanged-request comparison.
 
 The first diagnostic attempt failed during CUDA graph capture with the new
 host-to-device memcpy path. Its FP8 control completed, but the BF16 storage
@@ -67,3 +93,4 @@ rank 0's BF16 table files. Both manifests and `capture-relocation.json` preserve
 the location and checksums. Production ran during CPU/storage preparation. It
 was stopped for the GPU checks and request comparison; the campaign restores
 the original four-node binary/configuration and checks inference in `finally`.
+Both the excluded first attempt and the completed comparison verified restoration.
