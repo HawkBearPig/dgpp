@@ -1,0 +1,38 @@
+{
+  "engine": "native DGPP, real TP2",
+  "controls": [
+    {
+      "experts": "NVFP4",
+      "table": "FP8",
+      "correct": 5,
+      "total": 6,
+      "target_value": "val_5dac9ed720abddaf",
+      "record": "2026-09-23-issue4-ple-quantization/baseline-1-verdict.json"
+    },
+    {
+      "experts": "FP8",
+      "table": "FP8",
+      "correct": 5,
+      "total": 6,
+      "target_value": "val_51bf3e137245e273",
+      "record": "2026-09-23-issue4-fp8-control/verdict.json"
+    },
+    {
+      "experts": "NVFP4",
+      "table": "BF16",
+      "correct": 5,
+      "total": 6,
+      "target_value": "val_5dac9ed720abddaf",
+      "record": "2026-09-23-issue4-ple-quantization/bf16-1-verdict.json"
+    },
+    {
+      "experts": "FP8",
+      "table": "BF16",
+      "correct": 5,
+      "total": 6,
+      "target_value": "val_7265273163533973",
+      "record": "2026-09-23-issue4-fp8-ple-precision/bf16-1-verdict.json"
+    }
+  ],
+  "interpretation": "Every tested combination fails the same key. BF16 PLE table values change the FP8-expert wrong value, but do not repair retrieval. This is not an all-BF16 model run and does not prove engine correctness."
+}

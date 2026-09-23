@@ -1,0 +1,394 @@
+diff --git a/src/models/qwen/layers.cpp b/src/models/qwen/layers.cpp
+index 3279424..81ee6c1 100644
+--- a/src/models/qwen/layers.cpp
++++ b/src/models/qwen/layers.cpp
+@@ -14,6 +14,7 @@
+ #include "kernels/mma_gemv.hpp"
+ #include "kernels/dsa.hpp"
+ #include "kernels/kda.hpp"
++#include "kernels/kernels.hpp"
+ #include "kernels/qsa.hpp"
+ #include "kernels/rope_scaling.hpp"
+ #include "kernels/qwen_gr.hpp"
+@@ -636,7 +637,7 @@ QwenPleLayer::QwenPleLayer(const QwenPleResident& w, const QwenNgramTableResiden
+     DGPP_CUDA_OK(cudaHostAlloc(reinterpret_cast<void**>(&h_ids_), M * static_cast<size_t>(heads_) * 4,
+                                cudaHostAllocMapped));
+     DGPP_CUDA_OK(cudaHostGetDevicePointer(reinterpret_cast<void**>(&ids_), h_ids_, 0));
+-    DGPP_CUDA_OK(cudaHostAlloc(reinterpret_cast<void**>(&staged_), M * static_cast<size_t>(w_.hash_heads) * head_dim_,
++    DGPP_CUDA_OK(cudaHostAlloc(reinterpret_cast<void**>(&staged_), M * static_cast<size_t>(w_.hash_heads) * head_dim_ * table_.mmap->element_bytes(),
+                                cudaHostAllocMapped));
+     DGPP_CUDA_OK(cudaStreamCreateWithFlags(&side_, cudaStreamNonBlocking));
+     DGPP_CUDA_OK(cudaEventCreateWithFlags(&fork_, cudaEventDisableTiming));
+@@ -724,7 +725,9 @@ size_t QwenPleLayer::staging_bytes(const QwenTextConfig& cfg, int hash_heads, in
+   const size_t M = static_cast<size_t>(std::max(max_tokens, 0));
+   const size_t heads = static_cast<size_t>((cfg.ngram_size - 1) * cfg.heads_per_ngram);
+   const size_t hd = static_cast<size_t>(cfg.ple_embed_dim) / std::max<size_t>(heads, 1);
+-  return M * heads * 4 + M * static_cast<size_t>(hash_heads) * hd;
++  const char* manifest = std::getenv("DGPP_ISSUE4_PLE_BF16_MANIFEST");
++  const size_t element_bytes = manifest && *manifest ? 2 : 1;
++  return M * heads * 4 + M * static_cast<size_t>(hash_heads) * hd * element_bytes;
+ }
+ 
+ void QwenPleLayer::stage(const int64_t* tokens, int rows, const int32_t* req_ids, const int64_t* pos,
+@@ -769,7 +772,11 @@ void QwenPleLayer::embed(const int64_t* tokens, int rows, const int32_t* req_ids
+   if (staged()) {
+     if (staged_rows_ != rows) throw std::logic_error("QwenPleLayer: embed() without a matching stage()");
+     DGPP_CUDA_OK(cudaStreamWaitEvent(stream, join_, 0));
+-    qwen_ple_gather_staged_bf16(staged_, table_.scale, rows, w_.hash_heads, head_dim_, e_, stream);
++    if (table_.mmap->element_bytes() == 2) {
++      copy_rows_bf16(e_, staged_, rows, w_.hash_heads * head_dim_, stream);
++    } else {
++      qwen_ple_gather_staged_bf16(staged_, table_.scale, rows, w_.hash_heads, head_dim_, e_, stream);
++    }
+     staged_rows_ = 0;
+     return;
+   }
+diff --git a/src/models/qwen/loader.cpp b/src/models/qwen/loader.cpp
+index 27731d3..ca87525 100644
+--- a/src/models/qwen/loader.cpp
++++ b/src/models/qwen/loader.cpp
+@@ -17,6 +17,7 @@
+ #include <fstream>
+ #include <numeric>
+ #include <stdexcept>
++#include "loaders/minijson.hpp"
+ 
+ #include "common/cuda_check.hpp"
+ #include "common/log.hpp"
+@@ -695,14 +696,27 @@ uint64_t QwenLoaderFamily::loader_format() { return g_dense_weights_fp8 ? 2 : 1;
+ 
+ // ---- QwenNgramTableMmap ---------------------------------------------------------
+ 
+-QwenNgramTableMmap::QwenNgramTableMmap(std::vector<Part> parts, int64_t capacity, int head_dim)
+-    : parts_(std::move(parts)), capacity_(capacity), head_dim_(head_dim) {
++QwenNgramTableMmap::QwenNgramTableMmap(std::vector<Part> parts, int64_t capacity, int head_dim,
++                                     int element_bytes, int64_t row_begin, int64_t row_count)
++    : parts_(std::move(parts)), capacity_(capacity), head_dim_(head_dim),
++      element_bytes_(element_bytes), row_begin_(row_begin) {
+   if (capacity_ <= 0 || head_dim_ <= 0 || parts_.empty())
+     throw std::invalid_argument("QwenNgramTableMmap: empty geometry");
++  if (element_bytes_ != 1 && element_bytes_ != 2)
++    throw std::invalid_argument("QwenNgramTableMmap: unsupported element width");
++  const int64_t total_rows = (static_cast<int64_t>(parts_.size()) - 1) * capacity_ + parts_.back().rows;
++  if (row_count == -1) row_count = total_rows - row_begin_;
++  if (row_begin_ < 0 || row_count <= 0 || row_begin_ > total_rows || row_count > total_rows - row_begin_)
++    throw std::invalid_argument("QwenNgramTableMmap: invalid mapped row range");
++  row_end_ = row_begin_ + row_count;
+   std::unordered_map<std::string, size_t> by_path;
+   part_base_.resize(parts_.size(), nullptr);
+   for (size_t s = 0; s < parts_.size(); ++s) {
+     const Part& part = parts_[s];
++    if (part.rows <= 0 || part.rows > capacity_)
++      throw std::invalid_argument("QwenNgramTableMmap: invalid shard rows");
++    const int64_t first = static_cast<int64_t>(s) * capacity_;
++    if (first >= row_end_ || first + part.rows <= row_begin_) continue;
+     auto it = by_path.find(part.path);
+     if (it == by_path.end()) {
+       Mapping m;
+@@ -722,7 +736,7 @@ QwenNgramTableMmap::QwenNgramTableMmap(std::vector<Part> parts, int64_t capacity
+       it = by_path.emplace(part.path, maps_.size() - 1).first;
+     }
+     const Mapping& m = maps_[it->second];
+-    if (part.data_begin + static_cast<uint64_t>(part.rows) * head_dim_ > m.len)
++    if (part.data_begin > m.len || static_cast<uint64_t>(part.rows) * head_dim_ * element_bytes_ > m.len - part.data_begin)
+       throw std::runtime_error("QwenNgramTableMmap: part " + std::to_string(s) + " past the end of " + part.path);
+     part_base_[s] = m.base + part.data_begin;
+   }
+@@ -737,15 +751,16 @@ QwenNgramTableMmap::~QwenNgramTableMmap() {
+ 
+ const uint8_t* QwenNgramTableMmap::row(int64_t row) const {
+   const int64_t s = row / capacity_, r = row - s * capacity_;
+-  if (row < 0 || s >= static_cast<int64_t>(parts_.size()) || r >= parts_[static_cast<size_t>(s)].rows)
++  if (row < row_begin_ || row >= row_end_ || s >= static_cast<int64_t>(parts_.size()) || r >= parts_[static_cast<size_t>(s)].rows)
+     throw std::out_of_range("QwenNgramTableMmap: row " + std::to_string(row) + " outside the table");
+-  return part_base_[static_cast<size_t>(s)] + static_cast<size_t>(r) * head_dim_;
++  return part_base_[static_cast<size_t>(s)] + static_cast<size_t>(r) * head_dim_ * element_bytes_;
+ }
+ 
+ void QwenNgramTableMmap::gather(const int32_t* ids, int n, int heads, int head_begin, int heads_local,
+                                 uint8_t* dst) const {
+   if (n <= 0) return;
+   const int64_t total = static_cast<int64_t>(n) * heads_local;
++  const size_t row_bytes = static_cast<size_t>(head_dim_) * element_bytes_;
+   // Every row's page asked for up front (the kernel issues the reads in
+   // parallel), then the copies: a decode step's 32 rows in one thread, a
+   // prefill chunk's tens of thousands across a few.
+@@ -753,14 +768,14 @@ void QwenNgramTableMmap::gather(const int32_t* ids, int n, int heads, int head_b
+     for (int64_t pair = lo; pair < hi; ++pair) {
+       const int64_t t = pair / heads_local, hl = pair - t * heads_local;
+       const int32_t id = ids[t * heads + head_begin + hl];
+-      std::memcpy(dst + static_cast<size_t>(pair) * head_dim_, row(id), static_cast<size_t>(head_dim_));
++      std::memcpy(dst + static_cast<size_t>(pair) * row_bytes, row(id), row_bytes);
+     }
+   };
+   for (int64_t pair = 0; pair < total; ++pair) {
+     const int64_t t = pair / heads_local, hl = pair - t * heads_local;
+     const uint8_t* p = row(ids[t * heads + head_begin + hl]);
+     const uintptr_t page = reinterpret_cast<uintptr_t>(p) & ~uintptr_t{4095};
+-    madvise(reinterpret_cast<void*>(page), 4096 + static_cast<size_t>(head_dim_), MADV_WILLNEED);
++    madvise(reinterpret_cast<void*>(page), 4096 + row_bytes, MADV_WILLNEED);
+   }
+   constexpr int64_t kPerThread = 256;
+   if (total <= kPerThread) {
+@@ -784,13 +799,56 @@ const QwenNgramTableResident& QwenLayerStream::load_ngram_table() {
+   const QwenNgramGeometry g = cfg_.ngram_geometry();
+   const int64_t hd = g.head_dim;
+   const int64_t row_begin = geo_.table_row_begin, rows = geo_.table_rows;
++  const char* bf16_manifest = std::getenv("DGPP_ISSUE4_PLE_BF16_MANIFEST");
++  const bool override_bf16 = bf16_manifest && *bf16_manifest;
++  if (override_bf16 && !g_ngram_table_mmap)
++    throw std::invalid_argument("issue4 BF16 PLE diagnostic requires an mmap table");
+   if (g_ngram_table_mmap) {
+     // The table stays in its shard(s): the parts' file offsets, mapped by
+     // the table object; the resident view keeps the geometry and the scale
+     // (the staged gather's), rows_e4m3 null.
+     const std::string p = qwen_layer_prefix(cfg_, cfg_.ple_layer()) + "ple.ple_embedding.";
+     std::vector<QwenNgramTableMmap::Part> parts;
++    std::string manifest_text;
++    minijson::Value override_parts;
++    if (override_bf16) {
++      std::ifstream file(bf16_manifest);
++      if (!file) throw std::runtime_error("issue4: cannot open BF16 PLE manifest");
++      manifest_text.assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
++      const auto parsed = minijson::parse(manifest_text);
++      const auto& manifest = parsed.root;
++      const auto array = [&](const char* key) {
++        const auto& value = manifest.at(key);
++        if (!value.is_array()) throw std::runtime_error("issue4: invalid BF16 PLE hash buffer");
++        std::vector<int64_t> result;
++        for (const auto& item : value.items()) {
++          if (item.kind() != minijson::Value::Kind::Int)
++            throw std::runtime_error("issue4: noninteger BF16 PLE hash buffer");
++          result.push_back(item.as_int());
++        }
++        return result;
++      };
++      if (manifest.at("dtype").as_string() != "BF16" || manifest.at("head_dim").as_int(-1) != hd ||
++          manifest.at("capacity").as_int(-1) != qwen_ngram_shard_capacity(cfg_) ||
++          array("multipliers") != g.multipliers || array("head_vocab") != g.head_vocab ||
++          array("head_offset") != g.head_offset)
++        throw std::runtime_error("issue4: BF16 PLE manifest geometry/hash buffers differ");
++      override_parts = manifest.at("parts");
++      if (!override_parts.is_array() || override_parts.items().size() != static_cast<size_t>(cfg_.split_ngram_parts))
++        throw std::runtime_error("issue4: BF16 PLE manifest shard count differs");
++    }
+     for (int s = 0; s < cfg_.split_ngram_parts; ++s) {
++      if (override_bf16) {
++        const auto& part = override_parts.items().at(s);
++        if (part.at("rows").as_int(-1) != qwen_ngram_shard_rows(cfg_, s) ||
++            part.at("data_begin").kind() != minijson::Value::Kind::Int ||
++            part.at("data_begin").as_int(-1) < 0 || part.at("path").as_string().empty())
++          throw std::runtime_error("issue4: BF16 PLE shard row count differs");
++        parts.push_back(QwenNgramTableMmap::Part{std::string(part.at("path").as_string()),
++                                                static_cast<uint64_t>(part.at("data_begin").as_int()),
++                                                part.at("rows").as_int()});
++        continue;
++      }
+       const std::string name = p + "ngram_embedding.shard_" + std::to_string(s) + ".weight";
+       auto it = tensors_.find(name);
+       if (it == tensors_.end() || !it->second || !it->second->owner)
+@@ -799,7 +857,12 @@ const QwenNgramTableResident& QwenLayerStream::load_ngram_table() {
+       parts.push_back(QwenNgramTableMmap::Part{t.owner->path(), t.data_begin, t.shape[0]});
+     }
+     mmap_table_ = std::make_unique<QwenNgramTableMmap>(std::move(parts), qwen_ngram_shard_capacity(cfg_),
+-                                                       static_cast<int>(hd));
++                                                       static_cast<int>(hd), override_bf16 ? 2 : 1,
++                                                       override_bf16 ? row_begin : 0,
++                                                       override_bf16 ? rows : -1);
++    if (override_bf16)
++      DGPP_LOG_INFO("issue4: rank {} uses BF16 PLE rows [{}, {}), manifest {}; FP8 table scale bypassed",
++                    rank_, row_begin, row_begin + rows, bf16_manifest);
+     {
+       const std::string name = p + "ngram_embedding.weight_scale";
+       auto it = tensors_.find(name);
+diff --git a/src/models/qwen/loader.hpp b/src/models/qwen/loader.hpp
+index 3ad76f7..67b93ee 100644
+--- a/src/models/qwen/loader.hpp
++++ b/src/models/qwen/loader.hpp
+@@ -170,7 +170,8 @@ class QwenNgramTableMmap {
+     int64_t rows;          // rows in this part
+   };
+   // `parts` in shard order (part s holds rows [s * capacity, +rows)).
+-  QwenNgramTableMmap(std::vector<Part> parts, int64_t capacity, int head_dim);
++  QwenNgramTableMmap(std::vector<Part> parts, int64_t capacity, int head_dim,
++                    int element_bytes = 1, int64_t row_begin = 0, int64_t row_count = -1);
+   ~QwenNgramTableMmap();
+   QwenNgramTableMmap(const QwenNgramTableMmap&) = delete;
+   QwenNgramTableMmap& operator=(const QwenNgramTableMmap&) = delete;
+@@ -183,6 +184,7 @@ class QwenNgramTableMmap {
+               uint8_t* dst) const;
+   int64_t capacity() const { return capacity_; }
+   int head_dim() const { return head_dim_; }
++  int element_bytes() const { return element_bytes_; }
+   size_t mapped_bytes() const { return mapped_bytes_; }
+ 
+  private:
+@@ -196,6 +198,8 @@ class QwenNgramTableMmap {
+   std::vector<Mapping> maps_;
+   int64_t capacity_ = 0;
+   int head_dim_ = 0;
++  int element_bytes_ = 1;
++  int64_t row_begin_ = 0, row_end_ = 0;
+   size_t mapped_bytes_ = 0;
+ };
+ 
+diff --git a/tests/cuda/qwen_engine_test.cpp b/tests/cuda/qwen_engine_test.cpp
+index 97a9758..92f0c72 100644
+--- a/tests/cuda/qwen_engine_test.cpp
++++ b/tests/cuda/qwen_engine_test.cpp
+@@ -20,6 +20,8 @@
+ #include <cstdlib>
+ #include <cstring>
+ #include <filesystem>
++#include <fstream>
++#include <iomanip>
+ #include <memory>
+ #include <mutex>
+ #include <stdexcept>
+@@ -444,6 +446,85 @@ DGPP_TEST(qwen_engines_loopback_world_2_mtp_graph_over_the_mmap_table_matches_re
+                 ids_text(mapped[0].ma), mapped[0].mtp_steps_a, ids_text(mapped[0].mb), ids_text(mapped[0].mc));
+ }
+ 
++DGPP_TEST(qwen_engines_bf16_ple_storage_preserves_mmap_eager_and_mtp_graph_transcripts) {
++  require(std::getenv("DGPP_ISSUE4_PLE_BF16_MANIFEST") == nullptr,
++          "the storage control requires no external PLE override");
++  const QwenTextConfig cfg = qwenfx::tiny_config();
++  const auto ng = cfg.ngram_geometry();
++  const auto tensors = dgpp::qwen_expected_text_tensors(cfg);
++  const std::string dir = "qwen_bf16_ple_engine_fixture";
++  qwenfx::write_fixture(cfg, dir);
++  const std::string prefix = dgpp::qwen_layer_prefix(cfg, cfg.ple_layer()) + "ple.ple_embedding.ngram_embedding.";
++  const auto bytes = [&](const std::string& name) {
++    for (const auto& tensor : tensors)
++      if (tensor.name == name) return qwenfx::tensor_bytes(cfg, tensor);
++    throw std::runtime_error("missing PLE fixture tensor " + name);
++  };
++  const auto scale_data = bytes(prefix + "weight_scale");
++  uint16_t scale_bits;
++  require(scale_data.size() == sizeof(scale_bits), "global scale size");
++  std::memcpy(&scale_bits, scale_data.data(), sizeof(scale_bits));
++  const float scale = dgpp::bf16_bits_to_float(scale_bits);
++  const std::string manifest_path = fs::absolute(fs::path(dir) / "bf16-ple.json").string();
++  {
++    std::ofstream manifest(manifest_path);
++    manifest << "{\"dtype\":\"BF16\",\"head_dim\":" << ng.head_dim
++             << ",\"capacity\":" << dgpp::qwen_ngram_shard_capacity(cfg);
++    const auto array = [&](const char* name, const std::vector<int64_t>& values) {
++      manifest << ",\"" << name << "\":[";
++      for (size_t i = 0; i < values.size(); ++i) manifest << (i ? "," : "") << values[i];
++      manifest << "]";
++    };
++    array("multipliers", ng.multipliers);
++    array("head_vocab", ng.head_vocab);
++    array("head_offset", ng.head_offset);
++    manifest << ",\"parts\":[";
++    for (int shard = 0; shard < cfg.split_ngram_parts; ++shard) {
++      const auto encoded = bytes(prefix + "shard_" + std::to_string(shard) + ".weight");
++      std::vector<uint16_t> decoded(encoded.size());
++      for (size_t i = 0; i < encoded.size(); ++i)
++        decoded[i] = dgpp::float_to_bf16_bits(dgpp::fp8_e4m3_bits_to_float(encoded[i]) * scale);
++      const std::string path = fs::absolute(fs::path(dir) / ("bf16-part-" + std::to_string(shard))).string();
++      std::ofstream file(path, std::ios::binary);
++      file.write(reinterpret_cast<const char*>(decoded.data()), static_cast<std::streamsize>(decoded.size() * 2));
++      require(file.good(), "write BF16 PLE fixture rows");
++      manifest << (shard ? "," : "") << "{\"path\":" << std::quoted(path)
++               << ",\"data_begin\":0,\"rows\":" << dgpp::qwen_ngram_shard_rows(cfg, shard) << "}";
++    }
++    manifest << "]}";
++    require(manifest.good(), "write BF16 PLE fixture manifest");
++  }
++  struct Reset {
++    ~Reset() { unsetenv("DGPP_ISSUE4_PLE_BF16_MANIFEST"); dgpp::QwenLayerStream::set_ngram_table_mmap(false); }
++  } reset;
++  const auto A = smoke_tokens(cfg, 23, 0x9E3779B97F4A7C15ull);
++  const auto B = smoke_tokens(cfg, 17, 0xD1B54A32D192ED03ull);
++  const auto C = smoke_tokens(cfg, 11, 0x2545F4914F6CDD1Dull);
++  std::array<std::vector<RankOutcome>, 2> outcomes;
++  for (int pass = 0; pass < 2; ++pass) {
++    dgpp::QwenLayerStream::set_ngram_table_mmap(true);
++    if (pass == 1) setenv("DGPP_ISSUE4_PLE_BF16_MANIFEST", manifest_path.c_str(), 1);
++    auto buses = start_world(kWorld, kPort + 50 + 2 * pass);
++    require(!buses.empty(), "the loopback bus world failed to start");
++    auto& outs = outcomes[pass];
++    outs.resize(kWorld);
++    ConstructBarrier barrier(kWorld);
++    std::vector<std::thread> workers;
++    for (int rank = 0; rank < kWorld; ++rank)
++      workers.emplace_back(rank_work_mtp, rank, std::cref(cfg), std::cref(dir), std::cref(A), std::cref(B),
++                           std::cref(C), buses[rank].get(), &barrier, &outs[rank], 1);
++    for (auto& worker : workers) worker.join();
++    for (const auto& out : outs) require(out.error.empty(), out.error);
++  }
++  for (int rank = 0; rank < kWorld; ++rank) {
++    const auto& a = outcomes[0][rank];
++    const auto& b = outcomes[1][rank];
++    require(a.ea == b.ea && a.eb == b.eb && a.ec == b.ec, "BF16 storage changes eager transcripts");
++    require(a.ma == b.ma && a.mb == b.mb && a.mc == b.mc, "BF16 storage changes MTP graph transcripts");
++    require(a.mtp_steps_a == b.mtp_steps_a, "BF16 storage changes MTP acceptance");
++  }
++}
++
+ // Depth 2 (2026-09-10, kDraftChain): the chained draft rows through the
+ // block, the ring copied around them — the greedy transcripts still the
+ // plain engine's, scalar and batched, on every rank.
+diff --git a/tests/cuda/qwen_loader_test.cpp b/tests/cuda/qwen_loader_test.cpp
+index 1d6e256..9c97df7 100644
+--- a/tests/cuda/qwen_loader_test.cpp
++++ b/tests/cuda/qwen_loader_test.cpp
+@@ -11,6 +11,7 @@
+ #include <cmath>
+ #include <cstring>
+ #include <filesystem>
++#include <fstream>
+ #include <numeric>
+ #include <stdexcept>
+ #include <string>
+@@ -436,6 +437,48 @@ DGPP_TEST(qwen_loader_mmap_ngram_table_reads_the_shards_rows) {
+   }
+ }
+ 
++DGPP_TEST(qwen_loader_bf16_ngram_mmap_preserves_bits_and_rank_bounds) {
++  const fs::path dir = fs::current_path() / "qwen_bf16_ngram_mmap_fixture";
++  fs::create_directories(dir);
++  struct Cleanup { fs::path dir; ~Cleanup() { fs::remove_all(dir); } } cleanup{dir};
++  constexpr int capacity = 7, hd = 3, total_rows = 17;
++  std::vector<uint16_t> expected(total_rows * hd);
++  for (size_t i = 0; i < expected.size(); ++i) expected[i] = static_cast<uint16_t>(0x3f00 + i);
++  std::vector<dgpp::QwenNgramTableMmap::Part> parts;
++  for (int shard = 0; shard < 3; ++shard) {
++    const int first = shard * capacity, rows = std::min(capacity, total_rows - first);
++    const fs::path path = dir / ("shard" + std::to_string(shard));
++    if (shard != 0) {
++      std::ofstream file(path, std::ios::binary);
++      file.write("start", 5);
++      file.write(reinterpret_cast<const char*>(expected.data() + first * hd), rows * hd * 2);
++    }
++    parts.push_back({path.string(), 5, rows});
++  }
++  // The first shard is deliberately absent: this rank never reads its rows.
++  dgpp::QwenNgramTableMmap table(parts, capacity, hd, 2, 8, 9);
++  require(table.element_bytes() == 2, "BF16 element width");
++  for (int row : {8, 13, 14, 16})
++    require(std::memcmp(table.row(row), expected.data() + row * hd, hd * 2) == 0, "BF16 row bits");
++  for (int row : {-1, 0, 7, 17}) {
++    bool rejected = false;
++    try { (void)table.row(row); } catch (const std::out_of_range&) { rejected = true; }
++    require(rejected, "row outside this rank rejected");
++  }
++  for (int n : {3, 512}) {
++    std::vector<int32_t> ids(n * 4, 0);
++    for (int t = 0; t < n; ++t)
++      for (int h = 1; h < 3; ++h) ids[t * 4 + h] = 8 + (t * 2 + h) % 9;
++    std::vector<uint8_t> got(static_cast<size_t>(n) * 2 * hd * 2);
++    table.gather(ids.data(), n, 4, 1, 2, got.data());
++    for (int t = 0; t < n; ++t)
++      for (int h = 0; h < 2; ++h)
++        require(std::memcmp(got.data() + (t * 2 + h) * hd * 2,
++                            expected.data() + ids[t * 4 + 1 + h] * hd, hd * 2) == 0,
++                "serial/parallel BF16 gather bits and head selection");
++  }
++}
++
+ DGPP_TEST(qwen_loader_nvfp4_metadata_is_replicated_at_world_two) {
+   const Fixture fx = write_nvfp4_fixture();
+   require(fx.cfg.experts_nvfp4, "the fixture selects NVFP4 experts");

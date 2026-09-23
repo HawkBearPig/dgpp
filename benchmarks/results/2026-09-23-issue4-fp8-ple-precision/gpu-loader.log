@@ -1,0 +1,16 @@
+2026-09-23 17:00:08.093 INFO  qwen loader: rank 0 n-gram table rows [0, 1626) resident (0.00 GiB, scale 0.020019531)
+2026-09-23 17:00:08.283 INFO  qwen loader: rank 0 n-gram table rows [0, 660) resident (0.00 GiB, scale 0.020019531)
+2026-09-23 17:00:08.476 INFO  qwen loader: rank 1 n-gram table rows [660, 1626) resident (0.00 GiB, scale 0.020019531)
+2026-09-23 17:00:08.667 INFO  qwen loader: rank 0 n-gram table rows [0, 290) resident (0.00 GiB, scale 0.020019531)
+2026-09-23 17:00:08.853 INFO  qwen loader: rank 1 n-gram table rows [290, 660) resident (0.00 GiB, scale 0.020019531)
+2026-09-23 17:00:09.028 INFO  qwen loader: rank 2 n-gram table rows [660, 1092) resident (0.00 GiB, scale 0.020019531)
+2026-09-23 17:00:09.224 INFO  qwen loader: rank 3 n-gram table rows [1092, 1626) resident (0.00 GiB, scale 0.020019531)
+2026-09-23 17:00:09.518 INFO  qwen loader: rank 0 n-gram table rows [0, 1626) mmap'ed from the checkpoint (0.02 GiB mapped, scale 0.020019531)
+2026-09-23 17:00:09.716 INFO  qwen loader: rank 0 n-gram table rows [0, 660) mmap'ed from the checkpoint (0.02 GiB mapped, scale 0.020019531)
+2026-09-23 17:00:09.915 INFO  qwen loader: rank 1 n-gram table rows [660, 1626) mmap'ed from the checkpoint (0.02 GiB mapped, scale 0.020019531)
+qwen fixture written: 376 tensors, 18.11 MB payload
+[ OK ] qwen_loader_globals_and_ngram_table_slices
+qwen fixture written: 376 tensors, 18.11 MB payload
+[ OK ] qwen_loader_mmap_ngram_table_reads_the_shards_rows
+[ OK ] qwen_loader_bf16_ngram_mmap_preserves_bits_and_rank_bounds
+3 tests, 0 failed

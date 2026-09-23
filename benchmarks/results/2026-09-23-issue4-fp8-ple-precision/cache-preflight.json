@@ -1,0 +1,19 @@
+{
+  "source_full_hash_receipt": "../2026-09-23-issue4-fp8-control/snapshot-verification.json",
+  "current": [
+    {
+      "rank": 0,
+      "fp8_shards": 131,
+      "bf16_files": 17,
+      "checkpoint": "236dfdf285828023ca3bcd3f37366c58a3469b13",
+      "file_sizes_pass": true
+    },
+    {
+      "rank": 1,
+      "fp8_shards": 131,
+      "bf16_files": 17,
+      "checkpoint": "236dfdf285828023ca3bcd3f37366c58a3469b13",
+      "file_sizes_pass": true
+    }
+  ]
+}

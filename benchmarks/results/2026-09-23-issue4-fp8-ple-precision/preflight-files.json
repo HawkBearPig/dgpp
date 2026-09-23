@@ -1,0 +1,16 @@
+{
+  "cache-preflight.json": "8cb979cdbab0bea264a671741acff1beef1fbf26f615cbaf399760216088dd59",
+  "diagnostic.patch": "a5b546f31635fbe7c2bdb14cd4ea91b5ecb52ec1a68e4cb861c15ba400a81fef",
+  "rank0-verification.json": "0a2639bd4f91815bc038a604f89a63b2fd3e275a89f6d59373b3b809133d3c9d",
+  "table-verification.json": "62174b2723eb36caf431dd552b60143325d84a9730f9cb7bbfc0c78a66cf69ae",
+  "gpu-loader.log": "3d0fc6a5067692827b71c8bf94514f7fd22f19212e61ed54077aa6d7ffaca932",
+  "input-parity.json": "7a6c2d9ff66211128049f037b7fa30fd9482cde7ac923c0d96df2b81299e3866",
+  "gpu-ple-kernels.log": "212e4b5d5735318dfe2914063c00cc2339e41eceb7c48cac21dbe47398ef4684",
+  "bf16-table-manifest.json": "b238bfe4dd76b740d0f1470c28e92649a5a5ba61404e0120c93ea4412326fb0f",
+  "campaign.py": "0ec86d7d707e1070a25d3ccb032dd053ae72af245d041f1a9d4b33a720e8e8f0",
+  "gpu-storage-control.log": "a6848f720bffdb2380f312642ba8b389b75215b030f3428508862ce0be1a5004",
+  "summarize.py": "0f677926529b8b35c8fafe8435ad046c78f05bc79f5dc427294fbb0a74be8173",
+  "README.md": "8c1ab3fb827c899bc180d76bc81208856bc7c0fd1c846f7f0ee52de087ee3a0d",
+  "build-preflight.json": "4546aa7118867f2b4d50b27c5a18139ced045d13176b1aec2b127a7de421326c",
+  "gpu-validation.json": "65be69f059a178370c8945f49fc8f619dd3bc0248ed712779e8e492cdb181735"
+}

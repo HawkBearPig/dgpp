@@ -41,6 +41,7 @@ consistency patch is not a prerequisite for the investigation.
 | [Canonical reference grouping](2026-09-23-issue4-reference-canonical-moe/README.md) | Two original 5/6 failures; all captured fields repeat exactly | Removing measured reference grouping variation does not repair retrieval |
 | [Reference FP32 state](2026-09-23-issue4-reference-state-fp32/README.md) | Two original 5/6 failures; actual FP32 handoffs verified | BF16 reference state storage is insufficient to explain the failure |
 | [Independent FP8 reference](2026-09-23-issue4-reference-fp8/README.md) | Two 5/6 failures with the original wrong association, 169 output tokens; 257280 fields repeat exactly | Higher expert precision in the independent engine is insufficient |
+| [FP8 experts + BF16 PLE table](2026-09-23-issue4-fp8-ple-precision/README.md) | A/B/A all 5/6; table precision changes the wrong value; baselines repeat exactly | Combined higher expert/table precision is insufficient |
 
 [Draft PR #34](https://github.com/HawkBearPig/dgpp/pull/34) separates generation
 stop IDs from trained model EOS, preserving PLE semantics. The release build,
@@ -194,3 +195,19 @@ exits 0 after verified production restoration. Higher table precision alone
 does not repair the native NVFP4 failure. An earlier failed
 diagnostic copy path was corrected before any original request ran and is
 excluded from accuracy evidence; that attempt restored production successfully.
+
+The missing [FP8-expert/BF16-table combination](2026-09-23-issue4-fp8-ple-precision/README.md)
+is now complete using cached weights and the same validated diagnostic binary.
+A1/A2 exactly reproduce the earlier native FP8 failure (`val_51bf3e137245e273`,
+174 output tokens); B returns another existing record's value
+(`val_7265273163533973`, 175 output tokens). All score 5/6. The original request
+changes only the served model name and retains all 261120 token IDs. Actual
+process binary/environment checks and current-launch loader logs verify the
+change only in B; effective engine configuration matches. Resident images are
+disabled throughout, and A1 text/usage exactly match the prior cache-enabled
+control. Both campaign and independent rescorer exit 0; production restoration
+passes all four binary checks, exact configuration, smoke inference and idle
+state. All four tested expert/table precision combinations fail the same key.
+This rules out those precision changes as sufficient repairs, not every
+quantization effect or every possible engine defect. No full BF16 model was
+run. The retrieval root cause and a causally supported fix remain unresolved.

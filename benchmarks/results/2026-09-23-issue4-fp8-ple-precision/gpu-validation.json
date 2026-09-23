@@ -1,0 +1,26 @@
+{
+  "passed": true,
+  "total_tests": 11,
+  "checks": [
+    {
+      "name": "gpu-loader",
+      "tests": 3,
+      "failed": 0,
+      "log_sha256": "3d0fc6a5067692827b71c8bf94514f7fd22f19212e61ed54077aa6d7ffaca932"
+    },
+    {
+      "name": "gpu-storage-control",
+      "tests": 1,
+      "failed": 0,
+      "log_sha256": "a6848f720bffdb2380f312642ba8b389b75215b030f3428508862ce0be1a5004"
+    },
+    {
+      "name": "gpu-ple-kernels",
+      "tests": 7,
+      "failed": 0,
+      "log_sha256": "212e4b5d5735318dfe2914063c00cc2339e41eceb7c48cac21dbe47398ef4684"
+    }
+  ],
+  "binary_sha256": "ea1a66ed60278d2d4f08d8fc7374c78cbd036fc07c6d33460b69ce11192fee8c",
+  "earlier_failed_attempt_excluded": "attempt1.json"
+}

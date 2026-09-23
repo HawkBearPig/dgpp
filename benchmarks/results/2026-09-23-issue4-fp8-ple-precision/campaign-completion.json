@@ -1,0 +1,9 @@
+{
+  "campaign_exit_code": 0,
+  "summarizer_exit_code": 0,
+  "all_three_original_input_runs_completed": true,
+  "all_three_score": "5/6",
+  "production_restored_and_verified": true,
+  "campaign_log_sha256": "beeb3fe4d5bbbda09fd379adbfed5b5e8ebc0298fd69ab5f238e116cd0781fb4",
+  "comparison_sha256": "7f488b7938c6ad0511bf94a8f0aeb32353da5e5df1434c52232f95a999cb876d"
+}

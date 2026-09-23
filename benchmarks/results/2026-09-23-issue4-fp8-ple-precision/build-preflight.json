@@ -1,0 +1,27 @@
+{
+  "base_commit": "d318815984fd2ab1f0a67a6b830b57730a57439a",
+  "diagnostic_patch_sha256": "a5b546f31635fbe7c2bdb14cd4ea91b5ecb52ec1a68e4cb861c15ba400a81fef",
+  "binary_sha256": "ea1a66ed60278d2d4f08d8fc7374c78cbd036fc07c6d33460b69ce11192fee8c",
+  "release_server_build_passed": true,
+  "test_executables_built": [
+    "qwen_loader_test",
+    "qwen_engine_test",
+    "qwen_ple_test"
+  ],
+  "host_test": {
+    "command": "DGPP_TEST_FILTER=qwen_loader_bf16_ngram_mmap_preserves_bits_and_rank_bounds ./build-release/qwen_loader_test",
+    "exit_code": 0,
+    "tests": 1,
+    "failures": 0,
+    "log_sha256": "62bcc58d9f646ed61e9d937a1290e853ade308d28c944cfba4d61ca025d47c5b"
+  },
+  "gpu_tests_run": false,
+  "original_request_run": false,
+  "test_executable_sha256": {
+    "qwen_loader_test": "6ef747012e6dd5d58ff613b8479e11cf10f7449d07b92d8ffb4d337e6120c5e6",
+    "qwen_engine_test": "e3d384bbc81cce76cb4e781845d8413b86d7e2507cf4ab4cd64cbad3c5f57236",
+    "qwen_ple_test": "46c2a55ee97af7d8746ab4440104594ec24e5aa646200ce0df375364146e86ca"
+  },
+  "bf16_copy": "existing copy_rows_bf16 kernel (capture-safe staged host-memory reads)",
+  "excluded_attempt": "attempt1.json"
+}

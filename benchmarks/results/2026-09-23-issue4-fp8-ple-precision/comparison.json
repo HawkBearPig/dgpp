@@ -1,0 +1,98 @@
+{
+  "modes": [
+    {
+      "mode": "baseline-1",
+      "correct": 5,
+      "total": 6,
+      "failed_key_value": "val_51bf3e137245e273",
+      "completion_tokens": 174,
+      "wall_seconds": 230.48795286996756,
+      "pass_original_request": false
+    },
+    {
+      "mode": "bf16-1",
+      "correct": 5,
+      "total": 6,
+      "failed_key_value": "val_7265273163533973",
+      "completion_tokens": 175,
+      "wall_seconds": 231.03358486801153,
+      "pass_original_request": false
+    },
+    {
+      "mode": "baseline-2",
+      "correct": 5,
+      "total": 6,
+      "failed_key_value": "val_51bf3e137245e273",
+      "completion_tokens": 174,
+      "wall_seconds": 230.67938275402412,
+      "pass_original_request": false
+    }
+  ],
+  "request_bytes_identical_across_modes": true,
+  "original_request_json_equal_except_model": true,
+  "baseline_full_text_and_usage_repeat": true,
+  "effective_configuration_equal": true,
+  "actual_binary_equal_on_both_ranks": true,
+  "bf16_override_only_in_middle_run": true,
+  "bf16_full_text_and_usage_equal_to_baseline": false,
+  "loader_receipts": [
+    {
+      "mode": "baseline-1",
+      "rank": 0,
+      "launches_in_log": 1,
+      "launch_start": "2026-09-23 17:28:14.409 INFO  dgpp-serve 0.1.0+gd318815984fd.dirty (git d318815984fd)",
+      "log_sha256": "b52a0b3192e586ced5e0df847808f7e0d5037b89a38f3b65fbe254aff4ff7f3f",
+      "current_launch_sha256": "12d059a9f8a30b8ebfcf3a02b9b5590e9aaa1a77ab2d76931066dc28b26eab5f",
+      "bf16_rows_enabled": false
+    },
+    {
+      "mode": "baseline-1",
+      "rank": 1,
+      "launches_in_log": 1,
+      "launch_start": "2026-09-23 17:28:35.349 INFO  dgpp-serve 0.1.0+gd318815984fd.dirty (git d318815984fd)",
+      "log_sha256": "3a46cac76f635f282464a67e78fcaacea4b7725bc636544a2bc0ca7ce8312ac8",
+      "current_launch_sha256": "a094ee9f978e3d3bb080f4225038d32300dc77f7b5d8055ad918a4085dcc494b",
+      "bf16_rows_enabled": false
+    },
+    {
+      "mode": "bf16-1",
+      "rank": 0,
+      "launches_in_log": 1,
+      "launch_start": "2026-09-23 17:34:54.473 INFO  dgpp-serve 0.1.0+gd318815984fd.dirty (git d318815984fd)",
+      "log_sha256": "d3db73815dc607af57f693b5d958922b05b2fa0434be5db3769bdf228b841ae6",
+      "current_launch_sha256": "5ddbd8b02a1176fcca9b44831deea165f5ca95e2d28529e7b5df2828024758fc",
+      "bf16_rows_enabled": true
+    },
+    {
+      "mode": "bf16-1",
+      "rank": 1,
+      "launches_in_log": 2,
+      "launch_start": "2026-09-23 17:35:15.400 INFO  dgpp-serve 0.1.0+gd318815984fd.dirty (git d318815984fd)",
+      "log_sha256": "d475d3538088054ea1675d5299a9ba478b0755ffa72a0815f82feb0275c32d05",
+      "current_launch_sha256": "be7802f0d04a89e575c54ed67c8788bb890808a8f22c821e1dd36c8ed9a7bbfe",
+      "bf16_rows_enabled": true
+    },
+    {
+      "mode": "baseline-2",
+      "rank": 0,
+      "launches_in_log": 1,
+      "launch_start": "2026-09-23 17:41:23.016 INFO  dgpp-serve 0.1.0+gd318815984fd.dirty (git d318815984fd)",
+      "log_sha256": "1afb0864a672cff7cb27f8f9f250b91af4c22f33cc18839a758bd2893d02c93b",
+      "current_launch_sha256": "4d2374fb74537a6c4d3d29592f27669ff41a7d2ef74d3dcce7190e37159c877c",
+      "bf16_rows_enabled": false
+    },
+    {
+      "mode": "baseline-2",
+      "rank": 1,
+      "launches_in_log": 3,
+      "launch_start": "2026-09-23 17:41:43.975 INFO  dgpp-serve 0.1.0+gd318815984fd.dirty (git d318815984fd)",
+      "log_sha256": "1a4d3e1d9f59e929e17ec15a6bccd8abfb8a3c4540947cf42c640cb59f189caf",
+      "current_launch_sha256": "f546efe597ce73ac81bd77b5fbf76c0d991f8a422e0eb41973cab2b7381a9879",
+      "bf16_rows_enabled": false
+    }
+  ],
+  "production_restored_and_verified": true,
+  "script_sha256": "0f677926529b8b35c8fafe8435ad046c78f05bc79f5dc427294fbb0a74be8173",
+  "scorer_sha256": "c176424d40b2488fbfb06cb604f2db4e9dd3a9111e7ae4e90e76b554212e0ae7",
+  "interpretation": "This changes only n-gram table values in the native FP8 TP2 execution; it does not test unquantized experts."
+}
