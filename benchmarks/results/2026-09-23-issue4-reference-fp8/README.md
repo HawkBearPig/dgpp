@@ -47,6 +47,18 @@ PLE table payloads with NVFP4. No checkpoint download or conversion was needed.
 The completed campaign restored all four original production binaries and the
 resolved configuration, passed inference, collected the peer trace and exited 0.
 
+An independent CPU audit of the retained inputs also passes (`check_inputs.py`,
+`input-audit.json`). For each of the two requests on each rank, all 261120
+original prompt IDs match, consumed positions are continuous, and all 297
+two-token PLE contexts equal the actual preceding tokens, starting with the
+trained EOS 248044. All captured query boundaries match their call lengths.
+The 4391 saved embedding rows per request/rank match the checkpoint BF16 bits
+exactly in each of the four repeated streams. This covers the first 4096 rows
+and the final row of each later call; other embedding rows were not captured.
+It rules out those input/history errors in this reference run, not downstream
+PLE arithmetic or the retrieval failure itself. No GPU run or new checkpoint
+was required for this audit.
+
 ## Excluded attempts
 
 `attempt1.json`: the initial launch stopped at the idle guard without stopping

@@ -1,0 +1,84 @@
+{
+  "passed": true,
+  "checkpoint": "/home/stephen/.cache/huggingface/hub/models--Qwen--Qwen3.8-Flash-Next-FP8/snapshots/236dfdf285828023ca3bcd3f37366c58a3469b13",
+  "checkpoint_embedding": {
+    "name": "model.language_model.embed_tokens.weight",
+    "file": "model-00130-of-00131.safetensors",
+    "dtype": "BF16",
+    "shape": [
+      248320,
+      2560
+    ],
+    "tensor_sha256": "62288a3fca91d3575b68924a54ab73629b86b609284d3fcd059a309146c9be3a"
+  },
+  "checkpoint_config_sha256": "c22eb0a053eed62e18f0184d3ca62d3798f208c3e00b9feee939fc3dbacdc8ca",
+  "trained_eos": 248044,
+  "prompt_ids_file_sha256": "44dca6af1ceef6392a5364e9f092ff202c32a6958683a599457cdb20f8c64b31",
+  "prompt_ids_int64le_sha256": "af58d17bb2d2c0308043a686e30baf1486b454da4f40059ee04306bfb29972be",
+  "capture_root": "/home/stephen/workspace/dgpp/benchmarks/results/2026-09-23-issue4-reference-fp8/raw/captures",
+  "ranks_and_requests": [
+    {
+      "rank": 0,
+      "request": 1,
+      "calls": 297,
+      "original_prompt_tokens_exact": 261120,
+      "consumed_tokens": 261289,
+      "input_positions_contiguous": true,
+      "ngram_history_pairs_exact": 297,
+      "query_boundary_samples_exact": 297,
+      "embedding_rows_exact": 4391,
+      "embedding_copies_per_row": 4,
+      "final_consumed_token": 248046,
+      "consumed_ids_int64le_sha256": "eb305e804ad30133a66cbef75e33226c2001d90ee37dcea95290bbcf5209ff82"
+    },
+    {
+      "rank": 0,
+      "request": 2,
+      "calls": 297,
+      "original_prompt_tokens_exact": 261120,
+      "consumed_tokens": 261289,
+      "input_positions_contiguous": true,
+      "ngram_history_pairs_exact": 297,
+      "query_boundary_samples_exact": 297,
+      "embedding_rows_exact": 4391,
+      "embedding_copies_per_row": 4,
+      "final_consumed_token": 248046,
+      "consumed_ids_int64le_sha256": "eb305e804ad30133a66cbef75e33226c2001d90ee37dcea95290bbcf5209ff82"
+    },
+    {
+      "rank": 1,
+      "request": 1,
+      "calls": 297,
+      "original_prompt_tokens_exact": 261120,
+      "consumed_tokens": 261289,
+      "input_positions_contiguous": true,
+      "ngram_history_pairs_exact": 297,
+      "query_boundary_samples_exact": 297,
+      "embedding_rows_exact": 4391,
+      "embedding_copies_per_row": 4,
+      "final_consumed_token": 248046,
+      "consumed_ids_int64le_sha256": "eb305e804ad30133a66cbef75e33226c2001d90ee37dcea95290bbcf5209ff82"
+    },
+    {
+      "rank": 1,
+      "request": 2,
+      "calls": 297,
+      "original_prompt_tokens_exact": 261120,
+      "consumed_tokens": 261289,
+      "input_positions_contiguous": true,
+      "ngram_history_pairs_exact": 297,
+      "query_boundary_samples_exact": 297,
+      "embedding_rows_exact": 4391,
+      "embedding_copies_per_row": 4,
+      "final_consumed_token": 248046,
+      "consumed_ids_int64le_sha256": "eb305e804ad30133a66cbef75e33226c2001d90ee37dcea95290bbcf5209ff82"
+    }
+  ],
+  "limits": [
+    "Embedding coverage is the first 4096 rows plus the final row of each later call.",
+    "Later query_start_loc captures contain only the final boundary.",
+    "This audits consumed inputs, not the mathematical correctness of generated answers.",
+    "N-gram context continuity does not validate all downstream PLE arithmetic."
+  ],
+  "script_sha256": "b9984c1b2e02b4d59864dd456e8e84aadb7df3904d2d8c272c022936828cdb25"
+}

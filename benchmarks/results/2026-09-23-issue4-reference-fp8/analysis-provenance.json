@@ -3,5 +3,6 @@
   "compare_first_layer.py": "cd3ecfc266b0dfd2bb3f3118783c6e3962c0e68fe1f353ce71d8f0d0e9c36674",
   "verify_captures.py": "e3d0ef582b7ebf8ead262313851695504db630cecf5f771b2b679763a7db17a9",
   "check_state_storage.py": "bff6c52f13daaf21bc78ecf8c147b6e6c40ae681aa47b88e27aa268ad4a28bc3",
-  "summarize.py": "74d9c345e82906ec95456f56f85336acee110d27dec7521082c773a2fdb0411c"
+  "summarize.py": "74d9c345e82906ec95456f56f85336acee110d27dec7521082c773a2fdb0411c",
+  "check_inputs.py": "b9984c1b2e02b4d59864dd456e8e84aadb7df3904d2d8c272c022936828cdb25"
 }
