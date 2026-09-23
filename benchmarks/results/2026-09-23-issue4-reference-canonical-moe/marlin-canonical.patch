@@ -1,0 +1,10 @@
+--- a/marlin_moe.py
++++ b/marlin_moe.py
+@@ -27,6 +27,7 @@
+     batched_moe_align_block_size,
+     moe_align_block_size,
+ )
++from vllm.models.qwen3_8_flash_next.nvidia.issue4_moe_align import moe_align_block_size
+ from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
+     TopKWeightAndReduceDelegate,
+     TopKWeightAndReduceNoOP,

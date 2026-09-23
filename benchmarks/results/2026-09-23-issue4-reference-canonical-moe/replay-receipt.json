@@ -1,0 +1,35 @@
+{
+  "image": "sha256:d464f3b466fa9c45ddbff8a812e80564503b6879a9fd95c1a47514f3f0df5a4a",
+  "script_sha256": "f98c8934e867b76ab3995058b95246cb57b34fefb88677d721bec9501b398de6",
+  "runs": [
+    {
+      "rank": 0,
+      "process": 1,
+      "returncode": 0,
+      "wall_seconds": 26.402306237025186,
+      "bundle_sha256": "a4c7af4ec924d6752c14d5abee27dafc4e223f50e53501dec82907b1472f7b9f"
+    },
+    {
+      "rank": 0,
+      "process": 2,
+      "returncode": 0,
+      "wall_seconds": 26.54163122898899,
+      "bundle_sha256": "a4c7af4ec924d6752c14d5abee27dafc4e223f50e53501dec82907b1472f7b9f"
+    },
+    {
+      "rank": 1,
+      "process": 1,
+      "returncode": 0,
+      "wall_seconds": 26.64253077300964,
+      "bundle_sha256": "0fba331b7149870928cddaf7f05eb9606615fa1345e9a3e0aff30ccc9631bfbc"
+    },
+    {
+      "rank": 1,
+      "process": 2,
+      "returncode": 0,
+      "wall_seconds": 27.072388101019897,
+      "bundle_sha256": "0fba331b7149870928cddaf7f05eb9606615fa1345e9a3e0aff30ccc9631bfbc"
+    }
+  ],
+  "complete": true
+}

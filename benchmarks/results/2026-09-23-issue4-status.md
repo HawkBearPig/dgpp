@@ -131,4 +131,19 @@ still returns the original 5/6 answer (184 completion tokens). Both rank loader
 receipts confirm checkpoint dense weights and no resident image loads. The
 bounded follow-up was skipped and production restoration passed. An earlier
 pre-inference log-collection guard failure was corrected and is excluded from
-accuracy results. The bounded Marlin internal-MoE probe is now running.
+accuracy results.
+
+The [bounded Marlin probe](2026-09-23-issue4-reference-marlin-probe/README.md)
+now causally localizes reference expert variation to token grouping order. Both
+rank inputs exactly match the original first chunk; routing/shared outputs remain
+exact while valid token placement and the first routed GEMM vary. In four fresh
+processes, automatic grouping produces ten different outputs per ten replays;
+all 40 frozen-grouping replays exactly reproduce every captured expert stage.
+DGPP already uses deterministic placement. This is a reference reproducibility
+finding, not a DGPP retrieval fix.
+
+The [canonical grouping control](2026-09-23-issue4-reference-canonical-moe/README.md)
+passes 60 GPU/CPU-oracle cases and repeats exactly in 40 real-operand replays
+across fresh processes and both ranks. The full TP2 campaign is now running two
+unchanged original requests with canonical grouping, deterministic QSA and
+pinned GDN launch choices. BF16 auto state is retained for this control.

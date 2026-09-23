@@ -1,0 +1,35 @@
+{
+  "cases": [
+    {
+      "case": "rank0-process1",
+      "automatic_unique_outputs": 10,
+      "frozen_unique_outputs": 1,
+      "frozen_all_stages_match_capture_exactly": true,
+      "frozen_output_sha256": "66628e47971c542867cb9c42ef35a56c5de67903643a2b244abbcb21bd956895"
+    },
+    {
+      "case": "rank0-process2",
+      "automatic_unique_outputs": 10,
+      "frozen_unique_outputs": 1,
+      "frozen_all_stages_match_capture_exactly": true,
+      "frozen_output_sha256": "66628e47971c542867cb9c42ef35a56c5de67903643a2b244abbcb21bd956895"
+    },
+    {
+      "case": "rank1-process1",
+      "automatic_unique_outputs": 10,
+      "frozen_unique_outputs": 1,
+      "frozen_all_stages_match_capture_exactly": true,
+      "frozen_output_sha256": "5d4c39cbf7d6c2e59b2fcb2f059f661f1e9e57ac19a6e2bd1a2ce70da3df553a"
+    },
+    {
+      "case": "rank1-process2",
+      "automatic_unique_outputs": 10,
+      "frozen_unique_outputs": 1,
+      "frozen_all_stages_match_capture_exactly": true,
+      "frozen_output_sha256": "5d4c39cbf7d6c2e59b2fcb2f059f661f1e9e57ac19a6e2bd1a2ce70da3df553a"
+    }
+  ],
+  "automatic_replays": 40,
+  "frozen_replays": 40,
+  "cross_process_frozen_exact": true
+}

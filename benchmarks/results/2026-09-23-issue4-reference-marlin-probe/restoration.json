@@ -1,0 +1,40 @@
+{
+  "binaries": {
+    "192.168.88.11": "4638e3c595a2765d6d50c4626a9fef3aa2aa82936c6c50e3d0eec871fcde8e00  /proc/25223/exe\n",
+    "192.168.88.12": "4638e3c595a2765d6d50c4626a9fef3aa2aa82936c6c50e3d0eec871fcde8e00  /proc/409519/exe\n",
+    "192.168.88.13": "4638e3c595a2765d6d50c4626a9fef3aa2aa82936c6c50e3d0eec871fcde8e00  /proc/1284208/exe\n",
+    "192.168.88.14": "4638e3c595a2765d6d50c4626a9fef3aa2aa82936c6c50e3d0eec871fcde8e00  /proc/773651/exe\n"
+  },
+  "config_matches": true,
+  "smoke": {
+    "id": "chatcmpl-5959a5272764e1fa",
+    "object": "chat.completion",
+    "created": 1790171972,
+    "model": "HawkBearPig/GLM-5.3-Flash-NVFP4-FP8",
+    "system_fingerprint": null,
+    "choices": [
+      {
+        "index": 0,
+        "message": {
+          "role": "assistant",
+          "content": "OK",
+          "refusal": null
+        },
+        "logprobs": null,
+        "finish_reason": "stop"
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 16,
+      "completion_tokens": 3,
+      "total_tokens": 19,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      },
+      "completion_tokens_details": {
+        "reasoning_tokens": 1
+      }
+    }
+  },
+  "idle": true
+}

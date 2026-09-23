@@ -1,0 +1,44 @@
+[
+  {
+    "rank": 0,
+    "same_world_field_equality": {
+      "layer0_moe_routed_sum": false,
+      "layer0_moe_expert_down": false,
+      "layer0_moe_activation": false,
+      "layer0_moe_hidden_states": true,
+      "layer0_moe_topk_ids": true,
+      "layer0_moe_shared_output": true,
+      "layer0_moe_topk_weights": true,
+      "layer0_moe_gate_up": false,
+      "layer0_moe_expert_ids": true,
+      "layer0_moe_sorted_token_ids": false,
+      "layer0_moe_num_tokens_post_padded": true,
+      "layer0_moe_router_logits": true
+    },
+    "valid_padded_sort_slots": 34416,
+    "allocated_sort_slots": 44544,
+    "different_valid_sort_positions": 19340,
+    "different_real_route_positions": 19340
+  },
+  {
+    "rank": 1,
+    "same_world_field_equality": {
+      "layer0_moe_routed_sum": false,
+      "layer0_moe_expert_down": false,
+      "layer0_moe_activation": false,
+      "layer0_moe_hidden_states": true,
+      "layer0_moe_topk_ids": true,
+      "layer0_moe_shared_output": true,
+      "layer0_moe_topk_weights": true,
+      "layer0_moe_gate_up": false,
+      "layer0_moe_expert_ids": true,
+      "layer0_moe_sorted_token_ids": false,
+      "layer0_moe_num_tokens_post_padded": true,
+      "layer0_moe_router_logits": true
+    },
+    "valid_padded_sort_slots": 34416,
+    "allocated_sort_slots": 44544,
+    "different_valid_sort_positions": 19297,
+    "different_real_route_positions": 19297
+  }
+]

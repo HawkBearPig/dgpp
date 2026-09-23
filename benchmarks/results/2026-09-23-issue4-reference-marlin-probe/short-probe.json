@@ -1,0 +1,14 @@
+[
+  {
+    "request": 1,
+    "prompt_tokens": 2048,
+    "layer0_moe_input_matches_full_original": true,
+    "wall_seconds": 9.885788226965815
+  },
+  {
+    "request": 2,
+    "prompt_tokens": 2048,
+    "layer0_moe_input_matches_full_original": true,
+    "wall_seconds": 5.498374457005411
+  }
+]

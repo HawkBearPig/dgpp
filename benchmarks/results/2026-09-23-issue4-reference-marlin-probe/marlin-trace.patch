@@ -1,0 +1,53 @@
+--- a/marlin_moe.py
++++ b/marlin_moe.py
+@@ -6,6 +6,7 @@
+ from collections.abc import Callable
+ 
+ import torch
++from vllm.models.qwen3_8_flash_next.nvidia import issue4_trace as _issue4
+ 
+ import vllm._custom_ops as ops
+ import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+@@ -160,6 +161,7 @@
+         use_fp32_reduce=True,
+         is_zp_float=False,
+     )
++    _issue4.moe_capture("gate_up",intermediate_cache1)
+     activation_input = intermediate_cache1.view(-1, w13_num_shards * N)
+     if activation_func is None:
+         config = (
+@@ -184,6 +186,7 @@
+             expert_map=expert_map,
+         )
+ 
++    _issue4.moe_capture("activation",intermediate_cache2)
+     if output is None:
+         output = intermediate_cache3
+ 
+@@ -228,6 +231,7 @@
+         is_zp_float=False,
+     )
+ 
++    _issue4.moe_capture("expert_down",output)
+     return output
+ 
+ 
+@@ -345,6 +349,7 @@
+         ignore_invalid_experts=True,
+     )
+ 
++    _issue4.save_marlin_bundle(locals())
+     assert activation is not None
+     moe_output = _fused_marlin_moe(
+         hidden_states=hidden_states,
+@@ -394,7 +399,9 @@
+             return output
+         return torch.sum(moe_output.view(-1, topk, K), dim=1, out=output)
+     else:
+-        return moe_sum(moe_output, output, topk_ids, expert_map)
++        result = moe_sum(moe_output, output, topk_ids, expert_map)
++        _issue4.moe_capture("routed_sum",output)
++        return result
+ 
+ 
+ def batched_fused_marlin_moe(
