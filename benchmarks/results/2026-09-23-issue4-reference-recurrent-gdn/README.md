@@ -1,4 +1,4 @@
-# Successful W4A16 reference with recurrent GDN prefill — running
+# Successful W4A16 reference with recurrent GDN prefill — 5/6 twice
 
 Relative to the successful two-request untraced Marlin W4A16 reference, the
 only model-source change replaces the chunked GDN prefill call with the
@@ -11,7 +11,7 @@ This tests whether the chunked recurrence's arithmetic explains the remaining
 DGPP/reference difference. It does not presume that either implementation is
 incorrect. It follows the frozen-input kernel comparison and the untraced
 W4A4 control. Both workers must confirm the overlay and Marlin selection.
-Two unchanged original requests and verified production restoration are planned.
+Both unchanged original requests failed the original key with `val_5dac9ed720abddaf`. Full assistant text and token counts exactly match original DGPP (184 completion tokens), in 302.730 and 302.778 seconds. Exact production restoration and an inference smoke test passed.
 
 Before loading the model, a focused check runs the actual source adapter on
 replicated frozen inputs with the real TP2 grouped-value geometry (8 key
@@ -34,4 +34,8 @@ world (A/B/A) before attributing the change to GDN arithmetic. The existing
 The GPU adapter check passed: input state preserved, optional output buffer
 exact, direct-operator result exact, and repeated calls bitwise identical at
 1194 tokens and the real 8/24 head geometry. The isolated container was removed;
-both model workers are loading the pinned Marlin reference with the GDN overlay.
+both model workers verified the overlay hash and Marlin backend before inference.
+
+The fresh unmodified Marlin baseline is running to complete A/B/A before a
+causal conclusion. A native chunked GDN prototype is under development in an
+isolated worktree; it is not yet validated or proposed as a production fix.

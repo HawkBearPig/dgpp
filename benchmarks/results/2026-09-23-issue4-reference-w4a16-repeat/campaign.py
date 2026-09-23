@@ -143,6 +143,17 @@ try:
         if time.monotonic()>deadline: raise TimeoutError('reference startup')
         print(datetime.datetime.now(datetime.timezone.utc).isoformat(),'reference starting',flush=True)
         time.sleep(15)
+    original_gdn = '/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py'
+    original_gdn_sha = '81b4dcd0952492375c93bffc2cdf45f10b45ab5e117f2e1d949a147d144e64f0'
+    source_identity = {}
+    for rank in (0,1):
+        logs = subprocess.check_output(on(rank,['docker','logs',NAME]),stderr=subprocess.STDOUT,text=True,timeout=30)
+        (RAW/f'rank{rank}-ready.log').write_text(logs)
+        assert 'MARLIN' in logs and 'Issue4 control: recurrent GDN prefill' not in logs
+        digest = inspect(rank,['docker','exec',NAME,'sha256sum',original_gdn]).split()[0]
+        assert digest == original_gdn_sha
+        source_identity[rank] = {'gdn_sha256':digest,'marlin_selected':True}
+    (RAW/'runtime-source.json').write_text(json.dumps(source_identity,indent=2)+'\n')
     request=json.loads((EXACT/'raw/request.json').read_text())
     tokenize={k:request[k] for k in ('model','messages','chat_template_kwargs')}
     tokenize['add_generation_prompt']=True

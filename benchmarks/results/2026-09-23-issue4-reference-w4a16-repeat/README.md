@@ -1,4 +1,4 @@
-# Unmodified W4A16 reference in a second fresh world — prepared, not run
+# Unmodified W4A16 reference in a second fresh world — running
 
 This repeats the successful Marlin W4A16 recipe with byte-identical PLE/QSA
 source overlays and the same immutable image/configuration. It contains no
@@ -8,3 +8,7 @@ Use this A2 control if the recurrent-GDN experiment changes accuracy, before
 attributing a cross-world difference to its single operator change. Existing
 baseline success covers two requests in one world. Production restoration and
 independent binary/configuration/inference checks run in finally.
+
+This confirmation is now running because the recurrent-GDN replacement
+returned the original DGPP failure twice. Both workers must verify the original
+GDN source hash and Marlin selection before inference.

@@ -35,7 +35,7 @@ consistency patch is not a prerequisite for the investigation.
 | [Main Q/K rotation storage](2026-09-23-issue4-qsa-rope-staging/README.md) | Nine GPU tests pass; original request still 5/6 | FP32 main Q/K rotary products are insufficient to repair retrieval |
 | [Frozen GDN comparison](2026-09-23-issue4-gdn-frozen-reference/README.md) | 16 cases, all finite; recurrent capture agreement ≤0.033% output L2, chunk/recurrent difference ≤0.371% | Isolates normalized-input storage from recurrent/chunked arithmetic |
 | [Untraced W4A4 retry](2026-09-23-issue4-reference-w4a4-untraced-retry/README.md) | Two identical 5/6 answers; full text/usage match traced reference | Tracing does not explain observed W4A4/W4A16 difference |
-| [W4A16 recurrent-GDN reference](2026-09-23-issue4-reference-recurrent-gdn/README.md) | GPU adapter passes; model loading | Changes only the successful reference’s GDN prefill algorithm |
+| [W4A16 recurrent-GDN reference](2026-09-23-issue4-reference-recurrent-gdn/README.md) | Two identical 5/6 answers, exact DGPP text/token counts | Changing only GDN prefill reproduces DGPP failure; fresh A2 baseline running |
 
 | [Expert router ties](2026-09-23-issue4-router-ties/README.md) | All 576 captured rows agree across prefill/decode batch shapes | No reference/DGPP expert-set differences on identical logits |
 
@@ -98,9 +98,12 @@ before inference and were quarantined with verified production restoration.
 Reference expert routing also agrees with DGPP on all 576 captured logit rows,
 including 264 exact ties at the tenth-expert boundary, across both prefill
 shapes and individual rows. This does not test earlier logit divergence.
-The recurrent GDN source adapter passed real-geometry GPU checks and the
-full model is loading for two unchanged-request comparisons.
+The recurrent GDN source adapter passed real-geometry GPU checks. Both full
+requests returned the original DGPP failure with exactly matching full text
+and token counts (184 completion tokens). Production restoration passed.
 
 A second fresh-world [unmodified W4A16 repeat](2026-09-23-issue4-reference-w4a16-repeat/README.md)
-is prepared, conditional on the recurrent-GDN swap changing accuracy, to
-complete an A/B/A comparison before attributing a cross-world difference.
+is now running to complete A/B/A before attributing the cross-world difference.
+A native 64-token chunked GDN prototype has been written in an isolated
+worktree and is building; real-fixture reference comparisons are prepared.
+It is not yet a validated fix.
