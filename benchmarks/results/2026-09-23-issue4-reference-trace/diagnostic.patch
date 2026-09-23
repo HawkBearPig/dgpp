@@ -1,0 +1,70 @@
+--- a/vllm/models/qwen3_8_flash_next/nvidia/model.py
++++ b/vllm/models/qwen3_8_flash_next/nvidia/model.py
+@@ -7,6 +7,7 @@
+ 
+ import torch
+ from torch import nn
++from . import issue4_trace as _issue4
+ 
+ from vllm.compilation.decorators import support_torch_compile
+ from vllm.config import VllmConfig
+@@ -306,6 +307,8 @@
+         else:
+             hidden_states, block_input, injection = attn_hc.mix(hidden_states)
+ 
++        _issue4.capture("attn_in", block_input)
++        _issue4.capture("attn_injection", injection)
+         if self.layer_type == "linear_attention":
+             attn_out = self.linear_attn(hidden_states=block_input)
+         elif self.layer_type == "full_attention":
+@@ -316,11 +319,16 @@
+         else:
+             raise ValueError("Invalid layer_type")
+ 
++        _issue4.capture("attn_out", attn_out)
+         mlp_hc = self.mlp_hyper_connection
+         hidden_states, block_input, injection = mlp_hc.combine_and_mix(
+             hidden_states, attn_out, injection
+         )
++        _issue4.capture("mlp_in", block_input)
++        _issue4.capture("residual", hidden_states)
++        _issue4.capture("mlp_injection", injection)
+         mlp_out = self.mlp(block_input)
++        _issue4.capture("mlp_out", mlp_out)
+         return hidden_states, mlp_out, injection
+ 
+ 
+@@ -471,6 +479,9 @@
+         ngram_context: torch.Tensor | None = None,
+         deepstack_input_embeds: IntermediateTensors | None = None,
+     ) -> torch.Tensor | IntermediateTensors:
++        _issue4.begin(input_ids, positions)
++        _issue4.capture("ngram_context", ngram_context)
++        _issue4.capture("query_start_loc", query_start_loc)
+         if get_pp_group().is_first_rank:
+             if inputs_embeds is not None:
+                 hidden_states = inputs_embeds
+@@ -484,6 +495,7 @@
+                 raise ValueError("pipeline stage requires intermediate tensors")
+             hidden_states = intermediate_tensors["hidden_states"]
+ 
++        _issue4.capture("embedding", hidden_states)
+         block_output = None
+         injection = None
+         last_layer = None
+@@ -491,6 +503,7 @@
+             enumerate(self.layers), self.start_layer, self.end_layer
+         ):
+             last_layer = layer
++            _issue4.set_layer(layer_idx)
+             hidden_states, block_output, injection = layer(
+                 hidden_states=hidden_states,
+                 prev_block_output=block_output,
+@@ -546,6 +559,7 @@
+             # this tensor is needed by the final mixer regardless).
+             num_tokens = multi_hidden.shape[0]
+             self._mtp_hidden_buffer[:num_tokens].copy_(multi_hidden)
++        _issue4.capture("final_hidden", sample_hidden_states)
+         return sample_hidden_states
+ 
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:

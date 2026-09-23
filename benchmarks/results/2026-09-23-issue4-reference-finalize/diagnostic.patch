@@ -1,0 +1,10 @@
+--- a/vllm/model_executor/layers/fused_moe/experts/flashinfer_cutlass_moe.py
++++ b/vllm/model_executor/layers/fused_moe/experts/flashinfer_cutlass_moe.py
+@@ -388,6 +388,7 @@
+             use_deepseek_fp8_block_scale=self.use_deepseek_fp8_block_scale,
+             use_mxfp8_act_scaling=use_mxfp8_act_scaling,
+             use_w4_group_scaling=use_w4_group_scaling,
++            use_fused_finalize=False,
+         )
+ 
+     def moe_sum(self, input: torch.Tensor, output: torch.Tensor) -> None:

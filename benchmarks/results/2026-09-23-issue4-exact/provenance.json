@@ -1,0 +1,10 @@
+{
+  "commit": "c6ca191863d620360f3b4370c0156f9e26a2631f",
+  "binary_sha256": "b6afe5546afb687e4f9adea276625b2cbff2ac38ba6dc60eab55879a50ddba47",
+  "production_binary_sha256": "4638e3c595a2765d6d50c4626a9fef3aa2aa82936c6c50e3d0eec871fcde8e00",
+  "192.168.88.12": "4638e3c595a2765d6d50c4626a9fef3aa2aa82936c6c50e3d0eec871fcde8e00  /proc/3653024/exe\n3653024, ./dgpp-serve, 96083 MiB\n",
+  "192.168.88.13": "4638e3c595a2765d6d50c4626a9fef3aa2aa82936c6c50e3d0eec871fcde8e00  /proc/728854/exe\n728854, ./dgpp-serve, 96083 MiB\n",
+  "192.168.88.14": "4638e3c595a2765d6d50c4626a9fef3aa2aa82936c6c50e3d0eec871fcde8e00  /proc/601257/exe\n601257, ./dgpp-serve, 96083 MiB\n",
+  "replay_sha256": "c176424d40b2488fbfb06cb604f2db4e9dd3a9111e7ae4e90e76b554212e0ae7",
+  "native_render_source_sha256": "a71454802b371a96f2b333f1093ae53a8046fdc0f8c57abb836da469befb8c72"
+}

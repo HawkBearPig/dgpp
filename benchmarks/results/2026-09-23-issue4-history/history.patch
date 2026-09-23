@@ -1,0 +1,136 @@
+diff --git a/src/models/qwen/forward.cpp b/src/models/qwen/forward.cpp
+index 08d048e..298260c 100644
+--- a/src/models/qwen/forward.cpp
++++ b/src/models/qwen/forward.cpp
+@@ -1,4 +1,5 @@
+ #include "models/qwen/forward.hpp"
++#include "models/qwen/issue4_history.hpp"
+ 
+ #include "kernels/scale_gemm.hpp"
+ 
+@@ -688,6 +689,12 @@ QwenModel::Outputs QwenModel::run_rows(const RowRun& run) {
+   for (int layer = 0; layer < cfg_.num_hidden_layers; ++layer) {
+     const QwenLayerResident& r = loader_.load_layer(layer);
+     build_layer_objects(r);
++    issue4h::context(rank_, layer, run.pos0, T, run.decode, run.capture);
++    if (issue4h::active && layer == 0) {
++      issue4h::dump_rows("token_ids", tokens, 1, stream_);
++      issue4h::dump_rows("positions", d_pos, 1, stream_);
++      issue4h::dump_rows("request_ids", d_req, 1, stream_);
++    }
+     if (r.has_ple) {
+       ple_->embed(tokens, T, d_req, d_pos, d_spans, num_requests, d_ctx_, stream_);
+       // The context AFTER every row into the spec rows, the last real
+@@ -800,6 +807,8 @@ QwenModel::Outputs QwenModel::run_rows(const RowRun& run) {
+     if (run.decode) prefetch_attention_side(layer + 1);
+     fold(ffn_out, H);  // block boundary 2: the experts' sliced down projections
+     mlp_gr_->combine(r_, ffn_out, T, stream_);
++    if (issue4h::active)
++      issue4h::append("last_residual", issue4h::read(r_ + static_cast<size_t>(T - 1) * W, W, stream_));
+     if (run.capture_layers) {
+       DGPP_CUDA_OK(cudaStreamSynchronize(stream_));
+       std::vector<uint16_t> snap(static_cast<size_t>(T) * W);
+@@ -812,6 +821,7 @@ QwenModel::Outputs QwenModel::run_rows(const RowRun& run) {
+   // bitwise gate), not an m=1 GEMV.
+   mixer_->mix(r_, h_, T, stream_);
+   lm_head_logits(h_, T, stream_);
++  issue4h::active = false;
+   // The draft block's input: the last rows' hyper states into the slots'
+   // windows by position (the last window rows of a prefill chunk, every
+   // decode row — distinct slots within one launch).
+diff --git a/src/models/qwen/layers.cpp b/src/models/qwen/layers.cpp
+index 3279424..c051e0b 100644
+--- a/src/models/qwen/layers.cpp
++++ b/src/models/qwen/layers.cpp
+@@ -1,4 +1,5 @@
+ #include "models/qwen/layers.hpp"
++#include "models/qwen/issue4_history.hpp"
+ 
+ #include <algorithm>
+ #include <atomic>
+@@ -374,12 +375,19 @@ void QwenGdnLayer::enqueue(const uint16_t* x, float* recurrent_state, uint16_t*
+   const int C = static_cast<int>(conv_channels_);
+   const int LV = lv_ * v_dim_;
+   in_projections(x, tokens, stream);
++  if (issue4h::active) {
++    issue4h::before("recurrent", recurrent_state, static_cast<size_t>(lv_) * v_dim_ * k_dim_, stream);
++    issue4h::before("conv", conv_state, static_cast<size_t>(C) * (conv_width_ - 1), stream);
++  }
+   kda_causal_conv_silu_bf16(qkv_, C, w_.conv, conv_state, conv_width_ - 1, qkvc_, tokens, C,
+                             conv_width_, stream, conv_snap);
+   gdn_recurrent_fwd(qkvc_, a_, lv_, b_, lv_, w_.a_log, w_.dt_bias, recurrent_state, core_, tokens,
+                     lv_, lv_ / lk_, k_dim_, v_dim_, scale_, stream, rec_snap);
+   gdn_gated_rmsnorm_bf16(core_, z_, w_.norm, normed_, static_cast<int64_t>(tokens) * lv_, v_dim_,
+                          eps_, stream);
++  if (issue4h::active)
++    issue4h::gdn(qkv_, qkvc_, a_, b_, core_, w_.conv, w_.a_log, w_.dt_bias,
++        recurrent_state, conv_state, lk_, lv_, k_dim_, v_dim_, conv_width_, scale_, stream);
+   gemm_dense(g_, normed_, LV, w_.out_proj, w_.out_proj_fp8, out, GemmOut::BF16, tokens, H, LV, stream);
+ }
+ 
+@@ -581,6 +589,21 @@ void QwenQsaLayer::enqueue(const uint16_t* x, int tokens, const QwenQsaRows& row
+                    cache.block_tables, cache.blocks_per_request, scale_, m_ws_, l_ws_, c_ws_, stream);
+   dsa_attn_combine(m_ws_, l_ws_, c_ws_, T, n_split_, lh_, D, c_out_, stream);
+   qsa_gate_out(c_out_, q_ + D, QW, 2 * D, o_, T, lh_, D, stream);
++  if (issue4h::active) {
++    const auto table = issue4h::read(cache.block_tables + static_cast<size_t>(rows.request) * cache.blocks_per_request,
++        cache.blocks_per_request, stream);
++    issue4h::cache_check("k", cache.k_cache, cache.slots(), kn_, KW, cache.block_tokens, table, stream);
++    issue4h::cache_check("v", cache.v_cache, cache.slots(), v_, KW, cache.block_tokens, table, stream);
++    issue4h::index_check(cache.index_cache, cache.pool_slots(kpool_), idx_, IW, Di, idx_heads_ * Di,
++        pools_per_block, kpool_, table, stream);
++    issue4h::once("index_norm", w_.index_k_norm, Di, stream);
++    issue4h::once("inv_freq", d_inv_freq_, rotary_ / 2, stream);
++    if (issue4h::position == 0) {
++      issue4h::append("index_scalars", std::vector<float>{eps_, mscale_});
++      std::ofstream f(issue4h::directory / "index.meta");
++      f << Di << " " << kpool_ << " " << rotary_ << "\n";
++    }
++  }
+   gemm_dense(g_, o_, static_cast<int64_t>(lh_) * D, w_.o_proj, w_.o_proj_fp8, out, GemmOut::BF16, T, H,
+              lh_ * D, stream);
+ }
+@@ -770,6 +793,19 @@ void QwenPleLayer::embed(const int64_t* tokens, int rows, const int32_t* req_ids
+     if (staged_rows_ != rows) throw std::logic_error("QwenPleLayer: embed() without a matching stage()");
+     DGPP_CUDA_OK(cudaStreamWaitEvent(stream, join_, 0));
+     qwen_ple_gather_staged_bf16(staged_, table_.scale, rows, w_.hash_heads, head_dim_, e_, stream);
++    if (issue4h::active) {
++      issue4h::dump_rows("ple_ids", ids_, heads_, stream);
++      issue4h::dump_rows("ple_embedding", e_, w_.hash_heads * head_dim_, stream);
++      issue4h::once("ple_multipliers", d_mult_, 3, stream);
++      issue4h::once("ple_vocab", d_vocab_, heads_, stream);
++      issue4h::once("ple_offset", d_offset_, heads_, stream);
++      if (issue4h::position == 0) {
++        issue4h::append("ple_scale", std::vector<float>{table_.scale});
++        std::ofstream f(issue4h::directory / "ple.meta");
++        f << heads_ << " " << w_.hash_head_begin << " " << w_.hash_heads << " " << head_dim_ <<
++            " " << eos_ << " " << width_ << " " << dilation_ << " " << hc_ << " " << hidden_ << "\n";
++      }
++    }
+     staged_rows_ = 0;
+     return;
+   }
+@@ -810,8 +846,23 @@ void QwenPleLayer::finish(uint16_t* r, const uint16_t* value, uint16_t* states,
+   qwen_group_rmsnorm_bf16(r, w_.norm_query, qn_, T, hc_, H, eps_, stream);
+   qwen_ple_gate_bf16(kn_, qn_, value, gv_, T, hc_, H, stream);
+   qwen_group_rmsnorm_bf16(gv_, w_.norm_conv, un_, T, hc_, H, eps_, stream);
++  if (issue4h::active) {
++    issue4h::before("ple_conv", states, static_cast<size_t>(W) * state_len_, stream);
++    issue4h::dump_rows("ple_un", un_, W, stream);
++    issue4h::dump_rows("ple_gv", gv_, W, stream);
++    issue4h::dump_rows("ple_residual_before", r, W, stream);
++    issue4h::once("ple_conv_weight", w_.conv, static_cast<size_t>(W) * width_, stream);
++  }
+   qwen_ple_conv_rows_bf16(un_, gv_, states, state_stride, w_.conv, r, r, req_ids, pos, req_spans,
+                           num_requests, W, width_, dilation_, stream, snapshots);
++  if (issue4h::active) {
++    issue4h::dump_rows("ple_residual_after", r, W, stream);
++    auto state = issue4h::after("ple_conv", states, static_cast<size_t>(W) * state_len_, stream);
++    auto tail = issue4h::read(un_ + static_cast<size_t>(T - state_len_) * W, static_cast<size_t>(state_len_) * W, stream);
++    for (int c=0;c<W;++c) for (int j=0;j<state_len_;++j)
++      issue4h::require(state[c*state_len_+j] == tail[j*W+c], "PLE conv tail placement");
++    issue4h::report("ple_conv_tail_exact", state.size());
++  }
+ }
+ 
+ }  // namespace dgpp

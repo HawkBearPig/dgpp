@@ -1,0 +1,11 @@
+{
+  "capture_base_commit": "c6ca191863d620360f3b4370c0156f9e26a2631f",
+  "capture_manifest_sha256": "02ef2d4b3489d5f08479a09df9f62bdadb36032b2e3ef6f09857d68924ea29cc",
+  "script_sha256": "3a4b13eb1e959a5971a4682ee427ae3beaf39f493e6abee4b2f7d489d38e9a4b",
+  "results_sha256": "2ee7d9987be348e6724ae199e2c93f42d03dbf105387e2a8cfa66e6bd070428d",
+  "tensor_hashes_sha256": "a606394164aa2a0bb78bfb77f64da82e5aec2a066ffc1125fc62319973b3faad",
+  "corrected_execution_log_sha256": "47268be5a54e28f0d9c89b3238a31433a03f9cd4e97291d09c262b8b784fa6ab",
+  "numpy_threads": 2,
+  "gpu_used": false,
+  "full_history_campaign_executed": false
+}

@@ -1,0 +1,16 @@
+{
+  "value": "val_905_4_wrong",
+  "correct": false,
+  "usage": {
+    "prompt_tokens": 261138,
+    "completion_tokens": 7,
+    "total_tokens": 261145,
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    }
+  },
+  "finish_reason": "stop"
+}

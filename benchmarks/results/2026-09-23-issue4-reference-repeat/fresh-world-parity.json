@@ -1,0 +1,6 @@
+{
+  "same_assistant_text_as_prior_world": true,
+  "same_usage": true,
+  "native_input_tokens": 261120,
+  "same_autotune_cache_on_both_ranks": true
+}

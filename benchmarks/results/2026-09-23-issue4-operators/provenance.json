@@ -1,0 +1,54 @@
+{
+  "base_commit": "c6ca191863d620360f3b4370c0156f9e26a2631f",
+  "branch": "investigate/issue4-operator-capture",
+  "clean_binary_sha256": "b6afe5546afb687e4f9adea276625b2cbff2ac38ba6dc60eab55879a50ddba47",
+  "capture_binary_sha256": "0d5f7005eb7bff4aa2f9091fd4d05fba8b1fe49efb0ce41ea5b0ed94fce950ee",
+  "capture_patch_sha256": "b34ed442674a49c7c41040ae48fe3d30cdfe6c4402c68b9b0ec49992fd796832",
+  "capture_header_sha256": "d0d2167cfe2900402f4a3588b457612dedd3b8062684a911a97578e502c2dabe",
+  "manifest_sha256": "02ef2d4b3489d5f08479a09df9f62bdadb36032b2e3ef6f09857d68924ea29cc",
+  "manifest_entries": 2105,
+  "fixture_reconstruction_matches": true,
+  "first_generation_request_each_world": true,
+  "rank_logs_no_error_or_fatal": true,
+  "restoration": {
+    "config_matches": true,
+    "binaries": {
+      "192.168.88.11": "4638e3c595a2765d6d50c4626a9fef3aa2aa82936c6c50e3d0eec871fcde8e00  /proc/3720573/exe\n",
+      "192.168.88.12": "4638e3c595a2765d6d50c4626a9fef3aa2aa82936c6c50e3d0eec871fcde8e00  /proc/3859460/exe\n",
+      "192.168.88.13": "4638e3c595a2765d6d50c4626a9fef3aa2aa82936c6c50e3d0eec871fcde8e00  /proc/899060/exe\n",
+      "192.168.88.14": "4638e3c595a2765d6d50c4626a9fef3aa2aa82936c6c50e3d0eec871fcde8e00  /proc/612689/exe\n"
+    },
+    "smoke": {
+      "id": "chatcmpl-e1ee2d6ae64a3023",
+      "object": "chat.completion",
+      "created": 1790143294,
+      "model": "HawkBearPig/GLM-5.3-Flash-NVFP4-FP8",
+      "system_fingerprint": null,
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "OK",
+            "refusal": null
+          },
+          "logprobs": null,
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 16,
+        "completion_tokens": 3,
+        "total_tokens": 19,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 1
+        }
+      }
+    },
+    "idle": true
+  },
+  "issue_comment": "https://github.com/HawkBearPig/dgpp/issues/4#issuecomment-5789566019"
+}

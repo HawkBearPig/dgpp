@@ -1,0 +1,156 @@
+diff --git a/src/models/qwen/forward.cpp b/src/models/qwen/forward.cpp
+index 08d048e..73248e3 100644
+--- a/src/models/qwen/forward.cpp
++++ b/src/models/qwen/forward.cpp
+@@ -1,4 +1,5 @@
+ #include "models/qwen/forward.hpp"
++#include "models/qwen/issue4_capture.hpp"
+ 
+ #include "kernels/scale_gemm.hpp"
+ 
+@@ -688,6 +689,7 @@ QwenModel::Outputs QwenModel::run_rows(const RowRun& run) {
+   for (int layer = 0; layer < cfg_.num_hidden_layers; ++layer) {
+     const QwenLayerResident& r = loader_.load_layer(layer);
+     build_layer_objects(r);
++    issue4::context(rank_, layer, run.pos0, T, run.decode, run.capture);
+     if (r.has_ple) {
+       ple_->embed(tokens, T, d_req, d_pos, d_spans, num_requests, d_ctx_, stream_);
+       // The context AFTER every row into the spec rows, the last real
+@@ -708,6 +710,7 @@ QwenModel::Outputs QwenModel::run_rows(const RowRun& run) {
+                    stream_, snapshots ? spec_ple_ : nullptr);
+     }
+     attn_gr_->mix(r_, x_, T, stream_);
++    issue4::dump("attention_input", x_, static_cast<size_t>(T) * H, stream_);
+     uint16_t* attn_out = stage(y_, H);
+     if (r.kind == QwenLayerKind::Gdn) {
+       KdaStateSnapshots rec_snap;
+@@ -770,6 +773,7 @@ QwenModel::Outputs QwenModel::run_rows(const RowRun& run) {
+     }
+     if (run.decode) prefetch_ffn_side(r);
+     fold(attn_out, H);  // block boundary 1: the attention output projection's partial
++    issue4::dump("attention_folded", attn_out, static_cast<size_t>(T) * H, stream_);
+     attn_gr_->combine(r_, attn_out, T, stream_);
+     mlp_gr_->mix(r_, x_, T, stream_);
+     uint16_t* ffn_out = stage(y_, H);
+@@ -800,6 +804,7 @@ QwenModel::Outputs QwenModel::run_rows(const RowRun& run) {
+     if (run.decode) prefetch_attention_side(layer + 1);
+     fold(ffn_out, H);  // block boundary 2: the experts' sliced down projections
+     mlp_gr_->combine(r_, ffn_out, T, stream_);
++    issue4::dump("post_mlp_residual", r_ + static_cast<size_t>(T - 1) * W, W, stream_);
+     if (run.capture_layers) {
+       DGPP_CUDA_OK(cudaStreamSynchronize(stream_));
+       std::vector<uint16_t> snap(static_cast<size_t>(T) * W);
+@@ -812,6 +817,8 @@ QwenModel::Outputs QwenModel::run_rows(const RowRun& run) {
+   // bitwise gate), not an m=1 GEMV.
+   mixer_->mix(r_, h_, T, stream_);
+   lm_head_logits(h_, T, stream_);
++  issue4::dump("final_logits", logits_ + static_cast<size_t>(T - 1) * lm_vocab_count_, lm_vocab_count_, stream_);
++  issue4::active = false;
+   // The draft block's input: the last rows' hyper states into the slots'
+   // windows by position (the last window rows of a prefill chunk, every
+   // decode row — distinct slots within one launch).
+diff --git a/src/models/qwen/layers.cpp b/src/models/qwen/layers.cpp
+index 3279424..1ef7dda 100644
+--- a/src/models/qwen/layers.cpp
++++ b/src/models/qwen/layers.cpp
+@@ -1,4 +1,5 @@
+ #include "models/qwen/layers.hpp"
++#include "models/qwen/issue4_capture.hpp"
+ 
+ #include <algorithm>
+ #include <atomic>
+@@ -374,12 +375,35 @@ void QwenGdnLayer::enqueue(const uint16_t* x, float* recurrent_state, uint16_t*
+   const int C = static_cast<int>(conv_channels_);
+   const int LV = lv_ * v_dim_;
+   in_projections(x, tokens, stream);
++  if (issue4::active) {
++    issue4::meta("gdn", std::to_string(tokens) + " " + std::to_string(lk_) + " " + std::to_string(lv_) + " " +
++        std::to_string(k_dim_) + " " + std::to_string(v_dim_) + " " + std::to_string(conv_width_) + " " +
++        std::to_string(eps_) + " " + std::to_string(scale_));
++    issue4::write("gdn_scalars", std::vector<float>{eps_, scale_});
++    issue4::dump("qkv", qkv_, static_cast<size_t>(tokens) * C, stream);
++    issue4::dump("a", a_, static_cast<size_t>(tokens) * lv_, stream);
++    issue4::dump("b", b_, static_cast<size_t>(tokens) * lv_, stream);
++    issue4::dump("z", z_, static_cast<size_t>(tokens) * LV, stream);
++    issue4::dump("a_log", w_.a_log, lv_, stream);
++    issue4::dump("dt_bias", w_.dt_bias, lv_, stream);
++    issue4::dump("conv_weight", w_.conv, static_cast<size_t>(C) * conv_width_, stream);
++    issue4::dump("norm_weight", w_.norm, v_dim_, stream);
++    issue4::dump("state_before", recurrent_state, static_cast<size_t>(lv_) * v_dim_ * k_dim_, stream);
++    issue4::dump("conv_before", conv_state, static_cast<size_t>(C) * (conv_width_ - 1), stream);
++  }
+   kda_causal_conv_silu_bf16(qkv_, C, w_.conv, conv_state, conv_width_ - 1, qkvc_, tokens, C,
+                             conv_width_, stream, conv_snap);
+   gdn_recurrent_fwd(qkvc_, a_, lv_, b_, lv_, w_.a_log, w_.dt_bias, recurrent_state, core_, tokens,
+                     lv_, lv_ / lk_, k_dim_, v_dim_, scale_, stream, rec_snap);
+   gdn_gated_rmsnorm_bf16(core_, z_, w_.norm, normed_, static_cast<int64_t>(tokens) * lv_, v_dim_,
+                          eps_, stream);
++  if (issue4::active) {
++    issue4::dump("qkvc", qkvc_, static_cast<size_t>(tokens) * C, stream);
++    issue4::dump("core", core_, static_cast<size_t>(tokens) * LV, stream);
++    issue4::dump("normed", normed_, static_cast<size_t>(tokens) * LV, stream);
++    issue4::dump("state_after", recurrent_state, static_cast<size_t>(lv_) * v_dim_ * k_dim_, stream);
++    issue4::dump("conv_after", conv_state, static_cast<size_t>(C) * (conv_width_ - 1), stream);
++  }
+   gemm_dense(g_, normed_, LV, w_.out_proj, w_.out_proj_fp8, out, GemmOut::BF16, tokens, H, LV, stream);
+ }
+ 
+@@ -581,6 +605,58 @@ void QwenQsaLayer::enqueue(const uint16_t* x, int tokens, const QwenQsaRows& row
+                    cache.block_tables, cache.blocks_per_request, scale_, m_ws_, l_ws_, c_ws_, stream);
+   dsa_attn_combine(m_ws_, l_ws_, c_ws_, T, n_split_, lh_, D, c_out_, stream);
+   qsa_gate_out(c_out_, q_ + D, QW, 2 * D, o_, T, lh_, D, stream);
++  if (issue4::active) {
++    const int row = T - 1;
++    const auto positions = issue4::read(d_pos, T, stream);
++    const int64_t position = positions.back(), visible = (position + 1) / kpool_;
++    issue4::meta("qsa", std::to_string(T) + " " + std::to_string(lh_) + " " + std::to_string(lkv_) + " " +
++        std::to_string(D) + " " + std::to_string(idx_heads_) + " " + std::to_string(Di) + " " +
++        std::to_string(kpool_) + " " + std::to_string(n_split_) + " " + std::to_string(scale_) + " " +
++        std::to_string(eps_) + " " + std::to_string(rotary_) + " " + std::to_string(position));
++    issue4::write("qsa_scalars", std::vector<float>{eps_, scale_, mscale_});
++    issue4::dump("q", q_ + static_cast<size_t>(row) * QW, QW, stream);
++    issue4::dump("qn", qn_ + static_cast<size_t>(row) * lh_ * D, lh_ * D, stream);
++    issue4::dump("qi", qi_ + static_cast<size_t>(row) * idx_heads_ * Di, idx_heads_ * Di, stream);
++    issue4::dump("idx", idx_, static_cast<size_t>(T) * IW, stream);
++    issue4::dump("q_norm", w_.q_norm, D, stream);
++    issue4::dump("index_q_norm", w_.index_q_norm, Di, stream);
++    issue4::dump("index_k_norm", w_.index_k_norm, Di, stream);
++    issue4::dump("inv_freq", d_inv_freq_, rotary_ / 2, stream);
++    issue4::dump("scores", keys_ws_ + static_cast<size_t>(row) * max_pools_, visible, stream);
++    issue4::dump("count", counts_ + row, 1, stream);
++    const auto count = issue4::read(counts_ + row, 1, stream)[0];
++    const auto selected = issue4::read(topk_ + static_cast<size_t>(row) * max_selected_, count, stream);
++    issue4::write("selected", selected);
++    const auto table = issue4::read(cache.block_tables + static_cast<size_t>(rows.request) * cache.blocks_per_request,
++                                  cache.blocks_per_request, stream);
++    const auto compressed = issue4::read(cache.index_cache, static_cast<size_t>(cache.pool_slots(kpool_)) * Di, stream);
++    std::vector<uint16_t> logical_index(static_cast<size_t>(visible) * Di);
++    for (int64_t i = 0; i < visible; ++i) {
++      const int64_t phys = static_cast<int64_t>(table[i / pools_per_block]) * pools_per_block + i % pools_per_block;
++      std::copy_n(compressed.data() + phys * Di, Di, logical_index.data() + i * Di);
++    }
++    issue4::write("index_cache", logical_index);
++    for (const auto& pair : {std::pair{"k_cache", cache.k_cache}, std::pair{"v_cache", cache.v_cache}}) {
++      const auto all = issue4::read(pair.second, static_cast<size_t>(cache.slots()) * KW, stream);
++      std::vector<uint16_t> gathered(static_cast<size_t>(count) * KW), tail(static_cast<size_t>(T) * KW);
++      for (int i = 0; i < count; ++i) {
++        const int tok = selected[i];
++        const int64_t phys = static_cast<int64_t>(table[tok / cache.block_tokens]) * cache.block_tokens + tok % cache.block_tokens;
++        std::copy_n(all.data() + phys * KW, KW, gathered.data() + static_cast<size_t>(i) * KW);
++      }
++      for (int i = 0; i < T; ++i) {
++        const int64_t tok = rows.pos0 + i;
++        const int64_t phys = static_cast<int64_t>(table[tok / cache.block_tokens]) * cache.block_tokens + tok % cache.block_tokens;
++        std::copy_n(all.data() + phys * KW, KW, tail.data() + static_cast<size_t>(i) * KW);
++      }
++      issue4::write(pair.first, gathered);
++      issue4::write(std::string(pair.first) + "_tail", tail);
++    }
++    issue4::dump("kn_tail", kn_, static_cast<size_t>(T) * KW, stream);
++    issue4::dump("v_tail", v_, static_cast<size_t>(T) * KW, stream);
++    issue4::dump("attention_float", c_out_ + static_cast<size_t>(row) * lh_ * D, lh_ * D, stream);
++    issue4::dump("attention_gated", o_ + static_cast<size_t>(row) * lh_ * D, lh_ * D, stream);
++  }
+   gemm_dense(g_, o_, static_cast<int64_t>(lh_) * D, w_.o_proj, w_.o_proj_fp8, out, GemmOut::BF16, T, H,
+              lh_ * D, stream);
+ }

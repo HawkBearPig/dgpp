@@ -1,0 +1,20 @@
+{
+  "comparisons": 94,
+  "worst_relative_l2": {
+    "layer": 44,
+    "rank": 0,
+    "relative_l2": 0.0018211590087361946,
+    "max_abs": 0.015625,
+    "two_bf16_relative_mismatches": 28,
+    "rms": 0.5862700237634111,
+    "nonfinite": 0
+  },
+  "two_bf16_relative_mismatches": 310,
+  "nonfinite": 0,
+  "excluded_layers": {
+    "1": "PLE intervenes before the attention mixer; post-PLE residual not captured"
+  },
+  "scope": "Final-row attention mixer only; input residuals are captured production values.",
+  "max_two_bf16_relative_mismatch_fraction": 0.012109375,
+  "within_existing_gr_mix_limits": true
+}

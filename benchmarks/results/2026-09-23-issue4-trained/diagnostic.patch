@@ -1,0 +1,437 @@
+diff --git a/DESIGN.md b/DESIGN.md
+index 3df05d2..6a99841 100644
+--- a/DESIGN.md
++++ b/DESIGN.md
+@@ -1967,7 +1967,9 @@ seed and counter. Greedy selection consumes no random draw.
+ 
+ Defaults come from `generation_config.json`, with explicit handling of
+ missing fields and EOS IDs. Process flags and request fields override
+-them. `/v1/models` reports effective defaults. The service journals
++them. Generation stop IDs are resolved separately from the model's
++`config.json` EOS: Qwen PLE uses the trained EOS for n-gram padding and
++context resets. `/v1/models` reports effective defaults. The service journals
+ sampling parameters as float bits together with the seed, allowing peers
+ to reproduce the request's draws. Eager and graph engines both support
+ sampling; a backend without that capability rejects stochastic requests.
+diff --git a/apps/dgpp_serve.cpp b/apps/dgpp_serve.cpp
+index 86569a5..7717a3b 100644
+--- a/apps/dgpp_serve.cpp
++++ b/apps/dgpp_serve.cpp
+@@ -246,7 +246,7 @@ struct ServeFamily {
+   virtual ~ServeFamily() = default;
+   virtual const char* name() const = 0;
+   virtual int64_t vocab_size() const = 0;
+-  virtual std::vector<int64_t>& eos_token_ids() = 0;
++  virtual const std::vector<int64_t>& eos_token_ids() const = 0;
+   virtual int64_t block_tokens() const = 0;
+   virtual int prefill_chunk_tokens() const = 0;
+   // Empty when a pool of `pool_tokens` fits the family's id spaces.
+@@ -307,7 +307,7 @@ struct GlmFamily final : ServeFamily {
+   }
+   const char* name() const override { return "glm5"; }
+   int64_t vocab_size() const override { return cfg.vocab_size; }
+-  std::vector<int64_t>& eos_token_ids() override { return cfg.eos_token_ids; }
++  const std::vector<int64_t>& eos_token_ids() const override { return cfg.eos_token_ids; }
+   int64_t block_tokens() const override { return dsa().block_tokens; }
+   int prefill_chunk_tokens() const override { return dgpp::GlmDiagnosticModel::prefill_chunk_tokens(); }
+   std::string pool_check(int64_t pool_tokens) const override {
+@@ -399,7 +399,7 @@ struct QwenFamily final : ServeFamily {
+   }
+   const char* name() const override { return "qwen4_exp"; }
+   int64_t vocab_size() const override { return cfg.vocab_size; }
+-  std::vector<int64_t>& eos_token_ids() override { return cfg.eos_token_ids; }
++  const std::vector<int64_t>& eos_token_ids() const override { return cfg.eos_token_ids; }
+   int64_t block_tokens() const override { return dgpp::QwenModel::kv_block_tokens_static(); }
+   int prefill_chunk_tokens() const override { return dgpp::QwenModel::prefill_chunk_tokens(); }
+   std::string pool_check(int64_t pool_tokens) const override {
+@@ -471,7 +471,7 @@ struct Glm4Family final : ServeFamily {
+         ckpt(checkpoint) {}
+   const char* name() const override { return "glm4_moe"; }
+   int64_t vocab_size() const override { return cfg.vocab_size; }
+-  std::vector<int64_t>& eos_token_ids() override { return cfg.eos_token_ids; }
++  const std::vector<int64_t>& eos_token_ids() const override { return cfg.eos_token_ids; }
+   int64_t block_tokens() const override { return dgpp::Glm4Model::kv_block_tokens_static(); }
+   int prefill_chunk_tokens() const override { return dgpp::Glm4Model::prefill_chunk_tokens(); }
+   std::string pool_check(int64_t) const override { return ""; }
+@@ -539,7 +539,7 @@ struct GlmDsaFamily final : ServeFamily {
+         ckpt(checkpoint), world(world_), kv_format(fmt) {}
+   const char* name() const override { return "glm_moe_dsa"; }
+   int64_t vocab_size() const override { return cfg.vocab_size; }
+-  std::vector<int64_t>& eos_token_ids() override { return cfg.eos_token_ids; }
++  const std::vector<int64_t>& eos_token_ids() const override { return cfg.eos_token_ids; }
+   int64_t block_tokens() const override { return dgpp::GlmDsaModel::kv_block_tokens_static(); }
+   int prefill_chunk_tokens() const override { return dgpp::GlmDsaModel::prefill_chunk_tokens(); }
+   std::string pool_check(int64_t pool_tokens) const override {
+@@ -612,7 +612,7 @@ struct Dsv41Family final : ServeFamily {
+         ckpt(checkpoint), eos{cfg.eos_token_id} {}
+   const char* name() const override { return "deepseek_v41"; }
+   int64_t vocab_size() const override { return cfg.vocab_size; }
+-  std::vector<int64_t>& eos_token_ids() override { return eos; }
++  const std::vector<int64_t>& eos_token_ids() const override { return eos; }
+   int64_t block_tokens() const override { return dgpp::Dsv41Model::kv_block_tokens_static(); }
+   int prefill_chunk_tokens() const override { return dgpp::Dsv41Model::prefill_chunk_tokens(); }
+   std::string pool_check(int64_t pool_tokens) const override {
+@@ -692,7 +692,7 @@ struct MimoFamily final : ServeFamily {
+   }
+   const char* name() const override { return "mimo_v2"; }
+   int64_t vocab_size() const override { return cfg.vocab_size; }
+-  std::vector<int64_t>& eos_token_ids() override { return cfg.eos_token_ids; }
++  const std::vector<int64_t>& eos_token_ids() const override { return cfg.eos_token_ids; }
+   int64_t block_tokens() const override { return dgpp::MimoModel::kv_block_tokens_static(); }
+   int prefill_chunk_tokens() const override { return dgpp::MimoModel::prefill_chunk_tokens(); }
+   std::string pool_check(int64_t) const override { return ""; }
+@@ -1833,10 +1833,10 @@ int main(int argc, char** argv) {
+                     prefill == "bounded" ? "the decoder over the last window rows of each prompt" : "every layer over every row");
+     const dgpp::GlmGenerationDefaults generation_defaults =
+         dgpp::GlmGenerationDefaults::from_checkpoint_dir(ckpt, family->vocab_size());
+-    // generation_config.json is the generation authority. Retain the
+-    // config.json value only for old checkpoints/fixtures that omit it.
+-    if (generation_defaults.eos_token_ids.has_value())
+-      family->eos_token_ids() = *generation_defaults.eos_token_ids;
++    // Stop policy must not mutate the model's trained token semantics:
++    // Qwen PLE uses config.json's EOS to pad and reset n-gram history.
++    const auto generation_eos =
++        generation_defaults.effective_eos_token_ids(family->eos_token_ids());
+ 
+     // The served sampling defaults: the file's values, then the process
+     // overrides (DESIGN §10 — defaults from the model, overrides from the
+@@ -1968,7 +1968,7 @@ int main(int argc, char** argv) {
+       return 0;
+     }
+     std::vector<int64_t> eos =
+-        no_eos ? std::vector<int64_t>{} : family->eos_token_ids();
++        no_eos ? std::vector<int64_t>{} : generation_eos;
+     const std::string model_display = model_id.empty()
+                                           ? fs::path(ckpt).filename().string()
+                                           : model_id;
+@@ -1981,7 +1981,7 @@ int main(int argc, char** argv) {
+       const dgpp::text::Tokenizer tok = dgpp::text::Tokenizer::load(
+           (fs::path(ckpt) / "tokenizer.json").string());
+       dgpp::text::GrammarVocab v = dgpp::text::GrammarVocab::from_tokenizer(
+-          tok, family->eos_token_ids(), static_cast<int>(family->vocab_size()));
++          tok, generation_eos, static_cast<int>(family->vocab_size()));
+       DGPP_LOG_INFO(
+           "serve: grammar vocabulary built ({} ids, tool markers {}, "
+           "call-turn EOS {})",
+@@ -2264,7 +2264,7 @@ int main(int argc, char** argv) {
+         }
+         dgpp::serve::OpStreamObserver oplog;  // rank 0's audit leg
+         open_ops_file(&oplog, "serve_rank0.ops");
+-        const int rc = serve_openai(engine_ptr(), family->vocab_size(), family->eos_token_ids(), ckpt,
++        const int rc = serve_openai(engine_ptr(), family->vocab_size(), generation_eos, ckpt,
+                                     model_display, knobs, no_eos, boot_s(), journal ? &*journal : nullptr, &oplog,
+                                     family->name());
+         engine_release();
+@@ -2307,7 +2307,7 @@ int main(int argc, char** argv) {
+     std::unique_ptr<dgpp::sched::SchedulerEngine> engine = family->make_eager_engine(
+         max_concurrency, dgpp::make_w1_pick(family->vocab_size()), dgpp::make_w1_sample(family->vocab_size()),
+         &grammar_vocab, prefix_slots);
+-    const int rc = serve_openai(engine.get(), family->vocab_size(), family->eos_token_ids(), ckpt,
++    const int rc = serve_openai(engine.get(), family->vocab_size(), generation_eos, ckpt,
+                                 model_display, knobs, no_eos, boot_s(), /*journal=*/nullptr,
+                                 /*oplog=*/nullptr, family->name());
+     engine.reset();
+diff --git a/docs/qwen38_flash_next_plan.md b/docs/qwen38_flash_next_plan.md
+index 6505320..2f15d9f 100644
+--- a/docs/qwen38_flash_next_plan.md
++++ b/docs/qwen38_flash_next_plan.md
+@@ -213,6 +213,10 @@ Experts are FP8 e4m3 with `weight_scale_inv` BF16 `[5, 20]` for gate/up
+ The n-gram ids depend only on token ids. With `EOS = 248044`
+ (`<|endoftext|>`; `<|im_end|>` does NOT reset the context):
+ 
++Serving resolves generation stop IDs separately. In particular,
++`generation_config.json` may list `<|im_end|>` first without changing
++the EOS used by PLE or its initial session history.
++
+ ```
+ y_0 = x_t
+ y_s = x_{t−s}  if t−s ≥ 0 and no EOS occurs at positions t−s .. t−1, else EOS   (s = 1, 2)
+diff --git a/src/kernels/qwen_moe.cu b/src/kernels/qwen_moe.cu
+index 728576b..ac8c182 100644
+--- a/src/kernels/qwen_moe.cu
++++ b/src/kernels/qwen_moe.cu
+@@ -7,10 +7,30 @@
+ #include "kernels/bf16_gemv.cuh"
+ #include "kernels/fp8_gemv.cuh"
+ #include "kernels/gemv_common.cuh"
++#include "kernels/latent_format.hpp"
+ 
+ namespace dgpp {
+ namespace {
+ 
++__global__ void issue4_quant_kernel(const uint16_t* input, uint16_t* output,
++                                     int groups, float global) {
++  const int g = blockIdx.x * blockDim.x + threadIdx.x;
++  if (g >= groups) return;
++  float x[16], amax = 0.f;
++  for (int j = 0; j < 16; ++j) {
++    x[j] = bf16_bits_to_float(input[g * 16 + j]);
++    amax = fmaxf(amax, fabsf(x[j]));
++  }
++  const float scale = fp8_e4m3_bits_to_float(float_to_fp8_e4m3_bits(
++      fminf(448.f, global * (amax * (1.f / 6.f)))));
++  const float encode = scale == 0.f ? 0.f : global / scale;
++  const float decode = scale / global;
++  for (int j = 0; j < 16; ++j) {
++    const float y = fp4_e2m1_bits_to_float(float_to_fp4_e2m1_bits(x[j] * encode));
++    output[g * 16 + j] = float_to_bf16_bits(y * decode);
++  }
++}
++
+ __device__ __forceinline__ float round_bf16(float v) {
+   return bf16_bits_to_float(float_to_bf16_bits(v));
+ }
+@@ -245,4 +265,13 @@ void qwen_moe_shared_tail_decode_fp8(const uint16_t* x, size_t x_stride, const u
+   tail_rows<true>(x, x_stride, gate_p, gate_s, up_p, up_s, down_p, down_s, g, act, sw, acc, out, tokens, H, S, stream);
+ }
+ 
++void issue4_nvfp4_activations(const uint16_t* input, uint16_t* output,
++                              int rows, int width, float global, cudaStream_t stream) {
++  if (rows <= 0 || width <= 0 || width % 16 || !(global > 0.f))
++    throw std::invalid_argument("issue4 activation shape/scale");
++  const int groups = rows * (width / 16);
++  issue4_quant_kernel<<<(groups + 127) / 128, 128, 0, stream>>>(input, output, groups, global);
++  DGPP_CUDA_OK(cudaGetLastError());
++}
++
+ }  // namespace dgpp
+diff --git a/src/kernels/qwen_moe.hpp b/src/kernels/qwen_moe.hpp
+index 0b6072e..a83eb65 100644
+--- a/src/kernels/qwen_moe.hpp
++++ b/src/kernels/qwen_moe.hpp
+@@ -9,6 +9,10 @@
+ 
+ namespace dgpp {
+ 
++// Diagnostic NVFP4 activation round-trip; global is reciprocal input_scale.
++void issue4_nvfp4_activations(const uint16_t* input, uint16_t* output,
++                              int rows, int width, float global, cudaStream_t stream);
++
+ // w[t] = bf16(sigmoid(bf16(x[t] . g))) as an fp32 value: the reference's
+ // `sigmoid(shared_expert_gate(x))` — a bf16 Linear (one rounding of the
+ // logit) then a bf16 sigmoid (one rounding of the gate). x bf16
+diff --git a/src/models/glm/config.hpp b/src/models/glm/config.hpp
+index b6b3528..83d7f03 100644
+--- a/src/models/glm/config.hpp
++++ b/src/models/glm/config.hpp
+@@ -69,6 +69,13 @@ struct GlmGenerationDefaults {
+   float effective_repetition_penalty() const {
+     return repetition_penalty.value_or(1.0f);
+   }
++  // Generation stop tokens may differ from the model's trained EOS (for
++  // example, Qwen uses the latter to pad/reset PLE n-gram history).
++  // Resolve the serving policy without overwriting model configuration.
++  std::vector<int64_t> effective_eos_token_ids(
++      const std::vector<int64_t>& model_eos_token_ids) const {
++    return eos_token_ids.value_or(model_eos_token_ids);
++  }
+ 
+   // Names every absent sampler field whose neutral/greedy-safe fallback is
+   // in effect. JSON null is treated as absent, matching generated HF config
+diff --git a/src/models/glm/moe_layer.cpp b/src/models/glm/moe_layer.cpp
+index 7f033f1..f13c6c2 100644
+--- a/src/models/glm/moe_layer.cpp
++++ b/src/models/glm/moe_layer.cpp
+@@ -14,6 +14,7 @@
+ #include "kernels/glm_moe_launch.hpp"
+ #include "kernels/packq_gemm.hpp"
+ #include "kernels/scale_gemm.hpp"
++#include "kernels/qwen_moe.hpp"
+ #include "models/glm/step_timing.hpp"
+ 
+ namespace dgpp {
+@@ -140,6 +141,7 @@ GlmMoeLayer::GlmMoeLayer(const GlmMoeWeights& weights, const GlmMoeConfig& cfg,
+     DGPP_CUDA_OK(cudaEventCreateWithFlags(&view_ring_event_[i],
+                                           cudaEventDisableTiming));
+   DGPP_CUDA_OK(cudaMalloc(&d_gather_, rows_total * H * 2));
++  DGPP_CUDA_OK(cudaMalloc(&d_issue4_input_, std::max(M, decode_slots_) * H * 2));
+   DGPP_CUDA_OK(cudaMalloc(&d_gate_, rows_total * I * 2));
+   DGPP_CUDA_OK(cudaMalloc(&d_up_, rows_total * I * 2));
+   DGPP_CUDA_OK(cudaMalloc(&d_act_, rows_total * I * 2));
+@@ -206,6 +208,7 @@ GlmMoeLayer::~GlmMoeLayer() {
+   cudaFree(d_rows_);
+   cudaFree(d_row_w_);
+   cudaFree(d_gather_);
++  cudaFree(d_issue4_input_);
+   cudaFree(d_gate_);
+   cudaFree(d_up_);
+   cudaFree(d_act_);
+@@ -637,6 +640,11 @@ void GlmMoeLayer::grouped_expert_chain(MoeExpertKernel kernel,
+         "32/64 grid with hidden and the slice both multiples of 32; use "
+         "MoeExpertKernel::kGemv");
+   const int shared_split = mma ? 128 : 16;
++  if (issue4_gate_up_ > 0.f && fp4) {
++    if (shared_seg) throw std::logic_error("issue4 requires routed-only chain");
++    issue4_nvfp4_activations(hidden, d_issue4_input_, tokens, H, issue4_gate_up_, stream);
++    hidden = d_issue4_input_;
++  }
+   // The GEMV core reads a gathered copy of the rows; the tensor-core kernel
+   // reads the hidden rows through the row map directly (2026-09-05: the
+   // gather was 1.26 ms per layer at 2048 tokens).
+@@ -706,6 +714,9 @@ void GlmMoeLayer::grouped_expert_chain(MoeExpertKernel kernel,
+   launch_moe_swiglu_clamp(d_gate_, d_up_, d_act_,
+                           static_cast<int64_t>(rows_total) * I_max,
+                           cfg_.swiglu_limit, stream);
++  if (issue4_down_ > 0.f && fp4)
++    issue4_nvfp4_activations(d_act_, d_act_, static_cast<int>(rows_total),
++                              static_cast<int>(I_max), issue4_down_, stream);
+   gemm_f32(segs, n_segs, max_rows, 0, I_r, true);
+   if (shared_seg) gemm_f32(shared_seg, 1, tokens, shared_split, I_s, false);
+   if (std::getenv("DGPP_MOE_CHAIN_DUMP") != nullptr) {
+@@ -894,10 +905,17 @@ void GlmMoeLayer::enqueue_decode_impl(const uint16_t* hidden, uint16_t* out_bf16
+                                d_slot_down_, H, slots, K, stream, sbase);
+   } else if (fp4) {
+     const int fp4_group = w_.experts_fp4[0].scale_group;
++    if (issue4_gate_up_ > 0.f) {
++      if (with_shared) throw std::logic_error("issue4 requires routed-only decode");
++      issue4_nvfp4_activations(hidden, d_issue4_input_, tokens, H, issue4_gate_up_, stream);
++      hidden = d_issue4_input_;
++    }
+     launch_moe_slot_gate_up_swiglu_fp4(
+         hidden, H, d_ids_, order, table, I_r, H, I_s, K_s, sh_gate_p, sh_gate_s,
+         sh_up_p, sh_up_s, d_slot_act_, I_r, slots, K, cfg_.swiglu_limit, stream,
+         shared_view_base, fp4_group, sh_rs, sh_cs);
++    if (issue4_down_ > 0.f)
++      issue4_nvfp4_activations(d_slot_act_, d_slot_act_, slots, I_r, issue4_down_, stream);
+     launch_moe_slot_down_fp4(d_slot_act_, I_r, d_ids_, order, table, H, I_r, N_s,
+                              I_s, sh_down_p, sh_down_s, d_slot_down_, H, slots, K,
+                              stream, shared_view_base, fp4_group, sh_rs, sh_cs);
+diff --git a/src/models/glm/moe_layer.hpp b/src/models/glm/moe_layer.hpp
+index 3b87957..c8e601f 100644
+--- a/src/models/glm/moe_layer.hpp
++++ b/src/models/glm/moe_layer.hpp
+@@ -162,6 +162,10 @@ class GlmMoeLayer {
+   // views (router gate/bias, expert and shared matrices). Device scratch
+   // and segmentation buffers are shape-keyed and unaffected.
+   void rebind(const GlmMoeWeights& w) { w_ = w; }
++  void issue4_activation_scales(float gate_up, float down) {
++    issue4_gate_up_ = gate_up;
++    issue4_down_ = down;
++  }
+ 
+  private:
+   void check_expert_geometry() const;
+@@ -201,6 +205,8 @@ class GlmMoeLayer {
+   int32_t* d_rows_ = nullptr;
+   float* d_row_w_ = nullptr;
+   uint16_t* d_gather_ = nullptr;
++  uint16_t* d_issue4_input_ = nullptr;
++  float issue4_gate_up_ = 0.f, issue4_down_ = 0.f;
+   uint16_t* d_gate_ = nullptr;
+   uint16_t* d_up_ = nullptr;
+   uint16_t* d_act_ = nullptr;
+diff --git a/src/models/glm4/config.hpp b/src/models/glm4/config.hpp
+index 895af7f..56cf2c7 100644
+--- a/src/models/glm4/config.hpp
++++ b/src/models/glm4/config.hpp
+@@ -33,7 +33,7 @@ struct Glm4TextConfig {
+   std::string hidden_act = "silu";
+   int max_position_embeddings = 202752;
+   int first_k_dense_replace = 3;   // layers [0, first_k_dense_replace) carry the dense MLP
+-  std::vector<int64_t> eos_token_ids;  // config.json's; generation_config.json overrides at serve
++  std::vector<int64_t> eos_token_ids;  // config.json's; serving resolves generation stop IDs separately
+   int64_t pad_token_id = -1;
+ 
+   // --- attention (GQA, biased projections, per-head q/k norm, partial RoPE)
+diff --git a/src/models/glm_dsa/config.hpp b/src/models/glm_dsa/config.hpp
+index 9093015..4cf7003 100644
+--- a/src/models/glm_dsa/config.hpp
++++ b/src/models/glm_dsa/config.hpp
+@@ -39,7 +39,7 @@ struct GlmDsaTextConfig {
+   std::string hidden_act = "silu";
+   int max_position_embeddings = 1048576;
+   int first_k_dense_replace = 3;   // layers [0, first_k_dense_replace) carry the dense MLP
+-  std::vector<int64_t> eos_token_ids;  // config.json's; generation_config.json overrides at serve
++  std::vector<int64_t> eos_token_ids;  // config.json's; serving resolves generation stop IDs separately
+   int64_t pad_token_id = -1;
+ 
+   // --- MLA attention (DeepSeek-V3 shape with interleaved decoupled RoPE)
+diff --git a/src/models/mimo/config.hpp b/src/models/mimo/config.hpp
+index caf4b87..163fdf1 100644
+--- a/src/models/mimo/config.hpp
++++ b/src/models/mimo/config.hpp
+@@ -43,7 +43,7 @@ struct MimoTextConfig {
+   bool tie_word_embeddings = false;
+   std::string hidden_act = "silu";
+   int max_position_embeddings = 1048576;
+-  std::vector<int64_t> eos_token_ids;  // config.json's; generation_config.json overrides at serve
++  std::vector<int64_t> eos_token_ids;  // config.json's; serving resolves generation stop IDs separately
+   int64_t pad_token_id = -1;
+   std::vector<uint8_t> swa_layer;      // [num_hidden_layers]: 1 = sliding window, 0 = global
+   std::vector<uint8_t> moe_layer;      // [num_hidden_layers]: 1 = routed MoE, 0 = dense MLP
+diff --git a/src/models/qwen/config.hpp b/src/models/qwen/config.hpp
+index ef51305..32d9286 100644
+--- a/src/models/qwen/config.hpp
++++ b/src/models/qwen/config.hpp
+@@ -45,7 +45,9 @@ struct QwenTextConfig {
+   std::string hidden_act = "silu";
+   int max_position_embeddings = 262144;
+   std::vector<QwenLayerKind> layers;  // size == num_hidden_layers
+-  std::vector<int64_t> eos_token_ids;  // config.json's; generation_config.json overrides at serve
++  // Trained EOS from config.json, including PLE padding/reset semantics.
++  // Generation stop tokens are resolved separately by the serving layer.
++  std::vector<int64_t> eos_token_ids;
+   int64_t bos_token_id = -1;
+ 
+   // --- gated residual (hyper-connections) ---------------------------------
+diff --git a/src/models/qwen/forward.cpp b/src/models/qwen/forward.cpp
+index 08d048e..722ae99 100644
+--- a/src/models/qwen/forward.cpp
++++ b/src/models/qwen/forward.cpp
+@@ -1,4 +1,5 @@
+ #include "models/qwen/forward.hpp"
++#include "models/qwen/issue4_input_scales.hpp"
+ 
+ #include "kernels/scale_gemm.hpp"
+ 
+@@ -462,6 +463,12 @@ void QwenModel::build_layer_objects(const QwenLayerResident& r) {
+   } else {
+     moe_->rebind(moe_view(r.moe));
+   }
++  if (cfg_.experts_nvfp4 && r.layer >= 0 && r.layer < 48) {
++    moe_->routed().issue4_activation_scales(1.f / issue4_input_scales[r.layer][0],
++                                            1.f / issue4_input_scales[r.layer][1]);
++  } else {
++    moe_->routed().issue4_activation_scales(0.f, 0.f);
++  }
+   if (r.has_ple) {
+     if (!ple_) {
+       ple_ = std::make_unique<QwenPleLayer>(r.ple, table_, gw_, cfg_, max_tokens_);
+diff --git a/tests/unit/qwen_config_test.cpp b/tests/unit/qwen_config_test.cpp
+index 0925da1..14c51cf 100644
+--- a/tests/unit/qwen_config_test.cpp
++++ b/tests/unit/qwen_config_test.cpp
+@@ -10,6 +10,7 @@
+ #include "loaders/architecture.hpp"
+ #include "loaders/minijson.hpp"
+ #include "models/qwen/config.hpp"
++#include "models/glm/config.hpp"
+ 
+ namespace {
+ 
+@@ -107,6 +108,25 @@ DGPP_TEST(qwen_config_parses_the_release) {
+   require(c.context_limit() == 262144, "the checkpoint's ceiling");
+ }
+ 
++DGPP_TEST(qwen_generation_stop_tokens_preserve_ple_eos) {
++  const auto cfg = parse(text_json());
++  const auto generation = dgpp::minijson::parse(
++      R"({"eos_token_id": [248046, 248044]})");
++  const auto defaults = dgpp::GlmGenerationDefaults::parse(generation.root, cfg.vocab_size);
++  const auto stops = defaults.effective_eos_token_ids(cfg.eos_token_ids);
++  require(stops == std::vector<int64_t>({248046, 248044}),
++          "both generation terminators must stop decoding");
++  require(cfg.eos_token_ids == std::vector<int64_t>({248044}),
++          "PLE padding and reset must retain the model's trained EOS");
++  require(dgpp::GlmGenerationDefaults{}.effective_eos_token_ids(cfg.eos_token_ids) ==
++              cfg.eos_token_ids,
++          "missing generation EOS must fall back to the model");
++  auto empty = defaults;
++  empty.eos_token_ids = std::vector<int64_t>{};
++  require(empty.effective_eos_token_ids(cfg.eos_token_ids).empty(),
++          "an explicit empty stop set must not fall back");
++}
++
+ DGPP_TEST(qwen_config_rope_scaling_knob_lifts_the_ceiling) {
+   // The parsed config is the plain one; the serving layer sets
+   // cfg.rope_scaling from engine.rope_scaling, and everything that bounds

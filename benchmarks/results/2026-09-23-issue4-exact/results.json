@@ -1,0 +1,65 @@
+{
+  "commit": "c6ca191863d620360f3b4370c0156f9e26a2631f",
+  "runs": {
+    "native": {
+      "correct": 5,
+      "total": 6,
+      "finish_reason": "stop",
+      "usage": {
+        "prompt_tokens": 261120,
+        "completion_tokens": 184,
+        "total_tokens": 261304,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 0
+        }
+      },
+      "first_request_verified": true,
+      "http_status": 200,
+      "wall_seconds": 218.08795901900157,
+      "assistant_sha256": "c2413f544aa63bf4294825a521fc229e79fd8c5eafaef1e57038850d92b5bbec",
+      "assistant_identical_to_reporter": true,
+      "operation_stream_md5": {
+        "serve_rank0.ops": "1f5750054f6e03175c137a67c8ebe002",
+        "serve_rank1.ops": "1f5750054f6e03175c137a67c8ebe002"
+      },
+      "configuration_digest": "950bbc7bfa7908b1",
+      "error_lines": {
+        "serve_r1.log": [],
+        "serve_r0.log": []
+      }
+    },
+    "bounded1024": {
+      "correct": 5,
+      "total": 6,
+      "finish_reason": "stop",
+      "usage": {
+        "prompt_tokens": 261120,
+        "completion_tokens": 184,
+        "total_tokens": 261304,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 0
+        }
+      },
+      "first_request_verified": true,
+      "http_status": 200,
+      "wall_seconds": 235.90268163697328,
+      "assistant_sha256": "c2413f544aa63bf4294825a521fc229e79fd8c5eafaef1e57038850d92b5bbec",
+      "assistant_identical_to_reporter": true,
+      "operation_stream_md5": {
+        "serve_rank0.ops": "3cdb8d010056ed5c8a0613b00a871b4e",
+        "serve_rank1.ops": "3cdb8d010056ed5c8a0613b00a871b4e"
+      },
+      "configuration_digest": "6c6eaa5811fbac7b",
+      "error_lines": {
+        "serve_r1.log": [],
+        "serve_r0.log": []
+      }
+    }
+  }
+}

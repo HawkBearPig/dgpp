@@ -1,0 +1,6 @@
+{
+  "image": "sha256:d464f3b466fa9c45ddbff8a812e80564503b6879a9fd95c1a47514f3f0df5a4a",
+  "base_model_sha256": "d900cd6fcacba18f460e00b3f018fbf36fbe6ecc310692b6adb1451f7f53cc17",
+  "overlay_model_sha256": "dc14f7bf976cff93d4562ca53c0aa0149e2b2476a8150ae2acba0ee054f86db9",
+  "trace_module_sha256": "4192a34db70e0306092213861651507f393d3dd9c9cca2113e7dce07e23d69d0"
+}

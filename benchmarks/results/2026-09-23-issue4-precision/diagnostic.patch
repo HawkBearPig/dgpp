@@ -1,0 +1,179 @@
+diff --git a/src/kernels/qwen_moe.cu b/src/kernels/qwen_moe.cu
+index 728576b..ac8c182 100644
+--- a/src/kernels/qwen_moe.cu
++++ b/src/kernels/qwen_moe.cu
+@@ -7,10 +7,30 @@
+ #include "kernels/bf16_gemv.cuh"
+ #include "kernels/fp8_gemv.cuh"
+ #include "kernels/gemv_common.cuh"
++#include "kernels/latent_format.hpp"
+ 
+ namespace dgpp {
+ namespace {
+ 
++__global__ void issue4_quant_kernel(const uint16_t* input, uint16_t* output,
++                                     int groups, float global) {
++  const int g = blockIdx.x * blockDim.x + threadIdx.x;
++  if (g >= groups) return;
++  float x[16], amax = 0.f;
++  for (int j = 0; j < 16; ++j) {
++    x[j] = bf16_bits_to_float(input[g * 16 + j]);
++    amax = fmaxf(amax, fabsf(x[j]));
++  }
++  const float scale = fp8_e4m3_bits_to_float(float_to_fp8_e4m3_bits(
++      fminf(448.f, global * (amax * (1.f / 6.f)))));
++  const float encode = scale == 0.f ? 0.f : global / scale;
++  const float decode = scale / global;
++  for (int j = 0; j < 16; ++j) {
++    const float y = fp4_e2m1_bits_to_float(float_to_fp4_e2m1_bits(x[j] * encode));
++    output[g * 16 + j] = float_to_bf16_bits(y * decode);
++  }
++}
++
+ __device__ __forceinline__ float round_bf16(float v) {
+   return bf16_bits_to_float(float_to_bf16_bits(v));
+ }
+@@ -245,4 +265,13 @@ void qwen_moe_shared_tail_decode_fp8(const uint16_t* x, size_t x_stride, const u
+   tail_rows<true>(x, x_stride, gate_p, gate_s, up_p, up_s, down_p, down_s, g, act, sw, acc, out, tokens, H, S, stream);
+ }
+ 
++void issue4_nvfp4_activations(const uint16_t* input, uint16_t* output,
++                              int rows, int width, float global, cudaStream_t stream) {
++  if (rows <= 0 || width <= 0 || width % 16 || !(global > 0.f))
++    throw std::invalid_argument("issue4 activation shape/scale");
++  const int groups = rows * (width / 16);
++  issue4_quant_kernel<<<(groups + 127) / 128, 128, 0, stream>>>(input, output, groups, global);
++  DGPP_CUDA_OK(cudaGetLastError());
++}
++
+ }  // namespace dgpp
+diff --git a/src/kernels/qwen_moe.hpp b/src/kernels/qwen_moe.hpp
+index 0b6072e..a83eb65 100644
+--- a/src/kernels/qwen_moe.hpp
++++ b/src/kernels/qwen_moe.hpp
+@@ -9,6 +9,10 @@
+ 
+ namespace dgpp {
+ 
++// Diagnostic NVFP4 activation round-trip; global is reciprocal input_scale.
++void issue4_nvfp4_activations(const uint16_t* input, uint16_t* output,
++                              int rows, int width, float global, cudaStream_t stream);
++
+ // w[t] = bf16(sigmoid(bf16(x[t] . g))) as an fp32 value: the reference's
+ // `sigmoid(shared_expert_gate(x))` — a bf16 Linear (one rounding of the
+ // logit) then a bf16 sigmoid (one rounding of the gate). x bf16
+diff --git a/src/models/glm/moe_layer.cpp b/src/models/glm/moe_layer.cpp
+index 7f033f1..f13c6c2 100644
+--- a/src/models/glm/moe_layer.cpp
++++ b/src/models/glm/moe_layer.cpp
+@@ -14,6 +14,7 @@
+ #include "kernels/glm_moe_launch.hpp"
+ #include "kernels/packq_gemm.hpp"
+ #include "kernels/scale_gemm.hpp"
++#include "kernels/qwen_moe.hpp"
+ #include "models/glm/step_timing.hpp"
+ 
+ namespace dgpp {
+@@ -140,6 +141,7 @@ GlmMoeLayer::GlmMoeLayer(const GlmMoeWeights& weights, const GlmMoeConfig& cfg,
+     DGPP_CUDA_OK(cudaEventCreateWithFlags(&view_ring_event_[i],
+                                           cudaEventDisableTiming));
+   DGPP_CUDA_OK(cudaMalloc(&d_gather_, rows_total * H * 2));
++  DGPP_CUDA_OK(cudaMalloc(&d_issue4_input_, std::max(M, decode_slots_) * H * 2));
+   DGPP_CUDA_OK(cudaMalloc(&d_gate_, rows_total * I * 2));
+   DGPP_CUDA_OK(cudaMalloc(&d_up_, rows_total * I * 2));
+   DGPP_CUDA_OK(cudaMalloc(&d_act_, rows_total * I * 2));
+@@ -206,6 +208,7 @@ GlmMoeLayer::~GlmMoeLayer() {
+   cudaFree(d_rows_);
+   cudaFree(d_row_w_);
+   cudaFree(d_gather_);
++  cudaFree(d_issue4_input_);
+   cudaFree(d_gate_);
+   cudaFree(d_up_);
+   cudaFree(d_act_);
+@@ -637,6 +640,11 @@ void GlmMoeLayer::grouped_expert_chain(MoeExpertKernel kernel,
+         "32/64 grid with hidden and the slice both multiples of 32; use "
+         "MoeExpertKernel::kGemv");
+   const int shared_split = mma ? 128 : 16;
++  if (issue4_gate_up_ > 0.f && fp4) {
++    if (shared_seg) throw std::logic_error("issue4 requires routed-only chain");
++    issue4_nvfp4_activations(hidden, d_issue4_input_, tokens, H, issue4_gate_up_, stream);
++    hidden = d_issue4_input_;
++  }
+   // The GEMV core reads a gathered copy of the rows; the tensor-core kernel
+   // reads the hidden rows through the row map directly (2026-09-05: the
+   // gather was 1.26 ms per layer at 2048 tokens).
+@@ -706,6 +714,9 @@ void GlmMoeLayer::grouped_expert_chain(MoeExpertKernel kernel,
+   launch_moe_swiglu_clamp(d_gate_, d_up_, d_act_,
+                           static_cast<int64_t>(rows_total) * I_max,
+                           cfg_.swiglu_limit, stream);
++  if (issue4_down_ > 0.f && fp4)
++    issue4_nvfp4_activations(d_act_, d_act_, static_cast<int>(rows_total),
++                              static_cast<int>(I_max), issue4_down_, stream);
+   gemm_f32(segs, n_segs, max_rows, 0, I_r, true);
+   if (shared_seg) gemm_f32(shared_seg, 1, tokens, shared_split, I_s, false);
+   if (std::getenv("DGPP_MOE_CHAIN_DUMP") != nullptr) {
+@@ -894,10 +905,17 @@ void GlmMoeLayer::enqueue_decode_impl(const uint16_t* hidden, uint16_t* out_bf16
+                                d_slot_down_, H, slots, K, stream, sbase);
+   } else if (fp4) {
+     const int fp4_group = w_.experts_fp4[0].scale_group;
++    if (issue4_gate_up_ > 0.f) {
++      if (with_shared) throw std::logic_error("issue4 requires routed-only decode");
++      issue4_nvfp4_activations(hidden, d_issue4_input_, tokens, H, issue4_gate_up_, stream);
++      hidden = d_issue4_input_;
++    }
+     launch_moe_slot_gate_up_swiglu_fp4(
+         hidden, H, d_ids_, order, table, I_r, H, I_s, K_s, sh_gate_p, sh_gate_s,
+         sh_up_p, sh_up_s, d_slot_act_, I_r, slots, K, cfg_.swiglu_limit, stream,
+         shared_view_base, fp4_group, sh_rs, sh_cs);
++    if (issue4_down_ > 0.f)
++      issue4_nvfp4_activations(d_slot_act_, d_slot_act_, slots, I_r, issue4_down_, stream);
+     launch_moe_slot_down_fp4(d_slot_act_, I_r, d_ids_, order, table, H, I_r, N_s,
+                              I_s, sh_down_p, sh_down_s, d_slot_down_, H, slots, K,
+                              stream, shared_view_base, fp4_group, sh_rs, sh_cs);
+diff --git a/src/models/glm/moe_layer.hpp b/src/models/glm/moe_layer.hpp
+index 3b87957..c8e601f 100644
+--- a/src/models/glm/moe_layer.hpp
++++ b/src/models/glm/moe_layer.hpp
+@@ -162,6 +162,10 @@ class GlmMoeLayer {
+   // views (router gate/bias, expert and shared matrices). Device scratch
+   // and segmentation buffers are shape-keyed and unaffected.
+   void rebind(const GlmMoeWeights& w) { w_ = w; }
++  void issue4_activation_scales(float gate_up, float down) {
++    issue4_gate_up_ = gate_up;
++    issue4_down_ = down;
++  }
+ 
+  private:
+   void check_expert_geometry() const;
+@@ -201,6 +205,8 @@ class GlmMoeLayer {
+   int32_t* d_rows_ = nullptr;
+   float* d_row_w_ = nullptr;
+   uint16_t* d_gather_ = nullptr;
++  uint16_t* d_issue4_input_ = nullptr;
++  float issue4_gate_up_ = 0.f, issue4_down_ = 0.f;
+   uint16_t* d_gate_ = nullptr;
+   uint16_t* d_up_ = nullptr;
+   uint16_t* d_act_ = nullptr;
+diff --git a/src/models/qwen/forward.cpp b/src/models/qwen/forward.cpp
+index 08d048e..722ae99 100644
+--- a/src/models/qwen/forward.cpp
++++ b/src/models/qwen/forward.cpp
+@@ -1,4 +1,5 @@
+ #include "models/qwen/forward.hpp"
++#include "models/qwen/issue4_input_scales.hpp"
+ 
+ #include "kernels/scale_gemm.hpp"
+ 
+@@ -462,6 +463,12 @@ void QwenModel::build_layer_objects(const QwenLayerResident& r) {
+   } else {
+     moe_->rebind(moe_view(r.moe));
+   }
++  if (cfg_.experts_nvfp4 && r.layer >= 0 && r.layer < 48) {
++    moe_->routed().issue4_activation_scales(1.f / issue4_input_scales[r.layer][0],
++                                            1.f / issue4_input_scales[r.layer][1]);
++  } else {
++    moe_->routed().issue4_activation_scales(0.f, 0.f);
++  }
+   if (r.has_ple) {
+     if (!ple_) {
+       ple_ = std::make_unique<QwenPleLayer>(r.ple, table_, gw_, cfg_, max_tokens_);

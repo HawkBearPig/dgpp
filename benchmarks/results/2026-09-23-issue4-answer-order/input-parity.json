@@ -1,0 +1,6 @@
+{
+  "forced_prompt_tokens": 261138,
+  "original_prompt_ids_preserved": true,
+  "forced_token_sha256_int64le": "f46f3eba2f2af8f8245df444129e986874e07fbe0724af9aefe24e1c406a5c97",
+  "reordered_prompt_tokens": 261120
+}

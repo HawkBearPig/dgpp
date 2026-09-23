@@ -1,0 +1,71 @@
+{
+  "gdn": {
+    "cases": 72,
+    "convolution": {
+      "max_relative_l2": 2.41681310143e-05,
+      "worst": "rank1/layer13",
+      "nonfinite": 0
+    },
+    "recurrence": {
+      "max_relative_l2": 0.00149556424535,
+      "worst": "rank1/layer41",
+      "nonfinite": 0
+    },
+    "checkpoint_states": {
+      "max_relative_l2": 0.00123383113549,
+      "worst": "rank1/layer41",
+      "nonfinite": 0
+    }
+  },
+  "index": {
+    "cases": 24,
+    "compression_norm_rope": {
+      "max_relative_l2": 2.00849356539e-05,
+      "worst": "rank0/layer19",
+      "nonfinite": 0
+    }
+  },
+  "ple": {
+    "cases": 2,
+    "convolution_residual": {
+      "max_relative_l2": 1.91820681327e-07,
+      "worst": "rank0/layer1",
+      "nonfinite": 0
+    }
+  },
+  "validation": {
+    "eos_discrepancy": {
+      "model_eos": 248044,
+      "runtime_eos": 248046,
+      "different_positions": [
+        0,
+        1,
+        24,
+        261112
+      ],
+      "different_ids": 40
+    },
+    "total_live_checks": 49664,
+    "tokens_exact_each_rank": true,
+    "all_chunk_positions_exact": true,
+    "final_layer_residuals_match_previous": true,
+    "ple": [
+      {
+        "rank": 0,
+        "tokens": 261290,
+        "hash_ids_exact": true,
+        "embedding_mismatches": 0,
+        "nonfinite": 0,
+        "expected_embedding_sha256": "e30edc9270c1991af01fc69e462d078e8a9a2afdb06d413dd8abb3e2e0bb935f"
+      },
+      {
+        "rank": 1,
+        "tokens": 261290,
+        "hash_ids_exact": true,
+        "embedding_mismatches": 0,
+        "nonfinite": 0,
+        "expected_embedding_sha256": "088c32b48995e8edf8971c59e783db67d493367fccc0730948d2648b8ffe99f7"
+      }
+    ]
+  }
+}

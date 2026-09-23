@@ -1,0 +1,35 @@
+{
+  "model": "nvidia/Qwen3.8-Flash-Next-NVFP4",
+  "world_size": 2,
+  "engine": {
+    "max_concurrency": 4,
+    "kv_capacity": 262144,
+    "kv_dtype": "bf16",
+    "ngram_table": "mmap",
+    "default_max_tokens": 256,
+    "queue_limit": 8,
+    "max_connections": 64,
+    "decode_graph": true,
+    "mtp": false,
+    "mtp_depth": 1,
+    "prefix_cache_gib": 0,
+    "admission": "full",
+    "admission_window": 256,
+    "sampling_candidates": 128,
+    "stats_interval_s": 10,
+    "dense_weights": "fp8",
+    "prefill_budget_tokens": 0,
+    "prefill_idle_budget_tokens": 0,
+    "fp8_head": "gemv",
+    "bf16_weights": "checkpoint",
+    "compact_batches": false
+  },
+  "paths": {
+    "resident_cache": ""
+  },
+  "http": {
+    "bind_host": "127.0.0.1",
+    "port": 18084,
+    "max_body_bytes": 8388608
+  }
+}

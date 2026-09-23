@@ -1,0 +1,54 @@
+diff --git a/src/kernels/qwen_gr.cu b/src/kernels/qwen_gr.cu
+index ec5ceb7..e5a969e 100644
+--- a/src/kernels/qwen_gr.cu
++++ b/src/kernels/qwen_gr.cu
+@@ -37,8 +37,8 @@ __global__ void mix_finish_kernel(const uint16_t* __restrict__ logits,
+   float acc = 0.0f;
+   for (int i = 0; i < hc; ++i) {
+     const int64_t at = base + static_cast<int64_t>(i) * hidden;
+-    const float g = round_bf16(sigmoid_f(bf16_bits_to_float(logits[at])));
+-    acc += round_bf16(g * bf16_bits_to_float(rn[at]));
++    const float g = sigmoid_f(bf16_bits_to_float(logits[at]));
++    acc = fmaf(g, bf16_bits_to_float(rn[at]), acc);
+   }
+   x[row * hidden + j] = float_to_bf16_bits(acc * inv_hc);
+ }
+@@ -94,7 +94,7 @@ __global__ void combine_dots_kernel(const uint16_t* __restrict__ rn,
+                                        width, lane);
+   if (lane == 0) {
+     const float dot = round_bf16(acc);          // the linear's bf16 output
+-    gates[row * hc + warp] = 2.0f * round_bf16(sigmoid_f(dot * inv_hc));
++    gates[row * hc + warp] = 2.0f * sigmoid_f(dot * inv_hc);
+   }
+ }
+ 
+@@ -109,9 +109,9 @@ __global__ void combine_apply_kernel(uint16_t* __restrict__ r_state,
+   if (idx >= width) return;
+   const int i = idx / hidden, j = idx - i * hidden;
+   const float g = gates[row * hc + i];
+-  const float inj = round_bf16(bf16_bits_to_float(y[row * hidden + j]) * g);
++  const float block = bf16_bits_to_float(y[row * hidden + j]);
+   uint16_t* r = r_state + row * width + idx;
+-  *r = float_to_bf16_bits(bf16_bits_to_float(*r) + inj);
++  *r = float_to_bf16_bits(fmaf(block, g, bf16_bits_to_float(*r)));
+ }
+ 
+ // ---- the site's GEMVs with their producers folded into the staging ----------
+@@ -200,7 +200,7 @@ __global__ void __launch_bounds__(kGrGemvThreads)
+       if (lane == 0) {
+         const float dot = round_bf16(acc);  // the linear's bf16 output
+         gates[static_cast<size_t>(row) * hc + i] =
+-            2.0f * round_bf16(sigmoid_f(dot * inv_hc));
++            2.0f * sigmoid_f(dot * inv_hc);
+       }
+     }
+     return;
+@@ -245,7 +245,7 @@ __global__ void __launch_bounds__(kGrGemvThreads)
+       if (lane == 0) {
+         const float dot = round_bf16(acc);  // the linear's bf16 output
+         gates[static_cast<size_t>(row) * hc + i] =
+-            2.0f * round_bf16(sigmoid_f(dot * inv_hc));
++            2.0f * sigmoid_f(dot * inv_hc);
+       }
+     }
+     return;

@@ -1,0 +1,68 @@
+{
+  "comparisons": 408,
+  "scalars": 885120,
+  "worst_relative_l2": {
+    "layer": 31,
+    "rank": 1,
+    "projection": "v_tail",
+    "n": 256,
+    "relative_l2": 0.00047822555089727055,
+    "max_abs": 0.00390625,
+    "two_bf16_relative_mismatches": 0,
+    "over_two_percent_rms_and_two_bf16_relative": 0,
+    "nonfinite": 0
+  },
+  "two_bf16_relative_mismatches": 42,
+  "over_two_percent_rms_and_two_bf16_relative": 0,
+  "nonfinite": 0,
+  "by_projection": {
+    "a": {
+      "comparisons": 72,
+      "max_relative_l2": 0.0,
+      "two_bf16_relative_mismatches": 0,
+      "max_relative_mismatch_fraction": 0.0
+    },
+    "b": {
+      "comparisons": 72,
+      "max_relative_l2": 0.0,
+      "two_bf16_relative_mismatches": 0,
+      "max_relative_mismatch_fraction": 0.0
+    },
+    "idx": {
+      "comparisons": 24,
+      "max_relative_l2": 0.0004640642910151646,
+      "two_bf16_relative_mismatches": 0,
+      "max_relative_mismatch_fraction": 0.0
+    },
+    "output_projection": {
+      "comparisons": 48,
+      "max_relative_l2": 0.0004621007641186705,
+      "two_bf16_relative_mismatches": 23,
+      "max_relative_mismatch_fraction": 0.0015625
+    },
+    "q": {
+      "comparisons": 24,
+      "max_relative_l2": 0.00022330055173713323,
+      "two_bf16_relative_mismatches": 1,
+      "max_relative_mismatch_fraction": 0.00016276041666666666
+    },
+    "qkv": {
+      "comparisons": 72,
+      "max_relative_l2": 0.0002920244122981584,
+      "two_bf16_relative_mismatches": 14,
+      "max_relative_mismatch_fraction": 0.000390625
+    },
+    "v_tail": {
+      "comparisons": 24,
+      "max_relative_l2": 0.00047822555089727055,
+      "two_bf16_relative_mismatches": 0,
+      "max_relative_mismatch_fraction": 0.0
+    },
+    "z": {
+      "comparisons": 72,
+      "max_relative_l2": 0.0002479222700137988,
+      "two_bf16_relative_mismatches": 4,
+      "max_relative_mismatch_fraction": 0.0003255208333333333
+    }
+  }
+}

@@ -1,0 +1,44 @@
+{
+  "checks": {
+    "key_a3ea1faf8458": false,
+    "key_5c7ad6586dd6": false,
+    "key_ecf0ce89497b": false,
+    "key_3ee7709ef005": false,
+    "key_0769e0226c63": false,
+    "key_1ccd2debc518": true
+  },
+  "correct": 1,
+  "total": 6,
+  "actual": {
+    "key_0769e0226c63": "val_905_4_wrong",
+    "key_3ee7709ef005": "val_905_3_wrong",
+    "key_5c7ad6586dd6": "val_905_1_wrong",
+    "key_ecf0ce89497b": "val_905_2_wrong",
+    "key_a3ea1faf8458": "val_905_0_wrong",
+    "key_1ccd2debc518": null
+  },
+  "expected": {
+    "key_a3ea1faf8458": "val_d2efb323f0ac0eab",
+    "key_5c7ad6586dd6": "val_e08802eec5f6c596",
+    "key_ecf0ce89497b": "val_58e1450aa7c54384",
+    "key_3ee7709ef005": "val_00648ee398573f64",
+    "key_0769e0226c63": "val_aed39758a1abf065",
+    "key_1ccd2debc518": null
+  },
+  "usage": {
+    "prompt_tokens": 261120,
+    "completion_tokens": 148,
+    "total_tokens": 261268,
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    }
+  },
+  "finish_reason": "stop",
+  "semantic_pass": false,
+  "protocol_pass": true,
+  "first_request_verified": true,
+  "pass": false
+}

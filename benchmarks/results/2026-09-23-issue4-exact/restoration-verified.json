@@ -1,0 +1,13 @@
+{
+  "rank0_sha256": "4638e3c595a2765d6d50c4626a9fef3aa2aa82936c6c50e3d0eec871fcde8e00",
+  "resolved_config_identical": true,
+  "ranks": {
+    "192.168.88.12": "4638e3c595a2765d6d50c4626a9fef3aa2aa82936c6c50e3d0eec871fcde8e00  /proc/3846793/exe\n",
+    "192.168.88.13": "4638e3c595a2765d6d50c4626a9fef3aa2aa82936c6c50e3d0eec871fcde8e00  /proc/868429/exe\n",
+    "192.168.88.14": "4638e3c595a2765d6d50c4626a9fef3aa2aa82936c6c50e3d0eec871fcde8e00  /proc/608557/exe\n"
+  },
+  "inference_content": "OK",
+  "finish_reason": "stop",
+  "idle": true,
+  "engine_failed": false
+}
