@@ -163,7 +163,10 @@ restoration passed. An independent comparison of the already-cached FP8 checkpoi
 is prepared; it changes both expert weight precision and reference backend, so it
 will not isolate a single NVFP4 arithmetic difference.
 
-The [FP8 reference](2026-09-23-issue4-reference-fp8/README.md) launch stopped at
-the idle-production guard before any service interruption or test inference.
-Production is receiving live work; an exclusive GPU window is pending. The
-comparison is prepared, not an executed accuracy result.
+The initial [FP8 reference](2026-09-23-issue4-reference-fp8/README.md) launch
+stopped at the idle-production guard before any service interruption or test
+inference. The user subsequently authorized cluster testing. The retry passed
+both recorded idle checks, stopped production at 15:12 UTC and is loading the
+reference. Accuracy results are pending. A CPU-only check confirms both
+checkpoints have the same effective routing normalization, PLE seed and
+convolution width in the pinned reference.

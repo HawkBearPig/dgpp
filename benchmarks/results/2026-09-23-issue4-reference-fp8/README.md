@@ -1,4 +1,4 @@
-# Independent FP8 checkpoint reference — waiting for an exclusive GPU window
+# Independent FP8 checkpoint reference — running with the authorized cluster window
 
 DGPP's earlier FP8-checkpoint control also failed the original association. This
 comparison uses that same cached `Qwen/Qwen3.8-Flash-Next-FP8` revision
@@ -28,6 +28,13 @@ NVFP4 request. Exact production restoration is required after the campaign.
 
 The first launch aborted at its idle-service guard before stopping production or
 starting a reference world. It sent no test inference requests. `attempt1.json`
-records the exclusion; production remained live. A maintenance window is pending
-because new production traffic was observed. The prepared retry records both idle
-checks, including a second check immediately before the stop command.
+records the exclusion; production remained live. The user subsequently authorized
+stopping the cluster for testing. The retry passed both recorded idle checks and
+stopped production at 15:12 UTC; the reference is loading. Accuracy results are
+pending. The campaign restores production in its cleanup path.
+
+A CPU-only check instantiated the pinned reference configuration class for both
+checkpoints. Effective routing normalization, PLE seed and convolution width
+agree (`true`, `1234`, `4`), despite omitted optional metadata in the FP8 config.
+`effective-config-parity.json` records the values. The PLE consumer supplies seed
+1234 and GDN uses `linear_conv_kernel_dim`; neither omission changes execution.

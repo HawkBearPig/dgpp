@@ -1,0 +1,9 @@
+{
+  "config-parity.json": "5b76c1a8639d3e1b0a442b6e158e6491b2ffd999cb1b256c34fb37c985388d24",
+  "effective-config-parity.json": "39bc4403b4edf67ad011de81b41ab82321948a0cd36c3141309951c06275b51a",
+  "raw/reference-config.py": "0321b91c73ddf66546893379a946f2d7e3c53f8910d14d778824f39d289cbe7c",
+  "raw/reference-model-config.py": "ebc023291b0c6133a759645a5de625c0292c0743471a1ce110007d239d321b50",
+  "raw/config-defaults-stdout.log": "858f15e9293aa94fdb77ee71e5034c3d59bf4862b486247249aa50bff5b334b3",
+  "raw/config-defaults-stderr.log": "14710b591e9872468655e94d3bd6e8a89ac36b13a47a54b135e86f17a5f671a6",
+  "raw/effective-configs.json": "5040a8bca1f6f52138254005abf20513b8322df6b3a37a2dc069cd08c851aa40"
+}

@@ -1,0 +1,22 @@
+{
+  "checkpoint_config_sha256": {
+    "nvfp4": "deef67a61f3311faf051b23dc4192f442c7fee4f9cd2f38cbcbe4da55c763a80",
+    "fp8": "c22eb0a053eed62e18f0184d3ca62d3798f208c3e00b9feee939fc3dbacdc8ca"
+  },
+  "text_keys": 57,
+  "text_config_equal": false,
+  "text_differences": {
+    "norm_topk_prob": {
+      "nvfp4": true,
+      "fp8": null
+    },
+    "number_of_conv_states": {
+      "nvfp4": 3,
+      "fp8": null
+    },
+    "seed": {
+      "nvfp4": 1234,
+      "fp8": null
+    }
+  }
+}

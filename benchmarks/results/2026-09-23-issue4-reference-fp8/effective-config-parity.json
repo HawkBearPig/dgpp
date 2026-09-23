@@ -1,0 +1,25 @@
+{
+  "effective_differences": {
+    "seed": {
+      "nvfp4": 1234,
+      "fp8": null
+    },
+    "number_of_conv_states": {
+      "nvfp4": 3,
+      "fp8": null
+    }
+  },
+  "observed_consumer_values": {
+    "nvfp4": {
+      "effective_norm_topk_prob": true,
+      "effective_ple_seed": 1234,
+      "linear_conv_kernel_dim": 4
+    },
+    "fp8": {
+      "effective_norm_topk_prob": true,
+      "effective_ple_seed": 1234,
+      "linear_conv_kernel_dim": 4
+    }
+  },
+  "cpu_only_container": true
+}
