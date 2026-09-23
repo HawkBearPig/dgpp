@@ -6,5 +6,7 @@
   "weight_files": 131,
   "text_config_differences_from_fp8": {},
   "api_url": "https://huggingface.co/api/models/Qwen/Qwen3.8-Flash-Next/revision/de4b8e4d43b917e7706784d8bb445c9af86a3540?blobs=true",
-  "weights_download_started": false
+  "weights_download_started": true,
+  "download_scope": "33 snapshot files containing PLE tables for native NVFP4 TP2 precision isolation",
+  "full_model_inference_started": false
 }

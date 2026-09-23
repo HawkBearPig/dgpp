@@ -176,7 +176,13 @@ Higher expert precision with this independent backend does not repair retrieval.
 An earlier diagnostic assertion about checkpoint scale dtype was corrected and
 that aborted attempt is explicitly excluded from accuracy evidence.
 
-A full BF16 checkpoint is available, with identical text configuration to FP8,
-but no BF16 weights have been downloaded and no BF16 inference has run. It is
-an optional broader quantization control, not a prerequisite for a DGPP fix.
-Its result alone would not identify a specific engine defect.
+A full BF16 checkpoint is available, with identical text configuration to FP8.
+It is an optional broader quantization control, not a prerequisite for a DGPP
+fix; no full BF16 model run has started. The narrower
+[PLE precision comparison](2026-09-23-issue4-ple-quantization/README.md) is now
+in preparation. Small BF16 table samples show no large conversion/scaling
+discrepancy, but have a measured 2.67% relative FP8 quantization difference.
+The diagnostic will replace only n-gram table values while retaining native
+NVFP4 TP2 execution. Its server builds and CPU mapping regression pass;
+GPU validation and the unchanged-request comparison remain pending. Table-file
+downloads and a fully verified capture relocation prepare the required storage.

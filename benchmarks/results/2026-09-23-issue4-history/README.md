@@ -6,6 +6,12 @@ restored with its original binary hashes and resolved configuration, and an
 independent HTTP smoke test passed. The capture source is retained in
 `history.patch` and `issue4_history.hpp`.
 
+The 80.85 GB raw capture set has since been relocated to node 13 at
+`/home/stephen/dgpp-issue4-archive-20260923/history-captures`. All 1158 files
+passed independent size/SHA256 verification before the local copy was removed.
+The [relocation record](../2026-09-23-issue4-ple-quantization/capture-relocation.json)
+and adjacent complete manifests retain its identity and location.
+
 The independent PLE audit found a configuration defect: the trained model
 uses EOS `248044`, but serving overwrites its model configuration with
 `generation_config.json`'s stop list `[248046, 248044]`. Both PLE and session

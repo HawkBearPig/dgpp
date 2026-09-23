@@ -5,8 +5,11 @@ The official `Qwen/Qwen3.8-Flash-Next` snapshot
 Its text configuration exactly matches the tested FP8 snapshot. It has no
 quantization config and contains 359999963128 tensor bytes in 131 weight files
 (360000192888 bytes including headers; largest file 3510240000 bytes).
-Only public metadata, configuration, index and model card were read.
-**No BF16 weight download or inference has started.**
+The initial feasibility check read only public metadata, configuration, index
+and model card. No full BF16 checkpoint download or full BF16 inference has
+started. A later [PLE-only precision experiment](../2026-09-23-issue4-ple-quantization/README.md)
+has sampled BF16 table values and is fetching the 33 files containing the tables
+to isolate their precision while retaining the native NVFP4 TP2 engine.
 
 A full BF16 control could test whether the original association also fails
 without quantized expert weights and n-gram tables. It would require a separate
