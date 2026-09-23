@@ -87,6 +87,8 @@ for source, target in ((RECORD/'issue4_topk.py',TOPK_HELPER),(RAW/'qsa.py',QSA_P
     run('copy-'+Path(target).stem,['scp',target,'stephen@192.168.88.12:'+target])
 GDN_PATCH = '/tmp/dgpp-issue4-vllm-recurrent-gdn-20260923.py'
 GDN_SOURCE = '/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py'
+GDN_HASH = json.loads((RECORD/'source-provenance.json').read_text())['overlay_sha256']
+assert sha(RAW/'qwen_gdn_linear_attn.py') == GDN_HASH
 shutil.copy2(RAW/'qwen_gdn_linear_attn.py',GDN_PATCH)
 run('copy-gdn-overlay',['scp',GDN_PATCH,'stephen@192.168.88.12:'+GDN_PATCH])
 assert sha(ROOT / 'build-release/dgpp-serve') == EXPECTED_PROD
@@ -98,6 +100,9 @@ stopped = False
 try:
     stopped = True
     run('production-down', [sys.executable, str(ROOT / 'scripts/dgpp-cluster'), 'down', '--config', str(PROD)], timeout=120)
+    run('adapter-gpu-test',[sys.executable,str(RECORD/'run_adapter.py')],timeout=420)
+    unit = json.loads((RECORD/'receipt.json').read_text())
+    assert unit['returncode'] == 0 and unit['overlay_sha256'] == GDN_HASH
     for rank in (1,0):
         envs = {
             'HF_HOME':'/cache/huggingface', 'HF_HUB_OFFLINE':'1', 'TRANSFORMERS_OFFLINE':'1',
@@ -152,6 +157,7 @@ try:
         (RAW/f'rank{rank}-ready.log').write_text(logs)
         assert 'Issue4 control: recurrent GDN prefill with existing BF16 normalized Q/K' in logs
         assert 'MARLIN' in logs
+        assert inspect(rank,['docker','exec',NAME,'sha256sum',GDN_SOURCE]).split()[0] == GDN_HASH
     request=json.loads((EXACT/'raw/request.json').read_text())
     tokenize={k:request[k] for k in ('model','messages','chat_template_kwargs')}
     tokenize['add_generation_prompt']=True

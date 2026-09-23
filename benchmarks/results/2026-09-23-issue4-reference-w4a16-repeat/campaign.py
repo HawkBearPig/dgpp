@@ -13,7 +13,6 @@ import urllib.request
 import time
 import shlex
 import importlib.util
-import re
 
 ROOT = Path('/home/stephen/workspace/dgpp')
 WORK = Path('/tmp/dgpp-issue4-20260923')
@@ -80,13 +79,6 @@ for rank in (0,1):
     run(f'cache-dir-{rank}', on(rank, ['mkdir', '-p', CACHE]))
 shutil.copy2(RAW / 'ple_layer.py', PATCH)
 run('copy-reference-patch', ['scp', str(RAW / 'ple_layer.py'), 'stephen@192.168.88.12:' + PATCH])
-FINALIZE_PATCH = '/tmp/dgpp-issue4-vllm-finalize-20260923.py'
-FINALIZE_SOURCE = '/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/fused_moe/experts/flashinfer_cutlass_moe.py'
-FINALIZE_CACHE = '/cache/vllm-no-finalize/flashinfer_autotune_cache/0.6.17/121a/b54dae03d9ef53f9b63a229d72fb0adb59ccbd01fac00369b26845506a2425b7/autotune_configs.json'
-for rank in (0,1):
-    assert inspect(rank, ['docker','run','--rm','--runtime','runc','--network','none','-e','NVIDIA_VISIBLE_DEVICES=void','-v',CACHE+':/cache:ro','--entrypoint','sha256sum',IMAGE,FINALIZE_CACHE]).split()[0] == '4b34b1169b71e0fb3f8458c3636cf59bc9b7c569999e6a3606407fb961b1d3f8'
-shutil.copy2(RAW/'flashinfer_cutlass_moe.py',FINALIZE_PATCH)
-run('copy-finalize-overlay',['scp',FINALIZE_PATCH,'stephen@192.168.88.12:'+FINALIZE_PATCH])
 TRACE_PACKAGE = '/usr/local/lib/python3.12/dist-packages/vllm/models/qwen3_8_flash_next/nvidia/'
 TOPK_HELPER = '/tmp/dgpp-issue4-vllm-topk-20260923.py'
 QSA_PATCH = '/tmp/dgpp-issue4-vllm-qsa-20260923.py'
@@ -102,17 +94,10 @@ stopped = False
 try:
     stopped = True
     run('production-down', [sys.executable, str(ROOT / 'scripts/dgpp-cluster'), 'down', '--config', str(PROD)], timeout=120)
-    frozen = ROOT/'benchmarks/results/2026-09-23-issue4-gdn-frozen-reference'
-    unit = json.loads((frozen/'receipt.json').read_text())
-    assert unit['returncode'] == 0 and unit['script_sha256'] == sha(frozen/'compare.py')
-    summary = json.loads((frozen/'summary.json').read_text())
-    assert summary['cases'] == 16 and summary['all_finite']
-    for case in json.loads((frozen/'fixtures.json').read_text()):
-        assert sha(frozen/'raw/fixtures'/case['file']) == case['sha256']
     for rank in (1,0):
         envs = {
             'HF_HOME':'/cache/huggingface', 'HF_HUB_OFFLINE':'1', 'TRANSFORMERS_OFFLINE':'1',
-            'VLLM_CACHE_ROOT':'/cache/vllm-no-finalize', 'TRITON_CACHE_DIR':'/cache/triton',
+            'VLLM_CACHE_ROOT':'/cache/vllm-marlin', 'TRITON_CACHE_DIR':'/cache/triton',
             'VLLM_HOST_IP':f'192.168.88.{11+rank}', 'VLLM_ENGINE_READY_TIMEOUT_S':'3600',
             'PYTORCH_CUDA_ALLOC_CONF':'expandable_segments:True',
             'TORCH_CUDA_ARCH_LIST':'12.1a', 'FLASHINFER_CUDA_ARCH_LIST':'12.1a',
@@ -129,7 +114,6 @@ try:
                    '--device','/dev/infiniband:/dev/infiniband',
                    '-v',MODEL_HOST+':/hf-model:ro','-v',PATCH+':'+SOURCE+':ro',
                    '-v',CACHE+':/cache',
-                   '-v',FINALIZE_PATCH+':'+FINALIZE_SOURCE+':ro',
                    '-v',QSA_PATCH+':'+TRACE_PACKAGE+'ops/qsa.py:ro',
                    '-v',TOPK_HELPER+':'+TRACE_PACKAGE+'issue4_topk.py:ro']
         for key,val in envs.items(): command += ['-e',key+'='+val]
@@ -142,7 +126,7 @@ try:
                     '--max-model-len','262144','--max-num-seqs','1','--max-num-batched-tokens','2048',
                     '--gpu-memory-utilization','0.835','--kv-cache-memory-bytes','8589934592',
                     '--enable-chunked-prefill','--no-enable-prefix-caching','--mamba-cache-mode','none',
-                    '--enforce-eager','--reasoning-parser','qwen3','--enable-auto-tool-choice',
+                    '--moe-backend','marlin','--enforce-eager','--reasoning-parser','qwen3','--enable-auto-tool-choice',
                     '--tool-call-parser','qwen3_coder','--node-rank',str(rank)]
         if rank: command += ['--headless']
         started.append(rank)
@@ -159,19 +143,6 @@ try:
         if time.monotonic()>deadline: raise TimeoutError('reference startup')
         print(datetime.datetime.now(datetime.timezone.utc).isoformat(),'reference starting',flush=True)
         time.sleep(15)
-    # Assert the cache selected by the running workers, not just a file on disk.
-    cache_receipts = []
-    for rank in (0,1):
-        logs = subprocess.check_output(on(rank,['docker','logs',NAME]),stderr=subprocess.STDOUT,text=True,timeout=30)
-        (RAW/f'rank{rank}-ready.log').write_text(logs)
-        # Every worker logs actual config loading; only rank zero emits the
-        # vLLM "Using ..." announcement. Validate the shared loader evidence.
-        lines = re.findall(r'Loaded 42 configs from (\S+)', logs)
-        assert lines == [FINALIZE_CACHE], (rank, lines)
-        effective = inspect(rank,['docker','exec',NAME,'sha256sum',FINALIZE_CACHE]).split()[0]
-        assert effective == '4b34b1169b71e0fb3f8458c3636cf59bc9b7c569999e6a3606407fb961b1d3f8', (rank,effective)
-        cache_receipts.append({'rank':rank,'runtime_cache':lines[0],'sha256':effective})
-    (RAW/'effective-cache.json').write_text(json.dumps(cache_receipts,indent=2)+'\n')
     request=json.loads((EXACT/'raw/request.json').read_text())
     tokenize={k:request[k] for k in ('model','messages','chat_template_kwargs')}
     tokenize['add_generation_prompt']=True
@@ -231,4 +202,4 @@ finally:
         (RAW/'restoration.json').write_text(json.dumps({'binaries':binaries,'config_matches':True,'smoke':response,'idle':True},indent=2)+'\n')
         print('Production restored and independently verified',flush=True)
 
-print('Untraced deterministic W4A4 reference complete',flush=True)
+print('W4A16 reference control complete',flush=True)

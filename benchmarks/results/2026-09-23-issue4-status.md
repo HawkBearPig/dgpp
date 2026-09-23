@@ -34,7 +34,7 @@ consistency patch is not a prerequisite for the investigation.
 | [Expert output storage](2026-09-23-issue4-moe-staging/README.md) | Focused GPU check passes; same original 5/6 answer | Weighted-expert/shared BF16 stores are insufficient |
 | [Main Q/K rotation storage](2026-09-23-issue4-qsa-rope-staging/README.md) | Nine GPU tests pass; original request still 5/6 | FP32 main Q/K rotary products are insufficient to repair retrieval |
 | [Frozen GDN comparison](2026-09-23-issue4-gdn-frozen-reference/README.md) | 16 cases, all finite; recurrent capture agreement ≤0.033% output L2, chunk/recurrent difference ≤0.371% | Isolates normalized-input storage from recurrent/chunked arithmetic |
-| [Untraced W4A4 retry](2026-09-23-issue4-reference-w4a4-untraced-retry/README.md) | Loading after successful frozen-kernel check | Runtime-selected cache must match retained identity/hash before inference |
+| [Untraced W4A4 retry](2026-09-23-issue4-reference-w4a4-untraced-retry/README.md) | Both runtime cache checks pass; first request running | Runtime-selected cache must match retained identity/hash before inference |
 | [W4A16 recurrent-GDN reference](2026-09-23-issue4-reference-recurrent-gdn/README.md) | Prepared, not run | Changes only the successful reference’s GDN prefill algorithm |
 
 [Draft PR #34](https://github.com/HawkBearPig/dgpp/pull/34) separates generation
@@ -85,10 +85,13 @@ chunked arithmetic difference. The next causal control changes only GDN
 prefill in the successful Marlin reference to the recurrent operator, while
 preserving BF16-normalized inputs, gates and decode.
 
-The untraced W4A4 retry is loading, after the isolated frozen-kernel test. Its
-runtime-selected cache identity/hash will be checked on both workers before
-inference. The earlier attempt is invalid because an explicit backend option
+The untraced W4A4 retry passed runtime-selected cache identity/hash checks on
+both workers and is running its first unchanged request. The earlier attempt is invalid because an explicit backend option
 changed the cache identity and retuned 17 tactics. The retry's initial frozen
 harness API error produced no numerical data and triggered verified production
 restoration; that startup is quarantined. The corrected harness supplies the
 serving recurrent kernel's required state slots and completed successfully.
+
+A second fresh-world [unmodified W4A16 repeat](2026-09-23-issue4-reference-w4a16-repeat/README.md)
+is prepared, conditional on the recurrent-GDN swap changing accuracy, to
+complete an A/B/A comparison before attributing a cross-world difference.

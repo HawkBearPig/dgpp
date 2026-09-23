@@ -1,0 +1,15 @@
+{
+  "attempts": [
+    {
+      "directory": "raw/invalid-unit-startup",
+      "reason": "Frozen-kernel harness omitted required serving state slots; no TP2 reference world started.",
+      "restored": true
+    },
+    {
+      "directory": "raw/aborted-cache-log-parser",
+      "reason": "Actual cache paths correct on both workers, but checker expected rank-zero-only announcement on rank one; aborted before inference.",
+      "restored": true
+    }
+  ],
+  "current_checks": "Parse actual Loaded 42 configs evidence from both workers; verify runtime file hashes; reuse validated frozen GPU receipt."
+}

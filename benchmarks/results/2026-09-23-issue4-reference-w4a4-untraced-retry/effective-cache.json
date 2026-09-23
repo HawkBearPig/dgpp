@@ -1,0 +1,12 @@
+[
+  {
+    "rank": 0,
+    "runtime_cache": "/cache/vllm-no-finalize/flashinfer_autotune_cache/0.6.17/121a/b54dae03d9ef53f9b63a229d72fb0adb59ccbd01fac00369b26845506a2425b7/autotune_configs.json",
+    "sha256": "4b34b1169b71e0fb3f8458c3636cf59bc9b7c569999e6a3606407fb961b1d3f8"
+  },
+  {
+    "rank": 1,
+    "runtime_cache": "/cache/vllm-no-finalize/flashinfer_autotune_cache/0.6.17/121a/b54dae03d9ef53f9b63a229d72fb0adb59ccbd01fac00369b26845506a2425b7/autotune_configs.json",
+    "sha256": "4b34b1169b71e0fb3f8458c3636cf59bc9b7c569999e6a3606407fb961b1d3f8"
+  }
+]
