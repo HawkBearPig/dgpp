@@ -1,4 +1,4 @@
-# GDN normalization rounding control — GPU operator checks pass, original request running
+# GDN normalization rounding control — GPU operator checks pass; original request still 5/6
 
 The prior W4A16 GR/SwiGLU/checkpoint-dense combination still returns the original
 5/6 answer. This control changes only GDN gated normalization relative to that
@@ -17,3 +17,7 @@ If successful, further ablation must establish the minimal necessary fix.
 
 All three focused GPU normalization tests passed, including the independent
 FP64 GDN oracle and a check that distinguishes the old rounding policy.
+
+Executed retrieval result: the original wrong `val_5dac9ed720abddaf`, with
+184 completion tokens. Bounded control skipped. All four production binaries,
+configuration and inference restoration passed. This is not a fix for #4.

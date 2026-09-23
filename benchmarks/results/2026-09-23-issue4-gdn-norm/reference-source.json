@@ -1,0 +1,12 @@
+{
+  "image": "sha256:d464f3b466fa9c45ddbff8a812e80564503b6879a9fd95c1a47514f3f0df5a4a",
+  "source": "/usr/local/lib/python3.12/dist-packages/vllm/third_party/flash_linear_attention/ops/layernorm_guard.py",
+  "sha256": "7e9da2afea2b52edfc31341989b9e8d25d7c8a264a6d8a502cc9acb456264974",
+  "policy": "Input, affine weights, and output gate are promoted to FP32. Normalize, apply affine, multiply sigmoid, then store to output dtype. No intermediate BF16 cast.",
+  "relevant_lines": [
+    111,
+    146,
+    151,
+    167
+  ]
+}

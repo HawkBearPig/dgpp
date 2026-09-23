@@ -27,7 +27,8 @@ consistency patch is not a prerequisite for the investigation.
 | [W4A16 reference](2026-09-23-issue4-reference-w4a16/README.md) | Two identical 6/6 answers, 187 completion tokens | Repeatable successful reference in the tested world; other arithmetic differences remain |
 | [W4A16 DGPP rounding control](2026-09-23-issue4-reference-rounding-w4a16/README.md) | 5/6, same original wrong answer and 184 output tokens | GR/SwiGLU reference rounding with checkpoint dense projections is insufficient |
 | [Real-fixture expert replay](2026-09-23-issue4-moe-audit/README.md) | Exact capture parity; 576 local and 288 folded chains pass | No detected routed/shared expert error on sampled inputs |
-| [GDN normalization policy](2026-09-23-issue4-gdn-norm/README.md) | Built; original request campaign running | Keeps normalization/affine intermediates in FP32, following the pinned reference |
+| [GDN normalization policy](2026-09-23-issue4-gdn-norm/README.md) | Focused GPU tests pass; same original 5/6 answer | Lower operator error is insufficient to repair retrieval |
+| [FP32 routing weights](2026-09-23-issue4-router-fp32/README.md) | Building | Removes the extra BF16 cast after top-k renormalization |
 
 [Draft PR #34](https://github.com/HawkBearPig/dgpp/pull/34) separates generation
 stop IDs from trained model EOS, preserving PLE semantics. The release build,
@@ -64,6 +65,6 @@ The [real-fixture MoE audit](2026-09-23-issue4-moe-audit/README.md) passed all
 576 local and 288 folded chains, including routing/segmentation invariants. Its
 first, incorrectly configured attempt was quarantined; the valid capture has
 exact prediction/logprob/usage parity with the clean forced-prefix control.
-The next diagnostic changes GDN normalization to the pinned reference’s FP32
-intermediates; it has lower independent FP64 error in all 72 sampled rank/layer
-cases, but its effect on retrieval is not yet known.
+GDN normalization with FP32 intermediates has lower independent FP64 error in
+all 72 sampled rank/layer cases, but still returns the original 5/6 answer.
+The next control retains normalized expert routing weights in FP32.
