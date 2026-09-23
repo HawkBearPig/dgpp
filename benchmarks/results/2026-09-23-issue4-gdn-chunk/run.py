@@ -27,19 +27,20 @@ assert identity == IMAGE
 existing = subprocess.check_output(['ssh','-o','BatchMode=yes',NODE,
     shlex.join(['docker','ps','-aq','--filter','name=^/'+NAME+'$'])],text=True,timeout=20)
 assert not existing.strip(), 'Isolated test container already exists'
-call(['mkdir','-p',REMOTE+'/input',REMOTE+'/output'],timeout=20)
+CACHE='/tmp/dgpp-issue4-native-chunk-triton-cache-20260923'
+call(['mkdir','-p',REMOTE+'/input',REMOTE+'/output',CACHE],timeout=20)
 subprocess.run(['scp','-r',str(ROOT.parent/'2026-09-23-issue4-gdn-frozen-reference/raw/fixtures'),str(ROOT/'fixtures.json'),str(ROOT/'compare.py'),str(ROOT/'tuning.py'),str(ROOT/'raw/libgdn_chunk.so'),NODE+':'+REMOTE+'/input/'],check=True,timeout=120)
 code_hash=hashlib.sha256((ROOT/'compare.py').read_bytes()).hexdigest()
 start=time.monotonic()
 try:
     with (ROOT/'raw/gpu-comparison.log').open('w') as log:
         result = call(['docker','run','--rm','--gpus','all','--name',NAME,'--network','none',
-              '--memory','8g','--memory-swap','8g','-v',REMOTE+'/input:/inputs:ro',
+              '--memory','8g','--memory-swap','8g','-v',CACHE+':/triton-cache','-e','TRITON_CACHE_DIR=/triton-cache','-v',REMOTE+'/input:/inputs:ro',
               '-v',REMOTE+'/output:/output','--entrypoint','python3',IMAGE,'/inputs/compare.py'],
              stdout=log,stderr=subprocess.STDOUT,timeout=600,check=False)
-    for filename in ('comparison.json','regression-reference.json','regression-old-kernel.json','autotune-variation.json'):
+    for filename in ('comparison.json','regression-reference.json','regression-old-kernel.json','autotune-variation.json','reference-configs.json'):
         subprocess.run(['scp',NODE+':'+REMOTE+'/output/'+filename,str(ROOT/filename)],check=False,timeout=60)
-    (ROOT/'receipt.json').write_text(json.dumps({'node':NODE,'image':IMAGE,'script_sha256':code_hash,
+    (ROOT/'receipt.json').write_text(json.dumps({'node':NODE,'image':IMAGE,'script_sha256':code_hash,'tuning_sha256':hashlib.sha256((ROOT/'tuning.py').read_bytes()).hexdigest(),
         'library_sha256':hashlib.sha256((ROOT/'raw/libgdn_chunk.so').read_bytes()).hexdigest(),
         'idle_verified':True,'wall_seconds':time.monotonic()-start,'returncode':result.returncode},indent=2)+'\n')
 finally:

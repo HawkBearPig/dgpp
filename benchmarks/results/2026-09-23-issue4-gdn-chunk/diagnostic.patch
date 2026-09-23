@@ -12,10 +12,10 @@ index 59267a5..b2653e4 100644
    src/kernels/fp4_gemv.cu
 diff --git a/src/kernels/gdn_chunk.cu b/src/kernels/gdn_chunk.cu
 new file mode 100644
-index 0000000..e747ba5
+index 0000000..85e30f5
 --- /dev/null
 +++ b/src/kernels/gdn_chunk.cu
-@@ -0,0 +1,259 @@
+@@ -0,0 +1,263 @@
 +#include "kernels/gdn_chunk.hpp"
 +
 +#include <algorithm>
@@ -115,8 +115,12 @@ index 0000000..e747ba5
 +    float value = 0.f;
 +    if (j < i) {
 +      const float bi = beta[ch * B + i];
-+      for (int d = 0; d < D; ++d)
-+        value = fmaf(f(k[i * D + d]) * bi, f(k[j * D + d]), value);
++      for (int d = 0; d < D; ++d) {
++        // The reference's promoted beta*K operand enters a TF32 MMA.
++        // Its low 13 mantissa bits are discarded before multiplication.
++        const float scaled = __uint_as_float(__float_as_uint(f(k[i * D + d]) * bi) & 0xffffe000u);
++        value = fmaf(scaled, f(k[j * D + d]), value);
++      }
 +      value *= ex(g[ch * B + i] - g[ch * B + j]);
 +    }
 +    a[z] = value;

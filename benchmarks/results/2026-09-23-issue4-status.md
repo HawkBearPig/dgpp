@@ -36,7 +36,6 @@ consistency patch is not a prerequisite for the investigation.
 | [Frozen GDN comparison](2026-09-23-issue4-gdn-frozen-reference/README.md) | 16 cases, all finite; recurrent capture agreement ≤0.033% output L2, chunk/recurrent difference ≤0.371% | Isolates normalized-input storage from recurrent/chunked arithmetic |
 | [Untraced W4A4 retry](2026-09-23-issue4-reference-w4a4-untraced-retry/README.md) | Two identical 5/6 answers; full text/usage match traced reference | Tracing does not explain observed W4A4/W4A16 difference |
 | [W4A16 recurrent-GDN reference](2026-09-23-issue4-reference-recurrent-gdn/README.md) | Two identical 5/6 answers, exact DGPP text/token counts | A2 also fails: GDN causal attribution is not established |
-
 | [Fresh W4A16 repeat](2026-09-23-issue4-reference-w4a16-repeat/README.md) | Two original 5/6 answers with unchanged GDN | Earlier W4A16 success is not stable across fresh worlds |
 | [Expert router ties](2026-09-23-issue4-router-ties/README.md) | All 576 captured rows agree across prefill/decode batch shapes | No reference/DGPP expert-set differences on identical logits |
 
@@ -84,9 +83,8 @@ Their focused GPU checks pass, but no retrieval fix is established.
 The frozen reference GDN comparison completes all 16 first/final-chunk cases.
 Its recurrent FP32-normalization path closely matches the original captured
 DGPP recurrence; holding normalized inputs fixed separates the reference's
-chunked arithmetic difference. The next causal control changes only GDN
-prefill in the successful Marlin reference to the recurrent operator, while
-preserving BF16-normalized inputs, gates and decode.
+chunked arithmetic difference. The subsequent GDN swap preserves BF16-normalized inputs, gates and decode.
+The fresh unmodified repeat also fails, preventing causal attribution.
 
 The untraced W4A4 retry completed two identical 5/6 answers, matching the
 traced deterministic reference's full text and usage. Both runtime-selected
@@ -103,15 +101,14 @@ The recurrent GDN source adapter passed real-geometry GPU checks. Both full
 requests returned the original DGPP failure with exactly matching full text
 and token counts (184 completion tokens). Production restoration passed.
 
-A second fresh-world [unmodified W4A16 repeat](2026-09-23-issue4-reference-w4a16-repeat/README.md)
-completed with two original 5/6 failures. This prevents a causal conclusion
-from the preceding GDN swap. A native 64-token chunked GDN prototype has
-built and is undergoing frozen-input comparisons; it is not a validated fix.
+A fresh [unmodified W4A16 repeat](2026-09-23-issue4-reference-w4a16-repeat/README.md)
+returned the original DGPP failure twice, with exact full text/token-count
+agreement. Original GDN source hashes and Marlin selection were verified on
+both ranks. This invalidates causal attribution from the GDN swap.
 
-The fresh unmodified W4A16 reference (A2) also returned the original DGPP
-failure twice, with exact full text/token-count agreement. Original GDN
-source hashes and Marlin selection were verified on both ranks. This invalidates
-a causal conclusion from the GDN swap. Production restoration passed.
-The native chunked prototype remains diagnostic; the current campaign first
-compares it and reference launch configurations on frozen inputs, then permits
-a direct DGPP baseline/candidate test only if the operator checks pass.
+The [native chunked GDN prototype](2026-09-23-issue4-gdn-chunk/README.md)
+passes 24 operator comparisons and five executed GPU tests, but the unchanged
+original request still scores 5/6 with a different wrong record value,
+`val_7265273163533973` (190 completion tokens). Production restoration passed.
+The prototype is diagnostic and is not a proposed retrieval fix. A sixth
+fixture test has been built but not yet run on GPU.

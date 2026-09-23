@@ -1,0 +1,280 @@
+{
+  "tokens": 1194,
+  "key_heads": 8,
+  "value_heads": 24,
+  "kernel_cache_before_probe": {
+    "chunk_scaled_dot_kkt_fwd_kernel": {},
+    "recompute_w_u_fwd_kernel": {},
+    "chunk_gated_delta_rule_fwd_kernel_h_blockdim64": {},
+    "chunk_fwd_kernel_o": {},
+    "solve_tril_16x16_kernel": {},
+    "merge_16x16_to_32x32_inverse_kernel": {},
+    "merge_16x16_to_64x64_inverse_kernel": {}
+  },
+  "kkt_precision_controls": {
+    "fp32": {
+      "relative_l2": 0.00036217381693892024,
+      "max_abs": 0.00045293569564819336,
+      "different": 2016,
+      "elements": 4096,
+      "finite": true
+    },
+    "tf32_truncate": {
+      "relative_l2": 4.079388669556604e-07,
+      "max_abs": 6.556510925292969e-07,
+      "different": 2016,
+      "elements": 4096,
+      "finite": true
+    },
+    "tf32_nearest_even": {
+      "relative_l2": 0.00036462437297252534,
+      "max_abs": 0.0005126595497131348,
+      "different": 2015,
+      "elements": 4096,
+      "finite": true
+    },
+    "tf32_nearest_away": {
+      "relative_l2": 0.00036462437297252534,
+      "max_abs": 0.0005126595497131348,
+      "different": 2015,
+      "elements": 4096,
+      "finite": true
+    }
+  },
+  "complete": true,
+  "fixed_config_repeat_exact": true,
+  "changes": [
+    {
+      "kernel": "chunk_scaled_dot_kkt_fwd_kernel",
+      "baseline": {
+        "kwargs": {
+          "BK": 32
+        },
+        "num_warps": 2,
+        "num_stages": 2
+      },
+      "changed": {
+        "kwargs": {
+          "BK": 128
+        },
+        "num_warps": 8,
+        "num_stages": 4
+      },
+      "unsupported": [],
+      "output": {
+        "relative_l2": 0.0,
+        "max_abs": 0.0,
+        "different": 0,
+        "elements": 3667968,
+        "finite": true
+      },
+      "state": {
+        "relative_l2": 0.0,
+        "max_abs": 0.0,
+        "different": 0,
+        "elements": 393216,
+        "finite": true
+      }
+    },
+    {
+      "kernel": "recompute_w_u_fwd_kernel",
+      "baseline": {
+        "kwargs": {},
+        "num_warps": 2,
+        "num_stages": 2
+      },
+      "changed": {
+        "kwargs": {},
+        "num_warps": 8,
+        "num_stages": 4
+      },
+      "unsupported": [],
+      "output": {
+        "relative_l2": 0.0,
+        "max_abs": 0.0,
+        "different": 0,
+        "elements": 3667968,
+        "finite": true
+      },
+      "state": {
+        "relative_l2": 0.0,
+        "max_abs": 0.0,
+        "different": 0,
+        "elements": 393216,
+        "finite": true
+      }
+    },
+    {
+      "kernel": "chunk_gated_delta_rule_fwd_kernel_h_blockdim64",
+      "baseline": {
+        "kwargs": {
+          "BV": 32
+        },
+        "num_warps": 2,
+        "num_stages": 2
+      },
+      "changed": {
+        "kwargs": {
+          "BV": 64
+        },
+        "num_warps": 4,
+        "num_stages": 3
+      },
+      "unsupported": [
+        {
+          "config": {
+            "kwargs": {
+              "BV": 64
+            },
+            "num_warps": 4,
+            "num_stages": 4
+          },
+          "error": "out of resource: shared memory, Required: 131852, Hardware limit: 101376. Reducing block sizes or `num_stages` may help."
+        },
+        {
+          "config": {
+            "kwargs": {
+              "BV": 32
+            },
+            "num_warps": 4,
+            "num_stages": 4
+          },
+          "error": "out of resource: shared memory, Required: 115468, Hardware limit: 101376. Reducing block sizes or `num_stages` may help."
+        }
+      ],
+      "output": {
+        "relative_l2": 0.0,
+        "max_abs": 0.0,
+        "different": 0,
+        "elements": 3667968,
+        "finite": true
+      },
+      "state": {
+        "relative_l2": 0.0,
+        "max_abs": 0.0,
+        "different": 0,
+        "elements": 393216,
+        "finite": true
+      }
+    },
+    {
+      "kernel": "chunk_fwd_kernel_o",
+      "baseline": {
+        "kwargs": {
+          "BK": 32,
+          "BV": 32
+        },
+        "num_warps": 2,
+        "num_stages": 2
+      },
+      "changed": {
+        "kwargs": {
+          "BK": 64,
+          "BV": 64
+        },
+        "num_warps": 4,
+        "num_stages": 4
+      },
+      "unsupported": [],
+      "output": {
+        "relative_l2": 0.0,
+        "max_abs": 0.0,
+        "different": 0,
+        "elements": 3667968,
+        "finite": true
+      },
+      "state": {
+        "relative_l2": 0.0,
+        "max_abs": 0.0,
+        "different": 0,
+        "elements": 393216,
+        "finite": true
+      }
+    },
+    {
+      "kernel": "solve_tril_16x16_kernel",
+      "baseline": {
+        "kwargs": {},
+        "num_warps": 1,
+        "num_stages": 2
+      },
+      "changed": {
+        "kwargs": {},
+        "num_warps": 8,
+        "num_stages": 5
+      },
+      "unsupported": [],
+      "output": {
+        "relative_l2": 0.0,
+        "max_abs": 0.0,
+        "different": 0,
+        "elements": 3667968,
+        "finite": true
+      },
+      "state": {
+        "relative_l2": 0.0,
+        "max_abs": 0.0,
+        "different": 0,
+        "elements": 393216,
+        "finite": true
+      }
+    },
+    {
+      "kernel": "merge_16x16_to_32x32_inverse_kernel",
+      "baseline": {
+        "kwargs": {},
+        "num_warps": 1,
+        "num_stages": 2
+      },
+      "changed": {
+        "kwargs": {},
+        "num_warps": 8,
+        "num_stages": 5
+      },
+      "unsupported": [],
+      "output": {
+        "relative_l2": 0.0,
+        "max_abs": 0.0,
+        "different": 0,
+        "elements": 3667968,
+        "finite": true
+      },
+      "state": {
+        "relative_l2": 0.0,
+        "max_abs": 0.0,
+        "different": 0,
+        "elements": 393216,
+        "finite": true
+      }
+    },
+    {
+      "kernel": "merge_16x16_to_64x64_inverse_kernel",
+      "baseline": {
+        "kwargs": {},
+        "num_warps": 2,
+        "num_stages": 2
+      },
+      "changed": {
+        "kwargs": {},
+        "num_warps": 8,
+        "num_stages": 5
+      },
+      "unsupported": [],
+      "output": {
+        "relative_l2": 9.85792413218099e-06,
+        "max_abs": 3.814697265625e-06,
+        "different": 678,
+        "elements": 3667968,
+        "finite": true
+      },
+      "state": {
+        "relative_l2": 8.977436537883496e-06,
+        "max_abs": 1.1597294360399246e-05,
+        "different": 3748,
+        "elements": 393216,
+        "finite": true
+      }
+    }
+  ],
+  "scope": "Identical frozen inputs; does not establish which configurations ran in earlier full-model worlds."
+}

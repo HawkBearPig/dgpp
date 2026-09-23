@@ -74,6 +74,8 @@ def check(label,x,a,b,al,dt,initial,hk,hv):
 
 
 results=[]
+from tuning import pin_baseline
+pin_baseline()
 fixtures=json.loads((ROOT/'fixtures.json').read_text())
 loaded=[]
 for case in fixtures:

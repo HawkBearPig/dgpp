@@ -1,9 +1,10 @@
 {
   "node": "stephen@192.168.88.13",
   "image": "sha256:d464f3b466fa9c45ddbff8a812e80564503b6879a9fd95c1a47514f3f0df5a4a",
-  "script_sha256": "0b8b2bcbf67b30ff6a0cf80cd639379b55762e7e2f95d4b62e9f684be72385c0",
-  "library_sha256": "6a306ed92f81d2f22449b916a04e2cc62901d7e6bc20a65162f55ad29a820281",
+  "script_sha256": "02482ab5daef70eb898b10740622f5002e4e0cb4650fd5069a42648ed6c62a32",
+  "tuning_sha256": "363e022203a83ec1610a9691a6161f62b9efde8ba157d933c249363f5aef2d6c",
+  "library_sha256": "0cc3f9f702da81b86132ebba882bc2d7bd921f32678dd6d4de543f75ef0f7cab",
   "idle_verified": true,
-  "wall_seconds": 118.77629984501982,
-  "returncode": 1
+  "wall_seconds": 11.487763151002582,
+  "returncode": 0
 }
