@@ -32,7 +32,10 @@ consistency patch is not a prerequisite for the investigation.
 | [Untraced deterministic W4A4 reference](2026-09-23-issue4-reference-w4a4-untraced/README.md) | Invalid; aborted before verdict | Explicit backend option changed the cache identity and retuned 17 tactics |
 | [GDN normalized Q/K boundary](2026-09-23-issue4-gdn-qk-staging/README.md) | Four GPU tests pass; unchanged original answer remains 5/6 | Normalized-Q/K BF16 rounding is insufficient to repair the failure |
 | [Expert output storage](2026-09-23-issue4-moe-staging/README.md) | Focused GPU check passes; same original 5/6 answer | Weighted-expert/shared BF16 stores are insufficient |
-| [Main Q/K rotation storage](2026-09-23-issue4-qsa-rope-staging/README.md) | Nine GPU tests pass; original replay pending | Tests FP32 products in the active fused reference RoPE path |
+| [Main Q/K rotation storage](2026-09-23-issue4-qsa-rope-staging/README.md) | Nine GPU tests pass; original request still 5/6 | FP32 main Q/K rotary products are insufficient to repair retrieval |
+| [Frozen GDN comparison](2026-09-23-issue4-gdn-frozen-reference/README.md) | 16 cases, all finite; recurrent capture agreement ≤0.033% output L2, chunk/recurrent difference ≤0.371% | Isolates normalized-input storage from recurrent/chunked arithmetic |
+| [Untraced W4A4 retry](2026-09-23-issue4-reference-w4a4-untraced-retry/README.md) | Loading after successful frozen-kernel check | Runtime-selected cache must match retained identity/hash before inference |
+| [W4A16 recurrent-GDN reference](2026-09-23-issue4-reference-recurrent-gdn/README.md) | Prepared, not run | Changes only the successful reference’s GDN prefill algorithm |
 
 [Draft PR #34](https://github.com/HawkBearPig/dgpp/pull/34) separates generation
 stop IDs from trained model EOS, preserving PLE semantics. The release build,
@@ -71,11 +74,21 @@ first, incorrectly configured attempt was quarantined; the valid capture has
 exact prediction/logprob/usage parity with the clean forced-prefix control.
 GDN normalization with FP32 intermediates has lower independent FP64 error in
 all 72 sampled rank/layer cases, but still returns the original 5/6 answer.
-FP32 expert routing weights also leave the original answer unchanged. The next
-DGPP control adds the reference prefill’s normalized-Q/K BF16 boundary; all four
-GDN GPU tests pass and the old kernel fails the new-boundary oracle, but the
-original request still produces the identical 5/6 answer. The next control
-adds the main Q/K reference rotation policy. Marlin-like expert output storage
-boundaries also leave the original 5/6 answer unchanged. The untraced W4A4 attempt was aborted because
-an explicit backend option changed the runtime cache identity and retuned
-17 tactics; no accuracy conclusion is drawn from that invalid comparison.
+FP32 routing weights, normalized GDN Q/K storage, expert output storage and
+main Q/K rotation storage all leave the original 5/6 answer unchanged.
+Their focused GPU checks pass, but no retrieval fix is established.
+
+The frozen reference GDN comparison completes all 16 first/final-chunk cases.
+Its recurrent FP32-normalization path closely matches the original captured
+DGPP recurrence; holding normalized inputs fixed separates the reference's
+chunked arithmetic difference. The next causal control changes only GDN
+prefill in the successful Marlin reference to the recurrent operator, while
+preserving BF16-normalized inputs, gates and decode.
+
+The untraced W4A4 retry is loading, after the isolated frozen-kernel test. Its
+runtime-selected cache identity/hash will be checked on both workers before
+inference. The earlier attempt is invalid because an explicit backend option
+changed the cache identity and retuned 17 tactics. The retry's initial frozen
+harness API error produced no numerical data and triggered verified production
+restoration; that startup is quarantined. The corrected harness supplies the
+serving recurrent kernel's required state slots and completed successfully.

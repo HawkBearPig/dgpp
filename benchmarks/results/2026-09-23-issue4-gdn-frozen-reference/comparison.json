@@ -1,0 +1,946 @@
+[
+  {
+    "case": {
+      "rank": 0,
+      "layer": 0,
+      "position": 0,
+      "tokens": 2048,
+      "file": "rank0-layer0-position0.npz",
+      "sha256": "dd9b595c8dd0cebb1aee448b19dba27073bf69cf11c99dab1ccbca60e10f8c04"
+    },
+    "checks": {
+      "reference_recurrent_vs_captured_core": {
+        "relative_l2": 1.1462368081005926e-06,
+        "max_abs": 4.76837158203125e-07,
+        "different": 68,
+        "elements": 262144,
+        "finite": true
+      },
+      "reference_recurrent_vs_captured_state": {
+        "relative_l2": 3.374179649525838e-07,
+        "max_abs": 4.172325134277344e-07,
+        "different": 15590,
+        "elements": 16384,
+        "finite": true
+      },
+      "normalized_storage_output": {
+        "relative_l2": 0.0023531538769257787,
+        "max_abs": 0.0001220703125,
+        "different": 116378,
+        "elements": 262144,
+        "finite": true
+      },
+      "normalized_storage_state": {
+        "relative_l2": 0.0006084819891497732,
+        "max_abs": 0.000517040491104126,
+        "different": 16382,
+        "elements": 16384,
+        "finite": true
+      },
+      "chunk_vs_recurrent_output": {
+        "relative_l2": 0.002614383259226682,
+        "max_abs": 0.0001220703125,
+        "different": 158604,
+        "elements": 262144,
+        "finite": true
+      },
+      "chunk_vs_recurrent_state": {
+        "relative_l2": 0.0031592553020607927,
+        "max_abs": 0.0030786991119384766,
+        "different": 16384,
+        "elements": 16384,
+        "finite": true
+      }
+    },
+    "timings_seconds_including_first_compile": {
+      "recurrent_fp32_normalization": 0.42545246800000314,
+      "recurrent_bf16_normalization": 0.33134579300531186,
+      "chunk_bf16_normalization": 34.926150545012206
+    }
+  },
+  {
+    "case": {
+      "rank": 0,
+      "layer": 0,
+      "position": 260096,
+      "tokens": 1194,
+      "file": "rank0-layer0-position260096.npz",
+      "sha256": "68073c7ea54520546d5da9c91f7c3b343f50de35ea9e8e44e114558afa0f4bac"
+    },
+    "checks": {
+      "reference_recurrent_vs_captured_core": {
+        "relative_l2": 4.092136797225687e-06,
+        "max_abs": 1.9073486328125e-06,
+        "different": 42,
+        "elements": 152832,
+        "finite": true
+      },
+      "reference_recurrent_vs_captured_state": {
+        "relative_l2": 1.9627559663442582e-07,
+        "max_abs": 2.384185791015625e-07,
+        "different": 14530,
+        "elements": 16384,
+        "finite": true
+      },
+      "normalized_storage_output": {
+        "relative_l2": 0.002398378321497877,
+        "max_abs": 0.0001220703125,
+        "different": 67857,
+        "elements": 152832,
+        "finite": true
+      },
+      "normalized_storage_state": {
+        "relative_l2": 0.0006087108658994632,
+        "max_abs": 0.0004119575023651123,
+        "different": 16383,
+        "elements": 16384,
+        "finite": true
+      },
+      "chunk_vs_recurrent_output": {
+        "relative_l2": 0.002648827715167076,
+        "max_abs": 0.0001220703125,
+        "different": 91724,
+        "elements": 152832,
+        "finite": true
+      },
+      "chunk_vs_recurrent_state": {
+        "relative_l2": 0.0026461371066918804,
+        "max_abs": 0.002834498882293701,
+        "different": 16383,
+        "elements": 16384,
+        "finite": true
+      }
+    },
+    "timings_seconds_including_first_compile": {
+      "recurrent_fp32_normalization": 0.402433741997811,
+      "recurrent_bf16_normalization": 0.35125995900307316,
+      "chunk_bf16_normalization": 0.0007546590059064329
+    }
+  },
+  {
+    "case": {
+      "rank": 0,
+      "layer": 16,
+      "position": 0,
+      "tokens": 2048,
+      "file": "rank0-layer16-position0.npz",
+      "sha256": "91fdf541cf35bf16e1b825f8b2c6d282b2ad1cd8532606085aa73d4917ec6ca5"
+    },
+    "checks": {
+      "reference_recurrent_vs_captured_core": {
+        "relative_l2": 2.881919897281226e-05,
+        "max_abs": 7.62939453125e-06,
+        "different": 267,
+        "elements": 262144,
+        "finite": true
+      },
+      "reference_recurrent_vs_captured_state": {
+        "relative_l2": 1.5303207721056866e-06,
+        "max_abs": 2.7567148208618164e-07,
+        "different": 16294,
+        "elements": 16384,
+        "finite": true
+      },
+      "normalized_storage_output": {
+        "relative_l2": 0.001810706663586659,
+        "max_abs": 6.103515625e-05,
+        "different": 84391,
+        "elements": 262144,
+        "finite": true
+      },
+      "normalized_storage_state": {
+        "relative_l2": 0.000631606830607954,
+        "max_abs": 0.0001004934310913086,
+        "different": 16384,
+        "elements": 16384,
+        "finite": true
+      },
+      "chunk_vs_recurrent_output": {
+        "relative_l2": 0.002060055788778195,
+        "max_abs": 6.103515625e-05,
+        "different": 110705,
+        "elements": 262144,
+        "finite": true
+      },
+      "chunk_vs_recurrent_state": {
+        "relative_l2": 0.0012037133107451975,
+        "max_abs": 0.0002797372289933264,
+        "different": 16384,
+        "elements": 16384,
+        "finite": true
+      }
+    },
+    "timings_seconds_including_first_compile": {
+      "recurrent_fp32_normalization": 0.0036450219922699034,
+      "recurrent_bf16_normalization": 0.003198461010470055,
+      "chunk_bf16_normalization": 0.0008727710082894191
+    }
+  },
+  {
+    "case": {
+      "rank": 0,
+      "layer": 16,
+      "position": 260096,
+      "tokens": 1194,
+      "file": "rank0-layer16-position260096.npz",
+      "sha256": "63a157432918a07a0399d06d9617d851de036a38e2d91028e486696a84afbedf"
+    },
+    "checks": {
+      "reference_recurrent_vs_captured_core": {
+        "relative_l2": 2.56474449941708e-05,
+        "max_abs": 3.814697265625e-06,
+        "different": 89,
+        "elements": 152832,
+        "finite": true
+      },
+      "reference_recurrent_vs_captured_state": {
+        "relative_l2": 1.2716763811797817e-06,
+        "max_abs": 3.8743019104003906e-07,
+        "different": 16185,
+        "elements": 16384,
+        "finite": true
+      },
+      "normalized_storage_output": {
+        "relative_l2": 0.0018725698521797872,
+        "max_abs": 6.103515625e-05,
+        "different": 53976,
+        "elements": 152832,
+        "finite": true
+      },
+      "normalized_storage_state": {
+        "relative_l2": 0.0009734970715621633,
+        "max_abs": 0.00012448057532310486,
+        "different": 16384,
+        "elements": 16384,
+        "finite": true
+      },
+      "chunk_vs_recurrent_output": {
+        "relative_l2": 0.002464165877654632,
+        "max_abs": 6.103515625e-05,
+        "different": 75638,
+        "elements": 152832,
+        "finite": true
+      },
+      "chunk_vs_recurrent_state": {
+        "relative_l2": 0.0020754657204599208,
+        "max_abs": 0.0005304962396621704,
+        "different": 16384,
+        "elements": 16384,
+        "finite": true
+      }
+    },
+    "timings_seconds_including_first_compile": {
+      "recurrent_fp32_normalization": 0.002168439998058602,
+      "recurrent_bf16_normalization": 0.001843303005443886,
+      "chunk_bf16_normalization": 0.00046160200145095587
+    }
+  },
+  {
+    "case": {
+      "rank": 0,
+      "layer": 32,
+      "position": 0,
+      "tokens": 2048,
+      "file": "rank0-layer32-position0.npz",
+      "sha256": "e58aeed6f5656d6a689996a7dcaf48cce988311bb496d791e2cac6660985f3a0"
+    },
+    "checks": {
+      "reference_recurrent_vs_captured_core": {
+        "relative_l2": 0.00014331243569003178,
+        "max_abs": 6.103515625e-05,
+        "different": 1418,
+        "elements": 262144,
+        "finite": true
+      },
+      "reference_recurrent_vs_captured_state": {
+        "relative_l2": 2.548130463052915e-05,
+        "max_abs": 1.2755393981933594e-05,
+        "different": 16374,
+        "elements": 16384,
+        "finite": true
+      },
+      "normalized_storage_output": {
+        "relative_l2": 0.002283502315626525,
+        "max_abs": 0.0001220703125,
+        "different": 127663,
+        "elements": 262144,
+        "finite": true
+      },
+      "normalized_storage_state": {
+        "relative_l2": 0.0014289036757370523,
+        "max_abs": 0.0010972023010253906,
+        "different": 16383,
+        "elements": 16384,
+        "finite": true
+      },
+      "chunk_vs_recurrent_output": {
+        "relative_l2": 0.0026032226575432825,
+        "max_abs": 6.103515625e-05,
+        "different": 125733,
+        "elements": 262144,
+        "finite": true
+      },
+      "chunk_vs_recurrent_state": {
+        "relative_l2": 0.0013167947050702258,
+        "max_abs": 0.00045371055603027344,
+        "different": 16384,
+        "elements": 16384,
+        "finite": true
+      }
+    },
+    "timings_seconds_including_first_compile": {
+      "recurrent_fp32_normalization": 0.00363500599632971,
+      "recurrent_bf16_normalization": 0.0030990200029918924,
+      "chunk_bf16_normalization": 0.0004541139933280647
+    }
+  },
+  {
+    "case": {
+      "rank": 0,
+      "layer": 32,
+      "position": 260096,
+      "tokens": 1194,
+      "file": "rank0-layer32-position260096.npz",
+      "sha256": "1329fcbf03683b74edabebf1ebdc27dbeb3ef3365ea1caba40279931eba78b52"
+    },
+    "checks": {
+      "reference_recurrent_vs_captured_core": {
+        "relative_l2": 0.00014343584901315608,
+        "max_abs": 6.103515625e-05,
+        "different": 276,
+        "elements": 152832,
+        "finite": true
+      },
+      "reference_recurrent_vs_captured_state": {
+        "relative_l2": 3.5898247975553304e-06,
+        "max_abs": 6.705522537231445e-07,
+        "different": 16287,
+        "elements": 16384,
+        "finite": true
+      },
+      "normalized_storage_output": {
+        "relative_l2": 0.00190751954209457,
+        "max_abs": 0.0001220703125,
+        "different": 62458,
+        "elements": 152832,
+        "finite": true
+      },
+      "normalized_storage_state": {
+        "relative_l2": 0.0008582492402798755,
+        "max_abs": 0.00010795705020427704,
+        "different": 16384,
+        "elements": 16384,
+        "finite": true
+      },
+      "chunk_vs_recurrent_output": {
+        "relative_l2": 0.0019687285879191364,
+        "max_abs": 0.0001220703125,
+        "different": 64168,
+        "elements": 152832,
+        "finite": true
+      },
+      "chunk_vs_recurrent_state": {
+        "relative_l2": 0.0015934151113917248,
+        "max_abs": 0.0002542361617088318,
+        "different": 16384,
+        "elements": 16384,
+        "finite": true
+      }
+    },
+    "timings_seconds_including_first_compile": {
+      "recurrent_fp32_normalization": 0.0021521040034713224,
+      "recurrent_bf16_normalization": 0.0018304870027350262,
+      "chunk_bf16_normalization": 0.0006312180048553273
+    }
+  },
+  {
+    "case": {
+      "rank": 0,
+      "layer": 46,
+      "position": 0,
+      "tokens": 2048,
+      "file": "rank0-layer46-position0.npz",
+      "sha256": "85293f3a6e4a478eb92bc2446cea3b5160ced0e972236068b28623418700ac2d"
+    },
+    "checks": {
+      "reference_recurrent_vs_captured_core": {
+        "relative_l2": 1.4345890382222052e-05,
+        "max_abs": 9.5367431640625e-07,
+        "different": 21,
+        "elements": 262144,
+        "finite": true
+      },
+      "reference_recurrent_vs_captured_state": {
+        "relative_l2": 6.533257615575017e-08,
+        "max_abs": 7.450580596923828e-09,
+        "different": 10103,
+        "elements": 16384,
+        "finite": true
+      },
+      "normalized_storage_output": {
+        "relative_l2": 0.0019682146318844526,
+        "max_abs": 3.0517578125e-05,
+        "different": 64554,
+        "elements": 262144,
+        "finite": true
+      },
+      "normalized_storage_state": {
+        "relative_l2": 0.0011664226971496408,
+        "max_abs": 6.02230429649353e-05,
+        "different": 16384,
+        "elements": 16384,
+        "finite": true
+      },
+      "chunk_vs_recurrent_output": {
+        "relative_l2": 0.003496045951618868,
+        "max_abs": 3.0517578125e-05,
+        "different": 118141,
+        "elements": 262144,
+        "finite": true
+      },
+      "chunk_vs_recurrent_state": {
+        "relative_l2": 0.002622240345434544,
+        "max_abs": 0.0001763477921485901,
+        "different": 16384,
+        "elements": 16384,
+        "finite": true
+      }
+    },
+    "timings_seconds_including_first_compile": {
+      "recurrent_fp32_normalization": 0.0036147339997114614,
+      "recurrent_bf16_normalization": 0.0030866680026520044,
+      "chunk_bf16_normalization": 0.0004454260051716119
+    }
+  },
+  {
+    "case": {
+      "rank": 0,
+      "layer": 46,
+      "position": 260096,
+      "tokens": 1194,
+      "file": "rank0-layer46-position260096.npz",
+      "sha256": "da2892f1760aa2ebe823d8f2feeb4736a8755c1ababfee252bbc3858637d250d"
+    },
+    "checks": {
+      "reference_recurrent_vs_captured_core": {
+        "relative_l2": 4.4639366435734496e-06,
+        "max_abs": 4.76837158203125e-07,
+        "different": 20,
+        "elements": 152832,
+        "finite": true
+      },
+      "reference_recurrent_vs_captured_state": {
+        "relative_l2": 6.763119994634187e-08,
+        "max_abs": 3.725290298461914e-09,
+        "different": 10803,
+        "elements": 16384,
+        "finite": true
+      },
+      "normalized_storage_output": {
+        "relative_l2": 0.0017434341153772161,
+        "max_abs": 3.0517578125e-05,
+        "different": 66241,
+        "elements": 152832,
+        "finite": true
+      },
+      "normalized_storage_state": {
+        "relative_l2": 0.0011214304475901386,
+        "max_abs": 5.5477023124694824e-05,
+        "different": 16384,
+        "elements": 16384,
+        "finite": true
+      },
+      "chunk_vs_recurrent_output": {
+        "relative_l2": 0.0035484483332999064,
+        "max_abs": 6.103515625e-05,
+        "different": 74695,
+        "elements": 152832,
+        "finite": true
+      },
+      "chunk_vs_recurrent_state": {
+        "relative_l2": 0.0025598772035629954,
+        "max_abs": 0.0001298319548368454,
+        "different": 16384,
+        "elements": 16384,
+        "finite": true
+      }
+    },
+    "timings_seconds_including_first_compile": {
+      "recurrent_fp32_normalization": 0.002152472996385768,
+      "recurrent_bf16_normalization": 0.0018180710030719638,
+      "chunk_bf16_normalization": 0.0004131219902774319
+    }
+  },
+  {
+    "case": {
+      "rank": 1,
+      "layer": 0,
+      "position": 0,
+      "tokens": 2048,
+      "file": "rank1-layer0-position0.npz",
+      "sha256": "811be235620affed720b5f8b7629e5769f62a5bae6aee11754f6ccc4f39d286a"
+    },
+    "checks": {
+      "reference_recurrent_vs_captured_core": {
+        "relative_l2": 3.462280894860899e-05,
+        "max_abs": 3.814697265625e-06,
+        "different": 27,
+        "elements": 262144,
+        "finite": true
+      },
+      "reference_recurrent_vs_captured_state": {
+        "relative_l2": 5.521455438108128e-08,
+        "max_abs": 1.4901161193847656e-08,
+        "different": 14057,
+        "elements": 16384,
+        "finite": true
+      },
+      "normalized_storage_output": {
+        "relative_l2": 0.0028001446274543177,
+        "max_abs": 1.52587890625e-05,
+        "different": 98877,
+        "elements": 262144,
+        "finite": true
+      },
+      "normalized_storage_state": {
+        "relative_l2": 0.0007486336567106578,
+        "max_abs": 0.0001665651798248291,
+        "different": 16384,
+        "elements": 16384,
+        "finite": true
+      },
+      "chunk_vs_recurrent_output": {
+        "relative_l2": 0.003534056635735714,
+        "max_abs": 1.52587890625e-05,
+        "different": 132058,
+        "elements": 262144,
+        "finite": true
+      },
+      "chunk_vs_recurrent_state": {
+        "relative_l2": 0.0022092796152913506,
+        "max_abs": 0.00045387446880340576,
+        "different": 16384,
+        "elements": 16384,
+        "finite": true
+      }
+    },
+    "timings_seconds_including_first_compile": {
+      "recurrent_fp32_normalization": 0.003557260992238298,
+      "recurrent_bf16_normalization": 0.0032851799915079027,
+      "chunk_bf16_normalization": 0.0004364810010883957
+    }
+  },
+  {
+    "case": {
+      "rank": 1,
+      "layer": 0,
+      "position": 260096,
+      "tokens": 1194,
+      "file": "rank1-layer0-position260096.npz",
+      "sha256": "9ec469a2967bf4c855909c1f307c4f5ca057c3ff10e8faf5def3dff144ae7925"
+    },
+    "checks": {
+      "reference_recurrent_vs_captured_core": {
+        "relative_l2": 6.694593354905413e-05,
+        "max_abs": 3.814697265625e-06,
+        "different": 9,
+        "elements": 152832,
+        "finite": true
+      },
+      "reference_recurrent_vs_captured_state": {
+        "relative_l2": 9.028994514430421e-08,
+        "max_abs": 2.9802322387695312e-08,
+        "different": 12736,
+        "elements": 16384,
+        "finite": true
+      },
+      "normalized_storage_output": {
+        "relative_l2": 0.0028568189616821676,
+        "max_abs": 7.62939453125e-06,
+        "different": 58187,
+        "elements": 152832,
+        "finite": true
+      },
+      "normalized_storage_state": {
+        "relative_l2": 0.0010297133442880365,
+        "max_abs": 0.00022251997143030167,
+        "different": 16384,
+        "elements": 16384,
+        "finite": true
+      },
+      "chunk_vs_recurrent_output": {
+        "relative_l2": 0.003491528131974658,
+        "max_abs": 1.52587890625e-05,
+        "different": 76425,
+        "elements": 152832,
+        "finite": true
+      },
+      "chunk_vs_recurrent_state": {
+        "relative_l2": 0.0027824382093929257,
+        "max_abs": 0.0007677078247070312,
+        "different": 16384,
+        "elements": 16384,
+        "finite": true
+      }
+    },
+    "timings_seconds_including_first_compile": {
+      "recurrent_fp32_normalization": 0.0021625840017804876,
+      "recurrent_bf16_normalization": 0.0019245519943069667,
+      "chunk_bf16_normalization": 0.0004106740088900551
+    }
+  },
+  {
+    "case": {
+      "rank": 1,
+      "layer": 16,
+      "position": 0,
+      "tokens": 2048,
+      "file": "rank1-layer16-position0.npz",
+      "sha256": "a0e68ee9d9569d79236e5ee4332f2f06b4c4c59a98ce86bcad0cfd1c4c7a1456"
+    },
+    "checks": {
+      "reference_recurrent_vs_captured_core": {
+        "relative_l2": 0.00032926344569069235,
+        "max_abs": 3.0517578125e-05,
+        "different": 1978,
+        "elements": 262144,
+        "finite": true
+      },
+      "reference_recurrent_vs_captured_state": {
+        "relative_l2": 2.831305218945727e-05,
+        "max_abs": 1.6063451766967773e-05,
+        "different": 16383,
+        "elements": 16384,
+        "finite": true
+      },
+      "normalized_storage_output": {
+        "relative_l2": 0.0034626619305588384,
+        "max_abs": 3.814697265625e-05,
+        "different": 131236,
+        "elements": 262144,
+        "finite": true
+      },
+      "normalized_storage_state": {
+        "relative_l2": 0.0008227235511789433,
+        "max_abs": 0.0002363845705986023,
+        "different": 16383,
+        "elements": 16384,
+        "finite": true
+      },
+      "chunk_vs_recurrent_output": {
+        "relative_l2": 0.003707201169041211,
+        "max_abs": 6.103515625e-05,
+        "different": 140615,
+        "elements": 262144,
+        "finite": true
+      },
+      "chunk_vs_recurrent_state": {
+        "relative_l2": 0.0013230256591647673,
+        "max_abs": 0.000896751880645752,
+        "different": 16384,
+        "elements": 16384,
+        "finite": true
+      }
+    },
+    "timings_seconds_including_first_compile": {
+      "recurrent_fp32_normalization": 0.0036277109902584925,
+      "recurrent_bf16_normalization": 0.0031792279914952815,
+      "chunk_bf16_normalization": 0.0005237949953880161
+    }
+  },
+  {
+    "case": {
+      "rank": 1,
+      "layer": 16,
+      "position": 260096,
+      "tokens": 1194,
+      "file": "rank1-layer16-position260096.npz",
+      "sha256": "e937a69d17aec75e90f8db552a31c3ec8c887b60f530274162ea0e4637440f80"
+    },
+    "checks": {
+      "reference_recurrent_vs_captured_core": {
+        "relative_l2": 8.203417325359795e-05,
+        "max_abs": 1.52587890625e-05,
+        "different": 143,
+        "elements": 152832,
+        "finite": true
+      },
+      "reference_recurrent_vs_captured_state": {
+        "relative_l2": 4.768694278656304e-06,
+        "max_abs": 2.086162567138672e-06,
+        "different": 16362,
+        "elements": 16384,
+        "finite": true
+      },
+      "normalized_storage_output": {
+        "relative_l2": 0.0027142544561225904,
+        "max_abs": 3.0517578125e-05,
+        "different": 65397,
+        "elements": 152832,
+        "finite": true
+      },
+      "normalized_storage_state": {
+        "relative_l2": 0.0003623352995309616,
+        "max_abs": 9.237974882125854e-05,
+        "different": 16383,
+        "elements": 16384,
+        "finite": true
+      },
+      "chunk_vs_recurrent_output": {
+        "relative_l2": 0.0028292052515487285,
+        "max_abs": 3.0517578125e-05,
+        "different": 65921,
+        "elements": 152832,
+        "finite": true
+      },
+      "chunk_vs_recurrent_state": {
+        "relative_l2": 0.0008250531700916317,
+        "max_abs": 0.00042384862899780273,
+        "different": 16384,
+        "elements": 16384,
+        "finite": true
+      }
+    },
+    "timings_seconds_including_first_compile": {
+      "recurrent_fp32_normalization": 0.0021471600048244,
+      "recurrent_bf16_normalization": 0.0019442949997028336,
+      "chunk_bf16_normalization": 0.00041182599670719355
+    }
+  },
+  {
+    "case": {
+      "rank": 1,
+      "layer": 32,
+      "position": 0,
+      "tokens": 2048,
+      "file": "rank1-layer32-position0.npz",
+      "sha256": "12b91cb03270b8a273f1af8af367df00dd624d037b16cd50f2512fb31982befb"
+    },
+    "checks": {
+      "reference_recurrent_vs_captured_core": {
+        "relative_l2": 0.00021712221036474452,
+        "max_abs": 3.0517578125e-05,
+        "different": 506,
+        "elements": 262144,
+        "finite": true
+      },
+      "reference_recurrent_vs_captured_state": {
+        "relative_l2": 4.1222763321755616e-06,
+        "max_abs": 5.21540641784668e-07,
+        "different": 16344,
+        "elements": 16384,
+        "finite": true
+      },
+      "normalized_storage_output": {
+        "relative_l2": 0.0021137565648212116,
+        "max_abs": 3.0517578125e-05,
+        "different": 89438,
+        "elements": 262144,
+        "finite": true
+      },
+      "normalized_storage_state": {
+        "relative_l2": 0.0007380194474383238,
+        "max_abs": 7.576122879981995e-05,
+        "different": 16384,
+        "elements": 16384,
+        "finite": true
+      },
+      "chunk_vs_recurrent_output": {
+        "relative_l2": 0.0028625989062682523,
+        "max_abs": 3.0517578125e-05,
+        "different": 114580,
+        "elements": 262144,
+        "finite": true
+      },
+      "chunk_vs_recurrent_state": {
+        "relative_l2": 0.001411869735136287,
+        "max_abs": 8.844956755638123e-05,
+        "different": 16383,
+        "elements": 16384,
+        "finite": true
+      }
+    },
+    "timings_seconds_including_first_compile": {
+      "recurrent_fp32_normalization": 0.0036064300074940547,
+      "recurrent_bf16_normalization": 0.0030643960053566843,
+      "chunk_bf16_normalization": 0.0007595860079163685
+    }
+  },
+  {
+    "case": {
+      "rank": 1,
+      "layer": 32,
+      "position": 260096,
+      "tokens": 1194,
+      "file": "rank1-layer32-position260096.npz",
+      "sha256": "36da5ce1d3356822dab23dffa961d95dd3357c3c6546b4f0127d1e602054e239"
+    },
+    "checks": {
+      "reference_recurrent_vs_captured_core": {
+        "relative_l2": 9.066869561552114e-05,
+        "max_abs": 7.62939453125e-06,
+        "different": 338,
+        "elements": 152832,
+        "finite": true
+      },
+      "reference_recurrent_vs_captured_state": {
+        "relative_l2": 8.364151681560586e-07,
+        "max_abs": 7.450580596923828e-08,
+        "different": 15967,
+        "elements": 16384,
+        "finite": true
+      },
+      "normalized_storage_output": {
+        "relative_l2": 0.0020080555946118276,
+        "max_abs": 6.103515625e-05,
+        "different": 46180,
+        "elements": 152832,
+        "finite": true
+      },
+      "normalized_storage_state": {
+        "relative_l2": 0.0009359574389462499,
+        "max_abs": 3.3008866012096405e-05,
+        "different": 16383,
+        "elements": 16384,
+        "finite": true
+      },
+      "chunk_vs_recurrent_output": {
+        "relative_l2": 0.0023504561813877394,
+        "max_abs": 6.103515625e-05,
+        "different": 60381,
+        "elements": 152832,
+        "finite": true
+      },
+      "chunk_vs_recurrent_state": {
+        "relative_l2": 0.0019336478791829338,
+        "max_abs": 0.00012041628360748291,
+        "different": 16384,
+        "elements": 16384,
+        "finite": true
+      }
+    },
+    "timings_seconds_including_first_compile": {
+      "recurrent_fp32_normalization": 0.0021309200092218816,
+      "recurrent_bf16_normalization": 0.0019450799882179126,
+      "chunk_bf16_normalization": 0.0004548339929897338
+    }
+  },
+  {
+    "case": {
+      "rank": 1,
+      "layer": 46,
+      "position": 0,
+      "tokens": 2048,
+      "file": "rank1-layer46-position0.npz",
+      "sha256": "3d8b616386ccf9fae4004c721cd0ee7c0f20a7f048fd324b38d0baaeb685a9d8"
+    },
+    "checks": {
+      "reference_recurrent_vs_captured_core": {
+        "relative_l2": 1.916900490896471e-06,
+        "max_abs": 4.76837158203125e-07,
+        "different": 6,
+        "elements": 262144,
+        "finite": true
+      },
+      "reference_recurrent_vs_captured_state": {
+        "relative_l2": 6.678758450710754e-08,
+        "max_abs": 3.725290298461914e-09,
+        "different": 10873,
+        "elements": 16384,
+        "finite": true
+      },
+      "normalized_storage_output": {
+        "relative_l2": 0.0020614509355250843,
+        "max_abs": 3.0517578125e-05,
+        "different": 47186,
+        "elements": 262144,
+        "finite": true
+      },
+      "normalized_storage_state": {
+        "relative_l2": 0.0010283669363619942,
+        "max_abs": 6.926804780960083e-05,
+        "different": 16384,
+        "elements": 16384,
+        "finite": true
+      },
+      "chunk_vs_recurrent_output": {
+        "relative_l2": 0.0035405851783049855,
+        "max_abs": 6.103515625e-05,
+        "different": 116612,
+        "elements": 262144,
+        "finite": true
+      },
+      "chunk_vs_recurrent_state": {
+        "relative_l2": 0.0014724953993114438,
+        "max_abs": 7.793866097927094e-05,
+        "different": 16384,
+        "elements": 16384,
+        "finite": true
+      }
+    },
+    "timings_seconds_including_first_compile": {
+      "recurrent_fp32_normalization": 0.0036133579997112975,
+      "recurrent_bf16_normalization": 0.0031213719921652228,
+      "chunk_bf16_normalization": 0.00043664200347848237
+    }
+  },
+  {
+    "case": {
+      "rank": 1,
+      "layer": 46,
+      "position": 260096,
+      "tokens": 1194,
+      "file": "rank1-layer46-position260096.npz",
+      "sha256": "06400d0ff3eec2b299932ceb0ad1f894cd13ba2a2c15a15eef55fe3d338608b7"
+    },
+    "checks": {
+      "reference_recurrent_vs_captured_core": {
+        "relative_l2": 7.0901614582653196e-06,
+        "max_abs": 1.9073486328125e-06,
+        "different": 5,
+        "elements": 152832,
+        "finite": true
+      },
+      "reference_recurrent_vs_captured_state": {
+        "relative_l2": 6.860580260440459e-08,
+        "max_abs": 3.725290298461914e-09,
+        "different": 12801,
+        "elements": 16384,
+        "finite": true
+      },
+      "normalized_storage_output": {
+        "relative_l2": 0.0019408716832808313,
+        "max_abs": 3.0517578125e-05,
+        "different": 27507,
+        "elements": 152832,
+        "finite": true
+      },
+      "normalized_storage_state": {
+        "relative_l2": 0.0012412637563310076,
+        "max_abs": 9.533390402793884e-05,
+        "different": 16384,
+        "elements": 16384,
+        "finite": true
+      },
+      "chunk_vs_recurrent_output": {
+        "relative_l2": 0.0035414895809329217,
+        "max_abs": 3.0517578125e-05,
+        "different": 69847,
+        "elements": 152832,
+        "finite": true
+      },
+      "chunk_vs_recurrent_state": {
+        "relative_l2": 0.002278647966446891,
+        "max_abs": 0.00017376244068145752,
+        "different": 16384,
+        "elements": 16384,
+        "finite": true
+      }
+    },
+    "timings_seconds_including_first_compile": {
+      "recurrent_fp32_normalization": 0.0021263759990688413,
+      "recurrent_bf16_normalization": 0.0018966799980262294,
+      "chunk_bf16_normalization": 0.0004160169919487089
+    }
+  }
+]

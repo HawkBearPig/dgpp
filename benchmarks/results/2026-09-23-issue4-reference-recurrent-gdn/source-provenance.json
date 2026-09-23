@@ -1,0 +1,6 @@
+{
+  "image": "sha256:d464f3b466fa9c45ddbff8a812e80564503b6879a9fd95c1a47514f3f0df5a4a",
+  "original_sha256": "b3b5767deca68ddd28f6b9c8e4109e11b33553ac6c96e507549468fdf9fc7468",
+  "overlay_sha256": "76498d3c57d20394e507dcab33625e3055b65def940777dc1f679f66c4cd6a63",
+  "only_model_change": "GDN prefill chunked algorithm replaced with reference recurrent algorithm; normalized BF16 inputs unchanged"
+}

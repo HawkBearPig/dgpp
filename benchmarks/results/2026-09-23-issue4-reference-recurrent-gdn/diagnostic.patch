@@ -1,0 +1,41 @@
+--- a/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
++++ b/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+@@ -287,20 +287,25 @@
+         use_qk_l2norm_in_kernel: bool = True,
+         core_attn_out: torch.Tensor | None = None,
+     ):
+-        return fla_chunk_gated_delta_rule(
+-            q=q,
+-            k=k,
+-            v=v,
+-            g=g,
+-            beta=beta,
+-            initial_state=initial_state,
+-            output_final_state=output_final_state,
+-            cu_seqlens=cu_seqlens,
+-            chunk_indices=chunk_indices,
+-            chunk_offsets=chunk_offsets,
++        from vllm.third_party.flash_linear_attention.ops.fused_recurrent import (
++            fused_recurrent_gated_delta_rule,
++        )
++        logger.info_once("Issue4 control: recurrent GDN prefill with existing BF16 normalized Q/K")
++        # This campaign has max_num_seqs=1; keep the reference's prepared
++        # Q/K/V, gates, decode path, and state/output layouts unchanged.
++        assert q.shape[0] == initial_state.shape[0] == 1
++        pool = torch.cat((torch.zeros_like(initial_state), initial_state), dim=0)
++        indices = torch.ones((1, q.shape[1]), dtype=torch.int32, device=q.device)
++        o, final_pool = fused_recurrent_gated_delta_rule(
++            q=q, k=k, v=v, g=g, beta=beta, initial_state=pool,
++            inplace_final_state=True, cu_seqlens=cu_seqlens,
++            ssm_state_indices=indices,
+             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+-            core_attn_out=core_attn_out,
+-        )
++        )
++        if core_attn_out is not None:
++            core_attn_out.reshape(-1)[:o.numel()].copy_(o.reshape(-1))
++        return o, final_pool[1:2] if output_final_state else None
++
+ 
+     def forward_cutedsl(
+         self,

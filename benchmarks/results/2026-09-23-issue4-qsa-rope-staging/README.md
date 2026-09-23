@@ -1,4 +1,4 @@
-# Main-attention RoPE storage — nine GPU tests pass; original replay pending
+# Main-attention RoPE storage — nine GPU tests pass; original request still fails
 
 Relative to the expert-storage control, this diagnostic uses FP32 products
 and addition for the main Q/K rotary transform, then stores BF16 once. The
@@ -24,3 +24,7 @@ This verifies a real operator difference, not the cause of retrieval failure.
 All nine QSA GPU tests pass, including legacy indexer, compression, long
 paged-pool selection, attention and graph checks. The new exact-normalization
 rotation test passes all values against FP64; its old-policy control differs.
+
+The unchanged original request still returns the original 5/6 answer, with
+184 completion tokens. Bounded prefill was skipped. Production binaries,
+resolved configuration and inference were independently verified after restoration.

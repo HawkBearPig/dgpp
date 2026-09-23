@@ -1,0 +1,12 @@
+{
+  "cases": 16,
+  "all_finite": true,
+  "max_relative_l2": {
+    "reference_recurrent_vs_captured_core": 0.00032926344569069235,
+    "reference_recurrent_vs_captured_state": 2.831305218945727e-05,
+    "normalized_storage_output": 0.0034626619305588384,
+    "normalized_storage_state": 0.0014289036757370523,
+    "chunk_vs_recurrent_output": 0.003707201169041211,
+    "chunk_vs_recurrent_state": 0.0031592553020607927
+  }
+}
