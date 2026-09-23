@@ -1,0 +1,3 @@
+[ .. ] softmax router: 48 tokens x 512 experts, 0 certified swaps, logits within 1.00 ulp, weight relative error 2.2499e-07
+[ OK ] qwen_moe_softmax_router_matches_the_oracle_at_real_geometry
+1 tests, 0 failed

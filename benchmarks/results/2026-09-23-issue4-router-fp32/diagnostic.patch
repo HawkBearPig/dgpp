@@ -1,0 +1,254 @@
+diff --git a/src/kernels/glm_moe.cu b/src/kernels/glm_moe.cu
+index 2e3b799..43a896d 100644
+--- a/src/kernels/glm_moe.cu
++++ b/src/kernels/glm_moe.cu
+@@ -299,9 +299,8 @@ __device__ __forceinline__ void router_select_warp(
+   for (int i = 0; i < top_k; ++i) {
+     float w = norm_topk ? __fdiv_rn(wsel[i], denom) * routed_scaling_factor
+                         : wsel[i] * routed_scaling_factor;
+-    // The softmax mode's weights are bf16 values (the reference's cast),
+-    // carried exactly in the fp32 slot the chain multiplies by.
+-    if constexpr (kMode == kRouterSoftmax) w = bf16_bits_to_float(float_to_bf16_bits(w));
++    // Diagnostic: retain normalized routing weights in FP32, matching Marlin.
++    // No extra BF16 store is needed in the existing FP32 weight buffer.
+     ids[static_cast<size_t>(token) * top_k + i] = sel[i];
+     weights[static_cast<size_t>(token) * top_k + i] = w;
+   }
+@@ -335,10 +334,7 @@ __global__ void moe_swiglu_clamp_kernel(const uint16_t* __restrict__ gate,
+   float u = bf16_bits_to_float(up[i]);
+   if (g > limit) g = limit;  // gate: NO lower clamp (reference asymmetry)
+   u = fminf(fmaxf(u, -limit), limit);
+-  const uint16_t t =
+-      float_to_bf16_bits(g * sigmoidf_acc(g));  // rounding 1 (silu)
+-  out[i] =
+-      float_to_bf16_bits(bf16_bits_to_float(t) * u);  // rounding 2 (product)
++  out[i] = float_to_bf16_bits((g * sigmoidf_acc(g)) * u);  // diagnostic: one rounding
+ }
+ 
+ __global__ void moe_gather_rows_kernel(const uint16_t* __restrict__ src,
+@@ -1763,8 +1759,7 @@ __global__ void moe_slot_gate_up_swiglu_fp4_kernel(
+     }
+     if (g > limit) g = limit;
+     u = fminf(fmaxf(u, -limit), limit);
+-    const uint16_t tt = float_to_bf16_bits(g * sigmoidf_acc(g));
+-    act_row[row] = float_to_bf16_bits(bf16_bits_to_float(tt) * u);
++    act_row[row] = float_to_bf16_bits((g * sigmoidf_acc(g)) * u);
+   }
+ }
+ 
+diff --git a/src/kernels/qwen_gr.cu b/src/kernels/qwen_gr.cu
+index ec5ceb7..e5a969e 100644
+--- a/src/kernels/qwen_gr.cu
++++ b/src/kernels/qwen_gr.cu
+@@ -37,8 +37,8 @@ __global__ void mix_finish_kernel(const uint16_t* __restrict__ logits,
+   float acc = 0.0f;
+   for (int i = 0; i < hc; ++i) {
+     const int64_t at = base + static_cast<int64_t>(i) * hidden;
+-    const float g = round_bf16(sigmoid_f(bf16_bits_to_float(logits[at])));
+-    acc += round_bf16(g * bf16_bits_to_float(rn[at]));
++    const float g = sigmoid_f(bf16_bits_to_float(logits[at]));
++    acc = fmaf(g, bf16_bits_to_float(rn[at]), acc);
+   }
+   x[row * hidden + j] = float_to_bf16_bits(acc * inv_hc);
+ }
+@@ -94,7 +94,7 @@ __global__ void combine_dots_kernel(const uint16_t* __restrict__ rn,
+                                        width, lane);
+   if (lane == 0) {
+     const float dot = round_bf16(acc);          // the linear's bf16 output
+-    gates[row * hc + warp] = 2.0f * round_bf16(sigmoid_f(dot * inv_hc));
++    gates[row * hc + warp] = 2.0f * sigmoid_f(dot * inv_hc);
+   }
+ }
+ 
+@@ -109,9 +109,9 @@ __global__ void combine_apply_kernel(uint16_t* __restrict__ r_state,
+   if (idx >= width) return;
+   const int i = idx / hidden, j = idx - i * hidden;
+   const float g = gates[row * hc + i];
+-  const float inj = round_bf16(bf16_bits_to_float(y[row * hidden + j]) * g);
++  const float block = bf16_bits_to_float(y[row * hidden + j]);
+   uint16_t* r = r_state + row * width + idx;
+-  *r = float_to_bf16_bits(bf16_bits_to_float(*r) + inj);
++  *r = float_to_bf16_bits(fmaf(block, g, bf16_bits_to_float(*r)));
+ }
+ 
+ // ---- the site's GEMVs with their producers folded into the staging ----------
+@@ -200,7 +200,7 @@ __global__ void __launch_bounds__(kGrGemvThreads)
+       if (lane == 0) {
+         const float dot = round_bf16(acc);  // the linear's bf16 output
+         gates[static_cast<size_t>(row) * hc + i] =
+-            2.0f * round_bf16(sigmoid_f(dot * inv_hc));
++            2.0f * sigmoid_f(dot * inv_hc);
+       }
+     }
+     return;
+@@ -245,7 +245,7 @@ __global__ void __launch_bounds__(kGrGemvThreads)
+       if (lane == 0) {
+         const float dot = round_bf16(acc);  // the linear's bf16 output
+         gates[static_cast<size_t>(row) * hc + i] =
+-            2.0f * round_bf16(sigmoid_f(dot * inv_hc));
++            2.0f * sigmoid_f(dot * inv_hc);
+       }
+     }
+     return;
+diff --git a/src/kernels/qwen_moe.cu b/src/kernels/qwen_moe.cu
+index 728576b..2f2ee52 100644
+--- a/src/kernels/qwen_moe.cu
++++ b/src/kernels/qwen_moe.cu
+@@ -105,9 +105,8 @@ __global__ void shared_gate_up_swiglu_kernel(const uint16_t* __restrict__ x, siz
+     float uv = round_bf16(ua[r]);  // the up GEMV's
+     if (gv > limit) gv = limit;
+     uv = fminf(fmaxf(uv, -limit), limit);
+-    const uint16_t t = float_to_bf16_bits(gv * (1.0f / (1.0f + expf(-gv))));  // rounding 1
+     act[static_cast<size_t>(r) * S + row] =
+-        float_to_bf16_bits(bf16_bits_to_float(t) * uv);  // rounding 2
++        float_to_bf16_bits((gv * (1.0f / (1.0f + expf(-gv)))) * uv);
+   }
+ }
+ 
+diff --git a/src/kernels/qwen_norm.cu b/src/kernels/qwen_norm.cu
+index 2b993d4..8c6c8fe 100644
+--- a/src/kernels/qwen_norm.cu
++++ b/src/kernels/qwen_norm.cu
+@@ -64,8 +64,9 @@ __global__ void gated_rmsnorm_kernel(const uint16_t* __restrict__ x,
+   // 1/sqrtf by an ulp on some inputs; keep the division form.
+   const float rstd = 1.0f / sqrtf(total / static_cast<float>(dim) + eps);
+   for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+-    const float u = bf16_bits_to_float(float_to_bf16_bits(staged[i] * rstd));
+-    const float p = bf16_bits_to_float(float_to_bf16_bits(u * bf16_bits_to_float(weight[i])));
++    // Diagnostic: match the pinned reference's fused FP32 gated normalization.
++    const float u = staged[i] * rstd;
++    const float p = u * bf16_bits_to_float(weight[i]);
+     const float g = bf16_bits_to_float(gr[i]);
+     const float sig = 1.0f / (1.0f + expf(-g));
+     yr[i] = float_to_bf16_bits(p * sig);
+diff --git a/src/models/qwen/loader.cpp b/src/models/qwen/loader.cpp
+index 27731d3..743edaf 100644
+--- a/src/models/qwen/loader.cpp
++++ b/src/models/qwen/loader.cpp
+@@ -680,7 +680,12 @@ size_t QwenLayerStream::ngram_table_bytes(const QwenTextConfig& cfg, int rank, i
+ void QwenLayerStream::set_resident_image_dir(const std::string& dir) {
+   resident_image_dir_storage() = dir;
+ }
+-const std::string& QwenLayerStream::resident_image_dir() { return resident_image_dir_storage(); }
++const std::string& QwenLayerStream::resident_image_dir() {
++  // Diagnostic: force construction from checkpoint, without reading/writing
++  // the persistent image cache. The production cache and payloads stay intact.
++  static const std::string disabled;
++  return disabled;
++}
+ 
+ // ---- the n-gram table ----------------------------------------------------------
+ 
+diff --git a/tests/cuda/qwen_moe_test.cu b/tests/cuda/qwen_moe_test.cu
+index a7b115b..50e1cd4 100644
+--- a/tests/cuda/qwen_moe_test.cu
++++ b/tests/cuda/qwen_moe_test.cu
+@@ -128,7 +128,7 @@ DGPP_TEST(qwen_moe_softmax_router_matches_the_oracle_at_real_geometry) {
+   dgpp::glm_moe_ref_router(x.data(), gate.data(), nullptr, cfg, tokens, ref);
+ 
+   long certified = 0;
+-  double max_w_ulps = 0, max_logit_ulps = 0;
++  double max_weight_relative_error = 0, max_logit_ulps = 0;
+   for (int t = 0; t < tokens; ++t) {
+     // Ids: equal, or a near-tie swap certified on the oracle's logits — a
+     // swapped pair's logits are within one bf16 ulp (both sides round the
+@@ -157,27 +157,28 @@ DGPP_TEST(qwen_moe_softmax_router_matches_the_oracle_at_real_geometry) {
+       const double d = std::fabs(l - ref.biased[static_cast<size_t>(t) * E + e]);
+       max_logit_ulps = std::max(max_logit_ulps, d / bf16_ulp_at(ref.biased[static_cast<size_t>(t) * E + e]));
+     }
+-    // Weights: bf16 values; where the ids agree, within an ulp of the
+-    // oracle's; the row sums to one within bf16 rounding.
++    // Independent FP64 softmax over the selected captured logits. The full
++    // softmax denominator cancels during top-k renormalization.
++    double denominator = 0;
++    const double maximum = *std::max_element(tiled.biased.begin() + t * E,
++                                             tiled.biased.begin() + (t + 1) * E);
++    for (int e : got) denominator += std::exp(tiled.biased[t * E + e] - maximum);
+     double sum = 0;
+     for (int i = 0; i < K; ++i) {
+-      const float w = tiled.w[static_cast<size_t>(t) * K + i];
+-      require(dgpp::bf16_bits_to_float(dgpp::float_to_bf16_bits(w)) == w, "weight not a bf16 value");
+-      require(w > 0.f && w <= 1.f, "weight outside (0, 1]");
+-      sum += w;
+-      if (only_got.empty()) {
+-        const int u = bf16_ulps(dgpp::float_to_bf16_bits(w),
+-                                dgpp::float_to_bf16_bits(ref.weights[static_cast<size_t>(t) * K + i]));
+-        max_w_ulps = std::max(max_w_ulps, static_cast<double>(u));
+-      }
++      const float weight = tiled.w[t * K + i];
++      const double expected = std::exp(tiled.biased[t * E + got[i]] - maximum) / denominator;
++      require(weight > 0.f && weight <= 1.f, "weight outside (0, 1]");
++      sum += weight;
++      max_weight_relative_error = std::max(max_weight_relative_error,
++          std::abs(weight - expected) / expected);
+     }
+-    require(std::fabs(sum - 1.0) < 0.02, "weights do not sum to one");
++    require(std::fabs(sum - 1.0) < 1e-6, "FP32 weights do not sum to one");
+   }
+   std::printf("[ .. ] softmax router: %d tokens x %d experts, %ld certified swaps, "
+-              "logits within %.2f ulp, weights within %g ulp\n",
+-              tokens, E, certified, max_logit_ulps, max_w_ulps);
++              "logits within %.2f ulp, weight relative error %g\n",
++              tokens, E, certified, max_logit_ulps, max_weight_relative_error);
+   require(max_logit_ulps <= 1.0, "logits beyond one bf16 ulp of the oracle");
+-  require(max_w_ulps <= 1.0, "weights beyond one bf16 ulp of the oracle");
++  require(max_weight_relative_error < 1e-6, "weights disagree with independent FP64 softmax");
+   require(certified <= tokens, "too many near-tie swaps to trust");
+ }
+ 
+diff --git a/tests/cuda/qwen_norm_test.cu b/tests/cuda/qwen_norm_test.cu
+index 7e52143..c313c39 100644
+--- a/tests/cuda/qwen_norm_test.cu
++++ b/tests/cuda/qwen_norm_test.cu
+@@ -1,9 +1,10 @@
+ // The Qwen norm kernels against the host oracles: the
+ // (1 + w) norm, its grouped form over the 4-branch hyper state, and the
+-// GDN gated norm with the reference's three roundings. The device sum of
++// GDN gated norm with one final BF16 rounding. The device sum of
+ // squares is a tree, the host's a chain: rstd may differ by an fp32 ulp,
+ // so the outputs are held to one bf16 ulp on a small fraction of elements.
+ #include <cstdint>
++#include <cmath>
+ #include <string>
+ #include <vector>
+ 
+@@ -70,7 +71,7 @@ DGPP_TEST(qwen_group_rmsnorm_normalizes_every_branch_on_its_own) {
+   require_bitwise("grouped == plain per group", want.data(), flat.data(), want.size() * 2);
+ }
+ 
+-DGPP_TEST(gdn_gated_rmsnorm_keeps_the_reference_roundings) {
++DGPP_TEST(gdn_gated_rmsnorm_matches_fp64_without_intermediate_rounding) {
+   const int dim = 128;
+   const int64_t rows = 12 * 7;
+   const std::vector<uint16_t> x = random_bf16_normal(5, rows * dim, 1.0f);
+@@ -85,8 +86,29 @@ DGPP_TEST(gdn_gated_rmsnorm_keeps_the_reference_roundings) {
+   DGPP_CUDA_OK(cudaStreamSynchronize(s));
+   std::vector<uint16_t> got(x.size()), want(x.size());
+   dy.download(got.data(), got.size() * 2);
+-  dgpp::gdn_ref::gated_rmsnorm_sigmoid(x.data(), g.data(), w.data(), want.data(), rows, dim, 1e-6f);
++  // Independent FP64 evaluation of norm(x) * weight * sigmoid(gate).
++  for (int64_t row = 0; row < rows; ++row) {
++    double ss = 0;
++    for (int i = 0; i < dim; ++i) {
++      const double v = dgpp::bf16_bits_to_float(x[row * dim + i]);
++      ss += v * v;
++    }
++    const double inv = 1.0 / std::sqrt(ss / dim + 1e-6f);
++    for (int i = 0; i < dim; ++i) {
++      const int64_t at = row * dim + i;
++      const double value = double(dgpp::bf16_bits_to_float(x[at])) * inv *
++          double(dgpp::bf16_bits_to_float(w[i])) /
++          (1.0 + std::exp(-double(dgpp::bf16_bits_to_float(g[at]))));
++      want[at] = dgpp::float_to_bf16_bits(static_cast<float>(value));
++    }
++  }
+   require_bf16("gdn gated norm", compare_bf16(got, want, 1), 1e-3, 0.01);
++  std::vector<uint16_t> old(want.size());
++  dgpp::gdn_ref::gated_rmsnorm_sigmoid(x.data(), g.data(), w.data(), old.data(), rows, dim, 1e-6f);
++  size_t changed = 0;
++  for (size_t i = 0; i < old.size(); ++i) changed += old[i] != want[i];
++  if (changed <= old.size() / 10)
++    throw std::runtime_error("fixture does not distinguish intermediate-rounding policy");
+ }
+ 
+ int main() { return dgpp::test::run_all(); }

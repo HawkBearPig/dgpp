@@ -1,0 +1,6 @@
+{
+  "image": "sha256:d464f3b466fa9c45ddbff8a812e80564503b6879a9fd95c1a47514f3f0df5a4a",
+  "source": "vllm/third_party/flash_linear_attention/ops/fused_gdn_prefill_post_conv.py",
+  "sha256": "0e025ad6881393e3d2522b9ce8b504f5f1af7fb58b81a149382345b1df7f1741",
+  "policy": "Normalized Q and K are explicitly stored in BF16 before prefill recurrence. Beta and decay outputs remain FP32."
+}

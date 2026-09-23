@@ -1,0 +1,5 @@
+[ OK ] gdn_recurrent_matches_the_host_oracle
+[ OK ] gdn_recurrent_is_chunk_invariant_bitwise
+[ OK ] gdn_recurrent_snapshots_are_the_prefix_states_bitwise
+[ OK ] gdn_recurrent_batched_equals_per_request_runs_bitwise
+4 tests, 0 failed

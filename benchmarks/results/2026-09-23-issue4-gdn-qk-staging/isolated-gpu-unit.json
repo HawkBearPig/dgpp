@@ -1,0 +1,8 @@
+{
+  "node": "192.168.88.13",
+  "binary_sha256": "045960503487526e8bd5ae91e2ffa964a725cb7f49e6257e5e09c5bc9547cbe8",
+  "idle_before": true,
+  "returncode": 0,
+  "wall_seconds": 0.8236409469973296,
+  "scope": "Single-process GDN tests on the unused third node; reference TP2 occupies only nodes 11 and 12"
+}

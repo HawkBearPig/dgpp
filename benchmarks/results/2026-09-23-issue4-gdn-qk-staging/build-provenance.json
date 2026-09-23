@@ -1,0 +1,7 @@
+{
+  "base_commit": "d318815984fd2ab1f0a67a6b830b57730a57439a",
+  "binary_sha256": "84767e27ef2896aa598fdad3fe36948e000a621ce240d6b3a85de1050f033bad",
+  "patch_sha256": "31141b09edb60c39065ea438e081664bdd6aaf2602f95e672db8ee3c4e1a253f",
+  "unit_binary_sha256": "045960503487526e8bd5ae91e2ffa964a725cb7f49e6257e5e09c5bc9547cbe8",
+  "source": "Previous FP32-router control plus normalized GDN Q/K BF16 boundary in both execution paths"
+}

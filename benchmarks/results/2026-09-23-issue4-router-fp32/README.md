@@ -1,4 +1,4 @@
-# FP32 expert routing weights — building, not yet run
+# FP32 expert routing weights — GPU router check passes; original request still 5/6
 
 The preceding W4A16 arithmetic and GDN-normalization controls both return the
 original wrong value. This next control removes only the extra BF16 cast of
@@ -15,3 +15,11 @@ proof of a retrieval defect.
 
 The original request runs on fresh TP2, then bounded prefill only if native
 passes. Exact production restoration and inference verification run in finally.
+
+The real-geometry GPU router test passes across all three launch forms: no
+selection swaps, logits within one BF16 ulp, maximum weight relative error
+2.2499e-7 against independent FP64 softmax.
+
+Executed result: original wrong `val_5dac9ed720abddaf`, 184 completion tokens.
+Bounded prefill skipped after native failure. Exact production restoration
+passed on all four nodes. This policy change is insufficient to fix #4.

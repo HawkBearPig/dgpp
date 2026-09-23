@@ -1,0 +1,7 @@
+{
+  "base_commit": "d318815984fd2ab1f0a67a6b830b57730a57439a",
+  "binary_sha256": "cedb1c10c1620704ff6bd019c2675400651bb0b209dc1f8557c093d253689ff4",
+  "patch_sha256": "cb533e57270f408e46cb87a2228a8364cb1e31fd4d02e5c619c9028f57da9e3c",
+  "unit_binary_sha256": "131bf79ebd65e4a1dd35755fde29290bdf8aa3d3614db3ae5108d1d49b901f9b",
+  "source": "Previous GDN normalization control plus FP32 normalized router weights; no other inference changes"
+}
