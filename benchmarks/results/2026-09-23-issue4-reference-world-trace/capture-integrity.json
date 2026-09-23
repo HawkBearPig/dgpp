@@ -1,0 +1,18 @@
+{
+  "ranks": [
+    {
+      "rank": 0,
+      "positions": 312,
+      "fields_verified": 133740,
+      "bytes_verified": 1670640040
+    },
+    {
+      "rank": 1,
+      "positions": 312,
+      "fields_verified": 133740,
+      "bytes_verified": 1670640040
+    }
+  ],
+  "all_metadata_payload_hashes_match": true,
+  "wall_seconds": 50.468056954967324
+}

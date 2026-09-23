@@ -1,0 +1,8 @@
+{
+  "tests": 6,
+  "failed": 0,
+  "binary_sha256": "a86889bef3745d6ec58f50d1a2187d6154f9a853d8a9bda5be196562b798e486",
+  "log_sha256": "ef7fa428cc9f2c7a0c07cb6498b36bb2c65aed507b5a0847c1675e4e37be9a7d",
+  "executed_log": "benchmarks/results/2026-09-23-issue4-reference-world-trace/raw/gdn-fixture-unit.log",
+  "scope": "Six focused operator tests; does not change the failed retrieval result."
+}

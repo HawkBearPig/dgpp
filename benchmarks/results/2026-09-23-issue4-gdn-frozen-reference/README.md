@@ -31,3 +31,8 @@ for maxima and `comparison.json` for every case. The independent reference
 recurrent control closely matches the original DGPP capture. The chunked
 algorithm differs after holding normalized inputs and initial state fixed.
 The isolated container was removed before the TP2 reference world started.
+
+The fixtures supply FP32 starting state from DGPP. The later full-model trace
+(`2026-09-23-issue4-reference-world-trace`) shows that the reference recipe uses
+BF16 state storage between calls. These operator comparisons do not test that
+additional whole-model state conversion.

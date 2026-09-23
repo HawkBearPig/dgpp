@@ -22,8 +22,12 @@ check, not a retrieval result or full performance benchmark.
 Source review identifies explicit chunked arithmetic boundaries: the triangular
 inverse is stored in the key dtype (BF16); weighted K/V, reconstructed W/U and
 corrected values also have BF16 boundaries; state views are cast to BF16 for
-matrix products while persistent state remains FP32. The sequential recurrence
-carries the state update in FP32. `fla-source.json` pins the inspected files.
+matrix products while the within-call state accumulator remains FP32. The
+sequential recurrence carries the within-call state update in FP32. A later
+full-model trace confirms that this reference recipe stores the state between
+calls in BF16: `auto` resolves to the BF16 model dtype. DGPP keeps FP32 state
+between calls, as required by its checkpoint validation. This is an additional
+whole-model policy difference, separate from the frozen operator comparison. `fla-source.json` pins the inspected files.
 Neither numerical policy is labeled incorrect on this evidence alone.
 
 A failure after this swap would be a lead, not a complete causal verdict: the

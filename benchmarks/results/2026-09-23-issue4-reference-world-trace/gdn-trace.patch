@@ -1,0 +1,29 @@
+--- a/qwen_gdn_linear_attn.py
++++ b/qwen_gdn_linear_attn.py
+@@ -6,6 +6,7 @@
+ from typing import Literal
+ 
+ import torch
++from vllm.models.qwen3_8_flash_next.nvidia import issue4_trace as _issue4
+ from einops import rearrange
+ from torch import nn
+ 
+@@ -287,7 +288,8 @@
+         use_qk_l2norm_in_kernel: bool = True,
+         core_attn_out: torch.Tensor | None = None,
+     ):
+-        return fla_chunk_gated_delta_rule(
++        _issue4.capture_gdn(q,k,v,g,beta,initial_state)
++        result = fla_chunk_gated_delta_rule(
+             q=q,
+             k=k,
+             v=v,
+@@ -301,6 +303,8 @@
+             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+             core_attn_out=core_attn_out,
+         )
++        _issue4.capture_gdn_result(result)
++        return result
+ 
+     def forward_cutedsl(
+         self,

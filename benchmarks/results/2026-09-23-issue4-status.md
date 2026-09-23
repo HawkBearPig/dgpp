@@ -110,5 +110,15 @@ The [native chunked GDN prototype](2026-09-23-issue4-gdn-chunk/README.md)
 passes 24 operator comparisons and five executed GPU tests, but the unchanged
 original request still scores 5/6 with a different wrong record value,
 `val_7265273163533973` (190 completion tokens). Production restoration passed.
-The prototype is diagnostic and is not a proposed retrieval fix. A sixth
-fixture test has been built but not yet run on GPU.
+The prototype is diagnostic and is not a proposed retrieval fix. A separate sixth
+fixture test subsequently passed on GPU.
+
+A [fresh read-only Marlin trace](2026-09-23-issue4-reference-world-trace/README.md)
+reproduces the original 5/6 answer and exactly matches the untraced failure's
+text/usage. All 267480 captured fields across both ranks pass payload-hash
+verification. It confirms BF16 state storage between reference calls despite
+FP32 within-call accumulation; DGPP and the checkpoint require FP32 state.
+This is an additional numerical-policy difference, not a localized retrieval
+cause. A second fresh trace is running. An explicit FP32-state reference control
+with measured GDN configurations pinned and a native block-GDN/checkpoint-dense
+control are prepared but have not run.

@@ -33,5 +33,6 @@ Two earlier operator attempts are retained locally under `raw/attempt1-fp32-kkt`
 and `raw/attempt2-fixed-reference`. Both failed operator checks and restored
 production before any full-model candidate request. `build-provenance.json`
 and `diagnostic.patch` describe the five-test binary actually used in the
-completed third campaign. A subsequently built sixth fixture test has not yet
-run on the GPU and is not included in that validation claim.
+completed third campaign. A subsequently built sixth independent fixture test also passed on GPU before
+the fresh-reference trace; `fixture-test.json` identifies that separate six-test
+run. This does not change the failed retrieval verdict.
