@@ -1,0 +1,163 @@
+[
+  {
+    "name": "production-down",
+    "command": [
+      "/usr/bin/python3",
+      "/home/stephen/workspace/dgpp/scripts/dgpp-cluster",
+      "down",
+      "--config",
+      "/home/stephen/workspace/dgpp/deploy/cluster_glm-5.3-flash_nvfp4-fp8_w4.json"
+    ],
+    "returncode": 0,
+    "wall_seconds": 7.162153716024477
+  },
+  {
+    "name": "gpu-bf16",
+    "command": [
+      "/home/stephen/workspace/dgpp/benchmarks/results/2026-09-23-issue4-ple-fp64-key/raw/gpu_probe",
+      "/home/stephen/workspace/dgpp/benchmarks/results/2026-09-23-issue4-ple-projection/raw/gpu-input",
+      "/home/stephen/workspace/dgpp/benchmarks/results/2026-09-23-issue4-ple-fp64-key/raw/campaign/gpu-bf16",
+      "bf16",
+      "2048"
+    ],
+    "returncode": 0,
+    "wall_seconds": 1.1729819779866375
+  },
+  {
+    "name": "gpu-fp64",
+    "command": [
+      "/home/stephen/workspace/dgpp/benchmarks/results/2026-09-23-issue4-ple-fp64-key/raw/gpu_probe",
+      "/home/stephen/workspace/dgpp/benchmarks/results/2026-09-23-issue4-ple-projection/raw/gpu-input",
+      "/home/stephen/workspace/dgpp/benchmarks/results/2026-09-23-issue4-ple-fp64-key/raw/campaign/gpu-fp64",
+      "fp64",
+      "2048"
+    ],
+    "returncode": 0,
+    "wall_seconds": 1.5216678430442698
+  },
+  {
+    "name": "gpu-fp64-tail",
+    "command": [
+      "/home/stephen/workspace/dgpp/benchmarks/results/2026-09-23-issue4-ple-fp64-key/raw/gpu_probe",
+      "/home/stephen/workspace/dgpp/benchmarks/results/2026-09-23-issue4-ple-projection/raw/gpu-input",
+      "/home/stephen/workspace/dgpp/benchmarks/results/2026-09-23-issue4-ple-fp64-key/raw/campaign/gpu-fp64-tail",
+      "fp64",
+      "1024"
+    ],
+    "returncode": 0,
+    "wall_seconds": 1.1216925969929434
+  },
+  {
+    "name": "gpu-validation",
+    "command": [
+      "/home/stephen/workspace/dgpp/.venv/bin/python3",
+      "/home/stephen/workspace/dgpp/benchmarks/results/2026-09-23-issue4-ple-fp64-key/analyze_gpu.py"
+    ],
+    "returncode": 0,
+    "wall_seconds": 0.9719031430431642
+  },
+  {
+    "name": "baseline-1-up",
+    "command": [
+      "/usr/bin/python3",
+      "/tmp/dgpp-issue4-ple-fp64-key-20260923/scripts/dgpp-cluster",
+      "up",
+      "--config",
+      "/home/stephen/workspace/dgpp/benchmarks/results/2026-09-23-issue4-ple-fp64-key/raw/campaign/baseline.json",
+      "--log-dir",
+      "/home/stephen/workspace/dgpp/benchmarks/results/2026-09-23-issue4-ple-fp64-key/raw/campaign/baseline-1-world",
+      "--bin",
+      "/tmp/dgpp-issue4-ple-fp64-key-20260923/build-release/dgpp-serve"
+    ],
+    "returncode": 0,
+    "wall_seconds": 26.36856902501313
+  },
+  {
+    "name": "baseline-1-down",
+    "command": [
+      "/usr/bin/python3",
+      "/tmp/dgpp-issue4-ple-fp64-key-20260923/scripts/dgpp-cluster",
+      "down",
+      "--config",
+      "/home/stephen/workspace/dgpp/benchmarks/results/2026-09-23-issue4-ple-fp64-key/raw/campaign/baseline.json",
+      "--log-dir",
+      "/home/stephen/workspace/dgpp/benchmarks/results/2026-09-23-issue4-ple-fp64-key/raw/campaign/baseline-1-world"
+    ],
+    "returncode": 0,
+    "wall_seconds": 3.6975394610199146
+  },
+  {
+    "name": "fp64-1-up",
+    "command": [
+      "/usr/bin/python3",
+      "/tmp/dgpp-issue4-ple-fp64-key-20260923/scripts/dgpp-cluster",
+      "up",
+      "--config",
+      "/home/stephen/workspace/dgpp/benchmarks/results/2026-09-23-issue4-ple-fp64-key/raw/campaign/baseline.json",
+      "--log-dir",
+      "/home/stephen/workspace/dgpp/benchmarks/results/2026-09-23-issue4-ple-fp64-key/raw/campaign/fp64-1-world",
+      "--bin",
+      "/tmp/dgpp-issue4-ple-fp64-key-20260923/build-release/dgpp-serve"
+    ],
+    "returncode": 0,
+    "wall_seconds": 24.372753745992668
+  },
+  {
+    "name": "fp64-1-down",
+    "command": [
+      "/usr/bin/python3",
+      "/tmp/dgpp-issue4-ple-fp64-key-20260923/scripts/dgpp-cluster",
+      "down",
+      "--config",
+      "/home/stephen/workspace/dgpp/benchmarks/results/2026-09-23-issue4-ple-fp64-key/raw/campaign/baseline.json",
+      "--log-dir",
+      "/home/stephen/workspace/dgpp/benchmarks/results/2026-09-23-issue4-ple-fp64-key/raw/campaign/fp64-1-world"
+    ],
+    "returncode": 0,
+    "wall_seconds": 3.7461481770151295
+  },
+  {
+    "name": "baseline-2-up",
+    "command": [
+      "/usr/bin/python3",
+      "/tmp/dgpp-issue4-ple-fp64-key-20260923/scripts/dgpp-cluster",
+      "up",
+      "--config",
+      "/home/stephen/workspace/dgpp/benchmarks/results/2026-09-23-issue4-ple-fp64-key/raw/campaign/baseline.json",
+      "--log-dir",
+      "/home/stephen/workspace/dgpp/benchmarks/results/2026-09-23-issue4-ple-fp64-key/raw/campaign/baseline-2-world",
+      "--bin",
+      "/tmp/dgpp-issue4-ple-fp64-key-20260923/build-release/dgpp-serve"
+    ],
+    "returncode": 0,
+    "wall_seconds": 24.422577274031937
+  },
+  {
+    "name": "baseline-2-down",
+    "command": [
+      "/usr/bin/python3",
+      "/tmp/dgpp-issue4-ple-fp64-key-20260923/scripts/dgpp-cluster",
+      "down",
+      "--config",
+      "/home/stephen/workspace/dgpp/benchmarks/results/2026-09-23-issue4-ple-fp64-key/raw/campaign/baseline.json",
+      "--log-dir",
+      "/home/stephen/workspace/dgpp/benchmarks/results/2026-09-23-issue4-ple-fp64-key/raw/campaign/baseline-2-world"
+    ],
+    "returncode": 0,
+    "wall_seconds": 3.746263623004779
+  },
+  {
+    "name": "production-restore",
+    "command": [
+      "/usr/bin/python3",
+      "/home/stephen/workspace/dgpp/scripts/dgpp-cluster",
+      "up",
+      "--config",
+      "/home/stephen/workspace/dgpp/deploy/cluster_glm-5.3-flash_nvfp4-fp8_w4.json",
+      "--bin",
+      "/home/stephen/workspace/dgpp/build-release/dgpp-serve"
+    ],
+    "returncode": 0,
+    "wall_seconds": 36.68684259499423
+  }
+]

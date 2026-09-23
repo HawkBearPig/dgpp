@@ -227,7 +227,28 @@ control with the original BF16 partial boundaries returns identical outputs.
 The separate final-chunk QSA key-projection/norm/RoPE audit covers 7.34 million
 values, with worst per-layer/rank L2 0.0242% and exact cached-tail copies.
 Production was restored and verified after the bounded GPU probe. These are
-operator findings, not proof of the retrieval cause. The next causal comparison
-should change only the PLE key projection to validated higher-accuracy arithmetic
-and replay the unchanged original request on real TP2; no such accuracy result
-or retrieval fix is yet established.
+operator findings, not proof of the retrieval cause. They motivated the
+isolated higher-accuracy key-projection control below.
+
+The [FP64 PLE key-projection control](2026-09-23-issue4-ple-fp64-key/README.md)
+is now complete. The frozen GPU replay exactly matches the independent key
+projection/fold oracle at both native prefill shapes, corrects the identified
+gate outliers as predicted, and preserves the other operand paths. Nevertheless,
+the byte-identical original request returns the original 5/6 failure in all
+three fresh native/FP64/native TP2 worlds, with identical full text and usage
+(184 output tokens). Actual binaries, process environments and execution logs
+verify the change on both ranks only in the middle run. Production restoration
+passes all four original binary hashes, exact configuration, inference and idle
+state. The numerical lead is insufficient to repair retrieval; the experimental
+patch remains a diagnostic, not a proposed fix. No full BF16 model was run.
+
+A [final-row residual-boundary replay](2026-09-23-issue4-gr-boundaries/README.md)
+also closes a narrower coverage gap. Independent checkpoint arithmetic carries
+both residual injections through all 48 layers, accepting captured preceding
+residuals and folded attention/MoE branch outputs. All 491520 final residual
+values agree bit-for-bit; the intervening MoE input mixer has worst relative L2
+0.000966905. Both ranks' fields agree exactly. The PLE layer is now included
+using a bounded export from freshly rehashed complete post-PLE files. This
+checks the failed row's residual boundaries, not the whole prompt's earlier
+construction. The retrieval root cause and a causally supported fix remain
+unresolved; no additional reporter artifact is required for further local work.

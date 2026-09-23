@@ -1,0 +1,243 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 59267a5..f4bcaee 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -58,7 +58,7 @@ option(DGPP_ENABLE_IBV "Build serving and RDMA targets (required even for the si
+ add_library(dgpp_common INTERFACE)
+ target_include_directories(dgpp_common INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+ 
+-find_package(CUDAToolkit 13 REQUIRED COMPONENTS cudart cublasLt)
++find_package(CUDAToolkit 13 REQUIRED COMPONENTS cudart cublasLt cublas)
+ find_package(Threads REQUIRED)
+ find_package(Python3 3.10 REQUIRED COMPONENTS Interpreter)
+ 
+@@ -184,6 +184,7 @@ add_library(dgpp_kernels STATIC
+   src/kernels/qwen_gr.cu
+   src/kernels/qwen_moe.cu
+   src/kernels/qwen_ple.cu
++  src/kernels/qwen_ple_fp64.cu
+   src/kernels/dsv41_engram.cu
+   src/kernels/dsv41_dspark.cu
+   src/kernels/csa2.cu
+@@ -194,7 +195,7 @@ add_library(dgpp_kernels STATIC
+   src/kernels/mimo_attn.cu
+   src/kernels/mimo_attn_prefill.cu
+   src/kernels/add_rmsnorm.cu)
+-target_link_libraries(dgpp_kernels PUBLIC CUDA::cudart CUDA::cublasLt dgpp_core dgpp_rope_scaling)
++target_link_libraries(dgpp_kernels PUBLIC CUDA::cudart CUDA::cublasLt CUDA::cublas dgpp_core dgpp_rope_scaling)
+ dgpp_set_common(dgpp_kernels)
+ # The device sampler mirrors the host oracle bit for bit: no contraction of
+ # its multiplies and adds (the host builds with -ffp-contract=off).
+@@ -628,7 +629,7 @@ if(DGPP_ENABLE_IBV)
+   # a node needs only the driver, rdma-core, libnl and libstdc++.
+   set_target_properties(dgpp_serve_app PROPERTIES INSTALL_RPATH "$ORIGIN/../lib")
+   install(TARGETS dgpp_serve_app RUNTIME DESTINATION bin)
+-  foreach(_lib cudart cublasLt)
++  foreach(_lib cudart cublasLt cublas)
+     get_target_property(_loc CUDA::${_lib} IMPORTED_LOCATION)
+     if(NOT _loc)
+       get_target_property(_loc CUDA::${_lib} LOCATION)
+diff --git a/src/kernels/qwen_ple_fp64.cu b/src/kernels/qwen_ple_fp64.cu
+new file mode 100644
+index 0000000..a551344
+--- /dev/null
++++ b/src/kernels/qwen_ple_fp64.cu
+@@ -0,0 +1,74 @@
++#include "kernels/qwen_ple_fp64.hpp"
++
++#include <cublas_v2.h>
++#include <cuda_bf16.h>
++#include <stdexcept>
++#include "common/cuda_check.hpp"
++
++namespace dgpp {
++namespace {
++__global__ void widen(const __nv_bfloat16* in, double* out, size_t count) {
++  for (size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < count;
++       i += size_t(gridDim.x) * blockDim.x)
++    out[i] = static_cast<double>(__bfloat162float(in[i]));
++}
++
++__global__ void narrow(const double* in, __nv_bfloat16* out, size_t count) {
++  for (size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < count;
++       i += size_t(gridDim.x) * blockDim.x)
++    out[i] = __float2bfloat16_rn(__double2float_rn(in[i]));
++}
++}  // namespace
++
++struct QwenPleFp64Key::Impl {
++  int max_rows, n, k;
++  cublasHandle_t handle = nullptr;
++  double *act = nullptr, *weight = nullptr, *out = nullptr;
++  Impl(int rows, int outputs, int inputs) : max_rows(rows), n(outputs), k(inputs) {}
++  ~Impl() {
++    if (handle) cublasDestroy(handle);
++    cudaFree(act);
++    cudaFree(weight);
++    cudaFree(out);
++  }
++};
++
++QwenPleFp64Key::QwenPleFp64Key(int max_rows, int output_width, int input_width)
++    : impl_(std::make_unique<Impl>(max_rows, output_width, input_width)) {
++  if (max_rows <= 0 || output_width <= 0 || input_width <= 0)
++    throw std::invalid_argument("PLE FP64: dimensions must be positive");
++  auto& p = *impl_;
++  DGPP_CUBLAS_OK(cublasCreate(&p.handle), "PLE FP64 create");
++  DGPP_CUDA_OK(cudaMalloc(&p.act, size_t(max_rows) * p.k * sizeof(double)));
++  DGPP_CUDA_OK(cudaMalloc(&p.weight, size_t(p.n) * p.k * sizeof(double)));
++  DGPP_CUDA_OK(cudaMalloc(&p.out, size_t(max_rows) * p.n * sizeof(double)));
++}
++
++QwenPleFp64Key::~QwenPleFp64Key() = default;
++
++size_t QwenPleFp64Key::scratch_bytes(int max_rows, int output_width, int input_width) {
++  return (size_t(max_rows) * input_width + size_t(output_width) * input_width +
++          size_t(max_rows) * output_width) * sizeof(double);
++}
++
++void QwenPleFp64Key::project(const uint16_t* act, const uint16_t* weight, uint16_t* out,
++                            int rows, void* workspace, size_t workspace_bytes, cudaStream_t stream) {
++  auto& p = *impl_;
++  if (rows <= 0 || rows > p.max_rows || !act || !weight || !out || !workspace)
++    throw std::invalid_argument("PLE FP64: invalid operands or row count");
++  // SetStream resets cuBLAS workspace, so bind the caller's scratch afterwards.
++  DGPP_CUBLAS_OK(cublasSetStream(p.handle, stream), "PLE FP64 stream");
++  DGPP_CUBLAS_OK(cublasSetWorkspace(p.handle, workspace, workspace_bytes), "PLE FP64 workspace");
++  widen<<<1024, 256, 0, stream>>>(reinterpret_cast<const __nv_bfloat16*>(act), p.act, size_t(rows) * p.k);
++  // Reconvert each call so a streamed/rebound weight cannot leave a stale cache.
++  widen<<<1024, 256, 0, stream>>>(reinterpret_cast<const __nv_bfloat16*>(weight), p.weight, size_t(p.n) * p.k);
++  DGPP_CUDA_OK(cudaGetLastError());
++  const double alpha = 1.0, beta = 0.0;
++  DGPP_CUBLAS_OK(cublasDgemm(p.handle, CUBLAS_OP_T, CUBLAS_OP_N, p.n, rows, p.k,
++                            &alpha, p.weight, p.k, p.act, p.k, &beta, p.out, p.n), "PLE FP64 product");
++  // Explicit FP32 then BF16 round-to-nearest matches the independent oracle.
++  narrow<<<1024, 256, 0, stream>>>(p.out, reinterpret_cast<__nv_bfloat16*>(out), size_t(rows) * p.n);
++  DGPP_CUDA_OK(cudaGetLastError());
++}
++
++}  // namespace dgpp
+diff --git a/src/kernels/qwen_ple_fp64.hpp b/src/kernels/qwen_ple_fp64.hpp
+new file mode 100644
+index 0000000..28ff619
+--- /dev/null
++++ b/src/kernels/qwen_ple_fp64.hpp
+@@ -0,0 +1,27 @@
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++#include <memory>
++#include <cuda_runtime.h>
++
++namespace dgpp {
++
++// Issue #4 diagnostic, not a production lowering: retain BF16 operands and
++// rank-partial boundaries while isolating accumulation in the PLE key product.
++class QwenPleFp64Key {
++ public:
++  QwenPleFp64Key(int max_rows, int output_width, int input_width);
++  ~QwenPleFp64Key();
++  QwenPleFp64Key(const QwenPleFp64Key&) = delete;
++  QwenPleFp64Key& operator=(const QwenPleFp64Key&) = delete;
++  static size_t scratch_bytes(int max_rows, int output_width, int input_width);
++  void project(const uint16_t* act, const uint16_t* weight, uint16_t* out,
++               int rows, void* workspace, size_t workspace_bytes, cudaStream_t stream);
++
++ private:
++  struct Impl;
++  std::unique_ptr<Impl> impl_;
++};
++
++}  // namespace dgpp
+diff --git a/src/models/qwen/layers.cpp b/src/models/qwen/layers.cpp
+index 3279424..7cb35a3 100644
+--- a/src/models/qwen/layers.cpp
++++ b/src/models/qwen/layers.cpp
+@@ -21,6 +21,7 @@
+ #include "kernels/scale_gemm.hpp"
+ #include "kernels/qwen_norm.hpp"
+ #include "kernels/qwen_ple.hpp"
++#include "kernels/qwen_ple_fp64.hpp"
+ 
+ namespace dgpp {
+ namespace {
+@@ -32,6 +33,11 @@ T* dev_alloc(size_t n) {
+   return p;
+ }
+ 
++bool ple_fp64_key_enabled() {
++  const char* value = std::getenv("DGPP_ISSUE4_PLE_FP64_KEY");
++  return value && std::string(value) == "1";
++}
++
+ void gemm_bf16(const QwenGemmWorkspace& g, const uint16_t* act, int64_t act_stride,
+                const uint16_t* w, void* out, GemmOut out_type, int m, int n, int k,
+                cudaStream_t stream) {
+@@ -653,6 +659,10 @@ QwenPleLayer::QwenPleLayer(const QwenPleResident& w, const QwenNgramTableResiden
+   qn_ = dev_alloc<uint16_t>(M * W);
+   gv_ = dev_alloc<uint16_t>(M * W);
+   un_ = dev_alloc<uint16_t>(M * W);
++  if (ple_fp64_key_enabled()) {
++    fp64_key_ = std::make_unique<QwenPleFp64Key>(max_tokens_, hc_ * hidden_, w_.hash_heads * head_dim_);
++    DGPP_LOG_INFO("issue4: PLE prefill key projection uses FP64 accumulation; BF16 weights/output/TP fold retained");
++  }
+ }
+ 
+ QwenPleLayer::~QwenPleLayer() {
+@@ -689,7 +699,9 @@ size_t QwenPleLayer::scratch_bytes(const QwenTextConfig& cfg, int hash_heads, in
+   const size_t H = static_cast<size_t>(cfg.hidden_size), W = static_cast<size_t>(cfg.hc_count) * H;
+   const size_t heads = static_cast<size_t>((cfg.ngram_size - 1) * cfg.heads_per_ngram);
+   const size_t hd = static_cast<size_t>(cfg.ple_embed_dim) / std::max<size_t>(heads, 1);
+-  return M * heads * 4 + M * static_cast<size_t>(hash_heads) * hd * 2 + M * W * 2 * 5 + M * H * 2;
++  const size_t extra = ple_fp64_key_enabled() ? QwenPleFp64Key::scratch_bytes(
++      static_cast<int>(M), static_cast<int>(W), static_cast<int>(hash_heads * hd)) : 0;
++  return M * heads * 4 + M * static_cast<size_t>(hash_heads) * hd * 2 + M * W * 2 * 5 + M * H * 2 + extra;
+ }
+ 
+ // The host node's arguments: one block per captured walk (its pointer is
+@@ -784,6 +796,22 @@ void QwenPleLayer::project_key(uint16_t* key_dst, int rows, cudaStream_t stream)
+   if (rows <= 0) return;
+   if (!w_.key_proj && !w_.key_proj_fp8.payload) throw std::invalid_argument("QwenPleLayer: null weights");
+   const int E = w_.hash_heads * head_dim_, W = hc_ * hidden_;
++  if (fp64_key_ && rows > 128) {
++    if (!fp64_key_logged_) {
++      DGPP_LOG_INFO("issue4: executing FP64 PLE key projection rows={} output={} input={}", rows, W, E);
++      fp64_key_logged_ = true;
++    }
++    const uint16_t* weight = w_.key_proj;
++    if (w_.key_proj_fp8.payload) {
++      if (w_.key_proj_fp8.rows != W || w_.key_proj_fp8.cols != E || !g_.dequant ||
++          size_t(W) * E * sizeof(uint16_t) > g_.dequant_bytes)
++        throw std::invalid_argument("PLE FP64: prefill BF16 weight bridge unavailable");
++      launch_fp8_dequant_blocks(w_.key_proj_fp8.payload, w_.key_proj_fp8.scales, g_.dequant, W, E, stream);
++      weight = g_.dequant;
++    }
++    fp64_key_->project(e_, weight, key_dst ? key_dst : key_, rows, g_.ws, g_.ws_bytes, stream);
++    return;
++  }
+   gemm_dense(g_, e_, E, w_.key_proj, w_.key_proj_fp8, key_dst ? key_dst : key_, GemmOut::BF16, rows, W, E, stream);
+ }
+ 
+diff --git a/src/models/qwen/layers.hpp b/src/models/qwen/layers.hpp
+index c135072..da75b7a 100644
+--- a/src/models/qwen/layers.hpp
++++ b/src/models/qwen/layers.hpp
+@@ -26,6 +26,8 @@
+ 
+ namespace dgpp {
+ 
++class QwenPleFp64Key;
++
+ // The GEMM interface's workspace, shared by every layer object of a model.
+ struct QwenGemmWorkspace {
+   IGemm* gemm = nullptr;
+@@ -301,6 +303,8 @@ class QwenPleLayer {
+   int32_t eos() const { return eos_; }
+ 
+  private:
++  std::unique_ptr<QwenPleFp64Key> fp64_key_;
++  bool fp64_key_logged_ = false;
+   QwenPleResident w_;
+   QwenNgramTableResident table_;
+   QwenGemmWorkspace g_;

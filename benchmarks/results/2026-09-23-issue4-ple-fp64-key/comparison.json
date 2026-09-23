@@ -1,0 +1,166 @@
+{
+  "completed": true,
+  "modes": [
+    {
+      "mode": "baseline-1",
+      "correct": 5,
+      "actual": {
+        "key_3ee7709ef005": "val_00648ee398573f64",
+        "key_5c7ad6586dd6": "val_e08802eec5f6c596",
+        "key_ecf0ce89497b": "val_58e1450aa7c54384",
+        "key_a3ea1faf8458": "val_d2efb323f0ac0eab",
+        "key_1ccd2debc518": null,
+        "key_0769e0226c63": "val_5dac9ed720abddaf"
+      },
+      "usage": {
+        "prompt_tokens": 261120,
+        "completion_tokens": 184,
+        "total_tokens": 261304,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 0
+        }
+      },
+      "wall_seconds": 218.91146328498144,
+      "request_sha256": "9ebc3a1ed20f37f3501bf4629bf84d3e0523cbb33989c3ce68fb5e8fd0db2393",
+      "first_request_verified": true,
+      "actual_rank_code_paths_verified": true,
+      "response_sha256": "80d761074a93118b450432a8b2538488f252f50c681a7ef09b1de28917cbd7b6",
+      "content_sha256": "c2413f544aa63bf4294825a521fc229e79fd8c5eafaef1e57038850d92b5bbec",
+      "runtime": [
+        {
+          "node": "192.168.88.11",
+          "pid": 284848,
+          "binary_sha256": "948ae69ec973bb137d064251db4053c77759df73d0b9e8c8330475a9b2f25294",
+          "ple_fp64_key": []
+        },
+        {
+          "node": "192.168.88.12",
+          "pid": 764947,
+          "binary_sha256": "948ae69ec973bb137d064251db4053c77759df73d0b9e8c8330475a9b2f25294",
+          "ple_fp64_key": []
+        }
+      ]
+    },
+    {
+      "mode": "fp64-1",
+      "correct": 5,
+      "actual": {
+        "key_3ee7709ef005": "val_00648ee398573f64",
+        "key_5c7ad6586dd6": "val_e08802eec5f6c596",
+        "key_ecf0ce89497b": "val_58e1450aa7c54384",
+        "key_a3ea1faf8458": "val_d2efb323f0ac0eab",
+        "key_1ccd2debc518": null,
+        "key_0769e0226c63": "val_5dac9ed720abddaf"
+      },
+      "usage": {
+        "prompt_tokens": 261120,
+        "completion_tokens": 184,
+        "total_tokens": 261304,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 0
+        }
+      },
+      "wall_seconds": 235.50544286699733,
+      "request_sha256": "9ebc3a1ed20f37f3501bf4629bf84d3e0523cbb33989c3ce68fb5e8fd0db2393",
+      "first_request_verified": true,
+      "actual_rank_code_paths_verified": true,
+      "response_sha256": "4dae871f20925ee5d3dbad4aaf9c23c5279c2e0875a73302847ad7048864028e",
+      "content_sha256": "c2413f544aa63bf4294825a521fc229e79fd8c5eafaef1e57038850d92b5bbec",
+      "runtime": [
+        {
+          "node": "192.168.88.11",
+          "pid": 288138,
+          "binary_sha256": "948ae69ec973bb137d064251db4053c77759df73d0b9e8c8330475a9b2f25294",
+          "ple_fp64_key": [
+            "1"
+          ]
+        },
+        {
+          "node": "192.168.88.12",
+          "pid": 769553,
+          "binary_sha256": "948ae69ec973bb137d064251db4053c77759df73d0b9e8c8330475a9b2f25294",
+          "ple_fp64_key": [
+            "1"
+          ]
+        }
+      ]
+    },
+    {
+      "mode": "baseline-2",
+      "correct": 5,
+      "actual": {
+        "key_3ee7709ef005": "val_00648ee398573f64",
+        "key_5c7ad6586dd6": "val_e08802eec5f6c596",
+        "key_ecf0ce89497b": "val_58e1450aa7c54384",
+        "key_a3ea1faf8458": "val_d2efb323f0ac0eab",
+        "key_1ccd2debc518": null,
+        "key_0769e0226c63": "val_5dac9ed720abddaf"
+      },
+      "usage": {
+        "prompt_tokens": 261120,
+        "completion_tokens": 184,
+        "total_tokens": 261304,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 0
+        }
+      },
+      "wall_seconds": 218.3928892959957,
+      "request_sha256": "9ebc3a1ed20f37f3501bf4629bf84d3e0523cbb33989c3ce68fb5e8fd0db2393",
+      "first_request_verified": true,
+      "actual_rank_code_paths_verified": true,
+      "response_sha256": "0973cf5a72487f1dd9a0ce4c75ec5b5d5a02ec90eb7fc58ab74f671adeb97481",
+      "content_sha256": "c2413f544aa63bf4294825a521fc229e79fd8c5eafaef1e57038850d92b5bbec",
+      "runtime": [
+        {
+          "node": "192.168.88.11",
+          "pid": 291769,
+          "binary_sha256": "948ae69ec973bb137d064251db4053c77759df73d0b9e8c8330475a9b2f25294",
+          "ple_fp64_key": []
+        },
+        {
+          "node": "192.168.88.12",
+          "pid": 774162,
+          "binary_sha256": "948ae69ec973bb137d064251db4053c77759df73d0b9e8c8330475a9b2f25294",
+          "ple_fp64_key": []
+        }
+      ]
+    }
+  ],
+  "baseline_text_and_usage_repeat_exactly": true,
+  "fp64_text_matches_baseline": true,
+  "fp64_usage_matches_baseline": true,
+  "restoration_verified": true,
+  "build": {
+    "base_commit": "d318815984fd2ab1f0a67a6b830b57730a57439a",
+    "binary_sha256": "948ae69ec973bb137d064251db4053c77759df73d0b9e8c8330475a9b2f25294",
+    "probe_sha256": "d4b75d416284dae8f0a7f09fd301d9bc6aba1ce00f6c61042a78de99584ec788",
+    "diagnostic_patch_sha256": "8f29856ae2f905ce3b6055510b05aee71053e1c1586501acdbc16a487501c355",
+    "source_sha256": {
+      "CMakeLists.txt": "ef8cb30a1ce0e5c56344a9491f5b5817844e0547af237410624a200d371d9f0b",
+      "src/models/qwen/layers.cpp": "47a52a7ccdc2d9b3918ceb8bbf665be9f978417582bfbf77b1183bdac4bd563d",
+      "src/models/qwen/layers.hpp": "67540ef967b307d07192845088e6e1281da302b9cd3d9df2caae40f234cdb3e3",
+      "src/kernels/qwen_ple_fp64.cu": "53329bdd8de3ca3e33bf81d3c06ef55a3afe54f49dbc9b5fe95c3c7202be5100",
+      "src/kernels/qwen_ple_fp64.hpp": "8543ea0a2549b0db317a59694d735bd7bf41b33cd3f52d7798867a240aa0171a"
+    },
+    "release_build_passed": true,
+    "incremental_build_up_to_date": true,
+    "source_diff_check_passed": true,
+    "probe_compiled": true,
+    "script_sha256": {
+      "campaign.py": "01a7f4564814af2bd0be5c501a231c95bd3d256bd2bea031d24aa03a0e2ef31a",
+      "gpu_probe.cpp": "a46b2871dec8423c043c3d7512f915e701293e9fa10ce70a85337a1ce2f8c10c",
+      "analyze_gpu.py": "bc6196697cc29e1328a9a941824aff67ab5e65a2fd702ff9e9e5ebc95900b96e"
+    },
+    "extra_scratch_bytes_per_rank": 293601280
+  },
+  "script_sha256": "2f5f7ab7739ee34605d0781f4440d9daffe81ad2fce8d819293a99487c0514e4"
+}

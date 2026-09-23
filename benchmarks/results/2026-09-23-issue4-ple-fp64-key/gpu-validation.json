@@ -1,0 +1,912 @@
+{
+  "passed": true,
+  "native_baseline_all_fields_bitwise": true,
+  "key_partials_and_fold_match_fp64_oracle_bitwise": true,
+  "checked_shapes": [
+    {
+      "rows": 2048,
+      "outputs": 10240,
+      "inputs": 1280
+    },
+    {
+      "rows": 1024,
+      "outputs": 10240,
+      "inputs": 1280
+    }
+  ],
+  "value_and_query_unchanged": true,
+  "checks": {
+    "fp64/key_proj0": {
+      "elements": 296960,
+      "relative_l2": 0.0,
+      "max_abs": 0.0,
+      "bitwise_equal_elements": 296960,
+      "two_bf16_relative_mismatches": 0,
+      "mismatch_fraction": 0.0,
+      "nonfinite": 0,
+      "worst_rows": [
+        {
+          "position": 253221,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 155831,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 20486,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 46321,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 58309,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 75193,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 80174,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 90700,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 97329,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 106334,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        }
+      ]
+    },
+    "fp64/key_proj1": {
+      "elements": 296960,
+      "relative_l2": 0.0,
+      "max_abs": 0.0,
+      "bitwise_equal_elements": 296960,
+      "two_bf16_relative_mismatches": 0,
+      "mismatch_fraction": 0.0,
+      "nonfinite": 0,
+      "worst_rows": [
+        {
+          "position": 253221,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 155831,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 20486,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 46321,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 58309,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 75193,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 80174,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 90700,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 97329,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 106334,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        }
+      ]
+    },
+    "fp64/key_proj_folded": {
+      "elements": 296960,
+      "relative_l2": 0.0,
+      "max_abs": 0.0,
+      "bitwise_equal_elements": 296960,
+      "two_bf16_relative_mismatches": 0,
+      "mismatch_fraction": 0.0,
+      "nonfinite": 0,
+      "worst_rows": [
+        {
+          "position": 253221,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 155831,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 20486,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 46321,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 58309,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 75193,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 80174,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 90700,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 97329,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 106334,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        }
+      ]
+    },
+    "fp64-tail/key_proj0": {
+      "elements": 143360,
+      "relative_l2": 0.0,
+      "max_abs": 0.0,
+      "bitwise_equal_elements": 143360,
+      "two_bf16_relative_mismatches": 0,
+      "mismatch_fraction": 0.0,
+      "nonfinite": 0,
+      "worst_rows": [
+        {
+          "position": 235560,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 227885,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 205052,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 172612,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 162716,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 158304,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 155831,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 133125,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 121089,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 90700,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        }
+      ]
+    },
+    "fp64-tail/key_proj1": {
+      "elements": 143360,
+      "relative_l2": 0.0,
+      "max_abs": 0.0,
+      "bitwise_equal_elements": 143360,
+      "two_bf16_relative_mismatches": 0,
+      "mismatch_fraction": 0.0,
+      "nonfinite": 0,
+      "worst_rows": [
+        {
+          "position": 235560,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 227885,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 205052,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 172612,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 162716,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 158304,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 155831,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 133125,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 121089,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 90700,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        }
+      ]
+    },
+    "fp64-tail/key_proj_folded": {
+      "elements": 143360,
+      "relative_l2": 0.0,
+      "max_abs": 0.0,
+      "bitwise_equal_elements": 143360,
+      "two_bf16_relative_mismatches": 0,
+      "mismatch_fraction": 0.0,
+      "nonfinite": 0,
+      "worst_rows": [
+        {
+          "position": 235560,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 227885,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 205052,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 172612,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 162716,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 158304,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 155831,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 133125,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 121089,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 90700,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        }
+      ]
+    },
+    "change/key_proj_folded": {
+      "elements": 296960,
+      "relative_l2": 0.00011991053150998587,
+      "max_abs": 0.0009765625,
+      "bitwise_equal_elements": 296842,
+      "two_bf16_relative_mismatches": 10,
+      "mismatch_fraction": 3.367456896551724e-05,
+      "nonfinite": 0,
+      "worst_rows": [
+        {
+          "position": 245114,
+          "relative_l2": 0.0006414447911190026,
+          "max_abs": 0.0009765625,
+          "mismatches": 0
+        },
+        {
+          "position": 205052,
+          "relative_l2": 0.00021276694722926188,
+          "max_abs": 0.00048828125,
+          "mismatches": 0
+        },
+        {
+          "position": 133125,
+          "relative_l2": 0.0001202481313615199,
+          "max_abs": 0.000244140625,
+          "mismatches": 0
+        },
+        {
+          "position": 8915,
+          "relative_l2": 0.00011581289204455435,
+          "max_abs": 0.000244140625,
+          "mismatches": 0
+        },
+        {
+          "position": 58309,
+          "relative_l2": 0.0001133088522492168,
+          "max_abs": 0.000244140625,
+          "mismatches": 0
+        },
+        {
+          "position": 220287,
+          "relative_l2": 0.00011239693559089893,
+          "max_abs": 0.000244140625,
+          "mismatches": 0
+        },
+        {
+          "position": 144704,
+          "relative_l2": 0.000108582531152145,
+          "max_abs": 0.000244140625,
+          "mismatches": 1
+        },
+        {
+          "position": 20486,
+          "relative_l2": 0.00010459317729368499,
+          "max_abs": 0.000244140625,
+          "mismatches": 0
+        },
+        {
+          "position": 212825,
+          "relative_l2": 0.00010459317729368499,
+          "max_abs": 0.000244140625,
+          "mismatches": 0
+        },
+        {
+          "position": 90700,
+          "relative_l2": 9.93716227303058e-05,
+          "max_abs": 0.000244140625,
+          "mismatches": 1
+        }
+      ]
+    },
+    "change/key_norm": {
+      "elements": 296960,
+      "relative_l2": 0.00024522024752431375,
+      "max_abs": 0.125,
+      "bitwise_equal_elements": 296564,
+      "two_bf16_relative_mismatches": 10,
+      "mismatch_fraction": 3.367456896551724e-05,
+      "nonfinite": 0,
+      "worst_rows": [
+        {
+          "position": 245114,
+          "relative_l2": 0.0011381974928458129,
+          "max_abs": 0.125,
+          "mismatches": 0
+        },
+        {
+          "position": 20486,
+          "relative_l2": 0.0004575601354707658,
+          "max_abs": 0.0625,
+          "mismatches": 0
+        },
+        {
+          "position": 212825,
+          "relative_l2": 0.0004575601354707658,
+          "max_abs": 0.0625,
+          "mismatches": 0
+        },
+        {
+          "position": 158304,
+          "relative_l2": 0.00013487769484484918,
+          "max_abs": 0.015625,
+          "mismatches": 0
+        },
+        {
+          "position": 208700,
+          "relative_l2": 0.0001167649957536993,
+          "max_abs": 0.015625,
+          "mismatches": 0
+        },
+        {
+          "position": 46321,
+          "relative_l2": 0.0001167649957536993,
+          "max_abs": 0.015625,
+          "mismatches": 0
+        },
+        {
+          "position": 162716,
+          "relative_l2": 0.0001167649957536993,
+          "max_abs": 0.015625,
+          "mismatches": 0
+        },
+        {
+          "position": 253221,
+          "relative_l2": 0.0001167649957536993,
+          "max_abs": 0.015625,
+          "mismatches": 0
+        },
+        {
+          "position": 227885,
+          "relative_l2": 0.0001167649957536993,
+          "max_abs": 0.015625,
+          "mismatches": 0
+        },
+        {
+          "position": 205052,
+          "relative_l2": 0.00011594833003097497,
+          "max_abs": 0.0078125,
+          "mismatches": 0
+        }
+      ]
+    },
+    "change/gated": {
+      "elements": 296960,
+      "relative_l2": 0.01302499984149266,
+      "max_abs": 0.000732421875,
+      "bitwise_equal_elements": 225296,
+      "two_bf16_relative_mismatches": 39509,
+      "mismatch_fraction": 0.13304485452586207,
+      "nonfinite": 0,
+      "worst_rows": [
+        {
+          "position": 136732,
+          "relative_l2": 0.01876519097790274,
+          "max_abs": 0.000213623046875,
+          "mismatches": 2544
+        },
+        {
+          "position": 20486,
+          "relative_l2": 0.01733190183614756,
+          "max_abs": 0.000213623046875,
+          "mismatches": 2533
+        },
+        {
+          "position": 220287,
+          "relative_l2": 0.017054099909443336,
+          "max_abs": 0.00030517578125,
+          "mismatches": 2507
+        },
+        {
+          "position": 155831,
+          "relative_l2": 0.01663000770277029,
+          "max_abs": 0.00048828125,
+          "mismatches": 2094
+        },
+        {
+          "position": 212825,
+          "relative_l2": 0.0159852954679733,
+          "max_abs": 0.000213623046875,
+          "mismatches": 2533
+        },
+        {
+          "position": 106334,
+          "relative_l2": 0.01523639713665361,
+          "max_abs": 0.000244140625,
+          "mismatches": 1737
+        },
+        {
+          "position": 8915,
+          "relative_l2": 0.014381353535617423,
+          "max_abs": 0.000152587890625,
+          "mismatches": 2161
+        },
+        {
+          "position": 179328,
+          "relative_l2": 0.014183308856998153,
+          "max_abs": 0.0003662109375,
+          "mismatches": 680
+        },
+        {
+          "position": 245114,
+          "relative_l2": 0.014122117070555721,
+          "max_abs": 0.000732421875,
+          "mismatches": 724
+        },
+        {
+          "position": 80174,
+          "relative_l2": 0.014027839829540286,
+          "max_abs": 0.00018310546875,
+          "mismatches": 1300
+        }
+      ]
+    },
+    "change/conv_norm": {
+      "elements": 296960,
+      "relative_l2": 0.008805661013783059,
+      "max_abs": 0.25,
+      "bitwise_equal_elements": 233435,
+      "two_bf16_relative_mismatches": 23851,
+      "mismatch_fraction": 0.08031721443965517,
+      "nonfinite": 0,
+      "worst_rows": [
+        {
+          "position": 136732,
+          "relative_l2": 0.017991605863821168,
+          "max_abs": 0.15625,
+          "mismatches": 2560
+        },
+        {
+          "position": 20486,
+          "relative_l2": 0.015845802890829402,
+          "max_abs": 0.15625,
+          "mismatches": 2517
+        },
+        {
+          "position": 212825,
+          "relative_l2": 0.014869889583471132,
+          "max_abs": 0.15625,
+          "mismatches": 2517
+        },
+        {
+          "position": 58309,
+          "relative_l2": 0.013001648923490148,
+          "max_abs": 0.125,
+          "mismatches": 2560
+        },
+        {
+          "position": 220287,
+          "relative_l2": 0.012906229369595934,
+          "max_abs": 0.1875,
+          "mismatches": 769
+        },
+        {
+          "position": 90700,
+          "relative_l2": 0.011973938831021222,
+          "max_abs": 0.21875,
+          "mismatches": 2559
+        },
+        {
+          "position": 8915,
+          "relative_l2": 0.011630356502363763,
+          "max_abs": 0.125,
+          "mismatches": 1116
+        },
+        {
+          "position": 80174,
+          "relative_l2": 0.011594173008337955,
+          "max_abs": 0.125,
+          "mismatches": 500
+        },
+        {
+          "position": 133125,
+          "relative_l2": 0.011185085381361443,
+          "max_abs": 0.1875,
+          "mismatches": 2559
+        },
+        {
+          "position": 106334,
+          "relative_l2": 0.010754952442678675,
+          "max_abs": 0.125,
+          "mismatches": 262
+        }
+      ]
+    },
+    "gate_isolated": {
+      "elements": 296960,
+      "relative_l2": 0.0,
+      "max_abs": 0.0,
+      "bitwise_equal_elements": 296960,
+      "two_bf16_relative_mismatches": 0,
+      "mismatch_fraction": 0.0,
+      "nonfinite": 0,
+      "worst_rows": [
+        {
+          "position": 253221,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 155831,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 20486,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 46321,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 58309,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 75193,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 80174,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 90700,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 97329,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 106334,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        }
+      ]
+    },
+    "gate_vs_key_only_oracle": {
+      "elements": 296960,
+      "relative_l2": 0.0,
+      "max_abs": 0.0,
+      "bitwise_equal_elements": 296960,
+      "two_bf16_relative_mismatches": 0,
+      "mismatch_fraction": 0.0,
+      "nonfinite": 0,
+      "worst_rows": [
+        {
+          "position": 253221,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 155831,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 20486,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 46321,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 58309,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 75193,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 80174,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 90700,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 97329,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        },
+        {
+          "position": 106334,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "mismatches": 0
+        }
+      ]
+    }
+  },
+  "worst_position_136732_scalars": [
+    0.0306396484375,
+    0.00506591796875,
+    0.048828125,
+    0.006683349609375
+  ],
+  "output_sha256": {
+    "bf16/key_proj0": "e25eda0d89417552aac3aa7224a3c3e31eaf5999a5c5e47a8e8e4f1dab0d600d",
+    "bf16/key_proj1": "55b3c840203148420de52d7e8772aafd7bc237c70040eaf7d07604fa53ed0f6b",
+    "bf16/key_proj_folded": "d742c03c358cf1ac6f60f9b415b2c06f805f50533b7dfb86c9f6165dcf68e91c",
+    "bf16/value_proj0": "540f367ef9b35e6ee4ee406f85951b1c51314afb3b243f9eb29d4631aac27ca7",
+    "bf16/value_proj1": "32bc6f17bee7e42edd20d214402ede1ed1cecdb24753507865be4d9cb816c910",
+    "bf16/value_proj_folded": "564a688a96ab68c6370fa4cbde35cfc6cf3d6a2649124822bc9798783254b56c",
+    "bf16/key_norm": "ba5696d23150f0255760b6f4b888efa99989378a06dbf6a08a8205fe120ac4d7",
+    "bf16/query_norm": "e6f0a76979d9ec98554e004bdbc4bb9f8c9485e92c5984f2fa623329ba12fcb4",
+    "bf16/gated": "5bb29dc61515d76dc615b78a48a10cbcdf51394909657579760949ebcbdc5132",
+    "bf16/conv_norm": "bca653f0a1096e168175a2a4eb6bd8544053d352099a027da42824f291c2c41e",
+    "fp64/key_proj0": "1010f12db908a0cb1b5dcaa4775936342a677b6cc68855c2fc39130cbafb3b47",
+    "fp64/key_proj1": "d26976429e1dd631187cb54b3db1697f3c7a9254a0f793405e76c857c0883356",
+    "fp64/key_proj_folded": "8e353d1a2950b999c7ce9322292d2faa7d72a7df3ef523a34a59aceb7aa440f9",
+    "fp64/value_proj0": "540f367ef9b35e6ee4ee406f85951b1c51314afb3b243f9eb29d4631aac27ca7",
+    "fp64/value_proj1": "32bc6f17bee7e42edd20d214402ede1ed1cecdb24753507865be4d9cb816c910",
+    "fp64/value_proj_folded": "564a688a96ab68c6370fa4cbde35cfc6cf3d6a2649124822bc9798783254b56c",
+    "fp64/key_norm": "5f352259188ae4b2268db1a7f20af07d438a5958ef7beabc22b17c8acee6d948",
+    "fp64/query_norm": "e6f0a76979d9ec98554e004bdbc4bb9f8c9485e92c5984f2fa623329ba12fcb4",
+    "fp64/gated": "dc3654ba1caa6fe06d1e223f214aac2a4bc40602cbc7a270e4c2f26d49bfe50a",
+    "fp64/conv_norm": "5aa4cfa83d92527ca7cf80609abf798ab4b176f6636e101faa79754c3da69145",
+    "fp64-tail/key_proj0": "cc4ed31ba09a51339e9236feb41617623908566e2ac0ba916e48c7cf516c2c9d",
+    "fp64-tail/key_proj1": "968ffee64475003f5bcfbb15030cfc878de3a564f749ff8ddf801c8387bf0c28",
+    "fp64-tail/key_proj_folded": "3ad49cf65e6cf17f2f49d7358afc1435100288cce43b39fc416897033a7f2764",
+    "fp64-tail/value_proj0": "91be1eb02e9bc2e4ecd091fddc5f3e10855f91c70a32726dec82b0779a88a3f8",
+    "fp64-tail/value_proj1": "71560e070ba6bdf36303bee0c1a2a6d0b7e528382c04b90e85ae62b43512af6d",
+    "fp64-tail/value_proj_folded": "5be707b1ae91006f16e01e6da5fdb579cf2a746eae533bcd50c8c824e9a77efe",
+    "fp64-tail/key_norm": "1ade417588470c644b559355a2a660752212947b15c5b36058e9fafc6aecb3df",
+    "fp64-tail/query_norm": "8472ee5c6db1466a6de7ae840bda569fb7e496b2f9b1916d26f3aad3319fb5f9",
+    "fp64-tail/gated": "8d0e0c2806262652e5ebb8bb60713df5f131c813927ef54349f4803199c10df8",
+    "fp64-tail/conv_norm": "4f1ed6ae5c004c3f23ab89d888f47a7fecbca61c52408c30f84a21cb525dc72e"
+  },
+  "script_sha256": "bc6196697cc29e1328a9a941824aff67ab5e65a2fd702ff9e9e5ebc95900b96e",
+  "scope": "Frozen original outliers. Does not establish retrieval causality."
+}

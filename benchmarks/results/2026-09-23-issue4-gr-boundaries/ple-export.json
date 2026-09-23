@@ -1,0 +1,18 @@
+{
+  "position": 261289,
+  "full_source_rehash_matches": true,
+  "files": [
+    {
+      "source": "rank0/layer1/ple_residual_after.bin",
+      "bytes": 5351219200,
+      "sha256": "419b3d6eff7790ac23e690a9c44620855660685c5a410929f168b8e888fa8182",
+      "export_sha256": "b8390fcfd5aeaf386ec5604866e98b2a7d4020e7860a1359f6e0fb4948f16dc6"
+    },
+    {
+      "source": "rank1/layer1/ple_residual_after.bin",
+      "bytes": 5351219200,
+      "sha256": "419b3d6eff7790ac23e690a9c44620855660685c5a410929f168b8e888fa8182",
+      "export_sha256": "b8390fcfd5aeaf386ec5604866e98b2a7d4020e7860a1359f6e0fb4948f16dc6"
+    }
+  ]
+}

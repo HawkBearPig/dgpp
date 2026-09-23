@@ -1,0 +1,13 @@
+{
+  "completed": true,
+  "prior_attention_comparisons": 94,
+  "prior_attention_max_metric_delta": 2.168404344971009e-19,
+  "prior_result_sha256": "2ee7d9987be348e6724ae199e2c93f42d03dbf105387e2a8cfa66e6bd070428d",
+  "both_injection_chains_match_all_final_residual_values": true,
+  "files_sha256": {
+    "export_ple.py": "b15344a63fc75774bc2e234b62e66daf921a9d32bf006e8701260cb941e83344",
+    "replay.py": "341f3251ec0fcbb465aea208e87fde7c5cbd15b6b84db37a34697cab3ec1e003",
+    "replay.json": "78190e04ec759b2f7a33232cb436b5c1b1b936de7e9ab99f278535c39b5995f9",
+    "ple-export.json": "1185ccb637552bfbca96a1a15df356ac4fa1fb4deb8cf69790d76085f774a19c"
+  }
+}
