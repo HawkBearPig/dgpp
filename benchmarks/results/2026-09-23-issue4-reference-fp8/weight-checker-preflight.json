@@ -1,0 +1,18 @@
+{
+  "cpu_only": true,
+  "checker_sha256": "bbaf746b35a5b7e5128eed92cd946f93a921695f5d543b9aeb6f629933be9145",
+  "independent_scale_construction": "BF16 bit expansion to FP32, full 128x128 blocks, TP slice, then 64x64 regrouping",
+  "results": [
+    {
+      "rank": 0,
+      "exact_checks": 24,
+      "corrupted_scale_rejected": true
+    },
+    {
+      "rank": 1,
+      "exact_checks": 24,
+      "corrupted_scale_rejected": true
+    }
+  ],
+  "all_pass": true
+}

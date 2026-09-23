@@ -25,6 +25,8 @@ def check(module, rank, directory):
     assert tuple(selected['w2_weight'].shape) == (512, 2560, 320)
     assert tuple(selected['w13_weight_scale_inv'].shape) == (512, 10, 40)
     assert tuple(selected['w2_weight_scale_inv'].shape) == (512, 40, 5)
+    assert selected['w13_weight_scale_inv'].dtype == torch.float32
+    assert selected['w2_weight_scale_inv'].dtype == torch.float32
     assert rank in (0, 1)
     results = []
     for expert in (0, 127, 255, 511):
@@ -39,8 +41,11 @@ def check(module, rank, directory):
                     source[kind] = f.get_tensor(key)
             # Select raw FP8 bytes, avoiding any conversion of weight values.
             weight = source['weight'].view(torch.uint8)
-            scales = source['weight_scale_inv']
-            assert scales.dtype == torch.float32
+            checkpoint_scales = source['weight_scale_inv']
+            assert checkpoint_scales.dtype == torch.bfloat16
+            # The pinned loader allocates FP32 runtime scales. BF16 -> FP32
+            # is exact; the checkpoint's scale values must not change.
+            scales = checkpoint_scales.float()
             # Independently enumerate the finer grid's parent block.
             rows = torch.arange(scales.shape[0] * 2) // 2
             cols = torch.arange(scales.shape[1] * 2) // 2
@@ -60,11 +65,13 @@ def check(module, rank, directory):
                 actual_bytes, expected_bytes = raw(actual), raw(expected)
                 row = dict(expert=expert, projection=projection, kind=kind,
                            shape=list(actual.shape), bytes=len(actual_bytes),
+                           actual_dtype=str(actual.dtype), expected_dtype=str(expected.dtype),
                            sha256=hashlib.sha256(actual_bytes).hexdigest(),
                            exact=actual.shape == expected.shape and actual_bytes == expected_bytes)
                 assert row['exact'], row
                 results.append(row)
     receipt = dict(rank=rank, checkpoint_block=[128, 128], runtime_block=[64, 64],
+                   checkpoint_scale_dtype='torch.bfloat16', runtime_scale_dtype='torch.float32',
                    checks=results, all_pass=True)
     (directory / 'fp8-weight-checks.json').write_text(json.dumps(receipt, indent=2) + '\n')
     print('Issue4: FP8 checkpoint weights and refined scales verified, rank', rank, flush=True)

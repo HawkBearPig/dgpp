@@ -1,0 +1,158 @@
+[
+  {
+    "key": "model.language_model.layers.0.mlp.experts.0.gate_proj.weight_scale_inv",
+    "shard": "model-00002-of-00131.safetensors",
+    "dtype": "BF16",
+    "shape": [
+      5,
+      20
+    ],
+    "data_offsets": [
+      0,
+      200
+    ]
+  },
+  {
+    "key": "model.language_model.layers.0.mlp.experts.0.up_proj.weight_scale_inv",
+    "shard": "model-00002-of-00131.safetensors",
+    "dtype": "BF16",
+    "shape": [
+      5,
+      20
+    ],
+    "data_offsets": [
+      200,
+      400
+    ]
+  },
+  {
+    "key": "model.language_model.layers.0.mlp.experts.0.down_proj.weight_scale_inv",
+    "shard": "model-00003-of-00131.safetensors",
+    "dtype": "BF16",
+    "shape": [
+      20,
+      5
+    ],
+    "data_offsets": [
+      0,
+      200
+    ]
+  },
+  {
+    "key": "model.language_model.layers.0.mlp.experts.127.gate_proj.weight_scale_inv",
+    "shard": "model-00002-of-00131.safetensors",
+    "dtype": "BF16",
+    "shape": [
+      5,
+      20
+    ],
+    "data_offsets": [
+      12800,
+      13000
+    ]
+  },
+  {
+    "key": "model.language_model.layers.0.mlp.experts.127.up_proj.weight_scale_inv",
+    "shard": "model-00002-of-00131.safetensors",
+    "dtype": "BF16",
+    "shape": [
+      5,
+      20
+    ],
+    "data_offsets": [
+      13000,
+      13200
+    ]
+  },
+  {
+    "key": "model.language_model.layers.0.mlp.experts.127.down_proj.weight_scale_inv",
+    "shard": "model-00003-of-00131.safetensors",
+    "dtype": "BF16",
+    "shape": [
+      20,
+      5
+    ],
+    "data_offsets": [
+      6400,
+      6600
+    ]
+  },
+  {
+    "key": "model.language_model.layers.0.mlp.experts.255.gate_proj.weight_scale_inv",
+    "shard": "model-00002-of-00131.safetensors",
+    "dtype": "BF16",
+    "shape": [
+      5,
+      20
+    ],
+    "data_offsets": [
+      69600,
+      69800
+    ]
+  },
+  {
+    "key": "model.language_model.layers.0.mlp.experts.255.up_proj.weight_scale_inv",
+    "shard": "model-00002-of-00131.safetensors",
+    "dtype": "BF16",
+    "shape": [
+      5,
+      20
+    ],
+    "data_offsets": [
+      69800,
+      70000
+    ]
+  },
+  {
+    "key": "model.language_model.layers.0.mlp.experts.255.down_proj.weight_scale_inv",
+    "shard": "model-00003-of-00131.safetensors",
+    "dtype": "BF16",
+    "shape": [
+      20,
+      5
+    ],
+    "data_offsets": [
+      34800,
+      35000
+    ]
+  },
+  {
+    "key": "model.language_model.layers.0.mlp.experts.511.gate_proj.weight_scale_inv",
+    "shard": "model-00002-of-00131.safetensors",
+    "dtype": "BF16",
+    "shape": [
+      5,
+      20
+    ],
+    "data_offsets": [
+      183600,
+      183800
+    ]
+  },
+  {
+    "key": "model.language_model.layers.0.mlp.experts.511.up_proj.weight_scale_inv",
+    "shard": "model-00002-of-00131.safetensors",
+    "dtype": "BF16",
+    "shape": [
+      5,
+      20
+    ],
+    "data_offsets": [
+      183800,
+      184000
+    ]
+  },
+  {
+    "key": "model.language_model.layers.0.mlp.experts.511.down_proj.weight_scale_inv",
+    "shard": "model-00003-of-00131.safetensors",
+    "dtype": "BF16",
+    "shape": [
+      20,
+      5
+    ],
+    "data_offsets": [
+      91800,
+      92000
+    ]
+  }
+]

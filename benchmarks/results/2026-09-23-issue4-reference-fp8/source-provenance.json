@@ -1,7 +1,7 @@
 {
-  "campaign.py": "c3c822cc795c4c2b901a20a81c0b899f14a6af92ff71a8ba591be8cef4c8ea93",
+  "campaign.py": "e02f63098e692b33f1ba5fb2ceadda9b666a4471de8ee2769bfd9da3bc9574a5",
   "issue4_moe_align.py": "30ad4ef648d60afb92ee7056d5065d6413137865e71b0e9a44ebbcf566b59a54",
-  "issue4_fp8_weights.py": "bf668b032e327bd23209a8ff327eede2d86964f08c7e6bd1858cb7c3d9ec962c",
+  "issue4_fp8_weights.py": "bbaf746b35a5b7e5128eed92cd946f93a921695f5d543b9aeb6f629933be9145",
   "issue4_trace.py": "188340a3c050d3773b1e289cd12f98da4456f11fcd390f11eb39fc974a111503",
   "issue4_topk.py": "09adcdbf0de0f14f8589d6d08098f16a76c5d376ccc3c472cb59a5aa1478ed68",
   "pinned-gdn-configs.json": "f72c04239fa5a57ef899a410db8fef958d14a3a346f55c343b9b4bff355dc0f3",
@@ -13,5 +13,7 @@
   "raw/fp8.py": "de1f475609b6d5adc149e7c2c2d95bbe1be4ef45ff39abbdd524d785d3c69d41",
   "raw/fp8_oracle.py": "a4cab17ac95c380dc74df908fb554def104a75a9cce8d78363bd3e31a832083c",
   "raw/qsa.py": "d7a0c7690cae4a59a4f621b6b5b8abc904205371635c1c1fdef9d9bd3a682647",
-  "raw/ple_layer.py": "9410518f08adc844c318af0f21518ebcb0cd7fd9e3b95a8448356cf52dec68dc"
+  "raw/ple_layer.py": "9410518f08adc844c318af0f21518ebcb0cd7fd9e3b95a8448356cf52dec68dc",
+  "weight-checker-preflight.json": "4267cb4ef56a15023f0c36a35fd83d60c9e0fffa31f0161fd07fa500e0b3c18c",
+  "check_weight_checker.py": "5e50f2c405f60aa39206f76f8ab11536d5bd9907abb84f136c871333be90fbba"
 }

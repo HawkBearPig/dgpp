@@ -1,0 +1,150 @@
+[
+  {
+    "rank": 0,
+    "fields": [
+      {
+        "field": "layer-1_embedding",
+        "exact": true
+      },
+      {
+        "field": "layer-1_ngram_context",
+        "exact": true
+      },
+      {
+        "field": "layer-1_query_start_loc",
+        "exact": true
+      },
+      {
+        "field": "layer0_attn_in",
+        "exact": true
+      },
+      {
+        "field": "layer0_attn_injection",
+        "exact": true
+      },
+      {
+        "field": "layer0_attn_out",
+        "exact": true
+      },
+      {
+        "field": "layer0_gdn_beta",
+        "exact": true
+      },
+      {
+        "field": "layer0_gdn_core",
+        "exact": true
+      },
+      {
+        "field": "layer0_gdn_final_state",
+        "exact": true
+      },
+      {
+        "field": "layer0_gdn_g",
+        "exact": true
+      },
+      {
+        "field": "layer0_gdn_initial_state",
+        "exact": true
+      },
+      {
+        "field": "layer0_gdn_k",
+        "exact": true
+      },
+      {
+        "field": "layer0_gdn_q",
+        "exact": true
+      },
+      {
+        "field": "layer0_gdn_v",
+        "exact": true
+      },
+      {
+        "field": "layer0_mlp_in",
+        "exact": true
+      },
+      {
+        "field": "layer0_mlp_injection",
+        "exact": true
+      },
+      {
+        "field": "layer0_residual",
+        "exact": true
+      }
+    ],
+    "all_exact": true
+  },
+  {
+    "rank": 1,
+    "fields": [
+      {
+        "field": "layer-1_embedding",
+        "exact": true
+      },
+      {
+        "field": "layer-1_ngram_context",
+        "exact": true
+      },
+      {
+        "field": "layer-1_query_start_loc",
+        "exact": true
+      },
+      {
+        "field": "layer0_attn_in",
+        "exact": true
+      },
+      {
+        "field": "layer0_attn_injection",
+        "exact": true
+      },
+      {
+        "field": "layer0_attn_out",
+        "exact": true
+      },
+      {
+        "field": "layer0_gdn_beta",
+        "exact": true
+      },
+      {
+        "field": "layer0_gdn_core",
+        "exact": true
+      },
+      {
+        "field": "layer0_gdn_final_state",
+        "exact": true
+      },
+      {
+        "field": "layer0_gdn_g",
+        "exact": true
+      },
+      {
+        "field": "layer0_gdn_initial_state",
+        "exact": true
+      },
+      {
+        "field": "layer0_gdn_k",
+        "exact": true
+      },
+      {
+        "field": "layer0_gdn_q",
+        "exact": true
+      },
+      {
+        "field": "layer0_gdn_v",
+        "exact": true
+      },
+      {
+        "field": "layer0_mlp_in",
+        "exact": true
+      },
+      {
+        "field": "layer0_mlp_injection",
+        "exact": true
+      },
+      {
+        "field": "layer0_residual",
+        "exact": true
+      }
+    ],
+    "all_exact": true
+  }
+]

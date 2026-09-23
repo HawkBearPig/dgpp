@@ -103,6 +103,8 @@ shutil.copy2(RECORD/'pinned-gdn-configs.json',PINNED_GDN)
 run('copy-pinned-configs',['scp',PINNED_GDN,'stephen@192.168.88.12:'+PINNED_GDN])
 unit_summary=json.loads((RECORD/'alignment-validation.json').read_text())
 assert unit_summary['all_pass'] and unit_summary['alignment_sha256']==sha(RECORD/'issue4_moe_align.py')
+weight_preflight=json.loads((RECORD/'weight-checker-preflight.json').read_text())
+assert weight_preflight['all_pass'] and weight_preflight['checker_sha256']==sha(RECORD/'issue4_fp8_weights.py')
 EXPERTS_OVERLAY = '/tmp/dgpp-issue4-fp8-fused-moe.py'
 EXPERTS_SOURCE = '/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/fused_moe/fused_moe.py'
 ALIGN_HELPER = '/tmp/dgpp-issue4-canonical-moe-align.py'

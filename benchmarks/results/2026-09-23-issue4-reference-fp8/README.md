@@ -30,11 +30,28 @@ The first launch aborted at its idle-service guard before stopping production or
 starting a reference world. It sent no test inference requests. `attempt1.json`
 records the exclusion; production remained live. The user subsequently authorized
 stopping the cluster for testing. The retry passed both recorded idle checks and
-stopped production at 15:12 UTC; the reference is loading. Accuracy results are
-pending. The campaign restores production in its cleanup path.
+stopped production at 15:12 UTC. This attempt was excluded because the diagnostic
+checker incorrectly asserted FP32 checkpoint scales before the first expert
+computation. Production restoration passed. The corrected retry is starting;
+accuracy results remain pending.
 
 A CPU-only check instantiated the pinned reference configuration class for both
 checkpoints. Effective routing normalization, PLE seed and convolution width
 agree (`true`, `1234`, `4`), despite omitted optional metadata in the FP8 config.
 `effective-config-parity.json` records the values. The PLE consumer supplies seed
 1234 and GDN uses `linear_conv_kernel_dim`; neither omission changes execution.
+The small CPU source/output receipts are also published in `config-receipts/`;
+`config-parity-provenance.json` hashes their original local paths.
+
+## Excluded checker failure and correction
+
+`attempt2.json` records the diagnostic-only abort. All 12 sampled checkpoint scale
+tensors are BF16; the stock reference allocates FP32 runtime scales. The corrected
+checker requires those actual types and compares exact FP32 promotions of the
+BF16 checkpoint values. It still checks raw FP8 weight bytes and refined scale
+coordinates exactly. The CPU preflight independently decodes BF16 bits, expands
+full 128-by-128 scale blocks, shards them and regroups into 64-by-64 blocks. All
+48 checks pass, and deliberately corrupted scales are rejected on both ranks.
+The campaign requires this preflight and its checker hash. The aborted attempt
+also confirms all 17 captured fields before the first expert computation match
+the NVFP4 FP32-state control on both ranks. No retrieval verdict is claimed.

@@ -170,3 +170,11 @@ both recorded idle checks, stopped production at 15:12 UTC and is loading the
 reference. Accuracy results are pending. A CPU-only check confirms both
 checkpoints have the same effective routing normalization, PLE seed and
 convolution width in the pinned reference.
+
+The first authorized FP8 run loaded successfully but stopped in a diagnostic
+assertion: checkpoint scales are BF16, while runtime scales are FP32. This is an
+excluded checker error before the first expert computation, not an accuracy
+result. Production restoration passed. The corrected checker preserves exact
+value comparisons, passes 48 independently constructed CPU checks and rejects
+corrupted scales on both ranks. All 17 captured preceding fields match the
+NVFP4 reference on each rank. A corrected serial retry is starting.
