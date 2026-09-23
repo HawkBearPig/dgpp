@@ -1,0 +1,475 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 59267a5..b2653e4 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -161,6 +161,7 @@ add_library(dgpp_kernels STATIC
+   src/kernels/kernels.cu
+   src/kernels/doll_attention.cu
+   src/kernels/kda.cu
++  src/kernels/gdn_chunk.cu
+   src/kernels/dsa.cu
+   src/kernels/fp8_dequant.cu
+   src/kernels/fp4_gemv.cu
+diff --git a/src/kernels/gdn_chunk.cu b/src/kernels/gdn_chunk.cu
+new file mode 100644
+index 0000000..e747ba5
+--- /dev/null
++++ b/src/kernels/gdn_chunk.cu
+@@ -0,0 +1,259 @@
++#include "kernels/gdn_chunk.hpp"
++
++#include <algorithm>
++#include <cmath>
++#include <stdexcept>
++
++#include "common/cuda_check.hpp"
++#include "common/dtypes.hpp"
++
++namespace dgpp {
++namespace {
++constexpr int B = 64;
++constexpr int D = 128;
++constexpr int VS = 32;
++
++__device__ float f(uint16_t x) { return bf16_bits_to_float(x); }
++__device__ uint16_t b(float x) { return float_to_bf16_bits(x); }
++__device__ float ex(float x) { return __expf(x); }
++
++struct Buffers {
++  uint16_t *q, *k, *inverse, *w, *u, *vn, *h;
++  float *g, *beta;
++};
++
++Buffers buffers(void* memory, int chunks, int hk, int hv) {
++  auto* p = static_cast<uint16_t*>(memory);
++  Buffers s;
++  const size_t nk = size_t(chunks) * hk * B * D;
++  const size_t nv = size_t(chunks) * hv * B * D;
++  s.q = p; p += nk;
++  s.k = p; p += nk;
++  s.inverse = p; p += size_t(chunks) * hv * B * B;
++  s.w = p; p += nv;
++  s.u = p; p += nv;
++  s.vn = p; p += nv;
++  s.h = p; p += size_t(chunks) * hv * D * D;
++  s.g = reinterpret_cast<float*>(p);
++  s.beta = s.g + size_t(chunks) * hv * B;
++  return s;
++}
++
++__global__ void prepare_qk(const uint16_t* x, uint16_t* q, uint16_t* k,
++                           int tokens, int hk, int hv) {
++  const int t = blockIdx.x, h = blockIdx.y, d = threadIdx.x;
++  const int64_t src = int64_t(t) * (2 * hk + hv) * D + h * D + d;
++  float qv = t < tokens ? f(x[src]) : 0.f;
++  float kv = t < tokens ? f(x[src + hk * D]) : 0.f;
++  __shared__ float qs[D], ks[D];
++  qs[d] = qv * qv; ks[d] = kv * kv;
++  __syncthreads();
++  for (int step = D / 2; step; step /= 2) {
++    if (d < step) { qs[d] += qs[d + step]; ks[d] += ks[d + step]; }
++    __syncthreads();
++  }
++  const int64_t dst = ((int64_t(t / B) * hk + h) * B + t % B) * D + d;
++  q[dst] = b(qv * (1.f / sqrtf(qs[0] + 1e-6f)));
++  k[dst] = b(kv * (1.f / sqrtf(ks[0] + 1e-6f)));
++}
++
++__global__ void prepare_gates(const uint16_t* a, int64_t as,
++                              const uint16_t* raw_beta, int64_t bs,
++                              const float* al, const float* dt,
++                              float* g, float* beta, int tokens, int hv) {
++  const int c = blockIdx.x, h = blockIdx.y, i = threadIdx.x;
++  const int t = c * B + i;
++  __shared__ float scan[B];
++  float gv = 0.f, bv = 0.f;
++  if (t < tokens) {
++    const float x = f(a[int64_t(t) * as + h]) + dt[h];
++    const float sp = x > 20.f ? x : fmaxf(x, 0.f) + __logf(1.f + ex(-fabsf(x)));
++    gv = -ex(al[h]) * sp;
++    bv = 1.f / (1.f + ex(-f(raw_beta[int64_t(t) * bs + h])));
++  }
++  scan[i] = gv;
++  __syncthreads();
++  for (int step = 1; step < B; step *= 2) {
++    const float prev = i >= step ? scan[i - step] : 0.f;
++    __syncthreads();
++    scan[i] += prev;
++    __syncthreads();
++  }
++  const int64_t dst = (int64_t(c) * hv + h) * B + i;
++  g[dst] = scan[i]; beta[dst] = bv;
++}
++
++// Invert I + tril(beta_i <k_i,k_j> exp(G_i-G_j), -1). The solve is
++// FP32; its BF16 result is the WY representation used by the block scan.
++__global__ void inverse_kernel(const uint16_t* keys, const float* g,
++                               const float* beta, uint16_t* inverse,
++                               int hk, int hv) {
++  const int c = blockIdx.x, h = blockIdx.y;
++  const int64_t ch = int64_t(c) * hv + h;
++  const uint16_t* k = keys + (int64_t(c) * hk + h / (hv / hk)) * B * D;
++  __shared__ float a[B * B], inv[B * B];
++  for (int z = threadIdx.x; z < B * B; z += blockDim.x) {
++    const int i = z / B, j = z % B;
++    float value = 0.f;
++    if (j < i) {
++      const float bi = beta[ch * B + i];
++      for (int d = 0; d < D; ++d)
++        value = fmaf(f(k[i * D + d]) * bi, f(k[j * D + d]), value);
++      value *= ex(g[ch * B + i] - g[ch * B + j]);
++    }
++    a[z] = value;
++    inv[z] = i == j ? 1.f : 0.f;
++  }
++  __syncthreads();
++  for (int i = 1; i < B; ++i) {
++    const int j = threadIdx.x;
++    if (j < i) {
++      float value = -a[i * B + j];
++      for (int p = j + 1; p < i; ++p)
++        value = fmaf(-a[i * B + p], inv[p * B + j], value);
++      inv[i * B + j] = value;
++    }
++    __syncthreads();
++  }
++  for (int z = threadIdx.x; z < B * B; z += blockDim.x)
++    inverse[ch * B * B + z] = b(inv[z]);
++}
++
++__global__ void wy_kernel(const uint16_t* x, const uint16_t* keys,
++                          const float* g, const float* beta,
++                          const uint16_t* inverse, uint16_t* w, uint16_t* u,
++                          int tokens, int hk, int hv) {
++  const int c = blockIdx.x, h = blockIdx.y;
++  const int64_t ch = int64_t(c) * hv + h;
++  const uint16_t* k = keys + (int64_t(c) * hk + h / (hv / hk)) * B * D;
++  __shared__ uint16_t ai[B * B], kb[B * D], vb[B * D];
++  for (int z = threadIdx.x; z < B * B; z += blockDim.x)
++    ai[z] = inverse[ch * B * B + z];
++  for (int z = threadIdx.x; z < B * D; z += blockDim.x) {
++    const int i = z / D, d = z % D, t = c * B + i;
++    const float bi = beta[ch * B + i];
++    kb[z] = b((f(k[z]) * bi) * ex(g[ch * B + i]));
++    vb[z] = t < tokens ? b(f(x[(int64_t(t) * (2 * hk + hv) + 2 * hk + h) * D + d]) * bi) : 0;
++  }
++  __syncthreads();
++  for (int z = threadIdx.x; z < B * D; z += blockDim.x) {
++    const int i = z / D, d = z % D;
++    float sw = 0.f, su = 0.f;
++    for (int p = 0; p <= i; ++p) {
++      const float v = f(ai[i * B + p]);
++      sw = fmaf(v, f(kb[p * D + d]), sw);
++      su = fmaf(v, f(vb[p * D + d]), su);
++    }
++    w[ch * B * D + z] = b(sw); u[ch * B * D + z] = b(su);
++  }
++}
++
++// Each value slice owns its state for every block in this prefill call.
++// The persistent state is never rounded; BF16 views feed the matrix products.
++__global__ void state_kernel(const uint16_t* keys, const float* g,
++                             const uint16_t* w, const uint16_t* u,
++                             uint16_t* vn, uint16_t* history, float* state,
++                             int tokens, int chunks, int hk, int hv) {
++  const int h = blockIdx.x, v0 = blockIdx.y * VS;
++  __shared__ float s[VS * D];
++  __shared__ uint16_t weighted[B * VS];
++  for (int z = threadIdx.x; z < VS * D; z += blockDim.x)
++    s[z] = state[(int64_t(h) * D + v0) * D + z];
++  __syncthreads();
++  for (int c = 0; c < chunks; ++c) {
++    const int64_t ch = int64_t(c) * hv + h;
++    const uint16_t* k = keys + (int64_t(c) * hk + h / (hv / hk)) * B * D;
++    const int live = min(B, tokens - c * B);
++    const float last = g[ch * B + live - 1];
++    for (int z = threadIdx.x; z < VS * D; z += blockDim.x)
++      history[(ch * D + v0) * D + z] = b(s[z]);
++    __syncthreads();
++    for (int z = threadIdx.x; z < B * VS; z += blockDim.x) {
++      const int i = z / VS, v = z % VS;
++      float lo = 0.f, hi = 0.f;
++      for (int d = 0; d < 64; ++d) {
++        lo = fmaf(f(w[(ch * B + i) * D + d]), f(b(s[v * D + d])), lo);
++        hi = fmaf(f(w[(ch * B + i) * D + 64 + d]), f(b(s[v * D + 64 + d])), hi);
++      }
++      const float delta = f(u[(ch * B + i) * D + v0 + v]) - (lo + hi);
++      vn[(ch * B + i) * D + v0 + v] = b(delta);
++      weighted[z] = i < live ? b(delta * ex(last - g[ch * B + i])) : 0;
++    }
++    __syncthreads();
++    for (int z = threadIdx.x; z < VS * D; z += blockDim.x) {
++      const int v = z / D, d = z % D;
++      float delta = 0.f;
++      for (int i = 0; i < live; ++i)
++        delta = fmaf(f(k[i * D + d]), f(weighted[i * VS + v]), delta);
++      s[z] = __fadd_rn(__fmul_rn(s[z], ex(last)), delta);
++    }
++    __syncthreads();
++  }
++  for (int z = threadIdx.x; z < VS * D; z += blockDim.x)
++    state[(int64_t(h) * D + v0) * D + z] = s[z];
++}
++
++__global__ void output_kernel(const uint16_t* queries, const uint16_t* keys,
++                              const float* g, const uint16_t* vn,
++                              const uint16_t* history, uint16_t* out,
++                              int tokens, int hk, int hv, float scale) {
++  const int c = blockIdx.x, h = blockIdx.y, v0 = blockIdx.z * VS;
++  const int64_t ch = int64_t(c) * hv + h;
++  const int64_t kh = int64_t(c) * hk + h / (hv / hk);
++  const uint16_t* k = keys + kh * B * D;
++  __shared__ uint16_t q[B * D], a[B * B], st[VS * D], v[B * VS];
++  for (int z = threadIdx.x; z < B * D; z += blockDim.x) q[z] = queries[kh * B * D + z];
++  for (int z = threadIdx.x; z < VS * D; z += blockDim.x) st[z] = history[(ch * D + v0) * D + z];
++  for (int z = threadIdx.x; z < B * VS; z += blockDim.x)
++    v[z] = vn[(ch * B + z / VS) * D + v0 + z % VS];
++  __syncthreads();
++  for (int z = threadIdx.x; z < B * B; z += blockDim.x) {
++    const int i = z / B, j = z % B;
++    float value = 0.f;
++    if (j <= i) {
++      for (int d = 0; d < D; ++d) value = fmaf(f(q[i * D + d]), f(k[j * D + d]), value);
++      value *= ex(g[ch * B + i] - g[ch * B + j]);
++    }
++    a[z] = b(value);
++  }
++  __syncthreads();
++  for (int z = threadIdx.x; z < B * VS; z += blockDim.x) {
++    const int i = z / VS, vi = z % VS, t = c * B + i;
++    if (t >= tokens) continue;
++    float before = 0.f, within = 0.f;
++    for (int d = 0; d < D; ++d) before = fmaf(f(q[i * D + d]), f(st[vi * D + d]), before);
++    for (int j = 0; j <= i; ++j) within = fmaf(f(a[i * B + j]), f(v[j * VS + vi]), within);
++    out[(int64_t(t) * hv + h) * D + v0 + vi] = b((before * ex(g[ch * B + i])) * scale + within * scale);
++  }
++}
++}  // namespace
++
++size_t gdn_chunk_workspace_bytes(int tokens, int hk, int hv) {
++  if (tokens < 0 || hk <= 0 || hv <= 0 || hv % hk)
++    throw std::invalid_argument("gdn chunk: invalid geometry");
++  const size_t chunks = (size_t(tokens) + B - 1) / B;
++  return chunks * (size_t(2) * hk * B * D * 2 +
++                   size_t(hv) * (B * B * 2 + 3 * B * D * 2 + D * D * 2 + 2 * B * 4));
++}
++
++void gdn_chunk_fwd(const uint16_t* qkv, const uint16_t* a, int64_t as,
++                   const uint16_t* beta, int64_t bs, const float* al,
++                   const float* dt, float* state, uint16_t* out,
++                   int tokens, int hk, int hv, float scale,
++                   void* workspace, size_t workspace_bytes, cudaStream_t stream) {
++  if (tokens <= 0) return;
++  const size_t needed = gdn_chunk_workspace_bytes(tokens, hk, hv);
++  if (!qkv || !a || !beta || !al || !dt || !state || !out || !workspace ||
++      workspace_bytes < needed || as < hv || bs < hv)
++    throw std::invalid_argument("gdn chunk: invalid storage");
++  const int chunks = (tokens + B - 1) / B;
++  const auto s = buffers(workspace, chunks, hk, hv);
++  prepare_qk<<<dim3(chunks * B, hk), D, 0, stream>>>(qkv, s.q, s.k, tokens, hk, hv);
++  prepare_gates<<<dim3(chunks, hv), B, 0, stream>>>(a, as, beta, bs, al, dt, s.g, s.beta, tokens, hv);
++  inverse_kernel<<<dim3(chunks, hv), 256, 0, stream>>>(s.k, s.g, s.beta, s.inverse, hk, hv);
++  wy_kernel<<<dim3(chunks, hv), 256, 0, stream>>>(qkv, s.k, s.g, s.beta, s.inverse, s.w, s.u, tokens, hk, hv);
++  state_kernel<<<dim3(hv, D / VS), 256, 0, stream>>>(s.k, s.g, s.w, s.u, s.vn, s.h, state, tokens, chunks, hk, hv);
++  output_kernel<<<dim3(chunks, hv, D / VS), 256, 0, stream>>>(s.q, s.k, s.g, s.vn, s.h, out, tokens, hk, hv, scale);
++  DGPP_CUDA_OK(cudaGetLastError());
++}
++}  // namespace dgpp
+diff --git a/src/kernels/gdn_chunk.hpp b/src/kernels/gdn_chunk.hpp
+new file mode 100644
+index 0000000..f4418a5
+--- /dev/null
++++ b/src/kernels/gdn_chunk.hpp
+@@ -0,0 +1,20 @@
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++#include <cuda_runtime.h>
++
++namespace dgpp {
++
++// Single-sequence GDN prefill in 64-token blocks. Q/K normalization and
++// block-matrix intermediates use BF16; the persistent state remains FP32.
++// This initial implementation supports the Qwen 128 x 128 head geometry.
++size_t gdn_chunk_workspace_bytes(int tokens, int key_heads, int value_heads);
++
++void gdn_chunk_fwd(const uint16_t* qkv, const uint16_t* a, int64_t a_stride,
++                   const uint16_t* b, int64_t b_stride, const float* a_log,
++                   const float* dt_bias, float* state, uint16_t* out,
++                   int tokens, int key_heads, int value_heads, float scale,
++                   void* workspace, size_t workspace_bytes, cudaStream_t stream);
++
++}  // namespace dgpp
+diff --git a/src/models/qwen/forward.cpp b/src/models/qwen/forward.cpp
+index 08d048e..de55ab6 100644
+--- a/src/models/qwen/forward.cpp
++++ b/src/models/qwen/forward.cpp
+@@ -729,12 +729,12 @@ QwenModel::Outputs QwenModel::run_rows(const RowRun& run) {
+         for (int sp = 0; sp < run.num_spans; ++sp) {
+           const int len = run.span_lens[sp], sreq = run.span_reqs[sp];
+           gdn_->enqueue(x_ + static_cast<size_t>(row0) * H, gdn_rec(sreq, gdn_ordinal), gdn_conv(sreq, gdn_ordinal),
+-                        attn_out + static_cast<size_t>(row0) * H, len, stream_);
++                        attn_out + static_cast<size_t>(row0) * H, len, stream_, {}, {}, true);
+           row0 += len;
+         }
+       } else {
+         gdn_->enqueue(x_, gdn_rec(req, gdn_ordinal), gdn_conv(req, gdn_ordinal), attn_out, T, stream_,
+-                      rec_snap, conv_snap);
++                      rec_snap, conv_snap, !run.decode);
+       }
+       ++gdn_ordinal;
+     } else {
+diff --git a/src/models/qwen/layers.cpp b/src/models/qwen/layers.cpp
+index 3279424..8b451f5 100644
+--- a/src/models/qwen/layers.cpp
++++ b/src/models/qwen/layers.cpp
+@@ -14,6 +14,7 @@
+ #include "kernels/mma_gemv.hpp"
+ #include "kernels/dsa.hpp"
+ #include "kernels/kda.hpp"
++#include "kernels/gdn_chunk.hpp"
+ #include "kernels/qsa.hpp"
+ #include "kernels/rope_scaling.hpp"
+ #include "kernels/qwen_gr.hpp"
+@@ -270,6 +271,8 @@ QwenGdnLayer::QwenGdnLayer(const QwenGdnResident& w, const QwenGemmWorkspace& ge
+   b_ = dev_alloc<uint16_t>(M * static_cast<size_t>(lv_));
+   core_ = dev_alloc<uint16_t>(M * static_cast<size_t>(lv_) * v_dim_);
+   normed_ = dev_alloc<uint16_t>(M * static_cast<size_t>(lv_) * v_dim_);
++  chunk_workspace_bytes_ = gdn_chunk_workspace_bytes(max_tokens_, lk_, lv_);
++  chunk_workspace_ = dev_alloc<uint8_t>(chunk_workspace_bytes_);
+ }
+ 
+ QwenGdnLayer::~QwenGdnLayer() {
+@@ -280,6 +283,7 @@ QwenGdnLayer::~QwenGdnLayer() {
+   cudaFree(b_);
+   cudaFree(core_);
+   cudaFree(normed_);
++  cudaFree(chunk_workspace_);
+ }
+ 
+ void QwenGdnLayer::rebind(const QwenGdnResident& w) {
+@@ -363,7 +367,8 @@ void QwenGdnLayer::in_projections(const uint16_t* x, int tokens, cudaStream_t st
+ 
+ void QwenGdnLayer::enqueue(const uint16_t* x, float* recurrent_state, uint16_t* conv_state,
+                            uint16_t* out, int tokens, cudaStream_t stream,
+-                           const KdaStateSnapshots& rec_snap, const KdaConvSnapshots& conv_snap) {
++                           const KdaStateSnapshots& rec_snap, const KdaConvSnapshots& conv_snap,
++                           bool prefill) {
+   if (tokens <= 0) return;
+   if (tokens > max_tokens_) throw std::invalid_argument("QwenGdnLayer: tokens exceed max_tokens");
+   if (!(w_.in_proj_qkv || w_.in_proj_qkv_fp8.payload) || !w_.conv || !(w_.in_proj_z || w_.in_proj_z_fp8.payload) ||
+@@ -376,8 +381,13 @@ void QwenGdnLayer::enqueue(const uint16_t* x, float* recurrent_state, uint16_t*
+   in_projections(x, tokens, stream);
+   kda_causal_conv_silu_bf16(qkv_, C, w_.conv, conv_state, conv_width_ - 1, qkvc_, tokens, C,
+                             conv_width_, stream, conv_snap);
+-  gdn_recurrent_fwd(qkvc_, a_, lv_, b_, lv_, w_.a_log, w_.dt_bias, recurrent_state, core_, tokens,
+-                    lv_, lv_ / lk_, k_dim_, v_dim_, scale_, stream, rec_snap);
++  if (!prefill || rec_snap.states) {
++    gdn_recurrent_fwd(qkvc_, a_, lv_, b_, lv_, w_.a_log, w_.dt_bias, recurrent_state, core_, tokens,
++                      lv_, lv_ / lk_, k_dim_, v_dim_, scale_, stream, rec_snap);
++  } else {
++    gdn_chunk_fwd(qkvc_, a_, lv_, b_, lv_, w_.a_log, w_.dt_bias, recurrent_state, core_, tokens,
++                  lk_, lv_, scale_, chunk_workspace_, chunk_workspace_bytes_, stream);
++  }
+   gdn_gated_rmsnorm_bf16(core_, z_, w_.norm, normed_, static_cast<int64_t>(tokens) * lv_, v_dim_,
+                          eps_, stream);
+   gemm_dense(g_, normed_, LV, w_.out_proj, w_.out_proj_fp8, out, GemmOut::BF16, tokens, H, LV, stream);
+@@ -416,7 +426,8 @@ size_t QwenGdnLayer::scratch_bytes(const QwenTextConfig& cfg, int local_key_head
+   const size_t lk = static_cast<size_t>(local_key_heads), lv = static_cast<size_t>(local_value_heads);
+   const size_t K = static_cast<size_t>(cfg.gdn_key_head_dim), V = static_cast<size_t>(cfg.gdn_value_head_dim);
+   const size_t C = 2 * lk * K + lv * V;
+-  return M * (2 * C + 3 * lv * V + 2 * lv) * 2;  // qkv, qkvc, z, core, normed, a, b
++  return M * (2 * C + 3 * lv * V + 2 * lv) * 2 +
++         gdn_chunk_workspace_bytes(max_tokens, local_key_heads, local_value_heads);
+ }
+ 
+ // ---- QwenQsaLayer ----------------------------------------------------------------
+diff --git a/src/models/qwen/layers.hpp b/src/models/qwen/layers.hpp
+index c135072..c8ab678 100644
+--- a/src/models/qwen/layers.hpp
++++ b/src/models/qwen/layers.hpp
+@@ -122,7 +122,7 @@ class QwenGdnLayer {
+   // elements): row r's state lands in snapshot row r.
+   void enqueue(const uint16_t* x, float* recurrent_state, uint16_t* conv_state, uint16_t* out,
+                int tokens, cudaStream_t stream, const KdaStateSnapshots& rec_snap = {},
+-               const KdaConvSnapshots& conv_snap = {});
++               const KdaConvSnapshots& conv_snap = {}, bool prefill = false);
+   // The request-indexed row form (the fixed decode batch): rec_states /
+   // conv_states are slot 0's states, request strides in elements; the
+   // row map selects each span's slot, padding rows (pos < 0) write zero
+@@ -152,6 +152,8 @@ class QwenGdnLayer {
+   uint16_t* b_ = nullptr;       // [M, lv]
+   uint16_t* core_ = nullptr;    // [M, lv*V]
+   uint16_t* normed_ = nullptr;  // [M, lv*V]
++  void* chunk_workspace_ = nullptr;
++  size_t chunk_workspace_bytes_ = 0;
+ };
+ 
+ // ---- Qwen Sparse Attention ----------------------------------------------------------
+diff --git a/tests/cuda/gdn_test.cu b/tests/cuda/gdn_test.cu
+index 4d38328..31444fe 100644
+--- a/tests/cuda/gdn_test.cu
++++ b/tests/cuda/gdn_test.cu
+@@ -18,6 +18,7 @@
+ #include "common/test.hpp"
+ #include "kda_test_helpers.hpp"
+ #include "kernels/kda.hpp"
++#include "kernels/gdn_chunk.hpp"
+ #include "models/qwen/gdn_reference.hpp"
+ 
+ using namespace dgpp::kda_test;
+@@ -112,8 +113,53 @@ std::vector<float> random_state(const Problem& p, uint64_t seed) {
+   return random_f32_uniform(seed, p.state_elems(), 0.3f);
+ }
+ 
++DeviceRun run_chunk_device(const Problem& p, const std::vector<float>& initial, int span) {
++  cudaStream_t stream = test_stream();
++  DevBuf x(p.qkv.size() * 2), a(p.a_raw.size() * 2), beta(p.beta_raw.size() * 2);
++  DevBuf al(p.a_log.size() * 4), dt(p.dt_bias.size() * 4), st(initial.size() * 4);
++  DevBuf out(static_cast<size_t>(p.tokens) * p.heads * p.v * 2);
++  const size_t bytes = dgpp::gdn_chunk_workspace_bytes(span, p.heads_k(), p.heads);
++  DevBuf workspace(bytes);
++  x.upload(p.qkv.data(), p.qkv.size() * 2);
++  a.upload(p.a_raw.data(), p.a_raw.size() * 2);
++  beta.upload(p.beta_raw.data(), p.beta_raw.size() * 2);
++  al.upload(p.a_log.data(), p.a_log.size() * 4);
++  dt.upload(p.dt_bias.data(), p.dt_bias.size() * 4);
++  st.upload(initial.data(), initial.size() * 4);
++  for (int first = 0; first < p.tokens; first += span) {
++    const int count = std::min(span, p.tokens - first);
++    dgpp::gdn_chunk_fwd(x.as<uint16_t>() + first * p.qkv_row(),
++                        a.as<uint16_t>() + first * p.heads, p.heads,
++                        beta.as<uint16_t>() + first * p.heads, p.heads,
++                        al.as<float>(), dt.as<float>(), st.as<float>(),
++                        out.as<uint16_t>() + static_cast<int64_t>(first) * p.heads * p.v,
++                        count, p.heads_k(), p.heads, p.scale,
++                        workspace.as<uint8_t>(), bytes, stream);
++  }
++  DGPP_CUDA_OK(cudaStreamSynchronize(stream));
++  DeviceRun result;
++  result.out.resize(static_cast<size_t>(p.tokens) * p.heads * p.v);
++  result.state.resize(initial.size());
++  out.download(result.out.data(), result.out.size() * 2);
++  st.download(result.state.data(), result.state.size() * 4);
++  return result;
++}
++
+ }  // namespace
+ 
++DGPP_TEST(gdn_block_prefill_preserves_state_across_aligned_calls) {
++  // Distinct grouped heads, nonzero incoming state and a partial final block.
++  // Moving complete blocks between calls must not change their arithmetic.
++  const Problem p = Problem::make(193, 711, 6, 3);
++  const auto initial = random_state(p, 23);
++  const auto whole = run_chunk_device(p, initial, p.tokens);
++  for (int span : {64, 128, 193}) {
++    const auto split = run_chunk_device(p, initial, span);
++    require_bitwise("block prefill outputs", whole.out.data(), split.out.data(), whole.out.size() * 2);
++    require_bitwise("block prefill state", whole.state.data(), split.state.data(), whole.state.size() * 4);
++  }
++}
++
+ DGPP_TEST(gdn_recurrent_matches_the_host_oracle) {
+   for (const int tokens : {1, 5, 64}) {
+     const Problem p = Problem::make(tokens, 100 + tokens);

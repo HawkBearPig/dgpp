@@ -1,0 +1,12 @@
+[
+  {
+    "repetition": 1,
+    "assistant_text_exact_to_dgpp": true,
+    "token_counts_exact_to_dgpp": true
+  },
+  {
+    "repetition": 2,
+    "assistant_text_exact_to_dgpp": true,
+    "token_counts_exact_to_dgpp": true
+  }
+]

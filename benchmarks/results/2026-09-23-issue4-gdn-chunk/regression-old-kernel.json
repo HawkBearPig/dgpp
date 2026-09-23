@@ -1,0 +1,16 @@
+{
+  "output": {
+    "relative_l2": 0.003970088167281895,
+    "max_abs": 0.000244140625,
+    "different": 54784,
+    "elements": 99072,
+    "finite": true
+  },
+  "state": {
+    "relative_l2": 0.004101109291680441,
+    "max_abs": 0.0026975274085998535,
+    "different": 98304,
+    "elements": 98304,
+    "finite": true
+  }
+}

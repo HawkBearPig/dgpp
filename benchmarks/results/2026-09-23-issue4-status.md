@@ -35,8 +35,9 @@ consistency patch is not a prerequisite for the investigation.
 | [Main Q/K rotation storage](2026-09-23-issue4-qsa-rope-staging/README.md) | Nine GPU tests pass; original request still 5/6 | FP32 main Q/K rotary products are insufficient to repair retrieval |
 | [Frozen GDN comparison](2026-09-23-issue4-gdn-frozen-reference/README.md) | 16 cases, all finite; recurrent capture agreement ≤0.033% output L2, chunk/recurrent difference ≤0.371% | Isolates normalized-input storage from recurrent/chunked arithmetic |
 | [Untraced W4A4 retry](2026-09-23-issue4-reference-w4a4-untraced-retry/README.md) | Two identical 5/6 answers; full text/usage match traced reference | Tracing does not explain observed W4A4/W4A16 difference |
-| [W4A16 recurrent-GDN reference](2026-09-23-issue4-reference-recurrent-gdn/README.md) | Two identical 5/6 answers, exact DGPP text/token counts | Changing only GDN prefill reproduces DGPP failure; fresh A2 baseline running |
+| [W4A16 recurrent-GDN reference](2026-09-23-issue4-reference-recurrent-gdn/README.md) | Two identical 5/6 answers, exact DGPP text/token counts | A2 also fails: GDN causal attribution is not established |
 
+| [Fresh W4A16 repeat](2026-09-23-issue4-reference-w4a16-repeat/README.md) | Two original 5/6 answers with unchanged GDN | Earlier W4A16 success is not stable across fresh worlds |
 | [Expert router ties](2026-09-23-issue4-router-ties/README.md) | All 576 captured rows agree across prefill/decode batch shapes | No reference/DGPP expert-set differences on identical logits |
 
 [Draft PR #34](https://github.com/HawkBearPig/dgpp/pull/34) separates generation
@@ -103,7 +104,14 @@ requests returned the original DGPP failure with exactly matching full text
 and token counts (184 completion tokens). Production restoration passed.
 
 A second fresh-world [unmodified W4A16 repeat](2026-09-23-issue4-reference-w4a16-repeat/README.md)
-is now running to complete A/B/A before attributing the cross-world difference.
-A native 64-token chunked GDN prototype has been written in an isolated
-worktree and is building; real-fixture reference comparisons are prepared.
-It is not yet a validated fix.
+completed with two original 5/6 failures. This prevents a causal conclusion
+from the preceding GDN swap. A native 64-token chunked GDN prototype has
+built and is undergoing frozen-input comparisons; it is not a validated fix.
+
+The fresh unmodified W4A16 reference (A2) also returned the original DGPP
+failure twice, with exact full text/token-count agreement. Original GDN
+source hashes and Marlin selection were verified on both ranks. This invalidates
+a causal conclusion from the GDN swap. Production restoration passed.
+The native chunked prototype remains diagnostic; the current campaign first
+compares it and reference launch configurations on frozen inputs, then permits
+a direct DGPP baseline/candidate test only if the operator checks pass.

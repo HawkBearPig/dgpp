@@ -39,3 +39,7 @@ both model workers verified the overlay hash and Marlin backend before inference
 The fresh unmodified Marlin baseline is running to complete A/B/A before a
 causal conclusion. A native chunked GDN prototype is under development in an
 isolated worktree; it is not yet validated or proposed as a production fix.
+
+**A2 result:** the fresh unmodified Marlin world also fails both requests with
+exactly the same original DGPP answer. This comparison does not establish
+GDN as the cause. See the second-world reference record.

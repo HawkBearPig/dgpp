@@ -1,0 +1,130 @@
+[
+  {
+    "rank": 0,
+    "layer": 0,
+    "position": 0,
+    "tokens": 2048,
+    "file": "rank0-layer0-position0.npz",
+    "sha256": "dd9b595c8dd0cebb1aee448b19dba27073bf69cf11c99dab1ccbca60e10f8c04"
+  },
+  {
+    "rank": 0,
+    "layer": 0,
+    "position": 260096,
+    "tokens": 1194,
+    "file": "rank0-layer0-position260096.npz",
+    "sha256": "68073c7ea54520546d5da9c91f7c3b343f50de35ea9e8e44e114558afa0f4bac"
+  },
+  {
+    "rank": 0,
+    "layer": 16,
+    "position": 0,
+    "tokens": 2048,
+    "file": "rank0-layer16-position0.npz",
+    "sha256": "91fdf541cf35bf16e1b825f8b2c6d282b2ad1cd8532606085aa73d4917ec6ca5"
+  },
+  {
+    "rank": 0,
+    "layer": 16,
+    "position": 260096,
+    "tokens": 1194,
+    "file": "rank0-layer16-position260096.npz",
+    "sha256": "63a157432918a07a0399d06d9617d851de036a38e2d91028e486696a84afbedf"
+  },
+  {
+    "rank": 0,
+    "layer": 32,
+    "position": 0,
+    "tokens": 2048,
+    "file": "rank0-layer32-position0.npz",
+    "sha256": "e58aeed6f5656d6a689996a7dcaf48cce988311bb496d791e2cac6660985f3a0"
+  },
+  {
+    "rank": 0,
+    "layer": 32,
+    "position": 260096,
+    "tokens": 1194,
+    "file": "rank0-layer32-position260096.npz",
+    "sha256": "1329fcbf03683b74edabebf1ebdc27dbeb3ef3365ea1caba40279931eba78b52"
+  },
+  {
+    "rank": 0,
+    "layer": 46,
+    "position": 0,
+    "tokens": 2048,
+    "file": "rank0-layer46-position0.npz",
+    "sha256": "85293f3a6e4a478eb92bc2446cea3b5160ced0e972236068b28623418700ac2d"
+  },
+  {
+    "rank": 0,
+    "layer": 46,
+    "position": 260096,
+    "tokens": 1194,
+    "file": "rank0-layer46-position260096.npz",
+    "sha256": "da2892f1760aa2ebe823d8f2feeb4736a8755c1ababfee252bbc3858637d250d"
+  },
+  {
+    "rank": 1,
+    "layer": 0,
+    "position": 0,
+    "tokens": 2048,
+    "file": "rank1-layer0-position0.npz",
+    "sha256": "811be235620affed720b5f8b7629e5769f62a5bae6aee11754f6ccc4f39d286a"
+  },
+  {
+    "rank": 1,
+    "layer": 0,
+    "position": 260096,
+    "tokens": 1194,
+    "file": "rank1-layer0-position260096.npz",
+    "sha256": "9ec469a2967bf4c855909c1f307c4f5ca057c3ff10e8faf5def3dff144ae7925"
+  },
+  {
+    "rank": 1,
+    "layer": 16,
+    "position": 0,
+    "tokens": 2048,
+    "file": "rank1-layer16-position0.npz",
+    "sha256": "a0e68ee9d9569d79236e5ee4332f2f06b4c4c59a98ce86bcad0cfd1c4c7a1456"
+  },
+  {
+    "rank": 1,
+    "layer": 16,
+    "position": 260096,
+    "tokens": 1194,
+    "file": "rank1-layer16-position260096.npz",
+    "sha256": "e937a69d17aec75e90f8db552a31c3ec8c887b60f530274162ea0e4637440f80"
+  },
+  {
+    "rank": 1,
+    "layer": 32,
+    "position": 0,
+    "tokens": 2048,
+    "file": "rank1-layer32-position0.npz",
+    "sha256": "12b91cb03270b8a273f1af8af367df00dd624d037b16cd50f2512fb31982befb"
+  },
+  {
+    "rank": 1,
+    "layer": 32,
+    "position": 260096,
+    "tokens": 1194,
+    "file": "rank1-layer32-position260096.npz",
+    "sha256": "36da5ce1d3356822dab23dffa961d95dd3357c3c6546b4f0127d1e602054e239"
+  },
+  {
+    "rank": 1,
+    "layer": 46,
+    "position": 0,
+    "tokens": 2048,
+    "file": "rank1-layer46-position0.npz",
+    "sha256": "3d8b616386ccf9fae4004c721cd0ee7c0f20a7f048fd324b38d0baaeb685a9d8"
+  },
+  {
+    "rank": 1,
+    "layer": 46,
+    "position": 260096,
+    "tokens": 1194,
+    "file": "rank1-layer46-position260096.npz",
+    "sha256": "06400d0ff3eec2b299932ceb0ad1f894cd13ba2a2c15a15eef55fe3d338608b7"
+  }
+]

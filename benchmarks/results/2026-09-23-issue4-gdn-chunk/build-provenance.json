@@ -1,0 +1,8 @@
+{
+  "base_commit": "d318815984fd2ab1f0a67a6b830b57730a57439a",
+  "binary_sha256": "c35421aa4a4f319dcb361f586332178372ae35c3abd2f3fd39c9f74555f0546f",
+  "patch_sha256": "05f69d8b66008beeb31eab2fdf516645619b601ecb78bcdcfa17ce38d863b436",
+  "unit_binary_sha256": "a58b0fdefc5abd95fa220cb22229d5fb4a3fbc61de091441f80f36941fec7a65",
+  "library_sha256": "6a306ed92f81d2f22449b916a04e2cc62901d7e6bc20a65162f55ad29a820281",
+  "source": "Native 64-token chunked GDN prototype only, based on EOS fix. Causal attribution unresolved: fresh reference A2 also fails."
+}
