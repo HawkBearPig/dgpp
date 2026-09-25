@@ -133,12 +133,27 @@ the page count and the blob's pages. Per rank, at the checked-in recipes:
 
 On a Spark's NVMe (direct I/O, measured 2026-09-25: 4.5 GB/s writes,
 6.9 GB/s reads) a 260K-token Qwen entry spills in about a second and
-restores in under one, against 216 s to recompute it.
+restores in under one, against 216 s to recompute it. Measured on four
+Sparks (GLM-5.3-Flash, a 25,150-token document, 2026-09-25): the cold
+prefill took 18.8 s, the changed question over the in-memory document
+2.45 s, and after three other documents had pushed it out of a four-slot
+arena the same question came back from disk in 407 ms to first token
+(restore 121 ms for 341 MiB), with the transcript identical to the
+in-memory hit; see the
+[validation record](../benchmarks/results/2026-09-25-nvme-cold-tier/README.md).
 
 **Which entries.** Prefill snapshots (the deepest cut and the earlier
 document cut) and the close-time entries a completed answer leaves spill
-in the background right after they are taken, once they are at least
-`min_tokens` long (default: one prefill chunk). Blocks that two entries
+right after they are taken, once they are at least `min_tokens` long
+(default: one prefill chunk). A spill or restore advances two 64 MiB
+slices per scheduler tick — the device side of every slice is enqueued on
+the model stream between decode steps, never on a second stream beside
+the fabric's collectives — and a file worker moves the slices to and
+from the slab. Between requests that is the NVMe's rate; during decode
+about 3 GB/s (a 25K-token GLM entry, 340 MiB, spills in 0.4 s); during a
+long prefill, whose ticks are one chunk long, a spill paces at its ticks
+(the same entry took 16 s beside a 25K-token prefill). Measured 2026-09-25
+on four Sparks, the decode step held 34 ms with spills in flight. Blocks that two entries
 share in memory — a document and the questions attached to it — are stored
 once, by physical identity. A memory entry stays attachable while its copy
 is written; eviction from memory then keeps the disk copy. Retention on
@@ -167,7 +182,7 @@ process's and are not reused across restarts.
 request context limit plus its blob (startup prints the minimum) and must
 fit the filesystem's free space beside a 1 GiB reserve; both are checked on
 every rank before anything is allocated, and by `--memory-plan`. The tier's
-staging buffers (136 MiB per rank) are part of the memory plan. Watch
+staging buffers (264 MiB per rank) are part of the memory plan. Watch
 `nvme_cache` in `/v1/metrics`: `pages_used` against `pages_total`,
 `spilled`, `restored`, `restore_failed`, `spill_skipped` (no room), and
 `evictions` (disk retention at work).

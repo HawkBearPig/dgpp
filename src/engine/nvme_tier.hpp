@@ -1,8 +1,9 @@
 #pragma once
 // The prefix cache's NVMe cold tier (issue #26): a preallocated slab file
 // per rank holding evicted entries' state — the snapshot blob and the
-// cache blocks the entry's metadata pins — and a worker that copies
-// entries out and back on its own stream, off the decode path.
+// cache blocks the entry's metadata pins — a pump that moves that state
+// between the device and pinned staging on the MODEL stream, and a file
+// worker that moves it between pinned staging and the slab.
 //
 // The slab is `pages` records of `page_bytes`, one cache block's planes
 // (engine/cache_planes.hpp) rounded up to 4 KiB; a blob spans blob_pages
@@ -10,20 +11,31 @@
 // (sched/disk_cache.hpp): identical on every rank, while this file's
 // bytes are this rank's shard. The tier runs the ops it is handed:
 //
-//   spill   gather each block's planes into a device staging record,
-//           copy it to pinned memory, write it to its page (direct I/O,
-//           no page cache — the GB10's unified memory is the model's);
-//           the blob likewise, in page runs.
-//   restore read each page into pinned memory, verify its CRC-32C,
-//           copy it to the device and scatter the planes into the fresh
-//           block the restore acquired; the blob into the arena slot.
+//   spill   per tick, the pump gathers the next chunk of blocks (every
+//           plane of each block into one contiguous record) into device
+//           staging and copies it to a pinned buffer; the worker writes
+//           the records to their pages (direct I/O — no page cache on the
+//           GB10's unified memory) once the copy has landed. The blob
+//           follows in page runs.
+//   restore the worker reads pages into a pinned buffer; the pump copies
+//           the buffer to the device and scatters each record's planes
+//           into the fresh block the restore acquired; the blob into the
+//           arena slot.
 //
-// Two staging buffers pipeline the GPU copies against the file I/O. An
-// op's outcome (ok, or a short read/write, a device error, a checksum
-// mismatch) is reported through poll(); rank 0 journals every rank's
-// verdict as one commit, so a failure on any rank is the same cold miss
-// everywhere. The worker finishes every device op before it reports, so
-// a released restore never has a scatter in flight.
+// Every byte of device work is enqueued by the engine thread on the model
+// stream at a tick's top, in bounded slices (two staging chunks per
+// tick), exactly as the prefix arena's own copies interleave with the
+// decode replays; the worker never calls into CUDA. A second stream
+// beside the fabric's device-side spin loops (the graph replays' stage
+// gate and collectives) stalled them for their whole timeout (2026-09-25:
+// the spill took 30 s on two ranks and those ranks died), which is why
+// nothing here runs concurrently with the model stream.
+//
+// An op's outcome (ok, or a short read/write, a device error, a checksum
+// mismatch on a page's CRC-32C) is reported through poll() once every
+// slice of its device work has completed, so a released restore never
+// has a scatter in flight; rank 0 journals every rank's verdict as one
+// commit, so a failure on any rank is the same cold miss everywhere.
 //
 // Entries are the process's: the slab is recreated at every start (no
 // reuse across restarts — a later version may bind records to the
@@ -33,7 +45,7 @@
 #include <unistd.h>
 
 #include <algorithm>
-#include <atomic>
+#include <array>
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
@@ -41,6 +53,7 @@
 #include <cstring>
 #include <deque>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -64,6 +77,7 @@ class NvmeTier {
  public:
   using Config = sched::SchedulerEngine::DiskEnable;
   static constexpr size_t kAlign = 4096;
+  static constexpr int kBuffers = 2;
 
   // The host and device bytes the tier allocates for a chunk size (the
   // memory plan): two device and two pinned staging buffers plus the
@@ -98,16 +112,17 @@ class NvmeTier {
                                   " pages of " + std::to_string(page_bytes_) + " bytes) and one block");
     per_chunk_ = static_cast<int64_t>(cfg_.chunk_bytes / page_bytes_);
     open_slab();
-    DGPP_CUDA_OK(cudaGetDevice(&device_));
-    DGPP_CUDA_OK(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking));
+    // Every CUDA object now, before the world's collectives (the fabric's
+    // rule: nothing creates or frees one between them).
     const size_t max_segments = static_cast<size_t>(per_chunk_) * std::max<size_t>(1, planes_.size());
-    for (int b = 0; b < 2; ++b) {
-      DGPP_CUDA_OK(cudaMalloc(&d_stage_[b], cfg_.chunk_bytes));
-      DGPP_CUDA_OK(cudaHostAlloc(&h_stage_[b], cfg_.chunk_bytes, cudaHostAllocDefault));
-      DGPP_CUDA_OK(cudaMalloc(reinterpret_cast<void**>(&d_segs_[b]), max_segments * sizeof(CopySegment)));
-      DGPP_CUDA_OK(cudaHostAlloc(reinterpret_cast<void**>(&h_segs_[b]), max_segments * sizeof(CopySegment),
+    for (int b = 0; b < kBuffers; ++b) {
+      Buffer& buf = buffers_[b];
+      DGPP_CUDA_OK(cudaMalloc(&buf.device, cfg_.chunk_bytes));
+      DGPP_CUDA_OK(cudaHostAlloc(&buf.pinned, cfg_.chunk_bytes, cudaHostAllocDefault));
+      DGPP_CUDA_OK(cudaMalloc(reinterpret_cast<void**>(&buf.d_segs), max_segments * sizeof(CopySegment)));
+      DGPP_CUDA_OK(cudaHostAlloc(reinterpret_cast<void**>(&buf.h_segs), max_segments * sizeof(CopySegment),
                                  cudaHostAllocDefault));
-      DGPP_CUDA_OK(cudaEventCreateWithFlags(&done_[b], cudaEventDisableTiming));
+      DGPP_CUDA_OK(cudaEventCreateWithFlags(&buf.done, cudaEventDisableTiming));
     }
     crc_.assign(static_cast<size_t>(pages_), 0);
     worker_ = std::thread([this] { worker(); });
@@ -125,14 +140,16 @@ class NvmeTier {
     }
     cv_.notify_all();
     if (worker_.joinable()) worker_.join();
-    for (int b = 0; b < 2; ++b) {
-      if (done_[b]) cudaEventDestroy(done_[b]);
-      if (d_stage_[b]) cudaFree(d_stage_[b]);
-      if (h_stage_[b]) cudaFreeHost(h_stage_[b]);
-      if (d_segs_[b]) cudaFree(d_segs_[b]);
-      if (h_segs_[b]) cudaFreeHost(h_segs_[b]);
+    // Device work still in flight for a job settles before the buffers go.
+    for (Buffer& buf : buffers_)
+      if (buf.done) cudaEventSynchronize(buf.done);
+    for (Buffer& buf : buffers_) {
+      if (buf.done) cudaEventDestroy(buf.done);
+      if (buf.device) cudaFree(buf.device);
+      if (buf.pinned) cudaFreeHost(buf.pinned);
+      if (buf.d_segs) cudaFree(buf.d_segs);
+      if (buf.h_segs) cudaFreeHost(buf.h_segs);
     }
-    if (stream_) cudaStreamDestroy(stream_);
     if (fd_ >= 0) {
       ::close(fd_);
       ::unlink(cfg_.slab_path.c_str());
@@ -183,7 +200,7 @@ class NvmeTier {
       if (spill.pages[i] >= 0) job.blocks.emplace_back(meta.full_blocks[i], spill.pages[i]);
     if (spill.partial_page >= 0) job.blocks.emplace_back(meta.partial_block, spill.partial_page);
     check_pages(job);
-    enqueue(std::move(job));
+    jobs_.push_back(std::move(job));
   }
 
   sched::SchedulerEngine::DiskBlocks restore_begin(const sched::SchedulerEngine::DiskRestore& restore) {
@@ -231,13 +248,84 @@ class NvmeTier {
     // The slot owns the blocks from here: a release (a failed restore, an
     // eviction) returns them exactly as it returns a snapshot's.
     arena_->adopt(restore.slot, std::move(meta));
-    enqueue(std::move(job));
+    jobs_.push_back(std::move(job));
     return out;
+  }
+
+  // The per-tick pump (the engine thread): finished device slices go to
+  // the worker (spill) or free their buffer (restore); the next slices of
+  // the running job are enqueued on the model stream; a finished job
+  // reports.
+  void pump() {
+    if (!active_ && !jobs_.empty()) start_job();
+    if (!active_) return;
+    Job& job = *active_;
+    // Slices whose device work landed (kDevice is the pump's own state to
+    // set and clear, so the read needs no lock).
+    for (Buffer& buf : buffers_) {
+      if (buf.state != Buffer::kDevice) continue;
+      const cudaError_t q = cudaEventQuery(buf.done);
+      if (q == cudaErrorNotReady) continue;
+      if (q != cudaSuccess) {
+        (void)cudaGetLastError();
+        job.failed = true;
+        job.why = "the model stream failed on a slice";
+      }
+      if (job.restore || job.failed) {
+        release_buffer(buf);
+      } else {
+        std::lock_guard<std::mutex> lock(mutex_);
+        buf.state = Buffer::kWorker;
+        cv_.notify_one();
+      }
+    }
+    // Slices the worker finished (a restore's reads, a spill's writes).
+    std::vector<Buffer*> ready;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (!job.why.empty() && !job.failed) job.failed = true;
+      for (Buffer& buf : buffers_)
+        if (buf.state == Buffer::kReady) ready.push_back(&buf);
+    }
+    for (Buffer* buf : ready) {
+      if (job.restore && !job.failed) {
+        issue_restore_slice(job, *buf);
+      } else {
+        release_buffer(*buf);
+      }
+    }
+    // The next slices: a spill gathers into free buffers; a restore hands
+    // free buffers to the worker to read into.
+    if (!job.failed) {
+      for (Buffer& buf : buffers_) {
+        {
+          std::lock_guard<std::mutex> lock(mutex_);
+          if (buf.state != Buffer::kFree || job.next_slice >= job.slices) continue;
+        }
+        if (job.restore) {
+          std::lock_guard<std::mutex> lock(mutex_);
+          buf.slice = job.next_slice++;
+          buf.state = Buffer::kWorker;
+          cv_.notify_one();
+        } else {
+          issue_spill_slice(job, buf, job.next_slice++);
+        }
+      }
+    }
+    // Done: every slice issued and every buffer back, or failed with the
+    // buffers quiet (no device work in flight, no worker on them).
+    bool quiet = true;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      for (const Buffer& buf : buffers_) quiet = quiet && buf.state == Buffer::kFree;
+    }
+    if (!quiet) return;
+    if (!job.failed && job.next_slice < job.slices) return;
+    finish_job();
   }
 
   std::vector<sched::SchedulerEngine::DiskCompletion> poll() {
     std::vector<sched::SchedulerEngine::DiskCompletion> out;
-    std::lock_guard<std::mutex> lock(mutex_);
     out.swap(completions_);
     return out;
   }
@@ -245,7 +333,7 @@ class NvmeTier {
   sched::SchedulerEngine::DiskEngineStats stats() const {
     std::lock_guard<std::mutex> lock(mutex_);
     sched::SchedulerEngine::DiskEngineStats s = stats_;
-    s.pending = static_cast<int64_t>(jobs_.size()) + (running_ ? 1 : 0);
+    s.pending = static_cast<int64_t>(jobs_.size()) + (active_ ? 1 : 0);
     return s;
   }
 
@@ -256,8 +344,45 @@ class NvmeTier {
     int slot = -1;
     int64_t blob_page = -1;
     std::vector<std::pair<int32_t, int64_t>> blocks;  // (physical block, page)
-    cudaEvent_t start = nullptr;  // the model stream's position when the op began
+    int64_t block_slices = 0;  // ceil(blocks / per_chunk)
+    int64_t slices = 0;        // block slices + blob slices
+    int64_t next_slice = 0;
+    bool failed = false;
+    std::string why;
+    std::chrono::steady_clock::time_point started;
   };
+  // A staging buffer's state machine. Spill: kFree -> kDevice (gather +
+  // D2H on the model stream) -> kWorker (writing) -> kFree. Restore: kFree
+  // -> kWorker (reading) -> kReady -> kDevice (H2D + scatter) -> kFree.
+  struct Buffer {
+    enum State { kFree, kDevice, kWorker, kReady };
+    State state = kFree;
+    int64_t slice = -1;
+    void* device = nullptr;
+    void* pinned = nullptr;
+    CopySegment* d_segs = nullptr;
+    CopySegment* h_segs = nullptr;
+    cudaEvent_t done = nullptr;
+  };
+
+  // A slice's records: block slices first, then the blob's page runs.
+  struct Slice {
+    bool blob = false;
+    int64_t first = 0;   // first block index, or first blob page offset
+    int64_t count = 0;   // records in the slice
+  };
+  Slice slice_of(const Job& job, int64_t s) const {
+    Slice out;
+    if (s < job.block_slices) {
+      out.first = s * per_chunk_;
+      out.count = std::min<int64_t>(per_chunk_, static_cast<int64_t>(job.blocks.size()) - out.first);
+    } else {
+      out.blob = true;
+      out.first = (s - job.block_slices) * per_chunk_;
+      out.count = std::min<int64_t>(per_chunk_, blob_pages_ - out.first);
+    }
+    return out;
+  }
 
   void check_pages(const Job& job) const {
     const auto bad = [&](int64_t page) { return page < 0 || page >= pages_; };
@@ -296,53 +421,31 @@ class NvmeTier {
     }
   }
 
-  void enqueue(Job job) {
-    DGPP_CUDA_OK(cudaEventCreateWithFlags(&job.start, cudaEventDisableTiming));
-    DGPP_CUDA_OK(cudaEventRecord(job.start, model_->stream()));
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      jobs_.push_back(std::move(job));
-    }
-    cv_.notify_one();
+  void start_job() {
+    active_ = std::move(jobs_.front());
+    jobs_.pop_front();
+    Job& job = *active_;
+    job.block_slices = (static_cast<int64_t>(job.blocks.size()) + per_chunk_ - 1) / per_chunk_;
+    job.slices = job.block_slices + (blob_pages_ + per_chunk_ - 1) / per_chunk_;
+    job.next_slice = 0;
+    job.started = std::chrono::steady_clock::now();
   }
 
-  void worker() {
-    cudaSetDevice(device_);
-    for (;;) {
-      Job job;
-      {
-        std::unique_lock<std::mutex> lock(mutex_);
-        cv_.wait(lock, [&] { return stop_ || !jobs_.empty(); });
-        if (stop_ && jobs_.empty()) return;
-        job = std::move(jobs_.front());
-        jobs_.pop_front();
-        running_ = true;
-      }
-      const auto t0 = std::chrono::steady_clock::now();
-      bool ok = false;
-      std::string why;
-      try {
-        ok = job.restore ? run_restore(job, &why) : run_spill(job, &why);
-      } catch (const std::exception& e) {
-        why = e.what();
-        ok = false;
-      }
-      // Every device op of this job finishes before its verdict: a
-      // released slot never has a scatter in flight.
-      if (cudaStreamSynchronize(stream_) != cudaSuccess) {
-        ok = false;
-        why = "the tier's stream failed";
-      }
-      if (job.start) cudaEventDestroy(job.start);
-      const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-      if (!ok)
-        DGPP_LOG_ERROR("rank {}: NVMe cache {} op {} failed: {}", cfg_.rank, job.restore ? "restore" : "spill", job.op,
-                       why);
-      else
-        DGPP_LOG_DEBUG("rank {}: NVMe cache {} op {} done in {:.1f} ms ({} blocks)", cfg_.rank,
-                       job.restore ? "restore" : "spill", job.op, ms, job.blocks.size());
+  void finish_job() {
+    Job& job = *active_;
+    const bool ok = !job.failed;
+    const double ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - job.started).count();
+    if (!ok)
+      DGPP_LOG_ERROR("rank {}: NVMe cache {} op {} failed: {}", cfg_.rank, job.restore ? "restore" : "spill", job.op,
+                     job.why);
+    else
+      DGPP_LOG_INFO("rank {}: NVMe cache {} op {} done in {:.1f} ms ({} blocks, {:.1f} MiB)", cfg_.rank,
+                    job.restore ? "restore" : "spill", job.op, ms, job.blocks.size(),
+                    static_cast<double>((job.blocks.size() + static_cast<size_t>(blob_pages_)) * page_bytes_) /
+                        (1024.0 * 1024.0));
+    {
       std::lock_guard<std::mutex> lock(mutex_);
-      running_ = false;
       if (job.restore) {
         ++stats_.restores;
         stats_.restore_ms += ms;
@@ -351,11 +454,121 @@ class NvmeTier {
         stats_.spill_ms += ms;
       }
       if (!ok) ++stats_.failures;
-      completions_.push_back({job.op, ok});
+    }
+    completions_.push_back({job.op, ok});
+    active_.reset();
+  }
+
+  void release_buffer(Buffer& buf) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    buf.state = Buffer::kFree;
+    buf.slice = -1;
+  }
+
+  // A spill slice: the blocks' planes gathered into the device buffer as
+  // contiguous records (or the blob's run copied), then to the pinned
+  // buffer; the worker writes it once the event lands.
+  void issue_spill_slice(Job& job, Buffer& buf, int64_t s) {
+    const Slice sl = slice_of(job, s);
+    cudaStream_t stream = model_->stream();
+    if (sl.blob) {
+      const uint8_t* blob = static_cast<const uint8_t*>(arena_->slot_data(job.slot));
+      const size_t offset = static_cast<size_t>(sl.first) * page_bytes_;
+      const size_t bytes = std::min(static_cast<size_t>(sl.count) * page_bytes_, blob_bytes_ - offset);
+      DGPP_CUDA_OK(cudaMemcpyAsync(buf.pinned, blob + offset, bytes, cudaMemcpyDeviceToHost, stream));
+    } else {
+      size_t ns = 0;
+      for (int64_t j = 0; j < sl.count; ++j) {
+        const int32_t block = job.blocks[static_cast<size_t>(sl.first + j)].first;
+        uint8_t* record = static_cast<uint8_t*>(buf.device) + static_cast<size_t>(j) * page_bytes_;
+        for (size_t p = 0; p < planes_.size(); ++p) {
+          buf.h_segs[ns].src = planes_[p].base + static_cast<size_t>(block) * planes_[p].block_bytes;
+          buf.h_segs[ns].dst = record + plane_off_[p];
+          buf.h_segs[ns].bytes = planes_[p].block_bytes;
+          ++ns;
+        }
+      }
+      DGPP_CUDA_OK(cudaMemcpyAsync(buf.d_segs, buf.h_segs, ns * sizeof(CopySegment), cudaMemcpyHostToDevice, stream));
+      segment_copy(buf.d_segs, static_cast<int>(ns), stream);
+      DGPP_CUDA_OK(cudaMemcpyAsync(buf.pinned, buf.device, static_cast<size_t>(sl.count) * page_bytes_,
+                                   cudaMemcpyDeviceToHost, stream));
+    }
+    DGPP_CUDA_OK(cudaEventRecord(buf.done, stream));
+    std::lock_guard<std::mutex> lock(mutex_);
+    buf.slice = s;
+    buf.state = Buffer::kDevice;
+  }
+
+  // A restore slice the worker read: to the device, then each record's
+  // planes into its block (or the blob's run into the arena slot).
+  void issue_restore_slice(Job& job, Buffer& buf) {
+    const Slice sl = slice_of(job, buf.slice);
+    cudaStream_t stream = model_->stream();
+    if (sl.blob) {
+      uint8_t* blob = static_cast<uint8_t*>(arena_->slot_data_mutable(job.slot));
+      const size_t offset = static_cast<size_t>(sl.first) * page_bytes_;
+      const size_t bytes = std::min(static_cast<size_t>(sl.count) * page_bytes_, blob_bytes_ - offset);
+      DGPP_CUDA_OK(cudaMemcpyAsync(blob + offset, buf.pinned, bytes, cudaMemcpyHostToDevice, stream));
+    } else {
+      DGPP_CUDA_OK(cudaMemcpyAsync(buf.device, buf.pinned, static_cast<size_t>(sl.count) * page_bytes_,
+                                   cudaMemcpyHostToDevice, stream));
+      size_t ns = 0;
+      for (int64_t j = 0; j < sl.count; ++j) {
+        const int32_t block = job.blocks[static_cast<size_t>(sl.first + j)].first;
+        const uint8_t* record = static_cast<const uint8_t*>(buf.device) + static_cast<size_t>(j) * page_bytes_;
+        for (size_t p = 0; p < planes_.size(); ++p) {
+          buf.h_segs[ns].src = record + plane_off_[p];
+          buf.h_segs[ns].dst = planes_[p].base + static_cast<size_t>(block) * planes_[p].block_bytes;
+          buf.h_segs[ns].bytes = planes_[p].block_bytes;
+          ++ns;
+        }
+      }
+      DGPP_CUDA_OK(cudaMemcpyAsync(buf.d_segs, buf.h_segs, ns * sizeof(CopySegment), cudaMemcpyHostToDevice, stream));
+      segment_copy(buf.d_segs, static_cast<int>(ns), stream);
+    }
+    DGPP_CUDA_OK(cudaEventRecord(buf.done, stream));
+    std::lock_guard<std::mutex> lock(mutex_);
+    buf.state = Buffer::kDevice;
+  }
+
+  // ---- the file worker: pinned staging <-> the slab, nothing else -------
+  void worker() {
+    for (;;) {
+      Buffer* buf = nullptr;
+      bool restore = false;
+      {
+        std::unique_lock<std::mutex> lock(mutex_);
+        cv_.wait(lock, [&] {
+          if (stop_) return true;
+          for (Buffer& b : buffers_)
+            if (b.state == Buffer::kWorker) return true;
+          return false;
+        });
+        if (stop_) return;
+        for (Buffer& b : buffers_)
+          if (b.state == Buffer::kWorker && buf == nullptr) buf = &b;
+        restore = active_ && active_->restore;
+      }
+      // The active job is the engine thread's; the worker reads only its
+      // slice geometry, which does not change while a buffer is its.
+      const Job& job = *active_;
+      const Slice sl = slice_of(job, buf->slice);
+      std::string why;
+      bool ok = true;
+      for (int64_t j = 0; j < sl.count && ok; ++j) {
+        const int64_t page = sl.blob ? job.blob_page + sl.first + j : job.blocks[static_cast<size_t>(sl.first + j)].second;
+        uint8_t* record = static_cast<uint8_t*>(buf->pinned) + static_cast<size_t>(j) * page_bytes_;
+        ok = restore ? read_page(page, record, &why) : write_page(page, record, &why);
+      }
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (!ok && active_->why.empty()) active_->why = why;
+      // A finished read is the pump's to scatter; a finished write frees
+      // the buffer; a failure frees it either way.
+      buf->state = ok && restore ? Buffer::kReady : Buffer::kFree;
+      if (!ok || !restore) buf->slice = -1;
     }
   }
 
-  // ---- the file --------------------------------------------------------
   bool write_page(int64_t page, const void* buf, std::string* why) {
     const uint8_t* p = static_cast<const uint8_t*>(buf);
     size_t left = page_bytes_;
@@ -408,117 +621,6 @@ class NvmeTier {
     return true;
   }
 
-  // ---- the ops ---------------------------------------------------------
-  // The blocks in batches of per_chunk_ records: batch k gathers on buffer
-  // k % 2 while batch k - 1's pages are written from the other buffer.
-  bool run_spill(const Job& job, std::string* why) {
-    DGPP_CUDA_OK(cudaStreamWaitEvent(stream_, job.start, 0));
-    const int64_t n = static_cast<int64_t>(job.blocks.size());
-    int64_t issued = 0;  // batches issued
-    const auto issue = [&](int64_t first, int64_t count, int buf) {
-      CopySegment* segs = h_segs_[buf];
-      size_t ns = 0;
-      for (int64_t j = 0; j < count; ++j) {
-        const int32_t block = job.blocks[static_cast<size_t>(first + j)].first;
-        uint8_t* record = static_cast<uint8_t*>(d_stage_[buf]) + static_cast<size_t>(j) * page_bytes_;
-        for (size_t p = 0; p < planes_.size(); ++p) {
-          segs[ns].src = planes_[p].base + static_cast<size_t>(block) * planes_[p].block_bytes;
-          segs[ns].dst = record + plane_off_[p];
-          segs[ns].bytes = planes_[p].block_bytes;
-          ++ns;
-        }
-      }
-      DGPP_CUDA_OK(cudaMemcpyAsync(d_segs_[buf], segs, ns * sizeof(CopySegment), cudaMemcpyHostToDevice, stream_));
-      segment_copy(d_segs_[buf], static_cast<int>(ns), stream_);
-      DGPP_CUDA_OK(cudaMemcpyAsync(h_stage_[buf], d_stage_[buf], static_cast<size_t>(count) * page_bytes_,
-                                   cudaMemcpyDeviceToHost, stream_));
-      DGPP_CUDA_OK(cudaEventRecord(done_[buf], stream_));
-    };
-    const auto flush = [&](int64_t first, int64_t count, int buf) -> bool {
-      DGPP_CUDA_OK(cudaEventSynchronize(done_[buf]));
-      for (int64_t j = 0; j < count; ++j)
-        if (!write_page(job.blocks[static_cast<size_t>(first + j)].second,
-                        static_cast<const uint8_t*>(h_stage_[buf]) + static_cast<size_t>(j) * page_bytes_, why))
-          return false;
-      return true;
-    };
-    int64_t prev_first = 0, prev_count = 0;
-    for (int64_t first = 0; first < n; first += per_chunk_) {
-      const int64_t count = std::min<int64_t>(per_chunk_, n - first);
-      const int buf = static_cast<int>(issued % 2);
-      issue(first, count, buf);
-      if (issued > 0 && !flush(prev_first, prev_count, 1 - buf)) return false;
-      prev_first = first;
-      prev_count = count;
-      ++issued;
-    }
-    if (issued > 0 && !flush(prev_first, prev_count, static_cast<int>((issued - 1) % 2))) return false;
-    // The blob, in page runs.
-    const uint8_t* blob = static_cast<const uint8_t*>(arena_->slot_data(job.slot));
-    for (int64_t first = 0; first < blob_pages_; first += per_chunk_) {
-      const int64_t count = std::min<int64_t>(per_chunk_, blob_pages_ - first);
-      const size_t offset = static_cast<size_t>(first) * page_bytes_;
-      const size_t bytes = std::min(static_cast<size_t>(count) * page_bytes_, blob_bytes_ - offset);
-      DGPP_CUDA_OK(cudaMemcpyAsync(h_stage_[0], blob + offset, bytes, cudaMemcpyDeviceToHost, stream_));
-      DGPP_CUDA_OK(cudaStreamSynchronize(stream_));
-      for (int64_t j = 0; j < count; ++j)
-        if (!write_page(job.blob_page + first + j,
-                        static_cast<const uint8_t*>(h_stage_[0]) + static_cast<size_t>(j) * page_bytes_, why))
-          return false;
-    }
-    return true;
-  }
-
-  bool run_restore(const Job& job, std::string* why) {
-    DGPP_CUDA_OK(cudaStreamWaitEvent(stream_, job.start, 0));
-    const int64_t n = static_cast<int64_t>(job.blocks.size());
-    int64_t issued = 0;
-    for (int64_t first = 0; first < n; first += per_chunk_) {
-      const int64_t count = std::min<int64_t>(per_chunk_, n - first);
-      const int buf = static_cast<int>(issued % 2);
-      // The buffer's previous scatter must have consumed it.
-      DGPP_CUDA_OK(cudaEventSynchronize(done_[buf]));
-      for (int64_t j = 0; j < count; ++j)
-        if (!read_page(job.blocks[static_cast<size_t>(first + j)].second,
-                       static_cast<uint8_t*>(h_stage_[buf]) + static_cast<size_t>(j) * page_bytes_, why))
-          return false;
-      DGPP_CUDA_OK(cudaMemcpyAsync(d_stage_[buf], h_stage_[buf], static_cast<size_t>(count) * page_bytes_,
-                                   cudaMemcpyHostToDevice, stream_));
-      CopySegment* segs = h_segs_[buf];
-      size_t ns = 0;
-      for (int64_t j = 0; j < count; ++j) {
-        const int32_t block = job.blocks[static_cast<size_t>(first + j)].first;
-        const uint8_t* record = static_cast<const uint8_t*>(d_stage_[buf]) + static_cast<size_t>(j) * page_bytes_;
-        for (size_t p = 0; p < planes_.size(); ++p) {
-          segs[ns].src = record + plane_off_[p];
-          segs[ns].dst = planes_[p].base + static_cast<size_t>(block) * planes_[p].block_bytes;
-          segs[ns].bytes = planes_[p].block_bytes;
-          ++ns;
-        }
-      }
-      DGPP_CUDA_OK(cudaMemcpyAsync(d_segs_[buf], segs, ns * sizeof(CopySegment), cudaMemcpyHostToDevice, stream_));
-      segment_copy(d_segs_[buf], static_cast<int>(ns), stream_);
-      DGPP_CUDA_OK(cudaEventRecord(done_[buf], stream_));
-      ++issued;
-    }
-    // The blob into the arena slot, in page runs (the last page's tail
-    // beyond the blob is not copied).
-    uint8_t* blob = static_cast<uint8_t*>(arena_->slot_data_mutable(job.slot));
-    for (int64_t first = 0; first < blob_pages_; first += per_chunk_) {
-      const int64_t count = std::min<int64_t>(per_chunk_, blob_pages_ - first);
-      DGPP_CUDA_OK(cudaStreamSynchronize(stream_));  // h_stage_[0] is free
-      for (int64_t j = 0; j < count; ++j)
-        if (!read_page(job.blob_page + first + j,
-                       static_cast<uint8_t*>(h_stage_[0]) + static_cast<size_t>(j) * page_bytes_, why))
-          return false;
-      const size_t offset = static_cast<size_t>(first) * page_bytes_;
-      const size_t bytes = std::min(static_cast<size_t>(count) * page_bytes_, blob_bytes_ - offset);
-      DGPP_CUDA_OK(cudaMemcpyAsync(blob + offset, h_stage_[0], bytes, cudaMemcpyHostToDevice, stream_));
-      DGPP_CUDA_OK(cudaStreamSynchronize(stream_));
-    }
-    return true;
-  }
-
   Model* model_ = nullptr;
   PrefixArena<Model>* arena_ = nullptr;
   Config cfg_;
@@ -532,20 +634,17 @@ class NvmeTier {
   int64_t per_chunk_ = 0;
   int fd_ = -1;
   bool direct_ = false;
-  int device_ = 0;
-  cudaStream_t stream_ = nullptr;
-  void* d_stage_[2] = {nullptr, nullptr};
-  void* h_stage_[2] = {nullptr, nullptr};
-  CopySegment* d_segs_[2] = {nullptr, nullptr};
-  CopySegment* h_segs_[2] = {nullptr, nullptr};
-  cudaEvent_t done_[2] = {nullptr, nullptr};
+  std::array<Buffer, kBuffers> buffers_;
   std::vector<uint32_t> crc_;  // per page: the worker's alone
+  // The jobs (the engine thread's), the active one and the completions:
+  // the worker touches only the buffers' states and the job's failure
+  // note, under the mutex.
+  std::deque<Job> jobs_;
+  std::optional<Job> active_;
+  std::vector<sched::SchedulerEngine::DiskCompletion> completions_;
   mutable std::mutex mutex_;
   std::condition_variable cv_;
-  std::deque<Job> jobs_;
-  std::vector<sched::SchedulerEngine::DiskCompletion> completions_;
   sched::SchedulerEngine::DiskEngineStats stats_;
-  bool running_ = false;
   bool stop_ = false;
   std::thread worker_;
 };

@@ -440,8 +440,10 @@ int run_fixture(const std::string& dir, bool fp8_head = false) {
     tier = std::make_unique<dgpp::NvmeTier<QwenModel>>(&m, &arena, en);
     require(tier->block_bytes() == dgpp::cache_block_bytes(m.cache_planes()), "tier: the record is the planes' bytes");
     require(tier->page_bytes() % 4096 == 0 && tier->blob_pages() >= 1, "tier: 4 KiB pages, at least one blob page");
+    // The scheduler pumps the tier at every tick; here the loop does.
     const auto wait = [&](uint64_t op) {
       for (int i = 0; i < 2000; ++i) {
+        tier->pump();
         for (const auto& c : tier->poll())
           if (c.op == op) return c.ok;
         std::this_thread::sleep_for(std::chrono::milliseconds(2));

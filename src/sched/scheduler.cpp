@@ -1191,8 +1191,10 @@ bool Scheduler::quantum() {
   // admission or step — the step below never writes past a reservation,
   // and every rank grows or sheds the same requests at the same quantum.
   grow_reservations();
-  // The cold tier's spills (issue #26): queued entries start copying, up
-  // to the op bound, at this same fixed position on every rank.
+  // The cold tier (issue #26): the tier's next slice of device work on the
+  // model stream, then the queued spills, up to the op bound, at this same
+  // fixed position on every rank.
+  if (disk_.enabled()) engine_->disk_pump();
   start_spills();
 
   const bool any_active = std::any_of(
@@ -1564,9 +1566,12 @@ bool Scheduler::start_spill(int entry, const std::string& id) {
     emit_prefix(id, "disk_evict", v.position, -1);
   }
   if (!plan.ok) {
-    DGPP_LOG_INFO("sched: request '{}' entry at {} tokens not spilled — the NVMe cache holds no room for it "
-                  "({} of {} pages in use)",
-                  id, m.position, disk_.pages_used(), disk_.pages_total());
+    if (plan.duplicate)
+      DGPP_LOG_DEBUG("sched: request '{}' entry at {} tokens is on the NVMe cache already", id, m.position);
+    else
+      DGPP_LOG_INFO("sched: request '{}' entry at {} tokens not spilled — the NVMe cache holds no room for it "
+                    "({} of {} pages in use)",
+                    id, m.position, disk_.pages_used(), disk_.pages_total());
     return false;
   }
   ++next_disk_op_;

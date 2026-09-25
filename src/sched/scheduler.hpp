@@ -382,6 +382,11 @@ class SchedulerEngine {
     (void)restore;
     throw std::logic_error("SchedulerEngine: this engine has no cold tier");
   }
+  // The tier's per-tick pump: issues the next bounded slice of an op's
+  // device work on the model stream (the engine thread's alone — nothing
+  // runs on a second stream beside the fabric's collectives) and hands
+  // finished slices to the file worker. Called at every tick's top.
+  virtual void disk_pump() {}
   // The ops completed on this rank since the last poll, in completion order.
   struct DiskCompletion {
     uint64_t op = 0;

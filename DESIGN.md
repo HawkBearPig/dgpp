@@ -1758,7 +1758,14 @@ evicts survive on a preallocated slab per rank (`engine/nvme_tier.hpp`,
 blocks its metadata pins — gathered plane by plane into 4 KiB-aligned
 records, written with direct I/O so the page cache never grows into the
 memory the plan owns — and a restore reads them into fresh pool blocks and
-an arena slot before the request attaches. Blocks are shared on disk by
+an arena slot before the request attaches. Every byte of the tier's device
+work is enqueued by the engine thread on the model stream at a tick's top,
+two staging slices at a time, exactly as the arena's own copies interleave
+with the decode replays; a file worker moves slices between pinned staging
+and the slab and never calls into CUDA. A second stream beside the
+fabric's device-side spin loops stalled the graph replays for their whole
+gate timeout (2026-09-25), which is why nothing here runs concurrently
+with the model stream. Blocks are shared on disk by
 physical identity (the pool's block id and its contents generation), so a
 document and its attached variants are stored once. Retention is LRU
 within the capacity. The index is scheduler state, identical on every

@@ -203,7 +203,10 @@ DiskCache::SpillPlan DiskCache::begin_spill(const int64_t* ids, int64_t position
     throw std::invalid_argument("DiskCache: the partial block's identity does not match the position");
   const uint64_t h =
       PrefixCache::with_images(PrefixCache::hash_prefix(ids, position), position, images);
-  if (find_exact(ids, position, h, images, next_token) >= 0) return plan;  // already on disk
+  if (find_exact(ids, position, h, images, next_token) >= 0) {  // already on disk
+    plan.duplicate = true;
+    return plan;
+  }
   // Take references on every shared record first, so the evictions below
   // cannot free them; count the pages the rest need.
   std::vector<int> shared(static_cast<size_t>(n_full), -1);

@@ -82,6 +82,7 @@ class DiskCache {
   };
   struct SpillPlan {
     bool ok = false;
+    bool duplicate = false;  // an identical entry is already on disk (nothing to do)
     int entry = -1;
     int64_t blob_page = -1;
     std::vector<int64_t> pages;

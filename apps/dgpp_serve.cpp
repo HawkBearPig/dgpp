@@ -2072,7 +2072,7 @@ int main(int argc, char** argv) {
     // the free space beside it and the minimum capacity, from the family's
     // block record and snapshot sizes, before anything is allocated; its
     // staging buffers join the engine's bytes in the memory plan.
-    constexpr size_t kNvmeChunkBytes = size_t{32} << 20;
+    constexpr size_t kNvmeChunkBytes = size_t{64} << 20;  // two slices per tick move 128 MiB
     const size_t nvme_staging_bytes = nvme_cache ? 4 * kNvmeChunkBytes + (size_t{8} << 20) : 0;
     dgpp::serve::NvmeCachePlan nvme_plan;
     if (nvme_cache) {

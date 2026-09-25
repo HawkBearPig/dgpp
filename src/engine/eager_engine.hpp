@@ -248,6 +248,9 @@ class EagerEngineAdapter : public sched::SchedulerEngine {
     if (!tier_) throw std::logic_error("generation engine: no cold tier");
     return tier_->restore_begin(restore);
   }
+  void disk_pump() override {
+    if (tier_) tier_->pump();
+  }
   std::vector<sched::SchedulerEngine::DiskCompletion> disk_poll() override {
     return tier_ ? tier_->poll() : std::vector<sched::SchedulerEngine::DiskCompletion>{};
   }
