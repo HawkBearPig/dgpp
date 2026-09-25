@@ -26,7 +26,11 @@ user and the ports from the site's `.env` (`scripts/site_env.py`).
 
 Every template enables MTP (the block draft on DeepSeek) at the depth the
 family measured best, with the decode graph, at the request-slot count and
-cache budget that measured at or above every other shape tried. The shapes
+cache budget that measured at or above every other shape tried. The
+long-context templates also carry a top-level `nvme_cache` block, off by
+default: set `enabled` to true and size `capacity_gib` to the node's free
+NVMe to keep evicted prefix entries on disk (the [README](../README.md#nvme-cache)
+lists the keys; startup checks the space). The shapes
 a template does not name are knobs appended at boot:
 `scripts/dgpp-cluster up --config FILE --knobs "FLAGS"`.
 

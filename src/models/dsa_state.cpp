@@ -101,6 +101,7 @@ void DsaStatePool::init(Arena& arena, const DsaConfig& cfg, int max_requests,
   tables_host_.assign(size_t(max_requests_) * size_t(total_blocks_), 0);
   held_.assign(size_t(max_requests_), 0);
   refcount_.assign(size_t(total_blocks_), 0);
+  generation_.assign(size_t(total_blocks_), 0);
   free_.reserve(size_t(total_blocks_));
   for (int64_t b = int64_t(total_blocks_) - 1; b >= 0; --b)
     free_.push_back(int32_t(b));  // LIFO: low ids come out first
@@ -204,6 +205,7 @@ bool DsaStatePool::ensure_request_blocks(int req, int64_t tokens,
     row[have + i] = free_.back();
     free_.pop_back();
     refcount_[size_t(row[have + i])] = 1;
+    ++generation_[size_t(row[have + i])];
   }
   held_[size_t(req)] = int32_t(needed);
   DGPP_CUDA_OK(cudaMemcpyAsync(block_tables_ + size_t(req) * size_t(total_blocks_) +
@@ -276,7 +278,37 @@ int32_t DsaStatePool::acquire_pinned_block() {
   const int32_t b = free_.back();
   free_.pop_back();
   refcount_[size_t(b)] = 1;
+  ++generation_[size_t(b)];
   return b;
+}
+
+uint64_t DsaStatePool::block_identity(int32_t block) const {
+  if (block < 0 || block >= total_blocks_)
+    throw std::out_of_range("dsa state pool: block index out of range");
+  return (generation_[size_t(block)] << 32) | uint32_t(block);
+}
+
+std::vector<CachePlane> DsaStatePool::planes() const {
+  // The same regions copy_block_contents walks, one plane per layer (and
+  // per index ordinal), each with its block's bytes.
+  std::vector<CachePlane> out;
+  if (!initialized_) return out;
+  const size_t latent_blk = size_t(cfg_.block_tokens) * geo_.latent_bytes_per_token;
+  const size_t pools = size_t(geo_.pools_per_block);
+  for (int layer = 0; layer < cfg_.num_dsa_layers; ++layer) {
+    out.push_back({latent_base_ + size_t(layer) * size_t(max_token_slots_) * geo_.latent_bytes_per_token,
+                   latent_blk});
+    if (latent_scale_base_ != nullptr)
+      out.push_back({reinterpret_cast<uint8_t*>(latent_scale_base_ + size_t(layer) * size_t(max_token_slots_)),
+                     size_t(cfg_.block_tokens) * sizeof(float)});
+  }
+  for (int o = 0; o < geo_.index_layers; ++o) {
+    out.push_back({index_k_base_ + size_t(o) * size_t(max_pool_slots_) * geo_.index_k_bytes_per_pool,
+                   pools * geo_.index_k_bytes_per_pool});
+    out.push_back({reinterpret_cast<uint8_t*>(index_scale_base_ + size_t(o) * size_t(max_pool_slots_)),
+                   pools * sizeof(float)});
+  }
+  return out;
 }
 
 void DsaStatePool::copy_block_contents(int32_t src, int32_t dst,

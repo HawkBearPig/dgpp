@@ -138,6 +138,23 @@ int Glm4Model::table_slots() const {
   return loader_.residency() == Glm4Residency::Resident ? cfg_.num_moe_layers() + (mtp_ ? 1 : 0) : 0;
 }
 
+size_t Glm4Model::kv_block_bytes_static(const Glm4TextConfig& cfg, int tp_rank, int tp_world, bool mtp) {
+  const Glm4HeadSharding head = tp_world > 1 ? Glm4HeadSharding::VocabSharded : Glm4HeadSharding::Full;
+  const Glm4LocalGeometry geo = Glm4LocalGeometry::from_config(cfg, tp_rank, tp_world, head);
+  const int pool_layers = cfg.num_hidden_layers + (mtp ? 1 : 0);
+  const auto bytes = [&](int64_t tokens) {
+    Glm4KvPoolShape shape;
+    shape.layers = pool_layers;
+    shape.kv_heads = geo.local_kv_heads;
+    shape.dim = cfg.head_dim;
+    shape.block_tokens = kBlockTokens;
+    shape.max_requests = 1;
+    shape.token_slots = tokens;
+    return Glm4KvPool::cache_bytes(shape) - PagedBlockTable::table_bytes(1, tokens / kBlockTokens);
+  };
+  return bytes(2 * kBlockTokens) - bytes(kBlockTokens);
+}
+
 Glm4Model::MemoryPlan Glm4Model::plan_memory(const Glm4TextConfig& cfg, int max_tokens, int64_t max_cache_tokens,
                                              int tp_rank, int tp_world, Glm4Residency residency, int max_requests,
                                              bool mtp, int decode_rows) {

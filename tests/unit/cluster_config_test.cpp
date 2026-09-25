@@ -371,3 +371,36 @@ DGPP_TEST(cluster_config_prefill_defaults_to_auto_with_explicit_opt_out) {
     require(config.engine.prefill_budget_tokens == budget, "explicit budget preserved");
   }
 }
+
+DGPP_TEST(cluster_config_parses_nvme_cache) {
+  // Absent: off, the default path, no capacity.
+  const dgpp::serve::ClusterConfig off =
+      dgpp::serve::parse_cluster_config(engine_json("{\"kv_capacity\":8192}"), "t");
+  require(!off.nvme_cache.enabled && off.nvme_cache.capacity_gib == 0.0 &&
+              off.nvme_cache.path == "~/dgpp/nvme-cache" && off.nvme_cache.min_tokens == 0,
+          "off by default");
+  // The top-level block: on, a path, a capacity, a minimum.
+  const dgpp::serve::ClusterConfig on = dgpp::serve::parse_cluster_config(
+      "{\"model\":\"m\",\"nodes\":[\"h\"],\"nvme_cache\":{\"enabled\":true,\"path\":\"/nvme/dgpp\","
+      "\"capacity_gib\":64,\"min_tokens\":2048}}",
+      "t");
+  require(on.nvme_cache.enabled && on.nvme_cache.path == "/nvme/dgpp" && on.nvme_cache.capacity_gib == 64.0 &&
+              on.nvme_cache.min_tokens == 2048,
+          "every field parses");
+  // Refusals, by name.
+  require(refusal("{\"model\":\"m\",\"nodes\":[\"h\"],\"nvme_cache\":{\"enabled\":true}}")
+                  .find("capacity_gib") != std::string::npos,
+          "enabled without a capacity is refused");
+  require(refusal("{\"model\":\"m\",\"nodes\":[\"h\"],\"nvme_cache\":{\"capacity_gib\":-1}}")
+                  .find("capacity_gib") != std::string::npos,
+          "a negative capacity is refused");
+  require(refusal("{\"model\":\"m\",\"nodes\":[\"h\"],\"nvme_cache\":{\"enabled\":1}}")
+                  .find("nvme_cache.enabled") != std::string::npos,
+          "a non-boolean flag is refused");
+  require(refusal("{\"model\":\"m\",\"nodes\":[\"h\"],\"nvme_cache\":{\"size\":3}}")
+                  .find("unknown key 'nvme_cache.size'") != std::string::npos,
+          "unknown keys are refused");
+  require(refusal("{\"model\":\"m\",\"nodes\":[\"h\"],\"nvme_cache\":{\"path\":\"\"}}")
+                  .find("nvme_cache.path") != std::string::npos,
+          "an empty path is refused");
+}

@@ -252,6 +252,26 @@ For graph capacity and padded verification rows, see the
 They describe launched graph work, while these counters describe completed
 verification decisions; rejected drafts are not graph padding.
 
+### NVMe cache counters
+
+`nvme_cache` reports the prefix cache's cold tier (the top-level `nvme_cache`
+deployment key; `enabled` false leaves every count at zero):
+
+| Field | Meaning |
+| --- | --- |
+| `pages_total`, `pages_used`, `page_bytes` | The slab's records, the records in use and one record's bytes (one KV block's planes, rounded to 4 KiB); `bytes_total` and `bytes_used` are their products. |
+| `entries`, `blocks` | Entries on disk and the block records they reference (shared records count once). |
+| `spills`, `spilled`, `spill_failed`, `spill_skipped` | Spills begun, committed by the world, failed on some rank, and skipped for want of room after evicting every unused entry. |
+| `restores`, `restored`, `restore_failed`, `tokens_restored` | Restores begun, committed, failed (a short read, a device error or a checksum mismatch on some rank), and the prompt tokens committed restores brought back. |
+| `blocks_shared` | Blocks a spill found already on disk (a document shared by attached variants). |
+| `evictions` | Entries disk retention evicted for room. |
+| `pending`, `worker_pending` | Ops awaiting the world's verdict, and ops queued or running on this rank's worker. |
+| `bytes_written`, `bytes_read`, `failures`, `spill_ms_avg`, `restore_ms_avg` | This rank's file traffic, its failed ops and its average op times. |
+
+Like the prefix-cache counters these are published after each scheduler
+pass on rank 0 (the decisions are identical on every rank; the bytes and
+times are rank 0's own).
+
 ### Prefill progress
 
 `prefill.requests` contains one entry per currently prefilling scheduler choice:

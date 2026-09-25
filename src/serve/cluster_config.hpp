@@ -131,6 +131,19 @@ struct ClusterConfig {
     double stats_interval_s = 10.0;
     bool reasoning_in_content = false;
   } engine;
+  // The NVMe cold tier for the prefix cache (issue #26): a preallocated
+  // slab per rank under `path`, sized to `capacity_gib`, that evicted
+  // entries spill to and later requests restore from. Top-level, so a
+  // deployment turns the tier on with one value; `enabled` requires a
+  // positive capacity. Startup checks the path, the free space and the
+  // minimum size before anything is allocated. `min_tokens` (0: one
+  // prefill chunk) is the shortest entry worth keeping cold.
+  struct NvmeCache {
+    bool enabled = false;
+    std::string path = "~/dgpp/nvme-cache";
+    double capacity_gib = 0.0;
+    int64_t min_tokens = 0;
+  } nvme_cache;
   struct Paths {
     std::string log_dir = "~/dgpp/log";
     std::string stage_dir = "/tmp/bus4";     // where the launcher puts the peers' binary and config

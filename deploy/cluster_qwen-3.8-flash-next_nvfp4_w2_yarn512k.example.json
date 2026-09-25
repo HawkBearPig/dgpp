@@ -30,6 +30,11 @@
     "fp8_head": "mma",
     "bf16_weights": "bf12+bf16"
   },
+  "nvme_cache": {
+    "enabled": false,
+    "path": "~/dgpp/nvme-cache",
+    "capacity_gib": 64
+  },
   "paths": {
     "resident_cache": ""
   }

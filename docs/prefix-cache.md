@@ -4,8 +4,8 @@
 `engine.kv_capacity` sizes the separate KV token pool. Increasing the snapshot
 budget helps only when snapshot slots are the limiting resource. Cached
 documents and live requests still need room in the KV pool.
-Evicted entries are not spilled to disk; NVMe-backed retention is tracked
-separately in [enhancement #26](https://github.com/HawkBearPig/dgpp/issues/26).
+Entries evicted from memory are lost unless the [NVMe cold tier](#the-nvme-cold-tier)
+below is enabled ([enhancement #26](https://github.com/HawkBearPig/dgpp/issues/26)).
 
 ## Changed questions after a long document
 
@@ -109,3 +109,65 @@ build-release/dgpp-serve --config /tmp/qwen-resolved.json --rank 0 --memory-plan
 
 See the [implementation and validation record](../benchmarks/results/2026-09-21-prefix-document-reuse.md)
 for the measured reuse, capacity and correctness checks.
+
+## The NVMe cold tier
+
+`nvme_cache` (a top-level deployment key; see the [README](../README.md#nvme-cache))
+keeps entries the arena evicts on local NVMe and restores them for a later
+matching request. Each rank owns one preallocated slab file,
+`<path>/rank<N>.slab`, of `capacity_gib` GiB, holding its own shard of the
+state. An entry on disk is complete: the snapshot blob (recurrent, ring and
+draft state) and every KV block its metadata pins, so a restored entry needs
+nothing recomputed. Restores read into fresh pool blocks and an arena slot,
+so a restored prefix must still fit the memory pool; the tier expands the
+retained history, not the active context.
+
+**What a token costs.** The slab is pages of one KV block's bytes (rounded
+to 4 KiB); a snapshot blob spans a run of pages. Startup logs the page size,
+the page count and the blob's pages. Per rank, at the checked-in recipes:
+
+| Recipe | KV bytes per token | 260K-token entry | Snapshot blob |
+|---|---:|---:|---:|
+| Qwen NVFP4 YaRN, two nodes | 13.8 KiB | 3.4 GiB | 55 MiB |
+| GLM-5.3-Flash, four nodes | 12.4 KiB | 3.1 GiB | 35 MiB |
+
+On a Spark's NVMe (direct I/O, measured 2026-09-25: 4.5 GB/s writes,
+6.9 GB/s reads) a 260K-token Qwen entry spills in about a second and
+restores in under one, against 216 s to recompute it.
+
+**Which entries.** Prefill snapshots (the deepest cut and the earlier
+document cut) and the close-time entries a completed answer leaves spill
+in the background right after they are taken, once they are at least
+`min_tokens` long (default: one prefill chunk). Blocks that two entries
+share in memory — a document and the questions attached to it — are stored
+once, by physical identity. A memory entry stays attachable while its copy
+is written; eviction from memory then keeps the disk copy. Retention on
+disk is least-recently-used within the capacity, and the slab never grows
+past it: a spill that cannot find room after evicting every unused entry
+is skipped, not squeezed in.
+
+**Restores.** Lookup uses the same cuts and lookahead rules as memory. When
+the deepest usable state is on disk, the scheduler restores it (one restore
+at a time; a second request wanting the same entry waits on the same one),
+then attaches and prefills the suffix. Every page carries a CRC-32C; a
+short read, a device error or a checksum mismatch fails the restore, and
+the request prefills without it.
+
+**Ranks.** Spills and restores are scheduler decisions, identical on every
+rank; their outcomes are journaled: a peer reports each finished op to
+rank 0 over the journal's return path, and rank 0 journals the world's
+verdict once every rank has reported — ok only when all succeeded. A
+failure on one rank is therefore the same cold miss everywhere, and the
+prefix digest the journal checks every tick covers the tier's decisions.
+
+**Restarts.** The slab is recreated at every start; entries are the
+process's and are not reused across restarts.
+
+**Sizing and checks.** `capacity_gib` must hold at least one entry at the
+request context limit plus its blob (startup prints the minimum) and must
+fit the filesystem's free space beside a 1 GiB reserve; both are checked on
+every rank before anything is allocated, and by `--memory-plan`. The tier's
+staging buffers (136 MiB per rank) are part of the memory plan. Watch
+`nvme_cache` in `/v1/metrics`: `pages_used` against `pages_total`,
+`spilled`, `restored`, `restore_failed`, `spill_skipped` (no room), and
+`evictions` (disk retention at work).

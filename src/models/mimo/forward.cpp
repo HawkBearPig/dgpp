@@ -211,6 +211,24 @@ int MimoModel::table_slots() const {
   return loader_.residency() == MimoResidency::Resident ? cfg_.num_moe_layers() : 0;
 }
 
+size_t MimoModel::kv_block_bytes_static(const MimoTextConfig& cfg, int tp_rank, int tp_world, bool mtp,
+                                        LatentFormat kv_format) {
+  const MimoHeadSharding head = tp_world > 1 ? MimoHeadSharding::VocabSharded : MimoHeadSharding::Full;
+  const MimoLocalGeometry geo = MimoLocalGeometry::from_config(cfg, tp_rank, tp_world, head);
+  const auto bytes = [&](int64_t tokens) {
+    MimoKvPoolShape shape;
+    shape.kv_heads = pool_kv_heads(cfg, geo, mtp);
+    shape.k_dim = cfg.head_dim;
+    shape.v_dim = cfg.v_head_dim;
+    shape.block_tokens = kBlockTokens;
+    shape.max_requests = 1;
+    shape.token_slots = tokens;
+    shape.format = kv_format;
+    return MimoKvPool::cache_bytes(shape) - PagedBlockTable::table_bytes(1, tokens / kBlockTokens);
+  };
+  return bytes(2 * kBlockTokens) - bytes(kBlockTokens);
+}
+
 MimoModel::MemoryPlan MimoModel::plan_memory(const MimoTextConfig& cfg, int max_tokens, int64_t max_cache_tokens,
                                              int tp_rank, int tp_world, MimoResidency residency, int max_requests,
                                              bool mtp, int decode_rows, LatentFormat kv_format) {

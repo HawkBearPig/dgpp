@@ -49,6 +49,7 @@ class PagedBlockTable {
     tables_host_.assign(n, 0);
     held_.assign(static_cast<size_t>(max_requests_), 0);
     refcount_.assign(static_cast<size_t>(total_blocks_), 0);
+    generation_.assign(static_cast<size_t>(total_blocks_), 0);
     initialized_ = true;
     reset_all(nullptr);
   }
@@ -84,6 +85,7 @@ class PagedBlockTable {
       row[have + i] = free_.back();
       free_.pop_back();
       refcount_[static_cast<size_t>(row[have + i])] = 1;
+      ++generation_[static_cast<size_t>(row[have + i])];
     }
     held_[static_cast<size_t>(req)] = static_cast<int32_t>(needed);
     DGPP_CUDA_OK(cudaMemcpyAsync(tables_ + static_cast<size_t>(req) * total_blocks_ + have, row + have,
@@ -173,9 +175,19 @@ class PagedBlockTable {
     const int32_t b = free_.back();
     free_.pop_back();
     refcount_[static_cast<size_t>(b)] = 1;
+    ++generation_[static_cast<size_t>(b)];
     return b;
   }
   int32_t block_refcount(int32_t block) const { return refcount_[static_cast<size_t>(block)]; }
+  // The block's identity for the NVMe cold tier (issue #26): its id and
+  // the generation of its current contents — bumped at every acquisition,
+  // so a freed and reused block never passes for the state it held. Two
+  // prefix entries holding the same identity hold the same bytes (the
+  // shared immutable prefix), which is what lets the tier store them once.
+  uint64_t block_identity(int32_t block) const {
+    check_block(block);
+    return (generation_[static_cast<size_t>(block)] << 32) | static_cast<uint32_t>(block);
+  }
   void check_block(int32_t block) const {
     if (block < 0 || block >= total_blocks_)
       throw std::out_of_range("PagedBlockTable: block index out of range");
@@ -197,6 +209,7 @@ class PagedBlockTable {
   std::vector<int32_t> held_;  // blocks per request row
   std::vector<int32_t> free_;  // LIFO
   std::vector<int32_t> refcount_;
+  std::vector<uint64_t> generation_;  // per block: acquisitions so far
 };
 
 }  // namespace dgpp

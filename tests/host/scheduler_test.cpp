@@ -233,6 +233,89 @@ class FakeEngine : public SchedulerEngine {
     return n;
   }
 
+  // The NVMe cold tier (issue #26): an in-memory slab of `pages` records.
+  // Spills and restores complete after `disk_latency_` polls (the tests
+  // drive the commits through the scheduler like the journal does); the
+  // fake records "DS:op:slot" (a spill begun), "DR:op:slot:pos" (a
+  // restore begun) and pins the restored slot's blocks like a snapshot's.
+  // Identities: every pinned slot carries a generation stamp, so a
+  // restored entry's blocks are fresh identities, as the real pool's.
+  void set_disk(int64_t pages, int64_t blob_pages = 1, int64_t min_tokens = 0, int latency = 1) {
+    disk_pages_ = pages;
+    disk_blob_pages_ = blob_pages;
+    disk_min_tokens_ = min_tokens;
+    disk_latency_ = latency;
+  }
+  void fail_next_disk_op() { disk_fail_next_ = true; }
+  int64_t disk_ops_begun() const { return disk_ops_begun_; }
+  dgpp::sched::SchedulerEngine::DiskInfo disk_info() const override {
+    dgpp::sched::SchedulerEngine::DiskInfo i;
+    i.enabled = disk_pages_ > 0;
+    i.pages = disk_pages_;
+    i.page_bytes = 4096;
+    i.blob_pages = disk_blob_pages_;
+    i.min_tokens = disk_min_tokens_;
+    return i;
+  }
+  dgpp::sched::SchedulerEngine::DiskBlocks disk_entry_blocks(int slot) const override {
+    require(pinned_.count(slot) != 0, "fake: disk blocks of an empty arena slot");
+    dgpp::sched::SchedulerEngine::DiskBlocks b;
+    const int64_t position = pinned_positions_.at(slot);
+    const uint64_t gen = pinned_gen_.at(slot);
+    for (int64_t i = 0; i < position / block_tokens_; ++i) b.identities.push_back((gen << 32) | static_cast<uint64_t>(i));
+    b.partial_identity = position % block_tokens_ != 0 ? ((gen << 32) | 0xffffu) : 0;
+    b.mtp_position = position;
+    return b;
+  }
+  void disk_spill_begin(const dgpp::sched::SchedulerEngine::DiskSpill& sp) override {
+    require(pinned_.count(sp.slot) != 0, "fake: spill of an empty arena slot");
+    ops_.push_back("DS:" + std::to_string(sp.op) + ":" + std::to_string(sp.slot));
+    disk_pending_.push_back({sp.op, disk_latency_, !disk_fail_next_});
+    disk_fail_next_ = false;
+    ++disk_ops_begun_;
+  }
+  dgpp::sched::SchedulerEngine::DiskBlocks disk_restore_begin(
+      const dgpp::sched::SchedulerEngine::DiskRestore& rs) override {
+    require(pinned_.count(rs.slot) == 0, "fake: restore into an occupied arena slot");
+    const int64_t need = static_cast<int64_t>(rs.pages.size()) + (rs.partial_page >= 0 ? 1 : 0);
+    require(pool_blocks_in_use() + need <= total_blocks_, "fake: restore without free blocks");
+    // Every restored block is the entry's own (the real tier acquires
+    // fresh blocks); the pin counts them all.
+    pinned_[rs.slot] = need;
+    pinned_positions_[rs.slot] = rs.position;
+    pinned_gen_[rs.slot] = ++gen_;
+    ops_.push_back("DR:" + std::to_string(rs.op) + ":" + std::to_string(rs.slot) + ":" +
+                   std::to_string(rs.position));
+    disk_pending_.push_back({rs.op, disk_latency_, !disk_fail_next_});
+    disk_fail_next_ = false;
+    ++disk_ops_begun_;
+    return disk_entry_blocks(rs.slot);
+  }
+  std::vector<dgpp::sched::SchedulerEngine::DiskCompletion> disk_poll() override {
+    std::vector<dgpp::sched::SchedulerEngine::DiskCompletion> out;
+    for (auto it = disk_pending_.begin(); it != disk_pending_.end();) {
+      if (--it->left > 0) {
+        ++it;
+        continue;
+      }
+      out.push_back({it->op, it->ok});
+      it = disk_pending_.erase(it);
+    }
+    return out;
+  }
+  struct PendingDisk {
+    uint64_t op;
+    int left;
+    bool ok;
+  };
+  int64_t disk_pages_ = 0, disk_blob_pages_ = 1, disk_min_tokens_ = 0;
+  int disk_latency_ = 1;
+  bool disk_fail_next_ = false;
+  int64_t disk_ops_begun_ = 0;
+  std::vector<PendingDisk> disk_pending_;
+  std::map<int, uint64_t> pinned_gen_;
+  uint64_t gen_ = 0;
+
   int max_concurrent_requests() const override { return slots_; }
   int decode_batch_capacity() const override { return batch_capacity_; }
   int64_t pool_blocks_total() const override { return total_blocks_; }
@@ -357,6 +440,7 @@ class FakeEngine : public SchedulerEngine {
                         ? (position % block_tokens_ != 0 ? 1 : 0)
                         : position / block_tokens_ + (position % block_tokens_ != 0 ? 1 : 0);
     pinned_positions_[slot] = position;
+    pinned_gen_[slot] = ++gen_;
     if (partial_pins_ && pool_blocks_in_use() > total_blocks_)
       throw std::runtime_error("fake: pool overdrawn by a snapshot (" +
                                std::to_string(pool_blocks_in_use()) + " of " +
@@ -2561,6 +2645,222 @@ DGPP_TEST(scheduler_prefixCache_attachedEntriesAreNeverEvicted) {
   require(sched.meters().prefix_skipped == 1 && sched.meters().prefix_evictions == 1 &&
               sched.meters().prefix_close_entries == 1,
           "c's snapshot skipped while b was attached; a's entry gave way to b's close entry");
+}
+
+// ---- the NVMe cold tier (issue #26) -------------------------------------------
+// The commits ride the journal in production; here the driver hands the
+// fake's completions straight back to the scheduler before each tick, the
+// way a world of one does, until nothing is pending on either side.
+void settle(Scheduler& sched, FakeEngine& engine, int max_ticks = 1000) {
+  for (int i = 0; i < max_ticks; ++i) {
+    std::vector<Scheduler::DiskCommit> commits;
+    for (const auto& c : sched.poll_disk_completions()) commits.push_back({c.op, c.ok});
+    sched.apply_disk_commits(commits);
+    const bool more = sched.tick();
+    if (!more && !sched.has_pending() && sched.disk_ops_pending() == 0) return;
+  }
+  (void)engine;
+  throw std::runtime_error("settle: the scheduler did not drain in " + std::to_string(max_ticks) + " ticks");
+}
+
+DGPP_TEST(scheduler_nvmeCache_spillsAnEvictedEntryAndRestoresItForALaterRequest) {
+  // GIVEN a one-slot arena over a slab of 16 pages, a 21-token prompt
+  // whose deepest cut is 12:
+  FakeEngine engine(/*slots=*/2, /*total_blocks=*/100, /*block_tokens=*/4);
+  engine.set_prefix_arena(/*slots=*/1, /*align=*/4);
+  engine.set_disk(/*pages=*/16);
+  engine.arm(0, {1, 2, 3}, 3);
+  engine.arm(0, {4, 5}, 2);
+  engine.arm(0, {6, 7, 8}, 3);
+  Scheduler sched(&engine, {kEos});
+  require(sched.disk_enabled(), "the tier is on");
+  // a: a cold prefill takes the entry at 12 and the tier copies it out.
+  sched.submit(make_cached_request("a", counted_prompt(21), {5, 13}, 3));
+  settle(sched, engine);
+  Scheduler::Meters m = sched.meters();
+  require(m.disk_spills == 1 && m.disk_spilled == 1 && m.disk_entries == 1 && m.prefix_entries == 1,
+          "a's entry spilled and committed; memory keeps it too");
+  require(engine.op_stream().find("N:0:12@0") != std::string::npos &&
+              engine.op_stream().find("DS:1:0") != std::string::npos,
+          "the snapshot, then its spill: " + engine.op_stream());
+  // b: another prompt wants the only slot — a's memory entry goes, its
+  // cold copy stays.
+  sched.submit(make_cached_request("b", counted_prompt(21, 300), {5, 13}, 2));
+  settle(sched, engine);
+  m = sched.meters();
+  require(m.prefix_evictions == 1 && m.disk_entries == 2 && m.disk_spilled == 2,
+          "a evicted from memory, b spilled too");
+  // c: a's prompt again — no memory entry, a cold copy at its cut: the
+  // restore runs, then c attaches at 12 and prefills the suffix.
+  sched.submit(make_cached_request("c", counted_prompt(21), {5, 13}, 3));
+  settle(sched, engine);
+  m = sched.meters();
+  require(m.disk_restores == 1 && m.disk_restored == 1 && m.disk_restore_failed == 0,
+          "one restore, committed");
+  require(m.prefix_hits == 1 && m.prefix_tokens_saved == 12 && m.disk_tokens_restored == 12,
+          "c attached to the restored entry at 12");
+  const std::string ops = engine.op_stream();
+  const size_t dr = ops.find("DR:");
+  const size_t attach = ops.find("X:0:12@0");
+  require(dr != std::string::npos && attach != std::string::npos && dr < attach,
+          "the restore precedes the attach: " + ops);
+  require(ids_joined(sched.results()[2].generated) == "6,7,8", "c's ids");
+  require(m.disk_pages_used <= m.disk_pages_total, "within capacity");
+}
+
+DGPP_TEST(scheduler_nvmeCache_aFailedRestoreIsAColdMissAndDropsTheEntry) {
+  FakeEngine engine(/*slots=*/2, /*total_blocks=*/100, /*block_tokens=*/4);
+  engine.set_prefix_arena(/*slots=*/1, /*align=*/4);
+  engine.set_disk(/*pages=*/16);
+  engine.arm(0, {1, 2, 3}, 3);
+  engine.arm(0, {4, 5}, 2);
+  engine.arm(0, {6, 7, 8}, 3);
+  Scheduler sched(&engine, {kEos});
+  sched.submit(make_cached_request("a", counted_prompt(21), {5, 13}, 3));
+  settle(sched, engine);
+  sched.submit(make_cached_request("b", counted_prompt(21, 300), {5, 13}, 2));
+  settle(sched, engine);
+  require(sched.meters().disk_entries == 2, "two cold copies");
+  // The restore's read fails (a checksum, a device error): the world's
+  // verdict is a failure, c prefills cold, the entry is gone from disk.
+  engine.fail_next_disk_op();
+  sched.submit(make_cached_request("c", counted_prompt(21), {5, 13}, 3));
+  settle(sched, engine);
+  const Scheduler::Meters m = sched.meters();
+  require(m.disk_restores == 1 && m.disk_restored == 0 && m.disk_restore_failed == 1, "the restore failed");
+  require(m.prefix_hits == 0 && m.prefix_misses == 3, "c was a miss");
+  require(m.disk_entries == 2 && m.disk_spilled == 3,
+          "the suspect entry was dropped; b's stays and c's own cold prefill spilled");
+  require(m.prefix_entries == 1, "c's own entry is in memory now");
+  require(engine.op_stream().find("P:0:21 ") != std::string::npos ||
+              engine.op_stream().rfind("P:0:21") != std::string::npos,
+          "c prefilled its whole prompt: " + engine.op_stream());
+  require(ids_joined(sched.results()[2].generated) == "6,7,8", "c's ids");
+  require(m.pool_blocks_in_use == m.prefix_blocks_pinned, "the failed restore's blocks were released");
+}
+
+DGPP_TEST(scheduler_nvmeCache_aFailedSpillLeavesTheMemoryEntry) {
+  FakeEngine engine(/*slots=*/2, /*total_blocks=*/100, /*block_tokens=*/4);
+  engine.set_prefix_arena(/*slots=*/2, /*align=*/4);
+  engine.set_disk(/*pages=*/16);
+  engine.arm(0, {1, 2, 3}, 3);
+  engine.arm(0, {6, 7, 8}, 3);
+  Scheduler sched(&engine, {kEos});
+  engine.fail_next_disk_op();
+  sched.submit(make_cached_request("a", counted_prompt(21), {5, 13}, 3));
+  settle(sched, engine);
+  Scheduler::Meters m = sched.meters();
+  require(m.disk_spills == 1 && m.disk_spilled == 0 && m.disk_spill_failed == 1 && m.disk_entries == 0,
+          "the spill failed and left no cold copy");
+  require(m.prefix_entries == 1, "the memory entry stands");
+  // A repeat hits in memory as before; the entry is not spilled again
+  // (nothing asks for it), and nothing is restored.
+  sched.submit(make_cached_request("b", counted_prompt(21), {5, 13}, 3));
+  settle(sched, engine);
+  m = sched.meters();
+  require(m.prefix_hits == 1 && m.disk_restores == 0, "a memory hit, no restore");
+}
+
+DGPP_TEST(scheduler_nvmeCache_retentionHoldsTheCapacityAndEvictsLru) {
+  // A slab of 6 pages with one-page blobs: an entry at 12 tokens takes 3
+  // block pages + 1, so one fits; every later spill evicts the oldest.
+  FakeEngine engine(/*slots=*/1, /*total_blocks=*/100, /*block_tokens=*/4);
+  engine.set_prefix_arena(/*slots=*/1, /*align=*/4);
+  engine.set_disk(/*pages=*/6);
+  Scheduler sched(&engine, {kEos});
+  for (int i = 0; i < 4; ++i) {
+    engine.arm(0, {1}, 1);
+    sched.submit(make_cached_request(std::to_string(i), counted_prompt(21, 1000 * (i + 1)), {5, 13}, 1));
+    settle(sched, engine);
+    const Scheduler::Meters m = sched.meters();
+    require(m.disk_pages_used <= m.disk_pages_total, "never past the capacity");
+    require(m.disk_entries == 1, "one entry fits at a time");
+  }
+  const Scheduler::Meters m = sched.meters();
+  require(m.disk_spilled == 4 && m.disk_evictions == 3, "each spill evicted its predecessor");
+  // An entry too large for the slab is skipped, not squeezed in.
+  engine.arm(0, {1}, 1);
+  sched.submit(make_cached_request("big", counted_prompt(41, 9000), {5, 13, 39}, 1));
+  settle(sched, engine);
+  require(sched.meters().disk_spill_skipped == 1 && sched.meters().disk_entries == 1,
+          "an entry past the capacity is skipped and the slab keeps what it held");
+}
+
+DGPP_TEST(scheduler_nvmeCache_twoRequestsWaitOnOneRestore) {
+  FakeEngine engine(/*slots=*/2, /*total_blocks=*/100, /*block_tokens=*/4);
+  engine.set_prefix_arena(/*slots=*/1, /*align=*/4);
+  engine.set_disk(/*pages=*/16, /*blob_pages=*/1, /*min_tokens=*/0, /*latency=*/3);
+  engine.arm(0, {1, 2, 3}, 3);
+  engine.arm(0, {4, 5}, 2);
+  engine.arm(0, {6, 7}, 2);
+  engine.arm(0, {8, 9}, 2);  // c retires within its admission tick; d takes slot 0 next
+  Scheduler sched(&engine, {kEos});
+  sched.submit(make_cached_request("a", counted_prompt(21), {5, 13}, 3));
+  settle(sched, engine);
+  sched.submit(make_cached_request("b", counted_prompt(21, 300), {5, 13}, 2));
+  settle(sched, engine);
+  // c and d want a's state: one restore serves both.
+  sched.submit(make_cached_request("c", counted_prompt(21), {5, 13}, 2));
+  sched.submit(make_cached_request("d", counted_prompt(21), {5, 13}, 2));
+  settle(sched, engine);
+  const Scheduler::Meters m = sched.meters();
+  require(m.disk_restores == 1 && m.disk_restored == 1, "one restore");
+  require(m.prefix_hits == 2 && m.prefix_tokens_saved == 24, "both attached at 12");
+  require(ids_joined(sched.results()[2].generated) == "6,7" && ids_joined(sched.results()[3].generated) == "8,9",
+          "both answers");
+}
+
+DGPP_TEST(scheduler_nvmeCache_aCancelWhileRestoringKeepsTheRestoredEntry) {
+  FakeEngine engine(/*slots=*/2, /*total_blocks=*/100, /*block_tokens=*/4);
+  engine.set_prefix_arena(/*slots=*/1, /*align=*/4);
+  engine.set_disk(/*pages=*/16, /*blob_pages=*/1, /*min_tokens=*/0, /*latency=*/4);
+  engine.arm(0, {1, 2, 3}, 3);
+  engine.arm(0, {4, 5}, 2);
+  engine.arm(0, {6, 7}, 2);
+  Scheduler sched(&engine, {kEos});
+  sched.submit(make_cached_request("a", counted_prompt(21), {5, 13}, 3));
+  settle(sched, engine);
+  sched.submit(make_cached_request("b", counted_prompt(21, 300), {5, 13}, 2));
+  settle(sched, engine);
+  sched.submit(make_cached_request("c", counted_prompt(21), {5, 13}, 2));
+  // The tick starts the restore and does no engine work while it runs
+  // (it reports nothing pending for the pass; the request waits).
+  (void)sched.tick();
+  require(sched.disk_ops_pending() == 1, "c's restore begins at its first tick");
+  require(sched.cancel("c"), "c leaves while waiting");
+  settle(sched, engine);
+  Scheduler::Meters m = sched.meters();
+  require(m.disk_restored == 1 && m.prefix_entries == 1, "the restore landed anyway");
+  require(sched.results()[2].status == Scheduler::Result::Status::kCancelled, "c cancelled");
+  // The next request with a's prompt hits the restored entry in memory.
+  sched.submit(make_cached_request("d", counted_prompt(21), {5, 13}, 2));
+  settle(sched, engine);
+  m = sched.meters();
+  require(m.prefix_hits == 1 && m.disk_restores == 1, "a memory hit, no second restore");
+}
+
+DGPP_TEST(scheduler_nvmeCache_sameStreamTwice_identicalOpsAndDigests) {
+  const auto run = [](bool fail_restore) {
+    FakeEngine engine(/*slots=*/2, /*total_blocks=*/100, /*block_tokens=*/4);
+    engine.set_prefix_arena(/*slots=*/1, /*align=*/4);
+    engine.set_disk(/*pages=*/16, /*blob_pages=*/1, /*min_tokens=*/0, /*latency=*/2);
+    engine.arm(0, {1, 2, 3}, 3);
+    engine.arm(0, {4, 5}, 2);
+    engine.arm(0, {6, 7, 8}, 3);
+    Scheduler sched(&engine, {kEos});
+    sched.submit(make_cached_request("a", counted_prompt(21), {5, 13}, 3));
+    settle(sched, engine);
+    sched.submit(make_cached_request("b", counted_prompt(21, 300), {5, 13}, 2));
+    settle(sched, engine);
+    if (fail_restore) engine.fail_next_disk_op();
+    sched.submit(make_cached_request("c", counted_prompt(21), {5, 13}, 3));
+    settle(sched, engine);
+    return std::make_pair(engine.op_stream(), sched.prefix_digest());
+  };
+  const auto one = run(false), two = run(false), three = run(true);
+  require(one.first == two.first && one.second == two.second, "identical streams: identical ops and digests");
+  require(one.second != three.second, "a failed restore: a different digest");
+  require(one.first.find("DR:") != std::string::npos, "the base run restored: " + one.first);
 }
 
 DGPP_TEST(scheduler_prefixCache_sameStreamTwice_identicalOpsAndDigests) {

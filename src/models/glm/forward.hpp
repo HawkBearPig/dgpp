@@ -119,6 +119,9 @@ class GlmDiagnosticModel : public PrefillReporting {
   // may ask for more for the head at a large row count) and the CUDA
   // context, the bus and the prefix arena are the caller's to add.
   using MemoryPlan = dgpp::MemoryPlan;  // engine/memory_plan.hpp (shared with the Qwen model)
+  // One cache block's bytes across every DSA pool plane (the NVMe cold
+  // tier's record, issue #26) for a shape that is not built yet.
+  static size_t kv_block_bytes_static(const GlmTextConfig& cfg, int tp_world, bool mtp, LatentFormat kv_format);
   static MemoryPlan plan_memory(const GlmTextConfig& cfg, int max_tokens,
                                 int64_t max_cache_tokens, int tp_rank = 0,
                                 int tp_world = 1,
@@ -444,6 +447,21 @@ class GlmDiagnosticModel : public PrefillReporting {
   // recorded kernels ARE the eager kernels; the bus gate pins its
   // eager-vs-graph fold equality).
   cudaStream_t stream() const { return stream_; }
+  // The NVMe cold tier's view of the DSA pool (issue #26,
+  // engine/cache_planes.hpp): every plane a block spans, and a block's
+  // identity (id + contents generation).
+  std::vector<CachePlane> cache_planes() const {
+    if (dsa_cfg_.num_dsa_layers == 0) return {};
+    return pool_.planes();
+  }
+  uint64_t cache_block_identity(int32_t block) const { return pool_.block_identity(block); }
+  int32_t cache_acquire_block() {
+    if (dsa_cfg_.num_dsa_layers == 0) throw std::logic_error("cache_acquire_block: no DSA pool");
+    return pool_.acquire_pinned_block();
+  }
+  void cache_release_blocks(const int32_t* blocks, int64_t n) {
+    if (n > 0) pool_.unpin_blocks(blocks, n);
+  }
   // The on-device pick's inputs (glm_tp_bus.hpp DevicePicker): the head's
   // fp32 logits [rows, lm_vocab_count] and the decode call's token ids
   // [rows] as the last run/capture left them on the device. A verify's

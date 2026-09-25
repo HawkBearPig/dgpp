@@ -104,6 +104,10 @@ class MimoModel : public SessionModel<MimoModel> {
   // Every byte the constructor (and its layer objects) will allocate for
   // a shape, from the same formulas BEFORE anything is allocated.
   using MemoryPlan = dgpp::MemoryPlan;
+  // One cache block's bytes across every pool plane (the NVMe cold tier's
+  // record, issue #26) for a shape that is not built yet.
+  static size_t kv_block_bytes_static(const MimoTextConfig& cfg, int tp_rank, int tp_world, bool mtp,
+                                      LatentFormat kv_format);
   static MemoryPlan plan_memory(const MimoTextConfig& cfg, int max_tokens, int64_t max_cache_tokens,
                                 int tp_rank = 0, int tp_world = 1,
                                 MimoResidency residency = MimoResidency::Streaming,

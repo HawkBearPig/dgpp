@@ -17,6 +17,10 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <fcntl.h>
+#include <unistd.h>
+
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -24,12 +28,15 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <cuda_runtime.h>
 
 #include "common/bf16_residency.hpp"
 #include "common/dtypes.hpp"
+#include "engine/nvme_tier.hpp"
+#include "engine/prefix_arena.hpp"
 #include "engine/speculative.hpp"
 #include "kernels/gemm.hpp"
 #include "models/qwen/config.hpp"
@@ -406,6 +413,113 @@ int run_fixture(const std::string& dir, bool fp8_head = false) {
     require(m.kv_blocks_in_use() == 0, "prefix: every block released with the entries");
     for (uint8_t* p : arena) cudaFree(p);
     std::printf("[ OK ] prefix snapshots: hot == cold bitwise at a cut and mid-decode\n");
+  }
+  // 7. The NVMe cold tier (issue #26): a snapshot at cut 12 spilled to a
+  //    slab file and restored into another arena slot and fresh pool
+  //    blocks reads back bitwise (the blob and every block plane), attaches
+  //    and decodes bitwise the in-memory entry; a page corrupted on disk
+  //    fails the restore by its checksum and releases what it took.
+  {
+    dgpp::PrefixArena<QwenModel> arena(&m, /*slots=*/2);
+    const std::vector<int64_t> bounds{12};
+    QwenModel::SnapshotRequest snap = arena.request(0, 12);
+    const QwenModel::Outputs cold = m.session_prefill(0, A, bounds, &snap);
+    arena.commit(0, snap);
+    require(arena.filled(0) && arena.meta(0).position == 12, "tier: the snapshot at 12 is in slot 0");
+    const QwenModel::Outputs cold_step = m.session_step(0, tA.tokens[0]);
+    m.session_close(0);
+    const int64_t blocks_before = m.kv_blocks_in_use();
+    const std::string slab_dir = (fs::temp_directory_path() / "dgpp_nvme_tier_test").string();
+    fs::create_directories(slab_dir);
+    dgpp::sched::SchedulerEngine::DiskEnable en;
+    en.slab_path = slab_dir + "/rank0.slab";
+    en.capacity_bytes = size_t{64} << 20;
+    en.chunk_bytes = size_t{1} << 20;
+    en.rank = 0;
+    std::unique_ptr<dgpp::NvmeTier<QwenModel>> tier;
+    tier = std::make_unique<dgpp::NvmeTier<QwenModel>>(&m, &arena, en);
+    require(tier->block_bytes() == dgpp::cache_block_bytes(m.cache_planes()), "tier: the record is the planes' bytes");
+    require(tier->page_bytes() % 4096 == 0 && tier->blob_pages() >= 1, "tier: 4 KiB pages, at least one blob page");
+    const auto wait = [&](uint64_t op) {
+      for (int i = 0; i < 2000; ++i) {
+        for (const auto& c : tier->poll())
+          if (c.op == op) return c.ok;
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+      }
+      throw std::runtime_error("tier: op " + std::to_string(op) + " never completed");
+    };
+    // The spill: the entry's identities, one page per block (12 tokens in
+    // 64-token blocks: no full block, one partial), the blob's run.
+    const dgpp::sched::SchedulerEngine::DiskBlocks ids = tier->entry_blocks(0);
+    require(ids.identities.empty() && ids.partial_identity != 0, "tier: cut 12 is one partial block");
+    dgpp::sched::SchedulerEngine::DiskSpill spill;
+    spill.op = 1;
+    spill.slot = 0;
+    spill.blob_page = 0;
+    spill.partial_page = tier->blob_pages();
+    tier->spill_begin(spill);
+    require(wait(1), "tier: the spill completed");
+    // The restore into slot 1: fresh blocks, the same bytes.
+    dgpp::sched::SchedulerEngine::DiskRestore rs;
+    rs.op = 2;
+    rs.slot = 1;
+    rs.position = 12;
+    rs.mtp_position = arena.meta(0).mtp_position;
+    rs.blob_page = 0;
+    rs.partial_page = tier->blob_pages();
+    const dgpp::sched::SchedulerEngine::DiskBlocks fresh = tier->restore_begin(rs);
+    require(fresh.partial_identity != 0 && fresh.partial_identity != ids.partial_identity,
+            "tier: the restore took a fresh block");
+    require(m.kv_blocks_in_use() == blocks_before + 1, "tier: one block acquired for the restore");
+    require(wait(2), "tier: the restore completed");
+    require(arena.filled(1) && arena.meta(1).position == 12 && arena.meta(1).partial_block >= 0,
+            "tier: slot 1 adopted the restored entry");
+    {
+      const size_t bytes = arena.bytes();
+      std::vector<uint8_t> a(bytes), b(bytes);
+      DGPP_CUDA_OK(cudaMemcpy(a.data(), arena.slot_data(0), bytes, cudaMemcpyDeviceToHost));
+      DGPP_CUDA_OK(cudaMemcpy(b.data(), arena.slot_data(1), bytes, cudaMemcpyDeviceToHost));
+      require(a == b, "tier: the restored blob differs from the spilled one");
+      for (const dgpp::CachePlane& plane : m.cache_planes()) {
+        std::vector<uint8_t> x(plane.block_bytes), y(plane.block_bytes);
+        DGPP_CUDA_OK(cudaMemcpy(x.data(), plane.base + static_cast<size_t>(arena.meta(0).partial_block) * plane.block_bytes,
+                                plane.block_bytes, cudaMemcpyDeviceToHost));
+        DGPP_CUDA_OK(cudaMemcpy(y.data(), plane.base + static_cast<size_t>(arena.meta(1).partial_block) * plane.block_bytes,
+                                plane.block_bytes, cudaMemcpyDeviceToHost));
+        require(x == y, "tier: a restored block plane differs from the original");
+      }
+    }
+    // Attached from the restored slot, the suffix prefill and the first
+    // step are bitwise the cold run's.
+    arena.attach(1, 1);
+    const QwenModel::Outputs hot = m.session_prefill_resume(1, std::vector<int64_t>(A.begin() + 12, A.end()), bounds);
+    require(bitwise(hot.logits, cold.logits), "tier: the prefill after a restored attach differs");
+    require(bitwise(m.session_step(1, tA.tokens[0]).logits, cold_step.logits), "tier: the step after a restored attach differs");
+    m.session_close(1);
+    arena.release(1);
+    require(m.kv_blocks_in_use() == blocks_before, "tier: the release returned the restored block");
+    // A corrupted page: the restore fails on its checksum, and releasing
+    // the slot returns the block it took.
+    {
+      const int fd = ::open(en.slab_path.c_str(), O_WRONLY);
+      require(fd >= 0, "tier: reopen the slab");
+      const uint8_t junk[16] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
+      require(::pwrite(fd, junk, sizeof junk, static_cast<off_t>(static_cast<size_t>(tier->blob_pages()) * tier->page_bytes() + 64)) ==
+                  static_cast<ssize_t>(sizeof junk),
+              "tier: corrupt the partial block's page");
+      ::close(fd);
+    }
+    rs.op = 3;
+    (void)tier->restore_begin(rs);
+    require(!wait(3), "tier: a corrupted page fails the restore");
+    require(tier->stats().failures == 1, "tier: the failure counted");
+    arena.release(1);
+    require(m.kv_blocks_in_use() == blocks_before, "tier: the failed restore's block was released");
+    tier.reset();
+    require(!fs::exists(en.slab_path), "tier: the slab is removed with the tier");
+    arena.release(0);
+    require(m.kv_blocks_in_use() == 0, "tier: every block released");
+    std::printf("[ OK ] NVMe tier: spill/restore bitwise, attach bitwise, corruption detected\n");
   }
   // Two cuts in one prefill: an earlier document state for changed tails,
   // and the deepest state for identical repeats. Both include MTP state.

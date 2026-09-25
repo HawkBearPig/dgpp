@@ -20,6 +20,11 @@
     "sampling_candidates": 128,
     "stats_interval_s": 10
   },
+  "nvme_cache": {
+    "enabled": false,
+    "path": "~/dgpp/nvme-cache",
+    "capacity_gib": 64
+  },
   "paths": {
     "resident_cache": ""
   }

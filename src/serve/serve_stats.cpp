@@ -111,6 +111,14 @@ std::string ThroughputLog::format(int rank, double seconds, const Meters& prev,
   if (cur.prefix_slots > 0)
     out += std::format(" | prefix cache {}/{} entries", cur.prefix_entries,
                        cur.prefix_slots);
+  if (cur.disk_enabled)
+    out += std::format(" | nvme cache {} entries, {:.1f}/{:.1f} GiB, {} restored, {} pending",
+                       cur.disk_entries,
+                       static_cast<double>(cur.disk_pages_used * cur.disk_page_bytes) /
+                           (1024.0 * 1024.0 * 1024.0),
+                       static_cast<double>(cur.disk_pages_total * cur.disk_page_bytes) /
+                           (1024.0 * 1024.0 * 1024.0),
+                       cur.disk_restored, cur.disk_pending);
   if (cur.prefilling > 0)
     out += std::format(" | {} prefilling", cur.prefilling);
   if (cur_svc && prev_svc) {

@@ -46,6 +46,11 @@ class PrefixCache {
     uint64_t last_use = 0;      // the tick of the last attach / insert
     int attached = 0;           // live requests attached (never evicted)
     bool live = false;
+    // The NVMe cold tier (issue #26): the disk entry holding this
+    // entry's state (-1: none), and whether a spill is reading it — a
+    // busy entry is never evicted (its slot and blocks are being copied).
+    int disk = -1;
+    bool busy = false;
   };
   struct Stats {
     int64_t hits = 0;
@@ -137,10 +142,12 @@ class PrefixCache {
   // The smallest free slot, or -1.
   int take_free_slot();
   void give_back_slot(int slot);
-  // The least recently used live entry with no attached request: its slot
-  // is freed (the caller releases it on the engine) and the entry dies.
-  // Returns the slot, or -1 when nothing is evictable.
-  int evict_lru();
+  // The least recently used live entry with no attached request and no
+  // spill in flight: its slot is freed (the caller releases it on the
+  // engine) and the entry dies. Returns the slot, or -1 when nothing is
+  // evictable; `disk` (optional) receives the victim's disk entry (-1:
+  // none) so the caller can tell the cold tier its memory copy went.
+  int evict_lru(int* disk = nullptr);
   // A free slot, evicting once when none is free. -1 when neither works.
   int acquire_slot();
 
@@ -151,10 +158,15 @@ class PrefixCache {
   int insert(const int64_t* ids, int64_t position, int slot, uint64_t now,
              const Images& images = {}, int64_t next_token = -1);
   const Entry& entry(int index) const { return entries_.at(static_cast<size_t>(index)); }
+  int size() const { return static_cast<int>(entries_.size()); }  // records, live or dead
   void attach(int index, uint64_t now);
   void detach(int index);
   // Refreshes an entry's LRU stamp without a decision (no stats, no digest).
   void touch(int index, uint64_t now);
+  // The cold tier's links (issue #26): the disk entry an entry is stored
+  // in, and the busy flag while a spill copies it.
+  void set_disk(int index, int disk);
+  void set_busy(int index, bool busy);
   int64_t blocks_pinned(int64_t block_tokens) const;  // every live entry's
 
   // ---- the decision digest -----------------------------------------------

@@ -105,6 +105,20 @@ void QwenKvPool::reset_all(cudaStream_t stream) {
   table_.reset_all(stream);
 }
 
+std::vector<CachePlane> QwenKvPool::planes() const {
+  std::vector<CachePlane> out;
+  if (!initialized_) return out;
+  const size_t kv_blk = static_cast<size_t>(shape_.block_tokens) * kv_row_elems() * 2;
+  const size_t idx_blk = static_cast<size_t>(pools_per_block()) * shape_.idx_dim * 2;
+  for (int l = 0; l < shape_.layers; ++l) {
+    const QwenQsaCache c = view(l);
+    out.push_back({reinterpret_cast<uint8_t*>(c.k_cache), kv_blk});
+    out.push_back({reinterpret_cast<uint8_t*>(c.v_cache), kv_blk});
+    out.push_back({reinterpret_cast<uint8_t*>(c.index_cache), idx_blk});
+  }
+  return out;
+}
+
 void QwenKvPool::copy_block_contents(int32_t src, int32_t dst, cudaStream_t stream) {
   table_.check_block(src);
   table_.check_block(dst);

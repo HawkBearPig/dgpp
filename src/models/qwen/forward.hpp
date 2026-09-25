@@ -120,6 +120,9 @@ class QwenModel : public SessionModel<QwenModel> {
   // a shape, itemized from the same formulas BEFORE anything is allocated
   // (engine/memory_plan.hpp): the serving app's pre-flight check.
   using MemoryPlan = dgpp::MemoryPlan;
+  // One cache block's bytes across every pool plane (the NVMe cold tier's
+  // record, issue #26) for a shape that is not built yet.
+  static size_t kv_block_bytes_static(const QwenTextConfig& cfg, int tp_rank, int tp_world, bool mtp);
   static MemoryPlan plan_memory(const QwenTextConfig& cfg, int max_tokens, int64_t max_cache_tokens,
                                 int tp_rank = 0, int tp_world = 1,
                                 QwenResidency residency = QwenResidency::Streaming,

@@ -192,18 +192,21 @@ void PrefixCache::give_back_slot(int slot) {
   free_.insert(it, slot);
 }
 
-int PrefixCache::evict_lru() {
+int PrefixCache::evict_lru(int* disk) {
   int victim = -1;
   for (size_t i = 0; i < entries_.size(); ++i) {
     const Entry& e = entries_[i];
-    if (!e.live || e.attached > 0) continue;
+    if (!e.live || e.attached > 0 || e.busy) continue;
     if (victim < 0 ||
         e.last_use < entries_[static_cast<size_t>(victim)].last_use)
       victim = static_cast<int>(i);
   }
+  if (disk != nullptr) *disk = -1;
   if (victim < 0) return -1;
   Entry& e = entries_[static_cast<size_t>(victim)];
   const int slot = e.slot;
+  if (disk != nullptr) *disk = e.disk;
+  e.disk = -1;
   e.live = false;
   e.slot = -1;
   e.ids.clear();
@@ -309,6 +312,18 @@ void PrefixCache::touch(int index, uint64_t now) {
   Entry& e = entries_.at(static_cast<size_t>(index));
   if (!e.live) throw std::logic_error("PrefixCache: touch of a dead entry");
   e.last_use = now;
+}
+
+void PrefixCache::set_disk(int index, int disk) {
+  Entry& e = entries_.at(static_cast<size_t>(index));
+  if (!e.live) throw std::logic_error("PrefixCache: disk link on a dead entry");
+  e.disk = disk;
+}
+
+void PrefixCache::set_busy(int index, bool busy) {
+  Entry& e = entries_.at(static_cast<size_t>(index));
+  if (!e.live) throw std::logic_error("PrefixCache: busy flag on a dead entry");
+  e.busy = busy;
 }
 
 void PrefixCache::detach(int index) {

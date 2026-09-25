@@ -130,6 +130,18 @@ void Csa2StatePool::reset_all(cudaStream_t stream) {
   table_.reset_all(stream);
 }
 
+std::vector<CachePlane> Csa2StatePool::planes() const {
+  std::vector<CachePlane> out;
+  if (!initialized_) return out;
+  for (int o = 0; o < caches(); ++o) {
+    const size_t epb = static_cast<size_t>(entries_per_block(o));
+    out.push_back({main_[static_cast<size_t>(o)], epb * main_row_bytes()});
+    out.push_back({index_k_[static_cast<size_t>(o)], epb * kCsa2IndexDim});
+    out.push_back({reinterpret_cast<uint8_t*>(index_scale_[static_cast<size_t>(o)]), epb * sizeof(float)});
+  }
+  return out;
+}
+
 void Csa2StatePool::copy_block_contents(int32_t src, int32_t dst, cudaStream_t stream) {
   table_.check_block(src);
   table_.check_block(dst);

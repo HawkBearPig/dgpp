@@ -367,11 +367,37 @@ Startup checks the combined memory plan before loading.
 | `engine.default_max_tokens` | no | Answer-token budget for requests that omit `max_tokens`. Clients may supply their own value; this is not a global hard limit. A larger default also reserves more context space under full admission. | 256 |
 | `engine.queue_limit` | no | Maximum requests waiting for an execution slot or memory budget. Additional arrivals receive HTTP 503 `overloaded`. Increase to tolerate bursts, at the cost of longer waits—not higher execution capacity. | 64 |
 | `engine.max_connections` | no | Maximum simultaneously open HTTP connections on rank 0, including idle keep-alive connections and streams. Excess connections receive 503. Size this separately from active request slots. | 64 |
-| `engine.prefix_cache_gib` | no | Memory budget per rank for reusable prefix-state snapshots. Long documents can reuse an earlier snapshot when their question changes. Snapshot slots and the KV token pool are separate limits; see [sizing and recipe capacities](docs/prefix-cache.md). Set 0 to disable. | 1.5 GiB |
+| `engine.prefix_cache_gib` | no | Memory budget per rank for reusable prefix-state snapshots. Long documents can reuse an earlier snapshot when their question changes. Snapshot slots and the KV token pool are separate limits; see [sizing and recipe capacities](docs/prefix-cache.md). Set 0 to disable. Entries evicted from memory are lost unless the NVMe cache below is enabled. | 1.5 GiB |
 | `engine.admission` | no | When to reserve context space. `full` reserves prompt plus the requested answer budget before admitting a request. `grow` starts with a smaller reservation and extends it during generation; if space runs out, the youngest request is shed. Use `full` for predictable reservations, `grow` to trade that guarantee for denser occupancy. | `full` |
 | `engine.admission_window` | no | Answer-token reservation increment used by `grow` admission. Larger increments reduce growth frequency but reserve more space ahead of use. Has no effect under `full`. Must be positive. | 256 tokens |
 | `engine.prefill_budget_tokens` | no | Maximum prefill tokens per scheduler tick. -1 selects an aligned budget near 256 on supported Qwen and GLM-5.3-Flash graph engines, with cancellation and decode between chunks. Positive values override it; 0 explicitly keeps full-prompt admission. Other engines retain full-prompt admission. | -1 (automatic) |
 | `engine.prefill_idle_budget_tokens` | no | Larger prefill budget when no request is actively decoding. Requires an enabled busy budget, must be at least that budget, aligned and within the same prefill limit. Rechecked after each chunk. 0 uses the busy budget for all chunks. | 0 (disabled) |
+
+### NVMe cache
+
+The `nvme_cache` block is a top-level deployment key, beside `engine`. It keeps
+prefix-cache entries that memory evicts — the snapshot and the KV blocks it
+pins — in one preallocated slab file per rank on local NVMe, and restores an
+entry before a later matching request prefills its suffix. Startup checks the
+directory, the free space and the minimum size on every rank and refuses to
+boot when they do not fit; `dgpp-serve --memory-plan` runs the same check.
+See [the cold tier](docs/prefix-cache.md#the-nvme-cold-tier) for what is
+stored, how much a token takes and how retention works.
+
+```json
+"nvme_cache": {
+  "enabled": true,
+  "path": "~/dgpp/nvme-cache",
+  "capacity_gib": 64
+}
+```
+
+| Key | Required | Purpose and when to change it | Default |
+|---|---|---|---|
+| `nvme_cache.enabled` | no | Turns the cold tier on. Requires `engine.prefix_cache_gib` above 0 (the tier holds what the arena evicts) and a positive `capacity_gib`. Rank 0's value is applied on every rank. | false |
+| `nvme_cache.path` | no | Directory for the slab file, created at startup if missing; each rank writes `rank<N>.slab` under it on its own node, so choose a directory on every node's local NVMe. The slab is recreated at every start (entries are not reused across restarts). | `~/dgpp/nvme-cache` |
+| `nvme_cache.capacity_gib` | when enabled | Size of each rank's slab in GiB. Retention evicts the least recently used entries so the slab never grows past it. Must hold at least one entry at the request context limit plus its snapshot (startup names the number) and must fit the filesystem's free space beside a 1 GiB reserve. Every rank runs rank 0's value. | 0 |
+| `nvme_cache.min_tokens` | no | The shortest entry worth keeping cold, in prompt tokens. Shorter entries stay memory-only. 0 selects one prefill chunk. | 0 |
 
 ### Execution and performance
 

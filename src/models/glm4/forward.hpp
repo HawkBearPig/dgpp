@@ -93,6 +93,9 @@ class Glm4Model : public SessionModel<Glm4Model> {
   // Every byte the constructor (and its layer objects) will allocate for
   // a shape, from the same formulas BEFORE anything is allocated.
   using MemoryPlan = dgpp::MemoryPlan;
+  // One cache block's bytes across every pool plane (the NVMe cold tier's
+  // record, issue #26) for a shape that is not built yet.
+  static size_t kv_block_bytes_static(const Glm4TextConfig& cfg, int tp_rank, int tp_world, bool mtp);
   static MemoryPlan plan_memory(const Glm4TextConfig& cfg, int max_tokens, int64_t max_cache_tokens,
                                 int tp_rank = 0, int tp_world = 1,
                                 Glm4Residency residency = Glm4Residency::Streaming,
