@@ -138,6 +138,9 @@ class Dsv41Model : public SessionModel<Dsv41Model> {
   using Base::session_snapshot_bytes;
   static Csa2Config csa2_config(const Dsv41TextConfig& cfg, int tp_world);
   static Csa2PoolShape pool_shape(const Dsv41TextConfig& cfg, int max_requests, int64_t cache_tokens);
+  // One cache block's bytes across every pool plane (the NVMe cold tier's
+  // record, issue #26) for a shape that is not built yet.
+  static size_t kv_block_bytes_static(const Dsv41TextConfig& cfg);
 
   const Dsv41TextConfig& config() const { return cfg_; }
   const Csa2StatePool& csa2_pool() const { return pool_; }

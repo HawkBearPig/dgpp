@@ -135,6 +135,9 @@ class GlmDsaModel : public SessionModel<GlmDsaModel> {
   // The DSA configuration the pool and the layer run (the geometry's
   // formulas for a shape).
   static DsaConfig dsa_config(const GlmDsaTextConfig& cfg, int tp_world, bool mtp, LatentFormat format);
+  // One cache block's bytes across every pool plane (the NVMe cold tier's
+  // record, issue #26) for a shape that is not built yet.
+  static size_t kv_block_bytes_static(const GlmDsaTextConfig& cfg, int tp_world, bool mtp, LatentFormat format);
 
   const GlmDsaTextConfig& config() const { return cfg_; }
   const DsaStatePool& dsa_pool() const { return pool_; }

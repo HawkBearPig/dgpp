@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "common/cuda_check.hpp"
@@ -116,6 +117,20 @@ class PrefixArena {
   const typename Model::SessionSnapshotMeta& meta(int slot) const {
     check(slot);
     return metas_.at(static_cast<size_t>(slot));
+  }
+  // The NVMe cold tier's restore (issue #26): the slot's bytes for the
+  // tier to fill, and the metadata it adopts once the blocks a restore
+  // acquired are the slot's own — the slot reads as filled from then on
+  // (a release drops those blocks exactly as it drops a snapshot's).
+  void* slot_data_mutable(int slot) {
+    check(slot);
+    return ptr(slot);
+  }
+  void adopt(int slot, typename Model::SessionSnapshotMeta meta) {
+    check(slot);
+    release(slot);
+    metas_[static_cast<size_t>(slot)] = std::move(meta);
+    filled_[static_cast<size_t>(slot)] = true;
   }
 
   // A snapshot request for the model's prefill (taken mid-prefill when a

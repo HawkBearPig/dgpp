@@ -1,0 +1,422 @@
+{
+  "model": "HawkBearPig/GLM-5.3-Flash-NVFP4-FP8",
+  "records": 700,
+  "steps": [
+    {
+      "ttft_ms": 18783.681402972434,
+      "total_ms": 19616.596013016533,
+      "usage": {
+        "prompt_tokens": 25150,
+        "completion_tokens": 48,
+        "total_tokens": 25198,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 48
+        }
+      },
+      "step": "1 document A + Q0 (cold)",
+      "cached_tokens": 0,
+      "prompt_tokens": 25150
+    },
+    {
+      "ttft_ms": 2449.7503389720805,
+      "total_ms": 3257.6983589679003,
+      "usage": {
+        "prompt_tokens": 25150,
+        "completion_tokens": 48,
+        "total_tokens": 25198,
+        "prompt_tokens_details": {
+          "cached_tokens": 22528
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 48
+        }
+      },
+      "step": "2 document A + Q1 (memory hit)",
+      "cached_tokens": 22528,
+      "prompt_tokens": 25150
+    },
+    {
+      "ttft_ms": 18761.935015034396,
+      "total_ms": 19595.47698998358,
+      "usage": {
+        "prompt_tokens": 25165,
+        "completion_tokens": 48,
+        "total_tokens": 25213,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 48
+        }
+      },
+      "step": "3.1 document B1 + Q0 (cold, evicting A)",
+      "cached_tokens": 0,
+      "prompt_tokens": 25165
+    },
+    {
+      "ttft_ms": 18792.87733498495,
+      "total_ms": 19626.375186024234,
+      "usage": {
+        "prompt_tokens": 25151,
+        "completion_tokens": 48,
+        "total_tokens": 25199,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 48
+        }
+      },
+      "step": "3.2 document B2 + Q0 (cold, evicting A)",
+      "cached_tokens": 0,
+      "prompt_tokens": 25151
+    },
+    {
+      "ttft_ms": 18889.50313202804,
+      "total_ms": 19722.62709698407,
+      "usage": {
+        "prompt_tokens": 25147,
+        "completion_tokens": 48,
+        "total_tokens": 25195,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 48
+        }
+      },
+      "step": "3.3 document B3 + Q0 (cold, evicting A)",
+      "cached_tokens": 0,
+      "prompt_tokens": 25147
+    },
+    {
+      "ttft_ms": 407.22623898182064,
+      "total_ms": 1214.4262989750132,
+      "usage": {
+        "prompt_tokens": 25150,
+        "completion_tokens": 48,
+        "total_tokens": 25198,
+        "prompt_tokens_details": {
+          "cached_tokens": 25148
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 48
+        }
+      },
+      "step": "4 document A + Q1 (restore from disk)",
+      "cached_tokens": 25148,
+      "prompt_tokens": 25150
+    },
+    {
+      "ttft_ms": 257.00031797168776,
+      "total_ms": 1064.624507969711,
+      "usage": {
+        "prompt_tokens": 25150,
+        "completion_tokens": 48,
+        "total_tokens": 25198,
+        "prompt_tokens_details": {
+          "cached_tokens": 25148
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 48
+        }
+      },
+      "step": "5 document A + Q0 (memory hit after the restore)",
+      "cached_tokens": 25148,
+      "prompt_tokens": 25150
+    }
+  ],
+  "transcripts_identical": true,
+  "before": {
+    "scheduler": {
+      "active": 0,
+      "queued": 0,
+      "terminal": 0,
+      "records": 0,
+      "record_tokens": 0,
+      "pool_blocks_total": 6144,
+      "pool_blocks_in_use": 0,
+      "prefilling": 0,
+      "tokens_generated": 0,
+      "snapshot_age_ms": 2.111028,
+      "prompts_prefilled": 0,
+      "prompt_tokens": 0,
+      "prompt_tokens_computed": 0,
+      "decode_steps": 0,
+      "decode_rows": 0,
+      "decode_batch": {
+        "last_slots": 0,
+        "last_active": 0,
+        "last_rows_per_request": 0,
+        "replays": 0,
+        "rows": 0,
+        "padded_rows": 0,
+        "replays_by_slots": {
+          "1": 0,
+          "2": 0,
+          "3": 0,
+          "4": 0,
+          "5": 0,
+          "6": 0,
+          "7": 0,
+          "8": 0,
+          "9": 0,
+          "10": 0,
+          "11": 0,
+          "12": 0,
+          "13": 0,
+          "14": 0,
+          "15": 0,
+          "16": 0
+        }
+      },
+      "spec_decode": {
+        "depth": 1,
+        "num_drafts_total": 0,
+        "num_draft_tokens_total": 0,
+        "num_accepted_tokens_total": 0,
+        "num_draft_tokens_per_pos_total": [
+          0
+        ],
+        "num_accepted_tokens_per_pos_total": [
+          0
+        ]
+      },
+      "prefill_ms": 0.0,
+      "prefill_request_ms": 0.0,
+      "step_ms": 0.0
+    },
+    "service": {
+      "requests_total": 0,
+      "requests_shed": 0,
+      "pending_admissions": 0,
+      "pending_cancellations": 0,
+      "requests_cancelled": 0,
+      "requests_shed_pool": 0,
+      "requests_failed": 0,
+      "engine_failed": false,
+      "reservations_grown": 0,
+      "admission": {
+        "mode": "full",
+        "window": 256,
+        "prefill_budget_tokens": 256,
+        "prefill_idle_budget_tokens": 2048
+      },
+      "tokens_out": 0,
+      "rejects_bad": 0,
+      "tool_calls_out": 0
+    },
+    "prefix_cache": {
+      "enabled": true,
+      "slots": 4,
+      "entries": 0,
+      "hits": 0,
+      "misses": 0,
+      "tokens_saved": 0,
+      "snapshots": 0,
+      "close_entries": 0,
+      "rolling_snapshots": 0,
+      "hop_snapshots": 0,
+      "evictions": 0,
+      "duplicates": 0,
+      "skipped_no_block": 0,
+      "skipped_no_slot": 0,
+      "skipped_image_bytes": 0,
+      "image_bytes": 0,
+      "blocks_pinned": 0,
+      "snapshot_bytes": 36937728,
+      "arena_snapshots": 0,
+      "snapshot_ms_avg": 0.0,
+      "arena_attaches": 0,
+      "attach_ms_avg": 0.0,
+      "ttft_hit_count": 0,
+      "ttft_hit_ms_avg": 0.0,
+      "ttft_miss_count": 0,
+      "ttft_miss_ms_avg": 0.0,
+      "key": "tok:700b4469fc43f23b tpl:e823b72c4bff24e7 ckpt:17b8d4d83e33e836e9549d7e1a8d25b5117203c1"
+    },
+    "nvme_cache": {
+      "enabled": true,
+      "pages_total": 21129,
+      "pages_used": 0,
+      "page_bytes": 1626112,
+      "bytes_total": 34358120448,
+      "bytes_used": 0,
+      "entries": 0,
+      "blocks": 0,
+      "spills": 0,
+      "spilled": 0,
+      "spill_failed": 0,
+      "spill_skipped": 0,
+      "restores": 0,
+      "restored": 0,
+      "restore_failed": 0,
+      "tokens_restored": 0,
+      "blocks_shared": 0,
+      "evictions": 0,
+      "pending": 0,
+      "worker_pending": 0,
+      "bytes_written": 0,
+      "bytes_read": 0,
+      "failures": 0,
+      "spill_ms_avg": 0.0,
+      "restore_ms_avg": 0.0
+    },
+    "prefill": {
+      "requests": [],
+      "prompt_tokens": 0,
+      "processed_tokens": 0,
+      "cached_tokens": 0,
+      "computed_tokens": 0,
+      "remaining_tokens": 0
+    }
+  },
+  "after": {
+    "scheduler": {
+      "active": 0,
+      "queued": 0,
+      "terminal": 7,
+      "records": 0,
+      "record_tokens": 0,
+      "pool_blocks_total": 6144,
+      "pool_blocks_in_use": 396,
+      "prefilling": 0,
+      "tokens_generated": 336,
+      "snapshot_age_ms": 3.570369,
+      "prompts_prefilled": 7,
+      "prompt_tokens": 176063,
+      "prompt_tokens_computed": 103239,
+      "decode_steps": 168,
+      "decode_rows": 168,
+      "decode_batch": {
+        "last_slots": 1,
+        "last_active": 1,
+        "last_rows_per_request": 2,
+        "replays": 168,
+        "rows": 336,
+        "padded_rows": 0,
+        "replays_by_slots": {
+          "1": 168,
+          "2": 0,
+          "3": 0,
+          "4": 0,
+          "5": 0,
+          "6": 0,
+          "7": 0,
+          "8": 0,
+          "9": 0,
+          "10": 0,
+          "11": 0,
+          "12": 0,
+          "13": 0,
+          "14": 0,
+          "15": 0,
+          "16": 0
+        }
+      },
+      "spec_decode": {
+        "depth": 1,
+        "num_drafts_total": 168,
+        "num_draft_tokens_total": 168,
+        "num_accepted_tokens_total": 164,
+        "num_draft_tokens_per_pos_total": [
+          168
+        ],
+        "num_accepted_tokens_per_pos_total": [
+          164
+        ]
+      },
+      "prefill_ms": 77669.0,
+      "prefill_request_ms": 77675.6,
+      "step_ms": 5741.9
+    },
+    "service": {
+      "requests_total": 7,
+      "requests_shed": 0,
+      "pending_admissions": 0,
+      "pending_cancellations": 0,
+      "requests_cancelled": 0,
+      "requests_shed_pool": 0,
+      "requests_failed": 0,
+      "engine_failed": false,
+      "reservations_grown": 0,
+      "admission": {
+        "mode": "full",
+        "window": 256,
+        "prefill_budget_tokens": 256,
+        "prefill_idle_budget_tokens": 2048
+      },
+      "tokens_out": 336,
+      "rejects_bad": 0,
+      "tool_calls_out": 0
+    },
+    "prefix_cache": {
+      "enabled": true,
+      "slots": 4,
+      "entries": 4,
+      "hits": 3,
+      "misses": 4,
+      "tokens_saved": 72824,
+      "snapshots": 9,
+      "close_entries": 7,
+      "rolling_snapshots": 84,
+      "hop_snapshots": 47,
+      "evictions": 14,
+      "duplicates": 0,
+      "skipped_no_block": 0,
+      "skipped_no_slot": 0,
+      "skipped_image_bytes": 0,
+      "image_bytes": 0,
+      "blocks_pinned": 788,
+      "snapshot_bytes": 36937728,
+      "arena_snapshots": 93,
+      "snapshot_ms_avg": 0.453,
+      "arena_attaches": 3,
+      "attach_ms_avg": 0.511,
+      "ttft_hit_count": 3,
+      "ttft_hit_ms_avg": 1015.061,
+      "ttft_miss_count": 4,
+      "ttft_miss_ms_avg": 18788.457,
+      "key": "tok:700b4469fc43f23b tpl:e823b72c4bff24e7 ckpt:17b8d4d83e33e836e9549d7e1a8d25b5117203c1"
+    },
+    "nvme_cache": {
+      "enabled": true,
+      "pages_total": 21129,
+      "pages_used": 2916,
+      "page_bytes": 1626112,
+      "bytes_total": 34358120448,
+      "bytes_used": 4741742592,
+      "entries": 14,
+      "blocks": 2594,
+      "spills": 14,
+      "spilled": 14,
+      "spill_failed": 0,
+      "spill_skipped": 0,
+      "restores": 2,
+      "restored": 2,
+      "restore_failed": 0,
+      "tokens_restored": 50296,
+      "blocks_shared": 80,
+      "evictions": 0,
+      "pending": 0,
+      "worker_pending": 0,
+      "bytes_written": 4741742592,
+      "bytes_read": 715489280,
+      "failures": 0,
+      "spill_ms_avg": 4114.5,
+      "restore_ms_avg": 128.955
+    },
+    "prefill": {
+      "requests": [],
+      "prompt_tokens": 0,
+      "processed_tokens": 0,
+      "cached_tokens": 0,
+      "computed_tokens": 0,
+      "remaining_tokens": 0
+    }
+  },
+  "ok": true
+}

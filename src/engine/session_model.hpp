@@ -47,6 +47,7 @@
 #include "common/cuda_check.hpp"
 #include "common/prefill_progress.hpp"
 #include "engine/boundary_reducer.hpp"
+#include "engine/cache_planes.hpp"
 #include "engine/decode_outputs.hpp"
 #include "kernels/gemm.hpp"
 #include "kernels/glm_spec.hpp"
@@ -208,6 +209,28 @@ class SessionModel : public PrefillReporting {
   }
   int64_t kv_block_tokens() const { return derived().has_pool() ? block_tokens_ : 0; }
   int session_snapshot_align() const { return snapshot_align_; }
+  // The NVMe cold tier's view of the paged cache (issue #26,
+  // engine/cache_planes.hpp): every plane a block spans, and a block's
+  // identity (id + contents generation). A family without a pool has none.
+  std::vector<CachePlane> cache_planes() const {
+    if (derived().has_pool()) return derived().pool().planes();
+    return {};
+  }
+  uint64_t cache_block_identity(int32_t block) const {
+    if (!derived().has_pool()) throw std::logic_error("cache_block_identity: this family has no pool");
+    return derived().pool().block_identity(block);
+  }
+  // A fresh pool block owned by the caller (refcount 1; -1 when the pool is
+  // empty) and the release of such blocks — the tier's restore target.
+  int32_t cache_acquire_block() {
+    if (!derived().has_pool()) throw std::logic_error("cache_acquire_block: this family has no pool");
+    return derived().pool().acquire_pinned_block();
+  }
+  void cache_release_blocks(const int32_t* blocks, int64_t n) {
+    if (n <= 0) return;
+    if (!derived().has_pool()) throw std::logic_error("cache_release_blocks: this family has no pool");
+    derived().pool().unpin_blocks(blocks, n);
+  }
   int64_t max_context() const { return max_context_; }
   cudaStream_t stream() const { return stream_; }
   bool mtp_enabled() const { return mtp_; }

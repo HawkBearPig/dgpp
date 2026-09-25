@@ -57,6 +57,20 @@ Csa2PoolShape Dsv41Model::pool_shape(const Dsv41TextConfig& cfg, int max_request
   return s;
 }
 
+size_t Dsv41Model::kv_block_bytes_static(const Dsv41TextConfig& cfg) {
+  const auto bytes = [&](int64_t tokens) {
+    const Csa2PoolShape s = pool_shape(cfg, 1, tokens);
+    size_t total = 0;
+    for (const int r : s.cache_ratio) {
+      const size_t slots = static_cast<size_t>(tokens / s.block_tokens) * static_cast<size_t>(s.block_tokens / r);
+      total += slots * latent_row_bytes(Csa2StatePool::kMainFormat, kCsa2Latent) + slots * kCsa2IndexDim +
+               slots * sizeof(float);
+    }
+    return total;
+  };
+  return bytes(2 * kBlockTokens) - bytes(kBlockTokens);
+}
+
 int Dsv41Model::cache_ordinal(int layer) const { return cache_ord_[static_cast<size_t>(layer)]; }
 int Dsv41Model::tail_ordinal(int layer) const { return tail_ord_[static_cast<size_t>(layer)]; }
 

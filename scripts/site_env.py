@@ -154,9 +154,24 @@ def deployment(path):
         raise ValueError("deployment config must be an object")
     if set(cfg) & {"nodes", "ssh_user", "ports"}:
         raise ValueError("move nodes, ssh_user, and ports out of the deployment JSON into .env; use world_size")
-    unknown = set(cfg) - {"model", "world_size", "release", "engine", "paths", "http"}
+    unknown = set(cfg) - {"model", "world_size", "release", "engine", "paths", "http", "nvme_cache"}
     if unknown:
         raise ValueError("unknown deployment keys: " + ", ".join(sorted(unknown)))
+    nvme = cfg.get("nvme_cache", {})
+    if not isinstance(nvme, dict) or set(nvme) - {"enabled", "path", "capacity_gib", "min_tokens"}:
+        raise ValueError("nvme_cache may only contain enabled, path, capacity_gib and min_tokens")
+    if "enabled" in nvme and not isinstance(nvme["enabled"], bool):
+        raise ValueError("nvme_cache.enabled must be true or false")
+    if "path" in nvme and (not isinstance(nvme["path"], str) or not nvme["path"]):
+        raise ValueError("nvme_cache.path must be a non-empty directory path")
+    if "capacity_gib" in nvme and (isinstance(nvme["capacity_gib"], bool)
+                                  or not isinstance(nvme["capacity_gib"], (int, float))
+                                  or nvme["capacity_gib"] < 0):
+        raise ValueError("nvme_cache.capacity_gib must be a non-negative number of GiB")
+    if "min_tokens" in nvme and (type(nvme["min_tokens"]) is not int or nvme["min_tokens"] < 0):
+        raise ValueError("nvme_cache.min_tokens must be a non-negative integer")
+    if nvme.get("enabled") and not nvme.get("capacity_gib"):
+        raise ValueError("nvme_cache.capacity_gib must be positive when nvme_cache.enabled is true")
     if not isinstance(cfg.get("model"), str) or not cfg["model"]:
         raise ValueError("deployment model must be a non-empty string")
     release_name(cfg.get("release", ""))

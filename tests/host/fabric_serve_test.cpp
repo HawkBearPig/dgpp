@@ -69,11 +69,87 @@ int32_t fake_token(size_t prompt_len, int index) {
 bool fake_eos_second(size_t prompt_len) { return prompt_len % 4 == 3; }
 bool fake_eos_prefill(size_t prompt_len) { return prompt_len % 4 == 2; }
 
+// The prefix cache and the NVMe cold tier the rig's fakes carry (issue
+// #26): set before a rig is built (the scheduler reads them at
+// construction); 0 = off. Every rank's fake reads the same values, so the
+// three engines expose one geometry.
+int g_fake_arena_slots = 0;
+int64_t g_fake_disk_pages = 0;
+
 class FakeEngine : public SchedulerEngine {
  public:
   FakeEngine(int slots, int64_t total_blocks, int64_t block_tokens)
       : slots_(slots), total_blocks_(total_blocks),
-        block_tokens_(block_tokens) {}
+        block_tokens_(block_tokens), arena_slots_(g_fake_arena_slots), disk_pages_(g_fake_disk_pages) {}
+
+  // ---- the prefix cache (M7): pins by arena slot, like scheduler_test's fake ----
+  dgpp::sched::SchedulerEngine::PrefixInfo prefix_info() const override {
+    dgpp::sched::SchedulerEngine::PrefixInfo info;
+    info.arena_slots = arena_slots_;
+    info.align = 4;
+    info.block_tokens = block_tokens_;
+    info.chunk_tokens = 8;  // cuts every 8 tokens: a 21-byte prompt snapshots at 16
+    return info;
+  }
+  int32_t prefill_cached(int req, const std::vector<int64_t>& prompt,
+                         dgpp::sched::SchedulerEngine::PrefixPrefill* plan) override {
+    if (plan->attach_slot >= 0 && pinned_.count(plan->attach_slot) == 0)
+      throw std::runtime_error("fake: attach from an empty arena slot");
+    const int32_t token = prefill(req, prompt);
+    if (plan->snap_slot >= 0) {
+      pin(plan->snap_slot, plan->snap_position);
+      plan->snap_taken = true;
+    }
+    if (plan->body_snap_slot >= 0) {
+      pin(plan->body_snap_slot, plan->body_snap_position);
+      plan->body_snap_taken = true;
+    }
+    return token;
+  }
+  void prefix_snapshot(int, int slot, int64_t position) override { pin(slot, position); }
+  void prefix_release(int slot) override { pinned_.erase(slot); }
+
+  // ---- the NVMe cold tier (issue #26): an in-memory slab, ops done a poll later ----
+  dgpp::sched::SchedulerEngine::DiskInfo disk_info() const override {
+    dgpp::sched::SchedulerEngine::DiskInfo i;
+    i.enabled = disk_pages_ > 0;
+    i.pages = disk_pages_;
+    i.page_bytes = 4096;
+    i.blob_pages = 1;
+    return i;
+  }
+  dgpp::sched::SchedulerEngine::DiskBlocks disk_entry_blocks(int slot) const override {
+    const auto it = pinned_.find(slot);
+    if (it == pinned_.end()) throw std::runtime_error("fake: disk blocks of an empty arena slot");
+    dgpp::sched::SchedulerEngine::DiskBlocks b;
+    for (int64_t i = 0; i < it->second.position / block_tokens_; ++i)
+      b.identities.push_back((it->second.gen << 32) | static_cast<uint64_t>(i));
+    b.partial_identity = it->second.position % block_tokens_ != 0 ? ((it->second.gen << 32) | 0xffffu) : 0;
+    return b;
+  }
+  void disk_spill_begin(const dgpp::sched::SchedulerEngine::DiskSpill& sp) override {
+    if (pinned_.count(sp.slot) == 0) throw std::runtime_error("fake: spill of an empty arena slot");
+    disk_pending_.push_back({sp.op, 1, true});
+  }
+  dgpp::sched::SchedulerEngine::DiskBlocks disk_restore_begin(
+      const dgpp::sched::SchedulerEngine::DiskRestore& rs) override {
+    if (pinned_.count(rs.slot) != 0) throw std::runtime_error("fake: restore into an occupied arena slot");
+    pin(rs.slot, rs.position);
+    disk_pending_.push_back({rs.op, 1, true});
+    return disk_entry_blocks(rs.slot);
+  }
+  std::vector<dgpp::sched::SchedulerEngine::DiskCompletion> disk_poll() override {
+    std::vector<dgpp::sched::SchedulerEngine::DiskCompletion> out;
+    for (auto it = disk_pending_.begin(); it != disk_pending_.end();) {
+      if (--it->left > 0) {
+        ++it;
+        continue;
+      }
+      out.push_back({it->op, it->ok});
+      it = disk_pending_.erase(it);
+    }
+    return out;
+  }
 
   // Scenario knob: a per-op sleep that keeps a request in flight long
   // enough for the disconnect test to pull the plug mid-generation
@@ -93,6 +169,7 @@ class FakeEngine : public SchedulerEngine {
   int64_t pool_blocks_in_use() const override {
     int64_t sum = 0;
     for (const auto& [slot, live] : live_) (void)slot, sum += live.held_blocks;
+    for (const auto& [slot, pin] : pinned_) (void)slot, sum += pin.blocks;
     return sum;
   }
   int64_t blocks_for_tokens(int64_t tokens) const override {
@@ -146,9 +223,31 @@ class FakeEngine : public SchedulerEngine {
     int served = 0;
     int32_t last_token = -1;
   };
+  struct Pin {
+    int64_t position = 0;
+    int64_t blocks = 0;
+    uint64_t gen = 0;
+  };
+  struct PendingDisk {
+    uint64_t op;
+    int left;
+    bool ok;
+  };
+  void pin(int slot, int64_t position) {
+    Pin p;
+    p.position = position;
+    p.blocks = position / block_tokens_ + (position % block_tokens_ != 0 ? 1 : 0);
+    p.gen = ++gen_;
+    pinned_[slot] = p;
+  }
   int slots_;
   int64_t total_blocks_;
   int64_t block_tokens_;
+  int arena_slots_ = 0;
+  int64_t disk_pages_ = 0;
+  std::map<int, Pin> pinned_;
+  std::vector<PendingDisk> disk_pending_;
+  uint64_t gen_ = 0;
   std::atomic<int> op_delay_ms_{0};
   std::atomic<bool>* block_ = nullptr;
   std::atomic<bool> blocked_{false};
@@ -872,6 +971,7 @@ struct FabricRig {
   HttpServer http;
   dgpp::serve::OpStreamObserver oplog;  // rank 0's audit leg
   dgpp::serve::JournalWriter journal{0};
+  std::optional<dgpp::serve::DiskCommitCollector> disk_commits;  // the cold tier's verdicts (issue #26)
   std::vector<std::unique_ptr<PeerRig>> peers;
   std::thread http_loop;
   std::thread engine_loop;
@@ -906,6 +1006,26 @@ struct FabricRig {
         service(cfg, &engine, &frontend, {kFakeEos}),
         http(0, &service, 64) {
     service.set_audit_observer(&oplog);
+    // The cold tier's return path (issue #26), as dgpp-serve wires it: the
+    // peers' status lines and this rank's completions meet in the
+    // collector; the commits ready at a pass ride its record.
+    if (engine.disk_info().enabled) {
+      disk_commits.emplace(kWorld);
+      service.set_disk_hooks(
+          [this]() {
+            for (const auto& [peer, line] : journal.poll_peer_lines()) {
+              uint64_t op = 0;
+              bool ok = false;
+              if (!dgpp::serve::decode_disk_status(line, &op, &ok))
+                throw std::runtime_error("rig: unexpected peer line: " + line);
+              disk_commits->add(peer, op, ok);
+            }
+            return disk_commits->take_ready();
+          },
+          [this](const std::vector<dgpp::sched::SchedulerEngine::DiskCompletion>& done) {
+            for (const auto& c : done) disk_commits->add(0, c.op, c.ok);
+          });
+    }
     // Peers connect first (they block in the journal read loop),
     // then rank 0 accepts the full world, then HTTP + the engine.
     // Nothing broadcasts before accept_peers returns.
@@ -1445,6 +1565,144 @@ void test_op_stream_file_mode() {
   std::filesystem::remove(path);
 }
 
+// --- scenario: the NVMe cold tier across the world (issue #26) -----------
+// A one-slot arena over a fake slab on every rank: the first prompt's
+// entry (at cut 16) spills, the second prompt's admission evicts it from
+// memory, the first prompt again restores it from every rank's slab
+// through the journal's return path — the same decisions, the same op
+// stream, on all three ranks.
+void test_nvme_cache_identity(FabricRig& rig) {
+  const auto ask = [&](const std::string& text) {
+    Client c(rig.port());
+    c.send_all(post_request("/v1/chat/completions",
+                            R"({"model":"glm-5.3-flash-fp8","max_tokens":1,"messages":[)"
+                            R"({"role":"user","content":")" + text + R"("}]})"));
+    const std::string raw = c.read_until("\r\n0\r\n\r\n", 5000);
+    if (raw.find("200 OK") == std::string::npos) {
+      std::string why = "nvme: the request was refused: " + raw + "\nrank 0: " + rig.failure;
+      for (size_t i = 0; i < rig.peers.size(); ++i)
+        why += "\npeer " + std::to_string(i + 1) + ": " + rig.peers[i]->error;
+      throw std::runtime_error(why);
+    }
+  };
+  ask("Hello world, tests!!!");  // 21 bytes: cuts at 8 and 16, the entry at 16
+  wait_metrics(rig, "\"spilled\":1");
+  ask("Another prompt, no.2!");  // 21 bytes too: takes the only slot, evicts the first
+  wait_metrics(rig, "\"spilled\":2");
+  ask("Hello world, tests!!!");  // the first again: restored, then attached at 16
+  const std::string metrics = wait_metrics(rig, "\"restored\":1");
+  require(metrics.find("\"restore_failed\":0") != std::string::npos, "nvme: no failed restore: " + metrics);
+  require(metrics.find("\"tokens_saved\":16") != std::string::npos, "nvme: the third request attached at 16: " + metrics);
+  // Every rank's op stream carries the same decisions, in the same order.
+  for (int i = 0; i < 200 && !rig.oplogs_agree(); ++i)
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  const std::string ops = rig.oplog.text();
+  for (const char* needle : {"X spill ", "X spilled ", "X evict ", "X restore ", "X restored ", "X attach "})
+    require(ops.find(needle) != std::string::npos, std::string("nvme: rank 0's op stream lacks '") + needle + "':\n" + ops);
+  require(ops.find("X restore ") < ops.find("X restored ") && ops.find("X restored ") < ops.find("X attach "),
+          "nvme: restore, its commit, then the attach:\n" + ops);
+  rig.require_oplogs_agree("nvme");
+}
+
+DGPP_TEST(journal_disk_commits_ride_the_tick_record) {
+  GenerationService::PassEvents events;
+  events.disk_commits.push_back({7, true});
+  events.disk_commits.push_back({9, false});
+  const std::string line = dgpp::serve::encode_journal_tick(events);
+  require(line.find("\"dk\":[[\"7\",1],[\"9\",0]]") != std::string::npos, "the commits encode as [op, ok]: " + line);
+  const dgpp::serve::JournalRecord back = dgpp::serve::decode_journal_line(line);
+  require(back.disk_commits.size() == 2 && back.disk_commits[0].op == 7 && back.disk_commits[0].ok &&
+              back.disk_commits[1].op == 9 && !back.disk_commits[1].ok,
+          "the commits decode");
+  // A record without commits is byte for byte the earlier format.
+  require(dgpp::serve::encode_journal_tick(GenerationService::PassEvents{}).find("dk") == std::string::npos,
+          "no commits, no field");
+  for (const char* bad : {"{\"op\":\"tick\",\"dk\":[[\"0\",1]]}", "{\"op\":\"tick\",\"dk\":[[7,1]]}",
+                          "{\"op\":\"tick\",\"dk\":[[\"7\",2]]}", "{\"op\":\"tick\",\"dk\":[\"7\"]}"}) {
+    bool threw = false;
+    try {
+      (void)dgpp::serve::decode_journal_line(bad);
+    } catch (const std::runtime_error&) {
+      threw = true;
+    }
+    require(threw, std::string("a malformed commit is refused: ") + bad);
+  }
+  // The status line and its parse.
+  uint64_t op = 0;
+  bool ok = false;
+  require(dgpp::serve::decode_disk_status(dgpp::serve::encode_disk_status(42, true), &op, &ok) && op == 42 && ok,
+          "status ok round trip");
+  require(dgpp::serve::decode_disk_status(dgpp::serve::encode_disk_status(43, false), &op, &ok) && op == 43 && !ok,
+          "status fail round trip");
+  require(!dgpp::serve::decode_disk_status("hello 1", &op, &ok) && !dgpp::serve::decode_disk_status("disk 0 1", &op, &ok) &&
+              !dgpp::serve::decode_disk_status("disk 5 7", &op, &ok),
+          "other lines are not status lines");
+  // The settings record carries the tier when on, nothing when off.
+  dgpp::serve::WorldSettings off;
+  off.world = 2;
+  off.max_concurrency = 4;
+  off.kv_capacity = 8192;
+  off.admission = "full";
+  dgpp::serve::WorldSettings on = off;
+  on.nvme_cache = true;
+  on.nvme_cache_capacity_gib = 64.5;
+  on.nvme_cache_min_tokens = 2048;
+  require(dgpp::serve::decode_journal_line(dgpp::serve::encode_journal_settings(on)).world_settings == on,
+          "the tier's settings round trip");
+  require(dgpp::serve::encode_journal_settings(off).find("nvme") == std::string::npos, "off: absent");
+  require(dgpp::serve::decode_journal_line(dgpp::serve::encode_journal_settings(off)).world_settings == off,
+          "off decodes off");
+}
+
+DGPP_TEST(journal_disk_commit_collector_waits_for_every_rank) {
+  dgpp::serve::DiskCommitCollector c(3);
+  c.add(1, 5, true);
+  c.add(0, 5, true);
+  require(c.take_ready().empty() && c.pending() == 1, "two of three reports: not ready");
+  c.add(2, 5, false);
+  c.add(0, 6, true);
+  auto ready = c.take_ready();
+  require(ready.size() == 1 && ready[0].op == 5 && !ready[0].ok, "ready once every rank reported; any failure fails");
+  c.add(1, 6, true);
+  c.add(2, 6, true);
+  ready = c.take_ready();
+  require(ready.size() == 1 && ready[0].op == 6 && ready[0].ok && c.pending() == 0, "all ok: ok");
+  bool threw = false;
+  try {
+    c.add(1, 7, true);
+    c.add(1, 7, true);
+  } catch (const std::runtime_error&) {
+    threw = true;
+  }
+  require(threw, "a rank reporting twice is a divergence");
+}
+
+DGPP_TEST(journal_return_path_carries_peer_status_lines) {
+  // A writer and one peer over loopback: the peer's status line reaches
+  // the writer's poll without blocking; the death watch is undisturbed.
+  dgpp::serve::JournalWriter writer(0);
+  std::atomic<bool> stop{false};
+  std::unique_ptr<dgpp::serve::JournalReader> reader;
+  std::thread peer([&] { reader = std::make_unique<dgpp::serve::JournalReader>("127.0.0.1", writer.port(), 5000, 1); });
+  writer.accept_peers(2, 5000);
+  peer.join();
+  require(writer.poll_peer_lines().empty(), "nothing yet");
+  require(reader->send_line(dgpp::serve::encode_disk_status(11, true)), "the peer writes");
+  require(reader->send_line(dgpp::serve::encode_disk_status(12, false)), "and again");
+  std::vector<std::pair<int, std::string>> lines;
+  for (int i = 0; i < 500 && lines.size() < 2; ++i) {
+    for (auto& l : writer.poll_peer_lines()) lines.push_back(std::move(l));
+    if (lines.size() < 2) std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  }
+  require(lines.size() == 2 && lines[0].first == 1 && lines[0].second == "disk 11 1" && lines[1].second == "disk 12 0",
+          "both lines, in order, from rank 1");
+  require(writer.dead_peer() == 0, "the peer is alive");
+  (void)stop;
+  reader->close();
+  for (int i = 0; i < 500 && writer.dead_peer() == 0; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  require(writer.dead_peer() == 1, "its close is seen");
+}
+
 int main() {
   dgpp::set_log_level_from_env("DGPP_LOG_LEVEL");
   if (const int result = dgpp::test::run_all(); result != 0) return result;
@@ -1495,6 +1753,21 @@ int main() {
     }
     std::puts("ok 9 - the continuous drift check: a diverging peer dies naming "
               "the tick, rank 0 fails the service, the other peer is released");
+    {
+      g_fake_arena_slots = 1;
+      g_fake_disk_pages = 64;
+      FabricRig rig;
+      test_nvme_cache_identity(rig);
+      rig.stop();
+      for (size_t i = 0; i < rig.peers.size(); ++i)
+        require(rig.peers[i]->error.empty(),
+                "peer " + std::to_string(i + 1) + " errored: " + rig.peers[i]->error);
+      rig.require_oplogs_agree("nvme stop");
+      g_fake_arena_slots = 0;
+      g_fake_disk_pages = 0;
+    }
+    std::puts("ok 10 - the NVMe cold tier: spill, evict, restore and attach through the "
+              "journal's return path, identical on every rank");
     std::puts("fabric_serve_test: ALL PASS");
     return 0;
   } catch (const std::exception& e) {

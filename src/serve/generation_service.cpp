@@ -2229,6 +2229,7 @@ void GenerationService::route_metrics(HttpResponseWriter& w) {
   Stats st;
   const auto prefills = engine_->prefill_monitor()->snapshot();
   dgpp::sched::SchedulerEngine::PrefixEngineStats pe;
+  dgpp::sched::SchedulerEngine::DiskEngineStats de;
   double snapshot_age_ms = 0;
   size_t pending_admissions = 0, pending_cancellations = 0;
   {
@@ -2236,6 +2237,7 @@ void GenerationService::route_metrics(HttpResponseWriter& w) {
     m = meters_;
     st = stats_;
     pe = prefix_stats_;
+    de = disk_stats_;
     snapshot_age_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - meters_published_).count();
     pending_admissions = pending_admissions_.size();
@@ -2432,6 +2434,57 @@ void GenerationService::route_metrics(HttpResponseWriter& w) {
   append_ms("ttft_miss_ms_avg", avg(st.ttft_miss_ms, static_cast<int64_t>(st.ttft_miss_count)));
   out.append(",\"key\":");
   append_json_string(&out, cfg_.prefix_key);
+  // The NVMe cold tier (issue #26): the slab's occupancy, its entries and
+  // block records, the spills and restores begun / committed / failed,
+  // disk evictions, the ops in flight, the bytes moved and their times.
+  out.append("},\"nvme_cache\":{\"enabled\":");
+  out.append(m.disk_enabled ? "true" : "false");
+  out.append(",\"pages_total\":");
+  append_json_int(&out, m.disk_pages_total);
+  out.append(",\"pages_used\":");
+  append_json_int(&out, m.disk_pages_used);
+  out.append(",\"page_bytes\":");
+  append_json_int(&out, m.disk_page_bytes);
+  out.append(",\"bytes_total\":");
+  append_json_int(&out, m.disk_pages_total * m.disk_page_bytes);
+  out.append(",\"bytes_used\":");
+  append_json_int(&out, m.disk_pages_used * m.disk_page_bytes);
+  out.append(",\"entries\":");
+  append_json_int(&out, m.disk_entries);
+  out.append(",\"blocks\":");
+  append_json_int(&out, m.disk_blocks);
+  out.append(",\"spills\":");
+  append_json_int(&out, m.disk_spills);
+  out.append(",\"spilled\":");
+  append_json_int(&out, m.disk_spilled);
+  out.append(",\"spill_failed\":");
+  append_json_int(&out, m.disk_spill_failed);
+  out.append(",\"spill_skipped\":");
+  append_json_int(&out, m.disk_spill_skipped);
+  out.append(",\"restores\":");
+  append_json_int(&out, m.disk_restores);
+  out.append(",\"restored\":");
+  append_json_int(&out, m.disk_restored);
+  out.append(",\"restore_failed\":");
+  append_json_int(&out, m.disk_restore_failed);
+  out.append(",\"tokens_restored\":");
+  append_json_int(&out, m.disk_tokens_restored);
+  out.append(",\"blocks_shared\":");
+  append_json_int(&out, m.disk_blocks_shared);
+  out.append(",\"evictions\":");
+  append_json_int(&out, m.disk_evictions);
+  out.append(",\"pending\":");
+  append_json_int(&out, m.disk_pending);
+  out.append(",\"worker_pending\":");
+  append_json_int(&out, de.pending);
+  out.append(",\"bytes_written\":");
+  append_json_int(&out, de.bytes_written);
+  out.append(",\"bytes_read\":");
+  append_json_int(&out, de.bytes_read);
+  out.append(",\"failures\":");
+  append_json_int(&out, de.failures);
+  append_ms("spill_ms_avg", avg(de.spill_ms, de.spills));
+  append_ms("restore_ms_avg", avg(de.restore_ms, de.restores));
   out.append("},\"prefill\":{\"requests\":[");
   int64_t total = 0, processed = 0, cached = 0;
   const auto now = std::chrono::steady_clock::now();
@@ -3416,7 +3469,9 @@ bool GenerationService::engine_pass(const PreTickHook& pre_tick) {
   // The fixed journal position: this record and the tick below are one
   // atomic unit — rank 0 never ticks without broadcasting, a peer
   // never ticks without a record (see fabric_serve.hpp). The prefix
-  // cache's digest after the previous tick rides along (M7).
+  // cache's digest after the previous tick rides along (M7) — taken
+  // BEFORE this record's cold tier commits fold into it, since a peer
+  // compares its own before applying the record.
   if (sched_.prefix_slots() > 0) {
     events.has_prefix_digest = true;
     events.prefix_digest = sched_.prefix_digest();
@@ -3427,16 +3482,33 @@ bool GenerationService::engine_pass(const PreTickHook& pre_tick) {
     events.has_op_digest = true;
     events.op_digest = audit_->digest();
   }
+  // The NVMe cold tier's commits (issue #26): the world's verdicts on the
+  // ops every rank reported, applied before the tick — the record carries
+  // them so the peers apply the same list at the same quantum. A world of
+  // one commits its own completions.
+  if (sched_.disk_enabled()) {
+    if (disk_source_) {
+      events.disk_commits = disk_source_();
+    } else {
+      for (const auto& c : sched_.poll_disk_completions())
+        events.disk_commits.push_back({c.op, c.ok});
+    }
+    sched_.apply_disk_commits(events.disk_commits);
+  }
   if (pre_tick) pre_tick(events);
 
   const bool more = sched_.tick();  // may throw on scheduler contract
                                        // violations — the app treats
                                        // that as fatal (operator class)
+  // This rank's cold tier completions since the last pass, to the
+  // collector (rank 0 of a fabric); a world of one polls at the next pass.
+  if (sched_.disk_enabled() && disk_sink_) disk_sink_(sched_.poll_disk_completions());
 
   {
     std::lock_guard<std::mutex> lock(mutex_);
     meters_ = sched_.meters();
     prefix_stats_ = engine_->prefix_engine_stats();
+    disk_stats_ = engine_->disk_engine_stats();
     meters_published_ = std::chrono::steady_clock::now();
     return more || !pending_admissions_.empty();
   }

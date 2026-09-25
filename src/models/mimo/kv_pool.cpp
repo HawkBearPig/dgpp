@@ -102,6 +102,25 @@ void MimoKvPool::reset_all(cudaStream_t stream) {
   table_.reset_all(stream);
 }
 
+std::vector<CachePlane> MimoKvPool::planes() const {
+  std::vector<CachePlane> out;
+  if (!initialized_) return out;
+  const size_t eb = elem_bytes();
+  for (int l = 0; l < shape_.layers(); ++l) {
+    const MimoKvCache c = view(l);
+    const size_t kblk = static_cast<size_t>(shape_.block_tokens) * static_cast<size_t>(c.kv_heads) * shape_.k_dim * eb;
+    const size_t vblk = static_cast<size_t>(shape_.block_tokens) * static_cast<size_t>(c.kv_heads) * shape_.v_dim * eb;
+    out.push_back({reinterpret_cast<uint8_t*>(c.k_cache), kblk});
+    out.push_back({reinterpret_cast<uint8_t*>(c.v_cache), vblk});
+    if (shape_.fp8()) {
+      const size_t sblk = static_cast<size_t>(shape_.block_tokens) * static_cast<size_t>(c.kv_heads) * sizeof(float);
+      out.push_back({reinterpret_cast<uint8_t*>(c.k_scale), sblk});
+      out.push_back({reinterpret_cast<uint8_t*>(c.v_scale), sblk});
+    }
+  }
+  return out;
+}
+
 void MimoKvPool::copy_block_contents(int32_t src, int32_t dst, cudaStream_t stream) {
   table_.check_block(src);
   table_.check_block(dst);

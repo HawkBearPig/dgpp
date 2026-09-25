@@ -349,6 +349,17 @@ int GlmDsaModel::table_slots() const {
   return loader_.residency() == GlmDsaResidency::Resident ? cfg_.num_moe_layers() + (mtp_ ? 1 : 0) : 0;
 }
 
+size_t GlmDsaModel::kv_block_bytes_static(const GlmDsaTextConfig& cfg, int tp_world, bool mtp,
+                                          LatentFormat format) {
+  const DsaConfig dsa = dsa_config(cfg, tp_world, mtp, format);
+  const DsaGeometry g = DsaGeometry::from_config(dsa);
+  const size_t layers = static_cast<size_t>(dsa.num_dsa_layers);
+  const size_t ilayers = static_cast<size_t>(g.index_layers);
+  const size_t pools = static_cast<size_t>(g.pools_per_block);
+  return layers * static_cast<size_t>(dsa.block_tokens) * (g.latent_bytes_per_token + g.latent_scale_bytes_per_token) +
+         ilayers * pools * (g.index_k_bytes_per_pool + sizeof(float));
+}
+
 GlmDsaModel::MemoryPlan GlmDsaModel::plan_memory(const GlmDsaTextConfig& cfg, int max_tokens,
                                                  int64_t max_cache_tokens, int tp_rank, int tp_world,
                                                  GlmDsaResidency residency, int max_requests, bool mtp,

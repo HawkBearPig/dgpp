@@ -453,6 +453,22 @@ void GlmDiagnosticModel::finish_companions() {
   bf12_.log_summary(loader_.rank(), bf12_ms_ / 1000.0);
 }
 
+size_t GlmDiagnosticModel::kv_block_bytes_static(const GlmTextConfig& cfg, int tp_world, bool mtp,
+                                                 LatentFormat kv_format) {
+  DsaConfig dsa_cfg = with_tp(cfg.dsa_config(), tp_world);
+  if (dsa_cfg.num_dsa_layers == 0) return 0;
+  if (mtp) dsa_cfg.num_dsa_layers += 1;
+  dsa_cfg.latent_format = kv_format;
+  DsaConfig::validate_config(dsa_cfg);
+  const DsaGeometry g = DsaGeometry::from_config(dsa_cfg);
+  const size_t layers = static_cast<size_t>(dsa_cfg.num_dsa_layers);
+  const size_t ilayers = static_cast<size_t>(g.index_layers);
+  const size_t pools = static_cast<size_t>(g.pools_per_block);
+  return layers * static_cast<size_t>(dsa_cfg.block_tokens) *
+             (g.latent_bytes_per_token + g.latent_scale_bytes_per_token) +
+         ilayers * pools * (g.index_k_bytes_per_pool + sizeof(float));
+}
+
 GlmDiagnosticModel::MemoryPlan GlmDiagnosticModel::plan_memory(
     const GlmTextConfig& cfg, int max_tokens, int64_t max_cache_tokens,
     int tp_rank, int tp_world, GlmResidency residency, GlmHeadSharding head,

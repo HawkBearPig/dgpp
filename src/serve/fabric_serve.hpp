@@ -4,8 +4,15 @@
 //
 //   {"op":"settings", ...}       model, world and engine settings, sent first
 //   {"op":"warm","adm":{...},"pc":N,"cfg":"<digest>"}
-//   {"op":"tick","s":[{"id":"…","p":[ids],"m":N,"b":[...],"nc":1}],"c":["id"],"pd":D,"od":F}
+//   {"op":"tick","s":[{"id":"…","p":[ids],"m":N,"b":[...],"nc":1}],"c":["id"],"dk":[[op,1]],"pd":D,"od":F}
 //   {"op":"stop"}
+//
+// The NVMe cold tier (issue #26) adds the journal's one return path: a
+// peer writes "disk <op> <0|1>\n" when its tier finishes an op; rank 0
+// reads those lines between passes, and once every rank (itself
+// included) has reported an op it journals the world's verdict in the
+// next tick's "dk" — ok only when every rank succeeded — which every
+// scheduler applies before that tick.
 //
 // The settings record precedes model construction. Warm supplies admission
 // settings and prefix slot count, checks the configuration digest and
@@ -33,9 +40,12 @@
 #include <atomic>
 #include <cstdio>
 #include <functional>
+#include <map>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "kernels/rope_scaling.hpp"
@@ -155,6 +165,12 @@ struct WorldSettings {
   int rendezvous_timeout_ms = 0;
   double stats_interval_s = 0.0;
   bool reasoning_in_content = false;
+  // The NVMe cold tier (issue #26): on/off and the capacity every rank's
+  // slab is sized to (the page count is a decision input, so the world
+  // runs one capacity); the path stays each rank's own.
+  bool nvme_cache = false;
+  double nvme_cache_capacity_gib = 0.0;
+  int64_t nvme_cache_min_tokens = 0;
   bool operator==(const WorldSettings&) const = default;
 };
 std::string encode_journal_settings(const WorldSettings& s);
@@ -176,6 +192,32 @@ struct JournalRecord {
   std::vector<std::string> cancels;
   std::vector<std::string> stops;  // the stop-string retires,
                                    // applied like cancels ("sp")
+  std::vector<dgpp::sched::Scheduler::DiskCommit> disk_commits;  // "dk"
+};
+// The peer's status line for a finished cold tier op (the return path),
+// and its parse; false when the line is not one.
+std::string encode_disk_status(uint64_t op, bool ok);
+bool decode_disk_status(std::string_view line, uint64_t* op, bool* ok);
+
+// Rank 0's collector of the world's verdicts (issue #26): every rank's
+// completion of an op lands here; once all `world` ranks have reported it,
+// take_ready() hands the commit out — ok when every rank succeeded — in
+// op order.
+class DiskCommitCollector {
+ public:
+  explicit DiskCommitCollector(int world) : world_(world) {}
+  void add(int rank, uint64_t op, bool ok);
+  std::vector<dgpp::sched::Scheduler::DiskCommit> take_ready();
+  size_t pending() const { return pending_.size(); }
+
+ private:
+  struct Pending {
+    int reports = 0;
+    bool ok = true;
+    std::vector<int> ranks;
+  };
+  int world_ = 1;
+  std::map<uint64_t, Pending> pending_;
 };
 // The tick record's cross-rank check (M7): rank 0's prefix-cache digest
 // after the previous tick against this rank's. Throws on a mismatch — the
@@ -230,12 +272,17 @@ class JournalWriter {
   // Closes every peer connection now — what rank 0's process exit does;
   // the tests' stand-in for it (the peers see EOF).
   void close_peers();
+  // The return path (issue #26): every complete line the peers have
+  // written since the last poll, as (rank, line), without blocking. The
+  // engine thread's alone (broadcast's too); the death watch only peeks.
+  std::vector<std::pair<int, std::string>> poll_peer_lines();
   ~JournalWriter();
 
  private:
   dgpp::net::TcpListener listener_;
   std::vector<dgpp::net::TcpConn> peers_;  // arrival order; peer_ranks_ names them
   std::vector<int> peer_ranks_;
+  std::vector<std::string> peer_pending_;  // per peer: the unfinished line
   std::thread watch_;
   std::atomic<bool> watch_stop_{false};
 };
@@ -269,6 +316,9 @@ class JournalReader {
   // sees the FIN.
   void close() { conn_.close(); }
   void shutdown() { conn_.shutdown_rw(); }
+  // The return path (issue #26): one status line to rank 0. False when
+  // the connection is gone (the loop sees the EOF next).
+  bool send_line(const std::string& line);
 
  private:
   dgpp::net::TcpConn conn_;

@@ -203,6 +203,28 @@ QwenModel::QwenModel(const QwenTextConfig& cfg, const std::string& checkpoint_di
   if (cfg_.vision) vision_ = std::make_unique<QwenVisionEncoder>(*cfg_.vision, checkpoint_dir, stream_);
 }
 
+size_t QwenModel::kv_block_bytes_static(const QwenTextConfig& cfg, int tp_rank, int tp_world, bool mtp) {
+  const QwenHeadSharding head = tp_world > 1 ? QwenHeadSharding::VocabSharded : QwenHeadSharding::Full;
+  const QwenLocalGeometry geo = QwenLocalGeometry::from_config(cfg, tp_rank, tp_world, head);
+  int num_qsa = 0;
+  for (QwenLayerKind k : cfg.layers) num_qsa += k == QwenLayerKind::Gdn ? 0 : 1;
+  const int pool_layers = num_qsa + (mtp ? 1 : 0);
+  if (pool_layers <= 0) return 0;
+  const auto bytes = [&](int64_t tokens) {
+    QwenKvPoolShape shape;
+    shape.layers = pool_layers;
+    shape.kv_heads = geo.local_kv_heads;
+    shape.dim = cfg.head_dim;
+    shape.idx_dim = cfg.indexer_head_dim;
+    shape.kpool = cfg.indexer_compress_ratio;
+    shape.block_tokens = kBlockTokens;
+    shape.max_requests = 1;
+    shape.token_slots = tokens;
+    return QwenKvPool::cache_bytes(shape) - PagedBlockTable::table_bytes(1, tokens / kBlockTokens);
+  };
+  return bytes(2 * kBlockTokens) - bytes(kBlockTokens);
+}
+
 QwenModel::MemoryPlan QwenModel::plan_memory(const QwenTextConfig& cfg, int max_tokens,
                                              int64_t max_cache_tokens, int tp_rank, int tp_world,
                                              QwenResidency residency, int max_requests, bool mtp,

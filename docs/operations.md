@@ -374,8 +374,12 @@ exits before its first tick rather than form a mixed world.
 For prefix caching, size the snapshot arena and KV pool separately. Startup
 and `--memory-plan` report snapshot slots, bytes per slot and actual arena
 allocation. The [prefix-cache guide](prefix-cache.md) lists the current recipe
-capacities and explains when a larger `prefix_cache_gib` helps. The cache is
-memory-resident; it does not spill evicted prefixes to NVMe.
+capacities and explains when a larger `prefix_cache_gib` helps. With
+`nvme_cache.enabled`, entries the arena evicts are kept in a preallocated
+slab on each node's NVMe and restored for later matching requests; startup
+checks the slab's directory, free space and minimum size on every rank
+(`--memory-plan` too) and refuses to boot when they do not fit — see
+[the cold tier](prefix-cache.md#the-nvme-cold-tier).
 
 Reserve enough node memory for weights, model state and runtime buffers.
 The GLM-5.3-FP8 main stack alone uses about 82 GiB per rank at TP=4;
@@ -803,7 +807,10 @@ the prompts. Its artifacts land under `build-ci/fabric-runs/failure_drill_*`.
 - **Per request:** `GET /metrics` (also available at `GET /v1/metrics`
   for backward compatibility) — JSON counters for requests, sheds, cancellations,
   failures, the admission policy, the prefix cache (entries, hits, tokens
-  saved, hop snapshots, the TTFT split by hit and miss), sampling
+  saved, hop snapshots, the TTFT split by hit and miss), the NVMe cache
+  (`nvme_cache`: pages used and total, entries and block records, spills
+  and restores begun / committed / failed, tokens restored, disk evictions,
+  ops in flight, bytes moved and average op times), sampling
   fallbacks. `scheduler.spec_decode` reports cumulative MTP draft rounds,
   attempted and accepted draft tokens, and per-position counters; see the
   [counter definitions](openai-compatibility.md#speculative-decoding-counters)

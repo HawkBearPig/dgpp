@@ -4,6 +4,7 @@
 
 #include <cstdlib>
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -319,6 +320,17 @@ std::string encode_journal_tick(const GenerationService::PassEvents& events) {
     }
     out.push_back(']');
   }
+  // The NVMe cold tier's commits (issue #26): [op, ok] pairs, op as a
+  // decimal string (a uint64), applied before the tick on every rank.
+  if (!events.disk_commits.empty()) {
+    out += ",\"dk\":[";
+    for (size_t i = 0; i < events.disk_commits.size(); ++i) {
+      if (i != 0) out.push_back(',');
+      out += "[\"" + std::to_string(events.disk_commits[i].op) + "\"," +
+             (events.disk_commits[i].ok ? "1" : "0") + "]";
+    }
+    out.push_back(']');
+  }
   // The prefix cache's cross-rank check (M7): rank 0's decision digest
   // after the previous tick, as a decimal string (a uint64 is not a JSON
   // number the reader can trust to survive). A cache-less rank 0 writes
@@ -337,6 +349,47 @@ std::string encode_journal_tick(const GenerationService::PassEvents& events) {
 }
 
 std::string encode_journal_stop() { return "{\"op\":\"stop\"}"; }
+
+std::string encode_disk_status(uint64_t op, bool ok) {
+  return "disk " + std::to_string(op) + " " + (ok ? "1" : "0");
+}
+
+bool decode_disk_status(std::string_view line, uint64_t* op, bool* ok) {
+  unsigned long long o = 0;
+  int verdict = -1;
+  char tail = 0;
+  const std::string text(line);
+  if (std::sscanf(text.c_str(), "disk %llu %d%c", &o, &verdict, &tail) != 2) return false;
+  if (o == 0 || (verdict != 0 && verdict != 1)) return false;
+  *op = static_cast<uint64_t>(o);
+  *ok = verdict == 1;
+  return true;
+}
+
+void DiskCommitCollector::add(int rank, uint64_t op, bool ok) {
+  if (op == 0) throw std::invalid_argument("DiskCommitCollector: op 0");
+  if (rank < 0 || rank >= world_) throw std::out_of_range("DiskCommitCollector: rank outside the world");
+  Pending& p = pending_[op];
+  if (std::find(p.ranks.begin(), p.ranks.end(), rank) != p.ranks.end())
+    throw std::runtime_error("DiskCommitCollector: rank " + std::to_string(rank) + " reported op " +
+                             std::to_string(op) + " twice — the return path diverged");
+  p.ranks.push_back(rank);
+  ++p.reports;
+  p.ok = p.ok && ok;
+}
+
+std::vector<dgpp::sched::Scheduler::DiskCommit> DiskCommitCollector::take_ready() {
+  std::vector<dgpp::sched::Scheduler::DiskCommit> out;
+  for (auto it = pending_.begin(); it != pending_.end();) {
+    if (it->second.reports < world_) {
+      ++it;
+      continue;
+    }
+    out.push_back({it->first, it->second.ok});
+    it = pending_.erase(it);
+  }
+  return out;
+}
 std::string encode_journal_warm(const dgpp::sched::AdmissionPolicy& policy,
                                 int prefix_slots,
                                 const std::string& config_digest) {
@@ -377,6 +430,11 @@ std::string encode_journal_settings(const WorldSettings& s) {
       s.admission_window, s.bulk_pace_gbps, s.bulk_inflight, s.rendezvous_timeout_ms,
       s.stats_interval_s, s.reasoning_in_content ? 1 : 0);
   append_json_string(&out, s.kv_dtype);
+  // The NVMe cold tier (issue #26): written only when on, so a record
+  // without it is byte for byte the earlier format.
+  if (s.nvme_cache)
+    out += std::format(",\"nvme\":1,\"nvmegib\":{:.17g},\"nvmemin\":{}", s.nvme_cache_capacity_gib,
+                       s.nvme_cache_min_tokens);
   out += ",\"ngt\":";
   append_json_string(&out, s.ngram_table);
   out += ",\"dw\":";
@@ -545,6 +603,16 @@ JournalRecord decode_journal_line(std::string_view line) {
     s.stats_interval_s = num("stats").as_double();
     s.reasoning_in_content = flag("ric");
     s.kv_dtype = std::string(field(v, "kvdt", "settings").as_string());
+    // The NVMe cold tier (issue #26): absent = off.
+    if (v.find("nvme")) {
+      s.nvme_cache = flag("nvme");
+      s.nvme_cache_capacity_gib = num("nvmegib").as_double();
+      if (!(s.nvme_cache_capacity_gib >= 0.0) || (s.nvme_cache && !(s.nvme_cache_capacity_gib > 0.0)))
+        throw std::runtime_error("journal: settings record with a bad NVMe cache capacity");
+      s.nvme_cache_min_tokens = num("nvmemin").as_int();
+      if (s.nvme_cache_min_tokens < 0)
+        throw std::runtime_error("journal: settings record with a bad NVMe cache minimum");
+    }
     // Records before 2026-09-10 carry no table residency: resident.
     if (const dgpp::minijson::Value* ngt = v.find("ngt")) s.ngram_table = std::string(ngt->as_string());
     if (const auto* head = v.find("fp8_head")) {
@@ -905,6 +973,23 @@ JournalRecord decode_journal_line(std::string_view line) {
       rec.stops.emplace_back(id.as_string());
     }
   }
+  if (const dgpp::minijson::Value* dk = v.find("dk")) {
+    if (!dk->is_array())
+      throw std::runtime_error("journal: 'dk' is not an array");
+    for (const dgpp::minijson::Value& item : dk->items()) {
+      if (!item.is_array() || item.items().size() != 2 || !item.items()[0].is_string() ||
+          !item.items()[1].is_number())
+        throw std::runtime_error("journal: a 'dk' commit is not [op, ok]");
+      const std::string text(item.items()[0].as_string());
+      char* end = nullptr;
+      const unsigned long long op = std::strtoull(text.c_str(), &end, 10);
+      if (text.empty() || end == nullptr || *end != '\0' || op == 0)
+        throw std::runtime_error("journal: a 'dk' commit's op is not a decimal id");
+      const int64_t ok = item.items()[1].as_int();
+      if (ok != 0 && ok != 1) throw std::runtime_error("journal: a 'dk' commit's verdict is not 0 or 1");
+      rec.disk_commits.push_back({static_cast<uint64_t>(op), ok == 1});
+    }
+  }
   if (const dgpp::minijson::Value* pd = v.find("pd")) {
     if (!pd->is_string() || pd->as_string().empty())
       throw std::runtime_error("journal: 'pd' is not a digest string");
@@ -1031,6 +1116,26 @@ void JournalWriter::close_peers() {
   for (auto& p : peers_) p.close();
 }
 
+std::vector<std::pair<int, std::string>> JournalWriter::poll_peer_lines() {
+  std::vector<std::pair<int, std::string>> out;
+  if (peer_pending_.size() != peers_.size()) peer_pending_.resize(peers_.size());
+  for (size_t i = 0; i < peers_.size(); ++i) {
+    std::string& pending = peer_pending_[i];
+    for (int rounds = 0; rounds < 64 && peers_[i].wait_readable(0); ++rounds) {
+      char buf[4096];
+      const int n = peers_[i].read_some(buf, sizeof buf);
+      if (n <= 0) break;  // closed or reset: the death watch's finding
+      pending.append(buf, static_cast<size_t>(n));
+    }
+    size_t nl;
+    while ((nl = pending.find('\n')) != std::string::npos) {
+      out.emplace_back(peer_ranks_[i], pending.substr(0, nl));
+      pending.erase(0, nl + 1);
+    }
+  }
+  return out;
+}
+
 JournalWriter::~JournalWriter() { stop_watch(); }
 
 // ---- peers ------------------------------------------------------------------
@@ -1070,6 +1175,11 @@ bool JournalReader::read_line(const std::function<bool()>& should_stop,
       return false;  // readable but recv fails (reset): world's over
     pending_.append(buf, static_cast<size_t>(n));
   }
+}
+
+bool JournalReader::send_line(const std::string& line) {
+  const std::string framed = line + "\n";
+  return conn_.write_all(framed.data(), framed.size());
 }
 
 bool wait_journal_settings(JournalReader* reader,
@@ -1198,11 +1308,21 @@ void run_journal_peer(Scheduler* sched, JournalReader* reader,
     }
     for (const std::string& id : rec.cancels) sched->cancel(id);
     for (const std::string& id : rec.stops) sched->stop(id);
+    // The cold tier's commits (issue #26): the world's verdicts, before
+    // the tick, as rank 0 applied them.
+    if (!rec.disk_commits.empty()) sched->apply_disk_commits(rec.disk_commits);
     {
       TickScope scope(in_tick);
       sched->tick();
     }
     ++ticks;
+    // This rank's finished cold tier ops go back to rank 0 (the return
+    // path); a write that fails means rank 0 is gone, which the next read
+    // reports.
+    if (sched->disk_enabled())
+      for (const auto& c : sched->poll_disk_completions())
+        if (!reader->send_line(encode_disk_status(c.op, c.ok)))
+          DGPP_LOG_WARN("journal: could not report cold tier op {} to rank 0", c.op);
     if (stats) stats->observe(sched->meters(), nullptr);
   }
 }
