@@ -11,7 +11,8 @@ separately in [enhancement #26](https://github.com/HawkBearPig/dgpp/issues/26).
 
 For prompts at least four prefill chunks long, the cache keeps one earlier
 regular chunk snapshot as well as the final reusable cut. With 2048-token
-chunks, the earlier cut leaves 2048–4095 tokens to prefill. A new question
+chunks, the earlier cut leaves 2048–4095 tokens to prefill (4096–8191 on
+Qwen, whose chunks are 4096 tokens). A new question
 after an unchanged document can attach there; an identical repeat can still
 use the deeper cut. This requires an exact token-prefix match, a valid cut
 in the new prompt, and, with MTP, the same token immediately after the cut.

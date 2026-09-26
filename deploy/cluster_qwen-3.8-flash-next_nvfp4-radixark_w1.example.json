@@ -7,20 +7,22 @@
     "kv_dtype": "bf16",
     "bf16_weights": "bf12+bf16",
     "ngram_table": "mmap",
-    "default_max_tokens": 65500,
+    "default_max_tokens": 32768,
     "queue_limit": 8,
     "max_connections": 64,
     "decode_graph": true,
     "mtp": true,
-    "mtp_depth": 4,
+    "mtp_depth": 2,
     "prefix_cache_gib": 1.5,
-    "admission": "full",
+    "admission": "grow",
     "admission_window": 256,
     "model_alias": "Qwen3.8-Flash-Next",
     "sampling_candidates": 128,
     "stats_interval_s": 1,
     "dense_weights": "fp8",
-    "mtp_expert_format": "bf16_fused"
+    "mtp_expert_format": "bf16_fused",
+    "prefill_idle_budget_tokens": 4096,
+    "prefill_budget_tokens": 4096
   },
   "paths": {
     "resident_cache": ""

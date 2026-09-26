@@ -457,7 +457,7 @@ requests. The default, -1, selects 256 tokens rounded down to the engine
 alignment and capped by its prefill limit (at least one aligned unit).
 An explicit zero preserves full-prompt admission within a scheduler pass;
 model and snapshot boundaries still split the work. Qwen retains its internal
-2,048-token limit and reports token progress after each completed chunk.
+4,096-token limit and reports token progress after each completed chunk.
 The resolved budget is logged at startup and carried in rank 0's warm record.
 The four-rank GLM-5.3-Flash deployment explicitly selects 256-token busy and
 2,048-token idle budgets.
