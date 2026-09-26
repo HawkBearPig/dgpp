@@ -451,6 +451,7 @@ class GenerationService : public HttpHandler,
   void route_models(const HttpRequest& req, HttpResponseWriter& w);
   void route_health(HttpResponseWriter& w) const;
   void route_metrics(HttpResponseWriter& w);
+  void route_metrics_prometheus(HttpResponseWriter& w);
   bool validate_chat_parameters(const minijson::Value& body, HttpResponseWriter& w);
   bool parse_max_tokens(const minijson::Value& body, HttpResponseWriter& w, int* steps, bool chat);
   // OpenAI's ignore_eos: generate to the token limit whatever is drawn.

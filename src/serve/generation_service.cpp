@@ -1704,6 +1704,14 @@ void GenerationService::handle(const HttpRequest& req,
     route_health(w);
     return;
   }
+  if (p == "/metrics/prometheus") {
+    if (req.method != "GET") {
+      respond_error(w, 405, "use GET for metrics", "invalid_request_error");
+      return;
+    }
+    route_metrics_prometheus(w);
+    return;
+  }
   if (p == "/metrics" || p == "/v1/metrics") {
     if (req.method != "GET") {
       respond_error(w, 405, "use GET for metrics", "invalid_request_error");
@@ -2308,8 +2316,39 @@ Scheduler::Meters GenerationService::meters() const {
   return meters_;
 }
 
-void GenerationService::route_metrics(HttpResponseWriter& w) {
+// GET /metrics/prometheus (Prometheus text exposition for spec-decode
+// counters; tool-eval-bench scrapes these for acceptance rate / length)
+void GenerationService::route_metrics_prometheus(HttpResponseWriter& w) {
   Scheduler::Meters m;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    m = meters_;
+  }
+  uint64_t drafted = 0, accepted = 0;
+  for (int p = 0; p < m.mtp.depth && p < 8; ++p) {
+    drafted += m.mtp.attempts[p];
+    accepted += m.mtp.accepts[p];
+  }
+  std::string out =
+      "# HELP spec_decode_num_draft_tokens_total Cumulative MTP draft tokens verified.\n"
+      "# TYPE spec_decode_num_draft_tokens_total counter\n"
+      "spec_decode_num_draft_tokens_total ";
+  out.append(std::to_string(drafted));
+  out.append(
+      "\n# HELP spec_decode_num_accepted_tokens_total Cumulative accepted draft tokens.\n"
+      "# TYPE spec_decode_num_accepted_tokens_total counter\n"
+      "spec_decode_num_accepted_tokens_total ");
+  out.append(std::to_string(accepted));
+  out.append(
+      "\n# HELP spec_decode_num_drafts_total Cumulative verification rounds.\n"
+      "# TYPE spec_decode_num_drafts_total counter\n"
+      "spec_decode_num_drafts_total ");
+  out.append(std::to_string(m.mtp.attempts[0]));
+  out.push_back('\n');
+  w.respond(200, "text/plain; version=0.0.4", std::move(out));
+}
+
+void GenerationService::route_metrics(HttpResponseWriter& w) {  Scheduler::Meters m;
   Stats st;
   const auto prefills = engine_->prefill_monitor()->snapshot();
   dgpp::sched::SchedulerEngine::PrefixEngineStats pe;
