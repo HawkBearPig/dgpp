@@ -201,7 +201,20 @@ class SessionModel : public PrefillReporting {
   bool session_prefill_advance(PrefillCursor& cursor, int64_t chunk_tokens = 0);
   Outputs session_step(int req, int64_t token_id) { return session_verify(req, std::vector<int64_t>{token_id}); }
   Outputs session_verify(int req, const std::vector<int64_t>& token_ids);
+  // Batched verify: slot-major rows (each slot's fed rows contiguous),
+  // one live pass. Returns per-slot outputs in slot order; offsets[i] is
+  // slot i's first row (for rollback bases). Total rows must fit
+  // max_decode_rows_.
+  std::vector<Outputs> session_verify_batch(const std::vector<int>& reqs,
+                                            const std::vector<std::vector<int64_t>>& feds,
+                                            std::vector<int>* offsets = nullptr);
   void session_rollback(int req, int accepted);
+  // Rollback after a verify of exactly `rows` rows (the block drafter's
+  // verifies are 1..kSpecRows wide and vary with the proposal).
+  void session_rollback(int req, int accepted, int rows);
+  // ...with the slot's snapshot rows starting at `snapshot_base`
+  // (a batched verify's slot-major offset; 0 for scalar verifies).
+  void session_rollback(int req, int accepted, int rows, int snapshot_base);
   void head_dump_flush() {}  // a family may shadow this (QwenModel's head dump)
   void session_close(int req);
   int64_t session_position(int req) const {
@@ -1186,14 +1199,105 @@ typename SessionModel<D>::Outputs SessionModel<D>::session_verify(int req, const
 }
 
 template <class D>
+std::vector<typename SessionModel<D>::Outputs> SessionModel<D>::session_verify_batch(
+    const std::vector<int>& reqs, const std::vector<std::vector<int64_t>>& feds,
+    std::vector<int>* offsets) {
+  if (reqs.empty()) throw std::invalid_argument("session_verify_batch: no requests");
+  if (reqs.size() != feds.size())
+    throw std::invalid_argument("session_verify_batch: reqs/feds shape");
+  int total = 0;
+  for (size_t s = 0; s < reqs.size(); ++s) {
+    const int req = reqs[s];
+    check_req(req, "session_verify_batch");
+    const auto& ids = feds[s];
+    const int T = static_cast<int>(ids.size());
+    if (T < 1 || T > kSpecRows)
+      throw std::invalid_argument("session_verify_batch: row count must be in [1, " +
+                                  std::to_string(kSpecRows) + "]");
+    const int64_t pos = session_pos_[static_cast<size_t>(req)];
+    if (pos <= 0) throw std::invalid_argument("session_verify_batch: no open session");
+    for (int64_t id : ids)
+      if (id < 0 || id >= vocab_size_) throw std::invalid_argument("session_verify_batch: token id out of range");
+    if (pos + T > max_context_) throw std::invalid_argument("session_verify_batch: position exceeds the context bound");
+    if (derived().has_pool() &&
+        !derived().pool().ensure_request_blocks(req, pos + T, stream_))
+      throw std::runtime_error("session_verify_batch: cache pool exhausted (admission budget)");
+    total += T;
+  }
+  if (total > max_decode_rows_)
+    throw std::invalid_argument("session_verify_batch: rows exceed the decode batch ceiling");
+  // Slot-major staging: each slot's fed rows contiguous, spans per slot.
+  int row = 0;
+  std::vector<int> offs(reqs.size());
+  for (size_t s = 0; s < reqs.size(); ++s) {
+    const int req = reqs[s];
+    const auto& ids = feds[s];
+    const int T = static_cast<int>(ids.size());
+    const int64_t pos = session_pos_[static_cast<size_t>(req)];
+    offs[s] = row;
+    for (int r = 0; r < T; ++r) {
+      h_req_ids_[row] = req;
+      h_step_pos_[row] = pos + r;
+      h_token_[row] = ids[static_cast<size_t>(r)];
+      ++row;
+    }
+    h_req_spans_[2 * s] = offs[s];
+    h_req_spans_[2 * s + 1] = T;
+  }
+  // The tokens ride h_token_ through begin_run's decode branch; the ids,
+  // positions and spans are staged here (decode_host_prep's contract,
+  // generalized to the slot-major batch).
+  decode_rows_ = total;
+  glm_upload_i32(h_req_ids_, d_req_ids_, total, stream_);
+  glm_upload_i64(h_step_pos_, d_step_pos_, total, stream_);
+  glm_upload_i32(h_req_spans_, d_req_spans_, 2 * static_cast<int>(reqs.size()), stream_);
+  RowRun run;
+  run.req = reqs[0];
+  run.T = total;
+  run.pos0 = session_pos_[static_cast<size_t>(reqs[0])];
+  run.decode = true;
+  run.all_rows = true;
+  run.snapshots = total > 1;
+  run.batch_requests = static_cast<int>(reqs.size());
+  Outputs out = derived().run_rows(run);
+  if (offsets) *offsets = offs;
+  // Slice the materialized rows per slot (finish_run returns all T rows host-side on decode).
+  std::vector<Outputs> outs(reqs.size());
+  for (size_t s = 0; s < reqs.size(); ++s) {
+    const int T = static_cast<int>(feds[s].size());
+    Outputs& o = outs[s];
+    o.logits.assign(out.logits.begin() + static_cast<size_t>(offs[s]) * lm_vocab_count_,
+                    out.logits.begin() + static_cast<size_t>(offs[s] + T) * lm_vocab_count_);
+    o.lm_vocab_begin = out.lm_vocab_begin;
+    o.lm_vocab_count = out.lm_vocab_count;
+    o.final_hidden_bits.assign(
+        out.final_hidden_bits.begin() + static_cast<size_t>(offs[s]) * hidden_,
+        out.final_hidden_bits.begin() + static_cast<size_t>(offs[s] + T) * hidden_);
+    session_pos_[static_cast<size_t>(reqs[s])] += T;
+    push_position(reqs[s]);
+  }
+  return outs;
+}
+
+template <class D>
 void SessionModel<D>::session_rollback(int req, int accepted) {
+  session_rollback(req, accepted, decode_rows_);
+}
+
+template <class D>
+void SessionModel<D>::session_rollback(int req, int accepted, int rows) {
+  session_rollback(req, accepted, rows, 0);
+}
+
+template <class D>
+void SessionModel<D>::session_rollback(int req, int accepted, int rows, int snapshot_base) {
   check_req(req, "session_rollback");
-  const int T = decode_rows_;
+  const int T = rows;
   if (accepted < 1 || accepted > T)
     throw std::invalid_argument("session_rollback: accepted rows must be in [1, " + std::to_string(T) + "]");
   const int64_t pos = session_pos_[static_cast<size_t>(req)];
   if (pos < T) throw std::invalid_argument("session_rollback: no verify to retract");
-  const GlmSpecSegments segs = derived().spec_segments(req, 0);
+  const GlmSpecSegments segs = derived().spec_segments(req, snapshot_base);
   if (segs.replay_dst != nullptr) {
     // A checkpoint-and-replay family (kernels/glm_spec.hpp): this pass's
     // saved rows become the next pass's replay source and the accepted

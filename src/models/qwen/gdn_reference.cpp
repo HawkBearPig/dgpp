@@ -101,6 +101,29 @@ void gated_rmsnorm_sigmoid(const uint16_t* x, const uint16_t* gate,
   }
 }
 
+void gated_rmsnorm_swish(const uint16_t* x, const uint16_t* gate,
+                         const uint16_t* w, uint16_t* y, int64_t rows,
+                         int dim, float eps) {
+  for (int64_t r = 0; r < rows; ++r) {
+    const uint16_t* xr = x + r * dim;
+    const uint16_t* gr = gate + r * dim;
+    uint16_t* yr = y + r * dim;
+    float ss = 0.0f;
+    for (int i = 0; i < dim; ++i) {
+      const float v = bf16_bits_to_float(xr[i]);
+      ss = std::fma(v, v, ss);
+    }
+    const float rstd = 1.0f / std::sqrt(ss / static_cast<float>(dim) + eps);
+    for (int i = 0; i < dim; ++i) {
+      const float u = bf16_bits_to_float(float_to_bf16_bits(bf16_bits_to_float(xr[i]) * rstd));
+      const float p = bf16_bits_to_float(float_to_bf16_bits(u * bf16_bits_to_float(w[i])));
+      const float g = bf16_bits_to_float(gr[i]);
+      const float sig = 1.0f / (1.0f + std::exp(-g));
+      yr[i] = float_to_bf16_bits(p * (g * sig));
+    }
+  }
+}
+
 template void recurrent<float>(const uint16_t*, const uint16_t*, int64_t, const uint16_t*, int64_t,
                                const float*, const float*, float*, uint16_t*, int, int, int, int,
                                int, float);

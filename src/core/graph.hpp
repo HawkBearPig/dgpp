@@ -46,7 +46,17 @@ class GraphCache {
     cudaGraph_t g{};
     cudaGraphExec_t gx{};
     DGPP_CUDA_OK(cudaStreamBeginCapture(launch_stream, cudaStreamCaptureModeGlobal));
-    build(launch_stream);
+    try {
+      build(launch_stream);
+    } catch (...) {
+      // A throwing builder must not leave the stream capturing: abort the
+      // capture (dropping the partial graph) so the stream stays usable
+      // and the caller can fall back to eager.
+      cudaGraph_t abandoned{};
+      (void)cudaStreamEndCapture(launch_stream, &abandoned);
+      if (abandoned != nullptr) cudaGraphDestroy(abandoned);
+      throw;
+    }
     DGPP_CUDA_OK(cudaStreamEndCapture(launch_stream, &g));
     DGPP_CUDA_OK(cudaGraphInstantiate(&gx, g, 0));
     entries_[key] = Entry{g, gx, std::move(label)};

@@ -27,4 +27,11 @@ void gated_rmsnorm_sigmoid(const uint16_t* x, const uint16_t* gate,
                            const uint16_t* w, uint16_t* y, int64_t rows,
                            int dim, float eps);
 
+// The swish-gated form (Qwen3.5 output_gate_type): y = bf16(p * (gate *
+// sigmoid(gate))) — same three roundings, the gate applied unrounded in fp32
+// with a single final cast.
+void gated_rmsnorm_swish(const uint16_t* x, const uint16_t* gate,
+                         const uint16_t* w, uint16_t* y, int64_t rows,
+                         int dim, float eps);
+
 }  // namespace dgpp::gdn_ref

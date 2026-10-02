@@ -12,7 +12,10 @@
 //
 // Allocate pick buffers before decoding. Allocating device-related memory
 // inside a pick can synchronize with another rank's spinning collective.
+#include <algorithm>
+#include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <functional>
 #include <memory>
 #include <stdexcept>
@@ -21,12 +24,14 @@
 #include <vector>
 
 #include "common/dtypes.hpp"
+#include "common/log.hpp"
 #include "engine/decode_outputs.hpp"
 #include "engine/image_prefill.hpp"
 #include "engine/prefix_arena.hpp"
 #include "sample/sampler.hpp"
 #include "sched/scheduler.hpp"
 #include "text/tool_grammar.hpp"
+#include "engine/speculative.hpp"
 
 namespace dgpp {
 
@@ -61,6 +66,7 @@ class EagerEngineAdapter : public sched::SchedulerEngine {
         pending_(static_cast<size_t>(max_requests), -1),
         state_(static_cast<size_t>(max_requests)),
         arena_(model, prefix_slots) {
+    spec_.resize(static_cast<size_t>(max_requests));
     if constexpr (requires { model_->set_prefill_monitor(prefill_monitor()); })
       model_->set_prefill_monitor(prefill_monitor());
   }
@@ -155,6 +161,9 @@ class EagerEngineAdapter : public sched::SchedulerEngine {
     info.chunk_tokens = Model::prefill_chunk_tokens();
     if constexpr (requires { model_->mtp_enabled(); })
       info.prefill_lookahead = model_->mtp_enabled();
+    // The DFlash2 planes at position p are functions of token p too.
+    if constexpr (requires { model_->dflash2_enabled(); })
+      info.prefill_lookahead = info.prefill_lookahead || model_->dflash2_enabled();
     if constexpr (requires { model_->prefill_bounded(); })
       info.body_snapshots = !model_->prefill_bounded();
     return info;
@@ -243,10 +252,177 @@ class EagerEngineAdapter : public sched::SchedulerEngine {
       throw std::logic_error("generation step on a slot without a pending "
                              "token");
     SlotState& s = state_.at(static_cast<size_t>(req));
+    if constexpr (requires { model_->dflash2_enabled(); }) {
+      if (model_->dflash2_enabled()) {
+        // Keep a live speculation only while the slot stays plain greedy and
+        // one full block of verify rows fits the context; anything else
+        // runs the exact plain step (and retries later).
+        const std::vector<int64_t> fed = dflash_fed(req);
+        if (!fed.empty()) {
+          auto& sp = spec_.at(static_cast<size_t>(req));
+          const int T = static_cast<int>(fed.size());
+          const auto out = model_->session_verify(req, fed);
+          const std::vector<int32_t> winners = rows_pick()(local_row_maxes(out, T));
+          std::vector<int32_t> committed = sp->commit(fed, winners, 0);
+          pending = sp->next();
+          for (int32_t t : committed) s.context.push_back(t);
+          s.context.push_back(static_cast<int32_t>(pending));
+          return committed;
+        }
+      }
+    }
     const int32_t next = decide(s, model_->session_step(req, pending));
     s.context.push_back(next);
     pending = next;
     return {next};
+  }
+  // The batched speculative pass (plan §7's concurrency gate): every
+  // arriving slot's verify rows ride ONE physical target pass (slot-major,
+  // <= max_decode_rows() rows). Drafts stay per-slot — the block is a few
+  // % of the target's step. Per-slot decisions, rollbacks, publishes and
+  // the eligibility rule are exactly the scalar step()'s; a single-slot
+  // batch takes the scalar path, so a C1 transcript keeps the scalar
+  // kernel sequence bit-for-bit.
+  std::vector<std::vector<int32_t>> step_batch(const std::vector<int>& reqs) override {
+    if constexpr (requires { model_->dflash2_enabled(); }) {
+      const int graph_level = dflash_verify_graph();
+      if (!model_->dflash2_enabled() || reqs.size() < (graph_level >= 2 ? size_t{1} : size_t{2}))
+        return SchedulerEngine::step_batch(reqs);
+      const bool ph = dflash_phases();
+      const auto ns_now = [] {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(
+                   std::chrono::steady_clock::now().time_since_epoch())
+                    .count();
+      };
+      const long long ph0 = ph ? ns_now() : 0;
+      std::vector<std::vector<int64_t>> feds(reqs.size());
+      std::vector<char> is_spec(reqs.size(), 0);
+      for (size_t i = 0; i < reqs.size(); ++i) {
+        if (pending_.at(static_cast<size_t>(reqs[i])) < 0)
+          throw std::logic_error("generation step on a slot without a pending "
+                                 "token");
+        feds[i] = dflash_fed(reqs[i]);
+        if (!feds[i].empty()) {
+          is_spec[i] = 1;
+        } else {
+          // Ineligible slot: feeds its pending token, decided through the
+          // sampler closure like the scalar plain step.
+          feds[i].push_back(pending_.at(static_cast<size_t>(reqs[i])));
+        }
+      }
+      const long long ph1 = ph ? ns_now() : 0;
+      std::vector<int> offs;
+      // The verify, per DGPP_DFLASH2_VERIFY_GRAPH level: 0 the packed
+      // eager batch (the opt-out baseline, no graph); 1 multi-slot batches
+      // replay a captured static verify (the shipped default, the measured
+      // best); 2 lone slots too; 3 the bisection control — the same static
+      // padded staging executed eagerly. A lone slot is the scalar path at
+      // every level < 2 (the line-289 gate), so a C1 transcript keeps the
+      // scalar kernel sequence. Drafts, judge, rollback and redrafts are
+      // unchanged around it; any capture breakage falls back to the eager
+      // batch inside the model call. BATCH_EAGER forces the packed eager
+      // batch at any level.
+      const bool padded = !dflash_batch_eager() && graph_level == 3 &&
+                          model_->dflash_graph_verify_available();
+      const bool want_graph = !dflash_batch_eager() && !padded &&
+                              graph_level >= 1 &&
+                              (graph_level >= 2 || reqs.size() >= 2) &&
+                              model_->dflash_graph_verify_available();
+      auto outs = want_graph
+                      ? model_->session_verify_batch_graph(reqs, feds, &offs)
+                      : padded ? model_->session_verify_batch_padded(reqs, feds, &offs)
+                               : model_->session_verify_batch(reqs, feds, &offs);
+      const long long ph2 = ph ? ns_now() : 0;
+      std::vector<std::vector<int32_t>> out(reqs.size());
+      // Batched redrafts (DGPP_DFLASH2_DRAFT_BATCH=1): one stacked block
+      // forward for every spec slot instead of one per slot. Otherwise
+      // each slot redrafts alone (the shipped behavior).
+      std::vector<size_t> batch_idx;
+      if (dflash_draft_batch()) {
+        for (size_t i = 0; i < reqs.size(); ++i)
+          if (is_spec[i]) batch_idx.push_back(i);
+      }
+      const bool use_batch = batch_idx.size() >= 2;
+      for (size_t i = 0; i < reqs.size(); ++i) {
+        SlotState& s = state_.at(static_cast<size_t>(reqs[i]));
+        int64_t& pending = pending_.at(static_cast<size_t>(reqs[i]));
+        if (is_spec[i]) {
+          auto& sp = spec_.at(static_cast<size_t>(reqs[i]));
+          const int T = static_cast<int>(feds[i].size());
+          const std::vector<int32_t> winners = rows_pick()(local_row_maxes(outs[i], T));
+          if (use_batch) {
+            out[i] = sp->commit_verify(feds[i], winners, offs[i]);
+          } else {
+            out[i] = sp->commit(feds[i], winners, offs[i]);
+          }
+          pending = sp->next();
+          for (int32_t t : out[i]) s.context.push_back(t);
+          s.context.push_back(static_cast<int32_t>(pending));
+        } else {
+          const int32_t next = decide(s, outs[i]);
+          s.context.push_back(next);
+          pending = next;
+          out[i] = {next};
+        }
+      }
+      const long long ph3 = ph ? ns_now() : 0;
+      if (use_batch) {
+        std::vector<int> breqs;
+        std::vector<int64_t> bonuses;
+        breqs.reserve(batch_idx.size());
+        bonuses.reserve(batch_idx.size());
+        for (size_t i : batch_idx) {
+          breqs.push_back(reqs[i]);
+          bonuses.push_back(spec_.at(static_cast<size_t>(reqs[i]))->next());
+        }
+        std::vector<std::vector<int32_t>> bdrafts;
+        model_->dflash2_draft_batch(breqs, bonuses, &bdrafts);
+        for (size_t k = 0; k < batch_idx.size(); ++k)
+          spec_.at(static_cast<size_t>(reqs[batch_idx[k]]))->set_drafts(std::move(bdrafts[k]));
+      } else {
+        for (size_t i : batch_idx)
+          spec_.at(static_cast<size_t>(reqs[i]))->redraft();
+      }
+      if (ph) {
+        const long long ph4 = ns_now();
+        PhaseAcc& a = dfph_acc();
+        a.fed_ns += ph1 - ph0;
+        a.verify_ns += ph2 - ph1;
+        a.commit_ns += ph3 - ph2;
+        a.draft_ns += ph4 - ph3;
+        a.total_ns += ph4 - ph0;
+        ++a.steps;
+        if (a.steps % 25 == 0) {
+          const int n = a.steps;
+          DGPP_LOG_INFO("dflash phases ({} steps): fed {:.1f} us, verify {:.2f} ms, "
+                        "commit {:.1f} us, draft {:.2f} ms, total {:.2f} ms/pass; "
+                        "slots this step {}",
+                        n, a.fed_ns * 1e-3 / n, a.verify_ns * 1e-6 / n,
+                        a.commit_ns * 1e-3 / n, a.draft_ns * 1e-6 / n,
+                        a.total_ns * 1e-6 / n, static_cast<int>(reqs.size()));
+        }
+      }
+      return out;
+    } else {
+      return SchedulerEngine::step_batch(reqs);
+    }
+  }
+  // One physical pass advances every arriving spec slot; the row budget
+  // (max_decode_rows verify rows, a full block per spec slot) bounds it.
+  int decode_batch_capacity() const override {
+    if constexpr (requires { model_->dflash2_enabled(); model_->max_decode_rows(); })
+      if (model_->dflash2_enabled()) {
+        const int cap = model_->max_decode_rows() / kSpecRows;
+        return cap < 1 ? 1 : (cap > slots_ ? slots_ : cap);
+      }
+    return 1;
+  }
+  // A spec step writes up to a full block of positions (the scheduler's
+  // reservation window grows accordingly); plain engines keep 1.
+  int max_tokens_per_step() const override {
+    if constexpr (requires { model_->dflash2_enabled(); })
+      if (model_->dflash2_enabled()) return kSpecRows;
+    return 1;
   }
   // The logit bias (OpenAI's logit_bias, 2026-09-06): a dense row per slot
   // over [0, this rank's slice end) — the sampler closure adds it after the
@@ -274,6 +450,7 @@ class EagerEngineAdapter : public sched::SchedulerEngine {
   }
   void close(int req) override {
     pending_.at(static_cast<size_t>(req)) = -1;
+    if constexpr (requires { model_->dflash2_enabled(); }) retire_spec(spec_.at(static_cast<size_t>(req)));
     // A reopened slot is greedy until the scheduler arms it again.
     state_.at(static_cast<size_t>(req)) = SlotState{};
     model_->session_close(req);
@@ -356,6 +533,190 @@ class EagerEngineAdapter : public sched::SchedulerEngine {
   std::vector<int64_t> pending_;
   std::vector<SlotState> state_;
   PrefixArena<Model> arena_;  // the prefix cache's snapshot slots (M7)
+  // DFlash2 drafter drivers, one per slot (only used when the model has a
+  // drafter; eager greedy semantics, exact under greedy verify).
+  std::vector<std::unique_ptr<DFlash2Speculator<Model>>> spec_;
+  // The drafter's per-position acceptance counters, engine-wide: retired
+  // drivers fold in here, live ones read on top (the MTP stats group).
+  uint64_t spec_att_[8] = {}, spec_acc_[8] = {};
+
+  // The eligibility rule of step()'s spec branch, shared with step_batch:
+  // the slot's verify-fed rows when it rides speculation this step (plain
+  // greedy, one full block fits the context; the speculator is created and
+  // started as needed), empty when it runs the exact plain step instead
+  // (retiring any live speculation, retried next step).
+  std::vector<int64_t> dflash_fed(int req) {
+    SlotState& s = state_.at(static_cast<size_t>(req));
+    auto& sp = spec_.at(static_cast<size_t>(req));
+    const bool plain_greedy = s.params.temperature <= 0.0f && !s.report_logprobs &&
+                              s.bias.empty() && !s.grammar &&
+                              s.params.repetition_penalty == 1.0f &&
+                              s.params.frequency_penalty == 0.0f &&
+                              s.params.presence_penalty == 0.0f;
+    const bool fits = model_->session_position(req) + 1 + model_->dflash2_drafts() <=
+                      model_->max_context();
+    if (sp && (!plain_greedy || !fits)) retire_spec(sp);
+    if (!(plain_greedy && fits)) {
+      // DGPP_DFLASH2_TRACE=1 logs why a slot runs plain (one line per
+      // slot-step): the engagement split that sizes every spec-side
+      // investment. Default off: zero behavior change.
+      if (dflash_trace()) {
+        logf(LogLevel::Info, "dflash: slot {} runs plain (temp={} logprobs={} bias={} grammar={} reppen={} freqpen={} prespen={})",
+             req, s.params.temperature, s.report_logprobs ? 1 : 0, s.bias.empty() ? 0 : 1,
+             s.grammar ? 1 : 0, s.params.repetition_penalty, s.params.frequency_penalty,
+             s.params.presence_penalty);
+      }
+      return {};
+    }
+    if (!sp) {
+      sp = std::make_unique<DFlash2Speculator<Model>>(*model_, req, rows_pick());
+      // Experimental verify-depth cap (long-context throughput work):
+      // DGPP_DFLASH2_DEPTH=k verifies only the first k drafts per step
+      // (exact transcripts — unverified drafts re-draft next step).
+      // Unset (the default) verifies the whole block.
+      const int depth_cap = dflash_depth_cap();
+      if (depth_cap >= 0) {
+        const int D = model_->dflash2_drafts();
+        int k = depth_cap < D ? depth_cap : D;
+        sp->set_depth_policy([k](const std::vector<int32_t>& d) {
+          const int n = static_cast<int>(d.size());
+          return k < n ? k : n;
+        });
+      }
+      sp->start(static_cast<int32_t>(pending_.at(static_cast<size_t>(req))));
+    }
+    return sp->fed_rows();
+  }
+
+  // Cached env gates for the dflash throughput work (both default off,
+  // so the shipped path is untouched unless the operator opts in).
+  static int dflash_depth_cap() {
+    static const int v = [] {
+      const char* e = std::getenv("DGPP_DFLASH2_DEPTH");
+      if (!e || !*e) return -1;
+      const int k = std::atoi(e);
+      return k < 0 ? -1 : k;
+    }();
+    return v;
+  }
+  static bool dflash_draft_batch() {
+    // Batched redrafts (one stacked forward per step): default ON —
+    // validated +5–9% at c4 with no errors, C1-identical by construction
+    // (a single spec slot keeps the scalar redraft). DGPP_DFLASH2_DRAFT_BATCH=0
+    // opts out to the per-slot redrafts.
+    static const bool v = [] {
+      const char* e = std::getenv("DGPP_DFLASH2_DRAFT_BATCH");
+      return !(e && *e == '0');
+    }();
+    return v;
+  }
+  static bool dflash_trace() {
+    static const bool v = [] {
+      const char* e = std::getenv("DGPP_DFLASH2_TRACE");
+      return e && *e && *e != '0';
+    }();
+    return v;
+  }
+  static int dflash_verify_graph() {
+    // 0: the packed eager batch — no graph (the opt-out baseline). 1:
+    // multi-slot batches replay the captured static verify (the shipped
+    // default — the measured best: ~5–8% over the eager batch at
+    // short-context c4/c8, a tie at 8K). 2: lone slots too (their own
+    // 8-row capture — the capture-mechanism control: no padding involved
+    // at all). 3: the bisection control — the same static padded staging
+    // executed eagerly.
+    static const int v = [] {
+      const char* e = std::getenv("DGPP_DFLASH2_VERIFY_GRAPH");
+      if (!e || !*e) return 1;   // shipped default: the multi-slot graph
+      if (*e == '0') return 0;   // opt out: the packed eager batch
+      return std::atoi(e);
+    }();
+    return v;
+  }
+  static bool dflash_batch_eager() {
+    // Force the eager batch inside the graph method (the 3-way bisection:
+    // scalar vs eager-batch vs captured-batch on identical staging).
+    static const bool v = [] {
+      const char* e = std::getenv("DGPP_DFLASH2_BATCH_EAGER");
+      return e && *e && *e != '0';
+    }();
+    return v;
+  }
+  // DGPP_DFLASH2_PHASES=1: accumulate step_batch's phase wall times and
+  // log a rolling average every 25 steps (the 8K profiling split:
+  // fed / verify / commit / draft per pass).
+  static bool dflash_phases() {
+    static const bool v = [] {
+      const char* e = std::getenv("DGPP_DFLASH2_PHASES");
+      return e && *e && *e != '0';
+    }();
+    return v;
+  }
+  struct PhaseAcc {
+    long long verify_ns = 0, draft_ns = 0, commit_ns = 0, fed_ns = 0, total_ns = 0;
+    int steps = 0;
+  };
+  static PhaseAcc& dfph_acc() {
+    static PhaseAcc a;
+    return a;
+  }
+
+  template <class S>
+  void retire_spec(S& sp) {
+    if constexpr (requires { sp->attempts(0); }) {
+      if (sp) {
+        for (int p = 0; p < 8; ++p) {
+          spec_att_[p] += sp->attempts(p);
+          spec_acc_[p] += sp->accepts(p);
+        }
+        sp.reset();
+      }
+    }
+  }
+
+  sched::SchedulerEngine::MtpAcceptance mtp_acceptance() const override {
+    sched::SchedulerEngine::MtpAcceptance a;
+    if constexpr (requires { model_->dflash2_drafts(); }) {
+      if (model_->dflash2_enabled()) a.depth = model_->dflash2_drafts();
+      for (int p = 0; p < 8; ++p) {
+        a.attempts[p] = spec_att_[p];
+        a.accepts[p] = spec_acc_[p];
+        for (const auto& sp : spec_)
+          if (sp) {
+            a.attempts[p] += sp->attempts(p);
+            a.accepts[p] += sp->accepts(p);
+          }
+      }
+    }
+    return a;
+  }
+
+  sched::SchedulerEngine::MtpAcceptance mtp_acceptance(int req) const override {
+    sched::SchedulerEngine::MtpAcceptance a;
+    if constexpr (requires { model_->dflash2_drafts(); }) {
+      const auto& sp = spec_.at(static_cast<size_t>(req));
+      if (sp) {
+        a.depth = model_->dflash2_drafts();
+        for (int p = 0; p < 8; ++p) {
+          a.attempts[p] = sp->attempts(p);
+          a.accepts[p] = sp->accepts(p);
+        }
+      }
+    }
+    (void)req;
+    return a;
+  }
+
+
+  // The world-1 rows pick: each row's local max is already the winner.
+  static SpecPickRows rows_pick() {
+    return [](const std::vector<sample::Candidate>& locals) {
+      std::vector<int32_t> w;
+      w.reserve(locals.size());
+      for (const auto& c : locals) w.push_back(c.id);
+      return w;
+    };
+  }
 };
 
 // The world-1 pick: full-vocab argmax over the fp32 logits row. The closure

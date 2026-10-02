@@ -82,3 +82,12 @@ scripts/maximize-cluster-memory.sh
 .pi/
 mimo_engine_fixture/
 mimo_engine_cap_fixture/
+
+# Test-generated model fixtures: the CUDA tests (dsv41_model_test,
+# mimo_decode_test) regenerate these at runtime; never track the blobs.
+dsv41_model_fixture/
+mimo_decode_fixture/
+mimo_window_fixture/
+# Serve runtime state (scripts/dgpp_serve.sh STATE_DIR): logs + pid, and the
+# tool-eval-bench .md reports it drops under runs/YYYY/MM/. Never tracked.
+runs/

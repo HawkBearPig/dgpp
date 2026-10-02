@@ -35,13 +35,49 @@ def get(host, port, path, *, timeout=60):
         conn.close()
 
 
+def prom_value(text, name):
+    best = None
+    for line in text.splitlines():
+        if line.startswith(name + "{") or line == name + " " or line.startswith(name + " "):
+            try:
+                value = float(line.rsplit(" ", 1)[1])
+            except ValueError:
+                continue
+            if best is None or value > best:
+                best = value
+    return best
+
+
+def probe_metrics(host, port):
+    """Return ("dgpp", scheduler) or ("vllm", prometheus_text) for the server."""
+    conn = http.client.HTTPConnection(host, port, timeout=10)
+    try:
+        conn.request("GET", "/metrics")
+        response = conn.getresponse()
+        body = response.read().decode()
+        if response.status == 200:
+            try:
+                return "dgpp", json.loads(body)["scheduler"]
+            except (ValueError, KeyError):
+                return "vllm", body
+        raise RuntimeError(f"GET /metrics: HTTP {response.status}: {body[:1024]!r}")
+    finally:
+        conn.close()
+
+
 def idle_metrics(host, port, timeout=0, completed_after=None):
     deadline = time.monotonic() + timeout
     while True:
-        metrics = get(host, port, "/v1/metrics")["scheduler"]
-        if (not metrics["active"] and not metrics["queued"] and
-                (completed_after is None or metrics["prompts_prefilled"] > completed_after)):
-            return metrics
+        kind, metrics = probe_metrics(host, port)
+        if kind == "dgpp":
+            idle = not metrics["active"] and not metrics["queued"]
+            done = completed_after is None or metrics["prompts_prefilled"] > completed_after
+        else:
+            idle = prom_value(metrics, "vllm:num_requests_running") == 0 and \
+                prom_value(metrics, "vllm:num_requests_waiting") == 0
+            done = True
+        if idle and done:
+            return metrics if kind == "dgpp" else None
         if time.monotonic() >= deadline:
             raise RuntimeError("prefill probe requires an otherwise idle server")
         # The SSE finish can arrive before the service publishes the retired
@@ -82,11 +118,20 @@ def ask(host, port, model, prompt, no_think=False):
 
 
 def measured_prefill(before, after, response):
-    computed = after["prompt_tokens_computed"] - before["prompt_tokens_computed"]
-    milliseconds = after["prefill_ms"] - before["prefill_ms"]
     usage = response["usage"]
     prompt = usage["prompt_tokens"]
     cached = usage.get("prompt_tokens_details", {}).get("cached_tokens", 0)
+    if after is None:
+        # Prometheus-only server (vLLM): on an idle server, client TTFT is the
+        # prefill time up to first-token scheduling latency.
+        if response["ttft_ms"] is None:
+            raise RuntimeError("no visible first token; cannot time prefill without scheduler metrics")
+        return {**response, "prompt_tokens": prompt, "cached_tokens": cached,
+                "computed_tokens": prompt - cached, "prefill_ms": response["ttft_ms"],
+                "prefill_ms_per_token": response["ttft_ms"] / (prompt - cached),
+                "prefill_source": "client_ttft"}
+    computed = after["prompt_tokens_computed"] - before["prompt_tokens_computed"]
+    milliseconds = after["prefill_ms"] - before["prefill_ms"]
     if after["prompts_prefilled"] - before["prompts_prefilled"] != 1 or computed != prompt - cached:
         raise RuntimeError("prefill metrics do not describe exactly this request; check concurrent traffic")
     if cached:
@@ -95,7 +140,7 @@ def measured_prefill(before, after, response):
         raise RuntimeError("prefill metrics did not report positive computed work")
     return {**response, "prompt_tokens": prompt, "cached_tokens": cached,
             "computed_tokens": computed, "prefill_ms": milliseconds,
-            "prefill_ms_per_token": milliseconds / computed}
+            "prefill_ms_per_token": milliseconds / computed, "prefill_source": "engine"}
 
 
 def main():
@@ -128,7 +173,8 @@ def main():
         return f"{args.tag}-{value}" if args.tag else value
     initial = idle_metrics(args.host, args.port)
     calibration = ask(args.host, args.port, model, prompt_of(words, 400, nonce("cal-0"), rng), args.no_think)
-    idle_metrics(args.host, args.port, timeout=5, completed_after=initial["prompts_prefilled"])
+    idle_metrics(args.host, args.port, timeout=5,
+                 completed_after=initial["prompts_prefilled"] if initial else None)
     tokens = calibration["usage"]["prompt_tokens"]
     per_word = (tokens - 30) / 400
     if per_word <= 0:
@@ -146,7 +192,8 @@ def main():
             prompt = prompt_of(words, n_words, nonce(f"n{length}-r{repeat}-{rng.randrange(1 << 30)}"), rng)
             before = idle_metrics(args.host, args.port)
             response = ask(args.host, args.port, model, prompt, args.no_think)
-            after = idle_metrics(args.host, args.port, timeout=5, completed_after=before["prompts_prefilled"])
+            after = idle_metrics(args.host, args.port, timeout=5,
+                                 completed_after=before["prompts_prefilled"] if before else None)
             sample = measured_prefill(before, after, response)
             sample.update(requested_tokens=length, repeat=repeat)
             samples.append(sample)

@@ -400,10 +400,21 @@ int run_fixture(const std::string& dir) {
       m.session_rollback(0, 1);
       require(m.session_position(0) == static_cast<int64_t>(A.size()) + 1, "verify rows: the rollback's position");
       const MimoModel::Outputs next = m.session_step(0, tA.tokens[1]);
-      require(bitwise(next.logits, tA.rows[2]), "verify of " + std::to_string(T) + " rows: the step after the rollback differs");
+      if (T <= gemv_rows) {
+        require(bitwise(next.logits, tA.rows[2]),
+                "verify of " + std::to_string(T) + " rows: the step after the rollback differs");
+      } else {
+        // Beyond the GEMV rows the verify's row 0 (whose K/V the step
+        // re-reads) went through cuBLASLt: tolerance-equal, not bitwise.
+        const RowCompare c = compare_row(next.logits.data(), tA.rows[2].data(), V);
+        require(c.top1_equal || c.near_tie,
+                "verify of " + std::to_string(T) + " rows: the rollback's next step top-1 differs");
+        require(c.l2 < 2e-2, "verify of " + std::to_string(T) + " rows: the rollback's next step over budget");
+      }
       m.session_close(0);
-      std::printf("[ .. ] verify of %d rows: %d bitwise the scalar steps%s; the rollback's next step bitwise\n", T, exact,
-                  T > gemv_rows && exact < T ? " (the rest tolerance-equal: cuBLASLt on the bf16 sites)" : "");
+      std::printf("[ .. ] verify of %d rows: %d bitwise the scalar steps%s; the rollback's next step %s\n", T, exact,
+                  T > gemv_rows && exact < T ? " (the rest tolerance-equal: cuBLASLt on the bf16 sites)" : "",
+                  T > gemv_rows ? "tolerance-equal" : "bitwise");
     }
     std::printf("[ OK ] verify rows reproduce the scalar steps (bitwise through %d rows) and roll back bitwise\n", gemv_rows);
   }

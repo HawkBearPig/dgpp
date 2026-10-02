@@ -41,9 +41,13 @@ ModelArchitecture detect_architecture(const minijson::Value& root) {
   // `MiMoV2ForCausalLM` / `mimo_v2`.
   if (arch.rfind("MiMoV2", 0) == 0 || (arch.empty() && type == "mimo_v2"))
     return ModelArchitecture::MimoV2;
+  // Qwen3.8-27B (2026-09-27): `Qwen3_5ForConditionalGeneration` / `qwen3_5`
+  // (its text_config's type is `qwen3_5_text`).
+  if (arch.rfind("Qwen3_5", 0) == 0 || (arch.empty() && type == "qwen3_5"))
+    return ModelArchitecture::Qwen3_5;
   throw std::runtime_error(
       "config.json: unsupported architecture '" + arch + "' (model_type '" +
-      type + "'); the engine implements Glm5*, Qwen4Exp*, Glm4Moe*, GlmMoeDsa*, DeepseekV41* and MiMoV2*");
+      type + "'); the engine implements Glm5*, Qwen4Exp*, Glm4Moe*, GlmMoeDsa*, DeepseekV41*, MiMoV2* and Qwen3_5*");
 }
 
 ModelArchitecture detect_architecture_file(const std::string& path) {

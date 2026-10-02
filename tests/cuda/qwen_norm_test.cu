@@ -70,8 +70,7 @@ DGPP_TEST(qwen_group_rmsnorm_normalizes_every_branch_on_its_own) {
   require_bitwise("grouped == plain per group", want.data(), flat.data(), want.size() * 2);
 }
 
-DGPP_TEST(gdn_gated_rmsnorm_keeps_the_reference_roundings) {
-  const int dim = 128;
+DGPP_TEST(gdn_gated_rmsnorm_keeps_the_reference_roundings) {  const int dim = 128;
   const int64_t rows = 12 * 7;
   const std::vector<uint16_t> x = random_bf16_normal(5, rows * dim, 1.0f);
   const std::vector<uint16_t> g = random_bf16_normal(6, rows * dim, 2.0f);
@@ -87,6 +86,32 @@ DGPP_TEST(gdn_gated_rmsnorm_keeps_the_reference_roundings) {
   dy.download(got.data(), got.size() * 2);
   dgpp::gdn_ref::gated_rmsnorm_sigmoid(x.data(), g.data(), w.data(), want.data(), rows, dim, 1e-6f);
   require_bf16("gdn gated norm", compare_bf16(got, want, 1), 1e-3, 0.01);
+}
+
+DGPP_TEST(gdn_gated_rmsnorm_swish_keeps_the_reference_roundings) {
+  const int dim = 128;
+  const int64_t rows = 12 * 7;
+  const std::vector<uint16_t> x = random_bf16_normal(15, rows * dim, 1.0f);
+  const std::vector<uint16_t> g = random_bf16_normal(16, rows * dim, 2.0f);
+  const std::vector<uint16_t> w = random_bf16_uniform(17, dim, 0.5f);
+  cudaStream_t s = test_stream();
+  DevBuf dx(x.size() * 2), dg(g.size() * 2), dw(w.size() * 2), dy(x.size() * 2);
+  dx.upload(x.data(), x.size() * 2);
+  dg.upload(g.data(), g.size() * 2);
+  dw.upload(w.data(), w.size() * 2);
+  dgpp::gdn_gated_rmsnorm_swish_bf16(dx.p, dg.p, dw.p, dy.p, rows, dim, 1e-6f, s);
+  DGPP_CUDA_OK(cudaStreamSynchronize(s));
+  std::vector<uint16_t> got(x.size()), want(x.size());
+  dy.download(got.data(), got.size() * 2);
+  dgpp::gdn_ref::gated_rmsnorm_swish(x.data(), g.data(), w.data(), want.data(), rows, dim, 1e-6f);
+  require_bf16("gdn gated norm swish", compare_bf16(got, want, 1), 1e-3, 0.01);
+  // Swish is not sigmoid: the two gates must differ almost everywhere.
+  std::vector<uint16_t> sig(x.size());
+  dgpp::gdn_ref::gated_rmsnorm_sigmoid(x.data(), g.data(), w.data(), sig.data(), rows, dim, 1e-6f);
+  size_t same = 0;
+  for (size_t i = 0; i < got.size(); ++i) same += (got[i] == sig[i]);
+  if (same * 20 >= got.size())
+    throw std::runtime_error("swish gate output suspiciously close to sigmoid");
 }
 
 int main() { return dgpp::test::run_all(); }

@@ -1,0 +1,27 @@
+{
+  "model": "Qwen/Qwen3.8-27B-FP8",
+  "world_size": 1,
+  "engine": {
+    "max_concurrency": 4,
+    "kv_capacity": 65536,
+    "kv_dtype": "bf16",
+    "default_max_tokens": 4096,
+    "queue_limit": 8,
+    "max_connections": 64,
+    "decode_graph": true,
+    "mtp": false,
+    "prefix_cache_gib": 0,
+    "admission": "grow",
+    "admission_window": 256,
+    "model_alias": "Qwen3.8-27B",
+    "sampling_candidates": 128,
+    "stats_interval_s": 1
+  },
+  "paths": {
+    "resident_cache": ""
+  },
+  "http": {
+    "bind_host": "0.0.0.0",
+    "port": 8000
+  }
+}

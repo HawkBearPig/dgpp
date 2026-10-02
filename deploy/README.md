@@ -11,7 +11,7 @@ without `.example` and stay Git-ignored; the launcher fills the nodes, the SSH
 user and the ports from the site's `.env` (`scripts/site_env.py`).
 
 - Model names are `glm-5.3-flash`, `glm-5.3` (the full model), `glm-4.7`,
-  `qwen-3.8-flash-next`, `deepseek-v4.1-flash` and `mimo-v2.6-flash`.
+  `qwen-3.8-flash-next`, `qwen3.8-27b`, `deepseek-v4.1-flash` and `mimo-v2.6-flash`.
 - The quant names the checkpoint representation: `fp8`, `nvfp4`,
   `nvfp4-fp8` for the custom GLM-5.3-Flash hybrid, `int4-int8` for the full
   GLM-5.3's pack-quantized release (int4 group-64 routed experts, int8
@@ -26,7 +26,10 @@ user and the ports from the site's `.env` (`scripts/site_env.py`).
 
 Every template enables MTP (the block draft on DeepSeek) at the depth the
 family measured best, with the decode graph, at the request-slot count and
-cache budget that measured at or above every other shape tried. The shapes
+cache budget that measured at or above every other shape tried — except a
+`_dflash2` variant, which names `engine.dflash_model` instead of MTP and
+runs the eager world-1 path (no graph), the external block drafter
+replacing the MTP draft. The shapes
 a template does not name are knobs appended at boot:
 `scripts/dgpp-cluster up --config FILE --knobs "FLAGS"`.
 
@@ -47,6 +50,9 @@ a template does not name are knobs appended at boot:
 | [cluster_mimo-v2.6-flash_mxfp4-fp8_w4.example.json](cluster_mimo-v2.6-flash_mxfp4-fp8_w4.example.json) | MiMo-V2.6-Flash as shipped on four nodes: MTP depth 1 (the first of the release's three draft layers), the BF16 o_proj / head / eh_proj resident in their 12-bit form alone (`"bf12"`), 128K context (every layer's K/V paged, the sliding-window layers read theirs through the window), four request slots; text prompts only (the vision and audio encoders are not served) | T=1: `--no-mtp`; depth 2: `--mtp-depth 2` |
 | [cluster_mimo-v2.6-flash_mxfp4-fp8_w2.example.json](cluster_mimo-v2.6-flash_mxfp4-fp8_w2.example.json) | the same on two nodes: MTP depth 1, the K/V cache in the fp8 row form (`"kv_dtype": "fp8"`: 58 KiB per token per rank against 109 in bf16), 256K context (97.5 GiB of the 121.6 GiB per rank), four request slots | T=1: `--no-mtp` |
 | [cluster_deepseek-v4.1-flash_mxfp4-fp8_w4.example.json](cluster_deepseek-v4.1-flash_mxfp4-fp8_w4.example.json) | DeepSeek-V4.1-Flash as shipped on four nodes: six request slots at DSpark depth 4 (30 decode rows in one batched replay, the family's 32-row cap) with the confidence-scheduled verify depth (λ 0.045), the bounded prefill, 128K context — the six-stream shape the vLLM recipe reports its aggregate at; single and dual streams measure the same as the two-slot shapes did | the two-slot depth-5 shape: `--max-concurrency 2 --mtp-depth 5`; the two-slot depth-4 shape: `--max-concurrency 2`; T=1 at four slots: `--no-mtp --max-concurrency 4` |
+| [cluster_qwen3.8-27b-fp8_w1.example.json](cluster_qwen3.8-27b-fp8_w1.example.json) | Qwen3.8-27B FP8 on one Spark: the plain eager path (no MTP draft), 256K context, eight request slots | the MTP shape: `cluster_qwen3.8-27b-fp8_w1_mtp2.example.json`; the DFlash2-drafter shape: `cluster_qwen3.8-27b-fp8_w1_dflash2.example.json` |
+| [cluster_qwen3.8-27b-fp8_w1_mtp2.example.json](cluster_qwen3.8-27b-fp8_w1_mtp2.example.json) | Qwen3.8-27B FP8 on one Spark: MTP depth 2 with the decode graph, 256K context, eight request slots | T=1: `--no-mtp` |
+| [cluster_qwen3.8-27b-fp8_w1_dflash2.example.json](cluster_qwen3.8-27b-fp8_w1_dflash2.example.json) | Qwen3.8-27B FP8 on one Spark with the DFlash2 block drafter (`z-lab/Qwen3.8-27B-DFlash2`, eager world-1, no graph): seven drafts per step through the shared head and the rank-256 selector, the MTP draft off | plain from this template: `--no-dflash` |
 
 The Qwen NVFP4 templates use `engine.fp8_head: "mma"` after matched
 [real-checkpoint numerical checks](../benchmarks/results/2026-09-21-qwen-fp8-head-numerics.md)

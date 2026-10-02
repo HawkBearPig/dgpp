@@ -8,6 +8,8 @@
 #include "common/cuda_check.hpp"
 #include "common/dtypes.hpp"
 #include "kernels/bf16_gemv.cuh"
+#include "kernels/fp8_blockwise_dense.hpp"
+#include "kernels/fp8_gemv.cuh"
 #include "kernels/fp8_gemv.cuh"
 #include "kernels/glm_moe_launch.hpp"
 #include "kernels/mma_gemv.hpp"
@@ -301,6 +303,18 @@ void launch_scale_gemm(const uint16_t* act, size_t act_row_stride_elems,
   // per four-row GEMV launch, so prefill-sized segments go this way too.
   // The tile kernel keeps the large-m shapes where its grid fills the GPU.
   if (dispatch_rows <= kGemvMaxM && fp8_gemv::shape_ok(w_payload, /*rows=*/1, k)) {
+    {
+      static int trace_left = -1;  // the DGPP_MMA_TRACE budget, read once
+      if (trace_left < 0) {
+        const char* e = std::getenv("DGPP_MMA_TRACE");
+        trace_left = (e && *e && *e != '0') ? (std::atoi(e) > 0 ? std::atoi(e) : 64) : 0;
+      }
+      if (trace_left > 0) {
+        --trace_left;
+        std::fprintf(stderr, "scale_gemv m=%d n=%d k=%d\n", m, n, k);
+        std::fflush(stderr);
+      }
+    }
     for (int row0 = 0; row0 < m;) {
       int rows = std::min(fp8_gemv::kMaxRows, m - row0);
       while (!fp8_gemv::shape_ok(w_payload, rows, k)) --rows;
@@ -311,6 +325,21 @@ void launch_scale_gemm(const uint16_t* act, size_t act_row_stride_elems,
           stream);
       row0 += rows;
     }
+    return;
+  }
+  // Native blockwise-FP8 dense GEMM for prefill (Path B): the weight stays
+  // E4M3 and the activation is quantized per call in 128x128 blocks, so the
+  // FP8-dequant + cuBLASLt bridge below is skipped. Env-gated
+  // (DGPP_FP8BW_DENSE, off unless set) until the parity anchors validate it
+  // end to end; any shape outside the 128-block contract falls through.
+  if (m > 256 && (k % 128) == 0 && fp8_blockwise_dense_enabled() &&
+      fp8_blockwise_dense_supported(act, act_row_stride_elems, w_payload, m, n, k)) {
+    if constexpr (std::is_same_v<OutT, float>)
+      launch_fp8_blockwise_f32(act, act_row_stride_elems, w_payload, w_scales, out, m, n, k,
+                               stream, out_stride);
+    else
+      launch_fp8_blockwise_bf16(act, act_row_stride_elems, w_payload, w_scales, out, m, n, k,
+                                stream, out_stride);
     return;
   }
   // Large m: the 128-row tensor-core kernel (the MoE experts'

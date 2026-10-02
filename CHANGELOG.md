@@ -6,6 +6,144 @@ The history by milestone. The dated engineering record in
 
 ## Unreleased
 
+- **DFlash2 verify graph is the shipped default; level `0` is the eager
+  opt-out** (2026-10-02): a default-knob sweep found the previous "eager
+  batch is the default" reading was wrong — `step_batch` graphed the
+  multi-slot verify batch at *every* level (levels 0 and 1 were
+  identical), so last pass's "eager vs graph" numbers were graph-vs-
+  graph. Level `0` now means the true packed eager batch (the `want_graph`
+  condition gained a `graph_level >= 1` gate) and the default is `1`
+  (the multi-slot graph): re-measured against the real eager path
+  (`DGPP_DFLASH2_BATCH_EAGER=1`), the graph ties it at 8K c4 (14.9 vs
+  14.8–14.9) and leads it at short-context c4/c8 (~54–55 vs ~51 agg tg,
+  within that harness's run-to-run variance), never slower — so it is
+  the measured-best default. The single-slot graph (level `2`) stays off
+  by default: it is the slowest c1 option (20.1 vs the scalar path's
+  24.2), and the 2-slot gate in `step_batch` keeps C1 on the scalar path
+  (bit-exact 12/12 re-confirmed after the change). Batched redrafts stay
+  default-on (14.9 vs 14.3 off at 8K c4), the full verify block stays
+  default (`DGPP_DFLASH2_DEPTH=k` caps lose 14.9 → 14.4 @ k=4 → 13.2 @
+  k=2 at 8K c4), and per-slot top-1 stays default over walk (~1.2 vs
+  4.4–6.0 tok/pass). Nothing performance-relevant is opt-in on this
+  lane; the env gates remain bisection/diagnostic tools. Docs: mtp.md
+  "default knob sweep".
+- **Wide-row GEMM dispatch for the stacked verify/draft** (2026-10-02):
+  `CublasLtGemm::set_decode_mma` gains a min-rows bound and
+  `qwen_configure_gemm_rows` opts the wide decode into it
+  (`set_decode_mma(wide_decode, 17, kMmaGemvMaxRowsPerLaunch)`): a
+  stacked batch of 17..128 BF16 rows now takes the streaming
+  tensor-core GEMM (`mma_gemv.hpp`, the weights read once for every
+  row of the launch) instead of the kernel-only 4-row GEMV chunks that
+  re-read each weight once per chunk — eight times at the 32-row c4
+  batch. The 8K profile's draft phase (260 ms of a 466 ms c4 pass) was
+  exactly that re-reading: the BF16 5.8 GB `z-lab/Qwen3.8-27B-DFlash2`
+  drafter took the kernel-only band while the FP8 target was already
+  single-read through the scale-GEMM streaming form (the profile's
+  "400 eight-row MMA GEMVs" were misnamed — that kernel's `(int)8` is
+  its 128-row tile, and those launches are the target's FP8 prefill
+  chunks; the decode waste was the `bf16_gemv_kernel<4>` family).
+  Measured: the 8K draft phase drops 260 → 92 ms/pass (verify
+  195 → 192, already single-read) and the same-workload 8K
+  head-to-head flips to dflash 14.9 / 13.2 / 12.2 agg tg at
+  c4/c2/c1 against MTP's 14.8 / 12.7 / 7.6 — the plan §7 exit gate,
+  met at every concurrency tried; short-context c4 goes 36 →
+  53.8–56.0 agg tg and c8 lands at 56.9. The band's edges are the
+  numerics boundary: m ≤ 16 keeps its dispatch (GEMV at 1..4, Lt at
+  5..16), so C1 stays bit-exact 12/12, eager and graph replay alike,
+  and c2 is unchanged; c4 moves into the documented tolerance-equal
+  cross-dispatch class. The kernel-only band stays as the shape guard
+  and fallback, and its 64-row top extends to the mma's 128 (the c8/c16
+  batches previously fell to sixteen GEMV chunks / the Lt algorithm).
+  New `DGPP_MMA_TRACE=n` prints the first n shape decisions of every
+  dense-GEMM dispatch (mma form / GEMV chunks / Lt / scale-GEMV rows)
+  for the bisection.
+- **The DFlash2 verify rides a captured CUDA graph** (2026-10-02):
+  `DGPP_DFLASH2_VERIFY_GRAPH=1` replays the multi-slot verify batch as
+  one static 8/16/32-row graph (`session_verify_batch_graph`, keyed per
+  row size; `=2` adds the lone slot's 8-row capture, `=3` runs the same
+  static padded staging eagerly as the bisection control). Every slot's
+  fed rows are padded to a full 8-row block; the kernels are
+  row-independent for compute and skip position -1 for every state
+  write, so real rows read back the eager batch's. One capture bug:
+  the drafter's context-K/V feed (`dflash2_store_features`) was gated
+  `!run.capture`, so a replay starved the draft planes of the verify
+  rows' context and acceptance decayed within a request (the c4 graph
+  sat at 1.3–1.6 tok/pass against the eager batch's 4.5–6; feeding the
+  planes inside the graph restored 4.2–4.9 and made the graph the
+  fastest path: 35.9–36.1 vs 35.0–35.4 agg tg at c4, 35.9–39.0 vs
+  35.9–36.1 at c2). C1 stays bit-exact (12/12 transcripts); c2/c4
+  match the eager batch's documented near-tie class (graph-vs-eager
+  7–8/12 like eager-vs-eager 8/12). The 8K step profile
+  (`DGPP_DFLASH2_PHASES=1` splits fed/verify/commit/draft per pass):
+  the graph is neutral at length and the step's GEMM time sits in the
+  drafter's 4-row GEMV chunks (the wide-row GEMM dispatch entry above
+  is the follow-up). Default off at this entry (superseded the same
+  day — the multi-slot graph is now the shipped default, see the entry
+  above); the drafted verify is otherwise unchanged (drafts, judge,
+  rollback and redrafts stay eager between replays).
+- **The DFlash2 speculative pass batches across slots** (2026-10-01):
+  every arriving slot's verify rows ride one physical target pass
+  (`session_verify_batch`'s slot-major staging and per-slot rollback
+  bases; `step_batch`, a `floor(decode_rows/8)`-slot batch capacity, and
+  `serve` sizing the fixed batch to `max_concurrency x 8` clamped to the
+  family cap). C1 keeps the scalar kernel sequence bit-for-bit (a
+  single-slot batch takes the scalar path — 12/12 transcripts identical
+  to the pre-batch build); on the short-prompt harness the batched line
+  gives 25.7/41.3/52.4 agg tg at c1/c2/c4 against MTP depth-2's
+  14.4/32.6/47.3. Drafting under load, which sat flat at ~8 t/s at c4
+  against graph-MTP's 37, rides the graph era's batched decode kernels
+  from here.
+- **DFlash2 long-context levers (opt-in, serving validation pending)**
+  (2026-10-01): `DGPP_DFLASH2_DRAFT_BATCH=1` stacks the redrafts into one
+  block forward per step (row-wise GEMMs/norms/convs over S*8 rows;
+  per-slot attention/head/walk at row offsets); `DGPP_DFLASH2_DEPTH=k`
+  caps the verify width (exact transcripts). Host speculator halves
+  covered by `dflash2_speculator_test` (294/294 with unit_tests); the
+  device batch path is build-checked only. Measured 2026-10-01 on
+  tool-eval-bench: batch +5–9% at c4, no errors (now default-on,
+  opt out with `=0`); depth-5 τ 4.0 and throughput-neutral vs
+  depth-7 on sampled traffic. Headline fix the same day: the bench
+  was sampled all along (temp inherited from generation_config) —
+  with `temperature=0` dflash jumps +60–190% and beats graphed MTP
+  in every c1/c2 cell, ceding only c4.
+- **The DFlash2 block drafter on the Qwen3.5-family native engine**
+  (2026-10-01, plan §7): `engine.dflash_model` (or `--dflash-model`) serves
+  `z-lab/Qwen3.8-27B-DFlash2` — five bidirectional draft layers fed by
+  target taps `[5,19,33,47,61]`, 2-tap dynamic grouped convs and the
+  rank-256 top-16 selector — instead of the MTP draft (the two are
+  mutually exclusive; `mtp_depth` widened to 1–7 with `kSpecRows` 8 and
+  `kSpecMaxDrafts` 7, the DSpark block unchanged). The drafter rides the
+  main pool's five extra planes, the shared embed/lm head, the prefix
+  cache's lookahead and the greedy verify/rollback, so transcripts stay
+  exact; the recipe is eager world-1 (`decode_graph` off) and the graph
+  engine refuses capture with a drafter loaded. Kernel references in
+  `dflash2_kernels_test`, the config gates in `unit_tests`; the 12-prompt
+  greedy battery verifies 2.5–6.1 tok/pass per-slot top-1 (the shipped
+  proposal rule) against MTP depth-2's 2.3–2.82 — the exit gate, met on
+  every prompt tried. The reference chained selector walk is implemented
+  exactly but kept behind `DGPP_DFLASH2_WALK`: it verifies only ~1.2
+  here, an open parity question documented in mtp.md
+  (`deploy/cluster_qwen3.8-27b-fp8_w1_dflash2.example.json`).
+
+- **Serve Qwen3.8-27B-FP8 on the native engine, with MTP**
+  (2026-10-01): a new family, `qwen3_5` — the 27B dense model, 64 layers
+  of Gated-Delta-Net (48) and full-attention (16) — served from its native
+  blockwise-FP8 checkpoint `Qwen/Qwen3.8-27B-FP8`. The streaming loader
+  (`loader35`) reads the GDN in_proj (qkv/z) + out and the full-attention
+  q/k/v/o projections and the dense gate/up/down MLPs as blockwise FP8
+  (E4M3 + 128×128 scales), keeps the norms BF16, and loads the MTP draft
+  head (BF16) onto the last full-attention slot. `Qwen35Model` adds the
+  per-tensor FP8 prefill recipe (`DGPP_FP8_PT_DENSE`, Resident only —
+  every MLP and attention projection is boot-requantized into per-tensor
+  slots) and the blockwise-FP8 lm head (`DGPP_FP8_HEAD`) over the packed
+  decode batching. MTP speculative decoding (`engine.mtp` / `--mtp`)
+  drafts on the MTP head and verifies/rolls back on the shared greedy
+  path, so transcripts stay exact. Recipe
+  `deploy/cluster_qwen3.8-27b-fp8_w1_mtp2.example.json` (plain:
+  `..._w1.example.json`); kernel references in `qwen_full_attn_test` /
+  `full_attn_test` / `qwen_norm_test`, the config gates in
+  `qwen35_config_test`, and the loader smoke in `qwen35_loader_smoke`.
+
 - **W4A4 NVFP4 expert prefill is opt-in** (2026-10-01): default to
   W4A16 with BF16 activations; `DGPP_MOE_W4A4=1` explicitly enables
   activation quantization and its workspace. PR #50 reported kernel,

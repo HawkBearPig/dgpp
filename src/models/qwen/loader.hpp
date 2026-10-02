@@ -92,6 +92,22 @@ struct QwenQsaResident {
   int kv_head_begin = 0;    // first global kv head
 };
 
+// Qwen3.5 full-attention layers: plain GQA (no indexer). Same q/k/v/o +
+// q/k norms as QSA, the [q | gate] interleave, dense causal attention.
+struct QwenFullAttnResident {
+  const uint16_t* q_proj = nullptr;  // BF16 [lh * 2 * d, hidden]
+  const uint16_t* k_proj = nullptr;  // BF16 [lkv * d, hidden]
+  const uint16_t* v_proj = nullptr;  // BF16 [lkv * d, hidden]
+  const uint16_t* o_proj = nullptr;  // BF16 [hidden, lh * d] (packed columns)
+  const uint16_t* q_norm = nullptr;  // BF16 [d]
+  const uint16_t* k_norm = nullptr;  // BF16 [d]
+  GlmQuantMatrix q_proj_fp8, k_proj_fp8, v_proj_fp8, o_proj_fp8;  // dense_weights fp8
+  int local_heads = 0;      // query heads on this rank
+  int head_begin = 0;       // first global query head
+  int local_kv_heads = 0;   // kv heads on this rank
+  int kv_head_begin = 0;    // first global kv head
+};
+
 struct QwenMoeResident {
   const uint16_t* router = nullptr;       // BF16 [E, hidden]
   const uint16_t* shared_gate = nullptr;  // BF16 [1, hidden]

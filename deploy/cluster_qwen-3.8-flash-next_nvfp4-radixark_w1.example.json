@@ -2,7 +2,7 @@
   "model": "RadixArk/Qwen3.8-Flash-Next-NVFP4",
   "world_size": 1,
   "engine": {
-    "max_concurrency": 4,
+    "max_concurrency": 8,
     "kv_capacity": 262144,
     "kv_dtype": "bf16",
     "bf16_weights": "bf12+bf16",

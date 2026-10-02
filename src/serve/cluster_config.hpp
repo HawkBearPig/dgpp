@@ -159,8 +159,13 @@ struct ClusterConfig {
     bool compact_batches = false;
     bool decode_graph = false;
     bool mtp = false;
-    int mtp_depth = 1;             // draft tokens per step (1..5); needs mtp
+    int mtp_depth = 1;             // draft tokens per step (1..7); needs mtp
     bool mtp_depth_set = false;    // the file named it (else a family may default it: DSpark's block is 5)
+    // The DFlash2 block drafter (Qwen3.5-family, eager path only): a
+    // checkpoint directory or HF id whose config.json names the drafter.
+    // Replaces mtp (mutually exclusive); the draft width is the
+    // checkpoint's block_size - 1.
+    std::string dflash_model = "";
     // The confidence-scheduled verify depth (engine/verify_schedule.hpp,
     // 2026-09-14; needs mtp and a family with a confidence head — DSpark):
     // a step verifies only the leading drafts whose prefix survival beats

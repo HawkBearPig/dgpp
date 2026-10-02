@@ -493,6 +493,22 @@ void launch_decode(const uint16_t* a, size_t act_stride, const void* w, const fl
     launch_decode_form<kTiles, kFp8, 1, OutT>(a, act_stride, w, scales, o, rows, n, k, out_stride, rs, cs, stream, ws, ws_bytes);
 }
 
+// DGPP_MMA_TRACE=n: print the first n shape decisions (the dispatch
+// bisection log: which (m, n, k) lands on which tiles form).
+static int g_mma_trace_budget() {
+  static const int v = [] {
+    const char* e = std::getenv("DGPP_MMA_TRACE");
+    if (!e || !*e || *e == '0') return 0;
+    return std::atoi(e) > 0 ? std::atoi(e) : 64;
+  }();
+  return v;
+}
+static int& g_mma_trace_left() {
+  static int v = -1;  // -1: not yet read from the budget
+  if (v < 0) v = g_mma_trace_budget();
+  return v;
+}
+
 template <bool kFp8, typename OutT>
 void launch(const uint16_t* act, size_t act_stride, const void* w, const float* scales, OutT* out,
             int m, int n, int k, size_t out_stride, int rs, int cs, cudaStream_t stream, void* ws = nullptr,
@@ -510,6 +526,13 @@ void launch(const uint16_t* act, size_t act_stride, const void* w, const float* 
     const int rows = std::min(kMmaGemvMaxRowsPerLaunch, m - row0);
     const uint16_t* a = act + static_cast<size_t>(row0) * act_stride;
     OutT* o = out + static_cast<size_t>(row0) * out_stride;
+    if (g_mma_trace_left() > 0) {
+      --g_mma_trace_left();
+      std::fprintf(stderr, "mma_trace fp8=%d out=%s m=%d n=%d k=%d tiles=%d\n",
+                   static_cast<int>(kFp8), std::is_same<OutT, float>::value ? "f32" : "bf16", m, n, k,
+                   rows <= 16 ? 1 : rows <= 32 ? 2 : rows <= 64 ? 4 : 8);
+      std::fflush(stderr);
+    }
     if (rows <= 16)
       launch_decode<1, kFp8, OutT>(a, act_stride, w, scales, o, rows, n, k, out_stride, rs, cs, stream, ws, ws_bytes);
     else if (rows <= 32)

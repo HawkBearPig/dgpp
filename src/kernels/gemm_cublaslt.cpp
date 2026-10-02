@@ -54,6 +54,7 @@ struct CublasLtGemm::Impl {
   int decode_rows = kGemmDecodeRowsDefault;  // the decode lowering bound (set_decode_rows)
   int kernel_only_min_rows = 0, kernel_only_max_rows = 0;
   bool decode_mma = false;                   // the lowering's tensor-core form (set_decode_mma)
+  int decode_mma_min_rows = 1;               // narrower calls keep their dispatch (set_decode_mma)
   int decode_mma_max_rows = 0;               // its bound (0: every row count)
   int plan_rows = 0;                         // the Lt algorithm's row count (set_plan_rows)
   bool bf12_wide = false;                    // companions take 5..8-row calls too (set_bf12_wide)
@@ -376,13 +377,17 @@ void CublasLtGemm::set_kernel_only_rows(int min_rows, int max_rows) {
   impl_->kernel_only_max_rows = max_rows;
 }
 
-void CublasLtGemm::set_decode_mma(bool on, int max_rows) {
+void CublasLtGemm::set_decode_mma(bool on, int min_rows, int max_rows) {
+  if (min_rows < 1) throw std::invalid_argument("CublasLtGemm::set_decode_mma: min_rows < 1");
   if (max_rows < 0) throw std::invalid_argument("CublasLtGemm::set_decode_mma: negative bound");
+  if (max_rows > 0 && min_rows > max_rows)
+    throw std::invalid_argument("CublasLtGemm::set_decode_mma: min_rows above max_rows");
   if (on)
     for (const auto& [weight, e] : impl_->bf12)
       if (e.released)
         throw std::logic_error("CublasLtGemm::set_decode_mma: a released bf16 weight cannot take the tensor-core form");
   impl_->decode_mma = on;
+  impl_->decode_mma_min_rows = min_rows;
   impl_->decode_mma_max_rows = max_rows;
 }
 bool CublasLtGemm::decode_mma() const { return impl_->decode_mma; }
@@ -492,7 +497,7 @@ void CublasLtGemm::matmul(const void* act, const void* weight, void* out,
   // the rows sharing its launch, prefill included — the group prefill's
   // spans are bitwise their prefills alone (an Lt algorithm's split
   // changes with m). Long prefills pay a little on the small bf16 sites.
-  if (io_dtype == DType::BF16 && m >= 1 && impl_->decode_mma &&
+  if (io_dtype == DType::BF16 && m >= impl_->decode_mma_min_rows && impl_->decode_mma &&
       (impl_->decode_mma_max_rows == 0 || m <= impl_->decode_mma_max_rows) &&
       mma_gemv_shape_ok(static_cast<const uint16_t*>(weight), static_cast<const uint16_t*>(act),
                         act_row_stride, m, k)) {
@@ -528,6 +533,24 @@ void CublasLtGemm::matmul(const void* act, const void* weight, void* out,
     for (int row0 = 0; row0 < m;) {
       const int rows = packed != nullptr ? std::min(kBf12MaxRows, m - row0)
                                          : gemv_chunk_rows(weight, m - row0, k);
+    if (row0 == 0) {
+      static int trace_left = -1;  // the DGPP_MMA_TRACE budget, read once
+      if (trace_left < 0) {
+        const char* e = std::getenv("DGPP_MMA_TRACE");
+        trace_left = (e && *e && *e != '0') ? (std::atoi(e) > 0 ? std::atoi(e) : 64) : 0;
+      }
+      if (trace_left > 0) {
+        --trace_left;
+        int n_chunks = 0;
+        for (int r = 0; r < m;) {
+          r += packed != nullptr ? std::min(kBf12MaxRows, m - r) : gemv_chunk_rows(weight, m - r, k);
+          ++n_chunks;
+        }
+        std::fprintf(stderr, "gemm_chunk m=%d n=%d k=%d rows=%d chunks=%d packed=%d\n", m, n, k,
+                     rows, n_chunks, static_cast<int>(packed != nullptr));
+        std::fflush(stderr);
+      }
+    }
       const uint16_t* xr = x + static_cast<size_t>(row0) * act_row_stride;
       uint8_t* yr = y + static_cast<size_t>(row0) * n * out_elem;
       if (packed != nullptr)
@@ -554,6 +577,19 @@ void CublasLtGemm::matmul(const void* act, const void* weight, void* out,
     impl_->lt_released(act, weight, *packed, out, m, out_dtype, act_row_stride, workspace, ws_bytes,
                        stream, p, chosen.algo);
     return;
+  }
+  {
+    static int trace_left = -1;  // the DGPP_MMA_TRACE budget, read once
+    if (trace_left < 0) {
+      const char* e = std::getenv("DGPP_MMA_TRACE");
+      trace_left = (e && *e && *e != '0') ? (std::atoi(e) > 0 ? std::atoi(e) : 64) : 0;
+    }
+    if (trace_left > 0) {
+      --trace_left;
+      std::fprintf(stderr, "gemm_lt m=%d n=%d k=%d dtype=%d\n", m, n, k,
+                   static_cast<int>(io_dtype));
+      std::fflush(stderr);
+    }
   }
   float alpha = 1.f, beta = 0.f;
   // Heuristic-selected algo + fixed layouts keep replays bitwise-stable in
@@ -607,6 +643,29 @@ void CublasLtGemm::matmul_linear_bf16(const uint16_t* act, const uint16_t* weigh
   DGPP_CUBLAS_OK(cublasLtMatmul(impl_->lt, p.desc, &alpha, weight, p.la, act, p.lb, &beta, out,
                                 p.ld, out, p.ld, &p.algo, workspace, ws_bytes, stream),
                  "BF16 linear");
+}
+
+void CublasLtGemm::matmul_fp8_scaled(const uint8_t* act, const uint8_t* weight,
+                                     const float* act_scale, const float* weight_scale,
+                                     uint16_t* out, int m, int n, int k, void* workspace,
+                                     size_t ws_bytes, cudaStream_t stream) {
+  if (m <= 0 || n <= 0 || k <= 0) throw std::invalid_argument("FP8 scaled matmul: invalid shape");
+  if (!act || !weight || !act_scale || !weight_scale || !out)
+    throw std::invalid_argument("FP8 scaled matmul: null pointer");
+  auto& p = impl_->get_plan(m, n, k, DType::F8_E4M3, GemmOut::BF16, k, workspace, ws_bytes);
+  // Per-call scales overwrite the plan-cached unit pointers (the
+  // matmul_linear_bf16 bias-pointer precedent): the heuristic's validity
+  // does not depend on the pointed-to values.
+  DGPP_CUBLAS_OK(cublasLtMatmulDescSetAttribute(p.desc, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER,
+                                                &weight_scale, sizeof(weight_scale)),
+                 "FP8 weight scale");
+  DGPP_CUBLAS_OK(cublasLtMatmulDescSetAttribute(p.desc, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER,
+                                                &act_scale, sizeof(act_scale)),
+                 "FP8 act scale");
+  const float alpha = 1.f, beta = 0.f;
+  DGPP_CUBLAS_OK(cublasLtMatmul(impl_->lt, p.desc, &alpha, weight, p.la, act, p.lb, &beta, out,
+                                p.ld, out, p.ld, &p.algo, workspace, ws_bytes, stream),
+                 "FP8 scaled matmul");
 }
 
 bool CublasLtGemm::ensure_plan(int m, int n, int k, DType io_dtype, GemmOut out_dtype,

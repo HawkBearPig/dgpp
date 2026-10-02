@@ -234,12 +234,18 @@ Scheduler::PrefixPlan Scheduler::plan_prefix(const Request& r) const {
   // the head cold (the replay: 18K tokens on each of 24 post-compaction
   // turns). Taken on the same walk as the deepest cut, under the same
   // floor, only on a family whose extra snapshots preserve the walk.
+  // A head within a few rows of the deep snap is redundant: any future
+  // prompt matching it matches the deeper entry too, so the head entry
+  // is never the attach point — but its chunk split still costs a full
+  // micro-walk (a 2-row middle chunk runs the whole stack, ~150ms). Skip
+  // heads closer than 256 rows below the deep snap (the trailing
+  // <|im_end|>/<|im_start|> marker pair of single-turn chat).
   if (policy_.prefix_head_snapshots && prefix_info_.body_snapshots) {
     for (const int64_t b : r.spec.boundaries) {
       const int64_t head = (b / align) * align;
       if (head <= 0) continue;  // the opening marker: no prefix before it
       if (head >= floor_tokens && head > plan.attach_position && head < plan.snap_position &&
-          head != plan.body_snap_position)
+          head != plan.body_snap_position && plan.snap_position - head >= 256)
         plan.head_snap_position = head;
       break;
     }
@@ -519,8 +525,14 @@ std::vector<int> Scheduler::admissible_group(int first, int64_t budget) {
     const int64_t P = static_cast<int64_t>(r.spec.prompt.size());
     if (P <= 0 || P > span_limit) return false;
     if (!cache_on(r)) return true;
+    // Grouped walks take no snapshots (each member's rows run as one span;
+    // no per-member chunk ends exist to snap at), so grouped prompts leave
+    // no arena entries. Groups only form under concurrent load — exactly
+    // when throughput beats future cache hits (at low load requests arrive
+    // alone and keep their snapshots). Attached requests still go solo:
+    // their resume needs the entry's slot.
     const PrefixPlan plan = plan_prefix(r);
-    return plan.attach_entry < 0 && plan.snap_position <= 0;
+    return plan.attach_entry < 0;
   };
   if (!groupable(requests_[static_cast<size_t>(first)])) return group;
   group.push_back(first);
@@ -603,7 +615,20 @@ void Scheduler::admit(int arrival) {
     // document cut for long prompts. The deepest cut gets an arena slot
     // first; a full arena may skip the extra snapshot.
     const PrefixPlan plan = plan_prefix(r);
-    const std::vector<int64_t> cuts = cut_boundaries(r);
+    std::vector<int64_t> cuts = cut_boundaries(r);
+    // A walk split exists to take a snapshot: a cut with no snapshot
+    // planned buys only a micro-walk (a 2-row middle chunk still runs a
+    // full 65-layer decode-row walk, ~150ms). Keep snapshot cuts only;
+    // lookups and entries (r.cuts) are untouched, so reuse is identical.
+    if (!cuts.empty()) {
+      const int64_t keep[] = {plan.snap_position, plan.body_snap_position, plan.head_snap_position};
+      cuts.erase(std::remove_if(cuts.begin(), cuts.end(),
+                                [&](int64_t c) {
+                                  return c > 0 && !std::any_of(std::begin(keep), std::end(keep),
+                                                              [&](int64_t k) { return k == c; });
+                                }),
+                 cuts.end());
+    }
     SchedulerEngine::PrefixPrefill pp;
     pp.boundaries = &cuts;
     pp.images = &r.spec.images;

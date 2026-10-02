@@ -357,11 +357,14 @@ parallel block prediction followed by lightweight candidate-path selection
 and local convolutions. Implement the released architecture and reference
 behavior rather than treating it as a generic small autoregressive model.
 
-I did not verify a target-matched DFlash2 checkpoint for
-Qwen3.8-Flash-Next. The Qwen3.8-27B drafter is for a different model.
-Checkpoint compatibility—or training a new drafter—is a prerequisite for
-that lane. Similarly, the [DeepSpec released checkpoint table](https://github.com/deepseek-ai/DeepSpec#released-checkpoints)
-does not establish a drop-in DSpark drafter for every dgpp model.
+The released `z-lab/Qwen3.8-27B-DFlash2` checkpoint is target-matched to
+Qwen/Qwen3.8-27B — its config names that base model — and is served by
+the native engine today
+(`deploy/cluster_qwen3.8-27b-fp8_w1_dflash2.example.json`,
+[mtp.md](mtp.md#the-dflash2-block-drafter-qwen35-family)). No
+target-matched drafter is established for Qwen3.8-Flash-Next or, from
+the [DeepSpec released checkpoint table](https://github.com/deepseek-ai/DeepSpec#released-checkpoints),
+for every dgpp model; each new lane needs its own checkpoint check.
 
 ### Implementation sequence
 
@@ -401,6 +404,101 @@ verification matches its distribution, and per-class end-to-end results
 beat the best native-MTP configuration at acceptable memory cost. High
 acceptance alone is not success. Exact speculation does not undo quality
 changes introduced by a different target quantization.
+
+### Status (2026-10-01, Qwen3.8-27B lane)
+
+Steps 3–6 are implemented for the Qwen3.5-family target
+(`src/models/qwen/dflash2.*`, `src/kernels/dflash2.*`, the `dflash2_*`
+methods of `Qwen35Model`, `DFlash2Speculator`): the drafter loads
+independently with its weights and planes in the memory plan, taps
+capture through the five `fc` slices with fp32 accumulation, the five
+draft layers run bidirectional sliding-window attention over pool
+planes with the 2-tap dynamic grouped convs, per-slot top-1 proposals
+verify 2.5–6.1 tok/pass against MTP depth-2's 2.3–2.8 (the reference
+chained selector walk is implemented exactly and kept behind
+`DGPP_DFLASH2_WALK`, but verifies only ~1.2 here — see mtp.md), and
+acceptance is the greedy verify/rollback of eight rows
+(`kSpecRows`/`kSpecMaxDrafts` generalized 6/5 → 8/7; the DSpark block
+is unchanged). The batched pass landed 2026-10-01: one physical target
+verify covers every arriving slot (`SessionModel::session_verify_batch`,
+slot-major rows and rollback bases; `EagerEngine::step_batch` caps the
+batch to `floor(decode_rows/8)` slots — four at the 32-row ceiling, the
+plan's K7 arithmetic — and a single-slot batch keeps the scalar kernel
+sequence bit-for-bit). Drafts stay per-slot. Sampled verification (the
+selector's conditional proposal) is open. The GLM-Flash lane (step
+2's mHC-tap capture) is untouched.
+
+Measured 2026-10-01 (Qwen3.8-27B-FP8, greedy, 12-prompt battery,
+max_tokens 128): the block's per-slot top-1 proposals verify 2.5–6.1
+tok/pass against MTP depth-2's 2.3–2.82 — the exit gate, met on every
+prompt tried. The reference chained selector walk (implemented exactly,
+kept behind `DGPP_DFLASH2_WALK`) verifies only ~1.2 here; either a
+vLLM cross-check shows the reference picks the same drafts here
+(head-domain behavior, proposal rule to revisit), or it picks better
+ones (our block outputs differ somewhere top-1 doesn't see).
+Transcripts match plain modulo single near-tie flips from
+width-dependent GEMM numerics (T=8 verify vs T=1 steps). Concurrency
+(2026-10-01): the batched speculative pass (one physical verify for
+every arriving slot, `floor(decode_rows/8)` slots per pass) replaces
+the flat ~8 t/s c4 line — same short-prompt harness gives dflash
+25.7/41.3/52.4 agg tg at c1/c2/c4 vs MTP depth-2's 14.4/32.6/47.3,
+with C1 transcripts 12/12 identical to the pre-batch build. The
+stacked redraft is default-on (opt out with
+`DGPP_DFLASH2_DRAFT_BATCH=0`); `DGPP_DFLASH2_DEPTH=k` stays opt-in.
+Measured 2026-10-01: batch +5–9% at c4 with no errors; depth-5 keeps
+τ 4.0 (80% window use). Headline correction the same day: the
+throughput bench's traffic was *sampled* (benchy omits temperature;
+the server inherits temp=1.0 from generation_config), so greedy-only
+spec never engaged on either lane — all older throughput numbers are
+sampled-plain decode, graphs vs eager. With `temperature=0` forced,
+dflash throughput jumps +60–190% and wins every c1/c2 cell vs
+graphed MTP (τ 4.5 vs ~2.5), ceding only c4, where graphs scale
+linearly. That lane closed 2026-10-02: `DGPP_DFLASH2_VERIFY_GRAPH=1`
+replays the batched verify as one static 8/16/32-row graph (the
+slots' fed rows padded to full 8-row blocks; the drafter's context
+K/V feed is a recorded node — first capture attempt starved the
+planes and decayed acceptance), with the C1 capture bit-exact and the
+graph the fastest path on that binary (35.9–36.1 vs 35.0–35.4 agg tg
+at c4 on the short-prompt harness; see mtp.md "batched graph capture
+with a drafter loaded"). A later default-knob sweep found that reading
+had been graph-vs-graph: the shipped default (`DGPP_DFLASH2_VERIFY_GRAPH`
+unset) had always graphed the multi-slot batch — levels 0 and 1 were
+identical — so those "eager" numbers were the graph. Making level `0` a
+true eager baseline and setting the default to `1` (the multi-slot
+graph), re-measured against the real eager path (`BATCH_EAGER=1`): the
+graph ties it at 8K c4 (14.9 vs 14.8–14.9) and leads it at
+short-context c4/c8 (~54–55 vs ~51 agg tg, within that harness's
+variance), never slower; the single-slot graph (level `2`) is the slowest
+c1 option (20.1 vs the scalar path's 24.2), so lone slots stay scalar.
+The rest of the sweep held: batched redrafts on (`DRAFT_BATCH`) 14.9 vs
+14.3 off at 8K c4; full verify depth 14.9 vs 14.4 (k=4) vs 13.2 (k=2);
+per-slot top-1 over walk (~1.2 tok/pass). Nothing performance-relevant
+is opt-in on this lane (mtp.md "default knob sweep").
+
+The 8K step profile (`DGPP_DFLASH2_PHASES=1` + nsys, 2026-10-02):
+466 ms/pass at c4 = verify 195 + draft 260 + host ~11; the graph is
+neutral at length (launches amortized), so the c4 gap to MTP there
+(12.9 vs 14.8 same-workload agg tg; dflash still wins c1, 12.1 vs
+7.8) sits in the draft block. The original kernel-sum read of that
+window was wrong (`mma_gemv_kernel<(int)8, …>` is the mma form's
+128-row tile, and those launches are the target's FP8 *prefill*
+chunks); the corrected diagnosis (2026-10-02, dispatch trace via
+`DGPP_MMA_TRACE`): the **BF16 drafter**'s wide GEMMs ran the
+kernel-only 4-row GEMV chunks — m=32 as eight 4-row launches, eight
+reads of the 5.8 GB of draft weights per pass — while the FP8 target
+was already single-read. The lever was then implemented the same day:
+`set_decode_mma(on, min_rows, max_rows)` plus the wide-decode opt-in
+in `qwen_configure_gemm_rows` (17..128 rows → the streaming mma form,
+one weight read; m ≤ 16 untouched, so C1 stays bit-exact 12/12, eager
+and graphed). Result: the 8K draft phase 260 → 92 ms/pass, and the
+same-workload head-to-head flips to **dflash 14.9 / 13.2 / 12.2 agg
+tg at c4/c2/c1 against MTP's 14.8 / 12.7 / 7.6** — the §7 exit gate
+("per-class end-to-end results beat the best native-MTP
+configuration") is now met at every concurrency tried on the Qwen
+lane (see mtp.md "wide-row GEMM dispatch"). Remaining in this lane:
+the vLLM walk-parity dump (open), sampled verification (open), and
+the c2 band (m=16 still Lt; the dsv41 table says Lt leads the mma
+form below ~16 rows, so leaving it is the conservative call).
 
 ## 8. P1 experiments / P3 implementation: remaining single-stream wins
 

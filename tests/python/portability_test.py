@@ -204,21 +204,30 @@ class PortabilityTest(unittest.TestCase):
             "deepseek-ai/DeepSeek-V4.1-Flash": "deepseek-v4.1-flash_mxfp4-fp8",
             "XiaomiMiMo/MiMo-V2.6-Flash-RL": "mimo-v2.6-flash_mxfp4-fp8",
             "Saren/Qwen3.8-Flash-Next-W4A16-AutoRound-hybrid-MTP_int4RTN": "qwen-3.8-flash-next_autoround-int4",
+            "Qwen/Qwen3.8-27B-FP8": "qwen3.8-27b-fp8",
         }
         values = {**site_env.DEFAULTS, "DGPP_NODES": "head peer1 peer2 peer3", "DGPP_SSH_USER": "ops"}
         templates = list((ROOT / "deploy").glob("*.example.json"))
         self.assertTrue(templates)
         index = (ROOT / "deploy/README.md").read_text()
         # One template per model, quant and world (2026-09-14): every template
-        # enables MTP with the decode graph; the shapes a template does not
+        # enables MTP with the decode graph, except a DFlash2-drafter variant
+        # (2026-10-01): it names engine.dflash_model instead of MTP and runs
+        # the eager world-1 path (no graph), the drafter replacing the MTP
+        # draft one-for-one; the shapes a template does not
         # name are boot knobs, listed in the catalogue.
         seen = set()
         for path in templates:
             with self.subTest(path=path.name):
                 cfg = json.loads(path.read_text())
                 engine = cfg["engine"]
-                self.assertTrue(engine["mtp"], "every template enables MTP (the plain world is --no-mtp)")
-                self.assertTrue(engine["decode_graph"])
+                drafter = bool(engine.get("dflash_model"))
+                if drafter:
+                    self.assertFalse(engine["mtp"], "a drafter template replaces MTP, not both")
+                    self.assertFalse(engine["decode_graph"], "the drafter is the eager path")
+                else:
+                    self.assertTrue(engine["mtp"], "every template enables MTP (the plain world is --no-mtp)")
+                    self.assertTrue(engine["decode_graph"])
                 # The name is the shape: cluster_<model>_<quant>_w<n>, with an
                 # optional trailing _<variant> for a template that deviates from
                 # that shape in one documented engine setting (today the Qwen
