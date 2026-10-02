@@ -80,6 +80,7 @@
 #include "models/glm/gen_engine.hpp"
 #include "models/qwen/config.hpp"
 #include "models/qwen/forward.hpp"
+#include "models/qwen/model35.hpp"
 #include "models/glm4/config.hpp"
 #include "models/glm4/forward.hpp"
 #include "models/glm_dsa/config.hpp"
@@ -767,6 +768,68 @@ struct MimoFamily final : ServeFamily {
   }
 };
 
+// Qwen3.5-27B dense family (FP8 text-only, bf16 K/V pool, no MTP/graph drafts).
+struct Qwen35Family final : ServeFamily {
+  dgpp::Qwen35TextConfig cfg;
+  std::string ckpt;
+  std::vector<int64_t> eos_;
+  std::unique_ptr<dgpp::Qwen35Model> model;
+  Qwen35Family(const std::string& checkpoint)
+      : cfg(dgpp::Qwen35TextConfig::from_json_file((fs::path(checkpoint) / "config.json").string())),
+        ckpt(checkpoint) {
+    if (cfg.eos_token_ids.empty())
+      throw std::invalid_argument("Qwen3.5: the config names no EOS token");
+    for (int64_t id : cfg.eos_token_ids) eos_.push_back(id);
+  }
+  const char* name() const override { return "qwen3_5"; }
+  int64_t vocab_size() const override { return cfg.vocab_size; }
+  const std::vector<int64_t>& eos_token_ids() const override { return eos_; }
+  int64_t block_tokens() const override { return dgpp::Qwen35Model::kv_block_tokens_static(); }
+  int prefill_chunk_tokens() const override { return dgpp::Qwen35Model::prefill_chunk_tokens(); }
+  std::string pool_check(int64_t) const override { return ""; }
+  const char* kv_format_name() const override { return "bf16"; }
+  int decode_rows_cap() const override { return dgpp::Qwen35Model::decode_rows_cap(); }
+  size_t lat_slot_bytes(int decode_rows) const override {
+    return static_cast<size_t>(decode_rows) * static_cast<size_t>(cfg.hidden_size) * 2;
+  }
+  dgpp::MemoryPlan plan(int forward_rows, int64_t context, int rank, int world_, bool fabric, int slots,
+                        bool mtp, int decode_rows) const override {
+    return dgpp::Qwen35Model::plan_memory(cfg, forward_rows, context, fabric ? rank : 0, fabric ? world_ : 1,
+                                          fabric ? dgpp::LoaderResidency::Resident : dgpp::LoaderResidency::Streaming,
+                                          slots, fabric && mtp, decode_rows);
+  }
+  size_t snapshot_bytes(int world_, bool mtp) const override {
+    return dgpp::Qwen35Model::session_snapshot_bytes(cfg, world_, mtp);
+  }
+  void build_model(dgpp::BoundaryReducer* reducer, int rank, int world_, bool fabric, int forward_rows,
+                   int64_t pool_tokens, int slots, bool mtp, int decode_rows) override {
+    model = std::make_unique<dgpp::Qwen35Model>(
+        cfg, ckpt, forward_rows, pool_tokens,
+        fabric ? dgpp::LoaderResidency::Resident : dgpp::LoaderResidency::Streaming, reducer, fabric ? rank : 0,
+        fabric ? world_ : 1, slots, decode_rows, fabric && mtp);
+  }
+  void destroy_model() override { model.reset(); }
+  size_t model_snapshot_bytes() const override { return model ? model->session_snapshot_bytes() : 0; }
+  std::unique_ptr<ServeGraphEngine> make_graph_engine(dgpp::net::CollectiveBus* bus, int rank,
+                                                      int world_, uint16_t* pick_scratch,
+                                                      int batch_min_live, uint16_t* prefix_scratch,
+                                                      uint16_t* gather_scratch, int candidates,
+                                                      const dgpp::text::GrammarVocab* grammar,
+                                                      int prefix_slots, int mtp_depth,
+                                                      bool compact_batches) override {
+    return std::make_unique<ServeGraphEngineOf<dgpp::Qwen35Model>>(
+        model.get(), bus, rank, world_, pick_scratch, cfg.vocab_size, /*pick_timeout_ms=*/60000,
+        batch_min_live, prefix_scratch, gather_scratch, candidates, grammar, prefix_slots,
+        mtp_depth, compact_batches);
+  }
+  std::unique_ptr<dgpp::sched::SchedulerEngine> make_eager_engine(
+      int slots, dgpp::DecodePick pick, dgpp::DecodeSample sample, const dgpp::text::GrammarVocab* grammar,
+      int prefix_slots) override {
+    return std::make_unique<dgpp::EagerEngineAdapter<dgpp::Qwen35Model>>(
+        model.get(), slots, std::move(pick), std::move(sample), grammar, prefix_slots);
+  }
+};
+
 std::unique_ptr<ServeFamily> make_family(const std::string& ckpt, int world,
                                          dgpp::LatentFormat kv_format,
                                          const std::optional<dgpp::RopeScaling>& rope_scaling,
@@ -777,6 +840,7 @@ std::unique_ptr<ServeFamily> make_family(const std::string& ckpt, int world,
   if (arch == dgpp::ModelArchitecture::MimoV2) return std::make_unique<MimoFamily>(ckpt, kv_format);
   if (arch == dgpp::ModelArchitecture::Qwen4Exp)
     return std::make_unique<QwenFamily>(ckpt, rope_scaling, fp8_head_mma);
+  if (arch == dgpp::ModelArchitecture::Qwen3_5) return std::make_unique<Qwen35Family>(ckpt);
   if (arch == dgpp::ModelArchitecture::Glm4Moe) return std::make_unique<Glm4Family>(ckpt);
   if (arch == dgpp::ModelArchitecture::GlmMoeDsa) return std::make_unique<GlmDsaFamily>(ckpt, world, kv_format);
   return std::make_unique<GlmFamily>(ckpt, world, kv_format);

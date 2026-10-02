@@ -129,6 +129,17 @@ class CublasLtGemm : public IGemm {
                         uint16_t* out, int m, int n, int k, void* workspace, size_t ws_bytes,
                         cudaStream_t stream);
 
+  // E4M3 x E4M3 with per-call scalar scales (F32 device pointers) and BF16
+  // output. Same D[M,N] = Act[M,K] x W[N,K]^T convention; `weight` holds
+  // X/448 codes, `act_scale`/`weight_scale` the two grid maxabs values.
+  // Reuses the cached F8 plan (its unit-scale pointers are overwritten per
+  // call, the bias-pointer precedent) — the caller must have run
+  // ensure_plan(m, n, k, F8_E4M3, BF16, ...) first.
+  void matmul_fp8_scaled(const uint8_t* act, const uint8_t* weight,
+                         const float* act_scale, const float* weight_scale,
+                         uint16_t* out, int m, int n, int k, void* workspace,
+                         size_t ws_bytes, cudaStream_t stream);
+
   size_t query_workspace_bytes(int m, int n, int k, DType io_dtype) override;
 
   bool ensure_plan(int m, int n, int k, DType io_dtype, GemmOut out_dtype,

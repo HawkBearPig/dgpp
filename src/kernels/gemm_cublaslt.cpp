@@ -609,6 +609,29 @@ void CublasLtGemm::matmul_linear_bf16(const uint16_t* act, const uint16_t* weigh
                  "BF16 linear");
 }
 
+void CublasLtGemm::matmul_fp8_scaled(const uint8_t* act, const uint8_t* weight,
+                                     const float* act_scale, const float* weight_scale,
+                                     uint16_t* out, int m, int n, int k, void* workspace,
+                                     size_t ws_bytes, cudaStream_t stream) {
+  if (m <= 0 || n <= 0 || k <= 0) throw std::invalid_argument("FP8 scaled matmul: invalid shape");
+  if (!act || !weight || !act_scale || !weight_scale || !out)
+    throw std::invalid_argument("FP8 scaled matmul: null pointer");
+  auto& p = impl_->get_plan(m, n, k, DType::F8_E4M3, GemmOut::BF16, k, workspace, ws_bytes);
+  // Per-call scales overwrite the plan-cached unit pointers (the
+  // matmul_linear_bf16 bias-pointer precedent): the heuristic's validity
+  // does not depend on the pointed-to values.
+  DGPP_CUBLAS_OK(cublasLtMatmulDescSetAttribute(p.desc, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER,
+                                                &weight_scale, sizeof(weight_scale)),
+                 "FP8 weight scale");
+  DGPP_CUBLAS_OK(cublasLtMatmulDescSetAttribute(p.desc, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER,
+                                                &act_scale, sizeof(act_scale)),
+                 "FP8 act scale");
+  const float alpha = 1.f, beta = 0.f;
+  DGPP_CUBLAS_OK(cublasLtMatmul(impl_->lt, p.desc, &alpha, weight, p.la, act, p.lb, &beta, out,
+                                p.ld, out, p.ld, &p.algo, workspace, ws_bytes, stream),
+                 "FP8 scaled matmul");
+}
+
 bool CublasLtGemm::ensure_plan(int m, int n, int k, DType io_dtype, GemmOut out_dtype,
                                size_t act_row_stride) {
   // Callers must hand a workspace sized by query_workspace_bytes(); pass our

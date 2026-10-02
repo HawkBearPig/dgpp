@@ -165,6 +165,7 @@ add_library(dgpp_kernels STATIC
   src/kernels/dsa.cu
   src/kernels/fp8_dequant.cu
   src/kernels/fp8_gemm.cu
+  src/kernels/fp8_blockwise_dense.cu
   src/kernels/fp4_gemv.cu
   src/kernels/packq_gemv.cu
   src/kernels/packq_gemm.cu
@@ -196,6 +197,7 @@ add_library(dgpp_kernels STATIC
   src/kernels/qsa.cu
   src/kernels/qsa_warp.cu
   src/kernels/qsa_prefill.cu
+  src/kernels/full_attn.cu
   src/kernels/glm4_attn.cu
   src/kernels/mimo_attn.cu
   src/kernels/mimo_mtp_history.cu
@@ -385,6 +387,8 @@ dgpp_set_common(dgpp_models_dsv41_layers)
 add_library(dgpp_models_qwen STATIC
   src/models/qwen/config.cpp
   src/models/qwen/binding.cpp
+  src/models/qwen/config35.cpp
+  src/models/qwen/binding35.cpp
   src/models/qwen/gdn_reference.cpp
   src/models/qwen/norm_reference.cpp
   src/models/qwen/gr_reference.cpp
@@ -398,7 +402,8 @@ dgpp_set_common(dgpp_models_qwen)
 # TP geometry, plus the n-gram table's own residency.
 add_library(dgpp_models_qwen_loader STATIC
   src/models/qwen/vision.cpp
-  src/models/qwen/loader.cpp)
+  src/models/qwen/loader.cpp
+  src/models/qwen/loader35.cpp)
 target_include_directories(dgpp_models_qwen_loader PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(dgpp_models_qwen_loader PUBLIC dgpp_models_qwen dgpp_loaders dgpp_kernels CUDA::cudart dgpp_device_ranges)
 dgpp_set_common(dgpp_models_qwen_loader)
@@ -409,7 +414,9 @@ add_library(dgpp_models_qwen_layers STATIC
   src/models/qwen/moe_reference.cpp
   src/models/qwen/layers.cpp
   src/models/qwen/kv_pool.cpp
-  src/models/qwen/forward.cpp)
+  src/models/qwen/forward.cpp
+  src/models/qwen/model35.cpp
+  src/models/qwen/model35_kernels.cu)
 target_include_directories(dgpp_models_qwen_layers PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(dgpp_models_qwen_layers
   PUBLIC dgpp_models_qwen dgpp_models_qwen_loader dgpp_models_moe dgpp_models_glm dgpp_kernels CUDA::cudart)
@@ -756,6 +763,8 @@ add_executable(unit_tests
   tests/unit/qwen_config_test.cpp
   tests/unit/qwen_image_stage_test.cpp
   tests/unit/qwen_binding_test.cpp
+  tests/unit/qwen35_config_test.cpp
+  tests/unit/qwen35_binding_test.cpp
   tests/unit/qwen_rope_scaling_test.cpp
   tests/unit/glm4_config_test.cpp
   tests/unit/glm4_binding_test.cpp
@@ -1135,6 +1144,22 @@ target_include_directories(glm4_attn_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/sr
 target_link_libraries(glm4_attn_test PRIVATE dgpp_models_glm4 dgpp_kernels CUDA::cudart Threads::Threads)
 dgpp_set_common(glm4_attn_test)
 add_test(NAME glm4_attn_test COMMAND glm4_attn_test)
+
+add_executable(full_attn_test tests/cuda/full_attn_test.cu)
+target_include_directories(full_attn_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
+target_link_libraries(full_attn_test PRIVATE dgpp_kernels CUDA::cudart Threads::Threads)
+dgpp_set_common(full_attn_test)
+add_test(NAME full_attn_test COMMAND full_attn_test)
+add_executable(qwen_full_attn_test tests/cuda/qwen_full_attn_test.cpp)
+target_include_directories(qwen_full_attn_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
+target_link_libraries(qwen_full_attn_test PRIVATE dgpp_models_qwen_layers dgpp_models_qwen dgpp_kernels CUDA::cudart Threads::Threads)
+dgpp_set_common(qwen_full_attn_test)
+add_test(NAME qwen_full_attn_test COMMAND qwen_full_attn_test)
+
+add_executable(qwen35_loader_smoke tests/cuda/qwen35_loader_smoke.cpp)
+target_include_directories(qwen35_loader_smoke PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
+target_link_libraries(qwen35_loader_smoke PRIVATE dgpp_models_qwen_loader dgpp_models_qwen dgpp_kernels CUDA::cudart Threads::Threads)
+dgpp_set_common(qwen35_loader_smoke)
 
 add_executable(mimo_attn_test tests/cuda/mimo_attn_test.cu)
 target_include_directories(mimo_attn_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)

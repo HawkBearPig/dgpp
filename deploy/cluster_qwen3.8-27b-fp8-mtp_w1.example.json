@@ -1,28 +1,22 @@
 {
-  "model": "RadixArk/Qwen3.8-Flash-Next-NVFP4",
+  "model": "Qwen/Qwen3.8-27B-FP8",
   "world_size": 1,
   "engine": {
     "max_concurrency": 8,
     "kv_capacity": 262144,
     "kv_dtype": "bf16",
-    "bf16_weights": "bf12+bf16",
-    "ngram_table": "mmap",
     "default_max_tokens": 32768,
     "queue_limit": 8,
     "max_connections": 64,
     "decode_graph": true,
     "mtp": true,
     "mtp_depth": 2,
-    "prefix_cache_gib": 3,
+    "prefix_cache_gib": 1.5,
     "admission": "grow",
     "admission_window": 256,
-    "model_alias": "Qwen3.8-Flash-Next",
+    "model_alias": "Qwen3.8-27B",
     "sampling_candidates": 128,
-    "stats_interval_s": 1,
-    "dense_weights": "fp8",
-    "mtp_expert_format": "bf16_fused",
-    "prefill_idle_budget_tokens": 4096,
-    "prefill_budget_tokens": 4096
+    "stats_interval_s": 1
   },
   "paths": {
     "resident_cache": ""

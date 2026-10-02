@@ -6,6 +6,25 @@ The history by milestone. The dated engineering record in
 
 ## Unreleased
 
+- **Serve Qwen3.8-27B-FP8 on the native engine, with MTP**
+  (2026-10-01): a new family, `qwen3_5` — the 27B dense model, 64 layers
+  of Gated-Delta-Net (48) and full-attention (16) — served from its native
+  blockwise-FP8 checkpoint `Qwen/Qwen3.8-27B-FP8`. The streaming loader
+  (`loader35`) reads the GDN in_proj (qkv/z) + out and the full-attention
+  q/k/v/o projections and the dense gate/up/down MLPs as blockwise FP8
+  (E4M3 + 128×128 scales), keeps the norms BF16, and loads the MTP draft
+  head (BF16) onto the last full-attention slot. `Qwen35Model` adds the
+  per-tensor FP8 prefill recipe (`DGPP_FP8_PT_DENSE`, Resident only —
+  every MLP and attention projection is boot-requantized into per-tensor
+  slots) and the blockwise-FP8 lm head (`DGPP_FP8_HEAD`) over the packed
+  decode batching. MTP speculative decoding (`engine.mtp` / `--mtp`)
+  drafts on the MTP head and verifies/rolls back on the shared greedy
+  path, so transcripts stay exact. Recipe
+  `deploy/cluster_qwen3.8-27b-fp8_w1_mtp2.example.json` (plain:
+  `..._w1.example.json`); kernel references in `qwen_full_attn_test` /
+  `full_attn_test` / `qwen_norm_test`, the config gates in
+  `qwen35_config_test`, and the loader smoke in `qwen35_loader_smoke`.
+
 - **W4A4 NVFP4 expert prefill is opt-in** (2026-10-01): default to
   W4A16 with BF16 activations; `DGPP_MOE_W4A4=1` explicitly enables
   activation quantization and its workspace. PR #50 reported kernel,
