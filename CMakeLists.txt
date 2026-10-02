@@ -733,6 +733,7 @@ add_executable(unit_tests
   tests/unit/log_test.cpp
   tests/unit/process_memory_test.cpp
   tests/unit/minijson_test.cpp
+  tests/unit/prometheus_test.cpp
   tests/unit/utf8_test.cpp
   tests/unit/arena_test.cpp
   tests/unit/safetensors_test.cpp
@@ -868,7 +869,9 @@ add_library(dgpp_serve STATIC
   src/serve/http_server.cpp
   src/serve/generation_service.cpp
   src/serve/fabric_serve.cpp
-  src/serve/serve_stats.cpp)
+  src/serve/serve_stats.cpp
+  src/serve/prometheus.cpp
+  src/serve/rank_metrics.cpp)
 target_link_libraries(dgpp_serve
   PUBLIC dgpp_core dgpp_models_glm dgpp_loaders dgpp_net Threads::Threads)
 dgpp_set_common(dgpp_serve)

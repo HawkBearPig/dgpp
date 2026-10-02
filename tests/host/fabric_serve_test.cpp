@@ -43,6 +43,7 @@
 #include "serve/fabric_serve.hpp"
 #include "serve/generation_service.hpp"
 #include "serve/http_server.hpp"
+#include "serve/rank_metrics.hpp"
 
 namespace {
 
@@ -835,6 +836,9 @@ struct PeerRig {
   std::thread thread;
   std::string error;  // empty = the peer never complained
   std::atomic<bool> warmed{false};  // held at and released by the warm record
+  // The peer's metrics listener, as dgpp-serve runs it with ports.metrics
+  // (an ephemeral port on loopback here).
+  std::unique_ptr<dgpp::serve::RankMetricsServer> metrics;
   // The failure gates: `block` holds the peer's engine inside an op (the
   // in-tick case); `death_seen` is its in-tick watch's report; `finished`
   // the thread's end; kill() is a process death from rank 0's side (the
@@ -848,6 +852,8 @@ struct PeerRig {
 
   PeerRig(int rank, uint16_t journal_port, const std::atomic<bool>& stop_flag) {
     engine.set_block(&block);
+    metrics = std::make_unique<dgpp::serve::RankMetricsServer>(
+        0, "127.0.0.1", dgpp::serve::RankIdentity{rank, 3, "v", "g"}, nullptr);
     thread = std::thread([this, rank, journal_port, &stop_flag] {
       struct Done {
         std::atomic<bool>& f;
@@ -880,7 +886,8 @@ struct PeerRig {
               death_seen.store(true);
               block.store(false);
             },
-            /*watch_poll_ms=*/20, &oplog);
+            /*watch_poll_ms=*/20, &oplog, /*stats=*/nullptr,
+            [this](const dgpp::sched::Scheduler::Meters& m, int64_t ticks) { metrics->publish(m, ticks); });
       } catch (const std::exception& e) {
         error = e.what();
         // dgpp-serve's peer dies of this (the exception leaves main); the
@@ -940,6 +947,7 @@ struct FabricRig {
         service(cfg, &engine, &frontend, {kFakeEos}),
         http(0, &service, 64) {
     service.set_audit_observer(&oplog);
+    service.set_rank_metrics({0, kWorld, "v", "g"}, nullptr);
     // Peers connect first (they block in the journal read loop),
     // then rank 0 accepts the full world, then HTTP + the engine.
     // Nothing broadcasts before accept_peers returns.
@@ -1123,6 +1131,51 @@ void test_non_stream_and_identity(FabricRig& rig) {
           "non-stream: usage mismatch: " + raw);
   rig.require_oplogs_agree("non-stream");
   std::puts("ok 2 - non-stream completion + op-stream identity");
+}
+
+// --- the per-rank metrics --------------------------------------------------
+// Every rank reports its own meters (dgpp_rank_*): rank 0 on its HTTP
+// exposition, each peer on its metrics listener. The streams are identical,
+// so the generated-token counts agree once a peer has applied the ticks.
+
+std::string scrape_metrics(uint16_t port) {
+  Client c(port);
+  c.send_all("GET /metrics/prometheus HTTP/1.1\r\nHost: t\r\n\r\n");
+  return c.read_until("dgpp_rank_kv_pool_blocks_in_use", 2000);
+}
+
+int64_t sample_of(const std::string& text, const std::string& series) {
+  const size_t at = text.find("\n" + series + " ");
+  if (at == std::string::npos) return -1;
+  return std::stoll(text.substr(at + series.size() + 2));
+}
+
+void test_rank_metrics(FabricRig& rig) {
+  const std::string r0 = scrape_metrics(rig.port());
+  require(r0.find("dgpp_rank_info{model_name=\"glm-5.3-flash-fp8\",rank=\"0\",world_size=\"3\",version=\"v\","
+                  "git_sha=\"g\"} 1\n") != std::string::npos,
+          "rank 0's identity: " + r0);
+  const int64_t tokens =
+      sample_of(r0, "dgpp_rank_generation_tokens_total{model_name=\"glm-5.3-flash-fp8\",rank=\"0\"}");
+  require(tokens > 0, "rank 0 counted its generated tokens");
+  require(r0.find("dgpp_rank_ticks_total") == std::string::npos, "rank 0 follows no journal");
+  for (size_t i = 0; i < rig.peers.size(); ++i) {
+    const std::string rank = std::to_string(i + 1);
+    std::string text;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    do {
+      text = scrape_metrics(rig.peers[i]->metrics->port());
+    } while (sample_of(text, "dgpp_rank_generation_tokens_total{rank=\"" + rank + "\"}") != tokens &&
+             std::chrono::steady_clock::now() < deadline);
+    require(text.find("HTTP/1.1 200 OK\r\n") == 0 && text.find("text/plain; version=0.0.4") != std::string::npos,
+            "peer " + rank + " serves the text format");
+    require(text.find("dgpp_rank_info{rank=\"" + rank + "\",world_size=\"3\"") != std::string::npos,
+            "peer " + rank + "'s identity: " + text);
+    require(sample_of(text, "dgpp_rank_generation_tokens_total{rank=\"" + rank + "\"}") == tokens,
+            "peer " + rank + " generated what rank 0 did: " + text);
+    require(sample_of(text, "dgpp_rank_ticks_total{rank=\"" + rank + "\"}") > 0, "peer " + rank + " counts ticks");
+  }
+  std::puts("ok 2b - per-rank metrics: rank 0 and both peers report their meters, generated tokens agree");
 }
 
 // --- scenario 2: streaming lifecycle over the journal --------------------
@@ -1489,6 +1542,7 @@ int main() {
     {
       FabricRig rig;
       test_non_stream_and_identity(rig);
+      test_rank_metrics(rig);
       test_stream_lifecycle(rig);
       // Grow-on-demand rode the warm record to the peers and every growth
       // crossed the journal identically (the "W" lines are in every op

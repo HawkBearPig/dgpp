@@ -41,6 +41,9 @@ struct ClusterConfig {
   std::vector<std::map<std::string, std::string>> node_env;
   int fabric_port = 29970;
   int journal_port = 29971;
+  // Each peer rank's metrics listener (rank_metrics.hpp), on its own node
+  // address; 0 = off. Rank-local: not part of the config digest.
+  int metrics_port = 0;
   struct Engine {
     int max_concurrency = 8;
     int64_t kv_capacity = 8192;

@@ -169,6 +169,7 @@ ClusterConfig parse_cluster_config(const std::string& json, const std::string& w
         if (p.key == "http") c.http_port = static_cast<int>(integer(p.value, pk, what, 1, 65535));
         else if (p.key == "fabric") c.fabric_port = static_cast<int>(integer(p.value, pk, what, 1, 65535));
         else if (p.key == "journal") c.journal_port = static_cast<int>(integer(p.value, pk, what, 1, 65535));
+        else if (p.key == "metrics") c.metrics_port = static_cast<int>(integer(p.value, pk, what, 0, 65535));
         else fail(what, "unknown key '" + pk + "'");
       }
     } else if (k == "engine") {
@@ -366,6 +367,8 @@ ClusterConfig parse_cluster_config(const std::string& json, const std::string& w
     fail(what, "'node_env' must have one entry per node");
   if (c.fabric_port == c.journal_port)
     fail(what, "'ports.fabric' and 'ports.journal' must differ");
+  if (c.metrics_port != 0 && (c.metrics_port == c.fabric_port || c.metrics_port == c.journal_port))
+    fail(what, "'ports.metrics' must differ from 'ports.fabric' and 'ports.journal'");
   return c;
 }
 

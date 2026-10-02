@@ -795,6 +795,13 @@ class SchedulerObserver {
     (void)steps_done;
     (void)logprobs;
   }
+  // The request left the queue for an engine slot and its prefill begins
+  // (every admission path, grouped prefills included). Timing only: the
+  // op stream does not record it. Default: ignored.
+  virtual void on_admit(const std::string& id, int slot) {
+    (void)id;
+    (void)slot;
+  }
   // The request's terminal state, exactly once (EOS, steps cap,
   // scripted or external cancellation, pool exhaustion all land here).
   virtual void on_retire(const std::string& id,

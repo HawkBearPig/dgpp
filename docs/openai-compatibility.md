@@ -256,9 +256,11 @@ endpoints remain available. Stored completion routes are not provided.
 
 **OpenAI Chat Completions defines completion usage, not a metrics endpoint or
 live prefill-progress event.** DGPP's `GET /metrics` and `GET /v1/metrics` are
-equivalent operational extensions returning `application/json`. They do not
-provide Prometheus exposition. Progress never appears as a fabricated chat
-delta or usage event.
+equivalent operational extensions returning `application/json`;
+`GET /metrics/prometheus` renders the same counters in the Prometheus text
+format with the latency distributions JSON cannot carry (see
+[Prometheus exposition](#prometheus-exposition)). Progress never appears as a
+fabricated chat delta or usage event.
 
 After rebuilding and redeploying this version, monitor rank 0:
 
@@ -304,6 +306,72 @@ For graph capacity and padded verification rows, see the
 [decode graph batch counters](operations.md#decode-graph-batch-counters).
 They describe launched graph work, while these counters describe completed
 verification decisions; rejected drafts are not graph padding.
+
+### Prometheus exposition
+
+`GET /metrics/prometheus` returns `text/plain; version=0.0.4` for a
+Prometheus scrape of rank 0 (set `metrics_path: /metrics/prometheus`). Every
+sample carries `model_name`, the served model id. Families are `dgpp_`-prefixed;
+counters end in `_total` and reset with the engine, which `rate()` handles.
+Read rank 0 once: its counters already describe the whole world's work, and
+the peers serve no HTTP.
+
+The route's first three samples, `spec_decode_num_draft_tokens_total`,
+`spec_decode_num_accepted_tokens_total` and `spec_decode_num_drafts_total`,
+keep their original unprefixed, unlabeled form for existing scrapers;
+`dgpp_spec_decode_*` carries the same counts with labels and per position.
+
+The families mirror the JSON fields:
+
+| Group | Families |
+| --- | --- |
+| Build and limits | `dgpp_build_info{version,git_sha,world_size,admission}` (always 1), `dgpp_engine_failed`, `dgpp_max_concurrent_requests`, `dgpp_queue_limit`, `dgpp_kv_pool_tokens`, `dgpp_admission_*_tokens` |
+| Occupancy | `dgpp_num_requests_running` (slots held, prefills included), `_waiting`, `_prefilling`, `dgpp_pending_admissions`, `dgpp_pending_cancellations`, `dgpp_kv_pool_blocks_total`, `_in_use`, `dgpp_kv_cache_usage_perc` (0-1), `dgpp_scheduler_snapshot_age_seconds`, `dgpp_prefill_inflight_prompt_tokens`, `_remaining_tokens` |
+| Requests | `dgpp_requests_total`, `_shed_total`, `_shed_pool_total`, `_cancelled_total`, `_failed_total`, `_rejected_total`, `dgpp_request_finished_total{reason}` (`eos`, `length`, `stop`, `cancelled`, `pool_exhausted`, `none`; counts choices), `dgpp_tool_calls_total`, `dgpp_reservations_grown_total` |
+| Tokens and engine time | `dgpp_prompt_tokens_total` (attached prefixes included), `_computed_total`, `_cached_total`, `dgpp_generation_tokens_total`, `dgpp_prompts_prefilled_total`, `dgpp_prefill_seconds_total`, `dgpp_prefill_request_seconds_total`, `dgpp_decode_steps_total`, `dgpp_decode_rows_total`, `dgpp_decode_step_seconds_total` |
+| Decode graphs | `dgpp_decode_batch_*` ([decode graph batch counters](operations.md#decode-graph-batch-counters)), `replays_by_slots_total{slots}` |
+| Speculative decoding | `dgpp_spec_decode_depth`, `_num_drafts_total`, `_num_draft_tokens_total`, `_num_accepted_tokens_total`, `_num_draft_tokens_per_pos_total{position}`, `_num_accepted_tokens_per_pos_total{position}` (positions from 0) |
+| Prefix cache | `dgpp_prefix_cache_slots`, `_entries`, `_blocks_pinned`, `_snapshot_bytes`, `_hits_total`, `_misses_total`, `_queries_total`, `_tokens_saved_total`, the snapshot, eviction, duplicate and skip counters (`_skipped_no_block_total` rising means pool pressure), the arena copy counts and seconds |
+
+The histograms (`_bucket`, `_sum`, `_count`) are measured on rank 0's clock:
+
+| Histogram | Interval |
+| --- | --- |
+| `dgpp_time_to_first_token_seconds{prefix_cache="hit"\|"miss"}` | Door to first token, split by whether the prompt attached to a cache entry. |
+| `dgpp_request_queue_time_seconds` | Door to engine slot. |
+| `dgpp_request_prefill_time_seconds` | Engine slot to first token. |
+| `dgpp_request_decode_time_seconds` | First token to retire. |
+| `dgpp_e2e_request_latency_seconds` | Door to retire. |
+| `dgpp_request_time_per_output_token_seconds` | Decode time divided by the tokens after the first. |
+| `dgpp_inter_token_latency_seconds` | The gap between engine passes that delivered a request's tokens; MTP lands several tokens per pass, so this is the pace a streaming client sees. |
+| `dgpp_decode_step_duration_seconds` | Engine decode step time: each pass's mean, observed once per step. |
+| `dgpp_request_prompt_tokens`, `dgpp_request_generation_tokens` | Request sizes in tokens. |
+
+#### Per-rank families
+
+The families above describe the service once. Each rank also reports its own
+share of the work as `dgpp_rank_*`, labeled `rank`: `dgpp_rank_info{rank,world_size,version,git_sha}`,
+`dgpp_rank_decode_steps_total`, `dgpp_rank_decode_step_seconds_total` and
+`dgpp_rank_prefill_seconds_total` (wall time inside the engine's calls, the
+collectives it waited on included), `dgpp_rank_generation_tokens_total`,
+`dgpp_rank_num_requests_running`, `dgpp_rank_kv_pool_blocks_total` and
+`_in_use`, `dgpp_rank_collectives_total` (the bus's completed multi-rank
+collectives) and `dgpp_rank_snapshot_age_seconds`. Ranks run every step
+together, so step time per step that is higher on one rank than on the others
+points at that rank's GPU or link. Rank 0 appends its own (`rank="0"`) to
+`/metrics/prometheus` in a multi-rank world. A peer serves no HTTP API; with
+`DGPP_METRICS_PORT` set in `.env` (config `ports.metrics`, `--metrics-port`)
+each peer serves its families at `GET /metrics/prometheus` on its node
+address (an IPv4 address; `--metrics-bind` overrides it), adding
+`dgpp_rank_ticks_total`, the journal records it applied. A peer publishes
+after every tick it applies, so `dgpp_rank_snapshot_age_seconds` also grows
+while the world is idle. The bus's per-lane traffic counters are not exported:
+the bus updates them outside its stats lock.
+
+Request histograms count choices, as the TTFT counters do, and observe at the
+first token or at retire. A request shed before admission observes none of
+them. Latency buckets run from 1 ms to 640 s, step buckets from 1 ms to 10 s and
+token buckets from 1 to 1M.
 
 ### Prefill progress
 

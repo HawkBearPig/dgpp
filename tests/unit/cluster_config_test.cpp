@@ -93,7 +93,7 @@ DGPP_TEST(cluster_config_parses_fills_defaults_and_derives_the_world) {
     "nodes": ["10.0.0.1", "10.0.0.2", "10.0.0.3"],
     "ssh_user": "ops",
     "release": "0.1.0+gabc",
-    "ports": {"http": 8081, "journal": 29001},
+    "ports": {"http": 8081, "journal": 29001, "metrics": 29002},
     "engine": {"max_concurrency": 2, "decode_graph": true, "prefix_cache_gib": 0.5,
                "admission": "grow", "stats_interval_s": 0, "mtp_depth": 2, "prefill": "exact",
                "prefill_budget_tokens": 256, "prefill_idle_budget_tokens": 2048,
@@ -104,8 +104,10 @@ DGPP_TEST(cluster_config_parses_fills_defaults_and_derives_the_world) {
   require(c.model == "org/name" && c.world() == 3 && c.nodes[0] == "10.0.0.1" &&
               c.nodes[2] == "10.0.0.3" && c.ssh_user == "ops" && c.release == "0.1.0+gabc",
           "the model, the nodes, the user and the release");
-  require(c.http_port == 8081 && c.fabric_port == 29970 && c.journal_port == 29001,
+  require(c.http_port == 8081 && c.fabric_port == 29970 && c.journal_port == 29001 && c.metrics_port == 29002,
           "the ports: given ones taken, the fabric port defaulted");
+  require(dgpp::serve::parse_cluster_config(R"({"model":"m","nodes":["h"]})", "t").metrics_port == 0,
+          "the peers' metrics listener is off by default");
   require(c.engine.max_concurrency == 2 && c.engine.decode_graph && !c.engine.mtp &&
               c.engine.mtp_depth == 2 && c.engine.prefix_cache_gib == 0.5 &&
               c.engine.admission == "grow" && c.engine.stats_interval_s == 0.0 && c.engine.prefill == "exact" &&
@@ -341,6 +343,10 @@ DGPP_TEST(cluster_config_refusesUnknownKeysAndBadValuesByName) {
        "http.max_body_bytes"},
       {R"({"model":"m","nodes":["h"],"ports":{"fabric":5,"journal":5}})",
        "'ports.fabric' and 'ports.journal' must differ"},
+      {R"({"model":"m","nodes":["h"],"ports":{"metrics":70000}})",
+       "'ports.metrics' must be in [0, 65535]"},
+      {R"({"model":"m","nodes":["h"],"ports":{"metrics":29970}})",
+       "'ports.metrics' must differ from 'ports.fabric' and 'ports.journal'"},
       {R"({"model":"m","nodes":["h"],"paths":{"logs":"/x"}})", "unknown key 'paths.logs'"},
       {R"({"model":"m","nodes":["h"],"paths":{"log_dir":3}})", "'paths.log_dir' must be a string"},
       {R"({"model":"m","nodes":["h"],)", "invalid JSON"},

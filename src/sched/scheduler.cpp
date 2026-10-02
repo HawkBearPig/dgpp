@@ -502,6 +502,7 @@ int Scheduler::admit_prepare(int arrival) {
   // The slot is taken for the group's other members' free_slot() scans.
   slots_[static_cast<size_t>(slot)] = arrival;
   engine_->prefill_monitor()->begin(slot, r.spec.id, static_cast<int64_t>(r.spec.prompt.size()));
+  if (observer_) observer_->on_admit(r.spec.id, slot);
   DGPP_LOG_INFO("sched: request '{}' starting prefill in slot {} ({} prompt tokens)",
                 r.spec.id, slot, r.spec.prompt.size());
   return slot;

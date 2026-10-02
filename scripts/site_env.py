@@ -13,7 +13,7 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 SITE_KEYS = (
     "DGPP_NODES", "DGPP_SSH_USER", "DGPP_CLUSTER_CONFIG",
-    "DGPP_HTTP_PORT", "DGPP_FABRIC_PORT", "DGPP_JOURNAL_PORT",
+    "DGPP_HTTP_PORT", "DGPP_FABRIC_PORT", "DGPP_JOURNAL_PORT", "DGPP_METRICS_PORT",
     "DGPP_LOG_DIR", "DGPP_STAGE_DIR", "DGPP_RELEASE_DIR",
     "DGPP_HTTP_BIND", "DGPP_ROCE_DEVICES", "DGPP_ROCE_GID_INDICES",
     "HF_HOME", "HF_HUB_CACHE", "DGPP_RESIDENT_CACHE_DIR", "DGPP_NODE_OVERRIDES",
@@ -38,7 +38,7 @@ NODE_KEYS = ("DGPP_ROCE_DEVICES", "DGPP_ROCE_GID_INDICES", "HF_HUB_CACHE", "DGPP
 )
 DEFAULTS = {
     "DGPP_HTTP_PORT": "18080", "DGPP_FABRIC_PORT": "29970",
-    "DGPP_JOURNAL_PORT": "29971", "DGPP_LOG_DIR": "~/dgpp/log",
+    "DGPP_JOURNAL_PORT": "29971", "DGPP_METRICS_PORT": "0", "DGPP_LOG_DIR": "~/dgpp/log",
     "DGPP_STAGE_DIR": "/tmp/bus4", "DGPP_RELEASE_DIR": "~/dgpp/releases",
     "DGPP_HTTP_BIND": "127.0.0.1",
 }
@@ -127,6 +127,14 @@ def ssh_user(values):
     if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*\$?", user):
         raise ValueError("DGPP_SSH_USER is not a valid SSH login name")
     return user
+
+
+def metrics_port(values):
+    """The peers' metrics listener port; 0 (the default) turns it off."""
+    value = values["DGPP_METRICS_PORT"]
+    if not value.isdigit() or not 0 <= int(value) <= 65535:
+        raise ValueError("DGPP_METRICS_PORT must be 0 (off) or an integer in [1, 65535]")
+    return int(value)
 
 
 def port(values, name):
@@ -284,6 +292,11 @@ def resolve_config(path, values=None):
     cfg["ports"]["http"] = cfg["http"]["port"]
     if len(cfg["nodes"]) > 1 and len(set(cfg["ports"].values())) != 3:
         raise ValueError("HTTP, fabric, and journal ports must differ for multi-node deployments")
+    metrics = metrics_port(values)
+    if metrics:
+        if metrics in (cfg["ports"]["fabric"], cfg["ports"]["journal"]):
+            raise ValueError("DGPP_METRICS_PORT must differ from DGPP_FABRIC_PORT and DGPP_JOURNAL_PORT")
+        cfg["ports"]["metrics"] = metrics
     cfg["node_env"] = node_environments(values, cfg["nodes"])
     return cfg
 
@@ -333,6 +346,7 @@ def main():
         ssh_user(values)
         http_bind(values)
         ports = {name: port(values, name) for name in ("http", "fabric", "journal")}
+        metrics_port(values)
         if ports["fabric"] == ports["journal"]:
             raise ValueError("DGPP_FABRIC_PORT and DGPP_JOURNAL_PORT must differ")
         if "DGPP_CLUSTER_CONFIG" in values:

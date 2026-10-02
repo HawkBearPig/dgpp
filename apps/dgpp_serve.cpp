@@ -66,6 +66,7 @@
 #include "kernels/latent_format.hpp"
 #include "loaders/hf_cache.hpp"
 #include "serve/cluster_config.hpp"
+#include "serve/rank_metrics.hpp"
 #include "dgpp_version.hpp"
 #include "text/chat_template.hpp"
 #include "engine/eager_engine.hpp"
@@ -148,6 +149,7 @@ void open_ops_file(dgpp::serve::OpStreamObserver* oplog,
 
 struct ServeKnobs {
   dgpp::serve::FileInputConfig file_inputs;
+  int world = 1;  // dgpp_build_info's world_size
   uint16_t http_port = 8080;
   std::string http_bind = "127.0.0.1";
   int64_t http_max_body_bytes = dgpp::serve::kDefaultHttpMaxBodyBytes;
@@ -927,6 +929,9 @@ int serve_openai(dgpp::sched::SchedulerEngine* engine, int64_t vocab_size,
   scfg.position_ceiling = k.position_ceiling;
   scfg.kv_pool_tokens = k.kv_pool_tokens;
   scfg.rope_scaling = k.rope_scaling;
+  scfg.build_version = DGPP_VERSION;
+  scfg.build_git_sha = DGPP_GIT_SHA;
+  scfg.world_size = k.world;
   {
     // The prefix cache's key (M7): what the entries are bound to.
     char key[96];
@@ -941,6 +946,8 @@ int serve_openai(dgpp::sched::SchedulerEngine* engine, int64_t vocab_size,
   dgpp::serve::GenerationService service(scfg, engine, frontend.get(),
                                            std::move(eos));
   if (oplog) service.set_audit_observer(oplog);
+  if (k.world > 1)
+    service.set_rank_metrics({0, k.world, DGPP_VERSION, DGPP_GIT_SHA}, collective_progress);
   dgpp::serve::HttpServer http(k.http_port, &service, k.max_connections, k.http_bind,
                              k.http_max_body_bytes);
   DGPP_LOG_INFO("serve: HTTP request body limit {} bytes", k.http_max_body_bytes);
@@ -1127,6 +1134,9 @@ int main(int argc, char** argv) {
       "    engine knob below; flags given after it override\n"
       "  [--port N (default 18080; rank 0 only)]\n"
       "  [--bind-host IPV4 (default 127.0.0.1; rank 0 only)]\n"
+      "  [--metrics-port N (default 0 = off; ranks > 0 only)]: the peer's\n"
+      "    dgpp_rank_* metrics listener (GET /metrics/prometheus); config ports.metrics\n"
+      "  [--metrics-bind IPV4 (default: this rank's node address; ranks > 0 only)]\n"
       "  [--sse-ping-interval N (default 30 seconds; -1 disables; rank 0 only)]:\n"
       "    SSE comments while a stream is silent; overrides http.sse_ping_interval\n"
       "    in cluster JSON; request sse_ping_interval overrides the server setting.\n"
@@ -1217,6 +1227,10 @@ int main(int argc, char** argv) {
 
   std::string ckpt, model_id, peer;
   uint16_t port = 8080, fabric_port = 29970, journal_port = 29971;
+  // A peer's metrics listener (rank_metrics.hpp): 0 = off; the address
+  // defaults to this rank's node in the config.
+  uint16_t metrics_port = 0;
+  std::string metrics_bind;
   int64_t kv_capacity = 8192;
   int64_t http_max_body_bytes = dgpp::serve::kDefaultHttpMaxBodyBytes;
   int sse_ping_interval = dgpp::serve::kDefaultSsePingInterval;
@@ -1317,6 +1331,8 @@ int main(int argc, char** argv) {
     }
     fabric_port = static_cast<uint16_t>(c.fabric_port);
     journal_port = static_cast<uint16_t>(c.journal_port);
+    metrics_port = static_cast<uint16_t>(c.metrics_port);
+    if (rank >= 0 && rank < world) metrics_bind = c.nodes[rank];
     const dgpp::serve::ClusterConfig::Engine& e = c.engine;
     max_concurrency = e.max_concurrency;
     kv_capacity = e.kv_capacity;
@@ -1467,6 +1483,9 @@ int main(int argc, char** argv) {
       fabric_port = static_cast<uint16_t>(std::stoi(next()));
     else if (a == "--journal-port")
       journal_port = static_cast<uint16_t>(std::stoi(next()));
+    else if (a == "--metrics-port")
+      metrics_port = static_cast<uint16_t>(std::stoi(next()));
+    else if (a == "--metrics-bind") metrics_bind = next();
     else if (a == "--rendezvous-timeout-ms")
       rendezvous_timeout_ms = std::stoi(next());
     else if (a == "--temperature") temperature = std::stof(next());
@@ -2237,6 +2256,7 @@ int main(int argc, char** argv) {
     knobs.default_chat_template_kwargs = default_chat_template_kwargs;
     knobs.mtp = mtp;
     knobs.stats_interval_s = stats_interval_s;
+    knobs.world = world;
     knobs.position_ceiling = position_ceiling;
     knobs.kv_pool_tokens = pool_tokens;
     knobs.rope_scaling = rope_scaling;
@@ -2458,6 +2478,16 @@ int main(int argc, char** argv) {
           open_ops_file(&oplog, "serve_rank" + std::to_string(rank) + ".ops");
           sched.set_observer(&oplog);
           dgpp::serve::ThroughputLog stats(stats_interval_s, rank, mtp);
+          std::unique_ptr<dgpp::serve::RankMetricsServer> rank_metrics;
+          if (metrics_port != 0) {
+            const std::string bind = metrics_bind.empty() ? std::string("127.0.0.1") : metrics_bind;
+            rank_metrics = std::make_unique<dgpp::serve::RankMetricsServer>(
+                metrics_port, bind, dgpp::serve::RankIdentity{rank, world, DGPP_VERSION, DGPP_GIT_SHA},
+                &bus->completion_epoch());
+            rank_metrics->publish(sched.meters(), 0);
+            DGPP_LOG_INFO("rank {}: metrics on http://{}:{}/metrics/prometheus", rank, bind,
+                          rank_metrics->port());
+          }
           DGPP_LOG_INFO("rank {}: following rank 0's journal (admission {}, window {})",
                         rank, dgpp::sched::AdmissionPolicy::name(peer_policy.mode),
                         peer_policy.window_tokens);
@@ -2476,7 +2506,10 @@ int main(int argc, char** argv) {
                 std::fflush(nullptr);
                 std::_Exit(3);
               },
-              /*watch_poll_ms=*/100, &oplog, &stats);
+              /*watch_poll_ms=*/100, &oplog, &stats,
+              [&rank_metrics](const dgpp::sched::Scheduler::Meters& m, int64_t ticks) {
+                if (rank_metrics) rank_metrics->publish(m, ticks);
+              });
           oplog.flush();
           engine_release();
           cudaFreeHost(pick_scratch);

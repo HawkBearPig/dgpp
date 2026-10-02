@@ -1293,6 +1293,66 @@ DGPP_TEST(serve_modelsHealthMetrics_theOpsSurface) {
       require(json_of(m.value) == json_of(second.root.at("scheduler").at(m.key)), "scheduler gauges agree");
 }
 
+DGPP_TEST(serve_prometheusExposition_countersAndDistributions) {
+  // GIVEN the service after one chat completion (prompt 4, three tokens,
+  // the steps cap),
+  ServiceRig rig;
+  {
+    Client c(rig.port());
+    c.send_all("POST /v1/chat/completions HTTP/1.1\r\nHost: t\r\n"
+               "Content-Type: application/json\r\nContent-Length: " +
+               std::to_string(chat_body("abcd", 3).size()) + "\r\n\r\n" + chat_body("abcd", 3));
+    require(c.read_until("usage", 5000).find("200 OK") != std::string::npos, "the completion ran");
+  }
+
+  // WHEN the exposition is read,
+  Client m(rig.port());
+  m.send_all("GET /metrics/prometheus HTTP/1.1\r\nHost: t\r\n\r\n");
+  const std::string r = m.read_until("dgpp_request_generation_tokens_count", 2000);
+
+  // THEN it is the text format: the route's original unlabeled lines
+  // intact, every family declared once, the counters typed and labeled
+  // with the model, and each distribution holding the request.
+  const std::string model = "model_name=\"" + kModel + "\"";
+  const auto has = [&](const std::string& line) { return r.find(line) != std::string::npos; };
+  require(r.find("HTTP/1.1 200 OK\r\n") == 0 && has("Content-Type: text/plain; version=0.0.4"),
+          "exposition content type: " + r.substr(0, 200));
+  for (const char* legacy : {"\nspec_decode_num_draft_tokens_total 0\n", "\nspec_decode_num_accepted_tokens_total 0\n",
+                             "\nspec_decode_num_drafts_total 0\n"})
+    require(has(legacy), std::string("legacy line kept: ") + legacy);
+  require(has("# TYPE dgpp_requests_total counter\n") && has("dgpp_requests_total{" + model + "} 1\n"),
+          "requests counter: " + r);
+  require(has("dgpp_request_finished_total{" + model + ",reason=\"length\"} 1\n"), "finish reason");
+  require(has("dgpp_generation_tokens_total{" + model + "} 3\n"), "generated tokens");
+  require(has("dgpp_build_info{" + model + ",version=\"\",git_sha=\"\",world_size=\"1\",admission=\"full\"} 1\n"),
+          "build info");
+  require(has("dgpp_max_concurrent_requests{" + model + "} 4\n"), "engine slots");
+  require(has("dgpp_num_requests_running{" + model + "} 0\n") && has("dgpp_num_requests_waiting{" + model + "} 0\n"),
+          "idle occupancy");
+  for (const char* h : {"dgpp_e2e_request_latency_seconds", "dgpp_request_queue_time_seconds",
+                        "dgpp_request_prefill_time_seconds", "dgpp_request_decode_time_seconds",
+                        "dgpp_request_time_per_output_token_seconds", "dgpp_request_prompt_tokens",
+                        "dgpp_request_generation_tokens"}) {
+    require(has(std::string(h) + "_count{" + model + "} 1\n"), std::string("one observation: ") + h);
+    require(has(std::string(h) + "_bucket{" + model + ",le=\"+Inf\"} 1\n"), std::string("+Inf bucket: ") + h);
+  }
+  require(has("dgpp_time_to_first_token_seconds_count{" + model + ",prefix_cache=\"miss\"} 1\n") &&
+              has("dgpp_time_to_first_token_seconds_count{" + model + ",prefix_cache=\"hit\"} 0\n"),
+          "TTFT split by attach");
+  require(has("dgpp_request_prompt_tokens_bucket{" + model + ",le=\"1\"} 0\n") &&
+              has("dgpp_request_prompt_tokens_bucket{" + model + ",le=\"8\"} 1\n") &&
+              has("dgpp_request_generation_tokens_sum{" + model + "} 3\n"),
+          "size buckets");
+  for (const char* family : {"dgpp_time_to_first_token_seconds", "dgpp_inter_token_latency_seconds",
+                             "dgpp_decode_step_duration_seconds", "dgpp_spec_decode_depth",
+                             "dgpp_decode_batch_replays_by_slots_total", "dgpp_prefix_cache_skipped_no_block_total"}) {
+    const std::string header = std::string("# TYPE ") + family + " ";
+    const size_t first = r.find(header);
+    require(first != std::string::npos && r.find(header, first + 1) == std::string::npos,
+            std::string("declared exactly once: ") + family);
+  }
+}
+
 DGPP_TEST(serve_decodeBatchMetrics_retainsLastLaunchWhileIdle) {
   ServiceRig rig;
   for (const bool reported : {false, true}) {

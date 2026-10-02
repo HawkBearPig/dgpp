@@ -908,11 +908,16 @@ the prompts. Its artifacts land under `build-ci/fabric-runs/failure_drill_*`.
   during a synchronous prefill. `scheduler.snapshot_age_ms` reports the age of
   the remaining scheduler/pool counters. See the
   [metrics contract and monitoring command](openai-compatibility.md#metrics-and-prefill-progress).
-  Both metrics paths return `application/json`; direct Prometheus
-  scraping requires a supported
-  [exposition format](https://prometheus.io/docs/instrumenting/exposition_formats/),
-  which DGPP does not yet provide. `GET /health` is `{"status":"ok"}`
-  while the engine lives.
+  Both metrics paths return `application/json`. `GET /metrics/prometheus`
+  serves the same counters in the Prometheus
+  [text format](https://prometheus.io/docs/instrumenting/exposition_formats/),
+  with TTFT, queue, prefill, decode, end-to-end, inter-token and step-time
+  histograms (the
+  [family list](openai-compatibility.md#prometheus-exposition)); scrape rank
+  0 for the service; with `DGPP_METRICS_PORT` set, each peer serves its own
+  `dgpp_rank_*` step, prefill and pool meters on that port of its node
+  address ([per-rank families](openai-compatibility.md#per-rank-families)).
+  `GET /health` is `{"status":"ok"}` while the engine lives.
 - **Under load:** `scripts/serve_soak_run.sh MINUTES OUT_DIR` boots the
   world with the production knobs, starts `scripts/node_probe.sh` on every
   node, runs `scripts/serve_soak.py` (multi-turn chat, long generations,

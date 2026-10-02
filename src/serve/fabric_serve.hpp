@@ -329,6 +329,9 @@ void run_journal_peer(dgpp::sched::Scheduler* sched, JournalReader* reader,
                       const std::function<void()>& on_rank0_death = nullptr,
                       int watch_poll_ms = 100,
                       const dgpp::sched::SchedulerObserver* oplog = nullptr,
-                      ThroughputLog* stats = nullptr);
+                      ThroughputLog* stats = nullptr,
+                      // After every applied tick: the meters and the ticks so
+                      // far (the peer's metrics listener publishes them).
+                      const std::function<void(const dgpp::sched::Scheduler::Meters&, int64_t)>& on_tick = {});
 
 }  // namespace dgpp::serve

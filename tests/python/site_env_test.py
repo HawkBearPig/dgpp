@@ -188,6 +188,15 @@ class SiteEnvTest(unittest.TestCase):
             with self.subTest(case=case), self.assertRaises(ValueError):
                 site_env.resolve_config(self.config, self.values(**case))
 
+    def test_metrics_port_is_optional_and_validated(self):
+        self.assertNotIn("metrics", site_env.resolve_config(self.config, self.values())["ports"])
+        resolved = site_env.resolve_config(self.config, self.values(DGPP_METRICS_PORT="29972"))
+        self.assertEqual(resolved["ports"]["metrics"], 29972)
+        for value, message in (("70000", "DGPP_METRICS_PORT must be 0"), ("-1", "DGPP_METRICS_PORT must be 0"),
+                               ("29970", "must differ from DGPP_FABRIC_PORT")):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, message):
+                site_env.resolve_config(self.config, self.values(DGPP_METRICS_PORT=value))
+
     def test_missing_explicit_env_file_fails(self):
         with self.assertRaisesRegex(ValueError, "does not exist"):
             site_env.settings({"DGPP_ENV_FILE": str(self.root / "missing")})
