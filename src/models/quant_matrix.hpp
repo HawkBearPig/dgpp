@@ -30,6 +30,24 @@ struct GlmQuantMatrix {
   }
 };
 
+// The scale grid as the kernels' log2 block sizes (rs / cs): true with the
+// shifts written, false when an axis is not a power of two (the grid is
+// then the loaders' own and no kernel consumes it). scale_block_rows = 1
+// with a scale_block_cols >= cols is the CHANNEL grid (one scale a row —
+// the Qwen3.8-27B-NVFP4 release's attention half): rs = 0, cs large enough
+// that every 16-element chunk reads column 0.
+inline bool quant_scale_shifts(const GlmQuantMatrix& m, int& rs, int& cs) {
+  auto log2_exact = [](int64_t v) {
+    if (v <= 0 || (v & (v - 1)) != 0) return -1;
+    int s = 0;
+    while ((1LL << s) < v) ++s;
+    return s;
+  };
+  rs = log2_exact(m.scale_block_rows);
+  cs = log2_exact(m.scale_block_cols);
+  return rs >= 0 && cs >= 4;
+}
+
 // Row-range view: payload rows are contiguous, so this is a pure pointer
 // view — no copy. A 128-ALIGNED row_start re-anchors the scale grid exactly
 // (local row r's true block is row_start/128 + r/128, which is what the

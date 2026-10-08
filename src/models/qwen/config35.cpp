@@ -5,9 +5,23 @@
 #include <cstdio>
 #include <cstring>
 #include <format>
+#include <regex>
 #include <stdexcept>
 
 namespace dgpp {
+
+// The parsed config_groups (declared in config35.hpp behind a forward
+// declaration so the header stays off <regex>'s compile cost).
+struct Qwen35QuantGroups {
+  struct Rule {
+    std::regex pattern;      // matched with regex_search against the module
+    Qwen35TensorQuant kind;  // the group's format
+  };
+  std::vector<Rule> targets;  // document order: first match wins
+  std::vector<std::string> ignore_exact;  // exact module names
+  std::vector<std::regex> ignore_regex;
+};
+
 namespace {
 
 [[noreturn]] void reject(std::string_view field, std::string_view why) {
@@ -77,6 +91,65 @@ std::vector<int64_t> require_int_array(const minijson::Value& v, std::string_vie
   return out;
 }
 
+// ModelOpt glob (nvidia 122B exclude_modules / ignore): `*` spans any
+// suffix (the entries are `...linear_attn*` prefixes), `?` one char.
+// Compiled anchored, dots literal — the dense compressed-tensors path keeps
+// refusing globs (compile_target), this is ModelOpt-only.
+std::regex compile_modelopt_glob(const std::string& entry) {
+  std::string rx = "^";
+  for (const char ch : entry) {
+    if (ch == '*')
+      rx += ".*";
+    else if (ch == '?')
+      rx += ".";
+    else {
+      if (std::strchr("^$.()[]{}+?|\\", ch) != nullptr) rx += '\\';
+      rx += ch;
+    }
+  }
+  rx += "$";
+  try {
+    return std::regex(rx);
+  } catch (const std::regex_error& e) {
+    throw std::runtime_error(std::string("Qwen3.5 quantization_config ignore '") + entry +
+                             "': " + e.what());
+  }
+}
+// One target/ignore entry: "re:<pattern>" compiles as-is (Python regexes in
+// these checkpoints use `\.` and alternations ECMAScript reads verbatim);
+// a plain entry is a literal module/parameter name, escaped into an anchored
+// exact match — the dots of "model.language_model..." match themselves, not
+// any character. A plain entry carrying glob wildcards cannot be read as a
+// literal and is refused, never left to silently claim nothing.
+std::regex compile_target(const std::string& entry, const char* who = "target") {
+  const std::string prefix = "re:";
+  if (entry.rfind(prefix, 0) != 0) {
+    if (entry.find_first_of("*?[") != std::string::npos)
+      throw std::runtime_error(std::string("Qwen3.5 quantization_config ") + who + " '" + entry +
+                               "': plain entries are exact names (wildcards need the re: prefix)");
+    std::string literal;
+    for (const char ch : entry) {
+      if (std::strchr("^$.()[]{}*+?|\\", ch) != nullptr) literal += '\\';
+      literal += ch;
+    }
+    return std::regex("^" + literal + "$");
+  }
+  try {
+    return std::regex(entry.substr(prefix.size()));
+  } catch (const std::regex_error& e) {
+    throw std::runtime_error(std::string("Qwen3.5 quantization_config ") + who +
+                             " '" + entry + "': " + e.what());
+  }
+}
+
+void add_ignore(Qwen35QuantGroups& g, const std::string& entry) {
+  if (entry.rfind("re:", 0) == 0) {
+    g.ignore_regex.push_back(compile_target(entry, "ignore"));
+    return;
+  }
+  g.ignore_exact.push_back(entry);
+}
+
 std::string read_file(const std::string& path) {
   FILE* f = std::fopen(path.c_str(), "rb");
   if (!f)
@@ -97,8 +170,12 @@ Qwen35TextConfig Qwen35TextConfig::parse(const minijson::Value& tc,
   if (!tc.is_object()) reject("text_config", "not an object");
   Qwen35TextConfig c;
   const std::string model_type = optional_string(tc, "model_type", "qwen3_5_text");
-  if (model_type != "qwen3_5_text")
-    reject("model_type", "expected qwen3_5_text, got " + model_type);
+  if (model_type == "qwen3_5_moe_text")
+    c.is_moe = true;
+  else if (model_type == "qwen3_5_text")
+    c.is_moe = false;
+  else
+    reject("model_type", "expected qwen3_5_text or qwen3_5_moe_text, got " + model_type);
 
   c.hidden_size = require_int(tc, "hidden_size");
   c.vocab_size = require_int(tc, "vocab_size");
@@ -217,9 +294,28 @@ Qwen35TextConfig Qwen35TextConfig::parse(const minijson::Value& tc,
   if (!c.attn_output_gate)
     reject("attn_output_gate", "the checkpoint stacks [q | gate] in q_proj");
 
-  // --- dense MLP ----------------------------------------------------------------
-  c.intermediate_size = require_int(tc, "intermediate_size");
-  if (c.intermediate_size <= 0) reject("intermediate_size", "must be positive");
+  // --- dense MLP / MoE ----------------------------------------------------------
+  if (c.is_moe) {
+    c.num_experts = require_int(tc, "num_experts");
+    c.num_experts_per_tok = require_int(tc, "num_experts_per_tok");
+    c.moe_intermediate_size = require_int(tc, "moe_intermediate_size");
+    c.shared_expert_intermediate_size = require_int(tc, "shared_expert_intermediate_size");
+    if (c.num_experts <= 0 || c.num_experts > 4096)
+      reject("num_experts", "must be in [1, 4096]");
+    if (c.num_experts_per_tok <= 0 || c.num_experts_per_tok > c.num_experts ||
+        c.num_experts_per_tok > 16)
+      reject("num_experts_per_tok", "must be in [1, min(num_experts, 16)]");
+    if (c.moe_intermediate_size <= 0 || c.shared_expert_intermediate_size <= 0)
+      reject("moe_intermediate_size", "must be positive");
+    c.norm_topk_prob = optional_bool(tc, "norm_topk_prob", true);
+    if (tc.find("intermediate_size") != nullptr)
+      reject("intermediate_size", "dense MLP field must be absent for the MoE variant");
+  } else {
+    c.intermediate_size = require_int(tc, "intermediate_size");
+    if (c.intermediate_size <= 0) reject("intermediate_size", "must be positive");
+    if (tc.find("num_experts") != nullptr || tc.find("moe_intermediate_size") != nullptr)
+      reject("num_experts", "MoE fields must be absent for the dense variant");
+  }
 
   // --- MTP ----------------------------------------------------------------------
   c.mtp_num_layers = optional_int(tc, "mtp_num_hidden_layers", 0);
@@ -239,22 +335,151 @@ Qwen35TextConfig Qwen35TextConfig::parse(const minijson::Value& tc,
         "block release (e4m3 + BF16 128x128 scales) and the NVFP4 mixed release");
   {
     const minijson::Value& q = *quantization_config;
+    const std::string method = optional_string(q, "quant_method", "");
+    // The ModelOpt NVFP4 MoE release (nvidia/Qwen3.5-122B-A10B-NVFP4):
+    // quant_method modelopt + quant_algo NVFP4, one group targeting
+    // "Linear", ModelOpt glob ignore list. Routed experts NVFP4 (ModelOpt
+    // naming), everything else BF16. MoE-only in v1.
+    if (method == "modelopt") {
+      const std::string algo = optional_string(q, "quant_algo", "");
+      if (algo != "NVFP4")
+        throw std::runtime_error("Qwen3.5 quantization_config.quant_algo: only NVFP4 is "
+                                 "implemented, got '" + algo + "'");
+      if (!c.is_moe)
+        throw std::runtime_error("Qwen3.5 quantization_config.quant_method: modelopt NVFP4 "
+                                 "is implemented for the MoE variant only");
+      const minijson::Value* groups = q.find("config_groups");
+      if (groups == nullptr || !groups->is_object())
+        throw std::runtime_error("Qwen3.5 quantization_config.config_groups: missing object");
+      auto g = std::make_shared<Qwen35QuantGroups>();
+      if (const minijson::Value* ig = q.find("ignore"); ig != nullptr && !ig->is_null()) {
+        if (!ig->is_array())
+          throw std::runtime_error("Qwen3.5 quantization_config.ignore: not an array");
+        for (const auto& item : ig->items()) {
+          if (!item.is_string())
+            throw std::runtime_error("Qwen3.5 quantization_config.ignore: non-string element");
+          const std::string e(item.as_string());
+          if (e.rfind("re:", 0) == 0)
+            g->ignore_regex.push_back(compile_target(e, "ignore"));
+          else if (e.find_first_of("*?[") != std::string::npos)
+            g->ignore_regex.push_back(compile_modelopt_glob(e));
+          else
+            g->ignore_exact.push_back(e);
+        }
+      }
+      bool has_nvfp4 = false;
+      for (const auto& grp : groups->members()) {
+        const std::string key(grp.key);
+        const minijson::Value& gv = grp.value;
+        if (!gv.is_object())
+          throw std::runtime_error("Qwen3.5 quantization_config.config_groups." + key +
+                                   ": not an object");
+        const minijson::Value* w = gv.find("weights");
+        if (w == nullptr || !w->is_object())
+          throw std::runtime_error("Qwen3.5 quantization_config.config_groups." + key +
+                                   ".weights missing");
+        const int64_t bits = require_int(*w, "num_bits");
+        const int64_t group_size = require_int(*w, "group_size");
+        if (bits != 4 || group_size != 16)
+          throw std::runtime_error("Qwen3.5 quantization_config.config_groups." + key +
+                                   ": only NVFP4 (4-bit, group 16) is implemented");
+        const minijson::Value* tg = gv.find("targets");
+        if (tg == nullptr || !tg->is_array() || tg->items().empty())
+          throw std::runtime_error("Qwen3.5 quantization_config.config_groups." + key +
+                                   ".targets: non-empty array expected");
+        for (const auto& item : tg->items()) {
+          if (!item.is_string())
+            throw std::runtime_error("Qwen3.5 quantization_config.config_groups." + key +
+                                     ".targets: non-string element");
+          const std::string t(item.as_string());
+          // ModelOpt targets name the module type ("Linear" = every Linear);
+          // the ignore list decides which stay BF16. Any other target is
+          // refused by name.
+          if (t != "Linear")
+            throw std::runtime_error("Qwen3.5 quantization_config.config_groups." + key +
+                                     ".targets: only 'Linear' is implemented, got '" + t + "'");
+          g->targets.push_back({std::regex(".*"), Qwen35TensorQuant::Nvfp4});
+        }
+        has_nvfp4 = true;
+      }
+      if (!has_nvfp4)
+        throw std::runtime_error("Qwen3.5 quantization_config.config_groups: no NVFP4 group");
+      c.quant_groups = g;
+      c.quant_kind = Qwen35QuantKind::Nvfp4Moe;
+      return c;
+    }
     if (const minijson::Value* groups = q.find("config_groups");
         groups != nullptr && groups->is_object()) {
-      // The NVFP4 mixed release (compressed-tensors / modelopt): group_1 is
-      // the MLP's 4-bit float per 16; the loader slice interprets the rest.
-      const minijson::Value* g1 = groups->find("group_1");
-      const minijson::Value* w = g1 != nullptr ? g1->find("weights") : nullptr;
-      if (w == nullptr || !w->is_object())
-        throw std::runtime_error("Qwen3.5 quantization_config.config_groups: group_1.weights missing");
-      const int64_t bits = require_int(*w, "num_bits");
-      const int64_t group = require_int(*w, "group_size");
-      if (bits != 4 || group != 16)
-        throw std::runtime_error("Qwen3.5 quantization_config.config_groups: only NVFP4 (4-bit, group 16) is implemented");
+      // The NVFP4 mixed release (compressed-tensors): every matrix's format
+      // resolves through the group targets, so parse them all and bind
+      // per matrix (the binding table's contract). group_1 is the MLP's
+      // NVFP4 (e2m1 pairs, e4m3 scales per 16); group_0 the FP8-channel
+      // half (attention, the late MLP layers, lm_head).
+      if (method != "compressed-tensors")
+        throw std::runtime_error("Qwen3.5 quantization_config.quant_method: expected "
+                                 "\"compressed-tensors\" with config_groups, got '" + method + "'");
+      auto g = std::make_shared<Qwen35QuantGroups>();
+      bool has_nvfp4 = false;
+      // `ignore`: exact parameter/module names, or "re:"-anchored patterns.
+      if (const minijson::Value* ig = q.find("ignore"); ig != nullptr && !ig->is_null()) {
+        if (!ig->is_array())
+          throw std::runtime_error("Qwen3.5 quantization_config.ignore: not an array");
+        for (const auto& item : ig->items()) {
+          if (!item.is_string())
+            throw std::runtime_error("Qwen3.5 quantization_config.ignore: non-string element");
+          add_ignore(*g, std::string(item.as_string()));
+        }
+      }
+      for (const auto& grp : groups->members()) {
+        const std::string key(grp.key);
+        const minijson::Value& gv = grp.value;
+        if (!gv.is_object())
+          throw std::runtime_error("Qwen3.5 quantization_config.config_groups." + key +
+                                   ": not an object");
+        const std::string fmt = optional_string(gv, "format", "");
+        Qwen35TensorQuant kind;
+        if (fmt == "nvfp4-pack-quantized")
+          kind = Qwen35TensorQuant::Nvfp4;
+        else if (fmt == "float-quantized")
+          kind = Qwen35TensorQuant::Fp8Channel;
+        else
+          throw std::runtime_error("Qwen3.5 quantization_config.config_groups." + key +
+                                   ".format: unsupported '" + fmt + "'");
+        const minijson::Value* w = gv.find("weights");
+        if (w == nullptr || !w->is_object())
+          throw std::runtime_error("Qwen3.5 quantization_config.config_groups." + key +
+                                   ".weights missing");
+        const int64_t bits = require_int(*w, "num_bits");
+        if (kind == Qwen35TensorQuant::Nvfp4) {
+          const int64_t group_size = require_int(*w, "group_size");
+          if (bits != 4 || group_size != 16)
+            throw std::runtime_error("Qwen3.5 quantization_config.config_groups." + key +
+                                     ": only NVFP4 (4-bit, group 16) is implemented");
+          has_nvfp4 = true;
+        } else if (bits != 8) {
+          throw std::runtime_error("Qwen3.5 quantization_config.config_groups." + key +
+                                   ": float-quantized weights must be 8-bit, got " +
+                                   std::to_string(bits));
+        }
+        const minijson::Value* tg = gv.find("targets");
+        if (tg == nullptr || !tg->is_array() || tg->items().empty())
+          throw std::runtime_error("Qwen3.5 quantization_config.config_groups." + key +
+                                   ".targets: non-empty array expected");
+        for (const auto& item : tg->items()) {
+          if (!item.is_string())
+            throw std::runtime_error("Qwen3.5 quantization_config.config_groups." + key +
+                                     ".targets: non-string element");
+          g->targets.push_back({compile_target(std::string(item.as_string())), kind});
+        }
+      }
+      if (!has_nvfp4)
+        throw std::runtime_error(
+            "Qwen3.5 quantization_config.config_groups: no nvfp4-pack-quantized group — "
+            "expected the mixed release (NVFP4 MLP group, FP8 attention group)");
+      c.quant_groups = g;
       c.quant_kind = Qwen35QuantKind::Nvfp4Mixed;
       return c;
     }
-    const std::string method = optional_string(q, "quant_method", "");
     if (method != "fp8")
       throw std::runtime_error("Qwen3.5 quantization_config.quant_method: only fp8 is implemented, got '" + method + "'");
     const std::vector<int64_t> bs = require_int_array(q, "weight_block_size");
@@ -285,6 +510,25 @@ int Qwen35TextConfig::num_full_layers() const {
   int n = 0;
   for (auto k : layers) n += k == Qwen35LayerKind::Full;
   return n;
+}
+
+Qwen35TensorQuant Qwen35TextConfig::tensor_quant(const std::string& module) const {
+  if (quant_kind != Qwen35QuantKind::Nvfp4Mixed && quant_kind != Qwen35QuantKind::Nvfp4Moe)
+    throw std::logic_error("qwen35 tensor_quant: the FP8 block release binds the "
+                           "whole family as block FP8 (no per-matrix resolution)");
+  if (!quant_groups)
+    throw std::logic_error("qwen35 tensor_quant: NVFP4 without config_groups");
+  // The format's ignore rule is the fully qualified module name (exact or
+  // the regex forms); it is never a prefix — the release's bare
+  // `…linear_attn` entries must not swallow the targeted `…in_proj_qkv`.
+  for (const auto& e : quant_groups->ignore_exact)
+    if (e == module) return Qwen35TensorQuant::Bf16;
+  for (const auto& r : quant_groups->ignore_regex)
+    if (std::regex_search(module, r)) return Qwen35TensorQuant::Bf16;
+  for (const auto& t : quant_groups->targets)
+    if (std::regex_search(module, t.pattern)) return t.kind;
+  // Not targeted by any group: the checkpoint ships it BF16.
+  return Qwen35TensorQuant::Bf16;
 }
 
 }  // namespace dgpp

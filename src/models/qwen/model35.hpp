@@ -14,6 +14,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <algorithm>
 #include <memory>
 #include <string>
 #include <vector>
@@ -23,8 +24,12 @@
 #include "core/graph.hpp"
 #include "engine/paged_blocks.hpp"
 #include "engine/session_model.hpp"
+#include "models/glm/moe.hpp"
+#include "models/qwen/dflash.hpp"
+#include "models/qwen/moe_layer.hpp"
 #include "kernels/bf12_companions.hpp"
 #include "kernels/gemm.hpp"
+#include "kernels/glm_moe_launch.hpp"
 #include "kernels/glm_spec.hpp"
 #include "loaders/resident_stream.hpp"
 #include "models/quant_matrix.hpp"
@@ -139,6 +144,11 @@ void qwen35_swiglu_bf16(const uint16_t* gate, const uint16_t* up, uint16_t* out,
 void qwen35_mtp_concat_bf16(const uint16_t* e, const uint16_t* h, uint16_t* out, int64_t rows,
                             int64_t hidden, cudaStream_t stream);
 
+// The v1 draft's column-0 gather (model35_kernels.cu): tok[j] = ids[(j + 1) * stride]
+// (mask rows 1.., skipping the anchor row's column 0). One kernel, so the
+// captured draft stays kernels-only (no per-draft D2D nodes).
+void df1_collect_top1(const int32_t* ids, int stride, int32_t* tok, int n, cudaStream_t stream);
+
 class Qwen35Model : public SessionModel<Qwen35Model> {
  public:
   using Base = SessionModel<Qwen35Model>;
@@ -252,8 +262,14 @@ class Qwen35Model : public SessionModel<Qwen35Model> {
   // through the five bidirectional layers over the plane context; each
   // mask rows' top-K go through the reference chained selector walk, which
   // proposes the `drafts()` following tokens.
-  bool dflash2_enabled() const { return dflash2_; }
-  int dflash2_drafts() const { return dflash2_ ? dfcfg_.drafts() : 0; }
+  bool dflash2_enabled() const { return dflash2_ || dflash1_; }
+  // The verifiable drafts: v2's block; v1's 15 capped by the verify budget
+  // (dflash_depth, at most 7 — kSpecRows).
+  int dflash2_drafts() const {
+    if (dflash1_) return std::min(df1cfg_.drafts(), dflash_depth_ == 0 ? 7 : dflash_depth_);
+    return dflash2_ ? dfcfg_.drafts() : 0;
+  }
+  bool dflash1_enabled() const { return dflash1_; }
   // False without a draft (pool exhausted / context bound): the caller
   // runs the step without speculation.
   bool dflash2_draft(int req, int64_t bonus, std::vector<int32_t>* drafts);
@@ -324,12 +340,15 @@ class Qwen35Model : public SessionModel<Qwen35Model> {
   // The mirror the recorded draft of slot `req` publishes (readable once
   // the replay's end event has passed).
   const int32_t* block_drafts_host(int req) const {
+    if (dflash1_)
+      return df1_mirror_h_ + static_cast<size_t>(req) * static_cast<size_t>(df1cfg_.drafts());
     return df_mirror_h_ + static_cast<size_t>(req) * static_cast<size_t>(dfcfg_.drafts());
   }
   // The mask rows' top-k candidate ids the recorded draft walked
   // ([drafts][block_candidates()] per slot; the engine's acceptance
-  // diagnostics rank the verify's correction among them).
-  int block_candidates() const { return dfcfg_.selector_top_k; }
+  // diagnostics rank the verify's correction among them). v1 publishes no
+  // candidate tables (top-1 proposals only) — 0 skips the read.
+  int block_candidates() const { return dflash1_ ? 0 : dfcfg_.selector_top_k; }
   const int32_t* block_candidates_host(int req) const {
     return df_cands_h_ + static_cast<size_t>(req) * static_cast<size_t>(dfcfg_.drafts()) *
                             static_cast<size_t>(dfcfg_.selector_top_k);
@@ -357,6 +376,11 @@ class Qwen35Model : public SessionModel<Qwen35Model> {
                          const std::vector<std::vector<int64_t>>& feds,
                          int* slots_out, std::vector<int>* offs_out);
   void build_layer_objects(const Qwen35LayerResident& r);
+  // MoE MLP (is_moe): routed NVFP4 experts + BF16 shared tail via the
+  // shared QwenMoeLayer (decode fast path vs device prefill path).
+  QwenMoeWeights moe_view(const QwenMoeResident& m);
+  void moe_mlp(const uint16_t* x, uint16_t* out, int tokens, const QwenMoeResident& m,
+               cudaStream_t stream, int table_slot, bool decode);
   // The dense GEMM band for this model's own CublasLtGemm: the shared Qwen
   // rule, plus the streaming mma form for 17..128-row decode batches (the
   // drafter's stacked block forwards and the taps of a wide verify read
@@ -475,6 +499,20 @@ class Qwen35Model : public SessionModel<Qwen35Model> {
   // Activation scratch at max_tokens rows.
   uint16_t *resid_ = nullptr, *x_ = nullptr, *attn_out_ = nullptr, *mlp_out_ = nullptr;
   uint16_t *gate_tmp_ = nullptr, *up_tmp_ = nullptr;  // dense MLP [M, I]
+  // The NVFP4 dense path's pre-staged tables (production ldmatrix kernel):
+  // one {0, m, 0} segment per row count 1..max_tokens (the grouped
+  // launcher's only per-launch table, read not written), plus the
+  // [gate,up,down] view tables. Resident stacks harvest every layer's
+  // table once at boot (pointers are stable, and the decode graph forbids
+  // copy-engine nodes — docs/batched_mtp_graph_stall.md); streaming
+  // stacks rebuild one shared layer allocation per load, so dense_mlp
+  // re-stages this 3-entry slot per call (the eager tests never capture).
+  MoeSegment* fp4_segs_ = nullptr;      // [max_tokens] device
+  MoeExpertView* fp4_views_ = nullptr;  // [layers x 3] resident, [3] slot streaming
+  int fp4_view_layers_ = 0;             // 0 = slot mode (streaming)
+  // MoE MLP (is_moe): the routed chain over this rank's expert slice.
+  GlmMoeConfig moe_cfg_ = {};
+  std::unique_ptr<QwenMoeLayer> moe_;
   // MTP draft scratch at max_tokens rows (null when MTP is off): embed rows
   // and their norm, the gathered/gated main hidden and its norm, the
   // [M, 2H] concat, the draft residual, its norm (the chain rows), and the
@@ -524,6 +562,38 @@ class Qwen35Model : public SessionModel<Qwen35Model> {
   DraftProposal* df_props_h_ = nullptr;
   int df_props_stride_ = 0;
   int df_batch_ = 1;  // the stacked draft batch width (slots per forward)
+  // The DFlash v1 drafter (null unless a v1 directory was given):
+  // DFlashConfig + weights, eight tap map, single-slot eager scratch
+  // (query_rows = 16 rows; C1 scope — batching and capture stay open).
+  bool dflash1_ = false;
+  DFlashConfig df1cfg_;
+  DFlashWeights df1w_;
+  std::vector<int> df1_tap_;  // per main-layer index: the fc slice, else -1
+  uint16_t *df1_resid_ = nullptr, *df1_x_ = nullptr;
+  uint16_t *df1_q_ = nullptr, *df1_k_ = nullptr, *df1_v_ = nullptr;  // roped q/k/v rows
+  uint16_t *df1_attn_ = nullptr, *df1_o_ = nullptr, *df1_mlp_ = nullptr;
+  float* df1_attn_part_ = nullptr;  // the split-key block attention's partials (QR rows)
+  uint16_t *df1_gate_ = nullptr, *df1_up_ = nullptr;  // [query_rows, draft I]
+  uint16_t* df1_h_ = nullptr;       // [query_rows, H] the draft's final norm rows
+  float* df1_logits_ = nullptr;     // [query_rows, V] F32 (the block rows' head rows)
+  void* df1_topk_ws_ = nullptr;     // the top-1 chunk partials
+  size_t df1_topk_ws_bytes_ = 0;
+  int32_t* df1_ids_ = nullptr;   // [query_rows, 16] top-16 per row (the kernel's only K; row's draft is column 0)
+  float* df1_sc_ = nullptr;      // [query_rows, 16]
+  int32_t* df1_zero_ = nullptr;  // [query_rows] zeros (the single-slot append view)
+  int64_t* df1_pos_ = nullptr;   // [query_rows] device
+  int64_t* df1_tokens_ = nullptr;  // [query_rows] device
+  int64_t* df1_io64_h_ = nullptr;  // pinned: query_rows positions then tokens
+  int32_t* df1_tok_ = nullptr;     // [drafts] device (the captured proposal rows)
+  int32_t* df1_tok_h_ = nullptr;   // pinned [drafts]: the proposed drafts
+  int32_t* df1_mirror_h_ = nullptr;  // pinned [max_requests, drafts]: the recorded drafts
+  float* df1_inv_freq_ = nullptr;  // [head_dim/2] F32 rope table
+  // The v1 block forward + mask proposal (eager, one slot): stages
+  // [bonus, mask x D], runs the six layers over the draft planes, and
+  // top-1s each mask row off the shared head.
+  bool dflash1_draft(int req, int64_t bonus, std::vector<int32_t>* drafts);
+  void df1_block_layers(int req, cudaStream_t stream, bool capture);
+  void df1_store_features(int T, const int32_t* d_req, const int64_t* d_pos);
   // The captured verify's replay state (one static 32-row graph): the
   // pool tables pointer the capture baked in (a mismatch means the pool
   // grew — drop and recapture), and the breakage latch (a failed capture

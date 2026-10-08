@@ -53,4 +53,20 @@ void qwen35_mtp_concat_bf16(const uint16_t* e, const uint16_t* h, uint16_t* out,
   DGPP_CUDA_OK(cudaGetLastError());
 }
 
+__global__ void df1_collect_top1_kernel(const int32_t* __restrict__ ids, int stride,
+                                        int32_t* __restrict__ tok, int n) {
+  const int j = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (j >= n) return;
+  tok[j] = ids[(static_cast<int64_t>(j) + 1) * stride];
+}
+
+void df1_collect_top1(const int32_t* ids, int stride, int32_t* tok, int n,
+                      cudaStream_t stream) {
+  if (n <= 0) return;
+  constexpr int kThreads = 32;
+  const int blocks = (n + kThreads - 1) / kThreads;
+  df1_collect_top1_kernel<<<blocks, kThreads, 0, stream>>>(ids, stride, tok, n);
+  DGPP_CUDA_OK(cudaGetLastError());
+}
+
 }  // namespace dgpp

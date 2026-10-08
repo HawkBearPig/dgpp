@@ -363,6 +363,8 @@ DGPP_TEST(cluster_config_refusesUnknownKeysAndBadValuesByName) {
        "'engine.mtp_verify' must be token or block"},
       {R"({"model":"m","nodes":["h"],"engine":{"dflash_weights":"nvfp4"}})",
        "'engine.dflash_weights' must be checkpoint or fp8"},
+      {R"({"model":"m","nodes":["h"],"engine":{"mtp_expert_format":"int8"}})",
+       "'engine.mtp_expert_format' must be \"fp8\", \"bf16_fused\" or \"bf16\""},
       {R"({"model":"m","nodes":["h"],"engine":{"l2_prefetch_layer_rate":"heavy"}})",
        "'engine.l2_prefetch_layer_rate' must be off, light or full"},
       {R"({"model":"m","nodes":["h"],"engine":{"l2_prefetch_form":"walk"}})",

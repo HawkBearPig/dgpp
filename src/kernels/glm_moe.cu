@@ -4179,6 +4179,18 @@ void launch_dense_mma_fp4_f32(const uint16_t* act, size_t act_stride,
   launch_dense_mma_fp4<float>(act, act_stride, w, out, m, n, k, stream);
 }
 
+void launch_dense_mma_fp4_prod_bf16(const uint16_t* act, size_t act_stride,
+                                    const MoeSegment* seg, const MoeExpertView* views,
+                                    int which, uint16_t* out, int m, int n, int k,
+                                    cudaStream_t stream, int fp4_group) {
+  if (m <= 0 || n <= 0) return;
+  if (!act || !seg || !views || !out)
+    throw std::invalid_argument("dense mma fp4 prod: null pointer");
+  launch_moe_grouped_mma_fp4<uint16_t>(act, act_stride, nullptr, seg, /*n_segs=*/1,
+                                       /*max_rows=*/m, /*rows_per_block=*/0, views, which,
+                                       out, static_cast<size_t>(n), n, k, stream, fp4_group);
+}
+
 void launch_moe_grouped_gemv_fp4_f32(const uint16_t* act, size_t act_stride,
                                      const MoeSegment* segs, int n_segs,
                                      int max_rows, int rows_per_block,

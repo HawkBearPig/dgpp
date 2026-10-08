@@ -329,6 +329,19 @@ void launch_dense_mma_fp4_bf16(const uint16_t* act, size_t act_stride,
 void launch_dense_mma_fp4_f32(const uint16_t* act, size_t act_stride,
                               const GlmFp4Matrix& w, float* out, int m, int n,
                               int k, cudaStream_t stream);
+// The dense matrix through the PRODUCTION ldmatrix kernel (the grouped
+// launcher with one segment): bitwise the dense reference above
+// (glm_moe_test pins the pair per segment) at the production kernel's
+// rate (moe_tile_bench: ~1.5-2x on prefill shapes). `seg` is device
+// memory holding {0, m, 0}; `views` device memory holding at least
+// [which] as MoeExpertView::of(w) (a 3-entry [gate,up,down] table with
+// which = 0/1/2 mirrors the MoE layout). Both stay caller-owned: the
+// kernel only reads them.
+void launch_dense_mma_fp4_prod_bf16(const uint16_t* act, size_t act_stride,
+                                    const MoeSegment* seg, const MoeExpertView* views,
+                                    int which, uint16_t* out, int m, int n, int k,
+                                    cudaStream_t stream, int fp4_group = kFp4Group);
+
 // fp4_group (2026-09-13): 16 = NVFP4 view tables (e4m3 scales + globals),
 // 32 = MXFP4 tables (e8m0 scales, no globals — DeepSeek-V4.1-Flash,
 // docs/deepseek_v41_flash_plan.md D2); the routed k must be in the group's

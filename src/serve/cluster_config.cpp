@@ -211,8 +211,9 @@ ClusterConfig parse_cluster_config(const std::string& json, const std::string& w
         }
         else if (p.key == "mtp_expert_format") {
           e.mtp_expert_format = text(x, ek, what);
-          if (e.mtp_expert_format != "fp8" && e.mtp_expert_format != "bf16_fused")
-            fail(what, "'" + ek + "' must be \"fp8\" or \"bf16_fused\"");
+          if (e.mtp_expert_format != "fp8" && e.mtp_expert_format != "bf16_fused" &&
+              e.mtp_expert_format != "bf16")
+            fail(what, "'" + ek + "' must be \"fp8\", \"bf16_fused\" or \"bf16\" (qwen3_5 MoE draft only)");
         }
         else if (p.key == "bf16_weights") {
           e.bf16_weights = text(x, ek, what);

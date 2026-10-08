@@ -610,6 +610,18 @@ on an otherwise idle server to compare the longest client update pause
 with the budget disabled and enabled. Keep the same tag and prompt size
 in matched fresh-server runs so the long prompt has no cached prefix.
 
+**The MTP draft experts** (`engine.mtp_expert_format`, `--mtp-expert-format`):
+`fp8` serves a natively-FP8 draft (Qwen3.8-Flash-Next); `bf16_fused` decodes
+the RadixArk fused BF16 draft to FP8 at load. Qwen3.5-122B-A10B's draft ships
+per-expert BF16: `bf16` encodes each draft expert to block FP8 at load (other
+families refuse it; the dense 27B draft serves its BF16 MLP as shipped).
+Draft-only loss in all encoded forms — the verify reads the exact target —
+so greedy transcripts match the plain world; measure acceptance before
+quoting it. Qwen3.5-122B-A10B (2026-10-07, 416-token prose probe): depth 1 at 1.89
+tok/pass, 89 % p1 (26.9 tok/s); depth 2 at 2.59 tok/pass, 89 % p1 / 71 %
+p2 (31.1 tok/s, +16 %); depth 3 at 28.7 tok/s — the extra verify row
+costs more than the third draft earns. Templates ship depth 2.
+
 **The draft depth** (`engine.mtp_depth`, `--mtp-depth`, 1–5, with `mtp`)
 is the number of draft tokens verified per decode step. Depth 1 is the
 two-row step: the pending token and one draft through the main stack, the

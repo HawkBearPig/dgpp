@@ -69,7 +69,37 @@ int main(int argc, char** argv) {
               cfg.vocab_size);
   dgpp::Qwen35LayerStream stream(cfg, ckpt, 0, 1, dgpp::LoaderResidency::Streaming,
                                  dgpp::LoaderHeadSharding::Full, false);
-  std::fprintf(stderr, "MARK stream constructed\n");
+  std::fprintf(stderr, "MARK stream constructed (moe=%d)\n", cfg.is_moe ? 1 : 0);
+  if (cfg.is_moe) {
+    // MoE NVFP4 (122B): layer 0 GDN + routed experts, layer 3 Full.
+    {
+      const dgpp::Qwen35LayerResident& r = stream.load_layer(0);
+      std::fprintf(stderr, "MARK layer 0 loaded\n");
+      CHECK(r.kind == dgpp::Qwen35LayerKind::Gdn, "layer 0 kind != Gdn");
+      CHECK(r.input_norm && r.post_norm, "layer 0 norms null");
+      CHECK(r.moe.router && r.moe.shared_gate, "layer 0 router null");
+      CHECK(r.moe.shared[0] && r.moe.shared[2], "layer 0 shared null");
+      CHECK(!r.moe.experts_fp4.empty() && r.moe.experts_fp4[0].payload,
+            "layer 0 experts_fp4 null");
+      CHECK(r.moe.experts_fp4[0].global_scale, "layer 0 expert global null");
+      CHECK(r.moe.local_inter == cfg.moe_intermediate_size, "moe inter geometry");
+      CHECK(r.moe.local_shared_inter == cfg.shared_expert_intermediate_size,
+            "shared inter geometry");
+      const std::vector<uint16_t> n = down16(r.input_norm, 4);
+      std::printf("L0 input_norm[0..3] = %.4f %.4f %.4f %.4f\n", h2f(n[0]), h2f(n[1]),
+                  h2f(n[2]), h2f(n[3]));
+    }
+    {
+      const dgpp::Qwen35LayerResident& r = stream.load_layer(3);
+      std::fprintf(stderr, "MARK layer 3 loaded\n");
+      CHECK(r.kind == dgpp::Qwen35LayerKind::Full, "layer 3 kind != Full");
+      CHECK(r.full.q_norm && r.full.k_norm, "layer 3 q/k norms null");
+      CHECK(!r.moe.experts_fp4.empty() && r.moe.experts_fp4[0].payload,
+            "layer 3 experts_fp4 null");
+    }
+    std::printf("SMOKE PASS\n");
+    return 0;
+  }
   // Layer 0: GDN.
   {
     const dgpp::Qwen35LayerResident& r = stream.load_layer(0);

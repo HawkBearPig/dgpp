@@ -467,7 +467,7 @@ class ExprParser {
       const bool inv = accept_kw("not");
       if (peek().t != ETok::T::Ident) fail(line_, "'is' needs a test name");
       static const char* kTests[] = {"defined", "undefined", "none", "string",
-                                     "mapping", "iterable", "true", "false"};
+                                     "mapping", "sequence", "iterable", "true", "false"};
       ExprPtr e = make(Expr::Tag::Test);
       e->name = peek().s;
       e->inverted = inv;
@@ -1692,6 +1692,8 @@ struct Renderer {
           r = v.kind() == Value::Kind::String;
         else if (e.name == "mapping")
           r = v.kind() == Value::Kind::Map;  // namespaces are not mappings
+        else if (e.name == "sequence")
+          r = v.kind() == Value::Kind::String || v.kind() == Value::Kind::List;  // Jinja: str counts
         else  // iterable (strings, lists and maps — Python truth)
           r = v.kind() == Value::Kind::String || v.kind() == Value::Kind::List ||
               v.kind() == Value::Kind::Map;

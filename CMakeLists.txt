@@ -166,6 +166,7 @@ add_library(dgpp_kernels STATIC
   src/kernels/fp8_dequant.cu
   src/kernels/fp8_gemm.cu
   src/kernels/fp8w_gemm.cu
+  src/kernels/fp4w_gemm.cu
   src/kernels/fp8_per_tensor.cu
   src/kernels/fp4_gemv.cu
   src/kernels/packq_gemv.cu
@@ -440,7 +441,8 @@ add_library(dgpp_models_qwen_loader STATIC
   src/models/qwen/vision.cpp
   src/models/qwen/loader.cpp
   src/models/qwen/loader35.cpp
-  src/models/qwen/dflash2.cpp)
+  src/models/qwen/dflash2.cpp
+  src/models/qwen/dflash.cpp)
 target_include_directories(dgpp_models_qwen_loader PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(dgpp_models_qwen_loader PUBLIC dgpp_models_qwen dgpp_loaders dgpp_kernels CUDA::cudart dgpp_device_ranges)
 dgpp_set_common(dgpp_models_qwen_loader)
@@ -613,6 +615,9 @@ dgpp_set_common(glm_dsa_bind_check)
 add_executable(dsv41_bind_check apps/dsv41_bind_check.cpp)
 target_link_libraries(dsv41_bind_check PRIVATE dgpp_models_dsv41 dgpp_loaders)
 dgpp_set_common(dsv41_bind_check)
+add_executable(qwen35_bind_check apps/qwen35_bind_check.cpp)
+target_link_libraries(qwen35_bind_check PRIVATE dgpp_models_qwen_loader dgpp_loaders)
+dgpp_set_common(qwen35_bind_check)
 add_executable(dsv4_forward_check apps/dsv4_forward_check.cpp)
 target_include_directories(dsv4_forward_check PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
 target_link_libraries(dsv4_forward_check PRIVATE dgpp_models_dsv4_layers dgpp_bus dgpp_loaders dgpp_sched dgpp_text CUDA::cudart Threads::Threads)
@@ -817,6 +822,7 @@ add_executable(unit_tests
   tests/unit/qwen35_config_test.cpp
   tests/unit/qwen35_binding_test.cpp
   tests/unit/qwen_dflash2_config_test.cpp
+  tests/unit/qwen_dflash_config_test.cpp
   tests/unit/dflash2_speculator_test.cpp
   tests/unit/qwen_rope_scaling_test.cpp
   tests/unit/glm4_config_test.cpp
@@ -1268,6 +1274,45 @@ add_test(NAME qwen35_forward_test
   COMMAND qwen35_forward_test --checkpoint-dir ${QWEN35_FORWARD_FIXTURE}
           --dump-file ${CMAKE_CURRENT_BINARY_DIR}/qwen35_teacher_ref.q35dump)
 set_tests_properties(qwen35_forward_test PROPERTIES DEPENDS qwen35_forward_generate_teacher)
+# The NVFP4 mixed release (#131): the same gate over the mixed-form fixture
+# (channel-FP8 attention + late MLP + lm_head, NVFP4 early MLPs, BF16 draft).
+set(QWEN35_MIXED_FIXTURE ${CMAKE_CURRENT_BINARY_DIR}/qwen35_mixed_fixture)
+add_test(NAME qwen35_mixed_fixture COMMAND qwen35_forward_test --write-fixture-mixed ${QWEN35_MIXED_FIXTURE})
+add_test(NAME qwen35_mixed_smoke COMMAND qwen35_forward_test --smoke ${QWEN35_MIXED_FIXTURE})
+set_tests_properties(qwen35_mixed_smoke PROPERTIES DEPENDS qwen35_mixed_fixture)
+add_test(NAME qwen35_mixed_rows_invariance COMMAND qwen35_forward_test --rows-invariance ${QWEN35_MIXED_FIXTURE})
+set_tests_properties(qwen35_mixed_rows_invariance PROPERTIES DEPENDS qwen35_mixed_fixture)
+add_test(NAME qwen35_mixed_generate
+  COMMAND ${DSV41_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/tools/qwen35_reference_dump.py
+          gen-pure --checkpoint-dir ${QWEN35_MIXED_FIXTURE}
+          --out ${CMAKE_CURRENT_BINARY_DIR}/qwen35_mixed_ref.q35dump)
+set_tests_properties(qwen35_mixed_generate PROPERTIES DEPENDS qwen35_mixed_fixture)
+add_test(NAME qwen35_mixed_e2e
+  COMMAND qwen35_forward_test --checkpoint-dir ${QWEN35_MIXED_FIXTURE}
+          --dump-file ${CMAKE_CURRENT_BINARY_DIR}/qwen35_mixed_ref.q35dump --relaxed
+          --engine-states ${CMAKE_CURRENT_BINARY_DIR}/qwen35_mixed_engine_states.bin)
+set_tests_properties(qwen35_mixed_e2e PROPERTIES DEPENDS qwen35_mixed_generate)
+add_test(NAME qwen35_mixed_generate_teacher
+  COMMAND ${DSV41_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/tools/qwen35_reference_dump.py
+          gen-pure --checkpoint-dir ${QWEN35_MIXED_FIXTURE}
+          --out ${CMAKE_CURRENT_BINARY_DIR}/qwen35_mixed_teacher.q35dump
+          --teacher ${CMAKE_CURRENT_BINARY_DIR}/qwen35_mixed_engine_states.bin)
+set_tests_properties(qwen35_mixed_generate_teacher PROPERTIES DEPENDS qwen35_mixed_e2e)
+add_test(NAME qwen35_mixed_test
+  COMMAND qwen35_forward_test --checkpoint-dir ${QWEN35_MIXED_FIXTURE}
+          --dump-file ${CMAKE_CURRENT_BINARY_DIR}/qwen35_mixed_teacher.q35dump)
+set_tests_properties(qwen35_mixed_test PROPERTIES DEPENDS qwen35_mixed_generate_teacher)
+# The MoE release (122B layout at toy widths: ModelOpt NVFP4 routed experts,
+# BF16 rest): the same smoke/rows/group gates over the MoE fixture. Dump
+# parity waits on the reference dump's MoE path (tools/qwen35_reference_dump.py).
+set(QWEN35_MOE_FIXTURE ${CMAKE_CURRENT_BINARY_DIR}/qwen35_moe_fixture)
+add_test(NAME qwen35_moe_fixture COMMAND qwen35_forward_test --write-fixture-moe ${QWEN35_MOE_FIXTURE})
+add_test(NAME qwen35_moe_smoke COMMAND qwen35_forward_test --smoke ${QWEN35_MOE_FIXTURE})
+set_tests_properties(qwen35_moe_smoke PROPERTIES DEPENDS qwen35_moe_fixture)
+add_test(NAME qwen35_moe_rows_invariance COMMAND qwen35_forward_test --rows-invariance ${QWEN35_MOE_FIXTURE})
+set_tests_properties(qwen35_moe_rows_invariance PROPERTIES DEPENDS qwen35_moe_fixture)
+add_test(NAME qwen35_moe_group_invariance COMMAND qwen35_forward_test --group-invariance ${QWEN35_MOE_FIXTURE})
+set_tests_properties(qwen35_moe_group_invariance PROPERTIES DEPENDS qwen35_moe_fixture)
 # The 27B TP forwards (#86): loopback worlds of 2 and 4 over the tiny
 # fixture against the world-1 forward (ports 29950, 29951).
 add_executable(qwen35_tp_test tests/cuda/qwen35_tp_test.cpp)
@@ -1719,6 +1764,11 @@ target_include_directories(mma_gemv_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
 target_link_libraries(mma_gemv_test PRIVATE dgpp_kernels CUDA::cudart)
 dgpp_set_common(mma_gemv_test)
 add_test(NAME mma_gemv_test COMMAND mma_gemv_test)
+add_executable(fp4w_gemm_test tests/cuda/fp4w_gemm_test.cu)
+target_include_directories(fp4w_gemm_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(fp4w_gemm_test PRIVATE dgpp_kernels CUDA::cudart)
+dgpp_set_common(fp4w_gemm_test)
+add_test(NAME fp4w_gemm_test COMMAND fp4w_gemm_test)
 add_executable(fp4_gemv_test tests/cuda/fp4_gemv_test.cu tests/cuda/fp4_gemv_checkpoint.cpp)
 target_include_directories(fp4_gemv_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(fp4_gemv_test PRIVATE dgpp_kernels dgpp_loaders CUDA::cudart)

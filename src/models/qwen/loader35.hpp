@@ -18,12 +18,18 @@
 
 namespace dgpp {
 
-// Dense SwiGLU MLP resident (BF16 or block-FP8 weights).
+// Dense SwiGLU MLP resident. One matrix form per layer, whichever the
+// release binds: block FP8 (the FP8 release, `*_fp8`), channel FP8 (the
+// mixed release's late layers: the same `*_fp8` slots with a
+// scale_block_rows = 1 grid), NVFP4 (the mixed release's MLP: `*_fp4`), or
+// BF16 (the mixed release's draft layer — and any untargeted matrix).
 struct Qwen35DenseMlpResident {
   const uint16_t* gate = nullptr;  // BF16 [I, H]
   const uint16_t* up = nullptr;    // BF16 [I, H]
   const uint16_t* down = nullptr;  // BF16 [H, I]
-  GlmQuantMatrix gate_fp8, up_fp8, down_fp8;  // dense_weights fp8
+  GlmQuantMatrix gate_fp8, up_fp8, down_fp8;  // block- or channel-scaled
+  GlmFp4Matrix gate_fp4, up_fp4, down_fp4;    // the mixed release's MLP
+  int64_t inter = 0;  // this rank's I (gate/up rows, down cols) in any form
 };
 
 struct Qwen35LayerResident {
@@ -33,7 +39,8 @@ struct Qwen35LayerResident {
   const uint16_t* post_norm = nullptr;   // BF16 [H]
   QwenGdnResident gdn;                   // kind == Gdn
   QwenFullAttnResident full;             // kind == Full
-  Qwen35DenseMlpResident mlp;            // every layer
+  Qwen35DenseMlpResident mlp;            // dense variant (is_moe == false)
+  QwenMoeResident moe;                   // MoE variant (is_moe == true)
   size_t bytes = 0;  // set by the stream (bump cursor after build)
 };
 
@@ -41,6 +48,9 @@ struct Qwen35GlobalsResident {
   const uint16_t* embed = nullptr;       // BF16 [vocab, H]
   const uint16_t* final_norm = nullptr;  // BF16 [H]
   const uint16_t* lm_head = nullptr;     // BF16 [V/W, H] vocab shard
+  // The mixed release's native head: e4m3 [V/W, H] with per-row F32
+  // scales (scale_block_rows = 1); lm_head stays null then.
+  GlmQuantMatrix lm_head_fp8;
   int lm_vocab_begin = 0, lm_vocab_count = 0;
   // MTP draft head (BF16, replicated): fused fc [H, 2H] over
   // cat(pre_fc_norm_embedding(embed), pre_fc_norm_hidden(hidden)) plus the
@@ -58,7 +68,9 @@ struct Qwen35LocalGeometry {
   int local_key_heads = 0, local_value_heads = 0;  // GDN
   int local_heads = 0, head_begin = 0;             // Full query heads
   int local_kv_heads = 0, kv_head_begin = 0;       // Full kv heads
-  int64_t local_inter = 0;                         // MLP I/W
+  int64_t local_inter = 0;                         // dense MLP I/W
+  int64_t local_moe_inter = 0;                     // MoE routed I/W
+  int64_t local_shared_inter = 0;                  // MoE shared S/W
   int lm_vocab_begin = 0, lm_vocab_count = 0;      // lm head slice
   static Qwen35LocalGeometry from_config(const Qwen35TextConfig& cfg, int rank, int world,
                                           LoaderHeadSharding head);
@@ -102,6 +114,11 @@ struct Qwen35LayerStream : ResidentLayerStream<Qwen35LoaderFamily> {
                     bool resident_mtp = false);
   static void set_resident_image_dir(const std::string& dir);
   static const std::string& resident_image_dir();
+  // engine.mtp_expert_format for the MoE draft ("bf16": per-expert BF16
+  // encoded to block FP8 at load, draft proposals only). Set before the
+  // plan and the load; the image format carries it.
+  static void set_mtp_expert_format(const std::string& fmt);
+  static const std::string& mtp_expert_format();
   const std::string& image_dir() const override;
 };
 
