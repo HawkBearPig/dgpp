@@ -1,0 +1,31 @@
+{
+  "model": "kaushikvira/Qwen3.8-Flash-Next-swift15-nvfp4-dgpp",
+  "world_size": 2,
+  "engine": {
+    "max_concurrency": 4,
+    "kv_capacity": 1048576,
+    "kv_dtype": "bf16",
+    "bf16_weights": "bf12+bf16",
+    "ngram_table": "mmap",
+    "default_max_tokens": 32768,
+    "queue_limit": 8,
+    "max_connections": 64,
+    "decode_graph": true,
+    "mtp": true,
+    "mtp_depth": 4,
+    "prefix_cache_gib": 42,
+    "admission": "full",
+    "admission_window": 256,
+    "model_alias": "Qwen3.8-Flash-Next",
+    "sampling_candidates": 128,
+    "stats_interval_s": 10,
+    "dense_weights": "fp8",
+    "fp8_head": "mma",
+    "mtp_expert_format": "bf16_fused",
+    "prefill_budget_tokens": 4096,
+    "prefill_idle_budget_tokens": 4096
+  },
+  "paths": {
+    "resident_cache": ""
+  }
+}
