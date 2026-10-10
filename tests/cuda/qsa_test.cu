@@ -924,7 +924,7 @@ DGPP_TEST(qsa_listed_attention_and_gate_match_the_reference) {
     DevBuf dreq = up(req_ids), dpos = up(pos);
     dgpp::qsa_kv_append(ptr<uint16_t>(dk), width, ptr<uint16_t>(dv), width, ptr<int32_t>(dreq), ptr<int64_t>(dpos),
                         g.seq, ptr<int32_t>(sf.f.dtable), g.blocks_per_request, g.block_tokens, g.kv_heads, g.dim,
-                        mptr<uint16_t>(kc), mptr<uint16_t>(vc), st);
+                        mptr<uint16_t>(kc), mptr<uint16_t>(vc), nullptr, nullptr, st);
   }
   // Queries with the [q | gate] interleave; the reference lists.
   const int64_t q_head_stride = 2 * g.dim, q_row_stride = g.local_heads * q_head_stride;
@@ -971,7 +971,7 @@ DGPP_TEST(qsa_listed_attention_and_gate_match_the_reference) {
                              ptr<uint16_t>(vc), ptr<int32_t>(sf.dreq), ptr<int32_t>(dtopk), g.max_selected(),
                              ptr<int32_t>(dcounts), rows, n_split, g.local_heads, g.kv_heads, g.dim, g.block_tokens,
                              ptr<int32_t>(sf.f.dtable), g.blocks_per_request, 1.0f / 16.0f, mptr<float>(m_ws),
-                             mptr<float>(l_ws), mptr<float>(c_ws), st);
+                             mptr<float>(l_ws), mptr<float>(c_ws), st, nullptr, nullptr);
       dgpp::dsa_attn_combine(ptr<float>(m_ws), ptr<float>(l_ws), ptr<float>(c_ws), rows, n_split, g.local_heads, g.dim,
                              mptr<float>(c_out), st);
       dgpp::qsa_gate_out(ptr<float>(c_out), ptr<uint16_t>(dqg) + g.dim, q_row_stride, q_head_stride, mptr<uint16_t>(out),
@@ -1079,7 +1079,7 @@ DGPP_TEST(qsa_prefill_partials_preserve_arithmetic_and_graph_replay) {
            ptr<int32_t>(dtopk), stride, ptr<int32_t>(dcounts), rows, splits, heads, kv_heads, dim,
            block_tokens, ptr<int32_t>(dtable), blocks, 1.0f / 16,
            mptr<float>(candidate ? m1 : m0), mptr<float>(candidate ? l1 : l0),
-           mptr<float>(candidate ? c1 : c0), stream);
+           mptr<float>(candidate ? c1 : c0), stream, nullptr, nullptr);
       };
       launch(false);
       launch(true);

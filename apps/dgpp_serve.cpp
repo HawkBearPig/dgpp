@@ -421,11 +421,20 @@ struct QwenFamily final : ServeFamily {
   std::string ckpt;
   std::unique_ptr<dgpp::QwenModel> model;
   bool fp8_head_mma;
+  dgpp::LatentFormat kv_format;
   QwenFamily(const std::string& checkpoint, const std::optional<dgpp::RopeScaling>& rope_scaling,
-             bool head_mma)
+             bool head_mma, dgpp::LatentFormat kv_fmt)
       : cfg(dgpp::QwenTextConfig::from_json_file((fs::path(checkpoint) / "config.json").string())),
         ckpt(checkpoint),
-        fp8_head_mma(head_mma) {
+        fp8_head_mma(head_mma),
+        kv_format(kv_fmt) {
+    // The Qwen KV-cache format (engine.kv_dtype): bf16 or fp8 (e4m3 rows with
+    // one scale per (slot, kv-head); the QSA attention dequants in-kernel).
+    // fp4 is rejected here (not implemented). See docs/qwen_fp8_kv_plan.md.
+    if (kv_format != dgpp::LatentFormat::kBf16 && kv_format != dgpp::LatentFormat::kFp8)
+      throw std::invalid_argument(std::string("engine.kv_dtype ") +
+                                  dgpp::latent_format_name(kv_format) +
+                                  " is not supported for Qwen (bf16 or fp8)");
     // The fused BF16 MTP expert format is a process-wide flag (set from the
     // engine config or CLI before the family is built); it must be on the
     // config before the binding table and the loader see it.
@@ -469,7 +478,7 @@ struct QwenFamily final : ServeFamily {
       return "exceeds the QSA pool-id space (2^21 pools)";
     return "";
   }
-  const char* kv_format_name() const override { return "bf16"; }
+  const char* kv_format_name() const override { return dgpp::latent_format_name(kv_format); }
   // The YaRN-scaled ceiling (or the checkpoint's when the knob is off).
   int64_t position_limit() const override { return cfg.context_limit(); }
   // The small-row kernels keep their dispatch; wider batches use the
@@ -484,7 +493,7 @@ struct QwenFamily final : ServeFamily {
                         bool mtp, int decode_rows) const override {
     return dgpp::QwenModel::plan_memory(cfg, forward_rows, context, fabric ? rank : 0, fabric ? world_ : 1,
                                         fabric ? dgpp::QwenResidency::Resident : dgpp::QwenResidency::Streaming,
-                                        slots, fabric && mtp, decode_rows, /*serving_logits=*/true);
+                                        slots, fabric && mtp, decode_rows, /*serving_logits=*/true, kv_format);
   }
   size_t snapshot_bytes(int world_, bool mtp) const override {
     return dgpp::QwenModel::session_snapshot_bytes(cfg, world_, mtp);
@@ -497,7 +506,8 @@ struct QwenFamily final : ServeFamily {
     model = std::make_unique<dgpp::QwenModel>(
         cfg, ckpt, forward_rows, pool_tokens,
         fabric ? dgpp::QwenResidency::Resident : dgpp::QwenResidency::Streaming, reducer,
-        fabric ? rank : 0, fabric ? world_ : 1, slots, fabric && mtp, decode_rows, fp8_head_mma, /*serving_logits=*/true);
+        fabric ? rank : 0, fabric ? world_ : 1, slots, fabric && mtp, decode_rows, fp8_head_mma,
+        /*serving_logits=*/true, kv_format);
   }
   void destroy_model() override { model.reset(); }
   size_t model_snapshot_bytes() const override { return model ? model->session_snapshot_bytes() : 0; }
@@ -969,7 +979,7 @@ std::unique_ptr<ServeFamily> make_family(const std::string& ckpt, int world,
   if (arch == dgpp::ModelArchitecture::DeepseekV4) return std::make_unique<Dsv4Family>(ckpt);
   if (arch == dgpp::ModelArchitecture::MimoV2) return std::make_unique<MimoFamily>(ckpt, kv_format);
   if (arch == dgpp::ModelArchitecture::Qwen4Exp)
-    return std::make_unique<QwenFamily>(ckpt, rope_scaling, fp8_head_mma);
+    return std::make_unique<QwenFamily>(ckpt, rope_scaling, fp8_head_mma, kv_format);
   if (arch == dgpp::ModelArchitecture::Qwen3_5) return std::make_unique<Qwen35Family>(ckpt);
   if (arch == dgpp::ModelArchitecture::Glm4Moe) return std::make_unique<Glm4Family>(ckpt);
   if (arch == dgpp::ModelArchitecture::GlmMoeDsa) return std::make_unique<GlmDsaFamily>(ckpt, world, kv_format);
@@ -2513,9 +2523,10 @@ int main(int argc, char** argv) {
                   decode_rows, max_concurrency, graph_rows_per_request, dgpp::kDecodeRows, family->name(),
                   family->decode_rows_cap());
     if (std::string(family->name()) != "glm5" && std::string(family->name()) != "glm_moe_dsa" &&
-        std::string(family->name()) != "mimo_v2" && kv_dtype != "bf16")
-      DGPP_LOG_WARN("serve: --kv-dtype {} applies to the GLM-5.3 latent caches and the MiMo-V2 K/V cache only; "
-                    "the {} caches stay bf16",
+        std::string(family->name()) != "mimo_v2" && std::string(family->name()) != "qwen4_exp" &&
+        kv_dtype != "bf16")
+      DGPP_LOG_WARN("serve: --kv-dtype {} applies to the GLM-5.3 latent caches, the MiMo-V2 and "
+                    "Qwen3.8-Flash-Next K/V caches only; the {} caches stay bf16",
                     kv_dtype, family->name());
     if (std::string(family->name()) != "qwen4_exp" && ngram_table != "resident")
       DGPP_LOG_WARN("serve: --ngram-table {} applies to the Qwen n-gram table only; the {} family has none",

@@ -10,6 +10,7 @@
 
 #include "common/cuda_check.hpp"
 #include "common/dtypes.hpp"
+#include "kernels/latent_format.hpp"
 
 namespace dgpp {
 namespace {
@@ -23,6 +24,8 @@ template <int D>
 __global__ void attn_prefill_partial_kernel(const uint16_t* __restrict__ q, int64_t q_row_stride,
                                     const uint16_t* __restrict__ k_cache,
                                     const uint16_t* __restrict__ v_cache,
+                                    const float* __restrict__ k_scale,
+                                    const float* __restrict__ v_scale,
                                     const int32_t* __restrict__ req_ids,
                                     const int32_t* __restrict__ topk, int topk_stride,
                                     const int32_t* __restrict__ counts, int n_split,
@@ -86,17 +89,42 @@ __global__ void attn_prefill_partial_kernel(const uint16_t* __restrict__ q, int6
   for (int t0 = t_begin; t0 < t_end; t0 += kQsaTile) {
     const int n = min(kQsaTile, t_end - t0);
     // Gather the tile's K and V rows (kv head kvh) as uint4s.
-    for (int idx = threadIdx.x; idx < n * kVecPerRow * 2; idx += blockDim.x) {
-      const int which = idx / (n * kVecPerRow);
-      const int rem = idx - which * (n * kVecPerRow);
-      const int tt = rem / kVecPerRow;
-      const int c8 = rem - tt * kVecPerRow;
-      const int64_t tok = toks[t0 + tt];
-      const int32_t blk = bt[tok / block_tokens];
-      const int64_t phys = static_cast<int64_t>(blk) * block_tokens + tok % block_tokens;
-      const uint16_t* src = (which == 0 ? k_cache : v_cache) + phys * width + kvh * D + c8 * 8;
-      uint16_t* dst = (which == 0 ? kt : vt) + tt * kRowStride + c8 * 8;
-      *reinterpret_cast<uint4*>(dst) = *reinterpret_cast<const uint4*>(src);
+    if (k_scale == nullptr) {
+      for (int idx = threadIdx.x; idx < n * kVecPerRow * 2; idx += blockDim.x) {
+        const int which = idx / (n * kVecPerRow);
+        const int rem = idx - which * (n * kVecPerRow);
+        const int tt = rem / kVecPerRow;
+        const int c8 = rem - tt * kVecPerRow;
+        const int64_t tok = toks[t0 + tt];
+        const int32_t blk = bt[tok / block_tokens];
+        const int64_t phys = static_cast<int64_t>(blk) * block_tokens + tok % block_tokens;
+        const uint16_t* src = (which == 0 ? k_cache : v_cache) + phys * width + kvh * D + c8 * 8;
+        uint16_t* dst = (which == 0 ? kt : vt) + tt * kRowStride + c8 * 8;
+        *reinterpret_cast<uint4*>(dst) = *reinterpret_cast<const uint4*>(src);
+      }
+    } else {
+      // fp8 cache: vectorized gather (16 codes per 16-byte load) of the e4m3
+      // codes + per-(row, kv-head) scale, dequantized to bf16 in the smem
+      // tiles; the math below is unchanged (reads bf16).
+      const uint8_t* k8 = reinterpret_cast<const uint8_t*>(k_cache);
+      const uint8_t* v8 = reinterpret_cast<const uint8_t*>(v_cache);
+      constexpr int kFp8ChunksPerRow = D / 16;
+      for (int idx = threadIdx.x; idx < n * kFp8ChunksPerRow * 2; idx += blockDim.x) {
+        const int which = idx / (n * kFp8ChunksPerRow);
+        const int rem = idx - which * (n * kFp8ChunksPerRow);
+        const int tt = rem / kFp8ChunksPerRow;
+        const int c = (rem - tt * kFp8ChunksPerRow) * 16;
+        const int64_t tok = toks[t0 + tt];
+        const int32_t blk = bt[tok / block_tokens];
+        const int64_t phys = static_cast<int64_t>(blk) * block_tokens + tok % block_tokens;
+        const uint8_t* src = (which == 0 ? k8 : v8) + phys * width + kvh * D + c;
+        const float sc = (which == 0 ? k_scale : v_scale)[phys * kv_heads + kvh];
+        uint16_t* dst = (which == 0 ? kt : vt) + tt * kRowStride + c;
+        const uint4 v4 = *reinterpret_cast<const uint4*>(src);
+        const uint8_t* b = reinterpret_cast<const uint8_t*>(&v4);
+#pragma unroll
+        for (int j = 0; j < 16; ++j) dst[j] = latent_fp8_decode_bf16(b[j], sc);
+      }
     }
     __syncthreads();
     float tile_max = -INFINITY;
@@ -148,12 +176,13 @@ void qsa_attn_prefill_partial(const uint16_t* q, int64_t q_row_stride, const uin
                       int topk_stride, const int32_t* counts, int rows, int n_split,
                       int local_heads, int kv_heads, int dim, int block_tokens,
                       const int32_t* block_tables, int blocks_per_request, float scale,
-                      float* m_ws, float* l_ws, float* c_ws, cudaStream_t stream) {
+                      float* m_ws, float* l_ws, float* c_ws, cudaStream_t stream,
+                      const float* k_scale, const float* v_scale) {
   if (rows <= 0) return;
   if (dim != 256) {
     qsa_attn_partial(q, q_row_stride, k_cache, v_cache, req_ids, topk, topk_stride, counts,
                      rows, n_split, local_heads, kv_heads, dim, block_tokens, block_tables,
-                     blocks_per_request, scale, m_ws, l_ws, c_ws, stream);
+                     blocks_per_request, scale, m_ws, l_ws, c_ws, stream, k_scale, v_scale);
     return;
   }
   if (!q || !k_cache || !v_cache || !req_ids || !topk || !counts || !block_tables || !m_ws ||
@@ -175,7 +204,7 @@ void qsa_attn_prefill_partial(const uint16_t* q, int64_t q_row_stride, const uin
                   static_cast<unsigned>(local_heads / hpb));
   const int threads = hpb * 32;
   attn_prefill_partial_kernel<256><<<grid, threads, smem, stream>>>(
-      q, q_row_stride, k_cache, v_cache, req_ids, topk, topk_stride, counts, n_split,
+      q, q_row_stride, k_cache, v_cache, k_scale, v_scale, req_ids, topk, topk_stride, counts, n_split,
       local_heads, kv_heads, block_tokens, block_tables, blocks_per_request, scale, m_ws,
       l_ws, c_ws);
   DGPP_CUDA_OK(cudaGetLastError());
