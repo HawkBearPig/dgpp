@@ -52,8 +52,9 @@ void d2d(void* dst, const void* src, size_t bytes, cudaStream_t stream) {
 QwenModel::QwenModel(const QwenTextConfig& cfg, const std::string& checkpoint_dir, int max_tokens,
                      int64_t max_cache_tokens, QwenResidency residency, BoundaryReducer* boundary,
                      int tp_rank, int tp_world, int max_requests, bool mtp, int decode_rows,
-                     bool fp8_head_mma, bool serving_logits)
+                     bool fp8_head_mma, bool serving_logits, LatentFormat kv_format)
     : fp8_head_mma_(fp8_head_mma),
+      kv_format_(kv_format),
       cfg_(cfg),
       loader_(cfg, checkpoint_dir, tp_rank, tp_world, residency,
               tp_world > 1 ? QwenHeadSharding::VocabSharded : QwenHeadSharding::Full,
@@ -188,6 +189,7 @@ QwenModel::QwenModel(const QwenTextConfig& cfg, const std::string& checkpoint_di
     shape.block_tokens = kBlockTokens;
     shape.max_requests = max_requests_;
     shape.token_slots = max_cache_tokens_;
+    shape.format = kv_format_;
     pool_.init(shape);
     spec_ring_ = dev_alloc<uint16_t>(static_cast<size_t>(num_qsa_) * rows * ring_elems());
   }
@@ -256,7 +258,8 @@ QwenModel::QwenModel(const QwenTextConfig& cfg, const std::string& checkpoint_di
 QwenModel::MemoryPlan QwenModel::plan_memory(const QwenTextConfig& cfg, int max_tokens,
                                              int64_t max_cache_tokens, int tp_rank, int tp_world,
                                              QwenResidency residency, int max_requests, bool mtp,
-                                             int decode_rows, bool serving_logits) {
+                                             int decode_rows, bool serving_logits,
+                                             LatentFormat kv_format) {
   if (max_tokens <= 0) throw std::invalid_argument("plan_memory: max_tokens must be positive");
   if (max_requests <= 0 || max_requests > kPickMaxRequests)
     throw std::invalid_argument("plan_memory: max_requests must be in [1, kPickMaxRequests]");
@@ -343,7 +346,10 @@ QwenModel::MemoryPlan QwenModel::plan_memory(const QwenTextConfig& cfg, int max_
     shape.block_tokens = kBlockTokens;
     shape.max_requests = max_requests;
     shape.token_slots = cache_tokens;
-    plan.add("kv cache pool (K/V bf16, compressed index keys, rings)", QwenKvPool::cache_bytes(shape));
+    shape.format = kv_format;
+    plan.add(std::string("kv cache pool (K/V ") + (kv_format == LatentFormat::kFp8 ? "fp8" : "bf16") +
+                 ", compressed index keys, rings)",
+             QwenKvPool::cache_bytes(shape));
   }
   // Activations and the token rows.
   const size_t logits_rows =

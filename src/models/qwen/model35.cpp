@@ -1732,7 +1732,7 @@ void Qwen35Model::dflash2_store_features(int T, const int32_t* d_req, const int6
                              2 * KV, rows, KVH, HD, dfcfg_.rms_norm_eps, stream_);
       const QwenFullAttnCache plane = pool_.view(num_full_ + l);
       qsa_kv_append(df_kv_, 2 * KV, df_kv_ + KV, 2 * KV, d_req + off, d_pos + off, rows, tables, bpr,
-                    bt, KVH, HD, plane.k_cache, plane.v_cache, stream_);
+                    bt, KVH, HD, plane.k_cache, plane.v_cache, nullptr, nullptr, stream_);
     }
   }
 }
@@ -1821,7 +1821,7 @@ void Qwen35Model::df_block_layers(int slots, const int* reqs, bool capture) {
       const int32_t* table = tables + static_cast<size_t>(reqs[k]) * pool_.total_blocks();
       const uint16_t* krow = df_qkv_ + ro * qkv_stride + QW;
       qsa_kv_append(krow, qkv_stride, krow + KV, qkv_stride, df_zero_, df_pos_ + ro, QR, table, 1, bt, KVH,
-                    HD, plane.k_cache, plane.v_cache, stream_);
+                    HD, plane.k_cache, plane.v_cache, nullptr, nullptr, stream_);
       // The split-key form: the row's 2K window in 32 parallel ranges
       // (the serial walk cost ~2 ms a layer at a 2K context).
       dflash2_block_attn_split(df_q_ + ro * QW, QW, plane.k_cache, plane.v_cache, table, bt, bpr, QR,

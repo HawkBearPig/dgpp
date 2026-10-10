@@ -10,6 +10,7 @@
 
 #include "common/cuda_check.hpp"
 #include "common/dtypes.hpp"
+#include "kernels/latent_format.hpp"
 #include "kernels/topk_select.cuh"
 
 namespace dgpp {
@@ -39,6 +40,25 @@ __device__ inline float block_sum(float v, float* scratch) {
   float total = 0.f;
   if (threadIdx.x == 0) {
     for (int w = 0; w < nwarps; ++w) total += scratch[w];
+    scratch[0] = total;
+  }
+  __syncthreads();
+  total = scratch[0];
+  __syncthreads();
+  return total;
+}
+
+// Block-wide max (mirrors block_sum's shape; scratch >= 33 floats).
+__device__ inline float block_max(float v, float* scratch) {
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  const int nwarps = (blockDim.x + 31) / 32;
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) v = fmaxf(v, __shfl_xor_sync(~0u, v, off));
+  if (lane == 0) scratch[warp] = v;
+  __syncthreads();
+  float total = 0.f;
+  if (threadIdx.x == 0) {
+    for (int w = 0; w < nwarps; ++w) total = fmaxf(total, scratch[w]);
     scratch[0] = total;
   }
   __syncthreads();
@@ -98,22 +118,118 @@ __global__ void norm_rope_kernel(const uint16_t* __restrict__ x, int64_t x_row_s
   if (d < dim) out[r * out_row_stride + static_cast<int64_t>(h) * dim + d] = o;
 }
 
+// Fused (1+w) RMSNorm + RoPE + fp8 quantize + paged scatter for the QSA K
+// cache (the zero-copy K write, 2026-10-10): it replaces
+// `qsa_norm_rope_bf16(k_ -> kn_)` followed by the K half of `qsa_kv_append`,
+// so the kn_ staging buffer (a full bf16 K round trip per token per layer) is
+// gone. The norm + RoPE math is norm_rope_thread's, bit for bit; the
+// absmax / scale / encode are kv_append_kernel's — so the cache bytes are
+// exactly those of the two-kernel chain.
+__global__ void norm_rope_append_fp8_kernel(const uint16_t* __restrict__ x,
+                                            int64_t x_row_stride, int64_t x_head_stride,
+                                            const uint16_t* __restrict__ w,
+                                            const int64_t* __restrict__ pos,
+                                            const float* __restrict__ inv_freq,
+                                            const int32_t* __restrict__ req_ids,
+                                            const int32_t* __restrict__ block_tables,
+                                            int blocks_per_request, int block_tokens, int kv_heads,
+                                            int dim, int rotary_dim, float eps, float mscale,
+                                            uint8_t* __restrict__ k_cache,
+                                            float* __restrict__ k_scale) {
+  extern __shared__ float xs[];
+  __shared__ float scratch[33];
+  const int64_t r = blockIdx.x / kv_heads;
+  const int h = static_cast<int>(blockIdx.x % kv_heads);
+  const int64_t p = pos[r];
+  if (p < 0) return;
+  const int d = threadIdx.x;
+  if (d < dim) xs[d] = bf16_bits_to_float(x[r * x_row_stride + h * x_head_stride + d]);
+  __syncthreads();
+  const uint16_t o = norm_rope_thread(xs, w, p, inv_freq, dim, rotary_dim, eps, scratch, mscale);
+  __syncthreads();  // every thread is done reading xs before it is overwritten
+  if (d < dim) xs[d] = bf16_bits_to_float(o);
+  __syncthreads();
+  float amax = 0.f;
+  if (d < dim) amax = fabsf(xs[d]);
+  amax = block_max(amax, scratch);
+  if (d < dim) {
+    const auto s = latent_fp8_row_scale(amax);
+    const int32_t blk =
+        block_tables[static_cast<int64_t>(req_ids[r]) * blocks_per_request + p / block_tokens];
+    const int64_t phys = static_cast<int64_t>(blk) * block_tokens + p % block_tokens;
+    const int width = kv_heads * dim;
+    k_cache[phys * width + h * dim + d] = latent_fp8_encode(xs[d], s.inv);
+    if (d == 0) k_scale[phys * kv_heads + h] = s.scale;
+  }
+}
+
 __global__ void kv_append_kernel(const uint16_t* __restrict__ k, int64_t k_row_stride,
                                  const uint16_t* __restrict__ v, int64_t v_row_stride,
                                  const int32_t* __restrict__ req_ids,
                                  const int64_t* __restrict__ pos,
                                  const int32_t* __restrict__ block_tables,
-                                 int blocks_per_request, int block_tokens, int width,
-                                 uint16_t* __restrict__ k_cache, uint16_t* __restrict__ v_cache) {
+                                 int blocks_per_request, int block_tokens, int kv_heads, int dim,
+                                 uint16_t* __restrict__ k_cache, uint16_t* __restrict__ v_cache,
+                                 float* __restrict__ k_scale, float* __restrict__ v_scale) {
   const int64_t r = blockIdx.x;
   const int64_t p = pos[r];
   if (p < 0) return;
   const int32_t blk = block_tables[static_cast<int64_t>(req_ids[r]) * blocks_per_request +
                                    p / block_tokens];
   const int64_t phys = static_cast<int64_t>(blk) * block_tokens + p % block_tokens;
+  if (k_scale == nullptr) {
+    // bf16: the historical copy, element-strided over the row (bitwise unchanged).
+    const int width = kv_heads * dim;
+    for (int e = threadIdx.x; e < width; e += blockDim.x) {
+      k_cache[phys * width + e] = k[r * k_row_stride + e];
+      v_cache[phys * width + e] = v[r * v_row_stride + e];
+    }
+    return;
+  }
+  // fp8: cooperative over the block. Stage this token's K/V rows in smem ONCE
+  // (a single global read — the previous per-head form read every row twice:
+  // an absmax pass then an encode pass), reduce the per-head absmax with one
+  // warp per head, then encode every element. k == nullptr: the K half was
+  // already written by the fused norm+RoPE+quantize kernel
+  // (norm_rope_append_fp8); only V is written here.
+  const int width = kv_heads * dim;
+  extern __shared__ uint16_t kvstage[];  // [width] k bf16, then [width] v bf16
+  uint16_t* kb = kvstage;
+  uint16_t* vb = kvstage + width;
   for (int e = threadIdx.x; e < width; e += blockDim.x) {
-    k_cache[phys * width + e] = k[r * k_row_stride + e];
-    v_cache[phys * width + e] = v[r * v_row_stride + e];
+    kb[e] = k ? k[r * k_row_stride + e] : uint16_t(0);
+    vb[e] = v[r * v_row_stride + e];
+  }
+  __syncthreads();
+  __shared__ float kinv[32], vinv[32];
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  if (warp < kv_heads) {
+    float ka = 0.f, va = 0.f;
+    for (int e = lane; e < dim; e += 32) {
+      if (k) ka = fmaxf(ka, fabsf(bf16_bits_to_float(kb[warp * dim + e])));
+      va = fmaxf(va, fabsf(bf16_bits_to_float(vb[warp * dim + e])));
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+      ka = fmaxf(ka, __shfl_xor_sync(~0u, ka, off));
+      va = fmaxf(va, __shfl_xor_sync(~0u, va, off));
+    }
+    if (lane == 0) {
+      const auto sk = latent_fp8_row_scale(ka);
+      const auto sv = latent_fp8_row_scale(va);
+      kinv[warp] = sk.inv;
+      vinv[warp] = sv.inv;
+      if (k) k_scale[phys * kv_heads + warp] = sk.scale;
+      v_scale[phys * kv_heads + warp] = sv.scale;
+    }
+  }
+  __syncthreads();
+  uint8_t* kdst = reinterpret_cast<uint8_t*>(k_cache);
+  uint8_t* vdst = reinterpret_cast<uint8_t*>(v_cache);
+  for (int e = threadIdx.x; e < width; e += blockDim.x) {
+    const int h = e / dim;
+    if (k) kdst[phys * width + e] = latent_fp8_encode(bf16_bits_to_float(kb[e]), kinv[h]);
+    vdst[phys * width + e] = latent_fp8_encode(bf16_bits_to_float(vb[e]), vinv[h]);
   }
 }
 
@@ -463,6 +579,8 @@ template <int D, int kHpw>
 __global__ void attn_partial_kernel(const uint16_t* __restrict__ q, int64_t q_row_stride,
                                     const uint16_t* __restrict__ k_cache,
                                     const uint16_t* __restrict__ v_cache,
+                                    const float* __restrict__ k_scale,
+                                    const float* __restrict__ v_scale,
                                     const int32_t* __restrict__ req_ids,
                                     const int32_t* __restrict__ topk, int topk_stride,
                                     const int32_t* __restrict__ counts, int n_split,
@@ -663,7 +781,42 @@ __global__ void attn_partial_kernel(const uint16_t* __restrict__ q, int64_t q_ro
     }
   };
 
-  if (async_gather) {
+  if (k_scale != nullptr) {
+    // fp8 cache: vectorized gather (16 codes per 16-byte load) of the e4m3
+    // codes + per-(row, kv-head) scale, dequantized to bf16 in the smem
+    // tiles; the scores / PV phases below are unchanged (they read bf16 from
+    // kt / vt). The bf16 path is untouched (k_scale null). The 16-byte loads
+    // are as the uint4 bf16 loads were: the rows and the chunks are 16-byte
+    // aligned (width and D are multiples of 16, c is a multiple of 16).
+    const uint8_t* k8 = reinterpret_cast<const uint8_t*>(k_cache);
+    const uint8_t* v8 = reinterpret_cast<const uint8_t*>(v_cache);
+    constexpr int kFp8ChunksPerRow = D / 16;
+    for (int t0 = t_begin; t0 < t_end; t0 += kQsaTile) {
+      const int n = min(kQsaTile, t_end - t0);
+      resolve(t0, n, phys_rows);
+      __syncthreads();
+      for (int idx = static_cast<int>(threadIdx.x); idx < n * kFp8ChunksPerRow * 2;
+           idx += static_cast<int>(blockDim.x)) {
+        const int which = idx / (n * kFp8ChunksPerRow);
+        const int rem = idx - which * (n * kFp8ChunksPerRow);
+        const int tt = rem / kFp8ChunksPerRow;
+        const int c = (rem - tt * kFp8ChunksPerRow) * 16;
+        const int64_t phys = phys_rows[tt];
+        const uint8_t* src = (which == 0 ? k8 : v8) + phys * width + kvh * D + c;
+        const float sc = (which == 0 ? k_scale : v_scale)[phys * kv_heads + kvh];
+        uint16_t* dst = (which == 0 ? kt : vt) + tt * kRowStride + c;
+        const uint4 v4 = *reinterpret_cast<const uint4*>(src);
+        const uint8_t* b = reinterpret_cast<const uint8_t*>(&v4);
+#pragma unroll
+        for (int j = 0; j < 16; ++j) dst[j] = latent_fp8_decode_bf16(b[j], sc);
+      }
+      __syncthreads();
+      scores_phase(n);
+      __syncthreads();
+      pv_phase(n);
+      __syncthreads();
+    }
+  } else if (async_gather) {
     int n = min(kQsaTile, t_end - t_begin);
     int64_t* phys_cur = phys_rows;
     int64_t* phys_nxt = phys_next;
@@ -771,13 +924,39 @@ void qsa_kv_append(const uint16_t* k, int64_t k_row_stride, const uint16_t* v, i
                    const int32_t* req_ids, const int64_t* pos, int rows,
                    const int32_t* block_tables, int blocks_per_request, int block_tokens,
                    int kv_heads, int dim, uint16_t* k_cache, uint16_t* v_cache,
-                   cudaStream_t stream) {
+                   float* k_scale, float* v_scale, cudaStream_t stream) {
   if (rows <= 0) return;
-  if (!k || !v || !req_ids || !pos || !block_tables || !k_cache || !v_cache)
+  // k may be null when the fused norm+RoPE+quantize kernel already wrote K.
+  if (!v || !req_ids || !pos || !block_tables || !v_cache)
     throw std::invalid_argument("qsa_kv_append: null pointer");
-  kv_append_kernel<<<static_cast<unsigned>(rows), 256, 0, stream>>>(
+  if (k == nullptr && k_scale == nullptr)
+    throw std::invalid_argument("qsa_kv_append: null k with a bf16 cache");
+  const size_t smem =
+      k_scale != nullptr ? 2 * static_cast<size_t>(kv_heads) * dim * sizeof(uint16_t) : 0;
+  kv_append_kernel<<<static_cast<unsigned>(rows), 256, smem, stream>>>(
       k, k_row_stride, v, v_row_stride, req_ids, pos, block_tables, blocks_per_request,
-      block_tokens, kv_heads * dim, k_cache, v_cache);
+      block_tokens, kv_heads, dim, k_cache, v_cache, k_scale, v_scale);
+  DGPP_CUDA_OK(cudaGetLastError());
+}
+
+// Fused (1+w) RMSNorm + RoPE + fp8 quantize + paged scatter for the QSA K
+// cache (the zero-copy K write): one launch replaces qsa_norm_rope_bf16 into
+// the kn_ staging buffer plus the K half of qsa_kv_append. The cache bytes are
+// bitwise the two-kernel chain's. x is the raw k_proj output [rows, lkv * D].
+void qsa_norm_rope_append_fp8(const uint16_t* x, int64_t x_row_stride, int64_t x_head_stride,
+                              const uint16_t* w, const int64_t* pos, const float* inv_freq,
+                              const int32_t* req_ids, const int32_t* block_tables,
+                              int blocks_per_request, int block_tokens, int rows, int kv_heads,
+                              int dim, int rotary_dim, float eps, float mscale, uint8_t* k_cache,
+                              float* k_scale, cudaStream_t stream) {
+  if (rows <= 0) return;
+  if (!x || !w || !pos || !inv_freq || !req_ids || !block_tables || !k_cache || !k_scale)
+    throw std::invalid_argument("qsa_norm_rope_append_fp8: null pointer");
+  const int threads = block_threads_for(dim);
+  norm_rope_append_fp8_kernel<<<static_cast<unsigned>(rows * kv_heads), threads,
+                                dim * sizeof(float), stream>>>(
+      x, x_row_stride, x_head_stride, w, pos, inv_freq, req_ids, block_tables, blocks_per_request,
+      block_tokens, kv_heads, dim, rotary_dim, eps, mscale, k_cache, k_scale);
   DGPP_CUDA_OK(cudaGetLastError());
 }
 
@@ -876,10 +1055,12 @@ void qsa_attn_partial(const uint16_t* q, int64_t q_row_stride, const uint16_t* k
                       int topk_stride, const int32_t* counts, int rows, int n_split,
                       int local_heads, int kv_heads, int dim, int block_tokens,
                       const int32_t* block_tables, int blocks_per_request, float scale,
-                      float* m_ws, float* l_ws, float* c_ws, cudaStream_t stream) {
+                      float* m_ws, float* l_ws, float* c_ws, cudaStream_t stream,
+                      const float* k_scale, const float* v_scale) {
   qsa_attn_partial_gather(q, q_row_stride, k_cache, v_cache, req_ids, topk, topk_stride, counts, rows,
                           n_split, local_heads, kv_heads, dim, block_tokens, block_tables,
-                          blocks_per_request, scale, m_ws, l_ws, c_ws, stream, -1, 0, 0);
+                          blocks_per_request, scale, m_ws, l_ws, c_ws, stream, -1, 0, 0, k_scale,
+                          v_scale);
 }
 
 void qsa_attn_partial_gather(const uint16_t* q, int64_t q_row_stride, const uint16_t* k_cache,
@@ -888,7 +1069,8 @@ void qsa_attn_partial_gather(const uint16_t* q, int64_t q_row_stride, const uint
                              int local_heads, int kv_heads, int dim, int block_tokens,
                              const int32_t* block_tables, int blocks_per_request, float scale,
                              float* m_ws, float* l_ws, float* c_ws, cudaStream_t stream,
-                             int async_gather, int heads_per_block, int heads_per_warp) {
+                             int async_gather, int heads_per_block, int heads_per_warp,
+                             const float* k_scale, const float* v_scale) {
   if (rows <= 0) return;
   if (!q || !k_cache || !v_cache || !req_ids || !topk || !counts || !block_tables || !m_ws ||
       !l_ws || !c_ws)
@@ -929,8 +1111,9 @@ void qsa_attn_partial_gather(const uint16_t* q, int64_t q_row_stride, const uint
     constexpr int D = decltype(dim_tag)::value;
     constexpr int H = decltype(hpw_tag)::value;
     attn_partial_kernel<D, H><<<grid, threads, smem, stream>>>(
-        q, q_row_stride, k_cache, v_cache, req_ids, topk, topk_stride, counts, n_split, local_heads,
-        kv_heads, block_tokens, block_tables, blocks_per_request, scale, m_ws, l_ws, c_ws, async_gather);
+        q, q_row_stride, k_cache, v_cache, k_scale, v_scale, req_ids, topk, topk_stride, counts,
+        n_split, local_heads, kv_heads, block_tokens, block_tables, blocks_per_request, scale, m_ws,
+        l_ws, c_ws, async_gather);
   };
   const auto by_hpw = [&](auto dim_tag) {
     switch (hpw) {

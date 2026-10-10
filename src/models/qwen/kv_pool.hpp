@@ -21,6 +21,7 @@
 #include <cuda_runtime.h>
 
 #include "engine/paged_blocks.hpp"
+#include "kernels/latent_format.hpp"
 #include "models/qwen/layers.hpp"
 
 namespace dgpp {
@@ -34,6 +35,7 @@ struct QwenKvPoolShape {
   int block_tokens = 0;    // a multiple of kpool
   int max_requests = 0;
   int64_t token_slots = 0; // pool capacity in tokens, a multiple of block_tokens
+  LatentFormat format = LatentFormat::kBf16;  // the K/V cache's dtype (bf16 | fp8)
 };
 
 class QwenKvPool {
@@ -92,12 +94,19 @@ class QwenKvPool {
   QwenKvPoolShape shape_;
   bool initialized_ = false;
   PagedBlockTable table_;
-  uint16_t* k_base_ = nullptr;      // [layers][token_slots][kv_heads * dim]
-  uint16_t* v_base_ = nullptr;
-  uint16_t* idx_base_ = nullptr;    // [layers][pool_slots][idx_dim]
-  uint16_t* ring_base_ = nullptr;   // [layers][max_requests][kpool][idx_dim]
+  uint8_t* k_base_ = nullptr;     // [layers][token_slots][kv_heads*dim] bf16 (2B) or fp8 (1B)
+  uint8_t* v_base_ = nullptr;
+  float* k_scale_ = nullptr;      // [layers][token_slots][kv_heads] fp8 only (null for bf16)
+  float* v_scale_ = nullptr;
+  uint16_t* idx_base_ = nullptr;  // [layers][pool_slots][idx_dim]
+  uint16_t* ring_base_ = nullptr; // [layers][max_requests][kpool][idx_dim]
+  bool fp8() const { return shape_.format == LatentFormat::kFp8; }
   size_t kv_row_elems() const { return static_cast<size_t>(shape_.kv_heads) * shape_.dim; }
-  size_t layer_kv_elems() const { return static_cast<size_t>(shape_.token_slots) * kv_row_elems(); }
+  size_t kv_row_bytes() const { return kv_row_elems() * (fp8() ? 1 : 2); }
+  size_t layer_kv_bytes() const { return static_cast<size_t>(shape_.token_slots) * kv_row_bytes(); }
+  size_t layer_scale_bytes() const {
+    return static_cast<size_t>(shape_.token_slots) * shape_.kv_heads * sizeof(float);
+  }
   size_t layer_idx_elems() const { return static_cast<size_t>(pool_slots()) * shape_.idx_dim; }
   size_t layer_ring_elems() const {
     return static_cast<size_t>(shape_.max_requests) * shape_.kpool * shape_.idx_dim;

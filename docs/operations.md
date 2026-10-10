@@ -116,8 +116,9 @@ Qwen3.8-Flash-Next's FP8 checkpoint (where both values keep both forms resident)
 `--bf16-weights checkpoint` turns it off. Resident images are shared by all
 three values: switching never rebuilds them.
 
-`kv_dtype` affects only GLM-5.3's latent cache. Qwen and GLM-4.7 K/V
-caches stay BF16. Qwen's `ngram_table` and `dense_weights` settings
+`kv_dtype` affects GLM-5.3's latent cache and the MiMo-V2.6-Flash and
+Qwen3.8-Flash-Next K/V caches (the Qwen pool takes `bf16` or `fp8`). GLM-4.7
+and DeepSeek K/V caches stay BF16. Qwen's `ngram_table` and `dense_weights` settings
 control table residency and optional FP8 encoding of dense projections.
 The Qwen NVFP4 templates, including YaRN, set `engine.fp8_head: "mma"`.
 With `dense_weights: "fp8"`, this uses streaming MMA above the dense GEMV
@@ -718,7 +719,10 @@ which tokens are attended. The format is part of the world's settings (the
 head pushes it, the config digest carries it) and every rank runs the same
 one. The quantized formats are a memory trade an operator makes
 deliberately: at 262k tokens they save 1.5 GiB (fp8) or 2.2 GiB (fp4) per
-rank against a 98 GiB plan, and the model's answers change with them.
+rank against a 98 GiB plan, and the model's answers change with them. The
+Qwen3.8-Flash-Next K/V cache takes `bf16` or `fp8` (e4m3 rows with one scale
+per (slot, kv-head); the QSA attention dequantizes in-kernel and the pool is
+~1.86x smaller); `fp4` is not implemented for Qwen.
 
 **The DeepSeek-V4.1 prefill mode** (`engine.prefill`, `--prefill
 bounded|exact`, default `bounded`) applies to the `deepseek_v41` family

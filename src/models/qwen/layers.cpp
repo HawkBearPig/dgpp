@@ -756,16 +756,32 @@ void QwenQsaLayer::enqueue(const uint16_t* x, int tokens, const QwenQsaRows& row
     gemm_dense(g_, x, H, w_.index_qk_proj, w_.index_qk_proj_fp8, idx_, GemmOut::BF16, T, IW, H, stream);
   }
   // Norm + RoPE: q (the [q | gate] interleave), k, the indexer q.
+  // Norm + RoPE: q (the [q | gate] interleave) and the indexer q. The k norm
+  // is folded into the append below (fp8) or stays a separate pass (bf16).
   qsa_norm_rope_bf16(q_, QW, 2 * D, w_.q_norm, d_pos, d_inv_freq_, qn_, static_cast<int64_t>(lh_) * D,
                      T, lh_, D, rotary_, eps_, mscale_, stream);
-  qsa_norm_rope_bf16(k_, KW, D, w_.k_norm, d_pos, d_inv_freq_, kn_, KW, T, lkv_, D, rotary_, eps_,
-                     mscale_, stream);
   qsa_norm_rope_bf16(idx_, IW, Di, w_.index_q_norm, d_pos, d_inv_freq_, qi_,
                      static_cast<int64_t>(idx_heads_) * Di, T, idx_heads_, Di, rotary_, eps_,
                      mscale_, stream);
   // The caches: K/V rows, then the compressed keys and the ring.
-  qsa_kv_append(kn_, KW, v_, KW, d_req, d_pos, T, cache.block_tables, cache.blocks_per_request,
-                cache.block_tokens, lkv_, D, cache.k_cache, cache.v_cache, stream);
+  if (cache.k_scale != nullptr) {
+    // fp8: the fused norm+RoPE+quantize+scatter writes K straight to the
+    // cache (zero-copy — no kn_ staging buffer); V goes through the append
+    // with k == nullptr (it skips its K half).
+    qsa_norm_rope_append_fp8(k_, KW, D, w_.k_norm, d_pos, d_inv_freq_, d_req, cache.block_tables,
+                             cache.blocks_per_request, cache.block_tokens, T, lkv_, D, rotary_,
+                             eps_, mscale_, reinterpret_cast<uint8_t*>(cache.k_cache),
+                             cache.k_scale, stream);
+    qsa_kv_append(nullptr, 0, v_, KW, d_req, d_pos, T, cache.block_tables,
+                  cache.blocks_per_request, cache.block_tokens, lkv_, D, cache.k_cache,
+                  cache.v_cache, cache.k_scale, cache.v_scale, stream);
+  } else {
+    qsa_norm_rope_bf16(k_, KW, D, w_.k_norm, d_pos, d_inv_freq_, kn_, KW, T, lkv_, D, rotary_, eps_,
+                       mscale_, stream);
+    qsa_kv_append(kn_, KW, v_, KW, d_req, d_pos, T, cache.block_tables, cache.blocks_per_request,
+                  cache.block_tokens, lkv_, D, cache.k_cache, cache.v_cache, cache.k_scale,
+                  cache.v_scale, stream);
+  }
   const int pools_per_block = cache.block_tokens / kpool_;
   const uint16_t* raw_k = idx_ + static_cast<int64_t>(idx_heads_) * Di;
   if (rows.decode) {
@@ -802,12 +818,13 @@ void QwenQsaLayer::enqueue(const uint16_t* x, int tokens, const QwenQsaRows& row
   if (warp_attn && !rows.decode && T >= 128 && qsa_warp_supported(D, lh_, lkv_)) {
     qsa_attn_prefill_warp(qn_, static_cast<int64_t>(lh_) * D, cache.k_cache, cache.v_cache, d_req, topk_,
                           max_selected_, counts_, T, lh_, lkv_, cache.block_tokens, cache.block_tables,
-                          cache.blocks_per_request, scale_, c_out_, stream);
+                          cache.blocks_per_request, scale_, c_out_, stream, cache.k_scale, cache.v_scale);
   } else {
     const auto attend = !rows.decode && T >= 128 ? qsa_attn_prefill_partial : qsa_attn_partial;
     attend(qn_, static_cast<int64_t>(lh_) * D, cache.k_cache, cache.v_cache, d_req, topk_,
            max_selected_, counts_, T, n_split_, lh_, lkv_, D, cache.block_tokens,
-           cache.block_tables, cache.blocks_per_request, scale_, m_ws_, l_ws_, c_ws_, stream);
+           cache.block_tables, cache.blocks_per_request, scale_, m_ws_, l_ws_, c_ws_, stream,
+           cache.k_scale, cache.v_scale);
     dsa_attn_combine(m_ws_, l_ws_, c_ws_, T, n_split_, lh_, D, c_out_, stream);
   }
   qsa_gate_out(c_out_, q_ + D, QW, 2 * D, o_, T, lh_, D, stream);
@@ -947,7 +964,7 @@ void QwenFullAttnLayer::enqueue(const uint16_t* x, int tokens, const QwenQsaRows
                      mscale_, stream);
   // The caches: K/V rows (no compressed keys, no ring).
   qsa_kv_append(kn_, KW, v_, KW, d_req, d_pos, T, cache.block_tables, cache.blocks_per_request,
-                cache.block_tokens, lkv_, D, cache.k_cache, cache.v_cache, stream);
+                cache.block_tokens, lkv_, D, cache.k_cache, cache.v_cache, nullptr, nullptr, stream);
   // Dense causal attention over [0, pos] per row (kernels/full_attn.cu):
   // decode rows (arbitrary requests) through the split row walk, a prefill
   // chunk (one request, consecutive rows) through the query-tiled form.
