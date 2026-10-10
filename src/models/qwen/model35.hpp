@@ -234,6 +234,11 @@ class Qwen35Model : public SessionModel<Qwen35Model> {
   Qwen35KvPool& pool() { return pool_; }
   const Qwen35KvPool& pool() const { return pool_; }
   void graph_prepare();
+  // Eagerly materializes every resident layer (text stack + MTP draft when
+  // resident) on `threads` loader workers; a no-op unless resident and
+  // threads > 1. Called once before serving so the first forwards find
+  // all layers resident instead of faulting them in one by one.
+  void preload_resident_layers(int threads);
   void mtp_run_rows(int req, const int64_t* tokens, int64_t first_pos, int T, bool decode_row,
                     bool capture, int head_rows, int batch_requests);
   Outputs mtp_forward(const std::vector<int64_t>& token_ids);

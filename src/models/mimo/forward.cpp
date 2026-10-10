@@ -664,6 +664,15 @@ MimoModel::Outputs MimoModel::forward(const std::vector<int64_t>& token_ids, boo
 // ---------------------------------------------------------------------------
 // The graph era.
 // ---------------------------------------------------------------------------
+void MimoModel::preload_resident_layers(int threads) {
+  if (loader_.residency() != MimoResidency::Resident || threads <= 1) return;
+  const int last = cfg_.num_hidden_layers + (mtp_ ? cfg_.mtp_layers_loaded : 0);
+  const auto t0 = std::chrono::steady_clock::now();
+  loader_.load_layers_parallel(0, last, threads);
+  DGPP_LOG_INFO("mimo model: preloaded {} layers on {} workers in {:.1f}s (restored {}, captured {})", last,
+                threads, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
+                loader_.image_layers_restored(), loader_.image_layers_captured());
+}
 void MimoModel::graph_prepare() {
   if (loader_.residency() != MimoResidency::Resident)
     throw std::logic_error("session_graph_prepare: the decode graph needs a resident stack");

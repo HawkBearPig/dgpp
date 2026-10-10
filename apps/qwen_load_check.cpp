@@ -8,7 +8,9 @@
 //
 //   qwen_load_check --model ORG/NAME | --checkpoint-dir DIR
 //                   [--world W] [--rank R] [--streaming] [--mtp]
-//                   [--layers N] [--image-dir DIR|off]
+//                   [--layers N] [--threads T] [--image-dir DIR|off]
+// threads > 1 loads the range on a worker pool (resident mode only;
+// per-layer lines are skipped, the summary still reports totals).
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -26,7 +28,7 @@
 int main(int argc, char** argv) {
   std::string model_id, ckpt, image_dir, ngram_table, dense_weights, mtp_expert_format;
   std::string ngram_table_dir;
-  int world = 1, rank = 0, layers = -1;
+  int world = 1, rank = 0, layers = -1, threads = 1;
   bool streaming = false, mtp = false;
   auto next = [&](int& i) -> std::string {
     if (i + 1 >= argc) throw std::runtime_error("missing value after " + std::string(argv[i]));
@@ -42,6 +44,7 @@ int main(int argc, char** argv) {
       else if (a == "--streaming") streaming = true;
       else if (a == "--mtp") mtp = true;
       else if (a == "--layers") layers = std::stoi(next(i));
+      else if (a == "--threads") threads = std::stoi(next(i));
       else if (a == "--image-dir") image_dir = next(i);
       else if (a == "--ngram-table") ngram_table = next(i);
       else if (a == "--ngram-table-dir") ngram_table_dir = next(i);
@@ -127,21 +130,30 @@ int main(int argc, char** argv) {
     }
     const int n = layers < 0 ? cfg.num_hidden_layers + (mtp && cfg.mtp_layer() >= 0 ? 1 : 0) : layers;
     size_t total = 0;
-    for (int l = 0; l < n; ++l) {
-      const auto tl = std::chrono::steady_clock::now();
-      const uint64_t before = stream.source_bytes_read();
-      const auto& r = stream.load_layer(l);
-      const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - tl).count();
-      total += r.bytes;
-      if (l < 3 || l == n - 1 || l % 12 == 0)
-        DGPP_LOG_INFO("qwen_load_check: layer {} ({}{}) {:.3f} GiB in {:.2f} s, read {:.3f} GiB; experts {} x {} (scale block {}){}",
-                      l, r.kind == dgpp::QwenLayerKind::Gdn ? "gdn" : "qsa", r.has_ple ? "+ple" : "",
-                      r.bytes / kGiB, s, (stream.source_bytes_read() - before) / kGiB,
-                      r.moe.experts.size() / 3, r.moe.local_inter, r.moe.scale_block,
-                      r.has_ple ? std::format(", ple heads [{}, +{}) rows [{}, +{})", r.ple.hash_head_begin, r.ple.hash_heads, r.ple.row_begin, r.ple.rows) : "");
-      if (!streaming) continue;
-      stream.release_layer();
+    const auto t_layers = std::chrono::steady_clock::now();
+    if (threads > 1 && !streaming) {
+      stream.load_layers_parallel(0, n, threads);
+      for (int l = 0; l < n; ++l) total += stream.layer_bytes(cfg, l, rank, world);
+    } else {
+      for (int l = 0; l < n; ++l) {
+        const auto tl = std::chrono::steady_clock::now();
+        const uint64_t before = stream.source_bytes_read();
+        const auto& r = stream.load_layer(l);
+        const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - tl).count();
+        total += r.bytes;
+        if (l < 3 || l == n - 1 || l % 12 == 0)
+          DGPP_LOG_INFO("qwen_load_check: layer {} ({}{}) {:.3f} GiB in {:.2f} s, read {:.3f} GiB; experts {} x {} (scale block {}){}",
+                        l, r.kind == dgpp::QwenLayerKind::Gdn ? "gdn" : "qsa", r.has_ple ? "+ple" : "",
+                        r.bytes / kGiB, s, (stream.source_bytes_read() - before) / kGiB,
+                        r.moe.experts.size() / 3, r.moe.local_inter, r.moe.scale_block,
+                        r.has_ple ? std::format(", ple heads [{}, +{}) rows [{}, +{})", r.ple.hash_head_begin, r.ple.hash_heads, r.ple.row_begin, r.ple.rows) : "");
+        if (!streaming) continue;
+        stream.release_layer();
+      }
     }
+    DGPP_LOG_INFO("qwen_load_check: layer range loaded in {:.1f} s on {} thread(s)",
+                  std::chrono::duration<double>(std::chrono::steady_clock::now() - t_layers).count(),
+                  threads > 1 && !streaming ? threads : 1);
     if (!streaming) stream.release_sources();
     DGPP_LOG_INFO("qwen_load_check: {} layers {:.2f} GiB resident (+ globals {:.2f} + table {:.2f} = {:.2f} GiB); source bytes read {:.2f} GiB (verbatim {:.2f}); image restored {} captured {}; total {:.1f} s",
                   n, total / kGiB, g.bytes / kGiB, tbl.bytes / kGiB, (total + g.bytes + tbl.bytes) / kGiB,

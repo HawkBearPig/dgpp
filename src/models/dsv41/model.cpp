@@ -108,7 +108,10 @@ Dsv41Model::Dsv41Model(const Dsv41TextConfig& cfg, const std::string& checkpoint
     (void)loader_.load_engram_tables();
   }
   if (residency == Dsv41Residency::Resident) {
-    for (int l = 0; l < (mtp ? cfg_.max_layer() : cfg_.num_hidden_layers); ++l) (void)loader_.load_layer(l);
+    // Eager load, parallel when DGPP_PRELOAD_THREADS asks (unset keeps the
+    // serial loop); release_sources() still runs once everything is up.
+    loader_.load_layers_parallel(0, (mtp ? cfg_.max_layer() : cfg_.num_hidden_layers),
+                                 loader_preload_threads());
     loader_.release_sources();
   }
   log_memory_ledger("dsv41: layers resident, sources released");

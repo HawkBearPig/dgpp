@@ -1218,6 +1218,15 @@ void Qwen35Model::read_state_snapshot(int req, const uint8_t* d) {
   if (gdn_replay_) DGPP_CUDA_OK(cudaMemsetAsync(gdn_pending_ + req, 0, sizeof(int32_t), stream_));
 }
 
+void Qwen35Model::preload_resident_layers(int threads) {
+  if (loader_.residency() != LoaderResidency::Resident || threads <= 1) return;
+  const int last = cfg_.num_hidden_layers + (mtp_ && cfg_.mtp_layer() >= 0 ? 1 : 0);
+  const auto t0 = std::chrono::steady_clock::now();
+  loader_.load_layers_parallel(0, last, threads);
+  DGPP_LOG_INFO("qwen35 model: preloaded {} layers on {} workers in {:.1f}s (restored {}, captured {})", last,
+                threads, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
+                loader_.image_layers_restored(), loader_.image_layers_captured());
+}
 void Qwen35Model::graph_prepare() {
   if (loader_.residency() != LoaderResidency::Resident)
     throw std::logic_error("graph_prepare: the decode graph needs a resident stack");

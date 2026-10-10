@@ -104,7 +104,10 @@ Dsv4Model::Dsv4Model(const Dsv4Config& cfg, const std::string& checkpoint_dir, i
   if (embed_sharded_ && boundary == nullptr)
     throw std::invalid_argument("Dsv4Model: a vocab-sharded embedding needs the boundary reducer (world > 1)");
   if (residency == Dsv4Residency::Resident) {
-    for (int l = 0; l < (mtp ? cfg_.max_layer() : cfg_.num_hidden_layers); ++l) (void)loader_.load_layer(l);
+    // Eager load, parallel when DGPP_PRELOAD_THREADS asks (unset keeps the
+    // serial loop); release_sources() still runs once everything is up.
+    loader_.load_layers_parallel(0, (mtp ? cfg_.max_layer() : cfg_.num_hidden_layers),
+                                 loader_preload_threads());
     loader_.release_sources();
   }
   log_memory_ledger("dsv4: layers resident, sources released");

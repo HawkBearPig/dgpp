@@ -218,6 +218,12 @@ class QwenModel : public SessionModel<QwenModel> {
                                       const std::vector<ImageInput>* images = nullptr);
   bool session_prefill_advance(PrefillCursor& cursor, int64_t chunk_tokens = 0);
   void graph_prepare();
+  // Eagerly materializes every resident layer (text stack + MTP draft when
+  // resident) on `threads` loader workers; a no-op unless resident and
+  // threads > 1. Called once before serving so the first forwards — the
+  // graph warmup — find all layers resident instead of faulting them in
+  // one by one.
+  void preload_resident_layers(int threads);
   void mtp_run_rows(int req, const int64_t* tokens, int64_t first_pos, int T, bool decode_row,
                     bool capture, int head_rows, int batch_requests);
   void snapshot_draft_state(int req);
