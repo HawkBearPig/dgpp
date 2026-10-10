@@ -286,6 +286,10 @@ int64_t Scheduler::new_blocks(const Request& r, const PrefixPlan& plan) const {
   const int64_t bt = prefix_info_.block_tokens;
   if (plan.attach_entry >= 0 && bt > 0)
     blocks -= plan.attach_position / bt;  // the full blocks come shared
+  // An unaligned attach also copies one partial block into a free pool block
+  // (session_attach's ensure_request_blocks); without this term admission
+  // undercounts by one when the pool is nearly full and the attach throws.
+  if (plan.attach_entry >= 0) blocks += snapshot_blocks(plan.attach_position);
   // The pool blocks the cache takes on top of the reservation (the soak's
   // sweep of 2026-09-05 found the admission one block short of them): the
   // cut entry's private partial-block copy, and one block of headroom for
@@ -1028,13 +1032,33 @@ void Scheduler::step_batch(const std::vector<int>& arrivals) {
       ++cache_.stats().skipped_no_block;
       continue;
     }
-    if (position != hop)
-      throw std::logic_error("Scheduler: the hop snapshot's position differs from the armed position");
-    r.rolling_position = hop;
+    if (position != hop) {
+      // A deeper verify committed more rows than the two-row arm anticipated,
+      // so the engine stored the entry at its own position. The snapshot data
+      // is consistent with that position (the arena checked it against the
+      // live session); publish it only when it is alignment-valid, otherwise
+      // drop it — a cache entry is an optimisation and must never fail the
+      // engine for bookkeeping.
+      const int64_t align = std::max<int64_t>(1, prefix_info_.align);
+      if (position % align != 0) {
+        DGPP_LOG_WARN(
+            "sched: hop snapshot at {} (armed {}) is not alignment-aligned; "
+            "dropping it",
+            position, hop);
+        r.rolling_position = -1;
+        ++cache_.stats().skipped_no_block;
+        continue;
+      }
+      DGPP_LOG_WARN(
+          "sched: hop snapshot stored at {} differs from the armed {}; "
+          "publishing the stored position",
+          position, hop);
+    }
+    r.rolling_position = position;
     ++cache_.stats().rolling;
     ++cache_.stats().hops;
-    cache_.note(4, static_cast<uint64_t>(hop), static_cast<uint64_t>(r.rolling_slot));
-    emit_prefix(r.spec.id, "hop", hop, r.rolling_slot);
+    cache_.note(4, static_cast<uint64_t>(position), static_cast<uint64_t>(r.rolling_slot));
+    emit_prefix(r.spec.id, "hop", position, r.rolling_slot);
   }
   for (size_t i = 0; i < arrivals.size(); ++i) {
     const int arrival = arrivals[i];

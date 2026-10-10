@@ -1602,7 +1602,7 @@ void SessionModel<D>::session_attach(int req, const void* src, const SessionSnap
     if (meta.position % block_tokens_ != 0) {
       if (meta.partial_block < 0) throw std::invalid_argument("session_attach: the snapshot lacks its partial block");
       if (!pool.ensure_request_blocks(req, meta.position, stream_))
-        throw std::runtime_error("session_attach: cache pool exhausted");
+        throw CachePoolExhausted("session_attach: cache pool exhausted");
       const int32_t* row = pool.request_table_row(req);
       pool.copy_block_contents(meta.partial_block, row[n_full], stream_);
     }
