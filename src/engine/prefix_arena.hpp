@@ -83,7 +83,15 @@ class PrefixArena {
           std::to_string(expected_position));
     release(slot);
     Timer& t = begin_timer();
-    metas_[static_cast<size_t>(slot)] = model_->session_snapshot(req, ptr(slot));
+    // A full pool skips the snapshot (left unfilled, as the hop path does)
+    // instead of failing the engine. The timer stays unarmed on failure.
+    try {
+      metas_[static_cast<size_t>(slot)] = model_->session_snapshot(req, ptr(slot));
+    } catch (const CachePoolExhausted& e) {
+      DGPP_LOG_WARN("prefix cache: live snapshot at {} skipped for session {}: {}", expected_position, req,
+                    e.what());
+      return;
+    }
     end_timer(t, &snapshot_ms_, &snapshots_);
     filled_[static_cast<size_t>(slot)] = true;
   }
