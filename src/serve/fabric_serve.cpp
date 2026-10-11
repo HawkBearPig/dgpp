@@ -443,7 +443,8 @@ std::string encode_journal_settings(const WorldSettings& s) {
   out += std::format(",\"mdt\":{:.17g}", s.mtp_draft_temperature);
   out += ",\"mvf\":";
   append_json_string(&out, s.mtp_verify);
-  out += std::format(",\"dbr\":{}", s.dflash_batch_rows);
+  out += std::format(",\"dbr\":{},\"lk\":{},\"lkn\":{},\"lks\":{},\"lka\":{},\"lkt\":{}", s.dflash_batch_rows,
+                     s.lookup_draft ? 1 : 0, s.lookup_nmin, s.lookup_nstrong, s.lookup_agree, s.lookup_tail);
   out.push_back('}');
   return out;
 }
@@ -696,6 +697,16 @@ JournalRecord decode_journal_line(std::string_view line) {
       throw std::runtime_error("worker settings: mvf must be token or block");
     if (const dgpp::minijson::Value* dbr = v.find("dbr")) s.dflash_batch_rows = static_cast<int>(dbr->as_int());
     if (s.dflash_batch_rows < 0) throw std::runtime_error("worker settings: dbr must be >= 0");
+    // Records before context-lookup drafting carry none: off with defaults.
+    if (v.find("lk")) s.lookup_draft = flag("lk");
+    if (const dgpp::minijson::Value* lkn = v.find("lkn")) s.lookup_nmin = static_cast<int>(lkn->as_int());
+    if (const dgpp::minijson::Value* lks = v.find("lks")) s.lookup_nstrong = static_cast<int>(lks->as_int());
+    if (const dgpp::minijson::Value* lka = v.find("lka")) s.lookup_agree = static_cast<int>(lka->as_int());
+    // Records before the lookup tail carry none: the MTP block alone.
+    if (const dgpp::minijson::Value* lkt = v.find("lkt")) s.lookup_tail = static_cast<int>(lkt->as_int());
+    if (s.lookup_tail < 0) throw std::runtime_error("worker settings: lkt must be >= 0");
+    if (!(s.lookup_nmin >= 1 && s.lookup_nstrong >= s.lookup_nmin && s.lookup_agree >= 0))
+      throw std::runtime_error("worker settings: lookup thresholds must satisfy 1 <= lkn <= lks");
     if (s.world < 2 || s.max_concurrency < 1 || s.kv_capacity < 1 ||
         (s.admission != "full" && s.admission != "grow") ||
         !latent_format_from_string(s.kv_dtype) ||

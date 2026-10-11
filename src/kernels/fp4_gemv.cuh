@@ -295,7 +295,7 @@ __device__ __forceinline__ void load_window(const uint16_t* __restrict__ sx,
 // The decode of a byte (two codes): the hardware e2m1x2 -> f16x2
 // conversion (one F2FP on sm_121a; cuda_fp4.h's software form elsewhere),
 // then one f16x2 multiply by the group's scale. The product is exact in
-// f16 — e2m1 x e4m3 carries at most five significant bits, and every
+// f16 — e2m1 x e4m3 carries at most six significant bits, and every
 // nonzero product lies in [2^-10, 2688], all f16 normals — so its f32 is
 // the same value the f32 decode produced: the FMA chain is bitwise the
 // one before it (2026-09-08; counters had the fp4 slot kernels' compute

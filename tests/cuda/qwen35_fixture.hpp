@@ -42,7 +42,7 @@ using glmrng::seed_for;
 // columns are multiples of 128 except none — the 128 x 128 scale grid is
 // exact — and the hidden size keeps every GEMM on the ragged-free path the
 // release takes.
-inline const char* tiny_config_json() {
+inline const char* tiny_config_text_json() {
   return R"json({
   "architectures": ["Qwen3_5ForConditionalGeneration"], "model_type": "qwen3_5",
   "language_model_only": true, "tie_word_embeddings": false,
@@ -60,13 +60,43 @@ inline const char* tiny_config_json() {
                         "partial_rotary_factor": 0.25, "rope_theta": 10000000.0, "rope_type": "default"},
     "tie_word_embeddings": false, "vocab_size": 512
   },
-  "quantization_config": {"activation_scheme": "dynamic", "fmt": "e4m3", "quant_method": "fp8",
-                          "weight_block_size": [128, 128]}
+  "quantization_config": )json";
+}
+
+inline const char* tiny_quant_fp8() {
+  return R"json({"activation_scheme": "dynamic", "fmt": "e4m3", "quant_method": "fp8",
+                 "weight_block_size": [128, 128]}
 })json";
 }
 
-inline Qwen35TextConfig tiny_config() {
-  const auto t = dgpp::minijson::parse(tiny_config_json());
+// The NVFP4 mixed release, tiny: the attention stack and lm_head ride the
+// float-quantized channel group, layers 0-2's MLPs the NVFP4 group, the
+// full-attention layer's (3) MLP the channel group (the release's late-layer
+// regex, narrowed), and the draft layer is BF16 via the `^mtp.*` ignore.
+inline const char* tiny_quant_mixed() {
+  return R"json({"quant_method": "compressed-tensors", "format": "mixed-precision",
+    "config_groups": {
+      "group_0": {"format": "float-quantized",
+        "targets": ["re:.*self_attn\\.(q|k|v|o)_proj$",
+                    "re:.*linear_attn\\.(in_proj_qkv|in_proj_z|out_proj)$",
+                    "re:.*layers\\.3\\.mlp\\.(gate|up|down)_proj$",
+                    "re:.*lm_head"],
+        "weights": {"num_bits": 8, "type": "float", "strategy": "channel"}},
+      "group_1": {"format": "nvfp4-pack-quantized",
+        "targets": ["re:.*mlp\\.(gate|up|down)_proj$"],
+        "weights": {"num_bits": 4, "type": "float", "group_size": 16}}},
+    "ignore": ["re:^mtp.*"],
+    "kv_cache_scheme": {"num_bits": 8, "type": "float", "strategy": "tensor"}}
+})json";
+}
+
+inline std::string tiny_config_json(bool mixed = false) {
+  return std::string(tiny_config_text_json()) + (mixed ? tiny_quant_mixed() : tiny_quant_fp8());
+}
+
+inline Qwen35TextConfig tiny_config(bool mixed = false) {
+  const std::string json = tiny_config_json(mixed);
+  const auto t = dgpp::minijson::parse(json);
   return Qwen35TextConfig::parse(*t.root.find("text_config"), t.root.find("quantization_config"));
 }
 
@@ -95,8 +125,24 @@ inline std::vector<uint8_t> tensor_bytes(const QwenExpectedTensor& e) {
       case QwenTensorRole::Fp8Scale:
         // Random e4m3 codes have an rms near 100; a block scale of 4e-4 ..
         // 6e-4 puts the dequantized weights at the ~0.05 rms of the
-        // release's projections.
+        // release's projections. (Also the channel grid's [N, 1] BF16 row.)
         v = 4.0e-4f + 2.0e-4f * (0.5f * (rng.unit() + 1.0f));
+        break;
+      case QwenTensorRole::Fp4Payload:
+        out[i] = static_cast<uint8_t>(rng.next() & 0xFFu);  // any e2m1 nibble pair
+        continue;
+      case QwenTensorRole::Fp4Scale: {
+        // e4m3 codes around 1.0: with the 0.02 global below (and the e2m1
+        // codes' ~2 rms) the fp4 weights land near the release's ~0.05 rms.
+        static const uint8_t kNearOne[6] = {0x30, 0x34, 0x38, 0x3A, 0x3C, 0x40};
+        out[i] = kNearOne[rng.next() % 6u];
+        continue;
+      }
+      case QwenTensorRole::Fp4Global:
+        v = 64.0f;  // the checkpoint's weight-side divisor (the kernels divide the dot by it)
+        break;
+      case QwenTensorRole::InputScale:
+        v = 1.0f;  // input_global_scale / kv scales: bound, never resident
         break;
       default:
         if (is_norm) v = 0.1f * rng.unit();                 // the zero-centered (1 + w) form
@@ -134,8 +180,10 @@ inline std::vector<QwenExpectedTensor> ignored_extras() {
 }
 
 // Writes `dir` (config.json + one safetensors shard) for the tiny release.
-inline void write_fixture(const std::string& dir) {
-  const Qwen35TextConfig cfg = tiny_config();
+// `mixed` swaps the FP8 quantization_config for the NVFP4 mixed release's
+// (the same tensors' table comes out of the binding, in the other forms).
+inline void write_fixture(const std::string& dir, bool mixed = false) {
+  const Qwen35TextConfig cfg = tiny_config(mixed);
   fs::path root(dir);
   fs::remove_all(root);
   fs::create_directories(root);
@@ -143,8 +191,8 @@ inline void write_fixture(const std::string& dir) {
     const fs::path p = root / "config.json";
     std::FILE* f = std::fopen(p.c_str(), "wb");
     if (!f) throw std::runtime_error("cannot write config.json");
-    const char* json = tiny_config_json();
-    std::fwrite(json, 1, std::strlen(json), f);
+    const std::string json = tiny_config_json(mixed);
+    std::fwrite(json.data(), 1, json.size(), f);
     std::fclose(f);
   }
   auto table = dgpp::qwen35_expected_text_tensors(cfg);

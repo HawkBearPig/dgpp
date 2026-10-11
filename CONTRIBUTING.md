@@ -63,6 +63,10 @@ and `ubsan`; see [build profiles](docs/testing.md).
 
 ## What a change needs
 
+A new model family carries the extra gates in
+[adding a model](docs/adding_a_model.md): the plan document, the forward
+fixture gate, the deploy template registration and the engine-key plumbing.
+
 1. **Tests.** New behavior gets a test that would fail without it, in the
    suite whose subject it is (`tests/unit` for pure logic, `tests/host` for
    the scheduler, the service and the journal with their fakes,

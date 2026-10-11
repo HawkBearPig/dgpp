@@ -1,0 +1,30 @@
+[
+  {
+    "command": [
+      "/home/stephen/dgpp/pr95-followups-20261011/numerical-paired",
+      "/home/stephen/.cache/huggingface/hub/models--unsloth--Qwen3.8-27B-NVFP4/snapshots/f0b7c9e722f5565102fff8481c99e4d86ae099c7",
+      "/home/stephen/dgpp/pr95-followups-20261011/paired",
+      "/home/stephen/dgpp/pr95-followups-20261011/teacher_text_hard-0.ids",
+      "/home/stephen/dgpp/pr95-followups-20261011/teacher_text_hard-1.ids",
+      "/home/stephen/dgpp/pr95-followups-20261011/teacher_text_memorized-0.ids",
+      "/home/stephen/dgpp/pr95-followups-20261011/teacher_text_memorized-1.ids",
+      "/home/stephen/dgpp/pr95-followups-20261011/teacher_text-0.ids"
+    ],
+    "start": "2026-10-11T01:14:59.842537+00:00",
+    "binary_sha256": "b9c516658979453211c3979bf27e9ce8da855d1e933e035906df52354dbc8423",
+    "returncode": 0,
+    "end": "2026-10-11T01:16:18.362185+00:00"
+  },
+  {
+    "command": [
+      "/home/stephen/dgpp/pr95-followups-20261011/numerical-paired",
+      "/home/stephen/.cache/huggingface/hub/models--unsloth--Qwen3.8-27B-NVFP4/snapshots/f0b7c9e722f5565102fff8481c99e4d86ae099c7",
+      "/home/stephen/dgpp/pr95-followups-20261011/paired-repeat",
+      "/home/stephen/dgpp/pr95-followups-20261011/teacher_text_hard-0.ids"
+    ],
+    "start": "2026-10-11T01:16:18.362192+00:00",
+    "binary_sha256": "b9c516658979453211c3979bf27e9ce8da855d1e933e035906df52354dbc8423",
+    "returncode": 0,
+    "end": "2026-10-11T01:16:42.216942+00:00"
+  }
+]

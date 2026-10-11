@@ -20,6 +20,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -192,6 +193,9 @@ struct RankOutcome {
   std::vector<int32_t> ga;           // the graph engine, scalar
   std::vector<int32_t> ba, bb, bc;   // the graph engine, batched
   std::vector<int32_t> ma, mb, mc;   // the MTP graph engine: scalar A, batched B and C
+  std::vector<int32_t> la, lb, lc;  // the lookup MTP graph engine: scalar A, batched B/C
+  uint64_t scalar_fused = 0;
+  uint64_t fused = 0;                // lookup-fused steps this rank served
   int mtp_steps_a = 0;               // scalar MTP steps A took (< kSteps: drafts stood)
 };
 
@@ -1412,6 +1416,230 @@ DGPP_TEST(qwen_compact_logits_preserve_cache_concurrency_and_mtp) {
     require(run(false) == run(true),
             "compact logits changed graph/cache transcripts at MTP depth " + std::to_string(depth));
     std::printf("[ .. ] compact/full logits: four slots, cache reuse, retirement and MTP depth %d exact\n", depth);
+  }
+}
+
+// Context-lookup drafting through the recorded MTP path (engine.lookup_draft):
+// the same repeating prompts with the gate off and on. The fused drafts ride
+// the ordinary verify/commit/rollback, so the transcripts must be identical;
+// the fused-step counter must be nonzero (otherwise the test is vacuous on
+// random weights, which never copy). Scalar A plus a two-slot batch B.
+void rank_work_mtp_lookup(int r, const QwenTextConfig& cfg, const std::string& dir,
+                          const std::vector<int64_t>& A, const std::vector<int64_t>& B,
+                          CollectiveBus* bus, ConstructBarrier* barrier, RankOutcome* out,
+                          bool lookup, int tail = 0, bool sampled = false) {
+  bool arrived = false;
+  const auto arrive_once = [&] {
+    if (arrived) return;
+    arrived = true;
+    barrier->arrive_and_wait();
+  };
+  uint16_t* scratch = nullptr;
+  uint16_t* prefix_scratch = nullptr;
+  uint16_t* gather_scratch = nullptr;
+  try {
+    BusBoundaryReducer reducer(*bus, wait_timeout_ms());
+    QwenModel mtp(cfg, dir, kMaxTokens, kCache, QwenResidency::Resident, &reducer, r, kWorld, kSlots, /*mtp=*/true);
+    DGPP_CUDA_OK(cudaHostAlloc(reinterpret_cast<void**>(&scratch),
+                               sizeof(uint16_t) * dgpp::kPickScratchElems(kWorld), cudaHostAllocDefault));
+    if (sampled) {
+      DGPP_CUDA_OK(cudaHostAlloc(reinterpret_cast<void**>(&prefix_scratch),
+                                 2 * dgpp::fabric_sampling_prefix_scratch_elems(kWorld),
+                                 cudaHostAllocDefault));
+      DGPP_CUDA_OK(cudaHostAlloc(reinterpret_cast<void**>(&gather_scratch),
+                                 2 * dgpp::sampling_gather_scratch_elems(cfg.vocab_size),
+                                 cudaHostAllocDefault));
+    }
+    arrive_once();
+    GraphEngineAdapter<QwenModel> eng(&mtp, bus, r, kWorld, scratch, cfg.vocab_size,
+                                      wait_timeout_ms(),
+                                      /*batch_min_live=*/2, prefix_scratch, gather_scratch,
+                                      /*candidates=*/sampled ? 32 : 0, /*grammar=*/nullptr,
+                                      /*prefix_slots=*/0, /*mtp_depth=*/1, test_compaction(), tail);
+    if (lookup) eng.set_lookup_drafts(true, /*nmin=*/2, /*nstrong=*/4, /*agree=*/2);
+    const auto configure = [&](int slot) {
+      if (!sampled) return;
+      auto params = dgpp::sample::greedy_params();
+      params.temperature = 1.0f;
+      params.top_k = 1;  // a sampled slot with a deterministic target; lookup must still stay off
+      eng.configure_sampling(slot, params, 1234 + slot);
+    };
+    configure(0);
+    out->la.push_back(eng.prefill(0, A));
+    eng.reserve(0, static_cast<int64_t>(A.size()) + kSteps + 3);
+    while (out->la.size() < static_cast<size_t>(kSteps) + 1) {
+      const std::vector<int32_t> t = eng.step(0);
+      require(!t.empty() && t.size() <= static_cast<size_t>(2 + tail), "lookup scalar step shape");
+      if (out->la.size() == 1 && lookup && !sampled)
+        require(t.size() == 1, "the first scalar lookup draft must be rejected");
+      out->la.insert(out->la.end(), t.begin(), t.end());
+    }
+    out->la.resize(static_cast<size_t>(kSteps) + 1);
+    eng.close(0);
+    out->scalar_fused = eng.lookup_fused_steps();
+    configure(0);  // retiring a greedy or sampled slot clears its history and proposal state
+    out->lb.push_back(eng.prefill(0, B));
+    eng.reserve(0, static_cast<int64_t>(B.size()) + kSteps + 3);
+    configure(1);
+    out->lc.push_back(eng.prefill(1, B));
+    eng.reserve(1, static_cast<int64_t>(B.size()) + kSteps + 3);
+    while (out->lb.size() <= static_cast<size_t>(kSteps) || out->lc.size() <= static_cast<size_t>(kSteps)) {
+      const auto t = eng.step_batch({0, 1});
+      require(t.size() == 2, "lookup batch step shape");
+      if (out->lb.size() == 1 && lookup && tail > 0 && !sampled)
+        require(t[0].size() == 2 && t[1].size() == 2,
+                "batch lookup must accept its first draft and reject the second");
+      out->lb.insert(out->lb.end(), t[0].begin(), t[0].end());
+      out->lc.insert(out->lc.end(), t[1].begin(), t[1].end());
+    }
+    out->lb.resize(static_cast<size_t>(kSteps) + 1);
+    out->lc.resize(static_cast<size_t>(kSteps) + 1);
+    eng.close(0);
+    eng.close(1);
+    eng.drain();
+    out->fused = eng.lookup_fused_steps();
+    cudaFreeHost(scratch);
+    if (prefix_scratch) cudaFreeHost(prefix_scratch);
+    if (gather_scratch) cudaFreeHost(gather_scratch);
+  } catch (const std::exception& e) {
+    if (scratch) cudaFreeHost(scratch);
+    if (prefix_scratch) cudaFreeHost(prefix_scratch);
+    if (gather_scratch) cudaFreeHost(gather_scratch);
+    out->error = "rank " + std::to_string(r) + ": " + e.what();
+    arrive_once();
+  }
+}
+
+// A zero vocabulary head picks token 0 on every row. The prompt suffix ends
+// in that pending token, so lookup deterministically proposes the deliberately
+// wrong continuation. Random fixture weights do not continue repeating text.
+void write_lookup_fixture(const QwenTextConfig& cfg, const std::string& dir) {
+  qwenfx::write_fixture_for(cfg, dir);
+  std::fstream shard(fs::path(dir) / "model.safetensors",
+                     std::ios::in | std::ios::out | std::ios::binary);
+  uint64_t header_bytes = 0;
+  shard.read(reinterpret_cast<char*>(&header_bytes), sizeof(header_bytes));
+  size_t offset = 0;
+  bool found = false;
+  for (const auto& tensor : dgpp::qwen_expected_text_tensors(cfg)) {
+    if (tensor.cls == dgpp::QwenWeightClass::LmHead) {
+      require(tensor.dtype == dgpp::DType::BF16, "lookup fixture requires a BF16 head");
+      std::vector<char> zeros(tensor.nbytes(), 0);
+      shard.seekp(static_cast<std::streamoff>(8 + header_bytes + offset));
+      shard.write(zeros.data(), static_cast<std::streamsize>(zeros.size()));
+      found = true;
+    }
+    offset += tensor.nbytes();
+  }
+  require(found && shard.good(), "lookup fixture head written");
+}
+
+DGPP_TEST(qwen_engines_loopback_world_2_lookup_draft_matches_mtp_decode) {
+  const QwenTextConfig cfg = qwenfx::tiny_config();
+  const std::string dir = "qwen_engine_lookup_fixture";
+  write_lookup_fixture(cfg, dir);
+  const std::vector<int64_t> A = {7, 8, 9, 0, 1, 7, 8, 9};
+  const std::vector<int64_t> B = {7, 8, 9, 0, 1, 7, 8, 9};
+  std::vector<RankOutcome> off(kWorld), on(kWorld);
+  for (int pass = 0; pass < 2; ++pass) {
+    std::vector<std::unique_ptr<CollectiveBus>> buses =
+        start_world(kWorld, static_cast<uint16_t>(kPort + 30 + pass));
+    require(!buses.empty(), "the loopback bus world failed to start");
+    std::vector<RankOutcome>& outs = pass == 0 ? off : on;
+    ConstructBarrier barrier(kWorld);
+    std::vector<std::thread> workers;
+    for (int r = 0; r < kWorld; ++r)
+      workers.emplace_back(rank_work_mtp_lookup, r, std::cref(cfg), std::cref(dir), std::cref(A),
+                           std::cref(B), buses[static_cast<size_t>(r)].get(), &barrier,
+                           &outs[static_cast<size_t>(r)], /*lookup=*/pass == 1, /*tail=*/0,
+                           /*sampled=*/false);
+    for (auto& t : workers) t.join();
+    for (int r = 0; r < kWorld; ++r) require(outs[static_cast<size_t>(r)].error.empty(), outs[static_cast<size_t>(r)].error);
+  }
+  for (int r = 0; r < kWorld; ++r) {
+    require(off[static_cast<size_t>(r)].la == on[static_cast<size_t>(r)].la, "lookup scalar transcript differs");
+    require(off[static_cast<size_t>(r)].lb == on[static_cast<size_t>(r)].lb, "lookup batch transcript differs (slot 0)");
+    require(off[static_cast<size_t>(r)].lc == on[static_cast<size_t>(r)].lc, "lookup batch transcript differs (slot 1)");
+  }
+  for (int r = 1; r < kWorld; ++r)
+    require(on[static_cast<size_t>(r)].la == on[0].la && on[static_cast<size_t>(r)].lb == on[0].lb &&
+                on[static_cast<size_t>(r)].lc == on[0].lc,
+            "the ranks' lookup transcripts differ");
+  require(on[0].scalar_fused > 0 && on[0].fused > on[0].scalar_fused,
+          "lookup must fire in scalar decode and in the batch after slot reuse");
+  DGPP_LOG_INFO("world 2 lookup draft: A {} | B {}, fused {} steps",
+                ids_text(on[0].la), ids_text(on[0].lb), on[0].fused);
+}
+
+// The lookup tail (engine.lookup_tail): a wider verify block with the MTP
+// chain spanning it and lookup fusing over the whole width. Same repeating
+// prompts, MTP depth 1 alone vs depth 1 + 3 tail rows: identical transcripts
+// (exact at any width), and the tail must fire.
+DGPP_TEST(qwen_engines_loopback_world_2_lookup_tail_matches_mtp_decode) {
+  const QwenTextConfig cfg = qwenfx::tiny_config();
+  const std::string dir = "qwen_engine_lookup_fixture";
+  write_lookup_fixture(cfg, dir);
+  const std::vector<int64_t> A = {7, 8, 9, 0, 1, 7, 8, 9};
+  const std::vector<int64_t> B = {7, 8, 9, 0, 0, 1, 7, 8, 9};
+  std::vector<RankOutcome> off(kWorld), on(kWorld);
+  for (int pass = 0; pass < 2; ++pass) {
+    std::vector<std::unique_ptr<CollectiveBus>> buses =
+        start_world(kWorld, static_cast<uint16_t>(kPort + 32 + pass));
+    require(!buses.empty(), "the loopback bus world failed to start");
+    std::vector<RankOutcome>& outs = pass == 0 ? off : on;
+    ConstructBarrier barrier(kWorld);
+    std::vector<std::thread> workers;
+    for (int r = 0; r < kWorld; ++r)
+      workers.emplace_back(rank_work_mtp_lookup, r, std::cref(cfg), std::cref(dir), std::cref(A),
+                           std::cref(B), buses[static_cast<size_t>(r)].get(), &barrier,
+                           &outs[static_cast<size_t>(r)], /*lookup=*/pass == 1,
+                           /*tail=*/pass == 1 ? 3 : 0, /*sampled=*/false);
+    for (auto& t : workers) t.join();
+    for (int r = 0; r < kWorld; ++r) require(outs[static_cast<size_t>(r)].error.empty(), outs[static_cast<size_t>(r)].error);
+  }
+  for (int r = 0; r < kWorld; ++r) {
+    require(off[static_cast<size_t>(r)].la == on[static_cast<size_t>(r)].la, "lookup-tail scalar differs");
+    require(off[static_cast<size_t>(r)].lb == on[static_cast<size_t>(r)].lb, "lookup-tail batch differs (slot 0)");
+    require(off[static_cast<size_t>(r)].lc == on[static_cast<size_t>(r)].lc, "lookup-tail batch differs (slot 1)");
+  }
+  for (int r = 1; r < kWorld; ++r)
+    require(on[static_cast<size_t>(r)].la == on[0].la && on[static_cast<size_t>(r)].lb == on[0].lb &&
+                on[static_cast<size_t>(r)].lc == on[0].lc,
+            "the ranks' lookup-tail transcripts differ");
+  require(on[0].scalar_fused > 0 && on[0].fused > on[0].scalar_fused,
+          "lookup tail must fire in scalar decode and in the batch after slot reuse");
+  DGPP_LOG_INFO("world 2 lookup tail: A {} | B {}, fused {} steps",
+                ids_text(on[0].la), ids_text(on[0].lb), on[0].fused);
+}
+
+DGPP_TEST(qwen_engines_loopback_world_2_lookup_skips_sampled_slots) {
+  const QwenTextConfig cfg = qwenfx::tiny_config();
+  const std::string dir = "qwen_engine_lookup_fixture";
+  write_lookup_fixture(cfg, dir);
+  const std::vector<int64_t> A = {7, 8, 9, 0, 1, 7, 8, 9};
+  const std::vector<int64_t> B = {7, 8, 9, 0, 0, 1, 7, 8, 9};
+  for (int tail : {0, 3}) {
+    std::vector<RankOutcome> off(kWorld), on(kWorld);
+    for (int pass = 0; pass < 2; ++pass) {
+      auto buses = start_world(kWorld, static_cast<uint16_t>(kPort + 34 + pass));
+      require(!buses.empty(), "lookup sampling bus world started");
+      auto& outs = pass == 0 ? off : on;
+      ConstructBarrier barrier(kWorld);
+      std::vector<std::thread> workers;
+      for (int r = 0; r < kWorld; ++r)
+        workers.emplace_back(rank_work_mtp_lookup, r, std::cref(cfg), std::cref(dir), std::cref(A),
+                             std::cref(B), buses[r].get(), &barrier, &outs[r], pass == 1, tail,
+                             true);
+      for (auto& t : workers) t.join();
+      for (const auto& out : outs) require(out.error.empty(), out.error);
+    }
+    for (int r = 0; r < kWorld; ++r) {
+      require(off[r].la == on[r].la && off[r].lb == on[r].lb && off[r].lc == on[r].lc,
+              "lookup changed sampled transcripts");
+      require(on[r].fused == 0, "lookup must never reprice sampled MTP proposals");
+      require(on[r].la == on[0].la && on[r].lb == on[0].lb && on[r].lc == on[0].lc,
+              "sampled lookup ranks disagree");
+    }
   }
 }
 

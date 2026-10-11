@@ -1,0 +1,94 @@
+[
+  {
+    "label": "draft-probe-w4-prefetch4",
+    "command": [
+      "python3",
+      "/home/stephen/dgpp/pr95-followups-20261011/campaign.py",
+      "nvfp4",
+      "4",
+      "draft-probe-w4-prefetch4",
+      "--draft-probe",
+      "--prefetch-window",
+      "4"
+    ],
+    "started": "2026-10-11T03:54:17.665764+00:00",
+    "returncode": 0,
+    "finished": "2026-10-11T03:55:06.768284+00:00",
+    "median_tps": 56.7637958284175,
+    "steps": [
+      105,
+      105,
+      105
+    ],
+    "same_transcripts": true
+  },
+  {
+    "label": "draft-probe-w4-prefetch8",
+    "command": [
+      "python3",
+      "/home/stephen/dgpp/pr95-followups-20261011/campaign.py",
+      "nvfp4",
+      "4",
+      "draft-probe-w4-prefetch8",
+      "--draft-probe",
+      "--prefetch-window",
+      "8"
+    ],
+    "started": "2026-10-11T03:55:06.789134+00:00",
+    "returncode": 0,
+    "finished": "2026-10-11T03:55:54.089578+00:00",
+    "median_tps": 57.40269680120657,
+    "steps": [
+      105,
+      105,
+      105
+    ],
+    "same_transcripts": true
+  },
+  {
+    "label": "draft-probe-w4-prefetch12",
+    "command": [
+      "python3",
+      "/home/stephen/dgpp/pr95-followups-20261011/campaign.py",
+      "nvfp4",
+      "4",
+      "draft-probe-w4-prefetch12",
+      "--draft-probe",
+      "--prefetch-window",
+      "12"
+    ],
+    "started": "2026-10-11T03:55:54.126429+00:00",
+    "returncode": 0,
+    "finished": "2026-10-11T03:56:43.242065+00:00",
+    "median_tps": 57.14413768375763,
+    "steps": [
+      105,
+      105,
+      105
+    ],
+    "same_transcripts": true
+  },
+  {
+    "label": "draft-probe-w4-prefetch-full",
+    "command": [
+      "python3",
+      "/home/stephen/dgpp/pr95-followups-20261011/campaign.py",
+      "nvfp4",
+      "4",
+      "draft-probe-w4-prefetch-full",
+      "--draft-probe",
+      "--prefetch-rate",
+      "full"
+    ],
+    "started": "2026-10-11T03:56:43.253655+00:00",
+    "returncode": 0,
+    "finished": "2026-10-11T03:57:33.662733+00:00",
+    "median_tps": 52.51019315514189,
+    "steps": [
+      105,
+      105,
+      105
+    ],
+    "same_transcripts": true
+  }
+]

@@ -32,6 +32,13 @@ revisions recorded with them.
 
 ## Serving support
 
+The mixed `unsloth/Qwen3.8-27B-NVFP4` checkpoint runs at TP 1/2/4
+with the shipped DFlash2 recipes. Its dense FP4 prefill kernel reuses
+activation fragments across wider warp tiles while preserving the original
+FP32 dot order. Disabled MTP layers stay unmaterialized. Context-lookup
+fusion applies only to greedy MTP requests; sampled requests retain their
+original proposals. See the [review and validation record](benchmarks/results/2026-10-11-pr95-followups/README.md).
+
 Completion responses expose llama.cpp-style `timings`, including final stream
 chunks without usage opt-in. The response calculations preserve existing usage,
 JSON metrics, Prometheus and log semantics. See the

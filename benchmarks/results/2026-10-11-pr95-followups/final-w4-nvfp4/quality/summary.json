@@ -1,0 +1,28 @@
+{
+  "model": "Qwen3.8-27B-NVFP4",
+  "settings": {
+    "max_tokens": 4096,
+    "reasoning_effort": "low",
+    "no_think": true,
+    "limit": 100,
+    "seed": 20261010
+  },
+  "tasks": {
+    "gsm8k": {
+      "n": 100,
+      "passed": 95,
+      "rate": 0.95,
+      "seconds": 148,
+      "mean_completion_tokens": 412,
+      "truncated": 0
+    },
+    "extract": {
+      "n": 100,
+      "passed": 100,
+      "rate": 1.0,
+      "seconds": 31,
+      "mean_completion_tokens": 63,
+      "truncated": 0
+    }
+  }
+}

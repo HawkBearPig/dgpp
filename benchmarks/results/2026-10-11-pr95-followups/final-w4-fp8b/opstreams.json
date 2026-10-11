@@ -1,0 +1,10 @@
+{
+  "hashes": {
+    "serve_rank0.ops": "6053226b7669ef36494b9df6011c5063",
+    "serve_rank1.ops": "6053226b7669ef36494b9df6011c5063",
+    "serve_rank2.ops": "6053226b7669ef36494b9df6011c5063",
+    "serve_rank3.ops": "6053226b7669ef36494b9df6011c5063"
+  },
+  "expected_ranks": 4,
+  "match": true
+}

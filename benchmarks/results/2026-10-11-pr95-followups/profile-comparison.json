@@ -1,0 +1,20 @@
+{
+  "profiles": [
+    {
+      "leg": "original-prefill-profile",
+      "fp4_gemm_ms": 4432.22,
+      "prompt_sha256": "a572068f89ecfc0b61a3c108f55a21a890950afe746e0ecf999c52585a3a7e68",
+      "prompt_tokens": 8353,
+      "instrumented_prefill_ms": 8900.4
+    },
+    {
+      "leg": "final-prefill-profile",
+      "fp4_gemm_ms": 3055.6,
+      "prompt_sha256": "a572068f89ecfc0b61a3c108f55a21a890950afe746e0ecf999c52585a3a7e68",
+      "prompt_tokens": 8353,
+      "instrumented_prefill_ms": 7438.5
+    }
+  ],
+  "kernel_time_reduction_pct": 31.0593788214484,
+  "note": "Identical 8353-token uncached prompt and 336 FP4 GEMMs. Instrumented traces explain cost; uninstrumented A/B/A data defines serving performance."
+}

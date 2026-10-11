@@ -1,0 +1,32 @@
+[
+  {
+    "path": "/home/stephen/dgpp/pr95-followups-20261011/teacher_text_hard-0.ids",
+    "tokens": 4097,
+    "sha256": "9d8f9af8b81b1237e46a040ff4ea5fcb14cc2e948fd38013852f8ab7e6dd30a8",
+    "source_tokens": 7689
+  },
+  {
+    "path": "/home/stephen/dgpp/pr95-followups-20261011/teacher_text_hard-1.ids",
+    "tokens": 4097,
+    "sha256": "007b6089f1c6fcedc81b81959a94fdaae9fdced26e458066c89c2c65fa78fb47",
+    "source_tokens": 7689
+  },
+  {
+    "path": "/home/stephen/dgpp/pr95-followups-20261011/teacher_text_memorized-0.ids",
+    "tokens": 4097,
+    "sha256": "bbbfc095d84f1a696eba12fcf1f159037c2c39abd9fcc5155bdb6c4f5595029d",
+    "source_tokens": 6693
+  },
+  {
+    "path": "/home/stephen/dgpp/pr95-followups-20261011/teacher_text_memorized-1.ids",
+    "tokens": 4097,
+    "sha256": "783cafffc723a13a4e9f097e15990e4b398a73dfcee16c19bcdb3ffaa011f44f",
+    "source_tokens": 6693
+  },
+  {
+    "path": "/home/stephen/dgpp/pr95-followups-20261011/teacher_text-0.ids",
+    "tokens": 3073,
+    "sha256": "dbb780b4e0e37a739158802cf7fd8814eb80b41216c2a9f745dbe19f5f14cab1",
+    "source_tokens": 556
+  }
+]

@@ -45,7 +45,15 @@ inline const char* kQuantFp8 =
 inline const char* kQuantNvfp4Mixed =
     R"({"quant_method": "compressed-tensors", "format": "mixed-precision",
         "config_groups": {
-          "group_0": {"weights": {"num_bits": 8, "type": "float", "group_size": 128}},
-          "group_1": {"weights": {"num_bits": 4, "type": "float", "group_size": 16}}}})";
+          "group_0": {"format": "float-quantized",
+                      "targets": ["re:.*self_attn\\.(q|k|v|o)_proj$",
+                                  "re:.*linear_attn\\.(in_proj_qkv|in_proj_z|out_proj)$",
+                                  "re:.*layers\\.(56|57|58|59|60|61|62|63)\\.mlp\\.(gate|up|down)_proj$",
+                                  "re:.*lm_head"],
+                      "weights": {"num_bits": 8, "type": "float", "strategy": "channel"}},
+          "group_1": {"format": "nvfp4-pack-quantized",
+                      "targets": ["re:.*mlp\\.(gate|up|down)_proj$"],
+                      "weights": {"num_bits": 4, "type": "float", "group_size": 16}}},
+        "ignore": ["re:^mtp.*", "re:^model\\.visual.*"]})";
 
 }  // namespace qwen35_fixture

@@ -60,6 +60,7 @@ Rules that keep the numbers comparable:
 |---|---|---|
 | `engine.decode_graph` | replays each decode step as a CUDA graph | launch overhead; keep it on |
 | `engine.mtp`, `engine.mtp_depth` | draft tokens per pass | a deeper draft accepts more tokens per pass but every pass costs more rows; the template depth is the measured best for its model (depth 1 for GLM-5.3-Flash, 3 for the Qwen AutoRound hybrid); the [decode modes](benchmarks.md#decode-modes) table shows plain, default and deeper for every template |
+| `engine.lookup_draft` (+ thresholds) | accepted tokens per pass on repeating work | a prompt-history match replaces MTP drafts within the same rows (strong matches on their own, shorter ones only when they agree with the device's picks); free on prose (no match, no cost), decisive while the answer quotes the prompt; greedy slots only |
 | `engine.mtp_schedule*` (DeepSeek, the Qwen3.8-27B drafter) | confidence-scheduled verify depth | the cost model's two milliseconds are deployment measurements |
 | `engine.fp8_head` (Qwen FP8 head) | `mma` streams the vocabulary head through the tensor cores at every width (one chain alone, at any verify depth and in a batch) | validated numerically per template; `gemv` restores the previous path |
 | `engine.graph_batch_min_live` | when decode switches from scalar to batched graphs | earlier batching helps throughput under load and can cost a single stream |

@@ -153,14 +153,23 @@ eval holds at 39/40 on HumanEval and GSM8K and the acceptance is unchanged), and
 per-tensor e4m3 kernels (about 2x the prefill rate, +23 GiB resident). Both
 change greedy transcripts (the head within the first tokens, the prefill
 recipe at long context), so a deployment that enables them is not the
-checkpoint's model. The family is world-1 only.
+checkpoint's model. The dense family supports worlds 1, 2 and 4.
 
-Its DFlash2 drafter (`engine.dflash_model`, the `_dflash2` template) runs the
-eager world-1 engine with `mtp` and `decode_graph` off; its own options are
+The current dense templates use the DFlash2 drafter (`engine.dflash_model`)
+with `mtp` off, `decode_graph` on and adaptive verification depth at worlds
+1, 2 and 4. The earlier eager world-1 configuration with `decode_graph` off
+remains available; its own options are
 `engine.dflash_verify_graph` (the multi-slot verify as a captured graph, the
 default), `engine.dflash_draft_batch` (stacked redrafts, the default) and
 `engine.dflash_depth` (a verify-depth cap, 0 = the block). None of them
 changes a transcript: the drafter only proposes, the greedy verify decides.
+
+The [Qwen3.8-27B NVFP4 checkpoint](model_cards/Qwen3.8-27B-NVFP4.md) uses
+the same dense architecture and DFlash2 templates. Its mixed native FP4,
+channelwise FP8 and BF16 weights are loaded without requantization;
+`dense_weights: fp8` and `prefill_fp8_per_tensor` are rejected for this
+checkpoint. The model card links the matched performance and quality
+measurements, including the remaining four-node C1 prose decode exception.
 
 Qwen FP8 and packed heads keep the full product's kernel selection and
 accumulation order. BF16 heads use the existing small-row projection, which

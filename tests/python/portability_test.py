@@ -34,12 +34,13 @@ class PortabilityTest(unittest.TestCase):
                     "DGPP_CLUSTER_CONFIG": str(self.config)}
         self.values = site_env.settings(self.env)
 
-    def test_localhost_and_deployment_http_override(self):
+    def test_default_binding_and_deployment_http_override(self):
         resolved = site_env.resolve_config(self.config, self.values)
-        self.assertEqual(resolved["http"], {"bind_host": "127.0.0.1", "port": 18080})
+        self.assertEqual(resolved["http"], {"bind_host": "0.0.0.0", "port": 18080})
         self.config.write_text(json.dumps({"model": "org/model", "world_size": 1,
-                                         "http": {"bind_host": "0.0.0.0", "port": 8080}}))
+                                         "http": {"bind_host": "127.0.0.1", "port": 8080}}))
         resolved = site_env.resolve_config(self.config, self.values)
+        self.assertEqual(resolved["http"], {"bind_host": "127.0.0.1", "port": 8080})
         self.assertEqual(resolved["ports"]["http"], 8080)
         with patch.dict(os.environ, self.env, clear=True):
             self.assertEqual(site_env.default_host(), "127.0.0.1")
@@ -208,6 +209,7 @@ class PortabilityTest(unittest.TestCase):
             "deepseek-ai/DeepSeek-V4-Flash-0731": "deepseek-v4-flash_mxfp4-fp8",
             "Saren/Qwen3.8-Flash-Next-W4A16-AutoRound-hybrid-MTP_int4RTN": "qwen-3.8-flash-next_autoround-int4",
             "Qwen/Qwen3.8-27B-FP8": "qwen3.8-27b_fp8",
+            "unsloth/Qwen3.8-27B-NVFP4": "qwen3.8-27b_nvfp4",
         }
         values = {**site_env.DEFAULTS, "DGPP_NODES": "head peer1 peer2 peer3", "DGPP_SSH_USER": "ops"}
         templates = list((ROOT / "deploy").glob("*.example.json"))

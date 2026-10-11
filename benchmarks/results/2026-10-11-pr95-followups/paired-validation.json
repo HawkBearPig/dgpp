@@ -1,0 +1,120 @@
+[
+  {
+    "label": "paired-probe-build",
+    "command": [
+      "python3",
+      "/home/stephen/dgpp/pr95-followups-20261011/build_paired_numerical.py"
+    ],
+    "start": "2026-10-11T01:13:58.488212+00:00",
+    "returncode": 0,
+    "end": "2026-10-11T01:13:59.918994+00:00"
+  },
+  {
+    "label": "paired-targeted",
+    "command": [
+      "ctest",
+      "--test-dir",
+      "build-pr95",
+      "-R",
+      "^(fp4w_gemm_test|qwen35_mixed.*|qwen35_tp_test)$",
+      "--output-on-failure",
+      "-j1"
+    ],
+    "start": "2026-10-11T01:13:59.919242+00:00",
+    "returncode": 0,
+    "end": "2026-10-11T01:14:59.842196+00:00"
+  },
+  {
+    "label": "paired-numerical-0",
+    "command": [
+      "/home/stephen/dgpp/pr95-followups-20261011/numerical-paired",
+      "/home/stephen/.cache/huggingface/hub/models--unsloth--Qwen3.8-27B-NVFP4/snapshots/f0b7c9e722f5565102fff8481c99e4d86ae099c7",
+      "/home/stephen/dgpp/pr95-followups-20261011/paired",
+      "/home/stephen/dgpp/pr95-followups-20261011/teacher_text_hard-0.ids",
+      "/home/stephen/dgpp/pr95-followups-20261011/teacher_text_hard-1.ids",
+      "/home/stephen/dgpp/pr95-followups-20261011/teacher_text_memorized-0.ids",
+      "/home/stephen/dgpp/pr95-followups-20261011/teacher_text_memorized-1.ids",
+      "/home/stephen/dgpp/pr95-followups-20261011/teacher_text-0.ids"
+    ],
+    "start": "2026-10-11T01:14:59.910327+00:00",
+    "returncode": 0,
+    "end": "2026-10-11T01:16:18.361936+00:00"
+  },
+  {
+    "label": "paired-numerical-1",
+    "command": [
+      "/home/stephen/dgpp/pr95-followups-20261011/numerical-paired",
+      "/home/stephen/.cache/huggingface/hub/models--unsloth--Qwen3.8-27B-NVFP4/snapshots/f0b7c9e722f5565102fff8481c99e4d86ae099c7",
+      "/home/stephen/dgpp/pr95-followups-20261011/paired-repeat",
+      "/home/stephen/dgpp/pr95-followups-20261011/teacher_text_hard-0.ids"
+    ],
+    "start": "2026-10-11T01:16:18.423332+00:00",
+    "returncode": 0,
+    "end": "2026-10-11T01:16:42.216644+00:00"
+  },
+  {
+    "label": "paired-comparison",
+    "command": [
+      "python3",
+      "/home/stephen/dgpp/pr95-followups-20261011/analyze_paired.py"
+    ],
+    "start": "2026-10-11T01:16:42.217068+00:00",
+    "returncode": 0,
+    "end": "2026-10-11T01:16:42.332502+00:00"
+  },
+  {
+    "label": "paired-memcheck",
+    "command": [
+      "/usr/local/cuda/bin/compute-sanitizer",
+      "--tool",
+      "memcheck",
+      "--error-exitcode",
+      "99",
+      "build-pr95/fp4w_gemm_test"
+    ],
+    "start": "2026-10-11T01:16:42.332753+00:00",
+    "returncode": 0,
+    "end": "2026-10-11T01:16:53.349451+00:00"
+  },
+  {
+    "label": "paired-racecheck",
+    "command": [
+      "/usr/local/cuda/bin/compute-sanitizer",
+      "--tool",
+      "racecheck",
+      "--error-exitcode",
+      "99",
+      "build-pr95/fp4w_gemm_test"
+    ],
+    "start": "2026-10-11T01:16:53.349724+00:00",
+    "returncode": 0,
+    "end": "2026-10-11T01:18:31.787079+00:00"
+  },
+  {
+    "label": "paired-w4-controller",
+    "command": [
+      "python3",
+      "/home/stephen/dgpp/pr95-followups-20261011/campaign.py",
+      "nvfp4",
+      "4",
+      "paired-w4",
+      "--prefill-only"
+    ],
+    "start": "2026-10-11T01:18:31.787457+00:00",
+    "returncode": 0,
+    "end": "2026-10-11T01:20:20.078805+00:00"
+  },
+  {
+    "label": "merged-suite",
+    "command": [
+      "ctest",
+      "--test-dir",
+      "build-pr95",
+      "--output-on-failure",
+      "-j1"
+    ],
+    "start": "2026-10-11T01:20:20.079128+00:00",
+    "returncode": 8,
+    "end": "2026-10-11T01:41:00.092885+00:00"
+  }
+]

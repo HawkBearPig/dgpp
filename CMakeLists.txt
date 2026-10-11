@@ -166,6 +166,7 @@ add_library(dgpp_kernels STATIC
   src/kernels/fp8_dequant.cu
   src/kernels/fp8_gemm.cu
   src/kernels/fp8w_gemm.cu
+  src/kernels/fp4w_gemm.cu
   src/kernels/fp8_per_tensor.cu
   src/kernels/fp4_gemv.cu
   src/kernels/packq_gemv.cu
@@ -833,6 +834,7 @@ add_executable(unit_tests
   tests/unit/mimo_binding_test.cpp
   tests/unit/nvfp4_quant_test.cpp
   tests/unit/verify_schedule_test.cpp
+  tests/unit/lookup_draft_test.cpp
   src/core/trace.cpp)
 target_include_directories(unit_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(unit_tests PRIVATE CUDA::cudart dgpp_loaders
@@ -1270,6 +1272,79 @@ add_test(NAME qwen35_forward_test
   COMMAND qwen35_forward_test --checkpoint-dir ${QWEN35_FORWARD_FIXTURE}
           --dump-file ${CMAKE_CURRENT_BINARY_DIR}/qwen35_teacher_ref.q35dump)
 set_tests_properties(qwen35_forward_test PROPERTIES DEPENDS qwen35_forward_generate_teacher)
+# The NVFP4 mixed release (#131): the same gate over the mixed-form fixture
+# (channel-FP8 attention + late MLP + lm_head, NVFP4 early MLPs, BF16 draft).
+set(QWEN35_MIXED_FIXTURE ${CMAKE_CURRENT_BINARY_DIR}/qwen35_mixed_fixture)
+add_test(NAME qwen35_mixed_fixture COMMAND qwen35_forward_test --write-fixture-mixed ${QWEN35_MIXED_FIXTURE})
+add_test(NAME qwen35_mixed_smoke COMMAND qwen35_forward_test --smoke ${QWEN35_MIXED_FIXTURE})
+set_tests_properties(qwen35_mixed_smoke PROPERTIES DEPENDS qwen35_mixed_fixture)
+add_test(NAME qwen35_mixed_resident_mtp COMMAND qwen35_forward_test --resident-mtp ${QWEN35_MIXED_FIXTURE})
+set_tests_properties(qwen35_mixed_resident_mtp PROPERTIES DEPENDS qwen35_mixed_fixture)
+add_test(NAME qwen35_mixed_rows_invariance COMMAND qwen35_forward_test --rows-invariance ${QWEN35_MIXED_FIXTURE})
+set_tests_properties(qwen35_mixed_rows_invariance PROPERTIES DEPENDS qwen35_mixed_fixture)
+add_test(NAME qwen35_mixed_generate
+  COMMAND ${DSV41_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/tools/qwen35_reference_dump.py
+          gen-pure --checkpoint-dir ${QWEN35_MIXED_FIXTURE}
+          --out ${CMAKE_CURRENT_BINARY_DIR}/qwen35_mixed_ref.q35dump)
+set_tests_properties(qwen35_mixed_generate PROPERTIES DEPENDS qwen35_mixed_fixture)
+add_test(NAME qwen35_mixed_e2e
+  COMMAND qwen35_forward_test --checkpoint-dir ${QWEN35_MIXED_FIXTURE}
+          --dump-file ${CMAKE_CURRENT_BINARY_DIR}/qwen35_mixed_ref.q35dump --relaxed
+          --engine-states ${CMAKE_CURRENT_BINARY_DIR}/qwen35_mixed_engine_states.bin)
+set_tests_properties(qwen35_mixed_e2e PROPERTIES DEPENDS qwen35_mixed_generate)
+add_test(NAME qwen35_mixed_generate_teacher
+  COMMAND ${DSV41_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/tools/qwen35_reference_dump.py
+          gen-pure --checkpoint-dir ${QWEN35_MIXED_FIXTURE}
+          --out ${CMAKE_CURRENT_BINARY_DIR}/qwen35_mixed_teacher.q35dump
+          --teacher ${CMAKE_CURRENT_BINARY_DIR}/qwen35_mixed_engine_states.bin)
+set_tests_properties(qwen35_mixed_generate_teacher PROPERTIES DEPENDS qwen35_mixed_e2e)
+add_test(NAME qwen35_mixed_test
+  COMMAND qwen35_forward_test --checkpoint-dir ${QWEN35_MIXED_FIXTURE}
+          --dump-file ${CMAKE_CURRENT_BINARY_DIR}/qwen35_mixed_teacher.q35dump)
+set_tests_properties(qwen35_mixed_test PROPERTIES DEPENDS qwen35_mixed_generate_teacher)
+# Exercise the FP4 prefill dispatch at its 1024-row boundary.
+# The short mixed fixture above stays on the decode/short-prefill kernel.
+add_test(NAME qwen35_mixed_prefill_generate
+  COMMAND ${DSV41_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/tools/qwen35_reference_dump.py
+          gen-pure --checkpoint-dir ${QWEN35_MIXED_FIXTURE} --tokens 1024 --no-mtp
+          --out ${CMAKE_CURRENT_BINARY_DIR}/qwen35_mixed_prefill_ref.q35dump)
+set_tests_properties(qwen35_mixed_prefill_generate PROPERTIES DEPENDS qwen35_mixed_fixture)
+add_test(NAME qwen35_mixed_prefill_e2e
+  COMMAND qwen35_forward_test --checkpoint-dir ${QWEN35_MIXED_FIXTURE}
+          --dump-file ${CMAKE_CURRENT_BINARY_DIR}/qwen35_mixed_prefill_ref.q35dump --relaxed
+          --engine-states ${CMAKE_CURRENT_BINARY_DIR}/qwen35_mixed_prefill_states.bin)
+set_tests_properties(qwen35_mixed_prefill_e2e PROPERTIES DEPENDS qwen35_mixed_prefill_generate)
+add_test(NAME qwen35_mixed_prefill_generate_teacher
+  COMMAND ${DSV41_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/tools/qwen35_reference_dump.py
+          gen-pure --checkpoint-dir ${QWEN35_MIXED_FIXTURE} --tokens 1024 --no-mtp
+          --out ${CMAKE_CURRENT_BINARY_DIR}/qwen35_mixed_prefill_teacher.q35dump
+          --teacher ${CMAKE_CURRENT_BINARY_DIR}/qwen35_mixed_prefill_states.bin)
+set_tests_properties(qwen35_mixed_prefill_generate_teacher PROPERTIES DEPENDS qwen35_mixed_prefill_e2e)
+add_test(NAME qwen35_mixed_prefill_test
+  COMMAND qwen35_forward_test --checkpoint-dir ${QWEN35_MIXED_FIXTURE}
+          --dump-file ${CMAKE_CURRENT_BINARY_DIR}/qwen35_mixed_prefill_teacher.q35dump)
+set_tests_properties(qwen35_mixed_prefill_test PROPERTIES DEPENDS qwen35_mixed_prefill_generate_teacher)
+# A longer mixed-quant prefill spanning multiple tile groups.
+add_test(NAME qwen35_mixed_long_prefill_generate
+  COMMAND ${DSV41_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/tools/qwen35_reference_dump.py
+          gen-pure --checkpoint-dir ${QWEN35_MIXED_FIXTURE} --tokens 3072 --no-mtp
+          --out ${CMAKE_CURRENT_BINARY_DIR}/qwen35_mixed_long_prefill_ref.q35dump)
+set_tests_properties(qwen35_mixed_long_prefill_generate PROPERTIES DEPENDS qwen35_mixed_fixture)
+add_test(NAME qwen35_mixed_long_prefill_e2e
+  COMMAND qwen35_forward_test --checkpoint-dir ${QWEN35_MIXED_FIXTURE}
+          --dump-file ${CMAKE_CURRENT_BINARY_DIR}/qwen35_mixed_long_prefill_ref.q35dump --relaxed
+          --engine-states ${CMAKE_CURRENT_BINARY_DIR}/qwen35_mixed_long_prefill_states.bin)
+set_tests_properties(qwen35_mixed_long_prefill_e2e PROPERTIES DEPENDS qwen35_mixed_long_prefill_generate)
+add_test(NAME qwen35_mixed_long_prefill_generate_teacher
+  COMMAND ${DSV41_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/tools/qwen35_reference_dump.py
+          gen-pure --checkpoint-dir ${QWEN35_MIXED_FIXTURE} --tokens 3072 --no-mtp
+          --out ${CMAKE_CURRENT_BINARY_DIR}/qwen35_mixed_long_prefill_teacher.q35dump
+          --teacher ${CMAKE_CURRENT_BINARY_DIR}/qwen35_mixed_long_prefill_states.bin)
+set_tests_properties(qwen35_mixed_long_prefill_generate_teacher PROPERTIES DEPENDS qwen35_mixed_long_prefill_e2e)
+add_test(NAME qwen35_mixed_long_prefill_test
+  COMMAND qwen35_forward_test --checkpoint-dir ${QWEN35_MIXED_FIXTURE}
+          --dump-file ${CMAKE_CURRENT_BINARY_DIR}/qwen35_mixed_long_prefill_teacher.q35dump)
+set_tests_properties(qwen35_mixed_long_prefill_test PROPERTIES DEPENDS qwen35_mixed_long_prefill_generate_teacher)
 # The 27B TP forwards (#86): loopback worlds of 2 and 4 over the tiny
 # fixture against the world-1 forward (ports 29950, 29951).
 add_executable(qwen35_tp_test tests/cuda/qwen35_tp_test.cpp)
@@ -1779,6 +1854,11 @@ target_include_directories(mma_gemv_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
 target_link_libraries(mma_gemv_test PRIVATE dgpp_kernels CUDA::cudart)
 dgpp_set_common(mma_gemv_test)
 add_test(NAME mma_gemv_test COMMAND mma_gemv_test)
+add_executable(fp4w_gemm_test tests/cuda/fp4w_gemm_test.cu)
+target_include_directories(fp4w_gemm_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(fp4w_gemm_test PRIVATE dgpp_kernels CUDA::cudart)
+dgpp_set_common(fp4w_gemm_test)
+add_test(NAME fp4w_gemm_test COMMAND fp4w_gemm_test)
 add_executable(fp4_gemv_test tests/cuda/fp4_gemv_test.cu tests/cuda/fp4_gemv_checkpoint.cpp)
 target_include_directories(fp4_gemv_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(fp4_gemv_test PRIVATE dgpp_kernels dgpp_loaders CUDA::cudart)

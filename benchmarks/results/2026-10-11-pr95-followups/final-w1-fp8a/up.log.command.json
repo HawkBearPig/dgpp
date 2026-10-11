@@ -1,0 +1,16 @@
+{
+  "command": [
+    "python3",
+    "scripts/dgpp-cluster",
+    "up",
+    "--config",
+    "/home/stephen/dgpp/pr95-followups-20261011/final-w1-fp8a/deployment.json",
+    "--bin",
+    "/home/stephen/workspace/dgpp/build-pr95/dgpp-serve",
+    "--log-dir",
+    "/home/stephen/dgpp/pr95-followups-20261011/final-w1-fp8a/world"
+  ],
+  "started": "2026-10-11T01:44:21.687365+00:00",
+  "returncode": 0,
+  "finished": "2026-10-11T01:44:48.019344+00:00"
+}

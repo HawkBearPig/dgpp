@@ -146,6 +146,18 @@ DGPP_TEST(cluster_config_parses_fills_defaults_and_derives_the_world) {
           "the sampled requests' schedule scale defaults to the measured 0.93");
   require(dgpp::serve::parse_cluster_config(R"({"model":"m","nodes":["h"]})", "t").engine.mtp_draft == "auto",
           "the sampled requests' draft rule defaults to the family's");
+  require(!dgpp::serve::parse_cluster_config(R"({"model":"m","nodes":["h"]})", "t").engine.lookup_draft,
+          "context-lookup drafting is off by default");
+  {
+    const dgpp::serve::ClusterConfig l = dgpp::serve::parse_cluster_config(
+        R"({"model":"m","nodes":["h"],"engine":{"lookup_draft":true,"lookup_nmin":3,"lookup_nstrong":5,"lookup_agree":1,"lookup_tail":2}})",
+        "t");
+    require(l.engine.lookup_draft && l.engine.lookup_nmin == 3 && l.engine.lookup_nstrong == 5 &&
+                l.engine.lookup_agree == 1 && l.engine.lookup_tail == 2,
+            "the lookup thresholds parse");
+    require(!dgpp::serve::parse_cluster_config(R"({"model":"m","nodes":["h"]})", "t").engine.lookup_tail,
+            "the lookup tail defaults to the MTP block alone");
+  }
   // The idle engine's arrival gather: 3 ms by default, 0 disables, bounded.
   require(c.engine.admission_gather_ms == 3, "the arrival gather defaults to 3 ms");
   require(dgpp::serve::parse_cluster_config(R"({"model":"m","nodes":["h"],"engine":{"admission_gather_ms":0}})", "t")

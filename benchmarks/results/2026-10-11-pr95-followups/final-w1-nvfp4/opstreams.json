@@ -1,0 +1,7 @@
+{
+  "hashes": {
+    "serve_rank0.ops": "4a00e80990a5575e83683054e28bb3a8"
+  },
+  "expected_ranks": 1,
+  "match": true
+}

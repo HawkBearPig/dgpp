@@ -1,0 +1,129 @@
+{
+  "fp8a": {
+    "summary": {
+      "model": "Qwen3.8-27B",
+      "settings": {
+        "max_tokens": 4096,
+        "reasoning_effort": "low",
+        "no_think": true,
+        "limit": 100,
+        "seed": 20261010
+      },
+      "tasks": {
+        "gsm8k": {
+          "n": 100,
+          "passed": 96,
+          "rate": 0.96,
+          "seconds": 173,
+          "mean_completion_tokens": 432,
+          "truncated": 1
+        },
+        "extract": {
+          "n": 100,
+          "passed": 100,
+          "rate": 1.0,
+          "seconds": 33,
+          "mean_completion_tokens": 63,
+          "truncated": 0
+        }
+      }
+    },
+    "failures": [
+      {
+        "id": "gsm8k-12",
+        "gold": 13.0,
+        "got": 12.0,
+        "finish": "length",
+        "completion_tokens": 4096
+      },
+      {
+        "id": "gsm8k-45",
+        "gold": 104.0,
+        "got": 44.0,
+        "finish": "stop",
+        "completion_tokens": 2097
+      },
+      {
+        "id": "gsm8k-85",
+        "gold": 44.0,
+        "got": 48.0,
+        "finish": "stop",
+        "completion_tokens": 375
+      },
+      {
+        "id": "gsm8k-93",
+        "gold": 36.0,
+        "got": 36.36,
+        "finish": "stop",
+        "completion_tokens": 960
+      }
+    ]
+  },
+  "nvfp4": {
+    "summary": {
+      "model": "Qwen3.8-27B-NVFP4",
+      "settings": {
+        "max_tokens": 4096,
+        "reasoning_effort": "low",
+        "no_think": true,
+        "limit": 100,
+        "seed": 20261010
+      },
+      "tasks": {
+        "gsm8k": {
+          "n": 100,
+          "passed": 95,
+          "rate": 0.95,
+          "seconds": 148,
+          "mean_completion_tokens": 412,
+          "truncated": 0
+        },
+        "extract": {
+          "n": 100,
+          "passed": 100,
+          "rate": 1.0,
+          "seconds": 31,
+          "mean_completion_tokens": 63,
+          "truncated": 0
+        }
+      }
+    },
+    "failures": [
+      {
+        "id": "gsm8k-12",
+        "gold": 13.0,
+        "got": 12.0,
+        "finish": "stop",
+        "completion_tokens": 1396
+      },
+      {
+        "id": "gsm8k-45",
+        "gold": 104.0,
+        "got": 44.0,
+        "finish": "stop",
+        "completion_tokens": 1990
+      },
+      {
+        "id": "gsm8k-62",
+        "gold": 25000.0,
+        "got": 62500.0,
+        "finish": "stop",
+        "completion_tokens": 2528
+      },
+      {
+        "id": "gsm8k-85",
+        "gold": 44.0,
+        "got": 48.0,
+        "finish": "stop",
+        "completion_tokens": 374
+      },
+      {
+        "id": "gsm8k-93",
+        "gold": 36.0,
+        "got": 36.36,
+        "finish": "stop",
+        "completion_tokens": 597
+      }
+    ]
+  }
+}

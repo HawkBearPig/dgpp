@@ -1,0 +1,15 @@
+{
+  "command": [
+    "python3",
+    "scripts/serve_greedy_transcript.py",
+    "127.0.0.1",
+    "18081",
+    "--max-tokens",
+    "128",
+    "--out",
+    "/home/stephen/dgpp/pr95-followups-20261011/final-w4-nvfp4/transcripts.json"
+  ],
+  "started": "2026-10-11T03:16:16.248113+00:00",
+  "returncode": 0,
+  "finished": "2026-10-11T03:16:22.959638+00:00"
+}

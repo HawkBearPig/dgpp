@@ -90,6 +90,19 @@ void gemm_dense(const QwenGemmWorkspace& g, const uint16_t* act, int64_t act_str
   if (w8.payload) {
     if (w8.rows != n || w8.cols != k)
       throw std::invalid_argument("qwen dense fp8: the matrix's shape disagrees with the product");
+    // The resident scale grid as the kernels' log2 block sizes. The 128x128
+    // checkpoint grid keeps every branch below exactly as it was; a CHANNEL
+    // grid (scale_block_rows = 1, the Qwen3.8-27B-NVFP4 release's attention
+    // half) takes the grid launcher's GEMV lowering below at decode rows
+    // and the dequant bridge (which reads the grid) above them.
+    int rs = 7, cs = 7;
+    if (!quant_scale_shifts(w8, rs, cs))
+      throw std::invalid_argument("qwen dense fp8: the matrix's scale grid is not a "
+                                  "power-of-two block size");
+    const bool block128 = w8.scale_block_rows == 128 && w8.scale_block_cols == 128;
+    const bool channel = !block128 && w8.scale_block_rows == 1;
+    if (!block128 && !channel)
+      throw std::invalid_argument("qwen dense fp8: unsupported scale grid");
     // Prefill-shaped (above the scale GEMM's GEMV lowering): through the
     // BF16 interface on the dequantized matrix when the bridge holds it.
     const size_t bf16_bytes = static_cast<size_t>(n) * static_cast<size_t>(k) * 2;
@@ -101,9 +114,9 @@ void gemm_dense(const QwenGemmWorkspace& g, const uint16_t* act, int64_t act_str
     // (3 bytes a value at line rate) costs 494 / n of the GEMM's time
     // (the [320 x 10240] GR down: +60 % measured), while the fp8 GEMM
     // itself runs at cuBLAS's rate and saves the dequant alone.
-    if (m > 128 && n >= 1024 && g.a8 && QwenLayerStream::prefill_fp8_gemm() && k % 128 == 0 && w8.scale_block_cols == 128 &&
-        static_cast<size_t>(m) * static_cast<size_t>(k) <= g.a8_bytes && act_stride % 4 == 0 &&
-        (reinterpret_cast<uintptr_t>(act) % 8) == 0) {
+    if (m > 128 && n >= 1024 && g.a8 && QwenLayerStream::prefill_fp8_gemm() && k % 128 == 0 &&
+        block128 && static_cast<size_t>(m) * static_cast<size_t>(k) <= g.a8_bytes &&
+        act_stride % 4 == 0 && (reinterpret_cast<uintptr_t>(act) % 8) == 0) {
       launch_fp8_quantize_rows(act, static_cast<size_t>(act_stride), m, k, g.a8, g.a8_scales, stream);
       if (out_type == GemmOut::F32)
         launch_fp8_gemm_f32(g.a8, g.a8_scales, w8.payload, w8.scales, w8.scale_block_rows, static_cast<float*>(out),
@@ -113,21 +126,45 @@ void gemm_dense(const QwenGemmWorkspace& g, const uint16_t* act, int64_t act_str
                              static_cast<uint16_t*>(out), m, n, k, stream, static_cast<size_t>(n));
       return;
     }
-    if (m > 128 && g.dequant && bf16_bytes <= g.dequant_bytes) {
-      launch_fp8_dequant_blocks(w8.payload, w8.scales, g.dequant, n, k, stream);
+    // The channel half's rows the fp8 GEMV can stage (its own shape check,
+    // exposed: the grid launcher below re-applies it and throws on a channel
+    // matrix that fails it with the bridge unavailable).
+    const bool gemv_staged = fp8_gemv_can_stage(w8.payload, k);
+    if ((m > 128 || (channel && !gemv_staged)) && g.dequant &&
+        bf16_bytes <= g.dequant_bytes) {
+      // Bridge above the GEMV ceiling (as the block grid always has), and
+      // for a channel matrix whose rows the GEMV cannot stage.
+      launch_fp8_dequant_blocks(w8.payload, w8.scales, g.dequant, n, k, stream, rs, cs);
       gemm_bf16(g, act, act_stride, g.dequant, out, out_type, m, n, k, stream);
       return;
     }
     // The GEMM workspace rides along for the streaming form's split-K at a
     // small n (the hyperconnection down projection, [320 x 10240]).
+    if (block128) {
+      if (out_type == GemmOut::F32)
+        launch_scale_gemm_f32(act, static_cast<size_t>(act_stride), w8.payload, w8.scales,
+                              static_cast<float*>(out), m, n, k, stream, static_cast<size_t>(n),
+                              g.mma_from_rows, /*last_row_only=*/false, g.ws, g.ws_bytes);
+      else
+        launch_scale_gemm_bf16(act, static_cast<size_t>(act_stride), w8.payload, w8.scales,
+                               static_cast<uint16_t*>(out), m, n, k, stream, static_cast<size_t>(n),
+                               g.mma_from_rows, g.ws, g.ws_bytes);
+      return;
+    }
+    // The channel grid: the weights-once streaming MMA at decode rows
+    // (its per-row chain is m-invariant, so decode batches stay bitwise;
+    // the fp8w / dense-MMA large-m forms know the 128 grid only — above
+    // the ceiling this product took the bridge above).
     if (out_type == GemmOut::F32)
-      launch_scale_gemm_f32(act, static_cast<size_t>(act_stride), w8.payload, w8.scales,
-                            static_cast<float*>(out), m, n, k, stream, static_cast<size_t>(n), g.mma_from_rows,
-                            /*last_row_only=*/false, g.ws, g.ws_bytes);
+      launch_scale_gemm_grid_f32(act, static_cast<size_t>(act_stride), w8.payload, w8.scales,
+                                 static_cast<float*>(out), m, n, k, stream,
+                                 static_cast<size_t>(n), rs, cs, /*decode_mma=*/true, g.ws,
+                                 g.ws_bytes);
     else
-      launch_scale_gemm_bf16(act, static_cast<size_t>(act_stride), w8.payload, w8.scales,
-                             static_cast<uint16_t*>(out), m, n, k, stream, static_cast<size_t>(n), g.mma_from_rows,
-                             g.ws, g.ws_bytes);
+      launch_scale_gemm_grid_bf16(act, static_cast<size_t>(act_stride), w8.payload, w8.scales,
+                                  static_cast<uint16_t*>(out), m, n, k, stream,
+                                  static_cast<size_t>(n), rs, cs, /*decode_mma=*/true, g.ws,
+                                  g.ws_bytes);
     return;
   }
   if (!w) throw std::invalid_argument("qwen dense: null weight");

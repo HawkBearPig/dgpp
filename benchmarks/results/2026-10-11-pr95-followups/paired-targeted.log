@@ -1,0 +1,45 @@
+Internal ctest changing into directory: /home/stephen/workspace/dgpp/build-pr95
+Test project /home/stephen/workspace/dgpp/build-pr95
+      Start 107: qwen35_mixed_fixture
+ 1/18 Test #107: qwen35_mixed_fixture .........................   Passed    0.10 sec
+      Start 108: qwen35_mixed_smoke
+ 2/18 Test #108: qwen35_mixed_smoke ...........................   Passed    1.64 sec
+      Start 109: qwen35_mixed_resident_mtp
+ 3/18 Test #109: qwen35_mixed_resident_mtp ....................   Passed    1.68 sec
+      Start 110: qwen35_mixed_rows_invariance
+ 4/18 Test #110: qwen35_mixed_rows_invariance .................   Passed    1.58 sec
+      Start 111: qwen35_mixed_generate
+ 5/18 Test #111: qwen35_mixed_generate ........................   Passed    0.31 sec
+      Start 112: qwen35_mixed_e2e
+ 6/18 Test #112: qwen35_mixed_e2e .............................   Passed    2.01 sec
+      Start 113: qwen35_mixed_generate_teacher
+ 7/18 Test #113: qwen35_mixed_generate_teacher ................   Passed    0.35 sec
+      Start 114: qwen35_mixed_test
+ 8/18 Test #114: qwen35_mixed_test ............................   Passed    1.94 sec
+      Start 115: qwen35_mixed_prefill_generate
+ 9/18 Test #115: qwen35_mixed_prefill_generate ................   Passed    1.93 sec
+      Start 116: qwen35_mixed_prefill_e2e
+10/18 Test #116: qwen35_mixed_prefill_e2e .....................   Passed    1.78 sec
+      Start 117: qwen35_mixed_prefill_generate_teacher
+11/18 Test #117: qwen35_mixed_prefill_generate_teacher ........   Passed    1.83 sec
+      Start 118: qwen35_mixed_prefill_test
+12/18 Test #118: qwen35_mixed_prefill_test ....................   Passed    1.78 sec
+      Start 119: qwen35_mixed_long_prefill_generate
+13/18 Test #119: qwen35_mixed_long_prefill_generate ...........   Passed    8.78 sec
+      Start 120: qwen35_mixed_long_prefill_e2e
+14/18 Test #120: qwen35_mixed_long_prefill_e2e ................   Passed    1.89 sec
+      Start 121: qwen35_mixed_long_prefill_generate_teacher
+15/18 Test #121: qwen35_mixed_long_prefill_generate_teacher ...   Passed    8.67 sec
+      Start 122: qwen35_mixed_long_prefill_test
+16/18 Test #122: qwen35_mixed_long_prefill_test ...............   Passed    1.85 sec
+      Start 123: qwen35_tp_test
+17/18 Test #123: qwen35_tp_test ...............................   Passed   11.86 sec
+      Start 202: fp4w_gemm_test
+18/18 Test #202: fp4w_gemm_test ...............................   Passed    9.91 sec
+
+100% tests passed, 0 tests failed out of 18
+
+Label Time Summary:
+gpu    =  59.89 sec*proc (18 tests)
+
+Total Test time (real) =  59.90 sec

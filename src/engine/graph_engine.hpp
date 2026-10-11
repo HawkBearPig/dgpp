@@ -29,6 +29,7 @@
 #include "engine/eager_engine.hpp"
 #include "engine/graph_check.hpp"
 #include "engine/image_prefill.hpp"
+#include "engine/lookup_draft.hpp"
 #include "engine/prefix_arena.hpp"
 #include "engine/speculative.hpp"
 #include "engine/step_timing.hpp"
@@ -254,7 +255,7 @@ class GraphEngineAdapter final : public sched::SchedulerEngine {
                      uint16_t* sample_gather_scratch = nullptr,
                      int sampling_candidates_cap = kSamplingCandidates,
                      const text::GrammarVocab* grammar_vocab = nullptr, int prefix_slots = 0,
-                     int mtp_depth = 1, bool compact_batches = false)
+                     int mtp_depth = 1, bool compact_batches = false, int lookup_tail = 0)
       : compact_batches_(compact_batches),
         model_(model),
         bus_(bus),
@@ -273,10 +274,27 @@ class GraphEngineAdapter final : public sched::SchedulerEngine {
     static_assert(kPickMaxRequests <= sched::SchedulerEngine::DecodeBatchStats::kMaxSlots);
     slots_ = model_->max_session_requests();
     // The verify's rows: the pending token plus `mtp_depth` drafts
-    // (2026-09-06; depth 1 is the two-row step as built).
+    // (2026-09-06; depth 1 is the two-row step as built), plus the
+    // context-lookup tail (engine.lookup_tail): extra verify rows past the
+    // MTP block (a pinned serving mode — fewer batch slots for a longer
+    // block while copying). The device chain spans the full width as
+    // deeper MTP drafts; a strong lookup match fuses over it instead. Capped
+    // by the device picker's kSlots (one slot per draft).
     if (mtp_depth < 1 || 1 + mtp_depth > kSpecRows)
       throw std::invalid_argument("graph engine: mtp depth must be in [1, " +
                                   std::to_string(kSpecRows - 1) + "]");
+    if (lookup_tail < 0 || 1 + mtp_depth + lookup_tail > kSpecRows)
+      throw std::invalid_argument("graph engine: lookup tail must satisfy 1 + mtp_depth + tail <= " +
+                                  std::to_string(kSpecRows));
+    // The device picker arms one slot per chain row (slot 0 = the main verdict,
+    // 1..depth_ = each draft); DevicePicker::kSlots caps the chain at kSlots-1.
+    // The tail positions ride the host feed (lookup history), so only mtp_depth
+    // device picks are needed when lookup is on — but the capture loop still
+    // arms one slot per draft. Cap the total to keep both paths safe.
+    if (!block_ && model_->mtp_enabled() &&
+        1 + mtp_depth + lookup_tail > DevicePicker::kSlots)
+      throw std::invalid_argument("graph engine: the verify block (1 + mtp_depth + lookup_tail) must fit the " +
+                                  std::to_string(DevicePicker::kSlots) + "-slot device picker");
     // The DFlash2 block drafter (2026-10-04): every step verifies the
     // pending token plus the block's drafts, one recorded block forward
     // proposing them all (no draft picks); mtp_depth does not apply.
@@ -289,8 +307,13 @@ class GraphEngineAdapter final : public sched::SchedulerEngine {
       throw std::invalid_argument("graph engine: the block drafter replaces the MTP draft");
     if (block_ && (block_drafts < 1 || 1 + block_drafts > kSpecRows))
       throw std::invalid_argument("graph engine: the drafter's block exceeds the verify rows");
-    rows_per_request_ = block_ ? 1 + block_drafts : (model_->mtp_enabled() ? 1 + mtp_depth : 1);
-    depth_ = rows_per_request_ - 1;
+    if (block_ && lookup_tail > 0)
+      throw std::invalid_argument("graph engine: the lookup tail needs the MTP block, not the block drafter");
+    tail_ = (!block_ && model_->mtp_enabled()) ? lookup_tail : 0;
+    if (lookup_tail > 0 && tail_ == 0)
+      throw std::invalid_argument("graph engine: the lookup tail needs MTP speculation");
+    rows_per_request_ = block_ ? 1 + block_drafts : (model_->mtp_enabled() ? 1 + mtp_depth + tail_ : 1);
+    depth_ = rows_per_request_ - 1;  // every verify draft: the MTP block, then the lookup tail
     if constexpr (requires { model_->block_candidates(); }) {
       if (block_) block_cands_ = model_->block_candidates();
     }
@@ -468,6 +491,7 @@ class GraphEngineAdapter final : public sched::SchedulerEngine {
     drafts_.assign(static_cast<size_t>(slots_),
                    std::vector<int32_t>(static_cast<size_t>(depth_), -1));
     fed_drafts_ = drafts_;
+    fed_frozen_.assign(static_cast<size_t>(slots_), 0);
     hop_slot_.assign(static_cast<size_t>(slots_), -1);
     hop_position_.assign(static_cast<size_t>(slots_), 0);
     live_.assign(static_cast<size_t>(slots_), false);
@@ -634,6 +658,9 @@ class GraphEngineAdapter final : public sched::SchedulerEngine {
       a.attempts[p] = mtp_attempts_[static_cast<size_t>(p)];
       a.accepts[p] = mtp_accepts_[static_cast<size_t>(p)];
     }
+    a.lookup_fused = lookup_fused_steps_;
+    a.lookup_agree_fused = lookup_agree_fused_steps_;
+    a.lookup_sampled_fused = lookup_sampled_fused_steps_;
     return a;
   }
   MtpAcceptance mtp_acceptance(int req) const override {
@@ -702,6 +729,30 @@ class GraphEngineAdapter final : public sched::SchedulerEngine {
     draft_sampled_ = d_proposals_ != nullptr && !block_ && proposal_drafts_enabled();
     arm_block_proposals();
   }
+  // engine.lookup_draft (context-lookup drafting): fuse a
+  // prompt-history match into the MTP drafts. A strong
+  // match (match_len >= nstrong) is taken on its own; a weak one only
+  // when its first `agree` tokens equal the device's own picks (see
+  // maybe_fuse_lookup). Same verify rows — throughput only, never the
+  // output on greedy slots. Sampled slots retain their MTP proposals:
+  // choosing a lookup based on agreement changes the proposal distribution.
+  // A firing step reseeds the
+  // slot's persistent feed (stream-ordered, no drain); silent steps cost
+  // a host scan. May be set any time before serving (drains first).
+  void set_lookup_drafts(bool on, int nmin = 6, int nstrong = 8, int agree = 2) {
+    drain();
+    if (nmin < 1 || nstrong < nmin || agree < 0)
+      throw std::invalid_argument("graph engine: lookup thresholds must satisfy 1 <= nmin <= nstrong");
+    lookup_on_ = on;
+    lookup_nmin_ = nmin;
+    lookup_nstrong_ = nstrong;
+    lookup_agree_ = agree;
+    lookup_hist_.assign(static_cast<size_t>(slots_), {});
+    lookup_fused_steps_ = 0;
+    lookup_agree_fused_steps_ = 0;
+    lookup_sampled_fused_steps_ = 0;
+  }
+  uint64_t lookup_fused_steps() const { return lookup_fused_steps_; }
   // The block drafter's sampled proposals: the model's recorded walk reads
   // the slots' specs and writes the drawn-from sets to the proposal rows
   // the next verify tests against (the ratio rule); off, the walk is the
@@ -812,6 +863,10 @@ class GraphEngineAdapter final : public sched::SchedulerEngine {
       depth_options_.clear();
       return;
     }
+    if (tail_ > 0)
+      throw std::invalid_argument(
+          "graph engine: the scheduled verify depth needs the MTP block alone (confidence covers no lookup tail); "
+          "run the tail pinned or the schedule without it");
     {
       if (!spec_enabled() || depth_ < 1)
         throw std::invalid_argument(
@@ -1544,6 +1599,8 @@ class GraphEngineAdapter final : public sched::SchedulerEngine {
     model_->session_close(req);
     pending_[static_cast<size_t>(req)] = -1;
     drafts_[static_cast<size_t>(req)].assign(static_cast<size_t>(depth_), -1);
+    if (!lookup_hist_.empty()) lookup_hist_[static_cast<size_t>(req)].clear();
+    if (!fed_frozen_.empty()) fed_frozen_[static_cast<size_t>(req)] = 0;
     live_[static_cast<size_t>(req)] = false;
     reserved_[static_cast<size_t>(req)] = false;
   }
@@ -1620,6 +1677,15 @@ class GraphEngineAdapter final : public sched::SchedulerEngine {
         drafts[0] = picker_->run(model_->stream(), first_draft).next;
         chain_drafts_eagerly(req);
         refresh_confidence_eagerly(req);
+        if (lookup_on_ && !block_) {
+          // The mirror starts at the full prompt (prefix hits attach a
+          // suffix, but `prompt` here is the whole request); the first
+          // pick is not in it yet, so it rides along explicitly.
+          lookup_hist_[static_cast<size_t>(req)].assign(prompt.begin(), prompt.end());
+          DGPP_LOG_INFO("rank {}: lookup slot {} mirror assigned ({} prompt tokens)", rank_, req,
+                        prompt.size());
+          maybe_fuse_lookup(req, {first});
+        }
       }
       reserved_[static_cast<size_t>(req)] = false;
       live_[static_cast<size_t>(req)] = true;
@@ -1739,8 +1805,13 @@ class GraphEngineAdapter final : public sched::SchedulerEngine {
     settle_older();
     // A fallback drains the whole batch and publishes its new drafts.
     // Preserve every slot's verified drafts before collecting any verdict.
+    // A lookup-fused slot keeps the fused rows its seed published instead:
+    // the mirror holds the device's own picks by now, one step stale.
     for (const int req : reqs) {
-      fed_drafts_[static_cast<size_t>(req)] = drafts_[static_cast<size_t>(req)];
+      if (fed_frozen_[static_cast<size_t>(req)])
+        fed_frozen_[static_cast<size_t>(req)] = 0;
+      else
+        fed_drafts_[static_cast<size_t>(req)] = drafts_[static_cast<size_t>(req)];
       if (block_cands_ > 0) fed_cands_[static_cast<size_t>(req)] = drafts_cands_[static_cast<size_t>(req)];
     }
     if (rows < rows_per_request_ || compact_batches())
@@ -1788,6 +1859,8 @@ class GraphEngineAdapter final : public sched::SchedulerEngine {
     reserved_[static_cast<size_t>(req)] = false;
     pending_[static_cast<size_t>(req)] = -1;
     drafts_[static_cast<size_t>(req)].assign(static_cast<size_t>(depth_), -1);
+    if (!lookup_hist_.empty()) lookup_hist_[static_cast<size_t>(req)].clear();
+    if (!fed_frozen_.empty()) fed_frozen_[static_cast<size_t>(req)] = 0;
     hop_slot_[static_cast<size_t>(req)] = -1;
     if (schedule_) conf_stale_[static_cast<size_t>(req)] = true;
     // A reopened slot is greedy until the scheduler arms it again — on the
@@ -2828,6 +2901,53 @@ class GraphEngineAdapter final : public sched::SchedulerEngine {
     DGPP_CUDA_OK(cudaStreamSynchronize(model_->stream()));
   }
 
+  // Fuse a context-lookup match into drafts_[req] on greedy MTP slots.
+  // The mirror already ends at the
+  // pending token: collect_verdict's `decided` is the accepted row winners
+  // in order, whose last entry is the new pending (verify.next reads the
+  // same row), so the matched suffix ends at the pending with no extra
+  // append. `extra` completes the mirror only where the tail has not just
+  // appended it — the prefill path passes the first pick. A strong match
+  // (match_len >= nstrong) is taken on its own; a weak one only when its
+  // first `agree` tokens equal the device's own picks below (two sources
+  // agreeing — hidden state + text — is the cheap confidence signal that
+  // stops a coincidental short match from costing acceptance on prose).
+  // The device-pick base is fresh here: settle_older runs before every
+  // collect, so drafts_ holds the tail picks of the replay just decided.
+  // Silent steps cost one host scan. A firing step reseeds the slot's
+  // persistent feed so the next replay (scalar or batch) verifies the
+  // fused rows, and fed_drafts_ follows so the next collect's mirror sees
+  // what was actually fed. No drain: the seed rides the model stream
+  // behind the in-flight tail (stream-ordered, synced inside the seed),
+  // and the pipeline's settle cadence is unchanged. Point masses only —
+  // the commit rule never sees the draft source.
+  void maybe_fuse_lookup(int req, const std::vector<int32_t>& extra = {}) {
+    if (!lookup_on_ || block_ || !model_->mtp_enabled() || sampled_slot(req)) return;
+    if (grammar_[static_cast<size_t>(req)] && grammar_[static_cast<size_t>(req)]->active())
+      return;  // v1: staged grammar masks follow the mirror's picks, not fused rows
+    if (depth_ < 1 || pending_[static_cast<size_t>(req)] < 0) return;
+    std::vector<int64_t> hist;
+    const std::vector<int64_t>& base = lookup_hist_[static_cast<size_t>(req)];
+    hist.reserve(base.size() + extra.size());
+    hist.insert(hist.end(), base.begin(), base.end());
+    for (int32_t t : extra) hist.push_back(t);
+    const LookupDraft lu = lookup_propose(hist.data(), static_cast<int64_t>(hist.size()),
+                                          depth_, lookup_nmin_, 64, lookup_nstrong_);
+    if (lu.drafts.empty()) return;
+    std::vector<int32_t>& drafts = drafts_[static_cast<size_t>(req)];
+    const std::vector<int32_t> fused =
+        lookup_fuse(drafts, lu, lookup_nstrong_, lookup_agree_).drafts;
+    if (fused == drafts) return;  // declined: neither strong nor agreeing
+    DGPP_LOG_DEBUG("rank {}: lookup slot {} fires (match {} at {}, {} drafts{})", rank_, req, lu.match_len,
+                   lu.match_end, lu.drafts.size(), lu.strong ? "" : " on agree");
+    drafts = fused;
+    fed_drafts_[static_cast<size_t>(req)] = drafts;
+    fed_frozen_[static_cast<size_t>(req)] = 1;
+    model_->session_graph_seed_feed(req, feed_of(req));
+    ++lookup_fused_steps_;
+    if (!lu.strong) ++lookup_agree_fused_steps_;
+  }
+
   // `rows`: the verify's rows this replay decided (rows_per_request_, or a
   // scheduled scalar replay's 1 + verified drafts).
   std::vector<int32_t> collect_verdict(int req, int verdict_request,
@@ -3008,6 +3128,15 @@ class GraphEngineAdapter final : public sched::SchedulerEngine {
       }
     }
     pending_[static_cast<size_t>(req)] = next;
+    if (lookup_on_ && !block_) {
+      // The mirror follows the decided transcript, whose last entry is the
+      // new pending (verify.next reads the same row) — fused against it in
+      // place, no extra append. Every slot's mirror stays complete so the
+      // gate cannot desync ranks; only greedy MTP slots fuse (see helper).
+      std::vector<int64_t>& lh = lookup_hist_[static_cast<size_t>(req)];
+      for (int32_t t : decided) lh.push_back(t);
+      if (rows > 1) maybe_fuse_lookup(req);
+    }
     if (std::unique_ptr<text::GrammarState>& grammar =
             grammar_[static_cast<size_t>(req)]) {
       // The committed tokens advance the grammar in transcript order; the
@@ -3267,7 +3396,12 @@ class GraphEngineAdapter final : public sched::SchedulerEngine {
     r.rows = rows;
     launch(std::move(r));
     settle_older();
-    fed_drafts_[static_cast<size_t>(req)] = drafts_[static_cast<size_t>(req)];
+    // A lookup-fused slot keeps the fused rows its seed published instead
+    // (same staleness note as the batch path above).
+    if (fed_frozen_[static_cast<size_t>(req)])
+      fed_frozen_[static_cast<size_t>(req)] = 0;
+    else
+      fed_drafts_[static_cast<size_t>(req)] = drafts_[static_cast<size_t>(req)];
     if (block_cands_ > 0) fed_cands_[static_cast<size_t>(req)] = drafts_cands_[static_cast<size_t>(req)];
     stage_masks(req);
     publish_stage(req);
@@ -3554,6 +3688,20 @@ class GraphEngineAdapter final : public sched::SchedulerEngine {
   // Per-position draft acceptance: engine-wide and per slot.
   std::array<uint64_t, 8> mtp_attempts_{}, mtp_accepts_{};
   std::vector<std::array<uint64_t, 8>> slot_mtp_attempts_, slot_mtp_accepts_;
+  // Context-lookup drafting (engine.lookup_draft): per-slot token history
+  // (the prefill prompt + every decided token, whose last entry is the new
+  // pending). Sized on set_lookup_drafts; empty unless on.
+  bool lookup_on_ = false;
+  int lookup_nmin_ = 6, lookup_nstrong_ = 8, lookup_agree_ = 2;
+  std::vector<std::vector<int64_t>> lookup_hist_;
+  uint64_t lookup_fused_steps_ = 0;
+  uint64_t lookup_agree_fused_steps_ = 0;  // the fused steps taken below nstrong, on agreement
+  uint64_t lookup_sampled_fused_steps_ =
+      0;  // reserved for sampled lookup support; currently always zero
+  // A fused slot's fed_drafts_ holds its seeded rows until the next
+  // snapshot point, which consumes (clears) the flag instead of copying
+  // the mirror's one-step-stale picks over them.
+  std::vector<char> fed_frozen_;
   std::vector<int> hop_slot_;          // per slot: the armed hop's arena slot, -1 none
   std::vector<int64_t> hop_position_;  // per slot: the armed hop's position
   int batch_min_live_ = 1;
@@ -3626,6 +3774,9 @@ class GraphEngineAdapter final : public sched::SchedulerEngine {
   // before this replay can publish new drafts (including another slot's fallback).
   std::vector<std::vector<int32_t>> fed_drafts_;
   int depth_ = 0;
+  int tail_ = 0;       // engine.lookup_tail: extra verify rows past the MTP block. The device chain
+                       // spans them like any drafts (deeper MTP); a strong lookup match fuses over the
+                       // whole width instead. A pinned mode: fewer batch slots for a longer block.
   // ---- the confidence-scheduled verify depth (configure_verify_schedule) ----
   bool schedule_ = false;
   float sched_row_ms_ = 0.f;

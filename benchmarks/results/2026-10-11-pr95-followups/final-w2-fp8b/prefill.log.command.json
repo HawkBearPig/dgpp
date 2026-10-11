@@ -1,0 +1,22 @@
+{
+  "command": [
+    "python3",
+    "scripts/serve_prefill_probe.py",
+    "127.0.0.1",
+    "18081",
+    "512",
+    "2048",
+    "8192",
+    "32768",
+    "--repeat",
+    "3",
+    "--no-think",
+    "--tag",
+    "pr95-matched",
+    "--json-out",
+    "/home/stephen/dgpp/pr95-followups-20261011/final-w2-fp8b/prefill.json"
+  ],
+  "started": "2026-10-11T02:56:38.645533+00:00",
+  "returncode": 0,
+  "finished": "2026-10-11T02:58:16.011919+00:00"
+}

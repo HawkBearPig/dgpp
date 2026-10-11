@@ -66,6 +66,51 @@ DGPP_TEST(qwen35_config_accepts_nvfp4_mixed) {
       parse(qwen35_fixture::text_json(), qwen35_fixture::kQuantNvfp4Mixed);
   require(c.quant_kind == dgpp::Qwen35QuantKind::Nvfp4Mixed, "quant kind");
   require(c.hidden_size == 5120, "hidden");
+  // Group resolution: the ignore list, then the first group whose targets
+  // match (group_0's late-MLP regex wins over group_1's blanket one).
+  using Q = dgpp::Qwen35TensorQuant;
+  require(c.tensor_quant("model.language_model.layers.0.self_attn.q_proj") == Q::Fp8Channel,
+          "attn fp8");
+  require(c.tensor_quant("model.language_model.layers.2.linear_attn.in_proj_qkv") == Q::Fp8Channel,
+          "gdn fp8");
+  require(c.tensor_quant("model.language_model.layers.0.mlp.gate_proj") == Q::Nvfp4, "early mlp fp4");
+  require(c.tensor_quant("model.language_model.layers.56.mlp.down_proj") == Q::Fp8Channel,
+          "late mlp fp8");
+  require(c.tensor_quant("mtp.layers.0.mlp.up_proj") == Q::Bf16, "draft bf16");
+  require(c.tensor_quant("mtp.layers.0.self_attn.o_proj") == Q::Bf16, "draft attn bf16");
+  require(c.tensor_quant("lm_head") == Q::Fp8Channel, "head fp8");
+  require(c.tensor_quant("model.language_model.embed_tokens") == Q::Bf16, "embed bf16");
+}
+
+DGPP_TEST(qwen35_config_plain_targets_are_exact) {
+  // A plain (non-"re:") target is a literal module name: an anchored exact
+  // match, its dots matching themselves. A glob target cannot be read as a
+  // literal and is refused, never left to silently claim nothing.
+  using Q = dgpp::Qwen35TensorQuant;
+  const std::string quant = R"({"quant_method": "compressed-tensors", "format": "mixed-precision",
+      "config_groups": {
+        "group_0": {"format": "float-quantized",
+                    "targets": ["model.language_model.layers.0.self_attn.q_proj", "re:.*lm_head"],
+                    "weights": {"num_bits": 8, "type": "float", "strategy": "channel"}},
+        "group_1": {"format": "nvfp4-pack-quantized",
+                    "targets": ["re:.*mlp\\.(gate|up|down)_proj$"],
+                    "weights": {"num_bits": 4, "type": "float", "group_size": 16}}},
+      "ignore": ["re:^mtp.*"]})";
+  const auto c = parse(qwen35_fixture::text_json(), quant);
+  require(c.tensor_quant("model.language_model.layers.0.self_attn.q_proj") == Q::Fp8Channel,
+          "plain exact target");
+  require(c.tensor_quant("modelXlanguage_model.layers.0.self_attn.q_proj") == Q::Bf16,
+          "the dot matches only itself");
+  const std::string glob = R"({"quant_method": "compressed-tensors", "format": "mixed-precision",
+      "config_groups": {
+        "group_0": {"format": "float-quantized",
+                    "targets": ["model.language_model.layers.*.self_attn.q_proj"],
+                    "weights": {"num_bits": 8, "type": "float", "strategy": "channel"}},
+        "group_1": {"format": "nvfp4-pack-quantized",
+                    "targets": ["re:.*mlp\\.(gate|up|down)_proj$"],
+                    "weights": {"num_bits": 4, "type": "float", "group_size": 16}}}})";
+  require(refusal(qwen35_fixture::text_json(), glob).find("plain entries") != std::string::npos,
+          "glob target refused by name");
 }
 
 DGPP_TEST(qwen35_config_refusals_name_the_field) {

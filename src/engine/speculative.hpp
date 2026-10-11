@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "engine/decode_outputs.hpp"
+#include "engine/lookup_draft.hpp"
 #include "sample/sampler.hpp"
 #include "text/tool_grammar.hpp"
 
@@ -172,6 +173,7 @@ class GreedySpeculator {
   void start(int32_t first) {
     next_ = first;
     drafts_ = draft_after({first});
+    if (lookup_history_) fuse_lookup({}, first);
   }
   // Test interface: the block still drafts its first row (its counter must
   // move), but the proposal fed to the first verify is `forced_draft` —
@@ -195,6 +197,24 @@ class GreedySpeculator {
   }
   int last_verify_depth() const { return last_verify_depth_; }
 
+  // Optional context-lookup fusion (engine/lookup_draft.hpp, default off).
+  // history_fn supplies the request's committed token history KNOWN TO THE
+  // CALLER (prompt ids + tokens committed by previous steps' returns, NOT
+  // including anything decided inside the current step — the caller records
+  // v.committed only after step() returns). The hook completes it with the
+  // in-flight verdict (this step's committed prefix + the new pending) so
+  // the matched suffix always ends at the pending token. The lookup
+  // proposal is fused with the MTP drafts within the same depth (same rows
+  // verified, so the commit rule — and the transcript — are unchanged; only
+  // which drafts are tested moves). Exact: lookup drafts are point masses.
+  void set_lookup(std::function<std::vector<int64_t>()> history_fn, int nmin = 6,
+                  int nstrong = 8, int agree = 2) {
+    lookup_history_ = std::move(history_fn);
+    lookup_nmin_ = nmin;
+    lookup_nstrong_ = nstrong;
+    lookup_agree_ = agree;
+  }
+
   // One speculative step. Returns the tokens that became final this step
   // (1 to 1 + depth); next() is then the following token, already decided
   // but not yet consumed by the main stack.
@@ -217,6 +237,7 @@ class GreedySpeculator {
     accepted_drafts_ += v.accepted - 1;
     next_ = v.next;
     drafts_ = draft_after(v.draft_rows);
+    if (lookup_history_) fuse_lookup(v.committed, next_);
     return v.committed;
   }
 
@@ -239,12 +260,29 @@ class GreedySpeculator {
     return drafts;
   }
 
+  // Completes the caller's committed history with this step's in-flight
+  // verdict (newly committed prefix + new pending) and fuses the lookup
+  // proposal into drafts_. At start() nothing is committed yet: pass {}.
+  void fuse_lookup(const std::vector<int32_t>& committed, int32_t pending) {
+    std::vector<int64_t> hist = lookup_history_();
+    for (int32_t t : committed) hist.push_back(t);
+    hist.push_back(pending);
+    const LookupDraft lu = lookup_propose(hist.data(), static_cast<int64_t>(hist.size()),
+                                          depth_, lookup_nmin_, 64, lookup_nstrong_);
+    if (lu.drafts.empty()) return;
+    drafts_ = lookup_fuse(drafts_, lu, lookup_nstrong_, lookup_agree_).drafts;
+  }
+
   Model& model_;
   int req_ = 0;
   PickRows pick_rows_;
   int depth_ = 1;
   std::function<int(const std::vector<int32_t>&)> depth_policy_;
   int last_verify_depth_ = 0;
+  std::function<std::vector<int64_t>()> lookup_history_;
+  int lookup_nmin_ = 6;
+  int lookup_nstrong_ = 8;
+  int lookup_agree_ = 2;
   int32_t next_ = -1;
   std::vector<int32_t> drafts_;
   int steps_ = 0;

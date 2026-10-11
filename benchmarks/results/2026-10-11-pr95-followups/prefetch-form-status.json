@@ -1,0 +1,48 @@
+[
+  {
+    "label": "draft-probe-w4-prefetch-lines",
+    "command": [
+      "python3",
+      "/home/stephen/dgpp/pr95-followups-20261011/campaign.py",
+      "nvfp4",
+      "4",
+      "draft-probe-w4-prefetch-lines",
+      "--draft-probe",
+      "--prefetch-form",
+      "lines"
+    ],
+    "started": "2026-10-11T03:58:08.702852+00:00",
+    "returncode": 0,
+    "finished": "2026-10-11T03:58:58.190492+00:00",
+    "median_tps": 56.22064951385673,
+    "steps": [
+      105,
+      105,
+      105
+    ],
+    "same_transcripts": true
+  },
+  {
+    "label": "draft-probe-w4-prefetch-touch",
+    "command": [
+      "python3",
+      "/home/stephen/dgpp/pr95-followups-20261011/campaign.py",
+      "nvfp4",
+      "4",
+      "draft-probe-w4-prefetch-touch",
+      "--draft-probe",
+      "--prefetch-form",
+      "touch"
+    ],
+    "started": "2026-10-11T03:58:58.210965+00:00",
+    "returncode": 0,
+    "finished": "2026-10-11T03:59:47.829610+00:00",
+    "median_tps": 56.056276104638386,
+    "steps": [
+      105,
+      105,
+      105
+    ],
+    "same_transcripts": true
+  }
+]

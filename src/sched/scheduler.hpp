@@ -138,6 +138,12 @@ class SchedulerEngine {
     // (r+1)-th candidate, miss_rank[kMissRanks] those outside the list.
     static constexpr int kMissRanks = 16;
     uint64_t miss_rank[kMissRanks + 1] = {};
+    // Context-lookup drafting (engine.lookup_draft): steps whose drafts a
+    // prompt-history match replaced (engine-wide since construction), of
+    // which agree_fused took a below-strong match on device-pick agreement.
+    uint64_t lookup_fused = 0;
+    uint64_t lookup_agree_fused = 0;
+    uint64_t lookup_sampled_fused = 0;
   };
   // Last launched decode graph, retained while idle; counters since startup.
   struct DecodeBatchStats {

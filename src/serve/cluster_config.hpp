@@ -255,6 +255,18 @@ struct ClusterConfig {
     // rate: a sharper draft keeps the argmax's rate on sharp distributions,
     // the request's keeps the overlap on flat ones). 1: the request's.
     double mtp_draft_temperature = 1.0;
+    // Context-lookup drafting (engine/lookup_draft.hpp): fuse a strong
+    // prompt-history match into the MTP drafts on greedy slots. Same
+    // verify rows — throughput only, never the output. Off by default;
+    // every rank must agree (journal + digest carry it).
+    bool lookup_draft = false;
+    int lookup_nmin = 6;     // minimum suffix-match length to propose
+    int lookup_nstrong = 8;  // a match this long is taken on its own
+    int lookup_agree = 2;    // shorter matches need this many leading MTP agreements (v1: unused)
+    // Extra verify rows past the MTP block, filled from the prompt history
+    // (a pinned serving mode: fewer batch slots for a longer block while
+    // copying). 0: the MTP block alone.
+    int lookup_tail = 0;
     // The sampled chain's verify rule: "block" (block verification — the
     // drafts decided jointly; exact, never fewer tokens in expectation
     // than the token rule) or "token" (the token-by-token test).

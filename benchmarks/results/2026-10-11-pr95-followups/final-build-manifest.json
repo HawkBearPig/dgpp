@@ -1,0 +1,34 @@
+{
+  "date": "2026-10-11T01:42:47.912005+00:00",
+  "commit": "c9a98ac71964b37ea4701ce841fe27316a8ae50e",
+  "version": "dgpp-serve 0.1.0+gc9a98ac71964 (git c9a98ac71964, cuda 13.0)",
+  "binary_sha256": "26e470006ae96ccc4716b10f1d4ce1253caa10e1ab6d240a105c3ce1ab785ffd",
+  "base": "38d3af69485158a926eefb7eb46fbac475295df4",
+  "validation_source_files_unchanged": true,
+  "source_files": {
+    "src/kernels/fp4w_gemm.cu": "97b6c75f512d186aef2b51147d08a25060fd34d8c6ecb609f977c7f4dc2f0d14",
+    "src/models/qwen/model35.cpp": "27f64113f6d348a866ae98dbe1aee37a0c9d1ea6040b343f185a3f539b088e51",
+    "src/models/qwen/model35.hpp": "01fd7ce156101730b2855077218278b7fdf98aeb1a37b729c4aa52176412fbad",
+    "src/engine/graph_engine.hpp": "364e59fc0a1352b893231f1f39ff6a6a6fdd9e2be76ea77cd16ee83d8b2b82f8",
+    "tests/cuda/fp4w_gemm_test.cu": "9c0b7a76fde1d1760013e0dfbb18354aa92a9aeae56c317a6431ae758e7d2b27",
+    "tests/cuda/qwen35_tp_test.cpp": "101340580a4fd35d83fc80309c3b0ee7e127f3fbd6dd1a4e351f37d07bc1d55c",
+    "tests/cuda/qwen_engine_test.cpp": "f0a740058d4abe2b0aed5933891540b5152361c716b1731ef8b6f10de30a217c",
+    "CMakeLists.txt": "8e10e02807f08b2f963344269fa101a5488f7a6dff023cb4cc1cffa6009e8f82"
+  },
+  "build_command": [
+    "cmake",
+    "--build",
+    "build-pr95",
+    "-j4",
+    "--target",
+    "dgpp_serve_app"
+  ],
+  "build_note": "Full source build and validation used the same files before commits. This final rebuild changes the version stamp and relinks the server only.",
+  "cache_options": [
+    "CMAKE_BUILD_TYPE:STRING=Release",
+    "CMAKE_CUDA_COMPILER:STRING=/usr/local/cuda/bin/nvcc",
+    "CMAKE_CUDA_FLAGS_RELEASE:STRING=-O3 -DNDEBUG -Xcompiler=-g0",
+    "CMAKE_CXX_COMPILER:FILEPATH=/usr/bin/c++",
+    "CMAKE_CXX_FLAGS_RELEASE:STRING=-O3 -DNDEBUG -g0"
+  ]
+}

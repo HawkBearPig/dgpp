@@ -1,0 +1,17 @@
+{
+  "entries": 241,
+  "passing_after_retest": 235,
+  "skipped": [
+    "dsv4_tokenizer_test",
+    "dsv4_prompt_test",
+    "glm4_tokenizer_test",
+    "mimo_tokenizer_test",
+    "glm4_chat_template_test",
+    "mimo_chat_template_test"
+  ],
+  "initial_failure": [
+    "portability_test"
+  ],
+  "resolution": "The base-branch HTTP default changed to 0.0.0.0. Update the old assertion and verify an explicit localhost override. portability_test, site_env_test and bootstrap_test all passed on retest.",
+  "unresolved_failures": []
+}

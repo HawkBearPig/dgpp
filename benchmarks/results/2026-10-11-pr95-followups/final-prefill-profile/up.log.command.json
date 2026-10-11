@@ -1,0 +1,18 @@
+{
+  "command": [
+    "python3",
+    "scripts/dgpp-cluster",
+    "up",
+    "--config",
+    "/home/stephen/dgpp/pr95-followups-20261011/final-prefill-profile/deployment.json",
+    "--bin",
+    "/home/stephen/dgpp/pr95-followups-20261011/dgpp-serve-c9-final",
+    "--log-dir",
+    "/home/stephen/dgpp/pr95-followups-20261011/final-prefill-profile/world",
+    "--head-wrap",
+    "nsys profile -t cuda --cuda-graph-trace=node -o /home/stephen/dgpp/pr95-followups-20261011/final-prefill-profile/r0 --force-overwrite true"
+  ],
+  "started": "2026-10-11T04:00:27.856674+00:00",
+  "returncode": 0,
+  "finished": "2026-10-11T04:00:48.275307+00:00"
+}

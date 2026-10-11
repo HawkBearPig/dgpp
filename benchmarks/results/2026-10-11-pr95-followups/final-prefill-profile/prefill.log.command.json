@@ -1,0 +1,21 @@
+{
+  "command": [
+    "python3",
+    "scripts/serve_prefill_probe.py",
+    "127.0.0.1",
+    "18081",
+    "8192",
+    "--repeat",
+    "1",
+    "--no-think",
+    "--tag",
+    "pr95-profile",
+    "--interval",
+    "1",
+    "--json-out",
+    "/home/stephen/dgpp/pr95-followups-20261011/final-prefill-profile/prefill.json"
+  ],
+  "started": "2026-10-11T04:00:48.994458+00:00",
+  "returncode": 0,
+  "finished": "2026-10-11T04:00:58.280775+00:00"
+}

@@ -381,6 +381,11 @@ ClusterConfig parse_cluster_config(const std::string& json, const std::string& w
           if (!(e.mtp_draft_temperature > 0.0 && e.mtp_draft_temperature <= 4.0))
             fail(what, "'" + ek + "' must be in (0, 4] (the drawn drafts' temperature as a fraction of the request's)");
         }
+        else if (p.key == "lookup_draft") e.lookup_draft = boolean(x, ek, what);
+        else if (p.key == "lookup_nmin") e.lookup_nmin = static_cast<int>(integer(x, ek, what, 1, 64));
+        else if (p.key == "lookup_nstrong") e.lookup_nstrong = static_cast<int>(integer(x, ek, what, 1, 64));
+        else if (p.key == "lookup_agree") e.lookup_agree = static_cast<int>(integer(x, ek, what, 0, 16));
+        else if (p.key == "lookup_tail") e.lookup_tail = static_cast<int>(integer(x, ek, what, 0, 7));
         else if (p.key == "sampling_candidates") e.sampling_candidates = static_cast<int>(integer(x, ek, what, 1, 256));
         else if (p.key == "prefix_cache_gib") {
           e.prefix_cache_gib = number(x, ek, what);

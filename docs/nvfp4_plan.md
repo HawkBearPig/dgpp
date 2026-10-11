@@ -663,7 +663,7 @@ floor only fewer bytes or more tokens per step move the number.
   one step stays); gate and up issued together (neutral: ptxas had
   hoisted them); the decode moved to GB10's `cvt.rn.f16x2.e2m1x2` (one
   F2FP) plus one exact f16x2 multiply by the e4m3 scale (every product
-  <= 5 significant bits in [2^-10, 2688], all f16 normals — the f32 is the
+  <= 6 significant bits in [2^-10, 2688], all f16 normals — the f32 is the
   value the register decode produced), which needs the architecture-
   specific target: CMAKE_CUDA_ARCHITECTURES 121 -> 121a (the generic 121
   takes cuda_fp4.h's software path, still bitwise). The gate/up kernel

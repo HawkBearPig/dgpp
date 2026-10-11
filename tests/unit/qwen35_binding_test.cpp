@@ -108,6 +108,59 @@ DGPP_TEST(qwen35_binding_mtp_and_globals) {
   require_shape(g, "mtp.fc.weight", DType::BF16, {5120, 10240});
 }
 
+DGPP_TEST(qwen35_binding_mixed_release) {
+  // The NVFP4 mixed release's table: per-matrix forms resolved from the
+  // parsed config_groups (the release's own group/ignore rules).
+  const std::string text = qwen35_fixture::text_json();
+  const std::string quant = qwen35_fixture::kQuantNvfp4Mixed;
+  const auto t = dgpp::minijson::parse(text);
+  const auto q = dgpp::minijson::parse(quant);
+  const auto c = dgpp::Qwen35TextConfig::parse(t.root, &q.root);
+  const auto v = dgpp::qwen35_expected_text_tensors(c);
+  using dgpp::DType;
+  using R = dgpp::QwenTensorRole;
+  // Channel FP8 attention and lm_head, the late MLP layers; NVFP4 the
+  // early MLPs; BF16 the draft layer (the `^mtp.*` ignore) and the norms.
+  require_shape(v, "model.language_model.layers.0.linear_attn.in_proj_qkv.weight",
+                DType::F8_E4M3, {10240, 5120});
+  require_shape(v, "model.language_model.layers.0.linear_attn.in_proj_qkv.weight_scale",
+                DType::BF16, {10240, 1});
+  require_shape(v, "model.language_model.layers.0.mlp.gate_proj.weight_packed", DType::U8,
+                {17408, 2560});
+  require_shape(v, "model.language_model.layers.0.mlp.gate_proj.weight_scale", DType::F8_E4M3,
+                {17408, 320});
+  require_shape(v, "model.language_model.layers.0.mlp.gate_proj.weight_global_scale", DType::F32,
+                {1});
+  require_shape(v, "model.language_model.layers.0.mlp.gate_proj.input_global_scale", DType::F32,
+                {1});
+  require_shape(v, "model.language_model.layers.56.mlp.down_proj.weight", DType::F8_E4M3,
+                {5120, 17408});
+  require_shape(v, "model.language_model.layers.3.self_attn.k_scale", DType::BF16, {1});
+  require_shape(v, "mtp.layers.0.self_attn.q_proj.weight", DType::BF16, {12288, 5120});
+  require_shape(v, "mtp.layers.0.mlp.up_proj.weight", DType::BF16, {17408, 5120});
+  require_shape(v, "lm_head.weight", DType::F8_E4M3, {248320, 5120});
+  require(find(v, "model.language_model.layers.3.self_attn.q_proj.weight_scale_inv") == nullptr,
+          "no block scales in the mixed release");
+  size_t fp4 = 0, fp8 = 0, g16 = 0, insc = 0;
+  for (const auto& e : v) {
+    fp4 += e.role == R::Fp4Payload;
+    fp8 += e.role == R::Fp8Payload;
+    g16 += e.role == R::Fp4Global;
+    insc += e.role == R::InputScale;
+  }
+  require(fp4 == 56 * 3, "the early layers' MLPs are the NVFP4 ones");  // 0..55 x 3
+  require(fp8 == 48 * 3 + 16 * 4 + 8 * 3 + 1, "attn + late MLP + head channel-fp8");
+  require(g16 == fp4, "one global per fp4 matrix");
+  require(insc == fp4 + 16 * 2, "input globals + the full layers' kv scales");
+  // A complete mixed map validates (vision counted, nothing unexpected):
+  auto present = present_map(v);
+  present.emplace("model.visual.blocks.0.attn.qkv.weight",
+                  dgpp::QwenTensorDesc{DType::F8_E4M3, {1152 * 3, 3456}});
+  const auto rep = dgpp::qwen35_validate_text_binding(c, present);
+  require(rep.ok(), "complete mixed map validates");
+  require(rep.vision == 1, "vision counted");
+}
+
 DGPP_TEST(qwen35_binding_validates_a_complete_map) {
   const auto c = cfg();
   const auto expected = dgpp::qwen35_expected_text_tensors(c);

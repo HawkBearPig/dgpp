@@ -91,14 +91,50 @@ def load_np(entries, name):
 
 
 def load_fp8(entries, base):
-    """An fp8 pair on the 128 x 128 grid (BF16 weight_scale_inv) -> the
-    engine's weights: bf16(e4m3 x scale) as an exact [N, K] float64 matrix."""
+    """One quantized dense matrix -> the engine's weights as an exact
+    [N, K] float64 matrix. All four forms the qwen3_5 loader binds: the
+    block-FP8 pair (BF16 weight_scale_inv on the 128 x 128 grid), the FP8
+    release's BF16 head, and the mixed release's channel-FP8 pair (BF16
+    weight_scale [N, 1]) and NVFP4 triple (weight_packed / e4m3
+    weight_scale / F32 weight_global_scale, folded into the values here —
+    the engine folds the global once at the end of each dot, which is the
+    same float64 arithmetic)."""
+    if base + ".weight_packed" in entries:
+        return load_nvfp4(entries, base)
     p = load_np(entries, base + ".weight")
-    s = load_np(entries, base + ".weight_scale_inv")
-    n, k = p.shape
-    sc = np.repeat(np.repeat(s, 128, axis=0), 128, axis=1)[:n, :k]
-    prod = e4m3_decode(p).astype(np.float32) * sc.astype(np.float32)
+    if p.dtype == np.float64:  # a BF16 matrix (the FP8 release's head, the draft layer)
+        return p
+    if base + ".weight_scale_inv" in entries:
+        s = load_np(entries, base + ".weight_scale_inv")
+        n, k = p.shape
+        sc = np.repeat(np.repeat(s, 128, axis=0), 128, axis=1)[:n, :k]
+        prod = e4m3_decode(p).astype(np.float32) * sc.astype(np.float32)
+        return bf16(prod)
+    s = load_np(entries, base + ".weight_scale")  # BF16 [N, 1]: one scale a row
+    prod = e4m3_decode(p).astype(np.float32) * s.astype(np.float32)
     return bf16(prod)
+
+
+_E2M1 = np.array([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=np.float64)
+
+
+def load_nvfp4(entries, base):
+    """A compressed-tensors nvfp4-pack matrix: two e2m1 codes a byte (the
+    LOW nibble the even element), one e4m3 scale per 16, divided once by
+    the F32 weight global — the engine folds the same divisor at the end
+    of each dot (the kernels divide by the slot), which is the same
+    float64 arithmetic. The input global is the W4A4 activation-side
+    factor and has no subject under exact activations. Direction pinned
+    against the FP8 sibling release's per-layer RMS (2026-10-06)."""
+    packed = load_np(entries, base + ".weight_packed").astype(np.uint8)
+    n, kh = packed.shape
+    codes = np.empty((n, kh * 2), dtype=np.uint8)
+    codes[:, 0::2] = packed & 15
+    codes[:, 1::2] = packed >> 4
+    vals = _E2M1[codes & 7] * np.where(codes & 8, -1.0, 1.0)
+    s = e4m3_decode(load_np(entries, base + ".weight_scale"))
+    g = float(load_np(entries, base + ".weight_global_scale").reshape(-1)[0])
+    return (vals * np.repeat(s, 16, axis=1)) / g
 
 
 def text_config(checkpoint_dir):
@@ -331,7 +367,7 @@ def reference_forward(cfg, entries, tokens, progress=False, teacher=None):
     if teacher is not None:
         h = teacher[0][cfg["num_layers"] - 1]
     hn = rmsnorm(h, load_np(entries, "model.language_model.norm.weight"), cfg["eps"])
-    lm = load_np(entries, "lm_head.weight")
+    lm = load_fp8(entries, "lm_head")
     logits = f32(hn @ lm.T)
     return layer_states, hn, logits
 
@@ -353,7 +389,7 @@ def mtp_forward(cfg, entries, tokens, hn_main, progress=False):
     w = layer_weights(cfg, entries, cfg["num_layers"])
     h = layer_forward(x, w, cfg, R)
     hn_out = rmsnorm(h, load_np(entries, "mtp.norm.weight"), eps)
-    lm = load_np(entries, "lm_head.weight")
+    lm = load_fp8(entries, "lm_head")
     return hn_out, f32(hn_out @ lm.T)
 
 

@@ -138,6 +138,13 @@ void launch_scale_gemm_grid_f32(const uint16_t* act, size_t act_row_stride_elems
                                 size_t out_row_stride_elems, int rs, int cs,
                                 bool decode_mma = false, void* ws = nullptr, size_t ws_bytes = 0);
 
+// Whether the fp8 GEMV (the scale GEMM's small-m lowering) can stage a payload
+// at all: the grid launcher's shape check at one activation row (it chunks
+// rows down to fit its smem, so one row fitting is the whole question).
+// Callers deciding between the GEMV and the dequant bridge use this rather
+// than re-deriving fp8_gemv's shape rules.
+bool fp8_gemv_can_stage(const void* w_payload, int k);
+
 void launch_scale_gemm_tile_bf16(const uint16_t* act, size_t act_row_stride_elems,
                                  const uint8_t* w_payload, const float* w_scales,
                                  uint16_t* out, int m, int n, int k,

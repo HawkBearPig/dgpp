@@ -3299,7 +3299,7 @@ __global__ __launch_bounds__(fp4_pipe3::kThreads, 1) void moe_grouped_mma_fp4_pi
 //     copies) — 46.5 KB, two blocks per SM; no decoded bf16 tile exists:
 //     the B fragments are decoded at fragment time straight from the raw
 //     codes (one LDS.64 of a row's 16-code group, the two bytes this lane
-//     needs, cvt e2m1x2 -> f16x2, x scale in f16 — exact, <= 5 significant
+//     needs, cvt e2m1x2 -> f16x2, x scale in f16 — exact, <= 6 significant
 //     bits — then to bf16x2, also exact), one barrier per stage.
 // Every output element is still the same ascending-k16 mma.sync chain over
 // the same exact bf16 weights, so the outputs are bitwise the reference's.
@@ -3326,7 +3326,7 @@ __device__ __forceinline__ void ldmatrix_x4(uint32_t (&r)[4], const void* smem) 
                : "r"(a));
 }
 // Two e2m1 codes (one byte) times the group's scale (f16, exact) as a
-// bf16x2 word: the products carry <= 5 significant bits, so f16, f32 and
+// bf16x2 word: the products carry <= 6 significant bits, so f16, f32 and
 // bf16 all hold them exactly.
 __device__ __forceinline__ uint32_t decode_pair_bf16(uint32_t byte, __half2 s2) {
   const __half2 h(__nv_cvt_fp4x2_to_halfraw2(static_cast<__nv_fp4x2_storage_t>(byte), __NV_E2M1));
@@ -4570,6 +4570,18 @@ void launch_dense_mma_fp4_f32(const uint16_t* act, size_t act_stride,
                               const GlmFp4Matrix& w, float* out, int m, int n,
                               int k, cudaStream_t stream) {
   launch_dense_mma_fp4<float>(act, act_stride, w, out, m, n, k, stream);
+}
+
+void launch_dense_mma_fp4_prod_bf16(const uint16_t* act, size_t act_stride,
+                                    const MoeSegment* seg, const MoeExpertView* views,
+                                    int which, uint16_t* out, int m, int n, int k,
+                                    cudaStream_t stream, int fp4_group) {
+  if (m <= 0 || n <= 0) return;
+  if (!act || !seg || !views || !out)
+    throw std::invalid_argument("dense mma fp4 prod: null pointer");
+  launch_moe_grouped_mma_fp4<uint16_t>(act, act_stride, nullptr, seg, /*n_segs=*/1,
+                                       /*max_rows=*/m, /*rows_per_block=*/0, views, which,
+                                       out, static_cast<size_t>(n), n, k, stream, fp4_group);
 }
 
 void launch_moe_grouped_gemv_fp4_f32(const uint16_t* act, size_t act_stride,

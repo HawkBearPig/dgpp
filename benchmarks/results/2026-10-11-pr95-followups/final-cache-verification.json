@@ -1,0 +1,114 @@
+[
+  {
+    "rank": 0,
+    "host": "edgexpert-409e",
+    "models": [
+      {
+        "model": "unsloth/Qwen3.8-27B-NVFP4",
+        "revision": "f0b7c9e722f5565102fff8481c99e4d86ae099c7",
+        "shards": 2,
+        "tensors": 1968,
+        "file_bytes": 23417592488,
+        "tensor_bytes": 23417339744,
+        "index_total_bytes": 23417592488,
+        "complete": true
+      },
+      {
+        "model": "z-lab/Qwen3.8-27B-DFlash2",
+        "revision": "50307d4c4cde6860d4eee73e2547cd786fe8e8a4",
+        "shards": 1,
+        "tensors": 81,
+        "file_bytes": 3848817896,
+        "tensor_bytes": 3848808960,
+        "index_total_bytes": null,
+        "complete": true
+      }
+    ],
+    "free_bytes": 307083964416,
+    "note": "Final indexed-shard/header/length verification; content checksums were verified during the original cache transfer."
+  },
+  {
+    "rank": 1,
+    "host": "gx10-e9cd",
+    "models": [
+      {
+        "model": "unsloth/Qwen3.8-27B-NVFP4",
+        "revision": "f0b7c9e722f5565102fff8481c99e4d86ae099c7",
+        "shards": 2,
+        "tensors": 1968,
+        "file_bytes": 23417592488,
+        "tensor_bytes": 23417339744,
+        "index_total_bytes": 23417592488,
+        "complete": true
+      },
+      {
+        "model": "z-lab/Qwen3.8-27B-DFlash2",
+        "revision": "50307d4c4cde6860d4eee73e2547cd786fe8e8a4",
+        "shards": 1,
+        "tensors": 81,
+        "file_bytes": 3848817896,
+        "tensor_bytes": 3848808960,
+        "index_total_bytes": null,
+        "complete": true
+      }
+    ],
+    "free_bytes": 525925842944,
+    "note": "Final indexed-shard/header/length verification; content checksums were verified during the original cache transfer."
+  },
+  {
+    "rank": 2,
+    "host": "spark-a289",
+    "models": [
+      {
+        "model": "unsloth/Qwen3.8-27B-NVFP4",
+        "revision": "f0b7c9e722f5565102fff8481c99e4d86ae099c7",
+        "shards": 2,
+        "tensors": 1968,
+        "file_bytes": 23417592488,
+        "tensor_bytes": 23417339744,
+        "index_total_bytes": 23417592488,
+        "complete": true
+      },
+      {
+        "model": "z-lab/Qwen3.8-27B-DFlash2",
+        "revision": "50307d4c4cde6860d4eee73e2547cd786fe8e8a4",
+        "shards": 1,
+        "tensors": 81,
+        "file_bytes": 3848817896,
+        "tensor_bytes": 3848808960,
+        "index_total_bytes": null,
+        "complete": true
+      }
+    ],
+    "free_bytes": 785455562752,
+    "note": "Final indexed-shard/header/length verification; content checksums were verified during the original cache transfer."
+  },
+  {
+    "rank": 3,
+    "host": "aitopatom-4b80",
+    "models": [
+      {
+        "model": "unsloth/Qwen3.8-27B-NVFP4",
+        "revision": "f0b7c9e722f5565102fff8481c99e4d86ae099c7",
+        "shards": 2,
+        "tensors": 1968,
+        "file_bytes": 23417592488,
+        "tensor_bytes": 23417339744,
+        "index_total_bytes": 23417592488,
+        "complete": true
+      },
+      {
+        "model": "z-lab/Qwen3.8-27B-DFlash2",
+        "revision": "50307d4c4cde6860d4eee73e2547cd786fe8e8a4",
+        "shards": 1,
+        "tensors": 81,
+        "file_bytes": 3848817896,
+        "tensor_bytes": 3848808960,
+        "index_total_bytes": null,
+        "complete": true
+      }
+    ],
+    "free_bytes": 853823336448,
+    "note": "Final indexed-shard/header/length verification; content checksums were verified during the original cache transfer."
+  }
+]

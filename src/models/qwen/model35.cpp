@@ -21,9 +21,11 @@
 #include "common/log.hpp"
 #include "kernels/add_rmsnorm.hpp"
 #include "kernels/dflash2.hpp"
+#include "kernels/fp4w_gemm.hpp"
 #include "kernels/fp8_per_tensor.hpp"
 #include "kernels/fp8_dequant.hpp"
 #include "kernels/gemm.hpp"
+#include "kernels/glm_moe_launch.hpp"
 #include "kernels/kernels.hpp"
 #include "kernels/mma_gemv.hpp"
 #include "kernels/qwen_mtp.hpp"
@@ -205,6 +207,17 @@ Qwen35Model::Qwen35Model(const Qwen35TextConfig& cfg, const std::string& checkpo
   if (cfg_.eos_token_ids.empty()) throw std::invalid_argument("Qwen35Model: the config names no EOS token");
   if (mtp_ && cfg_.mtp_layer() < 0)
     throw std::invalid_argument("Qwen35Model: the config has no draft layer (mtp)");
+  // The FP8-release levers (the boot block-FP8 lm head, the per-tensor
+  // prefill recipe) requantize the checkpoint's block-FP8 bytes. The mixed
+  // NVFP4 release serves its own formats (NVFP4 MLP, FP8-channel
+  // attention): neither lever has a subject there, and an operator asking
+  // for one has the wrong release or the wrong config.
+  if (cfg_.quant_kind == Qwen35QuantKind::Nvfp4Mixed &&
+      (prefill_fp8_per_tensor_ || dense_weights_fp8_))
+    throw std::invalid_argument(
+        "Qwen35Model: the NVFP4 mixed release serves the checkpoint's own formats; "
+        "engine.prefill_fp8_per_tensor and engine.dense_weights = fp8 are the FP8 "
+        "release's levers (unset them)");
   if (!dflash2_dir.empty()) {
     if (mtp_)
       throw std::invalid_argument("Qwen35Model: dflash2 replaces the MTP draft; enable one or the other");
@@ -326,6 +339,37 @@ Qwen35Model::Qwen35Model(const Qwen35TextConfig& cfg, const std::string& checkpo
   DGPP_CUDA_OK(cudaMalloc(&mlp_out_, M * H * 2));
   DGPP_CUDA_OK(cudaMalloc(&gate_tmp_, M * I * 2));
   DGPP_CUDA_OK(cudaMalloc(&up_tmp_, M * I * 2));
+  // The NVFP4 dense path's tables (production ldmatrix kernel): one
+  // {0, m, 0} segment per row count, staged once — the grouped launcher's
+  // only per-launch table, indexed by (rows - 1), never written after.
+  DGPP_CUDA_OK(cudaMalloc(&fp4_segs_, M * sizeof(MoeSegment)));
+  {
+    std::vector<MoeSegment> segs(M);
+    for (size_t m = 1; m <= M; ++m) segs[m - 1] = MoeSegment{0, static_cast<int32_t>(m), 0};
+    DGPP_CUDA_OK(cudaMemcpy(fp4_segs_, segs.data(), M * sizeof(MoeSegment),
+                            cudaMemcpyHostToDevice));
+  }
+  if (cfg_.quant_kind == Qwen35QuantKind::Nvfp4Mixed &&
+      loader_.residency() == LoaderResidency::Resident) {
+    // Resident: harvest every layer's [gate,up,down] views once — the
+    // resident bumps are stable, so the tables stay valid for the process
+    // lifetime (and the decode graph stays kernels-only).
+    fp4_view_layers_ = cfg_.num_hidden_layers + (mtp_ ? 1 : 0);
+    DGPP_CUDA_OK(cudaMalloc(&fp4_views_,
+                            static_cast<size_t>(fp4_view_layers_) * 3 * sizeof(MoeExpertView)));
+    std::vector<MoeExpertView> views(static_cast<size_t>(fp4_view_layers_) * 3);
+    for (int l = 0; l < fp4_view_layers_; ++l) {
+      const Qwen35LayerResident& r = loader_.load_layer(l);
+      if (r.mlp.gate_fp4.payload == nullptr) continue;  // BF16/channel layer: slot unused
+      views[static_cast<size_t>(l) * 3 + 0] = MoeExpertView::of(r.mlp.gate_fp4);
+      views[static_cast<size_t>(l) * 3 + 1] = MoeExpertView::of(r.mlp.up_fp4);
+      views[static_cast<size_t>(l) * 3 + 2] = MoeExpertView::of(r.mlp.down_fp4);
+    }
+    DGPP_CUDA_OK(cudaMemcpy(fp4_views_, views.data(), views.size() * sizeof(MoeExpertView),
+                            cudaMemcpyHostToDevice));
+  } else {
+    DGPP_CUDA_OK(cudaMalloc(&fp4_views_, 3 * sizeof(MoeExpertView)));
+  }
   // Per-tensor FP8 prefill recipe (engine.prefill_fp8_per_tensor): Resident stacks
   // requantize every layer's MLP once at boot (dequant to the bridge, then
   // absmax + x/448 quantize). Streaming stacks keep the bridge: their
@@ -574,6 +618,8 @@ Qwen35Model::~Qwen35Model() {
   cudaFree(mlp_out_);
   cudaFree(gate_tmp_);
   cudaFree(up_tmp_);
+  cudaFree(fp4_segs_);
+  cudaFree(fp4_views_);
   cudaFree(mtp_e_);
   cudaFree(mtp_en_);
   cudaFree(mtp_hn_);
@@ -812,6 +858,29 @@ void Qwen35Model::requant_mlp_pt(int slot, const Qwen35DenseMlpResident& m, cuda
 void Qwen35Model::head_gemv(const uint16_t* act, float* out, int rows, cudaStream_t stream) {
   const int H = cfg_.hidden_size;
   const int64_t V = lm_vocab_count_;
+  // The mixed release's native head: FP8-channel, read through the channel
+  // grid's streaming form (the lm_head BF16 pointer is null there). Past
+  // 128 rows it rides the bridge's channel dequant (a wide-head call is a
+  // diagnostic, and the head is 1.3 GB in BF16 — the bridge holds it).
+  if (globals_.lm_head_fp8.payload) {
+    int rs = 0, cs = 0;
+    if (!quant_scale_shifts(globals_.lm_head_fp8, rs, cs))
+      throw std::runtime_error("qwen35 head: the native lm head's scale grid is malformed");
+    if (rows <= 128) {
+      launch_scale_gemm_grid_f32(act, static_cast<size_t>(H), globals_.lm_head_fp8.payload,
+                                 globals_.lm_head_fp8.scales, out, rows, static_cast<int>(V), H,
+                                 stream, static_cast<size_t>(V), rs, cs, /*decode_mma=*/true,
+                                 gw_.ws, gw_.ws_bytes);
+      return;
+    }
+    // Past 128 rows (a diagnostic wide head) the GEMV rows: the bridge is
+    // sized for the largest dense MLP matrix, not the 1.3 GB head.
+    launch_scale_gemm_grid_f32(act, static_cast<size_t>(H), globals_.lm_head_fp8.payload,
+                               globals_.lm_head_fp8.scales, out, rows, static_cast<int>(V), H,
+                               stream, static_cast<size_t>(V), rs, cs, /*decode_mma=*/false,
+                               nullptr, 0);
+    return;
+  }
   // Uniform FP8 dispatch: the weights-once streaming MMA at every decode
   // row count (~5 ms, half the BF16 bytes). Its row chains are bitwise
   // the same at any m (scale_gemm_test), so a request's logits are the
@@ -826,6 +895,8 @@ void Qwen35Model::head_gemv(const uint16_t* act, float* out, int rows, cudaStrea
                           /*mma_from_rows=*/1);
     return;
   }
+  if (!globals_.lm_head)
+    throw std::runtime_error("qwen35 head: the release binds no BF16 lm head");
   gemm_.matmul(act, globals_.lm_head, out, rows, static_cast<int>(V), H, DType::BF16, GemmOut::F32,
                static_cast<size_t>(H), gemm_ws_, gemm_ws_bytes_, stream);
 }
@@ -835,7 +906,7 @@ void Qwen35Model::dense_mlp(const uint16_t* x, uint16_t* out, int tokens,
                             bool resume) {
   // I is this rank's MLP slice (the resident gate rows): intermediate_size /
   // world under TP, the whole at world 1.
-  const int64_t H = cfg_.hidden_size, I = m.gate_fp8.rows;
+  const int64_t H = cfg_.hidden_size, I = m.inter ? m.inter : m.gate_fp8.rows;
   // Per-tensor FP8 recipe: one shared activation quantize over the H rows
   // feeds both gate and up; the swiglu output is quantized once for down.
   // All addresses are boot-fixed (slots, scratch, scale cells), so the
@@ -861,6 +932,106 @@ void Qwen35Model::dense_mlp(const uint16_t* x, uint16_t* out, int tokens,
                             out, tokens, static_cast<int>(H), static_cast<int>(I), gw_.ws,
                             gw_.ws_bytes, stream);
     return;
+  }
+  // ---- mixed-release forms (the loader binds one form per layer) -------------
+  if (m.gate_fp4.payload) {
+    // The NVFP4 MLP: the fp4w prefill GEMM from 1024 rows, the production
+    // ldmatrix kernel below (one chain everywhere at < 1024 rows;
+    // tolerance-equal, never bitwise, across the boundary — a different
+    // fp32 summation order). The 256-row tile amortizes weight decoding
+    // over more rows and wins at the 1024-row boundary at TP 1/2/4.
+    // Smaller ragged tiles are not consistently faster. Decode keeps the
+    // solo-vs-batch bitwise chain the gates pin.
+    if (tokens <= 0) return;
+    if (tokens >= 1024) {
+      launch_fp4w_gemm_bf16(x, static_cast<size_t>(H), m.gate_fp4, gate_tmp_, tokens,
+                            static_cast<int>(I), H, stream);
+      launch_fp4w_gemm_bf16(x, static_cast<size_t>(H), m.up_fp4, up_tmp_, tokens,
+                            static_cast<int>(I), H, stream);
+      qwen35_swiglu_bf16(gate_tmp_, up_tmp_, gate_tmp_, static_cast<int64_t>(tokens) * I, stream);
+      launch_fp4w_gemm_bf16(gate_tmp_, static_cast<size_t>(I), m.down_fp4, out, tokens, H,
+                            static_cast<int>(I), stream);
+      return;
+    }
+    // Resident: the boot-harvested per-layer table (graph-safe, no copies
+    // in the walk). Streaming: re-stage the slot — the shared layer
+    // allocation is rebuilt per load, so no table survives the walk (the
+    // eager tests never capture, so the copy node is harmless there).
+    const MoeExpertView* views = nullptr;
+    if (fp4_view_layers_ > 0 && layer >= 0 && layer < fp4_view_layers_ &&
+        m.gate_fp4.payload != nullptr) {
+      views = fp4_views_ + static_cast<size_t>(layer) * 3;
+    } else {
+      MoeExpertView slot[3] = {MoeExpertView::of(m.gate_fp4), MoeExpertView::of(m.up_fp4),
+                               MoeExpertView::of(m.down_fp4)};
+      DGPP_CUDA_OK(cudaMemcpyAsync(fp4_views_, slot, sizeof(slot), cudaMemcpyHostToDevice,
+                                   stream));
+      views = fp4_views_;
+    }
+    const MoeSegment* seg = fp4_segs_ + (tokens - 1);
+    launch_dense_mma_fp4_prod_bf16(x, static_cast<size_t>(H), seg, views, /*which=*/0,
+                                   gate_tmp_, tokens, static_cast<int>(I), H, stream,
+                                   m.gate_fp4.scale_group);
+    launch_dense_mma_fp4_prod_bf16(x, static_cast<size_t>(H), seg, views, /*which=*/1,
+                                   up_tmp_, tokens, static_cast<int>(I), H, stream,
+                                   m.up_fp4.scale_group);
+    qwen35_swiglu_bf16(gate_tmp_, up_tmp_, gate_tmp_, static_cast<int64_t>(tokens) * I, stream);
+    launch_dense_mma_fp4_prod_bf16(gate_tmp_, static_cast<size_t>(I), seg, views,
+                                   /*which=*/2, out, tokens, H, static_cast<int>(I), stream,
+                                   m.down_fp4.scale_group);
+    return;
+  }
+  if (m.gate && m.gate_fp8.payload == nullptr) {
+    // The BF16 draft layer (the mixed release's MTP MLP): the Lt matmuls.
+    gw_.gemm->matmul(x, m.gate, gate_tmp_, tokens, static_cast<int>(I), H, DType::BF16,
+                     GemmOut::BF16, static_cast<size_t>(H), gw_.ws, gw_.ws_bytes, stream);
+    gw_.gemm->matmul(x, m.up, up_tmp_, tokens, static_cast<int>(I), H, DType::BF16, GemmOut::BF16,
+                     static_cast<size_t>(H), gw_.ws, gw_.ws_bytes, stream);
+    qwen35_swiglu_bf16(gate_tmp_, up_tmp_, gate_tmp_, static_cast<int64_t>(tokens) * I, stream);
+    gw_.gemm->matmul(gate_tmp_, m.down, out, tokens, H, static_cast<int>(I), DType::BF16,
+                     GemmOut::BF16, static_cast<size_t>(I), gw_.ws, gw_.ws_bytes, stream);
+    return;
+  }
+  if (m.gate_fp8.payload && m.gate_fp8.scale_block_rows == 1) {
+    // The channel-FP8 MLP (the mixed release's late layers): the streaming
+    // MMA at decode rows (weights once, m-invariant chain), the dequant
+    // bridge — reading the channel grid — above them, as the FP8 release's
+    // block path below does for prefill.
+    int rs = 0, cs = 0, rs2 = 0, cs2 = 0;
+    if (!quant_scale_shifts(m.gate_fp8, rs, cs) || !quant_scale_shifts(m.down_fp8, rs2, cs2))
+      throw std::runtime_error("qwen35 mlp: the channel grid is malformed");
+    if (tokens <= 128) {
+      launch_scale_gemm_grid_bf16(x, static_cast<size_t>(H), m.gate_fp8.payload, m.gate_fp8.scales,
+                                  gate_tmp_, tokens, static_cast<int>(I), H, stream, 0, rs, cs,
+                                  true, gw_.ws, gw_.ws_bytes);
+      launch_scale_gemm_grid_bf16(x, static_cast<size_t>(H), m.up_fp8.payload, m.up_fp8.scales,
+                                  up_tmp_, tokens, static_cast<int>(I), H, stream, 0, rs, cs,
+                                  true, gw_.ws, gw_.ws_bytes);
+      qwen35_swiglu_bf16(gate_tmp_, up_tmp_, gate_tmp_, static_cast<int64_t>(tokens) * I, stream);
+      launch_scale_gemm_grid_bf16(gate_tmp_, static_cast<size_t>(I), m.down_fp8.payload,
+                                  m.down_fp8.scales, out, tokens, H, static_cast<int>(I), stream,
+                                  0, rs2, cs2, true, gw_.ws, gw_.ws_bytes);
+      return;
+    }
+    const size_t up_bytes = static_cast<size_t>(I) * static_cast<size_t>(H) * 2;
+    const size_t down_bytes = static_cast<size_t>(H) * static_cast<size_t>(I) * 2;
+    if (up_bytes <= gw_.dequant_bytes && down_bytes <= gw_.dequant_bytes) {
+      launch_fp8_dequant_blocks(m.gate_fp8.payload, m.gate_fp8.scales, gw_.dequant, I, H, stream,
+                                rs, cs);
+      gw_.gemm->matmul(x, gw_.dequant, gate_tmp_, tokens, static_cast<int>(I), H, DType::BF16,
+                       GemmOut::BF16, static_cast<size_t>(H), gw_.ws, gw_.ws_bytes, stream);
+      launch_fp8_dequant_blocks(m.up_fp8.payload, m.up_fp8.scales, gw_.dequant, I, H, stream, rs,
+                                cs);
+      gw_.gemm->matmul(x, gw_.dequant, up_tmp_, tokens, static_cast<int>(I), H, DType::BF16,
+                       GemmOut::BF16, static_cast<size_t>(H), gw_.ws, gw_.ws_bytes, stream);
+      qwen35_swiglu_bf16(gate_tmp_, up_tmp_, gate_tmp_, static_cast<int64_t>(tokens) * I, stream);
+      launch_fp8_dequant_blocks(m.down_fp8.payload, m.down_fp8.scales, gw_.dequant, H, I, stream,
+                                rs2, cs2);
+      gw_.gemm->matmul(gate_tmp_, gw_.dequant, out, tokens, H, static_cast<int>(I), DType::BF16,
+                       GemmOut::BF16, static_cast<size_t>(I), gw_.ws, gw_.ws_bytes, stream);
+      return;
+    }
+    throw std::runtime_error("qwen35 mlp: the channel prefill needs the dequant bridge");
   }
   // Prefill-shaped products run the dequant bridge + cuBLASLt BF16 (the same
   // lowering gemm_dense uses for the attention projections): nsys showed the
@@ -937,6 +1108,12 @@ MemoryPlan Qwen35Model::plan_memory(const Qwen35TextConfig& cfg, int max_tokens,
     throw std::invalid_argument("plan_memory: max_requests out of range");
   if (mtp && cfg.mtp_layer() < 0)
     throw std::invalid_argument("plan_memory: the config has no draft layer (mtp)");
+  if (cfg.quant_kind == Qwen35QuantKind::Nvfp4Mixed &&
+      (prefill_fp8_per_tensor_ || dense_weights_fp8_))
+    throw std::invalid_argument(
+        "plan_memory: the NVFP4 mixed release serves the checkpoint's own formats; "
+        "engine.prefill_fp8_per_tensor and engine.dense_weights = fp8 are the FP8 "
+        "release's levers (unset them)");
   std::unique_ptr<DFlash2Config> dfcfg;
   if (!dflash2_dir.empty()) {
     if (mtp)
@@ -990,6 +1167,17 @@ MemoryPlan Qwen35Model::plan_memory(const Qwen35TextConfig& cfg, int max_tokens,
                                     QwenGdnLayer::scratch_bytes(qc, lk, lv, max_tokens)));
   // Activations: resid/x/attn/mlp [M,H] + gate/up tmps [M,I].
   plan.add("activations", 4 * M * H * 2 + 2 * M * I * 2);
+  // The NVFP4 dense path's tables (production ldmatrix kernel): one
+  // {0, m, 0} segment per row count plus the view tables (per-layer on
+  // resident mixed-release stacks, one 3-entry staging slot elsewhere —
+  // the ctor's split).
+  plan.add(
+      "nvfp4 dense segment/view tables",
+      M * sizeof(MoeSegment) +
+          (residency == LoaderResidency::Resident && cfg.quant_kind == Qwen35QuantKind::Nvfp4Mixed
+               ? (static_cast<size_t>(cfg.num_hidden_layers) + (mtp ? 1 : 0)) * 3 *
+                     sizeof(MoeExpertView)
+               : 3 * sizeof(MoeExpertView)));
   // Dense FP8 prefill bridge: the largest dense matrix dequantized to BF16.
   plan.add("dense fp8 prefill bridge (largest dense matrix in BF16)",
            qwen35_dense_bridge_bytes(cfg));
@@ -1049,7 +1237,9 @@ MemoryPlan Qwen35Model::plan_memory(const Qwen35TextConfig& cfg, int max_tokens,
       packed += Bf12Companions::planned_bytes(dfcfg->selector_rank, dH);
     }
     if (mtp) packed += Bf12Companions::planned_bytes(H, 2 * H);
-    if (!(dense_weights_fp8_ && residency == LoaderResidency::Resident))
+    const bool head_bf16 = cfg.quant_kind == Qwen35QuantKind::Fp8Block ||
+                           cfg.tensor_quant("lm_head") == Qwen35TensorQuant::Bf16;
+    if (head_bf16 && !(dense_weights_fp8_ && residency == LoaderResidency::Resident))
       packed += Bf12Companions::planned_bytes(cfg.vocab_size, H);  // the head serves in bf16
     plan.add("bf16 decode packing (12-bit companions; the bf16 bytes stay)", packed);
   }

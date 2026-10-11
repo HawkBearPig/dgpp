@@ -1,0 +1,21 @@
+{
+  "command": [
+    "python3",
+    "scripts/timed_load.py",
+    "127.0.0.1",
+    "18081",
+    "--concurrency",
+    "1,2,4,8",
+    "--classes",
+    "all",
+    "--max-tokens",
+    "256",
+    "--repeat",
+    "3",
+    "--json-out",
+    "/home/stephen/dgpp/pr95-followups-20261011/final-w2-fp8a/decode.json"
+  ],
+  "started": "2026-10-11T02:29:54.153851+00:00",
+  "returncode": 0,
+  "finished": "2026-10-11T02:37:22.399791+00:00"
+}

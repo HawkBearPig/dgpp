@@ -1,0 +1,6 @@
+{
+  "measured_commit": "c9a98ac71964b37ea4701ce841fe27316a8ae50e",
+  "source_diff_only_changes_line_comments": true,
+  "patch_sha256": "58caf9cab4ef21f60f91e75926033e05fe15bae2889a0b72ff549d9c2b77aa95",
+  "explanation": "The precision bound is six significant bits; all products still fit exactly in BF16. No arithmetic or launch behavior changes."
+}

@@ -1,0 +1,35 @@
+{
+  "model": "unsloth/Qwen3.8-27B-NVFP4",
+  "world_size": 4,
+  "engine": {
+    "max_concurrency": 8,
+    "kv_capacity": 262144,
+    "kv_dtype": "bf16",
+    "default_max_tokens": 32768,
+    "queue_limit": 8,
+    "max_connections": 64,
+    "decode_graph": true,
+    "mtp": false,
+    "dflash_model": "z-lab/Qwen3.8-27B-DFlash2",
+    "dflash_weights": "fp8",
+    "mtp_schedule": true,
+    "mtp_schedule_row_ms": 2.0,
+    "mtp_schedule_base_ms": 34.0,
+    "mtp_draft_temperature": 0.7,
+    "mtp_verify": "block",
+    "prefix_cache_gib": 1.5,
+    "admission": "grow",
+    "admission_window": 256,
+    "model_alias": "Qwen3.8-27B-NVFP4",
+    "sampling_candidates": 128,
+    "stats_interval_s": 10,
+    "bf16_weights": "bf12"
+  },
+  "paths": {
+    "resident_cache": ""
+  },
+  "http": {
+    "bind_host": "0.0.0.0",
+    "port": 8000
+  }
+}

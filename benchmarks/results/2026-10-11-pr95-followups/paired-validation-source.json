@@ -1,0 +1,17 @@
+{
+  "date": "2026-10-11T01:25:09.607332+00:00",
+  "head": "5fc78dad65fb2ab0e25097c92fbe81eef4aedd61",
+  "merge_parent": "38d3af69485158a926eefb7eb46fbac475295df4",
+  "diff_sha256": "d65651e47107f04e3fd7b9d79615a896739dab01062df50b82498f628d099045",
+  "files": {
+    "src/kernels/fp4w_gemm.cu": "97b6c75f512d186aef2b51147d08a25060fd34d8c6ecb609f977c7f4dc2f0d14",
+    "src/models/qwen/model35.cpp": "27f64113f6d348a866ae98dbe1aee37a0c9d1ea6040b343f185a3f539b088e51",
+    "src/models/qwen/model35.hpp": "01fd7ce156101730b2855077218278b7fdf98aeb1a37b729c4aa52176412fbad",
+    "src/engine/graph_engine.hpp": "364e59fc0a1352b893231f1f39ff6a6a6fdd9e2be76ea77cd16ee83d8b2b82f8",
+    "tests/cuda/fp4w_gemm_test.cu": "9c0b7a76fde1d1760013e0dfbb18354aa92a9aeae56c317a6431ae758e7d2b27",
+    "tests/cuda/qwen35_tp_test.cpp": "101340580a4fd35d83fc80309c3b0ee7e127f3fbd6dd1a4e351f37d07bc1d55c",
+    "tests/cuda/qwen_engine_test.cpp": "f0a740058d4abe2b0aed5933891540b5152361c716b1731ef8b6f10de30a217c",
+    "CMakeLists.txt": "8e10e02807f08b2f963344269fa101a5488f7a6dff023cb4cc1cffa6009e8f82"
+  },
+  "server_sha256": "c6f3eab0a7daea432714cb43e2b6033fea2bc4c76fc806bf12bd9cdccc6b95ad"
+}

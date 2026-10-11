@@ -23,8 +23,10 @@
 #include "core/graph.hpp"
 #include "engine/paged_blocks.hpp"
 #include "engine/session_model.hpp"
+#include "models/glm/moe.hpp"
 #include "kernels/bf12_companions.hpp"
 #include "kernels/gemm.hpp"
+#include "kernels/glm_moe_launch.hpp"
 #include "kernels/glm_spec.hpp"
 #include "loaders/resident_stream.hpp"
 #include "models/quant_matrix.hpp"
@@ -204,6 +206,9 @@ class Qwen35Model : public SessionModel<Qwen35Model> {
                                 const std::string& dflash2_dir = "");
 
   const Qwen35TextConfig& config() const { return cfg_; }
+  // Actual resident layer allocation, for comparing initialization with the
+  // memory plan. An unmaterialized or streamed layer contributes zero bytes.
+  size_t resident_layer_bytes(int layer) const { return loader_.resident_layer_span(layer).second; }
 
   // ---- the session core's hooks (engine/session_model.hpp) --------------------
   typename Base::Outputs run_rows(const typename Base::RowRun& run);
@@ -475,6 +480,17 @@ class Qwen35Model : public SessionModel<Qwen35Model> {
   // Activation scratch at max_tokens rows.
   uint16_t *resid_ = nullptr, *x_ = nullptr, *attn_out_ = nullptr, *mlp_out_ = nullptr;
   uint16_t *gate_tmp_ = nullptr, *up_tmp_ = nullptr;  // dense MLP [M, I]
+  // The NVFP4 dense path's pre-staged tables (production ldmatrix kernel):
+  // one {0, m, 0} segment per row count 1..max_tokens (the grouped
+  // launcher's only per-launch table, read not written), plus the
+  // [gate,up,down] view tables. Resident stacks harvest every layer's
+  // table once at boot (pointers are stable, and the decode graph forbids
+  // copy-engine nodes — docs/batched_mtp_graph_stall.md); streaming
+  // stacks rebuild one shared layer allocation per load, so dense_mlp
+  // re-stages this 3-entry slot per call (the eager tests never capture).
+  MoeSegment* fp4_segs_ = nullptr;      // [max_tokens] device
+  MoeExpertView* fp4_views_ = nullptr;  // [layers x 3] resident, [3] slot streaming
+  int fp4_view_layers_ = 0;             // 0 = slot mode (streaming)
   // MTP draft scratch at max_tokens rows (null when MTP is off): embed rows
   // and their norm, the gathered/gated main hidden and its norm, the
   // [M, 2H] concat, the draft residual, its norm (the chain rows), and the

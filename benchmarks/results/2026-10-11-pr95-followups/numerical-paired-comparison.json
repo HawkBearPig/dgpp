@@ -1,0 +1,66 @@
+{
+  "cases": [
+    {
+      "case": "teacher_text_hard-0.ids",
+      "positions": 4096,
+      "mean_nll_delta": 0.0,
+      "standard_error": 0.0,
+      "max_abs_nll_delta": 0.0,
+      "fraction_over_one_nat": 0.0,
+      "top1_changes": 0,
+      "top1_changes_beyond_two_ulps": 0,
+      "identical_logits_rows": 4096,
+      "pass_gate": true
+    },
+    {
+      "case": "teacher_text_hard-1.ids",
+      "positions": 4096,
+      "mean_nll_delta": 0.0,
+      "standard_error": 0.0,
+      "max_abs_nll_delta": 0.0,
+      "fraction_over_one_nat": 0.0,
+      "top1_changes": 0,
+      "top1_changes_beyond_two_ulps": 0,
+      "identical_logits_rows": 4096,
+      "pass_gate": true
+    },
+    {
+      "case": "teacher_text_memorized-0.ids",
+      "positions": 4096,
+      "mean_nll_delta": 0.0,
+      "standard_error": 0.0,
+      "max_abs_nll_delta": 0.0,
+      "fraction_over_one_nat": 0.0,
+      "top1_changes": 0,
+      "top1_changes_beyond_two_ulps": 0,
+      "identical_logits_rows": 4096,
+      "pass_gate": true
+    },
+    {
+      "case": "teacher_text_memorized-1.ids",
+      "positions": 4096,
+      "mean_nll_delta": 0.0,
+      "standard_error": 0.0,
+      "max_abs_nll_delta": 0.0,
+      "fraction_over_one_nat": 0.0,
+      "top1_changes": 0,
+      "top1_changes_beyond_two_ulps": 0,
+      "identical_logits_rows": 4096,
+      "pass_gate": true
+    },
+    {
+      "case": "teacher_text-0.ids",
+      "positions": 3072,
+      "mean_nll_delta": 0.0,
+      "standard_error": 0.0,
+      "max_abs_nll_delta": 0.0,
+      "fraction_over_one_nat": 0.0,
+      "top1_changes": 0,
+      "top1_changes_beyond_two_ulps": 0,
+      "identical_logits_rows": 3072,
+      "pass_gate": true
+    }
+  ],
+  "repeat_bitwise": true,
+  "pass": true
+}

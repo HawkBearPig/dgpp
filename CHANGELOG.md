@@ -6,6 +6,55 @@ The history by milestone. The dated engineering record in
 
 ## Unreleased
 
+- **Qwen3.8-27B NVFP4: fp4w prefill GEMM** (2026-10-06):
+  `launch_fp4w_gemm_*` (new): `fp8w_gemm`'s 128x128x64 tiles and
+  three-stage pipeline with an e2m1 W-side (8 payload bytes + the
+  step's four e4m3 scale bytes a thread a step, exact pairwise decode,
+  the F32 global once in the epilogue). Wired above 1024 rows in
+  `dense_mlp` (measured crossover: slower below, 12-90% faster above);
+  the <= 1024-row chain is untouched. Serve: pp2080 prefill 2445-2460
+  ms vs 2568 (~5%), pp448 and decode unchanged.
+- **Qwen3.8-27B NVFP4: dense MLP on the production kernel** (2026-10-06):
+  gate/up/down run the production ldmatrix kernel at every row count
+  (`launch_dense_mma_fp4_prod_*`, new in `glm_moe_launch`: the grouped
+  launcher with one pre-staged `{0, m, 0}` segment per row count plus
+  boot-harvested per-layer view tables on resident stacks, a re-staged
+  3-entry slot on streaming stacks) instead of the CUDA-core `fp4_gemv`
+  (<= 128 rows) and the synchronous reference tile. Gate/up m=8/32 go
+  623/2456 us to 239/257 us against a ~251 us roofline; down is bitwise
+  the reference (glm_moe_test pins the pair). A purpose-built fp4
+  streaming decode kernel was tried and reverted (correct, but slower on
+  every production shape — the production kernel already saturates the
+  decode roofline). Serve A/B vs the FP8 release, identical transcripts:
+  29.1 vs 24.5 tok/s short-prompt, pp448 prefill 720-748 vs 931 ms —
+  NVFP4 leads on both, so no dense-W4A4 path is built.
+- **Qwen3.8-27B NVFP4: mixed formats in one checkpoint** (2026-10-05):
+  the `unsloth/Qwen3.8-27B-NVFP4` release binds directly — NVFP4
+  (`nvfp4-pack-quantized`, group 16, e4m3 block scales, per-tensor
+  global scales) for the dense MLPs, channelwise FP8 e4m3
+  (`float-quantized`, bits 8, group = full row) for the attention
+  projections and the vocabulary head, BF16 for the rest including the
+  MTP draft layer. `config35` reads the compressed-tensors
+  `config_groups` (targets, `re:` regexes, exact and regex `ignore`,
+  document order first-match wins) into a per-module
+  `tensor_quant()` resolution; `loader35` builds the three weight
+  forms side by side (fp4 payload + packed scales + the
+  `weight_global_scale` slots the kernels divide the finished dot by once,
+  channel `weight_scale [N,1]` widened to f32);
+  `layers.cpp`'s dense GEMM derives its scale shifts from the matrix
+  itself, so channel matrices ride the streaming fp8 GEMV at decode
+  (<= 128 rows, the row-chain invariance preserved) and the
+  dequant-to-bf16 bridge above (NVFP4 MLPs moved to the production
+  ldmatrix kernel the next day — see the entry above). The FP8-release levers
+  (`prefill_fp8_per_tensor`, `dense_weights: fp8`) are refused for
+  this quantization — the head is already fp8-channel resident. The
+  `qwen35_mixed_*` test chain (synthetic mixed fixture, smoke,
+  1..7-row invariance, dump-parity strict/relaxed against
+  `qwen35_reference_dump.py`, which decodes nibbles and both scale
+  kinds exactly as the kernels do, teacher-forced draft) runs
+  alongside the FP8 chain. Card:
+  `docs/model_cards/Qwen3.8-27B-NVFP4.md`; templates:
+  `deploy/cluster_qwen3.8-27b_nvfp4_w{1,2,4}.example.json`.
 - **Full GLM-5.3: `engine.attention_weights`** (2026-10-09): `int4`
   re-encodes the checkpoint's int8 g64 q_a/kv_a, q_b and o_proj rows to
   int4 g64 at load with the RTN recipe (kv_b keeps its int8 form; the

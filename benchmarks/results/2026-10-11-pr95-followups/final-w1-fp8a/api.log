@@ -1,0 +1,11 @@
+baseline: '\n\nRed\nYellow\nBlue' ({'prompt_tokens': 52, 'completion_tokens': 59, 'total_tokens': 111, 'prompt_tokens_details': {'cached_tokens': 0}, 'completion_tokens_details': {'reasoning_tokens': 52}})
+ok   stop one-shot: stop='Yellow' content='\n\nRed\n' finish=stop usage={'prompt_tokens': 52, 'completion_tokens': 56, 'total_tokens': 108, 'prompt_tokens_details': {'cached_tokens': 0}, 'completion_tokens_details': {'reasoning_tokens': 52}}
+ok   stop stream: joined='\n\nRed\n' finish=stop usage=[{'prompt_tokens': 52, 'completion_tokens': 56, 'total_tokens': 108, 'prompt_tokens_details': {'cached_tokens': 0}, 'completion_tokens_details': {'reasoning_tokens': 52}}]
+ok   n=2 one-shot: indices=[0, 1] usage={'prompt_tokens': 52, 'completion_tokens': 113, 'total_tokens': 165, 'prompt_tokens_details': {'cached_tokens': 0}, 'completion_tokens_details': {'reasoning_tokens': 99}} texts=['\n\nRed\nYellow\nBlue', '\n\nRed\nBlue\nYellow']
+ok   n=2 stream: choice0='The user wants three primary colors, one' choice1='The user wants three primary colors, one' finishes={0: 'stop', 1: 'stop'} usage=[{'prompt_tokens': 52, 'completion_tokens': 113, 'total_tokens': 165, 'prompt_tokens_details': {'cached_tokens': 0}, 'completion_tokens_details': {'reasoning_tokens': 99}}]
+ok   logit_bias force: tokens=['�', '�', '�', '�', '�', '�'] text='������'
+ok   logit_bias ban: a ban on an unused token changes nothing: '\n\nRed\nYellow\nBlue'
+ok   logit_bias refused by name: status=400 error={'message': "logit_bias keys must be token ids (decimal strings); got 'x'", 'type': 'invalid_request_error', 'param': 'logit_bias', 'code': None}
+ok   usage cached_tokens: cold={'cached_tokens': 0} hot={'cached_tokens': 2185}
+ok   usage reasoning_tokens: {'reasoning_tokens': 96} of 96 completion tokens
+ALL OK []

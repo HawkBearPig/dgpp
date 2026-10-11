@@ -5,7 +5,8 @@
 // one file. The table drives the offline validator and (with the loader
 // slice) the resident loader.
 //
-// Naming is checkpoint truth (Qwen/Qwen3.8-27B-FP8): main layers under
+// Naming is checkpoint truth (Qwen/Qwen3.8-27B-FP8 and the NVFP4 mixed
+// release, unsloth/Qwen3.8-27B-NVFP4): main layers under
 // `model.language_model.layers.L.`, the draft layer under `mtp.layers.0.`
 // with the head's own tensors under `mtp.`, the globals
 // `model.language_model.embed_tokens.weight`, `lm_head.weight` and
@@ -16,6 +17,16 @@
 // BF16 partner X.weight_scale_inv of shape [ceil(N/128), ceil(K/128)] —
 // 128x128 dequant blocks, MULTIPLY on dequant (the loader widens the
 // scales to F32 at load). Everything else is BF16.
+//
+// Scale contract (the mixed release, per config_groups): targeted
+// attention/linear-attention projections, the late MLP layers and lm_head
+// are FP8-channel — X.weight e4m3 + X.weight_scale BF16 [N, 1]; the MLP
+// gate/up/down are the NVFP4 quad X.weight_packed U8 [N, K/2],
+// X.weight_scale F8_E4M3 [N, K/16], X.weight_global_scale and
+// X.input_global_scale F32 [1] (the activation global: counted, unused —
+// W4A16 serves the matrix). The `ignore` list (the draft layer, vision) is
+// BF16, and the full layers' k_scale/v_scale (FP8 kv_cache_scheme) are
+// counted and unused: the engine's KV is BF16.
 #include <cstdint>
 #include <string>
 #include <unordered_map>

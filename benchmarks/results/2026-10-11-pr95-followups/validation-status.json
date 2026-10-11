@@ -1,0 +1,51 @@
+[
+  {
+    "label": "memcheck",
+    "command": [
+      "/usr/local/cuda/bin/compute-sanitizer",
+      "--tool",
+      "memcheck",
+      "--error-exitcode",
+      "99",
+      "build-pr95/fp4w_gemm_test"
+    ],
+    "start": "2026-10-11T00:34:42.016706+00:00",
+    "returncode": 0,
+    "end": "2026-10-11T00:34:52.713986+00:00"
+  },
+  {
+    "label": "racecheck",
+    "command": [
+      "/usr/local/cuda/bin/compute-sanitizer",
+      "--tool",
+      "racecheck",
+      "--error-exitcode",
+      "99",
+      "build-pr95/fp4w_gemm_test"
+    ],
+    "start": "2026-10-11T00:34:52.714392+00:00",
+    "returncode": 0,
+    "end": "2026-10-11T00:36:31.820611+00:00"
+  },
+  {
+    "label": "suite",
+    "command": [
+      "python3",
+      "scripts/site_env.py",
+      "run-rank",
+      "--rank",
+      "0",
+      "--",
+      "ctest",
+      "--test-dir",
+      "build-pr95",
+      "-LE",
+      "checkpoint",
+      "--output-on-failure",
+      "-j1"
+    ],
+    "start": "2026-10-11T00:36:31.821119+00:00",
+    "returncode": 8,
+    "end": "2026-10-11T00:55:20.372359+00:00"
+  }
+]

@@ -13,6 +13,8 @@
     "decode_graph": true,
     "mtp": true,
     "mtp_depth": 2,
+    "lookup_draft": true,
+    "lookup_tail": 2,
     "prefix_cache_gib": 3,
     "admission": "grow",
     "admission_window": 256,

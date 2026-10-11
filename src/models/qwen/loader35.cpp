@@ -1,6 +1,9 @@
-// Qwen3.5-27B loader family: FP8-native weights (the checkpoint already holds
-// e4m3 payload + BF16 scales — memcpy + BF16→F32 widen, never a BF16→FP8
-// re-encode), text-only, dense SwiGLU MLP, standard pre-norm residual.
+// Qwen3.5-27B loader family: native-weight builders for both releases —
+// the FP8 release's block FP8 (e4m3 payload + BF16 scales — memcpy +
+// BF16→F32 widen, never a BF16→FP8 re-encode), and the mixed NVFP4
+// release's channel FP8 (attention, late MLP layers, lm_head) plus NVFP4
+// MLP (e2m1 pairs, e4m3 scales per 16, F32 global served as its
+// reciprocal). Text-only, dense SwiGLU MLP, standard pre-norm residual.
 #include "models/qwen/loader35.hpp"
 
 #include <array>
@@ -19,6 +22,15 @@ bool ends_with(const std::string& s, const std::string& suffix) {
   return s.size() >= n && s.compare(s.size() - n, n, suffix) == 0;
 }
 
+// The channel-FP8 resident grid: one F32 scale per row, so the kernel's
+// column shift must cover the whole K (the smallest power of two >= K);
+// see quant_scale_shifts.
+constexpr int64_t pow2_ceil(int64_t v) {
+  int64_t p = 1;
+  while (p < v) p <<= 1;
+  return p;
+}
+
 // Per-layer build progress logs, off by default (the sibling qwen loader
 // prints nothing). Set DGPP_QWEN35_LOADER_VERBOSE to a non-'0' value to
 // trace layer construction at boot.
@@ -34,6 +46,8 @@ bool loader_verbose() {
 // norms replicate, projections slice. The MTP draft head is BF16 and
 // replicated whole (like the norms).
 bool is_replicated_35(const QwenExpectedTensor& e) {
+  if (e.role == QwenTensorRole::Fp4Global || e.role == QwenTensorRole::InputScale)
+    return true;  // the mixed release's F32 scalars: every rank reads the whole
   switch (e.cls) {
     case QwenWeightClass::Norm:
       return true;
@@ -274,6 +288,308 @@ struct Qwen35LoaderFamily::Builder : WeightBuilder<QwenExpectedTensor> {
     return q;
   }
 
+  // ---- mixed-release builders ---------------------------------------------
+  // Every per-matrix loader takes the checkpoint MODULE name (no .weight
+  // suffix); the format is resolved from the parsed config_groups.
+
+  enum class Form { BlockFp8, ChannelFp8, Nvfp4, Bf16 };
+
+  Form form_of(const std::string& module) {
+    if (cfg.quant_kind == Qwen35QuantKind::Fp8Block) return Form::BlockFp8;
+    switch (cfg.tensor_quant(module)) {
+      case Qwen35TensorQuant::Bf16: return Form::Bf16;
+      case Qwen35TensorQuant::Fp8Channel: return Form::ChannelFp8;
+      case Qwen35TensorQuant::Nvfp4:
+        fail(module + ": NVFP4 is implemented for the dense MLP only "
+                       "(the release's targets keep it there)");
+    }
+    fail(module + ": unreachable");
+  }
+
+  // A channel-FP8 matrix: e4m3 [N, K] payload + BF16 [N, 1] scales.
+  struct ChannelSource {
+    const QwenExpectedTensor* payload_entry = nullptr;
+    const QwenExpectedTensor* scale_entry = nullptr;
+    const TensorInfo* payload = nullptr;
+    const TensorInfo* scales = nullptr;
+    int64_t N = 0, K = 0, SB = 0;  // SB: the resident grid's column block (pow2 >= K)
+  };
+
+  ChannelSource channel_source(const std::string& module) {
+    const std::string pname = module + ".weight";
+    const QwenExpectedTensor& e = expected(pname);
+    if (e.shape.size() != 2) fail(pname + ": fp8 matrix needs 2 dims");
+    const std::string sname = module + ".weight_scale";
+    const QwenExpectedTensor& se = expected(sname);
+    if (se.shape.size() != 2 || se.shape[0] != e.shape[0] || se.shape[1] != 1)
+      fail(sname + ": the channel scale grid must be [N, 1]");
+    ChannelSource s;
+    // As in fp8_source: the counting pass never dereferences a source.
+    if (copy) {
+      s.payload = &source(pname);
+      s.scales = &source(sname);
+    } else {
+      s.payload = nullptr;
+      s.scales = nullptr;
+    }
+    s.payload_entry = &e;
+    s.scale_entry = &se;
+    s.N = e.shape[0];
+    s.K = e.shape[1];
+    s.SB = pow2_ceil(s.K);
+    return s;
+  }
+
+  GlmQuantMatrix channel_matrix(const ChannelSource& s, int64_t rows, int64_t cols) {
+    GlmQuantMatrix q;
+    q.rows = rows;
+    q.cols = cols;
+    q.scale_block_rows = 1;
+    q.scale_block_cols = s.SB;
+    return q;
+  }
+
+  // Rows [r0, +rn): payload rows contiguous, one widened F32 scale per row.
+  // No 128-alignment contract: a channel matrix slices anywhere.
+  GlmQuantMatrix load_channel_rows(const std::string& module, int64_t r0, int64_t rn) {
+    ChannelSource s = channel_source(module);
+    check_range(module, r0, rn, s.N);
+    GlmQuantMatrix q = channel_matrix(s, rn, s.K);
+    q.payload = static_cast<const uint8_t*>(bump.alloc(static_cast<size_t>(rn) * s.K));
+    q.scales = static_cast<const float*>(bump.alloc(static_cast<size_t>(rn) * 4));
+    if (copy) {
+      std::memcpy(bump.host(const_cast<uint8_t*>(q.payload)),
+                  static_cast<const uint8_t*>(s.payload->data) + static_cast<size_t>(r0) * s.K,
+                  static_cast<size_t>(rn) * s.K);
+      widen_bf16_to_f32(static_cast<const uint16_t*>(s.scales->data) + static_cast<size_t>(r0),
+                        static_cast<float*>(bump.host(const_cast<float*>(q.scales))),
+                        static_cast<size_t>(rn));
+    }
+    note_read(*s.payload_entry, static_cast<size_t>(rn) * s.K);
+    note_read(*s.scale_entry, static_cast<size_t>(rn) * 2);
+    if (copy) {
+      consumed(*s.payload);
+      consumed(*s.scales);
+    }
+    return q;
+  }
+
+  // Column range: strided payload rows; the per-row scales are not a sliced
+  // axis, so they copy whole.
+  GlmQuantMatrix load_channel_cols(const std::string& module, int64_t c0, int64_t cn) {
+    ChannelSource s = channel_source(module);
+    check_range(module + " cols", c0, cn, s.K);
+    GlmQuantMatrix q = channel_matrix(s, s.N, cn);
+    q.payload = static_cast<const uint8_t*>(bump.alloc(static_cast<size_t>(s.N) * cn));
+    q.scales = static_cast<const float*>(bump.alloc(static_cast<size_t>(s.N) * 4));
+    if (copy) {
+      const uint8_t* sp = static_cast<const uint8_t*>(s.payload->data);
+      uint8_t* dp = static_cast<uint8_t*>(bump.host(const_cast<uint8_t*>(q.payload)));
+      for (int64_t r = 0; r < s.N; ++r)
+        std::memcpy(dp + static_cast<size_t>(r) * cn, sp + static_cast<size_t>(r) * s.K + c0,
+                    static_cast<size_t>(cn));
+      widen_bf16_to_f32(static_cast<const uint16_t*>(s.scales->data),
+                        static_cast<float*>(bump.host(const_cast<float*>(q.scales))), s.N);
+    }
+    note_read(*s.payload_entry, static_cast<size_t>(s.N) * cn);
+    note_read(*s.scale_entry, static_cast<size_t>(s.N) * 2);
+    if (copy) {
+      consumed(*s.payload);
+      consumed(*s.scales);
+    }
+    return q;
+  }
+
+  // Channel-FP8 row segments concatenated (the GDN's merged in_proj_qkv):
+  // payload and scale rows both concatenate row-for-row.
+  GlmQuantMatrix merge_channel_segments(const std::string& module, int64_t total_rows, int64_t K,
+                                        const std::vector<std::array<int64_t, 3>>& segs) {
+    ChannelSource s = channel_source(module);
+    if (K != s.K) fail(module + ": merged width disagrees with the checkpoint");
+    GlmQuantMatrix q = channel_matrix(s, total_rows, K);
+    q.payload = static_cast<const uint8_t*>(bump.alloc(static_cast<size_t>(total_rows) * K));
+    q.scales = static_cast<const float*>(bump.alloc(static_cast<size_t>(total_rows) * 4));
+    if (copy) {
+      uint8_t* dp = reinterpret_cast<uint8_t*>(bump.host(const_cast<uint8_t*>(q.payload)));
+      float* ds = static_cast<float*>(bump.host(const_cast<float*>(q.scales)));
+      const uint8_t* sp = static_cast<const uint8_t*>(s.payload->data);
+      const uint16_t* ss = static_cast<const uint16_t*>(s.scales->data);
+      for (const auto& sg : segs) {
+        const int64_t src_row = sg[0], rows = sg[1], dst_row = sg[2];
+        check_range(module, src_row, rows, s.N);
+        std::memcpy(dp + static_cast<size_t>(dst_row) * K,
+                    sp + static_cast<size_t>(src_row) * K, static_cast<size_t>(rows) * K);
+        widen_bf16_to_f32(ss + static_cast<size_t>(src_row), ds + static_cast<size_t>(dst_row),
+                          static_cast<size_t>(rows));
+      }
+      consumed(*s.payload);
+      consumed(*s.scales);
+    }
+    for (const auto& sg : segs) {
+      note_read(*s.payload_entry, static_cast<size_t>(sg[1]) * K);
+      note_read(*s.scale_entry, static_cast<size_t>(sg[1]) * 2);
+    }
+    return q;
+  }
+
+  // An NVFP4 matrix (compressed-tensors naming): weight_packed U8 [N, K/2]
+  // + weight_scale e4m3 [N, K/16]; the resident global slot holds
+  // weight_global_scale itself — this release's global is already the
+  // divisor the kernels apply to the finished dot once (models/
+  // quant_matrix.hpp), so load_fp4_global stages it as is.
+  struct Fp4Source {
+    const QwenExpectedTensor* payload_entry = nullptr;
+    const QwenExpectedTensor* scale_entry = nullptr;
+    const TensorInfo* payload = nullptr;
+    const TensorInfo* scales = nullptr;
+    int64_t N = 0, K = 0;
+  };
+
+  Fp4Source fp4_source(const std::string& module) {
+    const std::string pname = module + ".weight_packed";
+    const QwenExpectedTensor& e = expected(pname);
+    if (e.shape.size() != 2 || e.shape[1] <= 0) fail(pname + ": packed matrix needs 2 dims");
+    const int64_t N = e.shape[0], K = e.shape[1] * 2;
+    if (K % kFp4Group != 0) fail(pname + ": fp4 K must be a multiple of 16");
+    const std::string sname = module + ".weight_scale";
+    const QwenExpectedTensor& se = expected(sname);
+    if (se.shape.size() != 2 || se.shape[0] != N || se.shape[1] != K / kFp4Group)
+      fail(sname + ": the NVFP4 scale grid must be [N, K/16]");
+    Fp4Source s;
+    if (copy) {
+      s.payload = &source(pname);
+      s.scales = &source(sname);
+    } else {
+      s.payload = nullptr;
+      s.scales = nullptr;
+    }
+    s.payload_entry = &e;
+    s.scale_entry = &se;
+    s.N = N;
+    s.K = K;
+    return s;
+  }
+
+  // weight_global_scale into a bump slot AS IS: the kernels divide the
+  // finished dot by the slot once, and this release's global is a
+  // weight-side divisor (per-layer RMS against the FP8 sibling release
+  // matches at q*s_block/ws, within 6% on every layer; the reciprocal or
+  // the product with the input global are orders of magnitude off). The
+  // input_global_scale is the activation-side factor of the W4A4 recipe;
+  // under W4A16 serving (exact BF16 activations) it has no subject, so it
+  // is read for the byte reconciliation and never resident.
+  void load_fp4_global(const std::string& module, float* slot) {
+    const QwenExpectedTensor& eg = expected(module + ".weight_global_scale");
+    const QwenExpectedTensor& ei = expected(module + ".input_global_scale");
+    if (copy) {
+      const TensorInfo& t = source(module + ".weight_global_scale");
+      float ws2 = 0.f;
+      std::memcpy(&ws2, t.data, 4);
+      if (!(ws2 > 0.0f) || !std::isfinite(ws2))
+        fail("'" + eg.name + "' is not a positive finite scale");
+      *bump.host(slot) = ws2;
+      consumed(t);
+      consumed(source(module + ".input_global_scale"));
+    }
+    note_read(eg, 4);
+    note_read(ei, 4);
+  }
+
+  GlmFp4Matrix load_fp4_rows(const std::string& module, int64_t r0, int64_t rn, float* global) {
+    Fp4Source s = fp4_source(module);
+    check_range(module, r0, rn, s.N);
+    const int64_t pc = s.K / 2, sc = s.K / kFp4Group;
+    GlmFp4Matrix q;
+    q.rows = rn;
+    q.cols = s.K;
+    q.scale_group = kFp4Group;
+    q.payload = static_cast<const uint8_t*>(bump.alloc(static_cast<size_t>(rn) * pc));
+    q.scales = static_cast<const uint8_t*>(bump.alloc(static_cast<size_t>(rn) * sc));
+    if (copy) {
+      std::memcpy(bump.host(const_cast<uint8_t*>(q.payload)),
+                  static_cast<const uint8_t*>(s.payload->data) + static_cast<size_t>(r0) * pc,
+                  static_cast<size_t>(rn) * pc);
+      std::memcpy(bump.host(const_cast<uint8_t*>(q.scales)),
+                  static_cast<const uint8_t*>(s.scales->data) + static_cast<size_t>(r0) * sc,
+                  static_cast<size_t>(rn) * sc);
+      consumed(*s.payload);
+      consumed(*s.scales);
+    }
+    note_read(*s.payload_entry, static_cast<size_t>(rn) * pc);
+    note_read(*s.scale_entry, static_cast<size_t>(rn) * sc);
+    load_fp4_global(module, global);
+    q.global_scale = global;
+    return q;
+  }
+
+  // Whole scale blocks on the sliced axis (16-aligned bounds), every row's
+  // payload and scale rows packed.
+  GlmFp4Matrix load_fp4_cols(const std::string& module, int64_t c0, int64_t cn, float* global) {
+    Fp4Source s = fp4_source(module);
+    check_range(module + " cols", c0, cn, s.K);
+    if (c0 % kFp4Group != 0 || cn % kFp4Group != 0)
+      fail(module + ": fp4 column slice needs 16-aligned bounds");
+    const int64_t pc = s.K / 2, lc = cn / 2, sc = s.K / kFp4Group, lsc = cn / kFp4Group;
+    GlmFp4Matrix q;
+    q.rows = s.N;
+    q.cols = cn;
+    q.scale_group = kFp4Group;
+    q.payload = static_cast<const uint8_t*>(bump.alloc(static_cast<size_t>(s.N) * lc));
+    q.scales = static_cast<const uint8_t*>(bump.alloc(static_cast<size_t>(s.N) * lsc));
+    if (copy) {
+      const uint8_t* sp = static_cast<const uint8_t*>(s.payload->data);
+      uint8_t* dp = static_cast<uint8_t*>(bump.host(const_cast<uint8_t*>(q.payload)));
+      const uint8_t* ss = static_cast<const uint8_t*>(s.scales->data);
+      uint8_t* ds = static_cast<uint8_t*>(bump.host(const_cast<uint8_t*>(q.scales)));
+      for (int64_t r = 0; r < s.N; ++r) {
+        std::memcpy(dp + static_cast<size_t>(r) * lc, sp + static_cast<size_t>(r) * pc + c0 / 2,
+                    static_cast<size_t>(lc));
+        std::memcpy(ds + static_cast<size_t>(r) * lsc, ss + static_cast<size_t>(r) * sc + c0 / 16,
+                    static_cast<size_t>(lsc));
+      }
+      consumed(*s.payload);
+      consumed(*s.scales);
+    }
+    note_read(*s.payload_entry, static_cast<size_t>(s.N) * lc);
+    note_read(*s.scale_entry, static_cast<size_t>(s.N) * lsc);
+    load_fp4_global(module, global);
+    q.global_scale = global;
+    return q;
+  }
+
+  // A full/GDN projection's row slice in its release's format (the MLP's
+  // NVFP4/BF16 forms do not reach here: form_of refuses NVFP4 off the MLP,
+  // and the draft layer's BF16 matrices do).
+  GlmQuantMatrix load_attn_rows(const std::string& module, int64_t r0, int64_t rn,
+                                const uint16_t** bf16_out) {
+    switch (form_of(module)) {
+      case Form::BlockFp8:
+        return load_fp8_native_rows(module + ".weight", r0, rn);
+      case Form::ChannelFp8:
+        return load_channel_rows(module, r0, rn);
+      case Form::Bf16:
+        *bf16_out = load_bf16_rows(module + ".weight", r0, rn);
+        return {};
+      case Form::Nvfp4: break;  // form_of refused
+    }
+    return {};
+  }
+
+  GlmQuantMatrix load_attn_cols(const std::string& module, int64_t c0, int64_t cn,
+                                const uint16_t** bf16_out) {
+    switch (form_of(module)) {
+      case Form::BlockFp8:
+        return load_fp8_native_cols(module + ".weight", c0, cn);
+      case Form::ChannelFp8:
+        return load_channel_cols(module, c0, cn);
+      case Form::Bf16:
+        *bf16_out = load_bf16_cols(module + ".weight", c0, cn);
+        return {};
+      case Form::Nvfp4: break;  // form_of refused
+    }
+    return {};
+  }
+
   void build_full(const std::string& p) {
     const int64_t d = cfg.head_dim;
     QwenFullAttnResident& a = out.full;
@@ -287,12 +603,18 @@ struct Qwen35LoaderFamily::Builder : WeightBuilder<QwenExpectedTensor> {
     const int64_t kvn = static_cast<int64_t>(geo.local_kv_heads) * d;
     const int64_t o0 = static_cast<int64_t>(geo.head_begin) * d;
     const int64_t on = static_cast<int64_t>(geo.local_heads) * d;
-    a.q_proj_fp8 = load_fp8_native_rows(p + "self_attn.q_proj.weight", q0, qn);
-    a.k_proj_fp8 = load_fp8_native_rows(p + "self_attn.k_proj.weight", kv0, kvn);
-    a.v_proj_fp8 = load_fp8_native_rows(p + "self_attn.v_proj.weight", kv0, kvn);
-    a.o_proj_fp8 = load_fp8_native_cols(p + "self_attn.o_proj.weight", o0, on);
+    a.q_proj_fp8 = load_attn_rows(p + "self_attn.q_proj", q0, qn, &a.q_proj);
+    a.k_proj_fp8 = load_attn_rows(p + "self_attn.k_proj", kv0, kvn, &a.k_proj);
+    a.v_proj_fp8 = load_attn_rows(p + "self_attn.v_proj", kv0, kvn, &a.v_proj);
+    a.o_proj_fp8 = load_attn_cols(p + "self_attn.o_proj", o0, on, &a.o_proj);
     a.q_norm = load_bf16(p + "self_attn.q_norm.weight");
     a.k_norm = load_bf16(p + "self_attn.k_norm.weight");
+    // The mixed release's FP8 kv_cache_scheme scalars: bound for the
+    // binding check, read for the byte reconciliation, never resident.
+    if (cfg.quant_kind == Qwen35QuantKind::Nvfp4Mixed && out.layer != cfg.mtp_layer()) {
+      load_raw(p + "self_attn.k_scale");
+      load_raw(p + "self_attn.v_scale");
+    }
   }
 
   void build_gdn(const std::string& p) {
@@ -306,13 +628,23 @@ struct Qwen35LoaderFamily::Builder : WeightBuilder<QwenExpectedTensor> {
     g.local_value_heads = static_cast<int>(lv);
     // in_proj_qkv rows [q | k | v] at the local geometry (world=1: whole).
     const int64_t local_rows = 2 * lk * dk + lv * dv;
-    const std::string qkv_name = p + "linear_attn.in_proj_qkv.weight";
-    g.in_proj_qkv_fp8 = merge_fp8_segments(
-        qkv_name, local_rows, H,
-        {{r * lk * dk, lk * dk, 0},
-         {K + r * lk * dk, lk * dk, lk * dk},
-         {2 * K + r * lv * dv, lv * dv, 2 * lk * dk}});
-    if (copy) consumed(source(qkv_name));
+    const std::string qkv_mod = p + "linear_attn.in_proj_qkv";
+    const std::vector<std::array<int64_t, 3>> segs = {
+        {r * lk * dk, lk * dk, 0},
+        {K + r * lk * dk, lk * dk, lk * dk},
+        {2 * K + r * lv * dv, lv * dv, 2 * lk * dk}};
+    switch (form_of(qkv_mod)) {
+      case Form::BlockFp8:
+        g.in_proj_qkv_fp8 = merge_fp8_segments(qkv_mod + ".weight", local_rows, H, segs);
+        break;
+      case Form::ChannelFp8:
+        g.in_proj_qkv_fp8 = merge_channel_segments(qkv_mod, local_rows, H, segs);
+        break;
+      case Form::Bf16:
+        fail(qkv_mod + ": the draft layer is never a GDN layer");
+      case Form::Nvfp4: break;  // form_of refused
+    }
+    if (copy) consumed(source(qkv_mod + ".weight"));
     // The conv channels follow the same three segments ([C, 1, w] rows).
     const int64_t w = cfg.gdn_conv_width;
     uint16_t* conv = static_cast<uint16_t*>(bump.alloc(static_cast<size_t>(local_rows) *
@@ -323,24 +655,63 @@ struct Qwen35LoaderFamily::Builder : WeightBuilder<QwenExpectedTensor> {
     copy_rows_into(conv_name, 2 * K + r * lv * dv, lv * dv, conv, 2 * lk * dk, w);
     if (copy) consumed(source(conv_name));
     g.conv = conv;
-    g.in_proj_z_fp8 =
-        load_fp8_native_rows(p + "linear_attn.in_proj_z.weight", r * lv * dv, lv * dv);
+    g.in_proj_z_fp8 = load_attn_rows(p + "linear_attn.in_proj_z", r * lv * dv, lv * dv,
+                                     &g.in_proj_z);
     g.in_proj_a = load_bf16_rows(p + "linear_attn.in_proj_a.weight", r * lv, lv);
     g.in_proj_b = load_bf16_rows(p + "linear_attn.in_proj_b.weight", r * lv, lv);
     g.a_log = load_bf16_as_f32(p + "linear_attn.A_log", r * lv, lv);
     g.dt_bias = load_bf16_as_f32(p + "linear_attn.dt_bias", r * lv, lv);
     g.norm = load_bf16(p + "linear_attn.norm.weight");
     g.out_proj_fp8 =
-        load_fp8_native_cols(p + "linear_attn.out_proj.weight", r * lv * dv, lv * dv);
+        load_attn_cols(p + "linear_attn.out_proj", r * lv * dv, lv * dv, &g.out_proj);
   }
 
   void build_mlp(const std::string& p) {
     const int64_t li = geo.local_inter;
     const int64_t r0 = static_cast<int64_t>(geo.rank) * li;
     Qwen35DenseMlpResident& m = out.mlp;
-    m.gate_fp8 = load_fp8_native_rows(p + "mlp.gate_proj.weight", r0, li);
-    m.up_fp8 = load_fp8_native_rows(p + "mlp.up_proj.weight", r0, li);
-    m.down_fp8 = load_fp8_native_cols(p + "mlp.down_proj.weight", r0, li);
+    m.inter = li;
+    const std::string gate = p + "mlp.gate_proj", up = p + "mlp.up_proj",
+                      down = p + "mlp.down_proj";
+    if (cfg.quant_kind == Qwen35QuantKind::Fp8Block) {
+      m.gate_fp8 = load_fp8_native_rows(gate + ".weight", r0, li);
+      m.up_fp8 = load_fp8_native_rows(up + ".weight", r0, li);
+      m.down_fp8 = load_fp8_native_cols(down + ".weight", r0, li);
+      return;
+    }
+    // The mixed release: the fp4 global slots only exist for this release
+    // (the FP8 release's resident image layout must not shift).
+    float* globals = static_cast<float*>(bump.alloc(3 * sizeof(float)));
+    if (copy) {
+      float* g = bump.host(globals);
+      g[0] = g[1] = g[2] = 1.0f;  // only the fp4 matrices overwrite these
+    }
+    const std::string rows_mods[2] = {gate, up};
+    for (int i = 0; i < 2; ++i) {
+      switch (cfg.tensor_quant(rows_mods[i])) {
+        case Qwen35TensorQuant::Bf16:
+          *(i == 0 ? &m.gate : &m.up) = load_bf16_rows(rows_mods[i] + ".weight", r0, li);
+          break;
+        case Qwen35TensorQuant::Fp8Channel:
+          *(i == 0 ? &m.gate_fp8 : &m.up_fp8) = load_channel_rows(rows_mods[i], r0, li);
+          break;
+        case Qwen35TensorQuant::Nvfp4:
+          *(i == 0 ? &m.gate_fp4 : &m.up_fp4) = load_fp4_rows(rows_mods[i], r0, li, globals + i);
+          break;
+      }
+    }
+    // down_proj slices its K (the SwiGLU's intermediate axis) as columns.
+    switch (cfg.tensor_quant(down)) {
+      case Qwen35TensorQuant::Bf16:
+        m.down = load_bf16_cols(down + ".weight", r0, li);
+        break;
+      case Qwen35TensorQuant::Fp8Channel:
+        m.down_fp8 = load_channel_cols(down, r0, li);
+        break;
+      case Qwen35TensorQuant::Nvfp4:
+        m.down_fp4 = load_fp4_cols(down, r0, li, globals + 2);
+        break;
+    }
   }
 
   void build_layer(int layer) {
@@ -369,7 +740,9 @@ struct Qwen35LoaderFamily::Builder : WeightBuilder<QwenExpectedTensor> {
 
 const char* Qwen35LoaderFamily::who() { return "qwen35 loader"; }
 
-uint64_t Qwen35LoaderFamily::loader_format() { return 2; }
+// 3: the NVFP4 global slot holds the weight-side divisor itself (2026-10-06;
+// the 2-era images hold its reciprocal, and the kernels divide by the slot).
+uint64_t Qwen35LoaderFamily::loader_format() { return 3; }
 
 int Qwen35LoaderFamily::max_layer(const Config& c) {
   return c.num_hidden_layers + (c.mtp_layer() >= 0 ? 1 : 0);
@@ -416,7 +789,11 @@ size_t Qwen35LoaderFamily::globals_bytes(const Config& c, int rank, int world,
   const size_t Vn = static_cast<size_t>(V * (rank + 1) / world) - static_cast<size_t>(V * rank / world);
   size_t b = 0;
   b += align_up_256(V * H * 2);   // embed
-  b += align_up_256(Vn * H * 2);  // lm head shard
+  if (c.quant_kind == Qwen35QuantKind::Nvfp4Mixed &&
+      c.tensor_quant("lm_head") == Qwen35TensorQuant::Fp8Channel)
+    b += align_up_256(Vn * H) + align_up_256(Vn * 4);  // head: e4m3 + F32 rows
+  else
+    b += align_up_256(Vn * H * 2);  // lm head shard
   b += align_up_256(H * 2);       // final norm
   if (c.mtp_layer() >= 0) {
     b += align_up_256(H * 2 * H * 2);  // mtp.fc [H, 2H] BF16
@@ -457,16 +834,39 @@ void Qwen35LoaderFamily::build_globals(const Config& c, const Geometry& geo,
   const int64_t V0 = V * geo.rank / geo.world;
   const int64_t Vn = V * (geo.rank + 1) / geo.world - V0;
   const size_t H = static_cast<size_t>(c.hidden_size);
-  const TensorInfo& lm = lookup("lm_head.weight");
-  uint16_t* head = static_cast<uint16_t*>(bump.alloc(static_cast<size_t>(Vn) * H * 2));
-  std::memcpy(reinterpret_cast<uint8_t*>(bump.host(head)),
-              static_cast<const uint8_t*>(lm.data) + static_cast<size_t>(V0) * H * 2,
-              static_cast<size_t>(Vn) * H * 2);
-  source_bytes += static_cast<uint64_t>(Vn) * H * 2;
-  verbatim_bytes += static_cast<uint64_t>(Vn) * H * 2;
-  out.lm_head = head;
   out.lm_vocab_begin = geo.lm_vocab_begin;
   out.lm_vocab_count = geo.lm_vocab_count;
+  if (c.quant_kind == Qwen35QuantKind::Nvfp4Mixed &&
+      c.tensor_quant("lm_head") == Qwen35TensorQuant::Fp8Channel) {
+    // The mixed release's native head: e4m3 rows + BF16 [N, 1] scales
+    // widened to F32 (channel grid, scale_block_rows = 1).
+    const TensorInfo& lm = lookup("lm_head.weight");
+    const TensorInfo& ls = lookup("lm_head.weight_scale");
+    uint8_t* payload = static_cast<uint8_t*>(bump.alloc(static_cast<size_t>(Vn) * H));
+    std::memcpy(bump.host(payload), static_cast<const uint8_t*>(lm.data) + V0 * H,
+                static_cast<size_t>(Vn) * H);
+    float* scales = static_cast<float*>(bump.alloc(static_cast<size_t>(Vn) * 4));
+    const uint16_t* ss = static_cast<const uint16_t*>(ls.data) + V0;
+    float* hs = bump.host(scales);
+    for (int64_t i = 0; i < Vn; ++i) hs[i] = bf16_bits_to_float(ss[i]);
+    source_bytes += static_cast<uint64_t>(Vn) * H + static_cast<uint64_t>(Vn) * 2;
+    out.lm_head_fp8.payload = payload;
+    out.lm_head_fp8.scales = scales;
+    out.lm_head_fp8.rows = Vn;
+    out.lm_head_fp8.cols = static_cast<int>(H);
+    out.lm_head_fp8.scale_block_rows = 1;
+    out.lm_head_fp8.scale_block_cols = static_cast<int>(pow2_ceil(static_cast<int64_t>(H)));
+    out.lm_head = nullptr;
+  } else {
+    const TensorInfo& lm = lookup("lm_head.weight");
+    uint16_t* head = static_cast<uint16_t*>(bump.alloc(static_cast<size_t>(Vn) * H * 2));
+    std::memcpy(reinterpret_cast<uint8_t*>(bump.host(head)),
+                static_cast<const uint8_t*>(lm.data) + static_cast<size_t>(V0) * H * 2,
+                static_cast<size_t>(Vn) * H * 2);
+    source_bytes += static_cast<uint64_t>(Vn) * H * 2;
+    verbatim_bytes += static_cast<uint64_t>(Vn) * H * 2;
+    out.lm_head = head;
+  }
   out.final_norm = copy_global("model.language_model.norm.weight");
   if (c.mtp_layer() >= 0) {
     out.mtp_fc = copy_global("mtp.fc.weight");

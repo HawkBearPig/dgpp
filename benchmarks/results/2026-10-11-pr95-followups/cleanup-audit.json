@@ -1,0 +1,58 @@
+[
+  {
+    "address": "192.168.88.11",
+    "host": "edgexpert-409e",
+    "reclaimed_bytes": 326294953984,
+    "free_bytes": 310135754752,
+    "removed_files": 4,
+    "retained_files": 19,
+    "new_files": 6,
+    "unexpected_missing": [],
+    "deleted_still_present": [],
+    "retained_metadata_changed": [],
+    "old_checkpoint_metadata_preserved": true,
+    "new_quant_complete": true
+  },
+  {
+    "address": "192.168.88.12",
+    "host": "gx10-e9cd",
+    "reclaimed_bytes": 326294953984,
+    "free_bytes": 528228225024,
+    "removed_files": 4,
+    "retained_files": 14,
+    "new_files": 4,
+    "unexpected_missing": [],
+    "deleted_still_present": [],
+    "retained_metadata_changed": [],
+    "old_checkpoint_metadata_preserved": true,
+    "new_quant_complete": true
+  },
+  {
+    "address": "192.168.88.13",
+    "host": "spark-a289",
+    "reclaimed_bytes": 579764785152,
+    "free_bytes": 787355836416,
+    "removed_files": 12,
+    "retained_files": 12,
+    "new_files": 2,
+    "unexpected_missing": [],
+    "deleted_still_present": [],
+    "retained_metadata_changed": [],
+    "old_checkpoint_metadata_preserved": true,
+    "new_quant_complete": true
+  },
+  {
+    "address": "192.168.88.14",
+    "host": "aitopatom-4b80",
+    "reclaimed_bytes": 579764789248,
+    "free_bytes": 855495364608,
+    "removed_files": 12,
+    "retained_files": 12,
+    "new_files": 2,
+    "unexpected_missing": [],
+    "deleted_still_present": [],
+    "retained_metadata_changed": [],
+    "old_checkpoint_metadata_preserved": true,
+    "new_quant_complete": true
+  }
+]

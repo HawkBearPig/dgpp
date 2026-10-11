@@ -1,0 +1,24 @@
+diff --git a/src/kernels/fp4_gemv.cuh b/src/kernels/fp4_gemv.cuh
+index ab06eca7..9a32277f 100644
+--- a/src/kernels/fp4_gemv.cuh
++++ b/src/kernels/fp4_gemv.cuh
+@@ -298 +298 @@ __device__ __forceinline__ void load_window(const uint16_t* __restrict__ sx,
+-// f16 — e2m1 x e4m3 carries at most five significant bits, and every
++// f16 — e2m1 x e4m3 carries at most six significant bits, and every
+diff --git a/src/kernels/fp4w_gemm.cu b/src/kernels/fp4w_gemm.cu
+index 5bfdff0f..7304bffe 100644
+--- a/src/kernels/fp4w_gemm.cu
++++ b/src/kernels/fp4w_gemm.cu
+@@ -53 +53 @@ __device__ __forceinline__ void ldsm_x4(uint32_t (&r)[4], const void* p) {
+-// bf16x2 word: the products carry <= 5 significant bits, so f16, f32 and
++// bf16x2 word: the products carry <= 6 significant bits, so f16, f32 and
+diff --git a/src/kernels/glm_moe.cu b/src/kernels/glm_moe.cu
+index d1e137c4..2d07850b 100644
+--- a/src/kernels/glm_moe.cu
++++ b/src/kernels/glm_moe.cu
+@@ -3302 +3302 @@ __global__ __launch_bounds__(fp4_pipe3::kThreads, 1) void moe_grouped_mma_fp4_pi
+-//     needs, cvt e2m1x2 -> f16x2, x scale in f16 — exact, <= 5 significant
++//     needs, cvt e2m1x2 -> f16x2, x scale in f16 — exact, <= 6 significant
+@@ -3329 +3329 @@ __device__ __forceinline__ void ldmatrix_x4(uint32_t (&r)[4], const void* smem)
+-// bf16x2 word: the products carry <= 5 significant bits, so f16, f32 and
++// bf16x2 word: the products carry <= 6 significant bits, so f16, f32 and

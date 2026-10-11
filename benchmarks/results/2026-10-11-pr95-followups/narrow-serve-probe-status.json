@@ -1,0 +1,42 @@
+[
+  {
+    "label": "narrow-v17-w4-probe",
+    "command": [
+      "python3",
+      "/home/stephen/dgpp/pr95-followups-20261011/campaign.py",
+      "nvfp4",
+      "4",
+      "narrow-v17-w4-probe",
+      "--draft-probe"
+    ],
+    "started": "2026-10-11T03:49:19.062438+00:00",
+    "returncode": 0,
+    "median_tps": 58.535913504579575,
+    "steps": [
+      105,
+      105,
+      105
+    ],
+    "same_transcripts": true
+  },
+  {
+    "label": "narrow-v16-w4-probe",
+    "command": [
+      "python3",
+      "/home/stephen/dgpp/pr95-followups-20261011/campaign.py",
+      "nvfp4",
+      "4",
+      "narrow-v16-w4-probe",
+      "--draft-probe"
+    ],
+    "started": "2026-10-11T03:50:08.157672+00:00",
+    "returncode": 0,
+    "median_tps": 58.433969614335794,
+    "steps": [
+      105,
+      105,
+      105
+    ],
+    "same_transcripts": true
+  }
+]

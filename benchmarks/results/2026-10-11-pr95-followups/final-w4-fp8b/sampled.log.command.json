@@ -1,0 +1,21 @@
+{
+  "command": [
+    "python3",
+    "scripts/serve_load.py",
+    "127.0.0.1",
+    "18081",
+    "--concurrency",
+    "1,4",
+    "--classes",
+    "code",
+    "--max-tokens",
+    "128",
+    "--temperature",
+    "0.7",
+    "--json-out",
+    "/home/stephen/dgpp/pr95-followups-20261011/final-w4-fp8b/sampled.json"
+  ],
+  "started": "2026-10-11T03:26:48.573741+00:00",
+  "returncode": 0,
+  "finished": "2026-10-11T03:26:54.642823+00:00"
+}

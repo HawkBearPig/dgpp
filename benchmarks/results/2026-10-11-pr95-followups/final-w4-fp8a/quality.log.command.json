@@ -1,0 +1,24 @@
+{
+  "command": [
+    "python3",
+    "scripts/serve_eval.py",
+    "127.0.0.1",
+    "18081",
+    "--out",
+    "/home/stephen/dgpp/pr95-followups-20261011/final-w4-fp8a/quality",
+    "--tasks",
+    "gsm8k,extract",
+    "--limit",
+    "100",
+    "--concurrency",
+    "4",
+    "--max-tokens",
+    "4096",
+    "--no-think",
+    "--seed",
+    "20261010"
+  ],
+  "started": "2026-10-11T03:06:14.202271+00:00",
+  "returncode": 0,
+  "finished": "2026-10-11T03:09:40.515728+00:00"
+}

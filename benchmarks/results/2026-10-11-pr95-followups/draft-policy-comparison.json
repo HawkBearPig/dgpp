@@ -1,0 +1,269 @@
+{
+  "fp8_tps": 61.19951040391676,
+  "trials": [
+    {
+      "label": "draft-probe-w4-full7",
+      "command": [
+        "python3",
+        "/home/stephen/dgpp/pr95-followups-20261011/campaign.py",
+        "nvfp4",
+        "4",
+        "draft-probe-w4-full7",
+        "--draft-probe",
+        "--schedule-off"
+      ],
+      "started": "2026-10-11T03:31:12.046138+00:00",
+      "returncode": 0,
+      "finished": "2026-10-11T03:32:01.907295+00:00",
+      "median_tps": 56.55857694184447,
+      "steps": [
+        105,
+        105,
+        105
+      ],
+      "same_transcripts": true,
+      "vs_fp8_pct": -7.583285277026119
+    },
+    {
+      "label": "draft-probe-w4-deeper",
+      "command": [
+        "python3",
+        "/home/stephen/dgpp/pr95-followups-20261011/campaign.py",
+        "nvfp4",
+        "4",
+        "draft-probe-w4-deeper",
+        "--draft-probe",
+        "--row-ms",
+        "1"
+      ],
+      "started": "2026-10-11T03:32:01.928668+00:00",
+      "returncode": 0,
+      "finished": "2026-10-11T03:32:51.005067+00:00",
+      "median_tps": 57.123655913978496,
+      "steps": [
+        105,
+        105,
+        105
+      ],
+      "same_transcripts": true,
+      "vs_fp8_pct": -6.659946236559122
+    },
+    {
+      "label": "draft-probe-w4-shallower",
+      "command": [
+        "python3",
+        "/home/stephen/dgpp/pr95-followups-20261011/campaign.py",
+        "nvfp4",
+        "4",
+        "draft-probe-w4-shallower",
+        "--draft-probe",
+        "--row-ms",
+        "4"
+      ],
+      "started": "2026-10-11T03:32:51.026328+00:00",
+      "returncode": 0,
+      "finished": "2026-10-11T03:33:37.874689+00:00",
+      "median_tps": 58.43798698322485,
+      "steps": [
+        105,
+        105,
+        105
+      ],
+      "same_transcripts": true,
+      "vs_fp8_pct": -4.512329269410575
+    },
+    {
+      "label": "draft-probe-w4-deepest",
+      "command": [
+        "python3",
+        "/home/stephen/dgpp/pr95-followups-20261011/campaign.py",
+        "nvfp4",
+        "4",
+        "draft-probe-w4-deepest",
+        "--draft-probe",
+        "--row-ms",
+        "0.5"
+      ],
+      "started": "2026-10-11T03:33:37.894743+00:00",
+      "returncode": 0,
+      "finished": "2026-10-11T03:34:27.485484+00:00",
+      "median_tps": 55.56766179995642,
+      "steps": [
+        105,
+        105,
+        105
+      ],
+      "same_transcripts": true,
+      "vs_fp8_pct": -9.202440618871199
+    },
+    {
+      "label": "draft-probe-w4-row8",
+      "command": [
+        "python3",
+        "/home/stephen/dgpp/pr95-followups-20261011/campaign.py",
+        "nvfp4",
+        "4",
+        "draft-probe-w4-row8",
+        "--draft-probe",
+        "--row-ms",
+        "8"
+      ],
+      "started": "2026-10-11T03:34:51.235054+00:00",
+      "returncode": 0,
+      "finished": "2026-10-11T03:35:38.162684+00:00",
+      "median_tps": 58.317705712848195,
+      "steps": [
+        108,
+        108,
+        108
+      ],
+      "same_transcripts": true,
+      "vs_fp8_pct": -4.708868865206039
+    },
+    {
+      "label": "draft-probe-w4-row16",
+      "command": [
+        "python3",
+        "/home/stephen/dgpp/pr95-followups-20261011/campaign.py",
+        "nvfp4",
+        "4",
+        "draft-probe-w4-row16",
+        "--draft-probe",
+        "--row-ms",
+        "16"
+      ],
+      "started": "2026-10-11T03:35:38.183254+00:00",
+      "returncode": 0,
+      "finished": "2026-10-11T03:36:25.433601+00:00",
+      "median_tps": 56.53976630229929,
+      "steps": [
+        114,
+        114,
+        114
+      ],
+      "same_transcripts": true,
+      "vs_fp8_pct": -7.614021862042941
+    },
+    {
+      "label": "draft-probe-w4-row32",
+      "command": [
+        "python3",
+        "/home/stephen/dgpp/pr95-followups-20261011/campaign.py",
+        "nvfp4",
+        "4",
+        "draft-probe-w4-row32",
+        "--draft-probe",
+        "--row-ms",
+        "32"
+      ],
+      "started": "2026-10-11T03:36:25.445958+00:00",
+      "returncode": 0,
+      "finished": "2026-10-11T03:37:12.935695+00:00",
+      "median_tps": 56.35732755762812,
+      "steps": [
+        117,
+        117,
+        117
+      ],
+      "same_transcripts": true,
+      "vs_fp8_pct": -7.912126770835648
+    },
+    {
+      "label": "draft-probe-w4-checkpoint",
+      "command": [
+        "python3",
+        "/home/stephen/dgpp/pr95-followups-20261011/campaign.py",
+        "nvfp4",
+        "4",
+        "draft-probe-w4-checkpoint",
+        "--draft-probe",
+        "--draft-weights",
+        "checkpoint"
+      ],
+      "started": "2026-10-11T03:37:20.838127+00:00",
+      "returncode": 0,
+      "finished": "2026-10-11T03:38:08.360122+00:00",
+      "median_tps": 57.08145859915385,
+      "steps": [
+        103,
+        103,
+        103
+      ],
+      "same_transcripts": true,
+      "vs_fp8_pct": -6.728896648982596
+    },
+    {
+      "label": "draft-probe-w4-fixed3",
+      "command": [
+        "python3",
+        "/home/stephen/dgpp/pr95-followups-20261011/campaign.py",
+        "nvfp4",
+        "4",
+        "draft-probe-w4-fixed3",
+        "--draft-probe",
+        "--fixed-depth",
+        "3"
+      ],
+      "started": "2026-10-11T03:38:08.372317+00:00",
+      "returncode": 0,
+      "finished": "2026-10-11T03:38:55.905593+00:00",
+      "median_tps": 56.181013020775964,
+      "steps": [
+        114,
+        114,
+        114
+      ],
+      "same_transcripts": true,
+      "vs_fp8_pct": -8.200224724052063
+    },
+    {
+      "label": "draft-probe-w4-fixed5",
+      "command": [
+        "python3",
+        "/home/stephen/dgpp/pr95-followups-20261011/campaign.py",
+        "nvfp4",
+        "4",
+        "draft-probe-w4-fixed5",
+        "--draft-probe",
+        "--fixed-depth",
+        "5"
+      ],
+      "started": "2026-10-11T03:38:55.926949+00:00",
+      "returncode": 0,
+      "finished": "2026-10-11T03:39:43.251153+00:00",
+      "median_tps": 57.295645530939645,
+      "steps": [
+        106,
+        106,
+        106
+      ],
+      "same_transcripts": true,
+      "vs_fp8_pct": -6.378915202444613
+    },
+    {
+      "label": "draft-probe-w4-fixed1",
+      "command": [
+        "python3",
+        "/home/stephen/dgpp/pr95-followups-20261011/campaign.py",
+        "nvfp4",
+        "4",
+        "draft-probe-w4-fixed1",
+        "--draft-probe",
+        "--fixed-depth",
+        "1"
+      ],
+      "started": "2026-10-11T03:39:43.270880+00:00",
+      "returncode": 0,
+      "finished": "2026-10-11T03:40:36.333941+00:00",
+      "median_tps": 45.933531477978924,
+      "steps": [
+        150,
+        150,
+        150
+      ],
+      "same_transcripts": true,
+      "vs_fp8_pct": -24.944609564982436
+    }
+  ],
+  "decision": "No policy tested closes the prose C1 regression; retain the shipped policy."
+}

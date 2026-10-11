@@ -342,6 +342,9 @@ counters on both metrics routes:
 | `num_accepted_tokens_total` | Sum of accepted draft tokens across all positions. |
 | `num_draft_tokens_per_pos_total` | Attempt counts, starting with the first speculative position. |
 | `num_accepted_tokens_per_pos_total` | Accepted counts in the same position order. |
+| `num_lookup_fused_total` | Steps whose drafts a prompt-history match replaced (`engine.lookup_draft`; 0 when off). |
+| `num_lookup_agree_fused_total` | The fused steps taken below `lookup_nstrong`, on device-pick agreement. |
+| `num_lookup_sampled_fused_total` | The fused steps on sampled slots (fused rows re-priced as point masses). |
 
 The arrays contain `depth` entries, up to eight. Non-MTP engines report zero
 totals and empty arrays. Counts exclude graph padding and the non-speculative

@@ -1,0 +1,11 @@
+{
+  "command": [
+    "python3",
+    "scripts/serve_api_check.py",
+    "127.0.0.1",
+    "18081"
+  ],
+  "started": "2026-10-11T01:59:45.509045+00:00",
+  "returncode": 0,
+  "finished": "2026-10-11T02:00:09.325303+00:00"
+}

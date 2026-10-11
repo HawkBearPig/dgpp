@@ -66,10 +66,10 @@ BusOptions loop_options(int rank, int world, uint16_t port) {
   o.rendezvous_host = rank == 0 ? "" : "127.0.0.1";
   o.rendezvous_timeout_ms = 20000;
   o.lat_slots = 8;
-  // A 256 KB latency slot: every fold of this test (72 rows x 256 bf16)
-  // rides the chunked latency path (qwen_tp_test's note on the bulk machine
-  // at world 4 with sub-stripe buffers).
-  o.lat_slot_bytes = 262144;
+  // Keep the 2304-row mixed-prefill fixture's 1.125 MiB fold on the
+  // latency path. Bulk protocol behavior is covered by the bus/fabric
+  // tests; this single-GPU loopback world checks model numerics.
+  o.lat_slot_bytes = 2 * 1024 * 1024;
   o.bulk_slots = 8;
   o.bulk_slot_bytes = 262144;
   o.qp_depth = 1024;
@@ -290,13 +290,12 @@ void check_world(int world, uint16_t port, const std::string& dir, const Qwen35T
   require(mism == 0, "world " + std::to_string(world) + " top-1 differs beyond a near tie");
 }
 
-}  // namespace
-
-DGPP_TEST(qwen35_tp_loopback_worlds_2_and_4_match_world_1) {
-  const std::string dir = (fs::current_path() / "qwen35_tp_fixture").string();
-  qwen35fx::write_fixture(dir);
+void check_quant_worlds(bool mixed, int rows) {
+  const std::string dir =
+      (fs::current_path() / (mixed ? "qwen35_tp_mixed_fixture" : "qwen35_tp_fixture")).string();
+  qwen35fx::write_fixture(dir, mixed);
   const Qwen35TextConfig cfg = Qwen35TextConfig::from_json_file((fs::path(dir) / "config.json").string());
-  const std::vector<int64_t> tokens = make_tokens(cfg, 72);
+  const std::vector<int64_t> tokens = make_tokens(cfg, rows);
   Qwen35Model::Outputs ref;
   {
     Qwen35Model single = make_model(cfg, dir, static_cast<int>(tokens.size()), nullptr, 0, 1);
@@ -304,6 +303,18 @@ DGPP_TEST(qwen35_tp_loopback_worlds_2_and_4_match_world_1) {
   }
   check_world(2, 29950, dir, cfg, tokens, ref);
   check_world(4, 29951, dir, cfg, tokens, ref);
+}
+
+}  // namespace
+
+DGPP_TEST(qwen35_tp_loopback_worlds_2_and_4_match_world_1) {
+  check_quant_worlds(false, 72);
+}
+DGPP_TEST(qwen35_mixed_tp_loopback_worlds_2_and_4_match_world_1) {
+  check_quant_worlds(true, 72);
+}
+DGPP_TEST(qwen35_mixed_prefill_tp_loopback_worlds_2_and_4_match_world_1) {
+  check_quant_worlds(true, 2304);
 }
 
 int main() { return dgpp::test::run_all(); }

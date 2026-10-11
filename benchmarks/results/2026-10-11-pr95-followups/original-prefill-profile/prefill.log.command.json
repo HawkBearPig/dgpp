@@ -1,0 +1,21 @@
+{
+  "command": [
+    "python3",
+    "scripts/serve_prefill_probe.py",
+    "127.0.0.1",
+    "18081",
+    "8192",
+    "--repeat",
+    "1",
+    "--no-think",
+    "--tag",
+    "pr95-profile",
+    "--interval",
+    "1",
+    "--json-out",
+    "/home/stephen/dgpp/pr95-review-20261010/nvfp4-w1-prefill-profile/prefill.json"
+  ],
+  "started": "2026-10-10T16:15:51.380502+00:00",
+  "returncode": 0,
+  "finished": "2026-10-10T16:16:02.129220+00:00"
+}

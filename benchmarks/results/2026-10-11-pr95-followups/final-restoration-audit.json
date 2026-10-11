@@ -1,0 +1,55 @@
+{
+  "date": "2026-10-11T04:02:40.044000+00:00",
+  "resolved_config_exact": true,
+  "model": "Qwen/Qwen3.8-Flash-Next-FP8",
+  "binary_sha256": "5b457ffed0f6290344c68609370e4b58ae893f52b4713ae39362babefea15542",
+  "nodes": [
+    {
+      "rank": 0,
+      "host": "192.168.88.11",
+      "pid": 1627981,
+      "binary_sha256": "5b457ffed0f6290344c68609370e4b58ae893f52b4713ae39362babefea15542",
+      "vm_swap_kib": 0,
+      "cgroup": "0::/user.slice/user-1000.slice/user@1000.service/app.slice/run-rb98745471bf249cca7ef7c027209f9a7.scope",
+      "cgroup_swap_current": "0",
+      "cgroup_swap_max": "0",
+      "gpu": "NVIDIA GB10, GPU-0543a403-d834-9f2c-14fc-d0efa6059dfb, 51, 2398 MHz, [N/A], 11.60 W"
+    },
+    {
+      "rank": 1,
+      "host": "192.168.88.12",
+      "pid": 1972083,
+      "binary_sha256": "5b457ffed0f6290344c68609370e4b58ae893f52b4713ae39362babefea15542",
+      "vm_swap_kib": 0,
+      "cgroup": "0::/user.slice/user-1000.slice/user@1000.service/app.slice/run-r1c10260207f5422a91cc941f38fbdfb4.scope",
+      "cgroup_swap_current": "0",
+      "cgroup_swap_max": "0",
+      "gpu": "NVIDIA GB10, GPU-51b36bbf-563e-ed8f-7403-185cc867257a, 45, 2405 MHz, [N/A], 12.35 W"
+    },
+    {
+      "rank": 2,
+      "host": "192.168.88.13",
+      "pid": 1625773,
+      "binary_sha256": "5b457ffed0f6290344c68609370e4b58ae893f52b4713ae39362babefea15542",
+      "vm_swap_kib": 0,
+      "cgroup": "0::/user.slice/user-1000.slice/user@1000.service/app.slice/run-r57e8aaa5cca14e0f84eb6f4ff33bdb80.scope",
+      "cgroup_swap_current": "0",
+      "cgroup_swap_max": "0",
+      "gpu": "NVIDIA GB10, GPU-b9c2d00b-b885-7710-284e-b11e92ecad49, 48, 2411 MHz, [N/A], 11.74 W"
+    },
+    {
+      "rank": 3,
+      "host": "192.168.88.14",
+      "pid": 3552147,
+      "binary_sha256": "5b457ffed0f6290344c68609370e4b58ae893f52b4713ae39362babefea15542",
+      "vm_swap_kib": 0,
+      "cgroup": "0::/user.slice/user-1000.slice/user@1000.service/app.slice/run-r04a108bfa6934edc93b65b2710a6afe0.scope",
+      "cgroup_swap_current": "0",
+      "cgroup_swap_max": "0",
+      "gpu": "NVIDIA GB10, GPU-387ca2dc-acdc-3b69-3320-36c0256ea75f, 47, 2411 MHz, [N/A], 10.73 W"
+    }
+  ],
+  "smoke_http_status": 200,
+  "smoke_content": "4",
+  "production_http_port": 18080
+}

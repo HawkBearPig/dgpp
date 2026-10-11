@@ -1,0 +1,18 @@
+{
+  "command": [
+    "python3",
+    "scripts/dgpp-cluster",
+    "up",
+    "--config",
+    "/home/stephen/dgpp/pr95-review-20261010/nvfp4-w1-prefill-profile/deployment.json",
+    "--bin",
+    "/home/stephen/workspace/dgpp/build-pr95/dgpp-serve",
+    "--log-dir",
+    "/home/stephen/dgpp/pr95-review-20261010/nvfp4-w1-prefill-profile/world",
+    "--head-wrap",
+    "nsys profile -t cuda --cuda-graph-trace=node -o /home/stephen/dgpp/pr95-review-20261010/nvfp4-w1-prefill-profile/r0 --force-overwrite true"
+  ],
+  "started": "2026-10-10T16:15:30.244023+00:00",
+  "returncode": 0,
+  "finished": "2026-10-10T16:15:50.608595+00:00"
+}

@@ -1,0 +1,16 @@
+{
+  "command": [
+    "ctest",
+    "--test-dir",
+    "build-pr95",
+    "-R",
+    "^(bus_test|bus_selftest)$",
+    "--output-on-failure",
+    "-j1"
+  ],
+  "start": "2026-10-11T00:56:16.845430+00:00",
+  "devices": "rocep1s0f0 roceP2p1s0f0",
+  "gids": "3 3",
+  "returncode": 0,
+  "end": "2026-10-11T00:56:56.581876+00:00"
+}

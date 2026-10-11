@@ -1,0 +1,13 @@
+{
+  "command": [
+    "python3",
+    "scripts/nsys_step_breakdown.py",
+    "/home/stephen/dgpp/pr95-review-20261010/nvfp4-w1-prefill-profile/r0.nsys-rep",
+    "--burst",
+    "--top",
+    "30"
+  ],
+  "started": "2026-10-10T16:16:09.174990+00:00",
+  "returncode": 0,
+  "finished": "2026-10-10T16:16:09.844588+00:00"
+}

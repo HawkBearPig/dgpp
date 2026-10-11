@@ -1,0 +1,26 @@
+[
+  {
+    "length": 512,
+    "saved_production_ms": 417.0999999999999,
+    "pr_fp8_ms": 415.8000000000002,
+    "change_pct": -0.31167585710853984
+  },
+  {
+    "length": 2048,
+    "saved_production_ms": 1298.4999999999995,
+    "pr_fp8_ms": 1292.7999999999997,
+    "change_pct": -0.43896804004619483
+  },
+  {
+    "length": 8192,
+    "saved_production_ms": 4575.099999999999,
+    "pr_fp8_ms": 4566.0,
+    "change_pct": -0.19890275622389542
+  },
+  {
+    "length": 32768,
+    "saved_production_ms": 19056.1,
+    "pr_fp8_ms": 19046.4,
+    "change_pct": -0.05090233573500358
+  }
+]

@@ -1,0 +1,66 @@
+{
+  "cases": [
+    {
+      "case": "teacher_text_hard-0.ids",
+      "positions": 4096,
+      "mean_nll_delta": -0.0003811526632158201,
+      "standard_error": 0.00048661138674885914,
+      "max_abs_nll_delta": 0.6136333050399996,
+      "fraction_over_one_nat": 0.0,
+      "top1_changes": 30,
+      "top1_changes_beyond_two_ulps": 0,
+      "identical_logits_rows": 0,
+      "pass_gate": true
+    },
+    {
+      "case": "teacher_text_hard-1.ids",
+      "positions": 4096,
+      "mean_nll_delta": 0.0010209831197079684,
+      "standard_error": 0.0009683324082621012,
+      "max_abs_nll_delta": 2.90344205017,
+      "fraction_over_one_nat": 0.00048828125,
+      "top1_changes": 52,
+      "top1_changes_beyond_two_ulps": 3,
+      "identical_logits_rows": 0,
+      "pass_gate": false
+    },
+    {
+      "case": "teacher_text_memorized-0.ids",
+      "positions": 4096,
+      "mean_nll_delta": -0.001563131273883819,
+      "standard_error": 0.00130211859961972,
+      "max_abs_nll_delta": 1.8656144792499996,
+      "fraction_over_one_nat": 0.000244140625,
+      "top1_changes": 39,
+      "top1_changes_beyond_two_ulps": 12,
+      "identical_logits_rows": 0,
+      "pass_gate": false
+    },
+    {
+      "case": "teacher_text_memorized-1.ids",
+      "positions": 4096,
+      "mean_nll_delta": -7.642546139084495e-05,
+      "standard_error": 0.0013228149197571102,
+      "max_abs_nll_delta": 0.8311952767399999,
+      "fraction_over_one_nat": 0.0,
+      "top1_changes": 56,
+      "top1_changes_beyond_two_ulps": 12,
+      "identical_logits_rows": 0,
+      "pass_gate": false
+    },
+    {
+      "case": "teacher_text-0.ids",
+      "positions": 3072,
+      "mean_nll_delta": 0.0768827404787739,
+      "standard_error": 0.04224180721422098,
+      "max_abs_nll_delta": 23.784231512412198,
+      "fraction_over_one_nat": 0.23990885416666666,
+      "top1_changes": 573,
+      "top1_changes_beyond_two_ulps": 550,
+      "identical_logits_rows": 0,
+      "pass_gate": false
+    }
+  ],
+  "repeat_bitwise": true,
+  "pass": false
+}

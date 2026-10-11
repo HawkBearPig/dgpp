@@ -253,6 +253,9 @@ struct ServeGraphEngine {
   virtual void configure_block_rows_budget(int budget) = 0;
   // engine.mtp_schedule_sampled_scale, before the warm capture.
   virtual void set_sampled_schedule_scale(float scale) = 0;
+  // engine.lookup_draft*: fuse strong prompt-history matches into MTP
+  // drafts, before the warm capture.
+  virtual void set_lookup_drafts(bool on, int nmin, int nstrong, int agree) = 0;
   // engine.prefill_group: several cold prompts as the spans of one walk.
   virtual void set_prefill_group(bool on) = 0;
 };
@@ -273,6 +276,9 @@ struct ServeGraphEngineOf final : ServeGraphEngine {
   void set_block_verify(bool on) override { eng.set_block_verify(on); }
   void configure_block_rows_budget(int budget) override { eng.configure_block_rows_budget(budget); }
   void set_sampled_schedule_scale(float scale) override { eng.set_sampled_schedule_scale(scale); }
+  void set_lookup_drafts(bool on, int nmin, int nstrong, int agree) override {
+    eng.set_lookup_drafts(on, nmin, nstrong, agree);
+  }
   void set_prefill_group(bool on) override { eng.set_prefill_group(on); }
 };
 
@@ -323,7 +329,7 @@ struct ServeFamily {
       dgpp::net::CollectiveBus* bus, int rank, int world, uint16_t* pick_scratch,
       int batch_min_live, uint16_t* prefix_scratch, uint16_t* gather_scratch, int candidates,
       const dgpp::text::GrammarVocab* grammar, int prefix_slots, int mtp_depth,
-      bool compact_batches) = 0;
+      bool compact_batches, int lookup_tail = 0) = 0;
   virtual std::unique_ptr<dgpp::sched::SchedulerEngine> make_eager_engine(
       int slots, dgpp::DecodePick pick, dgpp::DecodeSample sample,
       const dgpp::text::GrammarVocab* grammar, int prefix_slots) = 0;
@@ -399,11 +405,11 @@ struct GlmFamily final : ServeFamily {
                                                       uint16_t* gather_scratch, int candidates,
                                                       const dgpp::text::GrammarVocab* grammar,
                                                       int prefix_slots, int mtp_depth,
-                                                      bool compact_batches) override {
+                                                      bool compact_batches, int lookup_tail = 0) override {
     return std::make_unique<ServeGraphEngineOf<dgpp::GlmDiagnosticModel>>(
         model.get(), bus, rank, world_, pick_scratch, cfg.vocab_size, /*pick_timeout_ms=*/60000,
         batch_min_live, prefix_scratch, gather_scratch, candidates, grammar, prefix_slots,
-        mtp_depth, compact_batches);
+        mtp_depth, compact_batches, lookup_tail);
   }
   std::unique_ptr<dgpp::sched::SchedulerEngine> make_eager_engine(
       int slots, dgpp::DecodePick pick, dgpp::DecodeSample sample, const dgpp::text::GrammarVocab* grammar,
@@ -507,11 +513,11 @@ struct QwenFamily final : ServeFamily {
                                                       uint16_t* gather_scratch, int candidates,
                                                       const dgpp::text::GrammarVocab* grammar,
                                                       int prefix_slots, int mtp_depth,
-                                                      bool compact_batches) override {
+                                                      bool compact_batches, int lookup_tail = 0) override {
     return std::make_unique<ServeGraphEngineOf<dgpp::QwenModel>>(
         model.get(), bus, rank, world_, pick_scratch, cfg.vocab_size, /*pick_timeout_ms=*/60000,
         batch_min_live, prefix_scratch, gather_scratch, candidates, grammar, prefix_slots,
-        mtp_depth, compact_batches);
+        mtp_depth, compact_batches, lookup_tail);
   }
   std::unique_ptr<dgpp::sched::SchedulerEngine> make_eager_engine(
       int slots, dgpp::DecodePick pick, dgpp::DecodeSample sample, const dgpp::text::GrammarVocab* grammar,
@@ -573,11 +579,11 @@ struct Glm4Family final : ServeFamily {
                                                       uint16_t* gather_scratch, int candidates,
                                                       const dgpp::text::GrammarVocab* grammar,
                                                       int prefix_slots, int mtp_depth,
-                                                      bool compact_batches) override {
+                                                      bool compact_batches, int lookup_tail = 0) override {
     return std::make_unique<ServeGraphEngineOf<dgpp::Glm4Model>>(
         model.get(), bus, rank, world_, pick_scratch, cfg.vocab_size, /*pick_timeout_ms=*/60000,
         batch_min_live, prefix_scratch, gather_scratch, candidates, grammar, prefix_slots,
-        mtp_depth, compact_batches);
+        mtp_depth, compact_batches, lookup_tail);
   }
   std::unique_ptr<dgpp::sched::SchedulerEngine> make_eager_engine(
       int slots, dgpp::DecodePick pick, dgpp::DecodeSample sample, const dgpp::text::GrammarVocab* grammar,
@@ -645,11 +651,11 @@ struct GlmDsaFamily final : ServeFamily {
                                                       uint16_t* gather_scratch, int candidates,
                                                       const dgpp::text::GrammarVocab* grammar,
                                                       int prefix_slots, int mtp_depth,
-                                                      bool compact_batches) override {
+                                                      bool compact_batches, int lookup_tail = 0) override {
     return std::make_unique<ServeGraphEngineOf<dgpp::GlmDsaModel>>(
         model.get(), bus, rank, world_, pick_scratch, cfg.vocab_size, /*pick_timeout_ms=*/60000,
         batch_min_live, prefix_scratch, gather_scratch, candidates, grammar, prefix_slots,
-        mtp_depth, compact_batches);
+        mtp_depth, compact_batches, lookup_tail);
   }
   std::unique_ptr<dgpp::sched::SchedulerEngine> make_eager_engine(
       int slots, dgpp::DecodePick pick, dgpp::DecodeSample sample, const dgpp::text::GrammarVocab* grammar,
@@ -723,11 +729,11 @@ struct Dsv41Family final : ServeFamily {
                                                       uint16_t* gather_scratch, int candidates,
                                                       const dgpp::text::GrammarVocab* grammar,
                                                       int prefix_slots, int mtp_depth,
-                                                      bool compact_batches) override {
+                                                      bool compact_batches, int lookup_tail = 0) override {
     return std::make_unique<ServeGraphEngineOf<dgpp::Dsv41Model>>(
         model.get(), bus, rank, world_, pick_scratch, cfg.vocab_size, /*pick_timeout_ms=*/60000,
         batch_min_live, prefix_scratch, gather_scratch, candidates, grammar, prefix_slots,
-        mtp_depth, compact_batches);
+        mtp_depth, compact_batches, lookup_tail);
   }
   std::unique_ptr<dgpp::sched::SchedulerEngine> make_eager_engine(
       int slots, dgpp::DecodePick pick, dgpp::DecodeSample sample, const dgpp::text::GrammarVocab* grammar,
@@ -799,11 +805,11 @@ struct Dsv4Family final : ServeFamily {
                                                       uint16_t* gather_scratch, int candidates,
                                                       const dgpp::text::GrammarVocab* grammar,
                                                       int prefix_slots, int mtp_depth,
-                                                      bool compact_batches) override {
+                                                      bool compact_batches, int lookup_tail = 0) override {
     return std::make_unique<ServeGraphEngineOf<dgpp::Dsv4Model>>(
         model.get(), bus, rank, world_, pick_scratch, cfg.vocab_size, /*pick_timeout_ms=*/60000,
         batch_min_live, prefix_scratch, gather_scratch, candidates, grammar, prefix_slots,
-        mtp_depth, compact_batches);
+        mtp_depth, compact_batches, lookup_tail);
   }
   std::unique_ptr<dgpp::sched::SchedulerEngine> make_eager_engine(
       int slots, dgpp::DecodePick pick, dgpp::DecodeSample sample, const dgpp::text::GrammarVocab* grammar,
@@ -874,11 +880,11 @@ struct MimoFamily final : ServeFamily {
                                                       uint16_t* gather_scratch, int candidates,
                                                       const dgpp::text::GrammarVocab* grammar,
                                                       int prefix_slots, int mtp_depth,
-                                                      bool compact_batches) override {
+                                                      bool compact_batches, int lookup_tail = 0) override {
     return std::make_unique<ServeGraphEngineOf<dgpp::MimoModel>>(
         model.get(), bus, rank, world_, pick_scratch, cfg.vocab_size, /*pick_timeout_ms=*/60000,
         batch_min_live, prefix_scratch, gather_scratch, candidates, grammar, prefix_slots,
-        mtp_depth, compact_batches);
+        mtp_depth, compact_batches, lookup_tail);
   }
   std::unique_ptr<dgpp::sched::SchedulerEngine> make_eager_engine(
       int slots, dgpp::DecodePick pick, dgpp::DecodeSample sample, const dgpp::text::GrammarVocab* grammar,
@@ -945,11 +951,11 @@ struct Qwen35Family final : ServeFamily {
                                                       uint16_t* gather_scratch, int candidates,
                                                       const dgpp::text::GrammarVocab* grammar,
                                                       int prefix_slots, int mtp_depth,
-                                                      bool compact_batches) override {
+                                                      bool compact_batches, int lookup_tail = 0) override {
     return std::make_unique<ServeGraphEngineOf<dgpp::Qwen35Model>>(
         model.get(), bus, rank, world_, pick_scratch, cfg.vocab_size, /*pick_timeout_ms=*/60000,
         batch_min_live, prefix_scratch, gather_scratch, candidates, grammar, prefix_slots,
-        mtp_depth, compact_batches);
+        mtp_depth, compact_batches, lookup_tail);
   }
   std::unique_ptr<dgpp::sched::SchedulerEngine> make_eager_engine(
       int slots, dgpp::DecodePick pick, dgpp::DecodeSample sample, const dgpp::text::GrammarVocab* grammar,
@@ -1515,6 +1521,9 @@ int main(int argc, char** argv) {
   double mtp_draft_temperature = 1.0;  // engine.mtp_draft_temperature: the drawn drafts' temperature / the request's
   std::string mtp_verify = "token";  // engine.mtp_verify: token | block
   int dflash_batch_rows = 0;  // engine.dflash_batch_rows: the drafter's batched verify rows budget (0: whole blocks)
+  bool lookup_draft = false;  // engine.lookup_draft: fuse strong prompt-history matches into MTP drafts
+  int lookup_nmin = 6, lookup_nstrong = 8, lookup_agree = 2;
+  int lookup_tail = 0;  // engine.lookup_tail: extra verify rows past the MTP block (0: the block alone)
   double prefix_cache_gib = 1.5;  // M7: the snapshot arena; 0 = off
   std::optional<float> temperature, top_p, min_p, repetition_penalty;
   std::optional<int> top_k;
@@ -1621,6 +1630,11 @@ int main(int argc, char** argv) {
     mtp_draft_temperature = e.mtp_draft_temperature;
     mtp_verify = e.mtp_verify;
     dflash_batch_rows = e.dflash_batch_rows;
+    lookup_draft = e.lookup_draft;
+    lookup_nmin = e.lookup_nmin;
+    lookup_nstrong = e.lookup_nstrong;
+    lookup_agree = e.lookup_agree;
+    lookup_tail = e.lookup_tail;
     compact_batches = e.compact_batches;
     graph_batch_min_live = e.graph_batch_min_live;
     sampling_candidates = e.sampling_candidates;
@@ -1754,6 +1768,12 @@ int main(int argc, char** argv) {
     else if (a == "--mtp-draft-temperature") mtp_draft_temperature = std::stod(next());
     else if (a == "--mtp-verify") mtp_verify = next();
     else if (a == "--dflash-batch-rows") dflash_batch_rows = std::stoi(next());
+    else if (a == "--lookup-draft") lookup_draft = true;
+    else if (a == "--no-lookup-draft") lookup_draft = false;
+    else if (a == "--lookup-nmin") lookup_nmin = std::stoi(next());
+    else if (a == "--lookup-nstrong") lookup_nstrong = std::stoi(next());
+    else if (a == "--lookup-agree") lookup_agree = std::stoi(next());
+    else if (a == "--lookup-tail") lookup_tail = std::stoi(next());
     else if (a == "--sampling-candidates") sampling_candidates = std::stoi(next());
     else if (a == "--prefix-cache-gib") prefix_cache_gib = std::stod(next());
     else if (a == "--no-prefix-cache") prefix_cache_gib = 0.0;
@@ -1902,7 +1922,7 @@ int main(int argc, char** argv) {
         "batchmin={} cand={} "
         "pcgib={} adm={} win={} pfbudget={} pfidle={} pmin={} phead={} pace={} inflight={} "
         "reasoning_in_content={} "
-        "rs={} dflash={} dfw={}",
+        "rs={} dflash={} dfw={} lk={} lkn={} lks={} lka={} lkt={}",
         model_id.empty() ? ckpt : model_id, world, fabric_port, journal_port, max_concurrency,
         kv_capacity, kv_dtype, ngram_table, dense_weights, mtp_expert_format, bf16_weights, fp8_head, mtp_head,
         attention_weights, prefill, embed_sharding, default_max_tokens, queue_limit, no_eos ? 0 : 1, decode_graph ? 1 : 0,
@@ -1919,7 +1939,8 @@ int main(int argc, char** argv) {
                                    rope_scaling->beta_fast, rope_scaling->beta_slow,
                                    rope_scaling->attn_factor, rope_scaling->mrope_cache_factor)
                      : "off",
-        dflash_model.empty() ? "off" : dflash_model, dflash_weights);
+        dflash_model.empty() ? "off" : dflash_model, dflash_weights, lookup_draft ? 1 : 0,
+        lookup_nmin, lookup_nstrong, lookup_agree, lookup_tail);
   };
   if ((world > 1 || rank > 0) && !memory_plan_only) {
     try {
@@ -1994,6 +2015,11 @@ int main(int argc, char** argv) {
         ws.mtp_draft_temperature = mtp_draft_temperature;
         ws.mtp_verify = mtp_verify;
         ws.dflash_batch_rows = dflash_batch_rows;
+        ws.lookup_draft = lookup_draft;
+        ws.lookup_nmin = lookup_nmin;
+        ws.lookup_nstrong = lookup_nstrong;
+        ws.lookup_agree = lookup_agree;
+        ws.lookup_tail = lookup_tail;
         ws.compact_batches = compact_batches;
         ws.graph_batch_min_live = graph_batch_min_live;
         ws.sampling_candidates = sampling_candidates;
@@ -2080,6 +2106,11 @@ int main(int argc, char** argv) {
         mtp_draft_temperature = ws.mtp_draft_temperature;
         mtp_verify = ws.mtp_verify;
         dflash_batch_rows = ws.dflash_batch_rows;
+        lookup_draft = ws.lookup_draft;
+        lookup_nmin = ws.lookup_nmin;
+        lookup_nstrong = ws.lookup_nstrong;
+        lookup_agree = ws.lookup_agree;
+        lookup_tail = ws.lookup_tail;
         compact_batches = ws.compact_batches;
         graph_batch_min_live = ws.graph_batch_min_live;
         sampling_candidates = ws.sampling_candidates;
@@ -2184,6 +2215,15 @@ int main(int argc, char** argv) {
   if (mtp_draft != "auto" && mtp_draft != "sampled" && mtp_draft != "greedy") {
     DGPP_LOG_ERROR("--mtp-draft must be auto, sampled or greedy, got '{}'", mtp_draft);
     return 1;
+  }
+  if (lookup_tail < 0) {
+    DGPP_LOG_ERROR("--lookup-tail must be >= 0, got {}", lookup_tail);
+    return 2;
+  }
+  if (!(lookup_nmin >= 1 && lookup_nstrong >= lookup_nmin && lookup_agree >= 0)) {
+    DGPP_LOG_ERROR("--lookup thresholds must satisfy 1 <= --lookup-nmin <= --lookup-nstrong, got {}/{}/{}",
+                   lookup_nmin, lookup_nstrong, lookup_agree);
+    return 2;
   }
   if (prefill != "bounded" && prefill != "exact") {
     DGPP_LOG_ERROR("--prefill must be bounded or exact, got '{}'", prefill);
@@ -2493,7 +2533,7 @@ int main(int argc, char** argv) {
     // speculative pass caps itself to what the rows allow).
     const int graph_rows_per_request = !dflash_dir.empty()
                                            ? dgpp::kSpecRows
-                                           : (mtp ? 1 + mtp_depth : 1);
+                                           : (mtp ? 1 + mtp_depth + lookup_tail : 1);
     int decode_rows = std::max(dgpp::kDecodeRows, max_concurrency * graph_rows_per_request);
     if (decode_rows > family->decode_rows_cap()) {
       if (!decode_graph) {
@@ -2510,7 +2550,7 @@ int main(int argc, char** argv) {
         decode_rows = family->decode_rows_cap();
       } else {
         DGPP_LOG_ERROR(
-            "--decode-graph needs --max-concurrency * (1 + mtp depth) <= {} on the {} "
+            "--decode-graph needs --max-concurrency * (1 + mtp depth + lookup tail) <= {} on the {} "
             "family (got {} * {})",
             family->decode_rows_cap(), family->name(), max_concurrency, graph_rows_per_request);
         return 1;
@@ -2892,7 +2932,7 @@ int main(int argc, char** argv) {
           std::unique_ptr<ServeGraphEngine> graph_engine =
               family->make_graph_engine(bus.get(), rank, world, pick_scratch, graph_batch_min_live,
                                         sample_prefix.data, sample_gather.data, sampling_candidates,
-                                        &grammar_vocab, prefix_slots, mtp_depth, compact_batches);
+                                        &grammar_vocab, prefix_slots, mtp_depth, compact_batches, lookup_tail);
           knobs.admission = dgpp::serve::resolve_prefill_policy(knobs.admission, *graph_engine->engine());
           peer_policy = knobs.admission;
           DGPP_LOG_INFO("rank {}: prefill budget {} tokens/tick (0 = full prompt), {} with nothing decoding{}",
@@ -2903,6 +2943,15 @@ int main(int argc, char** argv) {
           graph_engine->set_proposal_temperature_scale(static_cast<float>(mtp_draft_temperature));
           graph_engine->set_block_verify(mtp_verify == "block");
           graph_engine->set_prefill_group(prefill_group);
+          graph_engine->set_lookup_drafts(lookup_draft, lookup_nmin, lookup_nstrong, lookup_agree);
+          if (lookup_draft)
+            DGPP_LOG_INFO("rank {}: context-lookup drafting on (nmin {}/nstrong {}/agree {}): strong "
+                          "prompt-history matches replace MTP drafts within the verify rows",
+                          rank, lookup_nmin, lookup_nstrong, lookup_agree);
+          if (lookup_tail > 0)
+            DGPP_LOG_INFO("rank {}: lookup tail mode: {} extra verify rows past the MTP block (fewer batch "
+                          "slots for a longer block while copying)",
+                          rank, lookup_tail);
           if (!prefill_group) DGPP_LOG_INFO("serve: cold prompts prefill one per walk (engine.prefill_group false)");
           if (!dflash_dir.empty()) graph_engine->configure_block_rows_budget(dflash_batch_rows);
           if (mtp_verify == "block")
