@@ -2326,14 +2326,30 @@ prefill, reservation, decode, close and cache operations without exposing
 logits. The engine includes token selection in each model operation;
 on the fabric, those picks and model reductions are collectives.
 
-Each tick admits one queued request or a fitting group of cold prompts, then
-decodes the next canonical slice of active requests. Admission chooses
+Each tick performs bounded prefill work, then decodes the next canonical
+slice of active requests. Admission chooses
 the oldest request that fits the free pool and an available slot, allowing
 smaller requests to pass a blocked larger one. A sustained stream of small
 requests can therefore delay a large request.
 
-Qwen's opt-in prefill budget advances one aligned chunk per tick before
-decode. One unfinished prefill holds its slot, KV reservation and private
+With a positive prefill budget, non-group-advance engines divide the tick's
+budget into equal aligned shares among unfinished prefills. While a prefill
+is in flight, at most one oldest-fitting queued text request joins those
+shares, regardless of total prompt length or cached suffix length. It needs
+a free slot, an aligned share and its existing full reservation; this scan
+does not evict cached entries to make it fit. Short text therefore need not
+wait for leftover budget behind a long prefill. Unused short-tail capacity
+is not redistributed. If the busy budget cannot cover all readers, the
+existing rotation gives them bounded turns.
+
+This changes admission during an unfinished non-group prefill, not image or
+group-advance eligibility, nor admission when no prefill is in flight.
+Earlier text decoding can switch later ticks from the idle to the busy
+budget and delay the long prompt's completion; token caps are not wall-time
+latency guarantees. Skip-fit admission still does not guarantee progress
+for a request that never has enough free KV capacity.
+
+An unfinished prefill holds its slot, KV reservation and private
 snapshot until completion or cancellation; its device positions are hidden
 between chunks so padded decode graphs cannot mutate its state. The optional
 idle budget permits larger chunks when no request is actively decoding,

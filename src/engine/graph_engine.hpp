@@ -1135,6 +1135,9 @@ class GraphEngineAdapter final : public sched::SchedulerEngine {
   int64_t blocks_for_tokens(int64_t tokens) const override {
     return model_->kv_blocks_for_tokens(tokens);
   }
+  int64_t reservation_blocks(int64_t tokens) const override {
+    return blocks_for_tokens(physical_reserve_tokens(tokens));
+  }
 
   int32_t prefill(int req, const std::vector<int64_t>& prompt) override {
     return open_slot(req, prompt, [&] { return model_->session_prefill(req, prompt); });
@@ -1219,10 +1222,9 @@ class GraphEngineAdapter final : public sched::SchedulerEngine {
           arena_.attach(req, plan.attach_slot);
         }
         auto cursor = std::make_shared<typename Model::PrefillCursor>([&] {
-          // The lifetime reservation: the prompt, every token the request may
-          // generate and the verify's depth - 1 trailing rows, capped at the
-          // ceiling — past it the position kernels stage padding rows.
-          const auto reserved = std::min<int64_t>(reserve_tokens + std::max(0, depth_ - 1), model_->max_context());
+          // Use the same physical reservation as the admission quote and
+          // reserve() after completion, including the block drafter's tail.
+          const auto reserved = physical_reserve_tokens(reserve_tokens);
           if constexpr (requires { model_->session_prefill_begin(req, task->prompt, reserved,
               chunk_tokens, task->boundaries, snap, plan.attach_position, &task->images); }) {
             return model_->session_prefill_begin(req, task->prompt, reserved, chunk_tokens,
@@ -1627,15 +1629,20 @@ class GraphEngineAdapter final : public sched::SchedulerEngine {
     }
   }
 
+  int64_t physical_reserve_tokens(int64_t tokens) const {
+    // The chained drafts write depth - 1 rows past the verify's last row;
+    // a block drafter's block starts after the last accepted row and spans
+    // the verify's width again. Past the context ceiling, position kernels
+    // stage padding rows. Clamp before adding to avoid overflowing the sum.
+    const int64_t ceiling = model_->max_context();
+    const int64_t tail = block_ ? depth_ + 1 : std::max(0, depth_ - 1);
+    return tokens >= ceiling ? ceiling : tokens + std::min(tail, ceiling - tokens);
+  }
+
  public:
   void reserve(int req, int64_t tokens) override {
     check_live(req, "reserve");
-    // The chained drafts write depth - 1 rows past the verify's last row;
-    // a block drafter's block starts after the last accepted row and spans
-    // the verify's width again.
-    model_->session_reserve_blocks(
-        req, std::min<int64_t>(tokens + (block_ ? depth_ + 1 : std::max(0, depth_ - 1)),
-                               model_->max_context()));
+    model_->session_reserve_blocks(req, physical_reserve_tokens(tokens));
     reserved_[static_cast<size_t>(req)] = true;
   }
 

@@ -199,6 +199,11 @@ Qwen graph serving can interleave prefill chunks with decode using
 `engine.prefill_budget_tokens`; zero preserves monolithic admission.
 An optional `engine.prefill_idle_budget_tokens` increases chunk size when
 no request is actively decoding, including after a decoding peer retires.
+Queued text of any size now joins existing fair shares while a non-group
+prefill is in flight (issue #104), with one new reader per tick and unchanged
+slot, KV and token budgets. Host scheduler regressions cover admission,
+cache attachment and cancellation/failure cleanup; real-model latency and
+MTP block-boundary validation remain separate acceptance gates.
 Extending this to other families and grouped continuations remains work
 for latency under mixed prompt lengths. Prefix entries
 are process-local, and grow-on-demand admission ends the youngest request

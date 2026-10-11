@@ -540,8 +540,13 @@ The resolved budget is logged at startup and carried in rank 0's warm record.
 The single-Spark NVIDIA and RadixArk Qwen NVFP4 templates explicitly select
 4,096-token busy and idle budgets. The two- and four-rank GLM-5.3-Flash
 NVFP4/FP8 templates select 256-token busy and 2,048-token idle budgets.
-A positive budget executes one aligned prefill chunk per tick, followed by
-a decode pass for active requests. Try 256 or 512 tokens; the budget must
+A positive budget bounds aligned prefill work before each decode pass.
+On non-group-advance engines, an unfinished prefill shares that budget with
+at most one new oldest-fitting queued text request per tick, even if that
+text would otherwise fit in a single pass. Slot and KV reservation limits
+still apply; images and group-advance engines retain their existing paths.
+Earlier short-text decoding can reduce later ticks to the busy budget and
+increase the long prompt's completion time. Try 256 or 512 tokens; the budget must
 be a multiple of the snapshot alignment and fit the prefill scratch limit.
 Smaller chunks trade prefill throughput and TTFT for shorter pauses in
 other streams. Request reservations are held before the first yield, and
