@@ -3424,13 +3424,530 @@ DGPP_TEST(scheduler_multiAdmission_no_group_after_inflight_exhausts_budget) {
   sched.submit(make_request("short-b", 2, 3));
   const auto before = sched.meters().prompt_tokens_computed;
   sched.tick();
-  require(sched.meters().prompt_tokens_computed - before == 4 && sched.meters().queued == 2,
-          "a zero leftover cannot become an unbounded group budget");
+  require(sched.meters().prompt_tokens_computed - before == 4 && sched.meters().queued == 1,
+          "one short reader joins fair shares; zero leftover cannot admit the remaining group");
   sched.run_to_completion();
   require(sched.find("short-a")->generated == std::vector<int64_t>({20, 21, 22}) &&
               sched.find("short-b")->generated == std::vector<int64_t>({30, 31, 32}), "deferred group transcripts");
   require(sched.meters().prompt_tokens_computed == 19 && sched.meters().pool_blocks_in_use == 0,
           "inflight and grouped work complete without leaks");
+}
+
+// Record the allocated shares as well as computed tails: unused tail capacity
+// must not silently turn into a second prefill budget.
+class AdmissionFairEngine : public ChunkFakeEngine {
+ public:
+  explicit AdmissionFairEngine(int64_t blocks = 1000, int slots = 4)
+      : ChunkFakeEngine(blocks, slots) {}
+  int decode_batch_capacity() const override { return max_concurrent_requests(); }
+  int64_t prefill_chunk_alignment() const override { return 4; }
+  int64_t prefill_chunk_limit() const override { return 2048; }
+  std::vector<int> begins;
+  std::map<int, int64_t> advanced, reserved;
+  std::map<int, int> decoded;
+  int64_t allocated = 0;
+  int fail_slot = -1;
+  std::vector<int32_t> step(int req) override {
+    ++decoded[req];
+    return ChunkFakeEngine::step(req);
+  }
+  void begin_prefill(int req, const std::vector<int64_t>& prompt, int64_t tokens, int64_t budget,
+                     const PrefixPrefill& plan) override {
+    begins.push_back(req);
+    reserved[req] = tokens;
+    ChunkFakeEngine::begin_prefill(req, prompt, tokens, budget, plan);
+  }
+  PrefillProgress advance_prefill(int req, int64_t budget) override {
+    require(budget >= 4 && budget % 4 == 0, "supported aligned share");
+    allocated += budget;
+    if (req == fail_slot) throw std::runtime_error("injected joined-prefill failure");
+    auto progress = ChunkFakeEngine::advance_prefill(req, budget);
+    advanced[req] += progress.computed_tokens;
+    return progress;
+  }
+  void reset_tick() {
+    begins.clear();
+    advanced.clear();
+    allocated = 0;
+  }
+};
+
+DGPP_TEST(scheduler_queuedText_boundary_sizes_join_busy_and_idle_fair_shares) {
+  // No short-prompt threshold: below/at/above alignment, common short
+  // lengths and both busy/idle budget boundaries all join the same path.
+  for (const bool decoding : {false, true}) {
+    for (const int length : {1, 3, 4, 5, 23, 32, 33, 64, 128, 255, 256, 257, 2048, 2049}) {
+      AdmissionFairEngine engine(10000);
+      const int long_slot = decoding ? 1 : 0;
+      const int peer_slot = long_slot + 1;
+      if (decoding) engine.arm(0, std::vector<int32_t>(100, 10), 100);
+      engine.arm(long_slot, {20, 21}, 2);
+      engine.arm(peer_slot, {30, 31}, 2);
+      dgpp::sched::AdmissionPolicy policy;
+      policy.prefill_budget_tokens = 256;
+      policy.prefill_idle_budget_tokens = 2048;
+      Scheduler sched(&engine, {}, 0, policy);
+      if (decoding) {
+        sched.submit(make_request("decode", 1, 100));
+        sched.tick();
+      }
+      sched.submit(make_request("long", 8192, 2));
+      sched.tick();
+      sched.submit(make_request("peer", length, 2));
+      engine.reset_tick();
+      const auto before = sched.meters();
+      sched.tick();
+      const int cap = decoding ? 256 : 2048;
+      require(engine.begins == std::vector<int>{peer_slot},
+              "queued text joins at length " + std::to_string(length));
+      require(engine.allocated == cap && engine.advanced.at(long_slot) == cap / 2 &&
+                  engine.advanced.at(peer_slot) == std::min(length, cap / 2),
+              "old and new readers receive equal shares, including a short tail");
+      require(sched.meters().prompt_tokens_computed - before.prompt_tokens_computed <= cap,
+              "computed work respects the same tick cap");
+      if (decoding) require(engine.decoded[0] == 3, "existing decoder advances");
+      for (int ticks = 0; sched.has_pending() && ticks < 200; ++ticks) {
+        const auto meters = sched.meters();
+        const int tick_cap = meters.active > meters.prefilling ? 256 : 2048;
+        engine.reset_tick();
+        sched.tick();
+        require(
+            engine.allocated <= tick_cap &&
+                sched.meters().prompt_tokens_computed - meters.prompt_tokens_computed <= tick_cap,
+            "busy/idle transitions retain both allocated and computed caps");
+      }
+      require(!sched.has_pending() && sched.meters().pool_blocks_in_use == 0,
+              "all requests drain and release reservations");
+      require(sched.find("peer")->generated == std::vector<int64_t>({30, 31}) &&
+                  sched.find("long")->generated == std::vector<int64_t>({20, 21}),
+              "both transcripts survive interleaving");
+    }
+  }
+}
+
+DGPP_TEST(scheduler_queuedText_oldest_first_one_begin_with_four_requests) {
+  AdmissionFairEngine engine;
+  engine.arm(0, std::vector<int32_t>(40, 10), 40);
+  engine.arm(1, {20, 21}, 2);
+  engine.arm(2, std::vector<int32_t>(40, 30), 40);
+  engine.arm(3, std::vector<int32_t>(40, 40), 40);
+  dgpp::sched::AdmissionPolicy policy;
+  policy.prefill_budget_tokens = 16;
+  Scheduler sched(&engine, {}, 0, policy);
+  sched.submit(make_request("decode", 1, 40));
+  sched.tick();
+  sched.submit(make_request("long", 127, 2));
+  sched.tick();
+  sched.submit(make_request("older", 16, 40));
+  sched.submit(make_request("newer", 1, 40));
+  engine.reset_tick();
+  sched.tick();
+  require(engine.begins == std::vector<int>{2} && sched.meters().queued == 1,
+          "oldest fitting text begins first, not the shortest");
+  require(engine.advanced.at(1) == 8 && engine.advanced.at(2) == 8 && engine.allocated == 16,
+          "the new reader shares rather than adding a budget");
+  engine.reset_tick();
+  sched.tick();
+  require(engine.begins == std::vector<int>{3} && sched.meters().active == 4,
+          "at most one new reader each tick; four requests can coexist");
+  require(engine.advanced.at(1) == 4 && engine.advanced.at(2) == 4 && engine.advanced.at(3) == 1,
+          "three readers get aligned equal shares without reclaiming the tiny tail");
+  require(engine.decoded[0] == 4 && engine.decoded[3] == 1,
+          "existing decode progresses while the short prompt begins its long completion");
+  int ticks = 0;
+  while (sched.has_pending() && ++ticks < 100) {
+    const auto before = sched.meters();
+    const int decoded = engine.decoded[0];
+    engine.reset_tick();
+    sched.tick();
+    require(engine.allocated <= 16 &&
+                sched.meters().prompt_tokens_computed - before.prompt_tokens_computed <= 16,
+            "four-request drain stays bounded");
+    if (decoded < 39) require(engine.decoded[0] == decoded + 1, "decoder never starves");
+  }
+  require(!sched.has_pending() && sched.meters().pool_blocks_in_use == 0,
+          "finite drain without leaks");
+  require(sched.find("older")->steps_done == 40 && sched.find("newer")->steps_done == 40 &&
+              sched.find("long")->generated == std::vector<int64_t>({20, 21}),
+          "long completions retain their full output budgets");
+}
+
+DGPP_TEST(scheduler_queuedText_full_reservation_slot_and_aligned_share_guards) {
+  for (const int slots : {1, 2})
+    for (const int blocks : {18, 19, 20})
+      for (const int budget : {4, 8}) {
+        AdmissionFairEngine engine(blocks, slots);
+        engine.arm(0, {10, 11}, 2);
+        engine.arm(1, {20, 21, 22}, 3);
+        dgpp::sched::AdmissionPolicy policy;
+        policy.prefill_budget_tokens = budget;
+        Scheduler sched(&engine, {}, 0, policy);
+        sched.submit(make_request("long", 31, 2));  // 17 blocks, full lifetime
+        sched.tick();
+        sched.submit(make_request("peer", 3, 3));  // 3 blocks, not just its 2-block prompt
+        engine.reset_tick();
+        sched.tick();
+        const bool fits = slots == 2 && blocks == 20 && budget == 8;
+        require(engine.begins.size() == (fits ? 1u : 0u) && sched.meters().queued == (fits ? 0 : 1),
+                "admission requires a slot, a full lifetime reservation and an aligned share");
+        require(engine.pool_blocks_in_use() <= blocks && engine.allocated <= budget,
+                "both budgets hold");
+        require(sched.cancel("peer") && sched.cancel("long"), "cancel queued or joined requests");
+        sched.run_to_completion();
+        require(engine.pool_blocks_in_use() == 0, "guard cases leave no reservation behind");
+      }
+  // Oldest-fitting, not strict head of line: a short prompt with a large
+  // completion cannot take the single free block, but the next request can.
+  AdmissionFairEngine engine(18);
+  engine.arm(0, {10, 11}, 2);
+  engine.arm(1, {30}, 1);
+  dgpp::sched::AdmissionPolicy policy;
+  policy.prefill_budget_tokens = 8;
+  Scheduler sched(&engine, {}, 0, policy);
+  sched.submit(make_request("long", 31, 2));
+  sched.tick();
+  sched.submit(make_request("blocked", 1, 20));
+  sched.submit(make_request("fits", 1, 1));
+  engine.reset_tick();
+  sched.tick();
+  require(engine.begins == std::vector<int>{1} && sched.find("fits")->steps_done == 1 &&
+              sched.find("blocked")->steps_done == 0,
+          "skip a non-fitting full-output reservation");
+  require(sched.cancel("blocked") && sched.cancel("long"), "cancel the remaining requests");
+  sched.run_to_completion();
+  require(engine.pool_blocks_in_use() == 0, "skip-fit cleanup");
+}
+
+DGPP_TEST(scheduler_queuedText_cached_small_total_and_long_history_attach) {
+  for (const int length : {7, 39}) {
+    AdmissionFairEngine engine;
+    engine.set_prefix_arena(8, 2);
+    engine.arm(0, {10}, 1);
+    engine.arm(0, {20, 21}, 2);
+    engine.arm(1, {30, 31}, 2);
+    dgpp::sched::AdmissionPolicy policy;
+    policy.prefill_budget_tokens = 8;
+    Scheduler sched(&engine, {}, 0, policy);
+    auto cached = make_cached_request("seed", counted_prompt(length), {length - 1}, 1);
+    sched.submit(cached);
+    sched.run_to_completion();
+    sched.submit(make_request("long", 127, 2));
+    sched.tick();
+    cached.id = "cached";
+    cached.max_steps = 2;
+    sched.submit(cached);
+    engine.reset_tick();
+    const auto before = sched.meters();
+    sched.tick();
+    require(engine.begins == std::vector<int>{1} && engine.advanced.at(1) == 1,
+            "both small total prompt and long cached history join with only their suffix computed");
+    require(sched.meters().prefix_hits == before.prefix_hits + 1 &&
+                sched.meters().prefix_tokens_saved == before.prefix_tokens_saved + length - 1 &&
+                sched.meters().prompt_tokens_computed == before.prompt_tokens_computed + 5,
+            "attach accounting and the existing reader's fair share are preserved");
+    sched.run_to_completion();
+    require(sched.find("cached")->generated == std::vector<int64_t>({30, 31}), "cached transcript");
+    require(engine.pool_blocks_in_use() == engine.pinned_blocks(),
+            "only retained cache blocks remain");
+  }
+}
+
+DGPP_TEST(scheduler_queuedText_keeps_image_and_group_advance_eligibility) {
+  struct Engine : AdmissionFairEngine {
+    bool group = false;
+    bool supports_images() const override { return true; }
+    bool prefill_group_advance() const override { return group; }
+  };
+  for (const bool group : {false, true}) {
+    Engine engine;
+    engine.group = group;
+    engine.arm(0, {10, 11}, 2);
+    dgpp::sched::AdmissionPolicy policy;
+    policy.prefill_budget_tokens = 8;
+    Scheduler sched(&engine, {}, 0, policy);
+    sched.submit(make_request("long", 127, 2));
+    sched.tick();
+    auto peer = make_request("peer", 1, 2);
+    if (!group) peer.images.push_back({0, 1, 28, 28, std::vector<uint8_t>(28 * 28 * 3, 123)});
+    sched.submit(peer);
+    engine.reset_tick();
+    sched.tick();
+    require(engine.begins.empty() && sched.meters().queued == 1 && engine.advanced.at(0) == 8,
+            "short images and group-advance one-shots keep their original eligibility");
+    require(sched.cancel("peer") && sched.cancel("long"), "cancel guard fixtures");
+    sched.run_to_completion();
+    require(engine.pool_blocks_in_use() == 0, "guard fixtures release reservations");
+  }
+}
+
+// Adapter-contract fixture, not GPU execution. Enforce the physical footprint
+// on BOTH admission paths; the quote must prevent overdraw, not catch it later.
+class ReservationEngine : public AdmissionFairEngine {
+ public:
+  explicit ReservationEngine(int64_t blocks, int depth = 3, int64_t context = 1000,
+                             bool block_draft = false)
+      : AdmissionFairEngine(blocks), depth_(depth), context_(context), block_(block_draft) {}
+  int64_t reservation_blocks(int64_t tokens) const override {
+    return blocks_for_tokens(std::min<int64_t>(
+        tokens + (block_ ? depth_ + 1 : std::max(0, depth_ - 1)), context_));
+  }
+  void set_pool(int64_t blocks) { total_blocks_ = blocks; }
+  void set_block_tokens(int64_t tokens) { block_tokens_ = tokens; }
+  int fail_begin = -1;
+  std::map<int, int64_t> shared;
+  void reserve(int req, int64_t tokens) override {
+    // Keep allocation independent of the quote so a logical-only quote is
+    // caught by the scheduler tests, rather than weakening the allocator.
+    const int64_t tail = block_ ? depth_ + 1 : std::max(0, depth_ - 1);
+    live_.at(req).held_blocks = blocks_for_tokens(std::min(tokens + tail, context_)) - shared[req];
+    require(pool_blocks_in_use() <= pool_blocks_total(), "physical MTP reservation cannot fit");
+  }
+  void begin_prefill(int req, const std::vector<int64_t>& prompt, int64_t tokens,
+                     int64_t budget, const PrefixPrefill& plan) override {
+    AdmissionFairEngine::begin_prefill(req, prompt, tokens, budget, plan);
+    shared[req] = plan.attach_position / block_tokens_;
+    try {
+      reserve(req, tokens);
+      if (req == fail_begin) throw std::runtime_error("injected begin failure after reservation");
+    } catch (...) {
+      close(req);
+      throw;
+    }
+  }
+  void close(int req) override {
+    shared.erase(req);
+    AdmissionFairEngine::close(req);
+  }
+ private:
+  int depth_;
+  int64_t context_;
+  bool block_;
+};
+
+DGPP_TEST(scheduler_queuedText_mtp_physical_boundary_must_complete) {
+  // The reviewer's exact sequence: 18 blocks held by the long request,
+  // three logical versus four physical blocks for the newly eligible peer.
+  for (const int blocks : {21, 22}) {
+    ReservationEngine engine(blocks);
+    engine.arm(0, {10, 11}, 2);
+    engine.arm(0, {20, 21, 22}, 3);  // deferred until slot 0 retires
+    engine.arm(1, {20, 21, 22}, 3);  // sufficient physical headroom
+    dgpp::sched::AdmissionPolicy policy;
+    policy.prefill_budget_tokens = 8;
+    Scheduler sched(&engine, {}, 0, policy);
+    sched.submit(make_request("long", 31, 2));
+    sched.tick();
+    require(engine.pool_blocks_in_use() == 18, "long physical reservation");
+    sched.submit(make_request("peer", 3, 3));
+    engine.reset_tick();
+    sched.tick();  // MUST NOT throw at either boundary
+    require(engine.begins.size() == (blocks == 22 ? 1u : 0u) &&
+                sched.meters().queued == (blocks == 21 ? 1 : 0),
+            "21 blocks defers; 22 admits into fair shares");
+    if (blocks == 22) require(engine.reserved.at(1) == 6, "engine receives logical lifetime tokens");
+    for (int i = 0; sched.has_pending() && i < 40; ++i) sched.tick();
+    require(!sched.has_pending(), "both requests complete without exception or manual cancellation");
+    require(sched.find("long")->generated == std::vector<int64_t>({10, 11}) &&
+                sched.find("peer")->generated == std::vector<int64_t>({20, 21, 22}),
+            "both transcripts intact");
+    require(engine.pool_blocks_in_use() == 0 && engine.prefill_monitor()->snapshot().empty(),
+            "all reservations and monitor entries released");
+  }
+}
+
+DGPP_TEST(scheduler_reservation_depth_clamp_and_synchronous_admission) {
+  for (const int depth : {0, 1, 2, 3, 5})
+    for (const bool block : {false, true})
+      for (const int context : {34, 1000})
+        for (const int budget : {0, 8})
+          for (const int slack : {-1, 0}) {
+            ReservationEngine engine(1000, depth, context, block);
+            const int steps = context == 34 ? 31 : 3;
+            // Clamp case: both reservations reach the context ceiling. The
+            // quote must not over-defer by rounding the unclamped extra rows.
+            const int64_t need = engine.reservation_blocks(33) + engine.reservation_blocks(3 + steps);
+            engine.set_pool(need + slack);
+            engine.arm(0, {10, 11, 12, 13}, 4);
+            engine.arm(0, std::vector<int32_t>(steps, 20), steps);
+            engine.arm(1, std::vector<int32_t>(steps, 20), steps);
+            dgpp::sched::AdmissionPolicy policy;
+            policy.prefill_budget_tokens = budget;
+            Scheduler sched(&engine, {}, 0, policy);
+            sched.submit(make_request("long", 29, 4));
+            sched.tick();
+            sched.submit(make_request("peer", 3, steps));
+            sched.tick();
+            require(sched.meters().queued == (slack < 0 ? 1 : 0),
+                    "physical quote applies to chunked and synchronous admission at every depth/clamp");
+            for (int i = 0; sched.has_pending() && i < 80; ++i) sched.tick();
+            require(!sched.has_pending() && engine.pool_blocks_in_use() == 0,
+                    "depth/clamp cases drain without overdraw");
+            require(sched.find("peer")->generated == std::vector<int64_t>(steps, 20), "peer transcript");
+          }
+}
+
+DGPP_TEST(scheduler_reservation_grow_uses_physical_deltas) {
+  ReservationEngine engine(4, 2);
+  engine.arm(0, {10, 11, 12, 13, 14, 15}, 6);
+  engine.arm(1, {20, 21, 22, 23, 24, 25}, 6);
+  dgpp::sched::AdmissionPolicy policy;
+  policy.mode = dgpp::sched::AdmissionPolicy::Mode::kGrowOnDemand;
+  policy.window_tokens = 2;
+  policy.prefill_budget_tokens = 8;
+  Scheduler sched(&engine, {}, 0, policy);
+  sched.submit(make_request("older", 1, 6));
+  sched.submit(make_request("younger", 1, 6));
+  sched.tick();
+  require(sched.meters().active == 2 && engine.pool_blocks_in_use() == 4,
+          "both initial three-token windows fit with one trailing row each");
+  // Growing 3 -> 4 logical tokens costs zero raw blocks but one physical
+  // block. The minimum growth must shed the younger request, not overdraw.
+  for (int i = 0; sched.has_pending() && i < 20; ++i) sched.tick();
+  require(!sched.has_pending() && sched.meters().requests_shed_pool == 1 &&
+              sched.find("younger")->reason == Scheduler::Result::Reason::kPoolExhausted,
+          "growth checks use the same physical quote as initial admission");
+  require(sched.find("older")->generated == std::vector<int64_t>({10, 11, 12, 13, 14, 15}) &&
+              engine.pool_blocks_in_use() == 0, "older completes and all reservations return");
+}
+
+DGPP_TEST(scheduler_queuedText_mtp_cached_attach_and_clamp_fit) {
+  for (const int context : {34, 1000}) for (const int slack : {-1, 0}) {
+    ReservationEngine engine(1000, 3, context);
+    engine.set_prefix_arena(8, 1);
+    engine.arm(0, {9}, 1);
+    engine.arm(0, {10, 11}, 2);
+    const int steps = context == 34 ? 26 : 3;
+    engine.arm(1, std::vector<int32_t>(steps, 20), steps);
+    dgpp::sched::AdmissionPolicy policy;
+    policy.prefill_budget_tokens = 8;
+    Scheduler sched(&engine, {}, 0, policy);
+    auto cached = make_cached_request("seed", counted_prompt(4), {3}, 1);
+    sched.submit(cached);
+    sched.run_to_completion();
+    const auto pinned = engine.pinned_blocks();
+    require(pinned > 0, "seed retained in prefix arena");
+    // One full attached block is shared; one rolling partial-copy block
+    // remains reserved. The existing cached partial block is NOT subtracted.
+    const int64_t private_need = engine.reservation_blocks(8 + steps) - 1 + 1;
+    engine.set_pool(pinned + engine.reservation_blocks(33) + private_need + slack);
+    sched.submit(make_request("long", 31, 2));
+    sched.tick();
+    cached.id = "cached";
+    cached.max_steps = steps;
+    cached.prompt = counted_prompt(8);
+    sched.submit(cached);
+    engine.reset_tick();
+    const auto before = sched.meters();
+    sched.tick();
+    require(engine.begins.size() == (slack == 0 ? 1u : 0u),
+            "cached physical fit includes shared full blocks and rolling copy headroom");
+    if (slack == 0) {
+      require(engine.shared.at(1) == 1 && engine.advanced.at(1) == 4 &&
+                  sched.meters().prefix_hits == before.prefix_hits + 1 &&
+                  sched.meters().prefix_tokens_saved == before.prefix_tokens_saved + 3,
+              "attach and suffix computation preserved at the physical boundary");
+    }
+    require(engine.pool_blocks_in_use() <= engine.pool_blocks_total(), "cache fit does not overdraw");
+    require(sched.cancel("cached") && sched.cancel("long"), "cancel cache boundary fixtures");
+    sched.run_to_completion();
+    require(engine.pool_blocks_in_use() == engine.pinned_blocks() &&
+                engine.prefill_monitor()->snapshot().empty(), "only retained cache blocks remain");
+  }
+}
+
+DGPP_TEST(scheduler_queuedText_mtp_snapshot_copy_headroom) {
+  for (const int blocks : {13, 14}) {
+    ReservationEngine engine(blocks);
+    engine.set_block_tokens(4);
+    engine.set_prefix_arena(4, 2);
+    engine.set_partial_pins(true);  // live full blocks shared; snapshots cost their partial copy
+    engine.arm(0, {10, 11}, 2);
+    engine.arm(1, {20}, 1);
+    dgpp::sched::AdmissionPolicy policy;
+    policy.prefill_budget_tokens = 8;
+    Scheduler sched(&engine, {}, 0, policy);
+    sched.submit(make_request("long", 31, 2));
+    sched.tick();
+    require(engine.pool_blocks_in_use() == 9, "long physical reservation with four-row blocks");
+    sched.submit(make_cached_request("peer", counted_prompt(7), {6}, 1));
+    engine.reset_tick();
+    sched.tick();
+    require(engine.begins.size() == (blocks == 14 ? 1u : 0u),
+            "three physical blocks plus cut-copy and rolling-copy headroom required");
+    require(sched.cancel("peer") && sched.cancel("long"), "cancel unfinished snapshots");
+    sched.run_to_completion();
+    require(engine.pool_blocks_in_use() == 0 && engine.pinned_blocks() == 0 &&
+                engine.prefill_monitor()->snapshot().empty(), "private snapshots and reservations released");
+  }
+}
+
+DGPP_TEST(scheduler_queuedText_injected_begin_failure_cleanup) {
+  ReservationEngine engine(1000);
+  engine.set_prefix_arena(2, 2);
+  engine.arm(0, {10, 11}, 2);
+  engine.arm(1, {20, 21}, 2);
+  engine.arm(0, {30}, 1);
+  dgpp::sched::AdmissionPolicy policy;
+  policy.prefill_budget_tokens = 8;
+  Scheduler sched(&engine, {}, 0, policy);
+  sched.submit(make_request("long", 127, 2));
+  sched.tick();
+  const auto held = engine.pool_blocks_in_use();
+  sched.submit(make_cached_request("joined", counted_prompt(7), {6}, 2));
+  engine.fail_begin = 1;  // Explicit fault with ample physical headroom, NOT a fit failure.
+  bool threw = false;
+  try { sched.tick(); }
+  catch (const std::runtime_error& e) {
+    require(std::string(e.what()) == "injected begin failure after reservation", "original exception propagates");
+    threw = true;
+  }
+  require(threw && engine.pool_blocks_in_use() == held && engine.pinned_blocks() == 0,
+          "adapter and scheduler unwind reservation and private snapshot; failure is not swallowed");
+  require(sched.cancel("joined") && sched.cancel("long"), "cancel failed and existing requests");
+  sched.run_to_completion();
+  require(engine.pool_blocks_in_use() == 0 && engine.prefill_monitor()->snapshot().empty(), "failure cleanup");
+  engine.fail_begin = -1;
+  sched.submit(make_cached_request("reuse", counted_prompt(7), {6}, 1));
+  sched.run_to_completion();
+  require(sched.find("reuse")->generated == std::vector<int64_t>({30}), "slot and arena reusable after explicit fault");
+}
+
+DGPP_TEST(scheduler_queuedText_cancel_and_advance_failure_release_joined_snapshot) {
+  for (const bool fail : {false, true}) {
+    AdmissionFairEngine engine;
+    engine.set_prefix_arena(2, 2);
+    engine.arm(0, {10, 11}, 2);
+    engine.arm(1, {20, 21}, 2);
+    engine.arm(0, {30}, 1);
+    dgpp::sched::AdmissionPolicy policy;
+    policy.prefill_budget_tokens = 8;
+    Scheduler sched(&engine, {}, 0, policy);
+    sched.submit(make_request("long", 127, 2));
+    sched.tick();
+    sched.submit(make_cached_request("joined", counted_prompt(7), {6}, 2));
+    if (fail) engine.fail_slot = 1;
+    bool threw = false;
+    try {
+      sched.tick();
+    } catch (const std::runtime_error& e) {
+      require(std::string(e.what()) == "injected joined-prefill failure",
+              "expected engine failure only");
+      threw = true;
+    }
+    require(threw == fail && engine.reserved.contains(1),
+            "newly joined prefill reached the engine");
+    require(sched.meters().prefix_entries == 0, "unfinished joined snapshot is private");
+    require(sched.cancel("joined") && sched.cancel("long"), "cancel joined and original readers");
+    sched.run_to_completion();
+    require(engine.pool_blocks_in_use() == 0 && engine.pinned_blocks() == 0 &&
+                engine.prefill_monitor()->snapshot().empty(),
+            "failure/cancellation releases all private state");
+    engine.fail_slot = -1;
+    sched.submit(make_cached_request("reuse", counted_prompt(7), {6}, 1));
+    sched.run_to_completion();
+    require(sched.meters().prefix_snapshots == 1 && sched.find("reuse")->steps_done == 1,
+            "released slot and snapshot arena can be reused");
+  }
 }
 
 DGPP_TEST(scheduler_fairShare_busy_budget_rotates_and_survives_compaction) {

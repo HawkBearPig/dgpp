@@ -65,8 +65,16 @@ class SchedulerEngine {
   // DSA pool meters (a no-DSA model reports an unbounded pool).
   virtual int64_t pool_blocks_total() const = 0;
   virtual int64_t pool_blocks_in_use() const = 0;
-  // Block count covering `tokens` tokens — the reserve arithmetic.
+  // Raw block geometry, without engine-specific reservation headroom.
   virtual int64_t blocks_for_tokens(int64_t tokens) const = 0;
+  // Physical block footprint of reserve(req, tokens) and begin_prefill's
+  // reservation, before prefix sharing and snapshot copies. Engines that
+  // reserve extra rows (e.g. speculative verify/draft tails) must include
+  // those rows and their context clamp here. Pure, rank-deterministic, and
+  // valid before opening a slot; ordinary engines retain the raw quote.
+  virtual int64_t reservation_blocks(int64_t tokens) const {
+    return blocks_for_tokens(tokens);
+  }
 
   // Opens slot `req` (fresh state), prefills `prompt`, picks the first
   // generated token. Returns a token id in [0, vocab).
