@@ -56,6 +56,22 @@ void add_nvfp4(TensorList& out, const std::string& module, int64_t rows, int64_t
       QwenTensorRole::InputScale);
 }
 
+// The ModelOpt NVFP4 matrix (nvidia 122B: base.weight U8 [N, K/2] e2m1
+// pairs, base.weight_scale F8_E4M3 [N, K/16], base.weight_scale_2 F32 []
+// global, base.input_scale F32 [] activation global consumed but unused
+// under W4A16 — the loader.cpp load_fp4_*_mo precedent).
+void add_nvfp4_modelopt(TensorList& out, const std::string& base, int64_t rows, int64_t cols,
+                        QwenWeightClass cls, int layer, int expert) {
+  add(out, base + ".weight", DType::U8, {rows, cols / 2}, cls, layer, expert,
+      QwenTensorRole::Fp4Payload);
+  add(out, base + ".weight_scale", DType::F8_E4M3, {rows, cols / kFp4Group}, cls, layer,
+      expert, QwenTensorRole::Fp4Scale);
+  add(out, base + ".weight_scale_2", DType::F32, {}, cls, layer, expert,
+      QwenTensorRole::Fp4Global);
+  add(out, base + ".input_scale", DType::F32, {}, cls, layer, expert,
+      QwenTensorRole::InputScale);
+}
+
 // One projection in the format its config_groups entry claims (FP8Block:
 // always the block pair; the draft layer and every untargeted matrix in the
 // mixed release are BF16).
@@ -63,6 +79,16 @@ void add_matrix35(TensorList& out, const Qwen35TextConfig& cfg, const std::strin
                   int64_t rows, int64_t cols, QwenWeightClass cls, int layer) {
   if (cfg.quant_kind == Qwen35QuantKind::Fp8Block) {
     add_fp8(out, module + ".weight", rows, cols, cls, layer);
+    return;
+  }
+  if (cfg.quant_kind == Qwen35QuantKind::Nvfp4Moe) {
+    // ModelOpt MoE release: only experts.* claim Nvfp4 (expect_moe35 owns
+    // their ModelOpt names); attention/GDN/head never route here — the
+    // ignore list keeps them BF16.
+    if (cfg.tensor_quant(module) != Qwen35TensorQuant::Bf16)
+      throw std::invalid_argument("qwen35 binding: Nvfp4Moe NVFP4 is implemented for the routed "
+                                  "experts only (module '" + module + "')");
+    add_bf16(out, module + ".weight", {rows, cols}, cls, layer);
     return;
   }
   switch (cfg.tensor_quant(module)) {
@@ -128,6 +154,42 @@ void expect_dense_mlp35(TensorList& out, const std::string& p, const Qwen35TextC
   add_matrix35(out, cfg, p + "down_proj", H, I, c, layer);
 }
 
+// MoE MLP (qwen3_5_moe_text, nvidia 122B): router gate [E,H], shared gate
+// [1,H], shared gate/up [S,H] + down [H,S] BF16, routed gate/up/down per
+// expert — backbone NVFP4 ModelOpt, MTP draft BF16 (no kernel yet, counted
+// for the binding; serve skips MTP in v1).
+void expect_moe35(TensorList& out, const std::string& p, const Qwen35TextConfig& cfg,
+                  int layer) {
+  const int64_t H = cfg.hidden_size;
+  const int64_t I = cfg.moe_intermediate_size;
+  const int64_t S = cfg.shared_expert_intermediate_size;
+  const int64_t E = cfg.num_experts;
+  const bool is_mtp = layer == cfg.mtp_layer();
+  add_bf16(out, p + "gate.weight", {E, H}, QwenWeightClass::Router, layer);
+  add_bf16(out, p + "shared_expert_gate.weight", {1, H}, QwenWeightClass::Router, layer);
+  add_bf16(out, p + "shared_expert.gate_proj.weight", {S, H}, QwenWeightClass::SharedExpert,
+           layer);
+  add_bf16(out, p + "shared_expert.up_proj.weight", {S, H}, QwenWeightClass::SharedExpert,
+           layer);
+  add_bf16(out, p + "shared_expert.down_proj.weight", {H, S}, QwenWeightClass::SharedExpert,
+           layer);
+  for (int64_t e = 0; e < E; ++e) {
+    const std::string ep = p + "experts." + std::to_string(e) + ".";
+    if (is_mtp) {
+      add_bf16(out, ep + "gate_proj.weight", {I, H}, QwenWeightClass::RoutedExpert, layer);
+      add_bf16(out, ep + "up_proj.weight", {I, H}, QwenWeightClass::RoutedExpert, layer);
+      add_bf16(out, ep + "down_proj.weight", {H, I}, QwenWeightClass::RoutedExpert, layer);
+    } else {
+      add_nvfp4_modelopt(out, ep + "gate_proj", I, H, QwenWeightClass::RoutedExpert, layer,
+                         static_cast<int>(e));
+      add_nvfp4_modelopt(out, ep + "up_proj", I, H, QwenWeightClass::RoutedExpert, layer,
+                         static_cast<int>(e));
+      add_nvfp4_modelopt(out, ep + "down_proj", H, I, QwenWeightClass::RoutedExpert, layer,
+                         static_cast<int>(e));
+    }
+  }
+}
+
 void expect_norm35(TensorList& out, const std::string& p, const Qwen35TextConfig& cfg, int layer) {
   add_bf16(out, p + "input_layernorm.weight", {cfg.hidden_size}, QwenWeightClass::Norm, layer);
   add_bf16(out, p + "post_attention_layernorm.weight", {cfg.hidden_size}, QwenWeightClass::Norm,
@@ -160,7 +222,10 @@ std::vector<QwenExpectedTensor> qwen35_expected_layer_tensors(const Qwen35TextCo
     expect_gdn35(out, p + "linear_attn.", cfg, layer);
   else
     expect_full35(out, p + "self_attn.", cfg, layer);
-  expect_dense_mlp35(out, p + "mlp.", cfg, layer);
+  if (cfg.is_moe)
+    expect_moe35(out, p + "mlp.", cfg, layer);
+  else
+    expect_dense_mlp35(out, p + "mlp.", cfg, layer);
   return out;
 }
 
@@ -277,7 +342,14 @@ void qwen35_tp_validate_geometry(const Qwen35TextConfig& cfg, int rank, int worl
   if (cfg.num_attention_heads / cfg.num_key_value_heads * cfg.num_key_value_heads !=
       cfg.num_attention_heads)
     fail("query heads per kv head");
-  if (cfg.intermediate_size % world != 0) fail("intermediate_size must divide by world");
+  if (cfg.is_moe) {
+    if (cfg.moe_intermediate_size % world != 0)
+      fail("moe_intermediate_size must divide by world");
+    if (cfg.shared_expert_intermediate_size % world != 0)
+      fail("shared_expert_intermediate_size must divide by world");
+  } else {
+    if (cfg.intermediate_size % world != 0) fail("intermediate_size must divide by world");
+  }
 }
 
 }  // namespace dgpp

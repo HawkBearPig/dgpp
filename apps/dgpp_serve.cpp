@@ -1513,7 +1513,7 @@ int main(int argc, char** argv) {
   std::string draft_head = "exact";         // the MTP draft head's read: exact | screen (engine.draft_head)
   int draft_head_blocks = 32;               // the screen's candidate cap (engine.draft_head_blocks)
   std::string dense_weights = "checkpoint";  // the Qwen dense stack: checkpoint | fp8
-  std::string mtp_expert_format = "fp8";    // the Qwen MTP draft experts: fp8 | bf16_fused
+  std::string mtp_expert_format = "fp8";    // the Qwen MTP draft experts: fp8 | bf16_fused | bf16 (qwen3_5 MoE)
   std::string bf16_weights = "checkpoint";  // the bf16 decode weights' resident form: checkpoint | bf12 | bf12+bf16
   std::string draft_vocab;                  // the Qwen draft head's vocabulary slice (engine.draft_vocab)
   bool prefill_bf16_partials = false;       // the opt-in prefill levers (engine.prefill_*; 2026-09-30)
@@ -2422,13 +2422,18 @@ int main(int argc, char** argv) {
       return 1;
     }
   }
-  if (mtp_expert_format != "fp8" && mtp_expert_format != "bf16_fused") {
-    DGPP_LOG_ERROR("--mtp-expert-format must be fp8 or bf16_fused, got '{}'", mtp_expert_format);
+  if (mtp_expert_format != "fp8" && mtp_expert_format != "bf16_fused" &&
+      mtp_expert_format != "bf16") {
+    DGPP_LOG_ERROR("--mtp-expert-format must be fp8, bf16_fused or bf16 (qwen3_5 MoE draft), got '{}'",
+                   mtp_expert_format);
     return 2;
   }
   // The RadixArk fusion flag: set before the plan and the load (both read it
   // through QwenLayerStream::mtp_experts_bf16_fused and loader_format()).
+  // The qwen3_5 MoE draft flag rides beside it (per-expert BF16 encoded to
+  // block FP8 at load when "bf16").
   dgpp::QwenLayerStream::set_mtp_expert_format(mtp_expert_format == "bf16_fused");
+  dgpp::Qwen35LayerStream::set_mtp_expert_format(mtp_expert_format);
   // The draft head's screen (engine.draft_head; kernels/draft_head.hpp): a
   // process-wide setting every family reads at construction (its memory
   // plan too) — the decode drafts' head reads through the 2-bit copy.
@@ -2717,7 +2722,8 @@ int main(int argc, char** argv) {
         dense_weights != "checkpoint")
       DGPP_LOG_WARN("serve: --dense-weights {} applies to the Qwen dense stack only; the {} family loads as shipped",
                     dense_weights, family->name());
-    if (std::string(family->name()) != "qwen4_exp" && mtp_expert_format != "fp8")
+    if (std::string(family->name()) != "qwen4_exp" &&
+        std::string(family->name()) != "qwen3_5" && mtp_expert_format != "fp8")
       DGPP_LOG_WARN("serve: --mtp-expert-format {} applies to the Qwen draft experts only; the {} family loads as shipped",
                     mtp_expert_format, family->name());
     if (bf16_weights != "checkpoint" &&

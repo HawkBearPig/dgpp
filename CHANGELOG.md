@@ -240,6 +240,30 @@ project procedures and design guidance live in `docs/`.
   `benchmarks/results/` are no longer tracked. The measured
   latency/throughput tradeoffs are in
   [PR #112](https://github.com/HawkBearPig/dgpp/pull/112).
+
+- **Qwen3.5-122B-A10B-NVFP4: MoE support** (2026-10-07/08):
+  the `nvidia/Qwen3.5-122B-A10B-NVFP4` release serves on the `qwen3_5`
+  family (`qwen3_5_moe_text`): 48 layers (36 GDN + 12 Full, 3072 hidden),
+  256 experts top-8 + gated shared expert per layer. ModelOpt NVFP4 for
+  the routed experts only (U8 pairs + F8-E4M3 group-16 scales +
+  `weight_scale_2` stored reciprocal, kernels divide once), BF16 rest;
+  the declared FP8 `kv_cache_scheme` scales are absent and KV stays BF16.
+  `config35` reads the ModelOpt `config_groups` (`Linear` match-all +
+  glob `ignore`), `binding35`/`loader35` carry the MoE table (Router
+  replicates; experts/shared slice), the model rides `QwenMoeLayer`
+  (decode fast path + device prefill, per-layer graph route tables).
+  The MTP draft ships per-expert BF16:
+  `engine.mtp_expert_format=bf16` (qwen3_5-MoE-only) encodes it to block
+  FP8 at load (proposals-only loss, exact verify); without the key the
+  draft is refused by name. Gates: `qwen35_bind_check` 148976/148976 on
+  the release, loader + forward smoke on real weights (48 layers,
+  finite, deterministic), tiny-MoE fixture e2e relaxed + teacher strict
+  parity (top-8-of-8 routing: no selection boundary, full renorm; top-k
+  selection rides the shared kernels + live routed answers 391/Paris),
+  live `mtp:true` prompt parity vs plain. Templates
+  `cluster_qwen3.5-122b-a10b_nvfp4_w{1,2,4}` ship MTP depth 2
+  (31.1 tok/s C1 single-stream vs 26.9 plain on one Spark, identical
+  transcripts); plain is `--no-mtp`.
 - **Qwen3.8-27B NVFP4: fp4w prefill GEMM** (2026-10-06):
   `launch_fp4w_gemm_*` (new): `fp8w_gemm`'s 128x128x64 tiles and
   three-stage pipeline with an e2m1 W-side (8 payload bytes + the

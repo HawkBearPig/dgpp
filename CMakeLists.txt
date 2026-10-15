@@ -446,7 +446,8 @@ add_library(dgpp_models_qwen_loader STATIC
   src/models/qwen/vision.cpp
   src/models/qwen/loader.cpp
   src/models/qwen/loader35.cpp
-  src/models/qwen/dflash2.cpp)
+  src/models/qwen/dflash2.cpp
+  src/models/qwen/dflash.cpp)
 target_include_directories(dgpp_models_qwen_loader PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(dgpp_models_qwen_loader PUBLIC dgpp_models_qwen dgpp_loaders dgpp_kernels CUDA::cudart dgpp_device_ranges)
 dgpp_set_common(dgpp_models_qwen_loader)
@@ -650,6 +651,9 @@ dgpp_set_common(glm_dsa_bind_check)
 add_executable(dsv41_bind_check apps/dsv41_bind_check.cpp)
 target_link_libraries(dsv41_bind_check PRIVATE dgpp_models_dsv41 dgpp_loaders)
 dgpp_set_common(dsv41_bind_check)
+add_executable(qwen35_bind_check apps/qwen35_bind_check.cpp)
+target_link_libraries(qwen35_bind_check PRIVATE dgpp_models_qwen_loader dgpp_loaders)
+dgpp_set_common(qwen35_bind_check)
 add_executable(dsv4_forward_check apps/dsv4_forward_check.cpp)
 target_include_directories(dsv4_forward_check PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
 target_link_libraries(dsv4_forward_check PRIVATE dgpp_models_dsv4_layers dgpp_bus dgpp_loaders dgpp_sched dgpp_text CUDA::cudart Threads::Threads)
@@ -857,6 +861,7 @@ add_executable(unit_tests
   tests/unit/qwen35_config_test.cpp
   tests/unit/qwen35_binding_test.cpp
   tests/unit/qwen_dflash2_config_test.cpp
+  tests/unit/qwen_dflash_config_test.cpp
   tests/unit/dflash2_speculator_test.cpp
   tests/unit/qwen_rope_scaling_test.cpp
   tests/unit/glm4_config_test.cpp
@@ -1341,6 +1346,17 @@ add_test(NAME qwen35_mixed_test
   COMMAND qwen35_forward_test --checkpoint-dir ${QWEN35_MIXED_FIXTURE}
           --dump-file ${CMAKE_CURRENT_BINARY_DIR}/qwen35_mixed_teacher.q35dump)
 set_tests_properties(qwen35_mixed_test PROPERTIES DEPENDS qwen35_mixed_generate_teacher)
+# The MoE release (122B layout at toy widths: ModelOpt NVFP4 routed experts,
+# BF16 rest): the same smoke/rows/group gates over the MoE fixture. Dump
+# parity waits on the reference dump's MoE path (tools/qwen35_reference_dump.py).
+set(QWEN35_MOE_FIXTURE ${CMAKE_CURRENT_BINARY_DIR}/qwen35_moe_fixture)
+add_test(NAME qwen35_moe_fixture COMMAND qwen35_forward_test --write-fixture-moe ${QWEN35_MOE_FIXTURE})
+add_test(NAME qwen35_moe_smoke COMMAND qwen35_forward_test --smoke ${QWEN35_MOE_FIXTURE})
+set_tests_properties(qwen35_moe_smoke PROPERTIES DEPENDS qwen35_moe_fixture)
+add_test(NAME qwen35_moe_rows_invariance COMMAND qwen35_forward_test --rows-invariance ${QWEN35_MOE_FIXTURE})
+set_tests_properties(qwen35_moe_rows_invariance PROPERTIES DEPENDS qwen35_moe_fixture)
+add_test(NAME qwen35_moe_group_invariance COMMAND qwen35_forward_test --group-invariance ${QWEN35_MOE_FIXTURE})
+set_tests_properties(qwen35_moe_group_invariance PROPERTIES DEPENDS qwen35_moe_fixture)
 # Exercise the FP4 prefill dispatch at its 1024-row boundary.
 # The short mixed fixture above stays on the decode/short-prefill kernel.
 add_test(NAME qwen35_mixed_prefill_generate

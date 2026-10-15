@@ -198,3 +198,41 @@ DGPP_TEST(qwen35_binding_tp_geometry) {
   }
   require(threw, "world 3 must fail (intermediate 17408 % 3)");
 }
+
+DGPP_TEST(qwen35_binding_moe_modelopt_table) {
+  // The 122B MoE table: router/shared BF16, routed experts ModelOpt NVFP4
+  // (backbone), MTP experts BF16, attention/GDN BF16, no kv scales.
+  const std::string text = qwen35_fixture::moe_text_json();
+  const std::string quant = qwen35_fixture::kQuantModeloptNvfp4;
+  const auto t = dgpp::minijson::parse(text);
+  const auto q = dgpp::minijson::parse(quant);
+  const auto c = dgpp::Qwen35TextConfig::parse(t.root, &q.root);
+  const auto v = dgpp::qwen35_expected_layer_tensors(c, 0);
+  using dgpp::DType;
+  require_shape(v, "model.language_model.layers.0.mlp.gate.weight", DType::BF16, {256, 3072});
+  require_shape(v, "model.language_model.layers.0.mlp.shared_expert_gate.weight", DType::BF16,
+                {1, 3072});
+  require_shape(v, "model.language_model.layers.0.mlp.shared_expert.gate_proj.weight",
+                DType::BF16, {1024, 3072});
+  require_shape(v, "model.language_model.layers.0.mlp.experts.0.gate_proj.weight", DType::U8,
+                {1024, 1536});
+  require_shape(v, "model.language_model.layers.0.mlp.experts.0.gate_proj.weight_scale",
+                DType::F8_E4M3, {1024, 192});
+  require_shape(v, "model.language_model.layers.0.mlp.experts.0.gate_proj.weight_scale_2",
+                DType::F32, {});
+  require_shape(v, "model.language_model.layers.0.mlp.experts.0.gate_proj.input_scale",
+                DType::F32, {});
+  require_shape(v, "model.language_model.layers.0.mlp.experts.0.down_proj.weight", DType::U8,
+                {3072, 512});
+  const auto full = dgpp::qwen35_expected_layer_tensors(c, 3);
+  require_shape(full, "model.language_model.layers.3.self_attn.q_proj.weight", DType::BF16,
+                {16384, 3072});
+  require(find(full, "model.language_model.layers.3.self_attn.k_scale") == nullptr,
+           "no kv scales in the MoE release");
+  const auto mtp = dgpp::qwen35_expected_layer_tensors(c, 48);
+  require_shape(mtp, "mtp.layers.0.mlp.experts.0.gate_proj.weight", DType::BF16,
+                {1024, 3072});
+  auto present = present_map(dgpp::qwen35_expected_text_tensors(c));
+  const auto rep = dgpp::qwen35_validate_text_binding(c, present);
+  require(rep.ok(), "complete MoE map validates");
+}

@@ -53,6 +53,11 @@ bool is_replicated_35(const QwenExpectedTensor& e) {
       return true;
     case QwenWeightClass::Mtp:
       return true;
+    case QwenWeightClass::Router:
+      return true;  // mlp.gate + shared_expert_gate (loader.cpp precedent)
+    case QwenWeightClass::SharedExpert:
+    case QwenWeightClass::RoutedExpert:
+      return false;  // I/W + S/W slices
     case QwenWeightClass::FullAttn:
       return ends_with(e.name, "q_norm.weight") || ends_with(e.name, "k_norm.weight");
     case QwenWeightClass::Gdn:
@@ -94,7 +99,9 @@ Qwen35LocalGeometry Qwen35LocalGeometry::from_config(const Qwen35TextConfig& cfg
     if (owner < g.kv_head_begin || owner >= g.kv_head_begin + g.local_kv_heads)
       throw std::invalid_argument("qwen35 loader: query/kv head sharding mismatch");
   }
-  g.local_inter = cfg.intermediate_size / world;
+  g.local_inter = cfg.is_moe ? 0 : cfg.intermediate_size / world;
+  g.local_moe_inter = cfg.is_moe ? cfg.moe_intermediate_size / world : 0;
+  g.local_shared_inter = cfg.is_moe ? cfg.shared_expert_intermediate_size / world : 0;
   g.lm_vocab_begin =
       static_cast<int>(static_cast<int64_t>(cfg.vocab_size) * rank / world);
   g.lm_vocab_count =
@@ -233,6 +240,19 @@ struct Qwen35LoaderFamily::Builder : WeightBuilder<QwenExpectedTensor> {
 
   // Contiguous BF16 row ranges of several source row spans concatenated into
   // one bump buffer (the GDN's segmented qkv/conv assembly + lm head shard).
+  // BF16 segment merge (the MoE release's GDN in_proj_qkv): payload rows
+  // concatenate; no scales.
+  const uint16_t* merge_bf16_segments(const std::string& name, int64_t total_rows, int64_t K,
+                                      const std::vector<std::array<int64_t, 3>>& segs) {
+    const QwenExpectedTensor& e = expected(name);
+    if (e.shape.size() != 2 || e.shape[1] != K)
+      fail(name + ": merged width disagrees with the checkpoint");
+    uint16_t* dst =
+        static_cast<uint16_t*>(bump.alloc(static_cast<size_t>(total_rows) * K * 2));
+    for (const auto& sg : segs) copy_rows_into(name, sg[0], sg[1], dst, sg[2], K);
+    if (copy) consumed(source(name));
+    return dst;
+  }
   void copy_rows_into(const std::string& name, int64_t src_row, int64_t rows, uint16_t* dst,
                       int64_t dst_row, int64_t width) {
     const QwenExpectedTensor& e = expected(name);
@@ -557,6 +577,101 @@ struct Qwen35LoaderFamily::Builder : WeightBuilder<QwenExpectedTensor> {
     return q;
   }
 
+  // ---- ModelOpt NVFP4 (nvidia 122B MoE) --------------------------------------
+  // base.weight U8 [N, K/2], base.weight_scale F8 [N, K/16],
+  // base.weight_scale_2 F32 [] multiplier stored as its reciprocal (the
+  // kernels divide once — loader.cpp load_global_reciprocal_into
+  // precedent; compressed-tensors globals are divisors already).
+  // base.input_scale consumed for reconciliation, never resident (W4A16).
+  void load_global_mo_into(const std::string& base, float* slot) {
+    const QwenExpectedTensor& eg = expected(base + ".weight_scale_2");
+    if (copy) {
+      const TensorInfo& t = source(eg.name);
+      float ws2 = 0.f;
+      std::memcpy(&ws2, t.data, 4);
+      if (!(ws2 > 0.0f) || !std::isfinite(ws2)) fail("'" + eg.name + "' is not positive finite");
+      const float inv = 1.0f / ws2;
+      std::memcpy(bump.host(slot), &inv, 4);
+      consumed(t);
+      consumed(source(base + ".input_scale"));
+    }
+    note_read(eg, 4);
+    const QwenExpectedTensor& ei = expected(base + ".input_scale");
+    note_read(ei, 4);
+  }
+
+  GlmFp4Matrix load_fp4_mo_rows(const std::string& base, int64_t r0, int64_t rn,
+                                float* global) {
+    const QwenExpectedTensor& ep = expected(base + ".weight");
+    const QwenExpectedTensor& es = expected(base + ".weight_scale");
+    const int64_t N = ep.shape[0], K = ep.shape[1] * 2;
+    if (K % kFp4Group != 0) fail(base + ": fp4 K must be a multiple of 16");
+    if (es.shape.size() != 2 || es.shape[0] != N || es.shape[1] != K / kFp4Group)
+      fail(base + ".weight_scale: NVFP4 scale grid must be [N, K/16]");
+    check_range(base, r0, rn, N);
+    const int64_t pc = K / 2, sc = K / kFp4Group;
+    GlmFp4Matrix q;
+    q.rows = rn;
+    q.cols = K;
+    q.scale_group = kFp4Group;
+    q.payload = static_cast<const uint8_t*>(bump.alloc(static_cast<size_t>(rn) * pc));
+    q.scales = static_cast<const uint8_t*>(bump.alloc(static_cast<size_t>(rn) * sc));
+    if (copy) {
+      std::memcpy(bump.host(const_cast<uint8_t*>(q.payload)),
+                  static_cast<const uint8_t*>(source(ep.name).data) + static_cast<size_t>(r0) * pc,
+                  static_cast<size_t>(rn) * pc);
+      std::memcpy(bump.host(const_cast<uint8_t*>(q.scales)),
+                  static_cast<const uint8_t*>(source(es.name).data) + static_cast<size_t>(r0) * sc,
+                  static_cast<size_t>(rn) * sc);
+      consumed(source(ep.name));
+      consumed(source(es.name));
+    }
+    note_read(ep, static_cast<size_t>(rn) * pc);
+    note_read(es, static_cast<size_t>(rn) * sc);
+    load_global_mo_into(base, global);
+    q.global_scale = global;
+    return q;
+  }
+
+  GlmFp4Matrix load_fp4_mo_cols(const std::string& base, int64_t c0, int64_t cn,
+                                float* global) {
+    const QwenExpectedTensor& ep = expected(base + ".weight");
+    const QwenExpectedTensor& es = expected(base + ".weight_scale");
+    const int64_t N = ep.shape[0], K = ep.shape[1] * 2;
+    if (K % kFp4Group != 0) fail(base + ": fp4 K must be a multiple of 16");
+    check_range(base + " cols", c0, cn, K);
+    if (c0 % kFp4Group != 0 || cn % kFp4Group != 0)
+      fail(base + ": fp4 column slice needs 16-aligned bounds");
+    if (es.shape.size() != 2 || es.shape[0] != N || es.shape[1] != K / kFp4Group)
+      fail(base + ".weight_scale: NVFP4 scale grid must be [N, K/16]");
+    const int64_t pc = K / 2, lc = cn / 2, sc = K / kFp4Group, lsc = cn / kFp4Group;
+    GlmFp4Matrix q;
+    q.rows = N;
+    q.cols = cn;
+    q.scale_group = kFp4Group;
+    q.payload = static_cast<const uint8_t*>(bump.alloc(static_cast<size_t>(N) * lc));
+    q.scales = static_cast<const uint8_t*>(bump.alloc(static_cast<size_t>(N) * lsc));
+    if (copy) {
+      const uint8_t* sp = static_cast<const uint8_t*>(source(ep.name).data);
+      uint8_t* dp = static_cast<uint8_t*>(bump.host(const_cast<uint8_t*>(q.payload)));
+      const uint8_t* ss = static_cast<const uint8_t*>(source(es.name).data);
+      uint8_t* ds = static_cast<uint8_t*>(bump.host(const_cast<uint8_t*>(q.scales)));
+      for (int64_t r = 0; r < N; ++r) {
+        std::memcpy(dp + static_cast<size_t>(r) * lc, sp + static_cast<size_t>(r) * pc + c0 / 2,
+                    static_cast<size_t>(lc));
+        std::memcpy(ds + static_cast<size_t>(r) * lsc, ss + static_cast<size_t>(r) * sc + c0 / 16,
+                    static_cast<size_t>(lsc));
+      }
+      consumed(source(ep.name));
+      consumed(source(es.name));
+    }
+    note_read(ep, static_cast<size_t>(N) * lc);
+    note_read(es, static_cast<size_t>(N) * lsc);
+    load_global_mo_into(base, global);
+    q.global_scale = global;
+    return q;
+  }
+
   // A full/GDN projection's row slice in its release's format (the MLP's
   // NVFP4/BF16 forms do not reach here: form_of refuses NVFP4 off the MLP,
   // and the draft layer's BF16 matrices do).
@@ -641,7 +756,10 @@ struct Qwen35LoaderFamily::Builder : WeightBuilder<QwenExpectedTensor> {
         g.in_proj_qkv_fp8 = merge_channel_segments(qkv_mod, local_rows, H, segs);
         break;
       case Form::Bf16:
-        fail(qkv_mod + ": the draft layer is never a GDN layer");
+        // BF16 GDN (the MoE release: every non-expert matrix is BF16).
+        // Concatenate the three row segments; the resident is plain BF16.
+        g.in_proj_qkv = merge_bf16_segments(qkv_mod + ".weight", local_rows, H, segs);
+        break;
       case Form::Nvfp4: break;  // form_of refused
     }
     if (copy) consumed(source(qkv_mod + ".weight"));
@@ -664,6 +782,64 @@ struct Qwen35LoaderFamily::Builder : WeightBuilder<QwenExpectedTensor> {
     g.norm = load_bf16(p + "linear_attn.norm.weight");
     g.out_proj_fp8 =
         load_attn_cols(p + "linear_attn.out_proj", r * lv * dv, lv * dv, &g.out_proj);
+  }
+
+  void build_moe(const std::string& p) {
+    // ModelOpt NVFP4 MoE (nvidia 122B backbone): router + shared BF16,
+    // routed gate/up rows [r*I, I), down cols [r*I, I), globals reciprocal.
+    // MTP draft (BF16 experts): engine.mtp_expert_format=bf16 below; the
+    // dense variant has no MoE draft at all.
+    if (!cfg.is_moe) fail("build_moe: dense variant carries no MoE");
+    const bool is_mtp = out.layer == cfg.mtp_layer();
+    QwenMoeResident& m = out.moe;
+    const int64_t I = geo.local_moe_inter, S = geo.local_shared_inter;
+    const int64_t r = geo.rank;
+    const int64_t E = cfg.num_experts;
+    m.local_inter = I;
+    m.local_shared_inter = S;
+    m.router = load_bf16(p + "mlp.gate.weight");
+    m.shared_gate = load_bf16(p + "mlp.shared_expert_gate.weight");
+    m.shared[0] = load_bf16_rows(p + "mlp.shared_expert.gate_proj.weight", r * S, S);
+    m.shared[1] = load_bf16_rows(p + "mlp.shared_expert.up_proj.weight", r * S, S);
+    m.shared[2] = load_bf16_cols(p + "mlp.shared_expert.down_proj.weight", r * S, S);
+    if (is_mtp) {
+      // The draft's BF16 experts: engine.mtp_expert_format=bf16 encodes
+      // each expert's slice to block FP8 at load (the fused-release
+      // precedent); the proposals are lossy, the verify exact. Any other
+      // value cannot serve the BF16 draft — refused by key name on a real
+      // load (sizing walks every layer, served or not, so it measures).
+      if (Qwen35LayerStream::mtp_expert_format() != "bf16" && copy)
+        fail("mtp draft MoE needs engine.mtp_expert_format=bf16 (the checkpoint holds "
+             "per-expert BF16, encoded to block FP8 at load for the proposals only)");
+      m.experts.resize(static_cast<size_t>(E) * 3);
+      m.scale_block = 128;
+      for (int64_t e = 0; e < E; ++e) {
+        const std::string ep = p + "mlp.experts." + std::to_string(e) + ".";
+        m.experts[static_cast<size_t>(e) * 3 + 0] =
+            load_bf16_rows_fp8(ep + "gate_proj.weight", r * I, I);
+        m.experts[static_cast<size_t>(e) * 3 + 1] =
+            load_bf16_rows_fp8(ep + "up_proj.weight", r * I, I);
+        m.experts[static_cast<size_t>(e) * 3 + 2] =
+            load_bf16_cols_fp8(ep + "down_proj.weight", r * I, I);
+      }
+      return;
+    }
+    m.experts_fp4.resize(static_cast<size_t>(E) * 3);
+    m.expert_globals = static_cast<float*>(bump.alloc(static_cast<size_t>(E) * 3 * sizeof(float)));
+    for (int64_t e = 0; e < E; ++e) {
+      const std::string ep = p + "mlp.experts." + std::to_string(e) + ".";
+      float* gb = m.expert_globals + e * 3;
+      m.experts_fp4[static_cast<size_t>(e) * 3 + 0] =
+          load_fp4_mo_rows(ep + "gate_proj", r * I, I, gb + 0);
+      m.experts_fp4[static_cast<size_t>(e) * 3 + 1] =
+          load_fp4_mo_rows(ep + "up_proj", r * I, I, gb + 1);
+      m.experts_fp4[static_cast<size_t>(e) * 3 + 2] =
+          load_fp4_mo_cols(ep + "down_proj", r * I, I, gb + 2);
+    }
+    // W4A4 input-scale maxima (loader.cpp precedent; unused under W4A16,
+    // kept for the byte reconciliation via load_global_mo_into).
+    m.act_scale_w13 = 0.0f;
+    m.act_scale_w2 = 0.0f;
   }
 
   void build_mlp(const std::string& p) {
@@ -732,7 +908,10 @@ struct Qwen35LoaderFamily::Builder : WeightBuilder<QwenExpectedTensor> {
       build_gdn(p);
     else
       build_full(p);
-    build_mlp(p);
+    if (cfg.is_moe)
+      build_moe(p);
+    else
+      build_mlp(p);
     if (loader_verbose())
       std::fprintf(stderr, "[qwen35] layer %d done (kind=%d)\n", layer, (int)kind);
   }
@@ -740,9 +919,13 @@ struct Qwen35LoaderFamily::Builder : WeightBuilder<QwenExpectedTensor> {
 
 const char* Qwen35LoaderFamily::who() { return "qwen35 loader"; }
 
+// 5: MoE MTP draft encoded (engine.mtp_expert_format=bf16 carries bit 8).
+// 4: MoE variant adds routed/shared slices (Nvfp4Moe, ModelOpt naming).
 // 3: the NVFP4 global slot holds the weight-side divisor itself (2026-10-06;
 // the 2-era images hold its reciprocal, and the kernels divide by the slot).
-uint64_t Qwen35LoaderFamily::loader_format() { return 3; }
+uint64_t Qwen35LoaderFamily::loader_format() {
+  return 4 | (Qwen35LayerStream::mtp_expert_format() == "bf16" ? 8 : 0);
+}
 
 int Qwen35LoaderFamily::max_layer(const Config& c) {
   return c.num_hidden_layers + (c.mtp_layer() >= 0 ? 1 : 0);
@@ -779,7 +962,8 @@ bool Qwen35LoaderFamily::digest_included(const Expected& e) { return is_replicat
 
 bool Qwen35LoaderFamily::discard_after_pack(const Expected& e) {
   return e.cls == QwenWeightClass::Gdn || e.cls == QwenWeightClass::FullAttn ||
-         e.cls == QwenWeightClass::DenseMlp;
+         e.cls == QwenWeightClass::DenseMlp || e.cls == QwenWeightClass::Router ||
+         e.cls == QwenWeightClass::SharedExpert || e.cls == QwenWeightClass::RoutedExpert;
 }
 
 size_t Qwen35LoaderFamily::globals_bytes(const Config& c, int rank, int world,
@@ -897,6 +1081,21 @@ Qwen35LayerStream::Qwen35LayerStream(const Qwen35TextConfig& cfg, const std::str
 
 void Qwen35LayerStream::set_resident_image_dir(const std::string& dir) {
   resident_image_dir_storage_35() = dir;
+}
+
+std::string& mtp_expert_format_storage_35() {
+  static std::string fmt = "fp8";
+  return fmt;
+}
+
+void Qwen35LayerStream::set_mtp_expert_format(const std::string& fmt) {
+  if (fmt != "fp8" && fmt != "bf16_fused" && fmt != "bf16")
+    throw std::invalid_argument("qwen35 mtp_expert_format: fp8 | bf16_fused | bf16");
+  mtp_expert_format_storage_35() = fmt;
+}
+
+const std::string& Qwen35LayerStream::mtp_expert_format() {
+  return mtp_expert_format_storage_35();
 }
 
 const std::string& Qwen35LayerStream::resident_image_dir() { return resident_image_dir_storage_35(); }
