@@ -46,14 +46,18 @@
 // registered reader stream + the loader's stream, resident cache hits read
 // no storage, release_sources() drops the mappings after the load.
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <type_traits>
 #include <unordered_map>
 #include <utility>
@@ -69,6 +73,19 @@
 #include "loaders/weight_build.hpp"
 
 namespace dgpp {
+
+// Eager parallel layer-load worker count (DGPP_PRELOAD_THREADS): unset or
+// <= 1 keeps the serial loop. Shared by the serving families and the
+// eagerly-loading model constructors; unset means historical behavior.
+inline int loader_preload_threads() {
+  int threads = 1;
+  if (const char* e = std::getenv("DGPP_PRELOAD_THREADS")) {
+    threads = std::atoi(e);
+    if (threads < 0) threads = 0;
+    if (threads > 16) threads = 16;
+  }
+  return threads;
+}
 
 namespace detail {
 // A family may declare `static std::string extra_shard_dir()` and
@@ -114,6 +131,14 @@ class ResidentLayerStream {
   ResidentLayerStream& operator=(const ResidentLayerStream&) = delete;
 
   const LayerResident& load_layer(int layer);
+  // Eagerly materializes [first, last) on `threads` workers (threads <= 1
+  // is the serial load_layer loop). Resident mode only. Each worker owns
+  // its pinned staging mirror and CUDA stream, so disk reads, host packs
+  // and H2D uploads overlap across layers; the disk itself still
+  // serializes at its line rate. Per-layer results are published by index,
+  // so completion order does not matter. Throws (after joining) on the
+  // first worker error; already-materialized layers stay resident.
+  void load_layers_parallel(int first, int last_exclusive, int threads);
   const GlobalsResident& load_globals();
   void release_layer();
   void release_globals();
@@ -235,6 +260,30 @@ class ResidentLayerStream {
   void restore_layer_from_image(int layer, LayerBump& bump, LayerResident& out);
   void capture_layer_to_image(int layer, const LayerBump& bump, size_t bytes);
   void build_layer_into(int layer, LayerBump& bump, LayerResident& out);
+  // Parallel-load machinery: one worker owns a staging mirror and a CUDA
+  // stream; LayerStats keeps a thread's counters for a post-join merge
+  // (the members stay plain: build_globals takes them by reference).
+  struct LoadWorker {
+    void* staging = nullptr;
+    cudaStream_t stream = nullptr;
+  };
+  struct LayerStats {
+    int restored = 0;
+    int captured = 0;
+    uint64_t source_bytes = 0;
+    uint64_t verbatim_bytes = 0;
+  };
+  LoadWorker make_worker() const;
+  void free_worker(const LoadWorker& w) const;
+  const LayerResident& load_one_layer(int layer, const LoadWorker& w, LayerStats& st);
+  void restore_layer_from_image(int layer, LayerBump& bump, LayerResident& out,
+                                const LoadWorker& w, LayerStats& st);
+  void capture_layer_to_image(int layer, const LayerBump& bump, size_t bytes,
+                              const LoadWorker& w, LayerStats& st);
+  void build_layer_into(int layer, LayerBump& bump, LayerResident& out,
+                        const LoadWorker& w, LayerStats& st);
+  void sync_image_failure();
+  std::atomic<bool> image_failed_{false};
 };
 
 // ---------------------------------------------------------------------------
@@ -489,8 +538,9 @@ void ResidentLayerStream<F>::open_resident_image() {
 
 template <class F>
 void ResidentLayerStream<F>::restore_layer_from_image(int layer, LayerBump& bump,
-                                                      LayerResident& out) {
-  bump.stage = staging_;
+                                                      LayerResident& out,
+                                                      const LoadWorker& w, LayerStats& st) {
+  bump.stage = w.staging;
   const std::vector<Expected> table = F::layer_table(cfg_, layer);
   std::unordered_map<std::string, const Expected*> by_name;
   for (const auto& e : table) by_name.emplace(e.name, &e);
@@ -507,33 +557,39 @@ void ResidentLayerStream<F>::restore_layer_from_image(int layer, LayerBump& bump
     const char* v = std::getenv("DGPP_RESIDENT_CACHE_VERIFY");
     return v && *v && std::string(v) != "0";
   }();
-  image_->read_layer(layer, staging_, bytes, verify);
-  sync_load_boundary(reader_, stream_);
-  bump.upload(stream_);  // stage == staging_: the blob is the mirror's layout
-  DGPP_CUDA_OK(cudaStreamSynchronize(stream_));
+  image_->read_layer(layer, w.staging, bytes, verify);
+  sync_load_boundary(reader_, w.stream);
+  bump.upload(w.stream);  // stage == w.staging: the blob is the mirror's layout
+  DGPP_CUDA_OK(cudaStreamSynchronize(w.stream));
   F::after_restore(cfg_, layer, tensors_, out);
   out.bytes = bytes;
-  ++image_restored_;
+  ++st.restored;
 }
 
 template <class F>
-void ResidentLayerStream<F>::capture_layer_to_image(int layer, const LayerBump& bump, size_t bytes) {
-  bump.download(staging_);
+void ResidentLayerStream<F>::capture_layer_to_image(int layer, const LayerBump& bump, size_t bytes,
+                                                    const LoadWorker& w, LayerStats& st) {
+  // A failed capture poisons the cache for this stream (flagged, reset by
+  // sync_image_failure after the layer/pool completes) rather than racing
+  // a null image_ against concurrent workers.
+  if (image_failed_.load(std::memory_order_relaxed)) return;
+  bump.download(w.staging);
   try {
-    image_->write_layer(layer, staging_, bytes);
-    ++image_captured_;
+    image_->write_layer(layer, w.staging, bytes);
+    ++st.captured;
   } catch (const std::exception& e) {
-    DGPP_LOG_WARN("{}: rank {} could not capture layer {} to the resident image ({}) — cache "
-                  "disabled for this stream", F::who(), rank_, layer, e.what());
-    image_.reset();
+    if (!image_failed_.exchange(true))
+      DGPP_LOG_WARN("{}: rank {} could not capture layer {} to the resident image ({}) — cache "
+                    "disabled for this stream", F::who(), rank_, layer, e.what());
   }
 }
 
 // ---- layers ------------------------------------------------------------------
 
 template <class F>
-void ResidentLayerStream<F>::build_layer_into(int layer, LayerBump& bump, LayerResident& out) {
-  bump.stage = staging_;
+void ResidentLayerStream<F>::build_layer_into(int layer, LayerBump& bump, LayerResident& out,
+                                             const LoadWorker& w, LayerStats& st) {
+  bump.stage = w.staging;
   const std::vector<Expected> table = F::layer_table(cfg_, layer);
   std::unordered_map<std::string, const Expected*> by_name;
   for (const auto& e : table) by_name.emplace(e.name, &e);
@@ -547,17 +603,19 @@ void ResidentLayerStream<F>::build_layer_into(int layer, LayerBump& bump, LayerR
   if (ctx.one_pass_sources) {
     // The packed column slices read their sources in phase one, above;
     // drop those pages now (the builder could not: the pack ran after it).
+    // Per-layer tensor names are disjoint across workers; a shared tensor
+    // discarded twice is an idempotent madvise.
     for (const auto& e : table)
       if (F::discard_after_pack(e))
         if (auto it = tensors_.find(e.name); it != tensors_.end() && it->second && it->second->owner)
           it->second->owner->discard(*it->second);
   }
-  bump.upload(stream_);
+  bump.upload(w.stream);
   if (!jobs.empty())
     throw std::logic_error(std::string(F::who()) + ": no dequant bridges exist for this family");
   for (const PackJob& j : packs)
-    if (j.src_on_device) run_device_pack(j, stream_);
-  DGPP_CUDA_OK(cudaStreamSynchronize(stream_));
+    if (j.src_on_device) run_device_pack(j, w.stream);
+  DGPP_CUDA_OK(cudaStreamSynchronize(w.stream));
   const size_t used = bump.cursor;
   const size_t expected_bytes = layer_bytes(cfg_, layer, rank_, world_);
   if (used != expected_bytes)
@@ -570,40 +628,143 @@ void ResidentLayerStream<F>::build_layer_into(int layer, LayerBump& bump, LayerR
                              std::to_string(layer) + ": read " + std::to_string(ctx.source_bytes) +
                              " != planned " + std::to_string(planned));
   out.bytes = used;
-  source_bytes_ += ctx.source_bytes;
-  verbatim_bytes_ += ctx.verbatim_bytes;
+  st.source_bytes += ctx.source_bytes;
+  st.verbatim_bytes += ctx.verbatim_bytes;
 }
 
 template <class F>
 const typename F::LayerResident& ResidentLayerStream<F>::load_layer(int layer) {
-  if (residency_ == LoaderResidency::Resident) {
-    if (layer < 0 || layer >= static_cast<int>(resident_layers_.size()))
-      throw std::out_of_range(std::string(F::who()) + ": layer index out of range: " + std::to_string(layer));
-    LayerResident& slot = resident_layers_[static_cast<size_t>(layer)];
-    if (slot.layer == layer) return slot;
-    if (sources_released_)
-      throw std::runtime_error(std::string(F::who()) + ": layer " + std::to_string(layer) +
-                               " was never materialized before release_sources()");
-    auto bump = std::make_unique<LayerBump>();
-    bump->side_mode = side_grants_;
-    const CountedBuild counted = count_layer(cfg_, layer, rank_, world_);
-    bump->init(counted.bytes - (side_grants_ ? counted.side_bytes : 0));
-    if (image_ && image_->has_layer(layer)) {
-      restore_layer_from_image(layer, *bump, slot);
-    } else {
-      sync_load_boundary(reader_, stream_);
-      build_layer_into(layer, *bump, slot);
-      if (image_) capture_layer_to_image(layer, *bump, slot.bytes);
-    }
-    resident_bumps_[static_cast<size_t>(layer)] = std::move(bump);
-    return slot;
+  if (residency_ != LoaderResidency::Resident) {
+    if (resident_.layer == layer) return resident_;
+    sync_load_boundary(reader_, stream_);
+    layer_bump_->reset();
+    resident_ = LayerResident{};
+    LayerStats st;
+    build_layer_into(layer, *layer_bump_, resident_, LoadWorker{staging_, stream_}, st);
+    source_bytes_ += st.source_bytes;
+    verbatim_bytes_ += st.verbatim_bytes;
+    return resident_;
   }
-  if (resident_.layer == layer) return resident_;
-  sync_load_boundary(reader_, stream_);
-  layer_bump_->reset();
-  resident_ = LayerResident{};
-  build_layer_into(layer, *layer_bump_, resident_);
-  return resident_;
+  LayerStats st;
+  const LayerResident& out = load_one_layer(layer, LoadWorker{staging_, stream_}, st);
+  source_bytes_ += st.source_bytes;
+  verbatim_bytes_ += st.verbatim_bytes;
+  image_restored_ += st.restored;
+  image_captured_ += st.captured;
+  sync_image_failure();
+  return out;
+}
+
+template <class F>
+const typename F::LayerResident& ResidentLayerStream<F>::load_one_layer(int layer, const LoadWorker& w,
+                                                                        LayerStats& st) {
+  if (layer < 0 || layer >= static_cast<int>(resident_layers_.size()))
+    throw std::out_of_range(std::string(F::who()) + ": layer index out of range: " + std::to_string(layer));
+  LayerResident& slot = resident_layers_[static_cast<size_t>(layer)];
+  if (slot.layer == layer) return slot;
+  if (sources_released_)
+    throw std::runtime_error(std::string(F::who()) + ": layer " + std::to_string(layer) +
+                             " was never materialized before release_sources()");
+  auto bump = std::make_unique<LayerBump>();
+  bump->side_mode = side_grants_;
+  const CountedBuild counted = count_layer(cfg_, layer, rank_, world_);
+  const size_t cap = counted.bytes - (side_grants_ ? counted.side_bytes : 0);
+  bump->init(cap);
+  if (image_ && image_->has_layer(layer)) {
+    restore_layer_from_image(layer, *bump, slot, w, st);
+  } else {
+    // Grants are 256-aligned but tensors are not: each grant's tail is
+    // never written by the build. Zero the mirror first so those tails
+    // (folded into the image entry, uploaded to the device) are
+    // deterministic — otherwise they leak whatever staging held before
+    // (the previous layer serially, garbage on a fresh worker).
+    if (cap > 0) std::memset(w.staging, 0, cap);
+    sync_load_boundary(reader_, w.stream);
+    build_layer_into(layer, *bump, slot, w, st);
+    if (image_) capture_layer_to_image(layer, *bump, slot.bytes, w, st);
+  }
+  resident_bumps_[static_cast<size_t>(layer)] = std::move(bump);
+  return slot;
+}
+
+template <class F>
+typename ResidentLayerStream<F>::LoadWorker ResidentLayerStream<F>::make_worker() const {
+  LoadWorker w;
+  DGPP_CUDA_OK(cudaHostAlloc(&w.staging, staging_bytes_, cudaHostAllocDefault));
+  DGPP_CUDA_OK(cudaStreamCreate(&w.stream));
+  return w;
+}
+
+template <class F>
+void ResidentLayerStream<F>::free_worker(const LoadWorker& w) const {
+  if (w.stream) cudaStreamDestroy(w.stream);
+  if (w.staging) cudaFreeHost(w.staging);
+}
+
+template <class F>
+void ResidentLayerStream<F>::sync_image_failure() {
+  if (image_failed_.exchange(false)) image_.reset();
+}
+
+template <class F>
+void ResidentLayerStream<F>::load_layers_parallel(int first, int last_exclusive, int threads) {
+  if (residency_ != LoaderResidency::Resident)
+    throw std::logic_error(std::string(F::who()) + ": load_layers_parallel needs resident residency");
+  if (threads <= 1 || last_exclusive - first <= 1) {
+    for (int l = first; l < last_exclusive; ++l) load_layer(l);
+    return;
+  }
+  threads = std::max(2, std::min(threads, 16));
+  DGPP_LOG_INFO("{}: rank {} preloading layers [{}, {}) on {} workers (each {:.2f} GiB pinned staging)",
+                F::who(), rank_, first, last_exclusive, threads,
+                static_cast<double>(staging_bytes_) / (1024.0 * 1024.0 * 1024.0));
+  std::vector<LoadWorker> workers;
+  workers.reserve(static_cast<size_t>(threads));
+  try {
+    for (int i = 0; i < threads; ++i) workers.push_back(make_worker());
+  } catch (...) {
+    for (const LoadWorker& w : workers) free_worker(w);
+    throw;
+  }
+  std::atomic<int> next(first);
+  std::exception_ptr error;
+  std::mutex error_mutex;
+  std::vector<std::thread> pool;
+  pool.reserve(static_cast<size_t>(threads));
+  for (int i = 0; i < threads; ++i) {
+    pool.emplace_back([&, i] {
+      LayerStats st;
+      const auto merge = [&] {
+        std::lock_guard<std::mutex> lk(error_mutex);
+        source_bytes_ += st.source_bytes;
+        verbatim_bytes_ += st.verbatim_bytes;
+        image_restored_ += st.restored;
+        image_captured_ += st.captured;
+      };
+      try {
+        for (int l = next.fetch_add(1); l < last_exclusive; l = next.fetch_add(1)) {
+          LayerStats one;
+          load_one_layer(l, workers[static_cast<size_t>(i)], one);
+          st.restored += one.restored;
+          st.captured += one.captured;
+          st.source_bytes += one.source_bytes;
+          st.verbatim_bytes += one.verbatim_bytes;
+        }
+      } catch (...) {
+        merge();
+        std::lock_guard<std::mutex> lk(error_mutex);
+        if (!error) error = std::current_exception();
+        return;
+      }
+      // Merge under the error mutex: workers finish at different times,
+      // the members stay plain and race-free.
+      merge();
+    });
+  }
+  for (auto& th : pool) th.join();
+  for (const LoadWorker& w : workers) free_worker(w);
+  sync_image_failure();
+  if (error) std::rethrow_exception(error);
 }
 
 template <class F>
