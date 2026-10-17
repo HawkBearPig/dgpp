@@ -7,6 +7,15 @@ Other model templates use the same launcher with their own memory and
 engine settings. See the [configuration reference](configuration.md) for
 settings, defaults and their effects.
 
+## Optional JSON mask optimization
+
+Build with `-DDGPP_JSON_FREE_STRING_MASK=ON` to use table masks inside
+unconstrained JSON value strings in mixed-constraint schemas. The option
+defaults to `OFF`; leaving it unspecified keeps the existing algorithm.
+It is a CMake setting, not a deployment JSON field or environment variable.
+Use the same build setting on all ranks. See the
+[CPU replay procedure](json-mask-performance.md) for scope, controls and tests.
+
 ## MiMo native MTP and prefill options
 
 MiMo defaults to upstream's recursive block-0 drafting. To use all three
