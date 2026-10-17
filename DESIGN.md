@@ -205,6 +205,12 @@ ambiguous or missing snapshots are errors. `--checkpoint-dir` also
 accepts fixture or staged directories. Each rank loads its own slices
 from the node's checkpoint.
 
+The safetensors reader validates header lengths and payload-relative tensor
+offsets before constructing mapped views. Dimensions and offsets must be
+nonnegative integers; the checked shape product and dtype width must match
+the tensor's byte interval. Scalars and empty tensors remain supported.
+Validation preserves the raw header hash used by resident-image cache keys.
+
 Resident serving loads the rank's weights at startup and keeps them for
 the process lifetime. GLM-5.3-Flash-FP8 requires TP=4 on 128 GB Sparks:
 the main stack occupies about 81.77 GiB per rank, and MTP adds about
