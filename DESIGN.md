@@ -2298,6 +2298,19 @@ The implementation has three layers:
    and array sizes, and keeps alternatives for `anyOf` until input
    disambiguates them. A value is complete when an applicable cursor accepts.
 
+By default, a schema containing string constraints, `multipleOf`, or container
+enums uses the vocabulary trie throughout the document. The default-off build
+option `DGPP_JSON_FREE_STRING_MASK` lets ordinary value-string content reuse
+the existing lexical tables when every live cursor has no active string, enum,
+or numeric constraint. Keys, escape states, container enums and constrained
+alternatives keep the trie path. Tokens crossing the closing quote still run
+the existing suffix simulation, including constraints in subsequent fields.
+Trie traversal clears the table-mask answer cache in a temporary root, avoiding
+per-edge copies of answers accumulated in an earlier free string. The caller's
+cache and structural epoch invalidation are retained. This adds no per-request
+option or object fields; all ranks should use the same build setting. See
+[the CPU replay](docs/json-mask-performance.md) for measurement and test commands.
+
 Integer-only schemas admit neither fractions nor exponents. Bounds are
 normalized to an inclusive int64 range, rounding fractional limits inward
 and adjusting exclusive limits. For a magnitude prefix M, possible

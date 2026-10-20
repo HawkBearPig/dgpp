@@ -1,5 +1,13 @@
 # DGPP implementation status
 
+JSON masking has a default-off `DGPP_JSON_FREE_STRING_MASK` build option for
+free value strings in mixed-constraint schemas. It reuses existing table masks
+and suffix simulation; active constraints remain on the vocabulary trie.
+Native regressions cover following-field checks, warm-cache copies, escapes,
+alternatives and container enums. The portable
+[CPU replay](docs/json-mask-performance.md) measures the real grammar wrapper
+and host mask staging without requiring weights or GPU execution.
+
 Request preparation uses one persistent worker per configured engine request
 slot, with bounded request/payload queues and completion-order admission.
 HTTP retains socket ownership; preparation completion always notifies it.

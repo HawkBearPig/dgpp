@@ -323,6 +323,9 @@ before sending requests. For unattended setup, read-only checks, offline cache
 sync and the manual walkthrough, see [Getting started](docs/getting-started.md).
 Use `./scripts/setup.sh --help` for all options.
 
+Manual builds can opt into [table masks for free JSON strings](docs/json-mask-performance.md).
+The build option is off by default; normal setup retains the existing behavior.
+
 ### Send a request
 
 Ask the running model a question. This short example requests low reasoning
