@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
 
 namespace dgpp::text {
@@ -98,6 +99,22 @@ uint64_t fnv1a64(const char* data, size_t n) {
 [[noreturn]] void fail(size_t line, const std::string& what) {
   throw std::runtime_error("chat-template: line " + std::to_string(line) +
                            ": " + what);
+}
+
+bool checked_add(int64_t a, int64_t b, int64_t* result) {
+  if ((b > 0 && a > std::numeric_limits<int64_t>::max() - b) ||
+      (b < 0 && a < std::numeric_limits<int64_t>::min() - b))
+    return false;
+  *result = a + b;
+  return true;
+}
+
+bool checked_subtract(int64_t a, int64_t b, int64_t* result) {
+  if ((b > 0 && a < std::numeric_limits<int64_t>::min() + b) ||
+      (b < 0 && a > std::numeric_limits<int64_t>::max() + b))
+    return false;
+  *result = a - b;
+  return true;
 }
 
 size_t utf8_length(std::string_view s) {
@@ -1249,9 +1266,9 @@ void Value::set_attr(std::string_view name, Value v) const {
 Value Value::get_item(const Value& index) const {
   if (kind_ == Kind::List && index.kind_ == Kind::Int) {
     const int64_t i = index.i_;
-    if (i >= 0 && i < static_cast<int64_t>(list_.size())) return list_[i];
-    if (i < 0 && -i <= static_cast<int64_t>(list_.size()))
-      return list_[list_.size() + i];
+    const int64_t len = static_cast<int64_t>(list_.size());
+    if (i >= 0 && i < len) return list_[i];
+    if (i < 0 && i >= -len) return list_[static_cast<size_t>(len + i)];
     return Value();
   }
   if (kind_ == Kind::Map && index.kind_ == Kind::String) {
@@ -1470,6 +1487,27 @@ struct Renderer {
       const std::string& to = args[1].as_string();
       const std::string& s = v.as_string();
       std::string out;
+      if (from.empty()) {
+        // Python inserts at every codepoint boundary, including both ends.
+        if (to.empty()) return v;
+        const size_t boundaries = utf8_length(s) + 1;
+        if (to.size() > (out.max_size() - s.size()) / boundaries)
+          fail(ctx_.line, "replace result is too large");
+        out.reserve(s.size() + boundaries * to.size());
+        out += to;
+        for (size_t i = 0; i < s.size();) {
+          const unsigned char c = static_cast<unsigned char>(s[i]);
+          const size_t n = std::min<size_t>(c < 0x80   ? 1
+                                            : c < 0xE0 ? 2
+                                            : c < 0xF0 ? 3
+                                                       : 4,
+                                            s.size() - i);
+          out.append(s, i, n);
+          out += to;
+          i += n;
+        }
+        return Value::string_value(std::move(out));
+      }
       size_t start = 0;
       for (;;) {
         const size_t hit = s.find(from, start);
@@ -1573,10 +1611,11 @@ struct Renderer {
         const int64_t start = norm(e.kids[1], 0, len - 1);
         const int64_t stop = norm(e.kids[2], len, -1);
         std::vector<Value> out;
-        if (step > 0)
-          for (int64_t i = start; i < stop; i += step) out.push_back(items[static_cast<size_t>(i)]);
-        else
-          for (int64_t i = start; i > stop; i += step) out.push_back(items[static_cast<size_t>(i)]);
+        for (int64_t i = start; step > 0 ? i < stop : i > stop;) {
+          out.push_back(items[static_cast<size_t>(i)]);
+          // An unrepresentable next index is past any int64 stop bound.
+          if (!checked_add(i, step, &i)) break;
+        }
         if (is_list) return Value::list_value(std::move(out));
         std::string joined;
         for (const Value& c : out) joined += c.as_string();
@@ -1606,10 +1645,11 @@ struct Renderer {
           const int64_t step = args.size() == 3 ? args[2].as_int(0) : 1;
           if (step == 0) fail(ctx_.line, "range: step must not be zero");
           std::vector<Value> out;
-          if (step > 0)
-            for (int64_t k = a; k < b; k += step) out.push_back(Value::integer(k));
-          else
-            for (int64_t k = a; k > b; k += step) out.push_back(Value::integer(k));
+          for (int64_t k = a; step > 0 ? k < b : k > b;) {
+            out.push_back(Value::integer(k));
+            // Overflow means the next value has passed the finite stop bound.
+            if (!checked_add(k, step, &k)) break;
+          }
           return Value::list_value(std::move(out));
         }
         if (callee.tag == Expr::Tag::Name && callee.name == "namespace") {
@@ -1675,15 +1715,23 @@ struct Renderer {
           fail(ctx_.line, std::string("'") + e.name +
                          "' needs two numbers (or, for '+', two strings)");
         if (e.name == "+") {
-          if (a.kind() == Value::Kind::Int && b.kind() == Value::Kind::Int)
-            return Value::integer(a.as_int(0) + b.as_int(0));
+          if (a.kind() == Value::Kind::Int && b.kind() == Value::Kind::Int) {
+            int64_t result;
+            if (!checked_add(a.as_int(), b.as_int(), &result))
+              fail(ctx_.line, "integer addition overflow");
+            return Value::integer(result);
+          }
           const double x = a.as_double(0);
           const double y = b.as_double(0);
           return Value::number(x + y);
         }
         if (e.name == "-") {
-          if (a.kind() == Value::Kind::Int && b.kind() == Value::Kind::Int)
-            return Value::integer(a.as_int(0) - b.as_int(0));
+          if (a.kind() == Value::Kind::Int && b.kind() == Value::Kind::Int) {
+            int64_t result;
+            if (!checked_subtract(a.as_int(), b.as_int(), &result))
+              fail(ctx_.line, "integer subtraction overflow");
+            return Value::integer(result);
+          }
           const double x = a.as_double(0);
           const double y = b.as_double(0);
           return Value::number(x - y);

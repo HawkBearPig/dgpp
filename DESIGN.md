@@ -2109,6 +2109,13 @@ See [tokenization](docs/tokenization.md) for bounds and validation. Golden corpo
 reference tokenizers and are keyed by the tokenizer file's hash. A
 different checkpoint revision must use its matching corpus.
 
+Template integers use signed 64-bit values. Addition and subtraction reject
+unrepresentable results with a line-numbered error. Range and slice iteration
+stop when the next value exceeds the integer domain, preserving finite
+sequences at its boundaries; out-of-range list indexes yield undefined.
+Replacing an empty pattern inserts at each UTF-8 codepoint boundary,
+including both ends, with a checked result size before allocation.
+
 `src/text/chat_template.*` parses the checkpoint's Jinja template at
 model load and renders its syntax tree per request. It implements the
 supported statements and expressions with transformers-compatible
