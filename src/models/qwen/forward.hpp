@@ -65,6 +65,7 @@
 #include "kernels/kda.hpp"
 #include "kernels/pick.hpp"
 #include "models/qwen/config.hpp"
+#include "models/dflash2/drafter.hpp"
 #include "models/qwen/kv_pool.hpp"
 #include "models/qwen/layers.hpp"
 #include "models/qwen/loader.hpp"
@@ -131,11 +132,18 @@ class QwenModel : public SessionModel<QwenModel> {
   // including short prefill. Bitwise parity needs matching settings/capacity.
   // serving_logits bounds head storage to decode rows and packs selected
   // prefill outputs. Leave false for all-row diagnostic forwards.
+  // dflash2_dir: a DFlash2 block-drafter checkpoint (models/dflash2/drafter.hpp,
+  // the 2026-10-20 Flash-Next port of the Qwen3.5 drafter): its five layers
+  // propose a block a step from the target's tapped features, replacing the
+  // MTP draft (one or the other). The decode graph records the block draft
+  // (session_graph_capture_block_draft/_batch, gated at serve by the family's
+  // block_draft_graph_ok), or the drafter runs eagerly.
   QwenModel(const QwenTextConfig& cfg, const std::string& checkpoint_dir, int max_tokens,
             int64_t max_cache_tokens, QwenResidency residency = QwenResidency::Streaming,
             BoundaryReducer* boundary = nullptr, int tp_rank = 0, int tp_world = 1,
             int max_requests = 1, bool mtp = false, int decode_rows = 0, bool fp8_head_mma = false,
-            bool serving_logits = false, LatentFormat kv_format = LatentFormat::kBf16);
+            bool serving_logits = false, LatentFormat kv_format = LatentFormat::kBf16,
+            const std::string& dflash2_dir = "");
   bool fp8_head_mma() const { return fp8_head_mma_; }
   // The draft head's screen (kernels/head_screen.hpp): the candidate cap
   // the model was built with (QwenLayerStream::draft_head_blocks() under
@@ -146,6 +154,23 @@ class QwenModel : public SessionModel<QwenModel> {
     fp8_prefill_attention_ = prefill;
     fp8_decode_attention_ = decode;
   }
+  // engine.dflash_weights fp8: the drafter's five block matrices as block-
+  // 128 E4M3 (lossy for the proposals only; the verify is exact whatever
+  // the drafter proposes). Before plan_memory / the ctor.
+  static void set_dflash2_weights_fp8(bool on) { dflash2_fp8_ = on; }
+  // The drafter's serving options (engine.dflash_verify_graph,
+  // engine.dflash_draft_batch, engine.dflash_depth), set from the cluster
+  // config before the engine is built; the eager engine reads them. The
+  // verify-graph knob gates the graph engine's recorded block draft (the
+  // dflash_graph_verify_available() gate below, the Qwen35 rule).
+  static void set_dflash_options(bool verify_graph, bool draft_batch, int depth) {
+    dflash_verify_graph_ = verify_graph;
+    dflash_draft_batch_ = draft_batch;
+    dflash_depth_ = depth;
+  }
+  static bool dflash_verify_graph() { return dflash_verify_graph_; }
+  static bool dflash_draft_batch() { return dflash_draft_batch_; }
+  static int dflash_depth() { return dflash_depth_; }
   ~QwenModel();
   QwenModel(const QwenModel&) = delete;
   QwenModel& operator=(const QwenModel&) = delete;
@@ -158,7 +183,8 @@ class QwenModel : public SessionModel<QwenModel> {
                                 int tp_rank = 0, int tp_world = 1,
                                 QwenResidency residency = QwenResidency::Streaming,
                                 int max_requests = 1, bool mtp = false, int decode_rows = 0,
-                                bool serving_logits = false, LatentFormat kv_format = LatentFormat::kBf16);
+                                bool serving_logits = false, LatentFormat kv_format = LatentFormat::kBf16,
+                                const std::string& dflash2_dir = "");
 
   // The cold diagnostic forward: one request on slot 0 (which must be
   // closed), fresh state, every row's logits; the slot is closed after.
@@ -172,6 +198,53 @@ class QwenModel : public SessionModel<QwenModel> {
   // at q) with the head on every row — logits [T-1, count], the mixer's
   // final hidden [T-1, hidden].
   Outputs mtp_forward(const std::vector<int64_t>& token_ids);
+
+  // ---- the DFlash2 block drafter (dflash2_dir) -----------------------------
+  // The shared drafter's surface (models/dflash2/drafter.hpp, the 2026-10-20
+  // port of the Qwen35 drafter): the target's every run leaves the
+  // drafter's context K/V in the pool's draft planes (the tapped features
+  // at the run's positions, rejected verify rows included — overwrite, no
+  // rollback), and a redraft runs [bonus, mask x drafts] through the
+  // draft's layers over that context, the mask rows' top-K through the
+  // selector walk. The family hosts one DFlash2Drafter (df_) over its own
+  // pool planes, exact-head dispatch and gemm row envelope.
+  bool dflash2_enabled() const { return dflash2_; }
+  // The verifiable drafts a step proposes (the block; the engine caps the
+  // verify at dflash_depth()).
+  int dflash2_drafts() const { return dflash2_ ? df_.drafts() : 0; }
+  // Physical rows written by a redraft, independent of the verify cap.
+  int block_draft_rows() const { return dflash2_ ? df_.query_rows() : 0; }
+  // False without a draft (pool exhausted / context bound): the caller
+  // runs the step without speculation.
+  bool dflash2_draft(int req, int64_t bonus, std::vector<int32_t>* drafts);
+  // The batched redraft (engine.dflash_draft_batch): one stacked block
+  // forward for every slot; the per-slot failures mirror the scalar call.
+  void dflash2_draft_batch(const std::vector<int>& reqs,
+                           const std::vector<int64_t>& bonuses,
+                           std::vector<std::vector<int32_t>>* drafts);
+  // The stacked draft batch width (slots per block forward).
+  int dflash2_batch_slots() const { return df_.batch_slots(); }
+  // The captured-verify gate (the Qwen35 rule, model35.hpp:394): the
+  // recorded block draft is ported, so the verified rows ride the step's
+  // decode graph when they fit the graph's row ceiling (the eager engine
+  // keeps its eager batch: QwenModel has no session_verify_batch_graph).
+  bool dflash_graph_verify_available() const {
+    return dflash2_ && max_decode_rows() >= block_draft_rows();
+  }
+  // The recorded block proposal off a verify's verdict (the graph engine
+  // records it inside a step replay — the next replay's feed [next,
+  // drafts] at the slot's persistent feed rows, the drafts' pinned mirror
+  // and the mask rows' candidate lists).
+  void session_graph_capture_block_draft(int req, const PickVerdict* verdict);
+  void session_graph_capture_block_draft_batch(const PickVerdict* verdicts, int requests);
+  // The recorded drafts' host copies (the engine reads them after a
+  // replay's end event) and the mask rows' candidate lists (the
+  // acceptance diagnostics).
+  const int32_t* block_drafts_host(int req) const { return df_.drafts_host(req); }
+  const int32_t* block_candidates_host(int req) const { return df_.candidates_host(req); }
+  // The selector's confidence per draft, [max_requests][drafts], written
+  // by every walk (engine.mtp_schedule's input with a drafter).
+  const float* dflash2_confidence() const { return df_.confidence(); }
 
 
   int64_t kv_block_tokens() const { return num_qsa_ > 0 ? kBlockTokens : 0; }
@@ -448,6 +521,29 @@ class QwenModel : public SessionModel<QwenModel> {
   uint16_t* mtp_enc_ = nullptr;         // [M, W] fc_hidden per branch
   uint16_t* mtp_r_ = nullptr;           // [M, W] the block's hyper state
   std::unique_ptr<QwenGrSite> mtp_mixer_;
+
+  // The DFlash2 drafter (dflash2_dir): the shared component
+  // (models/dflash2/drafter.hpp) over this pool (the draft planes ride the
+  // shared block table via pool_.draft_view) and the exact-head dispatch.
+  // The taps match the vLLM reference contract: df_.tap(layer) names the fc
+  // slice to accumulate on the tap layer's whole output — its multi-stream
+  // residual with the MLP combine materialized, collapsed to the mean over
+  // the hc streams (df_mean_) — captured at the end of that layer's run
+  // (run_rows).
+  bool dflash2_ = false;
+  DFlash2Drafter df_;
+  uint16_t* df_mean_ = nullptr;        // [M, H] one tap's mean over the hc streams (the tap site's staging)
+  // The capture-time step fields for the component.
+  DFlash2CaptureCtx df_capture_ctx() const;
+  // The full head at draft rows into `out` (the served head's own dispatch;
+  // the draft reads the exact product — the screen is the MTP draft's lever,
+  // block proposals take the head as served). The component passes its own
+  // head-logit buffer.
+  void df_head(const uint16_t* hidden, float* out, int rows);
+  inline static bool dflash2_fp8_ = false;
+  inline static bool dflash_verify_graph_ = true;
+  inline static bool dflash_draft_batch_ = true;
+  inline static int dflash_depth_ = 0;
 };
 
 }  // namespace dgpp

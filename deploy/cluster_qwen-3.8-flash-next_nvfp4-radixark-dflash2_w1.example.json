@@ -1,0 +1,32 @@
+{
+  "model": "RadixArk/Qwen3.8-Flash-Next-NVFP4",
+  "world_size": 1,
+  "engine": {
+    "max_concurrency": 4,
+    "kv_capacity": 262144,
+    "kv_dtype": "bf16",
+    "bf16_weights": "bf12+bf16",
+    "ngram_table": "mmap",
+    "default_max_tokens": 32768,
+    "queue_limit": 8,
+    "max_connections": 64,
+    "decode_graph": true,
+    "mtp": false,
+    "dflash_model": "incoai/Qwen3.8-Flash-Next-DFlash2",
+    "mtp_expert_format": "bf16_fused",
+    "prefix_cache_gib": 3,
+    "admission": "grow",
+    "admission_window": 256,
+    "model_alias": "Qwen3.8-Flash-Next",
+    "sampling_candidates": 128,
+    "stats_interval_s": 1,
+    "dense_weights": "fp8"
+  },
+  "paths": {
+    "resident_cache": ""
+  },
+  "http": {
+    "bind_host": "0.0.0.0",
+    "port": 8000
+  }
+}

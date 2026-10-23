@@ -57,7 +57,8 @@ inline void qwen35_check_image_pads(const std::vector<int64_t>& ids, int64_t sta
 #include "kernels/l2_prefetch.hpp"
 #include "kernels/latent_format.hpp"
 #include "kernels/sample_pick.hpp"
-#include "models/qwen/dflash2.hpp"
+#include "models/dflash2/draft_planes.hpp"
+#include "models/dflash2/drafter.hpp"
 #include "models/qwen/layers.hpp"
 #include "models/qwen/loader.hpp"
 #include "models/qwen/loader35.hpp"
@@ -157,18 +158,13 @@ class Qwen35KvPool {
   FullAttnStageMaps maps_{};
   bool maps_ready_ = false;
   uint8_t* v_base_ = nullptr;
-  uint16_t* dk_base_ = nullptr;  // [draft_layers][token_slots][dkv * ddim]
-  uint16_t* dv_base_ = nullptr;
+  // The DFlash2 drafter's plain bf16 planes over the shared block table
+  // (models/dflash2/draft_planes.hpp; 0 layers without a v2 drafter).
+  DraftKvPlanes draft_;
   size_t kv_row_elems() const { return static_cast<size_t>(shape_.kv_heads) * shape_.dim; }
   size_t layer_kv_elems() const { return static_cast<size_t>(shape_.token_slots) * kv_row_elems(); }
   size_t elem_bytes() const { return shape_.fp8 ? 1 : 2; }
   size_t layer_kv_bytes() const { return layer_kv_elems() * elem_bytes(); }
-  size_t draft_row_elems() const {
-    return static_cast<size_t>(shape_.draft_kv_heads) * shape_.draft_dim;
-  }
-  size_t draft_layer_kv_elems() const {
-    return static_cast<size_t>(shape_.token_slots) * draft_row_elems();
-  }
   void check_req(int req, const char* what) const;
 };
 
@@ -362,10 +358,10 @@ class Qwen35Model : public SessionModel<Qwen35Model> {
   // (dflash_depth, at most 7 — kSpecRows).
   int dflash2_drafts() const {
     if (dflash1_) return std::min(df1cfg_.drafts(), dflash_depth_ == 0 ? 7 : dflash_depth_);
-    return dflash2_ ? dfcfg_.drafts() : 0;
+    return dflash2_ ? df_.drafts() : 0;
   }
   // Physical rows written by a redraft, independent of the verify cap.
-  int block_draft_rows() const { return dflash1_ ? df1cfg_.query_rows() : dfcfg_.query_rows(); }
+  int block_draft_rows() const { return dflash1_ ? df1cfg_.query_rows() : df_.query_rows(); }
   bool dflash1_enabled() const { return dflash1_; }
   // False without a draft (pool exhausted / context bound): the caller
   // runs the step without speculation.
@@ -381,7 +377,7 @@ class Qwen35Model : public SessionModel<Qwen35Model> {
                            std::vector<std::vector<int32_t>>* drafts);
   // The stacked draft batch width (slots per block forward): the verify
   // batch's slot count at the row ceiling.
-  int dflash2_batch_slots() const { return df_batch_; }
+  int dflash2_batch_slots() const { return df_.batch_slots(); }
   // The captured verify (batched graph capture with a drafter loaded):
   // one static replay per row size — 8 rows for a lone slot, 16 for two,
   // 32 (4 x 8) otherwise. Every slot is padded to a full 8-row block;
@@ -421,52 +417,29 @@ class Qwen35Model : public SessionModel<Qwen35Model> {
   // walk, no proposals (the default). Before the first capture.
   void dflash2_arm_proposals(const SampleSpec* specs, DraftProposal* proposals,
                              DraftProposal* proposals_host, int stride) {
-    if (specs != nullptr && (proposals == nullptr || stride < dflash2_drafts()))
-      throw std::invalid_argument("dflash2_arm_proposals: proposals / stride");
-    df_specs_ = specs;
-    df_props_ = proposals;
-    df_props_h_ = proposals_host;
-    df_props_stride_ = stride;
+    df_.arm_proposals(specs, proposals, proposals_host, stride);
   }
-  bool dflash2_proposals_armed() const { return df_specs_ != nullptr; }
+  bool dflash2_proposals_armed() const { return df_.proposals_armed(); }
   // The selector's confidence per draft, [max_requests][drafts] acceptance
   // logits written by every walk (recorded or eager) at the slot's row —
   // the scheduled verify depth's input for the block drafter
   // (engine.mtp_schedule with a drafter).
-  const float* dflash2_confidence() const { return df_conf_; }
+  const float* dflash2_confidence() const { return df_.confidence(); }
   // The mirror the recorded draft of slot `req` publishes (readable once
   // the replay's end event has passed).
   const int32_t* block_drafts_host(int req) const {
     if (dflash1_)
       return df1_mirror_h_ + static_cast<size_t>(req) * static_cast<size_t>(df1cfg_.drafts());
-    return df_mirror_h_ + static_cast<size_t>(req) * static_cast<size_t>(dfcfg_.drafts());
+    return df_.drafts_host(req);
   }
   // The mask rows' top-k candidate ids the recorded draft walked
   // ([drafts][block_candidates()] per slot; the engine's acceptance
   // diagnostics rank the verify's correction among them). v1 publishes no
   // candidate tables (top-1 proposals only) — 0 skips the read.
-  int block_candidates() const { return dflash1_ ? 0 : dfcfg_.selector_top_k; }
-  const int32_t* block_candidates_host(int req) const {
-    return df_cands_h_ + static_cast<size_t>(req) * static_cast<size_t>(dfcfg_.drafts()) *
-                            static_cast<size_t>(dfcfg_.selector_top_k);
-  }
+  int block_candidates() const { return dflash1_ ? 0 : df_.cfg().selector_top_k; }
+  const int32_t* block_candidates_host(int req) const { return df_.candidates_host(req); }
 
  private:
-  // The block forward's layers over `slots` stacked [bonus, mask x D]
-  // blocks (df_pos_ / df_tokens_ / df_resid_ staged for slots * query_rows
-  // rows): the row-wise ops over every row at once, each slot's K/V
-  // appends and attention at its row offset against its own block table.
-  void df_block_layers(int slots, const int* reqs, bool capture);
-  // This rank's drafter slices (the whole drafter at world 1): heads, kv
-  // heads, q / kv row widths, MLP rows.
-  int df_nh_ = 0, df_kvh_ = 0, df_qw_ = 0, df_kvr_ = 0, df_i_ = 0;
-  // The mask rows' head rows and top-K per slot (world > 1: this rank's
-  // slice lists staged, folded and merged into the global top-K), the
-  // hidden projection and the selector walk into df_tok_ (D per slot). The
-  // recorded walk (capture) of slot k draws for request reqs[k] when the
-  // proposals are armed; the eager walk is the argmax (the engine clears
-  // the slot's proposals after an eager draft).
-  void df_block_select(int slots, const int* reqs, bool capture);
   // The shared static padded staging of the two padded verify variants
   // (validate, grow blocks, stage the 8-row blocks, upload, RowRun).
   RowRun df_stage_padded(const std::vector<int>& reqs,
@@ -519,11 +492,6 @@ class Qwen35Model : public SessionModel<Qwen35Model> {
   // The bound layer's per-tensor attention view (disabled when PT is off).
   QwenPtAttnView pt_gdn_view(int layer) const;
   QwenPtAttnView pt_full_view(int layer) const;
-  // One run's fused features into the draft planes (rows [0, T) at the
-  // staged req/position metadata), chunked over the feature scratch.
-  void dflash2_store_features(int T, const int32_t* d_req, const int64_t* d_pos);
-  // The 64-element fp32 1/theta^(2i/128) table for the draft's rope.
-  float* df_inv_freq_ = nullptr;
   float* gdn_rec(int slot, int ord) const {
     return gdn_rec_base_ + (static_cast<size_t>(slot) * num_gdn_ + ord) * rec_elems_;
   }
@@ -672,47 +640,13 @@ class Qwen35Model : public SessionModel<Qwen35Model> {
   uint16_t *mtp_cat_ = nullptr, *mtp_r_ = nullptr, *mtp_h_ = nullptr;
   bool mtp_ = false;
   // The DFlash2 drafter (null unless a drafter directory was given): the
-  // fp32 feature accumulator and its per-tap GEMM output at max_tokens
-  // rows, the chunked hidden_norm / per-layer K/V scratch, the block
-  // forward's query_rows-row activations, the candidate/selector buffers,
-  // and pinned staging for the eager draft (no captures).
+  // The DFlash2 block drafter (models/dflash2/drafter.hpp, shared with the
+  // Flash-Next model): the family hosts the component over its own pool
+  // planes (view(num_full_ + l)), head dispatch (the draft screen) and gemm
+  // row envelope; the target-side taps (run_rows) read the layer outputs
+  // into the component's feature accumulator (df_.acc / tap_gemm_out).
   bool dflash2_ = false;
-  DFlash2Config dfcfg_;
-  DFlash2Weights dfw_;
-  std::vector<int> df_tap_;  // per main-layer index: the fc slice, else -1
-  float* df_acc_ = nullptr;   // [max_tokens, H] F32 (the sum_t tap @ fc_t^T)
-  float* df_t32_ = nullptr;   // [max_tokens, H] F32 (one tap GEMM's out)
-  uint16_t* df_norm_ = nullptr;   // [df_rows_cap, H] BF16 (hidden_norm)
-  uint16_t* df_kv_ = nullptr;     // [df_rows_cap, 2*KW] BF16 (one layer's k|v)
-  uint16_t *df_resid_ = nullptr, *df_x_ = nullptr, *df_xc_ = nullptr, *df_qkv_ = nullptr;
-  uint16_t *df_q_ = nullptr, *df_attn_ = nullptr, *df_o_ = nullptr, *df_mlp_ = nullptr;
-  float* df_attn_part_ = nullptr;  // the split-key block attention's partials (BR rows)
-  uint16_t *df_gate_ = nullptr, *df_up_ = nullptr;  // [query_rows, draft I]
-  int32_t* df_zero_ = nullptr;  // [query_rows] zeros (the single-request append view)
-  uint16_t* df_delta_ = nullptr;  // [query_rows, 2*taps*groups] the conv deltas
-  uint16_t* df_h_ = nullptr;      // [query_rows, H] the draft's final norm rows
-  float* df_logits_ = nullptr;    // [drafts, V] F32 (the mask rows' head rows)
-  void* df_topk_ws_ = nullptr;    // the top-K chunk partials (dflash2_topk_ws_bytes)
-  size_t df_topk_ws_bytes_ = 0;
-  float* df_hidden32_ = nullptr;  // [drafts, rank] F32 (hidden_projection)
-  int32_t* df_ids_ = nullptr;     // [drafts, top_k]
-  float* df_sc_ = nullptr;        // [drafts, top_k]
-  int32_t* df_tok_ = nullptr;     // [drafts] device
-  int32_t* df_tok_h_ = nullptr;   // pinned
-  int64_t* df_pos_ = nullptr;     // [query_rows] device
-  int64_t* df_tokens_ = nullptr;  // [query_rows] device
-  int64_t* df_io64_h_ = nullptr;  // pinned: query_rows positions then tokens
-  uint16_t* df_table_ = nullptr;   // world > 1: the top-K gather table (the eager fold's buffer)
-  int32_t* df_mirror_h_ = nullptr;  // pinned [max_requests, drafts]: the recorded drafts
-  int32_t* df_cands_h_ = nullptr;   // pinned [max_requests, drafts, top_k]: the walked candidates
-  float* df_conf_ = nullptr;        // [max_requests, drafts]: the selector's confidence (acceptance logits)
-  // The armed proposals (dflash2_arm_proposals): the engine's spec table
-  // and proposal rows, `df_props_stride_` rows per request.
-  const SampleSpec* df_specs_ = nullptr;
-  DraftProposal* df_props_ = nullptr;
-  DraftProposal* df_props_h_ = nullptr;
-  int df_props_stride_ = 0;
-  int df_batch_ = 1;  // the stacked draft batch width (slots per forward)
+  DFlash2Drafter df_;
   // The DFlash v1 drafter (null unless a v1 directory was given):
   // DFlashConfig + weights, tap map, one block of reusable scratch
   // (query_rows = 16 rows; C1 scope — batching and capture stay open).
@@ -739,6 +673,10 @@ class Qwen35Model : public SessionModel<Qwen35Model> {
   int32_t* df1_tok_h_ = nullptr;   // pinned [drafts]: the proposed drafts
   int32_t* df1_mirror_h_ = nullptr;  // pinned [max_requests, drafts]: the recorded drafts
   float* df1_inv_freq_ = nullptr;  // [head_dim/2] F32 rope table
+  // The v1 tap accumulator (v1-only: the v2 drafter's are the component's).
+  float* df1_acc_ = nullptr;       // [max_tokens, H] F32 (the sum_t tap @ fc_t^T)
+  float* df1_t32_ = nullptr;       // [max_tokens, H] F32 (one tap GEMM's out)
+  uint16_t* df1_table_ = nullptr;  // world > 1: the v1 top-K fold buffer
   // The v1 block forward + mask proposal (eager, one slot): stages
   // [bonus, mask x D], runs the six layers over the draft planes, and
   // top-1s each mask row off the shared head.
@@ -754,7 +692,9 @@ class Qwen35Model : public SessionModel<Qwen35Model> {
   GraphCache df_verify_graph_;
   const int32_t* df_verify_tables_ = nullptr;
   bool df_verify_broken_ = false;
-  static constexpr int df_rows_cap() { return 2048; }
+  // The capture-time step fields for the component (the session's graph
+  // family, read at every recorded-proposal call).
+  DFlash2CaptureCtx df_capture_ctx() const;
   // Model-owned GDN state: [max_requests][num_gdn][elems], plus the
   // verify's per-row CONV snapshots ([max_decode_rows][num_gdn][elems]) the
   // speculative rollback reads (engine/session_model.hpp's commit). The

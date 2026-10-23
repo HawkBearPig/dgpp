@@ -23,6 +23,9 @@ void validate(const QwenKvPoolShape& s) {
     throw std::invalid_argument("QwenKvPool: native FP8 attention requires engine.kv_dtype fp8");
   if ((s.fp8_prefill_attention || s.fp8_decode_attention) && s.dim != 256)
     throw std::invalid_argument("QwenKvPool: native FP8 attention requires head dimension 256");
+  if (s.draft_layers < 0 || s.draft_kv_heads < 0 || s.draft_dim < 0 ||
+      (s.draft_layers > 0 && (s.draft_kv_heads <= 0 || s.draft_dim <= 0)))
+    throw std::invalid_argument("QwenKvPool: draft planes need draft_layers with positive geometry");
 }
 }  // namespace
 
@@ -43,7 +46,10 @@ size_t QwenKvPool::cache_bytes(const QwenKvPoolShape& s) {
   const size_t idx = static_cast<size_t>(s.token_slots / s.kpool) * s.idx_dim * 2;
   const size_t ring = static_cast<size_t>(s.max_requests) * s.kpool * s.idx_dim * 2;
   const size_t table = PagedBlockTable::table_bytes(s.max_requests, s.token_slots / s.block_tokens);
-  return L * (2 * kvb + scale + idx + ring) + table;
+  // The drafter's planes: k and v, bf16, per draft layer (shared storage).
+  const size_t draft =
+      DraftKvPlanes::bytes(s.draft_layers, s.draft_kv_heads, s.draft_dim, s.token_slots);
+  return L * (2 * kvb + scale + idx + ring) + draft + table;
 }
 
 void QwenKvPool::init(const QwenKvPoolShape& shape) {
@@ -60,6 +66,8 @@ void QwenKvPool::init(const QwenKvPoolShape& shape) {
   }
   alloc(reinterpret_cast<void**>(&idx_base_), L * layer_idx_elems() * 2);
   alloc(reinterpret_cast<void**>(&ring_base_), L * layer_ring_elems() * 2);
+  draft_.init(shape_.draft_layers, shape_.draft_kv_heads, shape_.draft_dim,
+              shape_.token_slots, shape_.block_tokens);
   table_.init(shape_.max_requests, shape_.block_tokens, shape_.token_slots / shape_.block_tokens);
   initialized_ = true;
   reset_all(nullptr);
@@ -94,6 +102,15 @@ QwenQsaCache QwenKvPool::view(int layer) const {
   return c;
 }
 
+QwenFullAttnCache QwenKvPool::draft_view(int l) const {
+  if (!initialized_) throw std::logic_error("QwenKvPool: draft_view before init");
+  const auto plane = draft_.view(l);
+  QwenFullAttnCache c;
+  c.k_cache = plane.k;
+  c.v_cache = plane.v;
+  return c;
+}
+
 uint16_t* QwenKvPool::ring(int layer, int req) const {
   check_req(req, "ring");
   if (layer < 0 || layer >= shape_.layers)
@@ -124,6 +141,7 @@ void QwenKvPool::reset_all(cudaStream_t stream) {
   }
   DGPP_CUDA_OK(cudaMemsetAsync(idx_base_, 0, L * layer_idx_elems() * 2, stream));
   DGPP_CUDA_OK(cudaMemsetAsync(ring_base_, 0, L * layer_ring_elems() * 2, stream));
+  draft_.reset(stream);
   table_.reset_all(stream);
 }
 
@@ -156,6 +174,7 @@ void QwenKvPool::copy_block_contents(int32_t src, int32_t dst, cudaStream_t stre
                                  c.index_cache + static_cast<size_t>(src) * idx_blk, idx_blk * 2,
                                  cudaMemcpyDeviceToDevice, stream));
   }
+  draft_.copy_block(src, dst, stream);
 }
 
 }  // namespace dgpp

@@ -195,6 +195,35 @@ project procedures and design guidance live in `docs/`.
   TP slicing, independent forward references, graph replay and mixed prefill.
   See [docs/fp4local_plan.md](docs/fp4local_plan.md).
 
+- **The DFlash2 block drafter serves Qwen3.8-Flash-Next** (2026-10-20).
+  The Qwen3.5 drafter (`engine.dflash_model`, the block-diffusion proposal
+  model from a separate checkpoint) reaches the `qwen4_exp` family:
+  `incoai/Qwen3.8-Flash-Next-DFlash2` — five bidirectional sliding Qwen3
+  layers over a KV context built from the target's tapped features, the
+  mask rows' top-K through the chained selector walk, the embeddings and lm
+  head shared with the target. Re-hosted on `QwenModel`: the block forward
+  and the mask-row select, the feature store that feeds the draft planes,
+  the batched redraft, and the recorded block draft the decode graph
+  replays (the Qwen35 family's capture, re-hosted — the
+  `session_graph_capture_block_draft/_batch` pair), most of the arithmetic
+  riding the shared `kernels/dflash2` and the engine's `requires`-guarded
+  duck typing (one eager-engine dispatch guard for the families without the
+  captured static verify). Two family seams: the target-side taps read the
+  layer's output at the NEXT layer's attention-mix launch (a QSA stack has
+  no per-layer `[T, H]` residual stream to read, only the mixed hidden), and
+  the draft K/V rides new plain planes on the QSA pool's shared block table
+  (`QwenKvPoolShape::draft_layers`, copying with the request's blocks).
+  `engine.dflash_model` selects it (`mtp: false`); the
+  [template](deploy/cluster_qwen-3.8-flash-next_nvfp4-radixark-dflash2_w1.example.json)
+  ships it on the decode graph, and `--mtp-schedule` sizes the verify depth
+  from the walk's published confidence. Gates: the armed eager engine's
+  scalar and batched transcripts are bit-for-bit the plain engine's on the
+  world-1 fixture, the graph replay's published drafts are the eager
+  redraft's and its transcript the eager engine's bit-for-bit, the
+  drafter-armed plain walk is bitwise the no-drafter model's, and the block
+  proposes its seven drafts repeatably; the `validate_against` overload
+  cross-checks the qwen4_exp widths in the config unit suite.
+
 - **The day's DeepSeek-V4.1 levers ported where they apply; the campaign's
   C8 cell on a six-slot template read** (2026-10-20). Inventory of the
   2026-10-20 commits: the lm head's bf12 tensor-core form lives in the GEMM

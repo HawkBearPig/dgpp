@@ -463,6 +463,17 @@ target_include_directories(dgpp_models_dsv4_layers PUBLIC ${CMAKE_CURRENT_SOURCE
 target_link_libraries(dgpp_models_dsv4_layers PUBLIC dgpp_models_dsv4_loader dgpp_models_dsv4_attn dgpp_models_moe dgpp_models_glm dgpp_kernels CUDA::cudart)
 dgpp_set_common(dgpp_models_dsv4_layers)
 
+# The DFlash2 block drafter (family-agnostic): the drafter model's config,
+# the standalone weight load, the shared execution (models/dflash2/
+# drafter.hpp) and the pool's draft planes. The target families host one
+# drafter over their own pool planes, tap sites and head dispatch.
+add_library(dgpp_models_dflash2 STATIC
+  src/models/dflash2/dflash2.cpp
+  src/models/dflash2/drafter.cpp)
+target_include_directories(dgpp_models_dflash2 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(dgpp_models_dflash2 PUBLIC dgpp_kernels dgpp_loaders dgpp_common CUDA::cudart)
+dgpp_set_common(dgpp_models_dflash2)
+
 # Qwen3.8-Flash-Next: the host-side model description.
 add_library(dgpp_models_qwen STATIC
   src/models/qwen/config.cpp
@@ -484,10 +495,9 @@ add_library(dgpp_models_qwen_loader STATIC
   src/models/qwen/vision.cpp
   src/models/qwen/loader.cpp
   src/models/qwen/loader35.cpp
-  src/models/qwen/dflash2.cpp
   src/models/qwen/dflash.cpp)
 target_include_directories(dgpp_models_qwen_loader PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(dgpp_models_qwen_loader PUBLIC dgpp_models_qwen dgpp_loaders dgpp_kernels CUDA::cudart dgpp_device_ranges)
+target_link_libraries(dgpp_models_qwen_loader PUBLIC dgpp_models_qwen dgpp_loaders dgpp_kernels CUDA::cudart dgpp_device_ranges dgpp_models_dflash2)
 dgpp_set_common(dgpp_models_qwen_loader)
 
 # The Qwen layers (Q3): the MoE on the shared MoE layer, with its oracle.
@@ -1619,6 +1629,13 @@ add_test(NAME qwen35_tp_test_draft_screen
   COMMAND ${CMAKE_COMMAND} -E env DGPP_TEST_DRAFT_SCREEN=2 $<TARGET_FILE:qwen35_tp_test>)
 set_tests_properties(qwen35_tp_test_draft_screen PROPERTIES RUN_SERIAL TRUE LABELS "gpu" SKIP_RETURN_CODE 2)
 set_tests_properties(qwen35_tp_test PROPERTIES RUN_SERIAL TRUE LABELS "gpu")
+
+add_executable(qwen_dflash2_test tests/cuda/qwen_dflash2_test.cpp)
+target_include_directories(qwen_dflash2_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
+target_link_libraries(qwen_dflash2_test PRIVATE dgpp_models_qwen_layers dgpp_models_qwen_loader dgpp_models_qwen dgpp_bus dgpp_loaders dgpp_kernels dgpp_sched dgpp_text CUDA::cudart Threads::Threads)
+dgpp_set_common(qwen_dflash2_test)
+add_test(NAME qwen_dflash2_test COMMAND qwen_dflash2_test)
+set_tests_properties(qwen_dflash2_test PROPERTIES RUN_SERIAL TRUE LABELS "gpu")
 
 add_executable(qwen35_loader_smoke tests/cuda/qwen35_loader_smoke.cpp)
 target_include_directories(qwen35_loader_smoke PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)

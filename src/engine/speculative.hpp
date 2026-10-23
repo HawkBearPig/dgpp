@@ -432,7 +432,7 @@ class SampledSpeculator {
   int accepted_drafts_ = 0;
 };
 
-// The DFlash2 drafter's eager greedy driver (models/qwen/dflash2.hpp):
+// The DFlash2 drafter's eager greedy driver (models/dflash2/drafter.hpp):
 // the same exact verify/judge/rollback as GreedySpeculator — the fed rows
 // are the pending token plus the drafter's block proposals, the accepted
 // prefix commits, the rest rolls back — but the proposal comes from one

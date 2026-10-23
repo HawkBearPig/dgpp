@@ -354,6 +354,11 @@ struct ServeFamily {
     if (!dir.empty())
       throw std::invalid_argument(std::string(name()) + ": no block drafter (dflash_model) support");
   }
+  // Whether this family runs the block drafter inside the decode graph (the
+  // recorded block draft, engine/graph_engine.hpp). True where the graph
+  // capture exists; families with the eager drafter only refuse the
+  // combination at startup.
+  virtual bool block_draft_graph_ok() const { return true; }
 };
 
 // GLM-5.3-Flash: the DSA pool's block and pool-id geometry, the latent
@@ -439,6 +444,7 @@ struct GlmFamily final : ServeFamily {
 struct QwenFamily final : ServeFamily {
   dgpp::QwenTextConfig cfg;
   std::string ckpt;
+  std::string dflash;  // the DFlash2 drafter's checkpoint dir (empty: off)
   std::unique_ptr<dgpp::QwenModel> model;
   bool fp8_head_mma;
   dgpp::LatentFormat kv_format;
@@ -521,9 +527,10 @@ struct QwenFamily final : ServeFamily {
   }
   dgpp::MemoryPlan plan(int forward_rows, int64_t context, int rank, int world_, bool fabric, int slots,
                         bool mtp, int decode_rows) const override {
-    return dgpp::QwenModel::plan_memory(cfg, forward_rows, context, fabric ? rank : 0, fabric ? world_ : 1,
-                                        fabric ? dgpp::QwenResidency::Resident : dgpp::QwenResidency::Streaming,
-                                        slots, fabric && mtp, decode_rows, /*serving_logits=*/true, kv_format);
+    return dgpp::QwenModel::plan_memory(
+        cfg, forward_rows, context, fabric ? rank : 0, fabric ? world_ : 1,
+        fabric || !dflash.empty() ? dgpp::QwenResidency::Resident : dgpp::QwenResidency::Streaming,
+        slots, fabric && mtp, decode_rows, /*serving_logits=*/true, kv_format, dflash);
   }
   size_t snapshot_bytes(int world_, bool mtp) const override {
     return dgpp::QwenModel::session_snapshot_bytes(cfg, world_, mtp);
@@ -535,10 +542,17 @@ struct QwenFamily final : ServeFamily {
     dgpp::QwenLayerStream::set_resident_image_dir(dgpp::GlmLayerStream::resident_image_dir());
     model = std::make_unique<dgpp::QwenModel>(
         cfg, ckpt, forward_rows, pool_tokens,
-        fabric ? dgpp::QwenResidency::Resident : dgpp::QwenResidency::Streaming, reducer,
+        fabric || !dflash.empty() ? dgpp::QwenResidency::Resident : dgpp::QwenResidency::Streaming,
+        reducer,
         fabric ? rank : 0, fabric ? world_ : 1, slots, fabric && mtp, decode_rows, fp8_head_mma,
-        /*serving_logits=*/true, kv_format);
+        /*serving_logits=*/true, kv_format, dflash);
   }
+  // The drafter (2026-10-20 port of the Qwen35 DFlash2 walk): its recorded
+  // block draft (session_graph_capture_block_draft/_batch, mirrors and the
+  // capture-aware folds) re-hosted in commit 40da8852..0fae644e, so the
+  // decode graph records it (block_draft_graph_ok).
+  void set_draft_model(const std::string& dir) override { dflash = dir; }
+  bool block_draft_graph_ok() const override { return true; }
   void destroy_model() override { model.reset(); }
   size_t model_snapshot_bytes() const override { return model ? model->session_snapshot_bytes() : 0; }
   std::unique_ptr<ServeGraphEngine> make_graph_engine(dgpp::net::CollectiveBus* bus, int rank,
@@ -2159,7 +2173,7 @@ int main(int argc, char** argv) {
   // the MTP world beside it (--mtp --mtp-depth N), run without it unless
   // the command line asked for it.
   if (no_dflash_cli && !mtp_schedule_cli) mtp_schedule = false;
-  // The DFlash2 block drafter (models/qwen/dflash2.hpp): a standalone
+  // The DFlash2 block drafter (models/dflash2/drafter.hpp): a standalone
   // checkpoint (a directory or a cached HF id) that replaces the MTP
   // draft. World 1 without the decode graph is the eager engine's drafter
   // (the batched verify graph, the stacked redrafts); the graph worlds —
@@ -2680,11 +2694,13 @@ int main(int argc, char** argv) {
     return 2;
   }
   dgpp::Qwen35Model::set_dflash2_weights_fp8(dflash_weights == "fp8");
+  dgpp::QwenModel::set_dflash2_weights_fp8(dflash_weights == "fp8");
   if (dflash_depth < 0 || dflash_depth > 7) {
     DGPP_LOG_ERROR("engine.dflash_depth (--dflash-depth) must be in [0, 7], got {}", dflash_depth);
     return 2;
   }
   dgpp::Qwen35Model::set_dflash_options(dflash_verify_graph, dflash_draft_batch, dflash_depth);
+  dgpp::QwenModel::set_dflash_options(dflash_verify_graph, dflash_draft_batch, dflash_depth);
   if (prefill_fp8_per_tensor)
     DGPP_LOG_INFO("serve: engine.prefill_fp8_per_tensor on — prefill GEMMs on per-tensor e4m3 (not transcript-preserving)");
   dgpp::QwenLayerStream::set_ngram_prestage(ngram_prestage);
@@ -2897,6 +2913,13 @@ int main(int argc, char** argv) {
         family->set_draft_model(dflash_dir);
       } catch (const std::exception& e) {
         DGPP_LOG_ERROR("{}", e.what());
+        return 2;
+      }
+      if (decode_graph && !family->block_draft_graph_ok()) {
+        DGPP_LOG_ERROR(
+            "engine.dflash_model on {} runs the eager engine: set engine.decode_graph false "
+            "(the recorded block draft is not ported to this family)",
+            family->name());
         return 2;
       }
     }

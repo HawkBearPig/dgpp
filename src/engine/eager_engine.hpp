@@ -497,9 +497,20 @@ class EagerEngineAdapter : public sched::SchedulerEngine {
       // scalar kernel sequence. Drafts, judge, rollback and redrafts are
       // unchanged around it; a capture breakage falls back to the eager
       // batch inside the model call.
-      const bool want_graph = model_->dflash_verify_graph() && model_->dflash_graph_verify_available();
-      auto outs = want_graph ? model_->session_verify_batch_graph(reqs, feds, &offs)
-                             : model_->session_verify_batch(reqs, feds, &offs);
+      auto outs = [&] {
+        // Families without the captured static verify (no re-hosted block
+        // graph) take the eager batch; the graph call only instantiates
+        // where the model has session_verify_batch_graph (QwenModel has no
+        // such member, so its block drafts stay on the eager batch).
+        if constexpr (requires { model_->session_verify_batch_graph(reqs, feds, &offs); }) {
+          const bool want_graph =
+              model_->dflash_verify_graph() && model_->dflash_graph_verify_available();
+          return want_graph ? model_->session_verify_batch_graph(reqs, feds, &offs)
+                            : model_->session_verify_batch(reqs, feds, &offs);
+        } else {
+          return model_->session_verify_batch(reqs, feds, &offs);
+        }
+      }();
       const long long ph2 = ph ? ns_now() : 0;
       long long ph3 = 0;
       auto out = finish_verifications(reqs, feds, outs, offs, is_spec, [&] { ph3 = ph ? ns_now() : 0; });

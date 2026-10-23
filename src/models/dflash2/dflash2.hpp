@@ -1,14 +1,18 @@
 #pragma once
-// The DFlash2 drafter for the Qwen3.5-27B family (docs/
-// performance_improvement_plan.md §7): a block-diffusion draft model from a
-// SEPARATE checkpoint (z-lab/Qwen3.8-27B-DFlash2) — five bidirectional
-// sliding-window Qwen3 layers over a KV context built from fused target
-// features (the tap layers' residual streams concatenated through fc),
-// two-tap dynamic grouped convolutions, and a codebook path selector over
-// the mask rows' top-K candidates. The embeddings and lm head are the
-// target's (the draft checkpoint ships neither); the draft planes live in
-// the model's KV pool so block tables, prefix sharing and rollback ride
-// the existing protocol.
+// The DFlash2 block drafter — the drafter MODEL (config, the standalone
+// weight load, the target cross-checks): a block-diffusion draft model from
+// a SEPARATE checkpoint (incoai/Qwen3.8-Flash-Next-DFlash2,
+// z-lab/Qwen3.8-27B-DFlash2, …) — five bidirectional sliding-window Qwen3
+// layers over a KV context built from fused target features (the tap
+// layers' outputs concatenated through fc), two-tap dynamic grouped
+// convolutions, and a codebook path selector over the mask rows' top-K
+// candidates. The embeddings and lm head are the target's (the draft
+// checkpoint ships neither); the draft planes live in the target's KV pool
+// so block tables, prefix sharing and rollback ride the existing protocol
+// (models/dflash2/draft_planes.hpp). The drafter's own backbone is always
+// Qwen3 (parse enforces it) whatever the TARGET family is; the target-side
+// integration (the taps, the head dispatch, the pool planes) is the host
+// model's — models/dflash2/drafter.hpp carries the shared execution.
 //
 // v1 scope: eager greedy C1 (the plan's implementation sequence); graph
 // capture, batching and sampled verification stay open.
@@ -20,9 +24,18 @@
 #include <cuda_runtime.h>
 
 #include "loaders/minijson.hpp"
-#include "models/qwen/config35.hpp"
 
 namespace dgpp {
+
+// The target geometry the drafter cross-checks against (the family adapts
+// its own text config into this; the position bound is the YaRN-scaled
+// context ceiling where the target ramps it).
+struct DFlash2TargetShape {
+  int hidden_size = 0;
+  int vocab_size = 0;
+  int num_hidden_layers = 0;
+  int64_t context_limit = 0;
+};
 
 struct DFlash2Config {
   // dflash_config.
@@ -73,8 +86,13 @@ struct DFlash2Config {
   // Cross-checks the draft/target pair (silent-acceptance-failure hazards:
   // §7 step 2 — widths, vocab and the tap indices). Throws with a message
   // naming the field.
-  void validate_against(const Qwen35TextConfig& target) const;
+  void validate_against(const DFlash2TargetShape& target) const;
 };
+
+// The checkpoint's first `architectures` entry ("" without the field): the
+// drafter's own name decides v1 (DFlashDraftModel) vs v2
+// (DFlash2DraftModel) — never a guess from the target's family.
+std::string drafter_architecture(const std::string& dir);
 
 // One draft layer's device weights (BF16, arena-resident; at world > 1 the
 // q|k|v rows, o columns, gate/up rows and down columns are this rank's

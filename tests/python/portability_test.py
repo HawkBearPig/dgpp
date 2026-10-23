@@ -288,14 +288,23 @@ class PortabilityTest(unittest.TestCase):
                 # 512K YaRN ramp) instead of in its size. A base shape stays
                 # unique, and a variant may repeat one only with its suffix;
                 # deploy/README.md carries the rule and the catalogue.
+                # A DFlash2 drafter world of a model that also ships an MTP
+                # world carries a -dflash2 marker before the size (the drafter
+                # and the MTP draft are two worlds of one checkpoint); when the
+                # drafter IS the family's default world (the 27B NVFP4 releases)
+                # the name carries no marker. The marker stays in the stem so a
+                # model's MTP and drafter worlds of one size remain distinct.
+                prefix = models[cfg['model']]
+                marker = "(?:-dflash2)?" if drafter else ""
                 shape = re.fullmatch(
-                    rf"cluster_{re.escape(models[cfg['model']])}_w([0-9]+)(_[a-z0-9]+)?",
+                    rf"cluster_{re.escape(prefix)}{marker}_w([0-9]+)(_[a-z0-9]+)?",
                     path.name.removesuffix(".example.json"))
                 self.assertIsNotNone(
-                    shape, f"a template is named cluster_<model>_<quant>_w<n>[_variant]: {path.name}")
+                    shape, f"a template is named cluster_<model>_<quant>[-dflash2]_w<n>[_variant]: {path.name}")
                 self.assertEqual(int(shape.group(1)), cfg["world_size"],
                                  "the world size in the name is the JSON's")
-                stem = f"cluster_{models[cfg['model']]}_w{cfg['world_size']}{shape.group(2) or ''}"
+                drafter_marker = "-dflash2" if (drafter and f"{prefix}-dflash2_w" in path.name) else ""
+                stem = f"cluster_{prefix}{drafter_marker}_w{cfg['world_size']}{shape.group(2) or ''}"
                 self.assertNotIn(stem, seen, "one template per model, quant, world and variant")
                 seen.add(stem)
                 self.assertEqual(path.name, stem + ".example.json")

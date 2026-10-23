@@ -165,7 +165,7 @@ step is held at the full block).
 
 ## The DFlash2 block drafter (Qwen3.8-27B)
 
-DFlash2 (`src/models/qwen/dflash2.hpp`, `src/kernels/dflash2.cu`) replaces
+DFlash2 (`src/models/dflash2/dflash2.hpp`, `src/kernels/dflash2.cu`) replaces
 the MTP draft with an external block-drafter checkpoint
 (`z-lab/Qwen3.8-27B-DFlash2`): five bidirectional sliding-window Qwen3 layers
 over a K/V context built from the target's tapped residual streams (layers
