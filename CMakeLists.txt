@@ -924,6 +924,8 @@ add_executable(unit_tests
   tests/unit/log_test.cpp
   tests/unit/process_memory_test.cpp
   tests/unit/minijson_test.cpp
+  tests/unit/chat_template_test.cpp
+  tests/unit/chat_template_limits_test.cpp
   tests/unit/prometheus_test.cpp
   tests/unit/utf8_test.cpp
   tests/unit/arena_test.cpp

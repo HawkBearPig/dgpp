@@ -2109,6 +2109,13 @@ See [tokenization](docs/tokenization.md) for bounds and validation. Golden corpo
 reference tokenizers and are keyed by the tokenizer file's hash. A
 different checkpoint revision must use its matching corpus.
 
+Template integers use signed 64-bit values. Addition and subtraction reject
+unrepresentable results with a line-numbered error. Range and slice iteration
+stop when the next value exceeds the integer domain, preserving finite
+sequences at its boundaries; out-of-range list indexes yield undefined.
+Replacing an empty pattern inserts at each UTF-8 codepoint boundary,
+including both ends, with a checked result size before allocation.
+
 `src/text/chat_template.*` parses the checkpoint's Jinja template at
 model load and renders its syntax tree per request. It implements the
 supported statements and expressions with transformers-compatible
@@ -2117,6 +2124,16 @@ during parsing; rendering errors identify the template line. Rendering
 state is per call, so the parsed template can be shared. Golden tests
 cover rendered bytes and encoded IDs for text, reasoning and tool calls
 in each supported family.
+
+Compilation limits source size, expression tokens and recursive parser entries.
+Each render limits evaluator/macro depth and interpreter dispatch steps. Macro
+buffers and block captures share a cumulative emitted-byte counter; output,
+concatenation and replacement builders check result size before growth. Range
+cardinality is checked before allocation. The defaults are documented in
+`src/text/chat_template.hpp`; exhaustion uses the existing line-numbered error
+path. These selective guards do not bound all helper work, implicit value copies,
+collections, allocations or elapsed time. Shared-object cycles and a broader
+allocation policy remain separate work.
 
 ### Sampling semantics
 

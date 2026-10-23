@@ -376,6 +376,14 @@ build. The suites cover:
   divergences rejected), and the TCP/roster control plane (seal, epoch
   bumps, eviction by death and by deadline, rejection reasons, coordinator
   loss).
+- native template unit cases (`DGPP_TEST_FILTER=chat_template_`) without model
+  data: empty-pattern replacement across UTF-8 codepoints, extreme list indexes,
+  finite range/slice results at integer boundaries, checked addition/subtraction
+  and line-numbered errors. `chat_template_limits_` covers compile limits,
+  recursion, dispatch exhaustion, preflight range cardinality, string growth,
+  cumulative emission across discarded captures/macros, and recovery after
+  refusal. Run these under ASan/UBSan as well as optimized builds;
+  the checkpoint template goldens separately cover valid family renders and IDs.
 - the M6 host suites: the tokenizer (55 byte-exact goldens per family,
   hash-keyed — GLM-5.3, Qwen3.8-Flash-Next and GLM-4.7 corpora), the chat
   template (26 / 20 / 26 goldens + 8 refusal negatives, the tool-call
