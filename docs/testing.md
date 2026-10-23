@@ -1,5 +1,14 @@
 # Tests
 
+`chat_template_generator_test` exercises the Python golden generator's Jinja
+sandbox without a checkpoint or GPU. It checks private-attribute restrictions,
+input immutability, literal message data, namespace/loop behavior, JSON rendering
+and template validation errors. Install `requirements-tools.txt`, then run
+`python3 tests/python/chat_template_generator_test.py` or select the test with
+CTest. Missing Jinja2 is an explicit skip (exit 2), not a passing check.
+The sandbox does not bound CPU or memory: use resource isolation when generating
+reference data from untrusted checkpoint templates.
+
 `resident_image_*` unit tests cover malformed offsets and lengths, truncated
 blobs, default payload verification, its explicit opt-out and recoverable
 read/size failures. `glm_loader_rebuilds_rejected_resident_images` and

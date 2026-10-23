@@ -1180,6 +1180,10 @@ add_test(NAME unit COMMAND unit_tests)
 add_test(NAME checkpoint_audit_test
   COMMAND ${Python3_EXECUTABLE}
           ${CMAKE_CURRENT_SOURCE_DIR}/tests/python/checkpoint_audit_test.py)
+add_test(NAME chat_template_generator_test
+  COMMAND ${Python3_EXECUTABLE}
+          ${CMAKE_CURRENT_SOURCE_DIR}/tests/python/chat_template_generator_test.py)
+set_tests_properties(chat_template_generator_test PROPERTIES SKIP_RETURN_CODE 2)
 add_test(NAME route_trace_test
   COMMAND ${Python3_EXECUTABLE}
           ${CMAKE_CURRENT_SOURCE_DIR}/tests/python/route_trace_test.py)
@@ -2621,7 +2625,7 @@ endforeach()
 set_tests_properties(word_cache_test bpe_test unit unit_tests http_server_test serve_test serve_test_wake fabric_serve_test fabric_serve_test_wake scheduler_test shutdown_watchdog_test engine_watchdog_test
   qwen_yarn_fixture_test qwen_w4a4_plan_default qwen_w4a4_plan_mode_0 qwen_w4a4_plan_mode_1
   qwen_w4a4_plan_mode_empty qwen_w4a4_plan_mode_invalid PROPERTIES LABELS "host")
-set_tests_properties(checkpoint_audit_test route_trace_test sampling_profile_test
+set_tests_properties(checkpoint_audit_test chat_template_generator_test route_trace_test sampling_profile_test
   site_env_test script_reports_test timed_load_test serve_admission_bench_test qwen_yarn_release_check_test qwen_head_compare_test portability_test spark_cross_test setup_tools_test bootstrap_test launcher_test cluster_process_swap_test PROPERTIES LABELS "host;python")
 set_tests_properties(cluster_process_swap_systemd_test PROPERTIES LABELS "systemd" TIMEOUT 180)
 if(TARGET dgpp_serve_app)

@@ -58,6 +58,11 @@ and GPU recovery coverage for both resident loader implementations.
 
 ## Serving support
 
+Chat-template reference generation uses an immutable Jinja sandbox, with
+host Python regressions for private-attribute access, input mutation and
+valid rendering behavior. This change affects the golden generator;
+serving continues to use the native C++ template interpreter.
+
 Host sampling automatically omits neutral penalty preparation using the
 effective request parameters. Deployment defaults and request overrides
 are covered by config, sampler, HTTP and journal regressions, including

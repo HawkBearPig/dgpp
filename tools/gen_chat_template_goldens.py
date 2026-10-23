@@ -2,7 +2,7 @@
 """Generates tests/data/glm_chat_template_goldens.jsonl — the differential
 goldens for the GLM chat template (M6 Stage 3b, DESIGN §10).
 
-The GOLDEN SOURCE is jinja2 3.1.2 configured EXACTLY like transformers'
+The GOLDEN SOURCE is sandboxed Jinja2 configured like transformers'
 chat-template environment (src/transformers/utils/chat_template_utils.py,
 verified 2026-08-31):
   * trim_blocks=True, lstrip_blocks=True
@@ -72,7 +72,9 @@ THINK_CLOSE = "</" + "think>"
 
 def env():
     import jinja2
-    e = jinja2.Environment(
+    from jinja2.sandbox import ImmutableSandboxedEnvironment
+
+    e = ImmutableSandboxedEnvironment(
         trim_blocks=True, lstrip_blocks=True,
         extensions=["jinja2.ext.loopcontrols"],
     )

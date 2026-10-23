@@ -2118,6 +2118,13 @@ state is per call, so the parsed template can be shared. Golden tests
 cover rendered bytes and encoded IDs for text, reasoning and tool calls
 in each supported family.
 
+The Python golden generator uses Jinja's `ImmutableSandboxedEnvironment`.
+The sandbox blocks private-attribute access and mutation of built-in input
+collections; namespace assignments, loop controls and the JSON filter
+retain their reference semantics. This restricts template capabilities, not
+CPU or memory consumption, so untrusted templates still require resource
+isolation when generating reference data.
+
 ### Sampling semantics
 
 The model exposes FP32 logits for its vocabulary slice. Greedy selection
