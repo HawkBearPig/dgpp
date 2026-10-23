@@ -154,18 +154,24 @@ void ResidentImage::write_fresh(uint64_t key) {
 }
 
 int ResidentImage::present() const {
+  std::lock_guard<std::mutex> lk(mutex_);
   int n = 0;
   for (const Entry& e : entries_) n += e.bytes != 0;
   return n;
 }
 
 bool ResidentImage::has_layer(int layer) const {
+  std::lock_guard<std::mutex> lk(mutex_);
   return layer >= 0 && layer < layers() &&
          entries_[static_cast<size_t>(layer)].bytes != 0;
 }
 
 size_t ResidentImage::layer_bytes(int layer) const {
-  return has_layer(layer) ? entries_[static_cast<size_t>(layer)].bytes : 0;
+  std::lock_guard<std::mutex> lk(mutex_);
+  if (layer < 0 || layer >= layers() ||
+      entries_[static_cast<size_t>(layer)].bytes == 0)
+    return 0;
+  return entries_[static_cast<size_t>(layer)].bytes;
 }
 
 uint64_t ResidentImage::table_offset(int layer) const {
@@ -210,17 +216,29 @@ bool ResidentImage::verification_enabled() {
 
 void ResidentImage::read_layer(int layer, void* dst, size_t bytes,
                                   bool verify) const {
-  if (!has_layer(layer))
-    throw std::runtime_error("resident image " + path_ + ": layer " +
-                             std::to_string(layer) + " is absent");
-  const Entry& e = entries_[static_cast<size_t>(layer)];
-  if (e.bytes != bytes)
-    throw std::runtime_error(
-        "resident image " + path_ + ": layer " + std::to_string(layer) +
-        " holds " + std::to_string(e.bytes) + " bytes, the build formula says " +
-        std::to_string(bytes) + " (stale image for this loader — delete it)");
-  read_blob(dst, bytes, e.offset);
-  if (verify && fold(dst, bytes) != e.fold)
+  // Snapshot the entry under the mutex; the blob itself moves outside it
+  // so concurrent restores of different layers stay parallel.
+  uint64_t offset = 0;
+  uint64_t want = 0;
+  uint64_t expect_fold = 0;
+  {
+    std::lock_guard<std::mutex> lk(mutex_);
+    if (layer < 0 || layer >= layers() ||
+        entries_[static_cast<size_t>(layer)].bytes == 0)
+      throw std::runtime_error("resident image " + path_ + ": layer " +
+                               std::to_string(layer) + " is absent");
+    const Entry& e = entries_[static_cast<size_t>(layer)];
+    if (e.bytes != bytes)
+      throw std::runtime_error(
+          "resident image " + path_ + ": layer " + std::to_string(layer) +
+          " holds " + std::to_string(e.bytes) + " bytes, the build formula says " +
+          std::to_string(bytes) + " (stale image for this loader — delete it)");
+    offset = e.offset;
+    want = e.bytes;
+    expect_fold = e.fold;
+  }
+  read_blob(dst, want, offset);
+  if (verify && fold(dst, want) != expect_fold)
     throw std::runtime_error("resident image " + path_ + ": layer " +
                              std::to_string(layer) +
                              " failed verification (corrupt blob)");
@@ -234,6 +252,7 @@ bool ResidentImage::try_read_layer(int layer, void* dst, size_t bytes) {
   } catch (const std::runtime_error& e) {
     DGPP_LOG_WARN("resident image {}: layer {} rejected ({}) — rebuilding from the checkpoint",
                   path_, layer, e.what());
+    std::lock_guard<std::mutex> lk(mutex_);
     entries_[static_cast<size_t>(layer)] = Entry{};
     return false;
   }
@@ -242,19 +261,32 @@ bool ResidentImage::try_read_layer(int layer, void* dst, size_t bytes) {
 void ResidentImage::write_layer(int layer, const void* src, size_t bytes) {
   if (layer < 0 || layer >= layers() || bytes == 0)
     throw std::invalid_argument("resident image: bad layer/bytes");
-  struct stat st{};
-  if (fstat(fd_, &st) != 0) fail("fstat failed", path_);
-  const uint64_t offset =
-      align_up(static_cast<uint64_t>(st.st_size), kBlobAlign);
+  // Reserve the range under the mutex so concurrent captures land on
+  // disjoint offsets; the bytes and the entry publish outside/after it.
+  // A crash between reserve and publish leaves allocated-but-absent tail
+  // bytes (a cache: wasted, never trusted — absent entries rebuild).
+  uint64_t offset = 0;
+  {
+    std::lock_guard<std::mutex> lk(mutex_);
+    struct stat st{};
+    if (fstat(fd_, &st) != 0) fail("fstat failed", path_);
+    offset = align_up(static_cast<uint64_t>(st.st_size), kBlobAlign);
+    if (ftruncate(fd_, static_cast<off_t>(offset + bytes)) != 0)
+      fail("reserve failed", path_);
+  }
+  const uint64_t blob_fold = fold(src, bytes);
   write_blob(src, bytes, offset);
   // The blob must be durable before its entry says it exists. (The direct
   // part already is; this covers the buffered tail and the file size.)
   if (fdatasync(fd_) != 0) fail("fdatasync failed", path_);
-  Entry& e = entries_[static_cast<size_t>(layer)];
-  e.offset = offset;
-  e.bytes = bytes;
-  e.fold = fold(src, bytes);
-  write_entry(layer);
+  {
+    std::lock_guard<std::mutex> lk(mutex_);
+    Entry& e = entries_[static_cast<size_t>(layer)];
+    e.offset = offset;
+    e.bytes = bytes;
+    e.fold = blob_fold;
+    write_entry(layer);
+  }
 }
 
 std::unique_ptr<ResidentImage> ResidentImage::open_for(const std::string& dir, uint64_t key, int layers,
