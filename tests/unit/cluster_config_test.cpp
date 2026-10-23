@@ -33,6 +33,16 @@ std::string engine_json(const std::string& engine) {
 
 }  // namespace
 
+DGPP_TEST(cluster_config_rejects_malformed_number_syntax) {
+  for (const char* number : {"1e+", "01"})
+    require(refusal(engine_json("{\"repetition_penalty\":" + std::string(number) + "}"))
+                    .find("malformed number") != std::string::npos,
+            "invalid numeric syntax is refused before field validation");
+  const auto config =
+      dgpp::serve::parse_cluster_config(engine_json("{\"repetition_penalty\":1e+0}"), "t");
+  require(config.engine.repetition_penalty == 1.0f, "valid exponent remains accepted");
+}
+
 DGPP_TEST(cluster_config_penalty_defaults_preserve_omission_and_explicit_neutral_values) {
   const auto absent = dgpp::serve::parse_cluster_config(engine_json("{}"), "t").engine;
   require(!absent.repetition_penalty && !absent.frequency_penalty && !absent.presence_penalty,

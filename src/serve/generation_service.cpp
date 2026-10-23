@@ -1754,8 +1754,7 @@ bool GenerationService::parse_chat(const dgpp::minijson::Value& body,
               args_value = *args;
             } else if (args->is_string()) {
               try {
-                dgpp::minijson::ParseResult pr =
-                    dgpp::minijson::parse(args->as_string());
+                dgpp::minijson::ParseResult pr = dgpp::minijson::parse_document(args->as_string());
                 if (!pr.root.is_object()) throw std::runtime_error("not an object");
                 args_value = std::move(pr.root);
               } catch (const std::exception& e) {
@@ -2186,7 +2185,7 @@ void GenerationService::prepare_chat_completions(const HttpRequest& req,
                                               PreparedRequest& w) {
   dgpp::minijson::ParseResult parsed;
   try {
-    parsed = dgpp::minijson::parse(req.body);
+    parsed = dgpp::minijson::parse_document(req.body);
   } catch (const std::exception& e) {
     respond_error(w, 400, std::string("invalid JSON body: ") + e.what(),
                   "invalid_request_error", "body");
@@ -2448,7 +2447,7 @@ void GenerationService::prepare_completions(const HttpRequest& req,
                                           PreparedRequest& w) {
   dgpp::minijson::ParseResult parsed;
   try {
-    parsed = dgpp::minijson::parse(req.body);
+    parsed = dgpp::minijson::parse_document(req.body);
   } catch (const std::exception& e) {
     respond_error(w, 400, std::string("invalid JSON body: ") + e.what(),
                   "invalid_request_error", "body");

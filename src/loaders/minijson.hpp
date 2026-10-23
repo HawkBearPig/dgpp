@@ -145,4 +145,8 @@ struct ParseResult {
 
 ParseResult parse(std::string_view in);
 
+// Requires only JSON whitespace after the value. Like parse(), returned string
+// views borrow in, and consumed excludes trailing whitespace.
+ParseResult parse_document(std::string_view in);
+
 }  // namespace dgpp::minijson

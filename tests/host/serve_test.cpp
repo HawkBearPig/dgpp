@@ -1656,6 +1656,69 @@ void expect_invalid_request(const std::string& resp, const std::string& param) {
   require(error.at("param").as_string() == param, "error names " + param + ": " + resp);
 }
 
+DGPP_TEST(serve_json_numbersAndCompleteRequestBodies) {
+  ServiceRig rig(8, model_defaults(), true);
+  for (bool chat : {false, true}) {
+    const auto body = [&](const std::string& extra) {
+      return chat ? chat_body("abcd", 2, extra)
+                  : "{\"model\":\"" + kModel + "\",\"prompt\":\"abcd\",\"max_tokens\":2" + extra +
+                        "}";
+    };
+    const auto post = [&](const std::string& payload, bool valid = false) {
+      Client c(rig.port());
+      c.send_all("POST " + std::string(chat ? "/v1/chat/completions" : "/v1/completions") +
+                 " HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\nContent-Length: " +
+                 std::to_string(payload.size()) + "\r\n\r\n" + payload);
+      return c.read_until(valid ? "usage" : "\"param\"", 3000);
+    };
+    const size_t armed = rig.engine.armed().size();
+    for (const char* token : {"1e", "1e+", "1.2.3", "1-2", "01", "1.", "1.e2", "1e309"})
+      expect_invalid_request(post(body(",\"temperature\":" + std::string(token))), "body");
+    for (const char* extra : {",\"x_vendor\":1e+", ",\"x_vendor\":{\"nested\":[01]}"})
+      expect_invalid_request(post(body(extra)), "body");
+    for (bool stream : {false, true})
+      for (const std::string& suffix :
+           {std::string("junk"), std::string("{}"), std::string(" true"), std::string("\n[]"),
+            std::string(1, '\0'), std::string("\v"), std::string("\f")})
+        expect_invalid_request(post(body(stream ? ",\"stream\":true" : "") + suffix), "body");
+    expect_invalid_request(post(body(",\"seed\":1e0")), "seed");
+    expect_invalid_request(post(body(",\"seed\":9223372036854775808")), "seed");
+    require(rig.engine.armed().size() == armed, "invalid JSON never arms the engine");
+    for (const char* extra : {"", ",\"temperature\":1e+0", ",\"temperature\":-0.0",
+                              ",\"seed\":9223372036854775807", ",\"seed\":-9223372036854775808"})
+      require(post(body(extra) + " \t\r\n", true).find("200 OK") != std::string::npos,
+              "valid numeric syntax and whitespace still complete after refusals");
+    for (const char* number : {"2e0", "2.0", "1e20"}) {
+      auto payload = body("");
+      const size_t at = payload.find("\"max_tokens\":2") + std::strlen("\"max_tokens\":");
+      payload.replace(at, 1, number);
+      const auto response = post(payload, std::string_view(number) != "1e20");
+      if (std::string_view(number) == "1e20")
+        expect_invalid_request(response, "max_tokens");
+      else
+        require(response.find("200 OK") != std::string::npos, "integral doubles remain accepted");
+    }
+  }
+}
+
+DGPP_TEST(serve_json_fileBodiesValidatedBeforeNormalization) {
+  ServiceRig rig(8, model_defaults(), true);
+  const std::string body =
+      "{\"model\":\"" + kModel +
+      R"(","messages":[{"role":"user","content":[{"type":"file","file":{"filename":"input.txt","file_data":"aGVsbG8="}}]}],"max_tokens":2})";
+  for (const std::string& suffix :
+       {std::string("junk"), std::string("{}"), std::string(" \n[]"), std::string(1, '\0')})
+    expect_invalid_request(post_chat(rig, body + suffix, "\"param\""), "body");
+  auto malformed = body;
+  malformed.insert(malformed.size() - 1, "e");
+  expect_invalid_request(post_chat(rig, malformed, "\"param\""), "body");
+  require(rig.engine.armed().empty(), "malformed file requests never arm the engine");
+  require(post_chat(rig, body + " \t\r\n", "usage").find("200 OK") != std::string::npos,
+          "valid padded file request completes");
+  require(rig.frontend.last_globals().find("hello") != std::string::npos,
+          "file normalization still extracts text");
+}
+
 std::string assistant_history_body(const std::string& messages) {
   return "{\"model\":\"" + kModel + "\",\"max_tokens\":1,\"messages\":["
          "{\"role\":\"user\",\"content\":\"hi\"}," + messages + "]}";
@@ -1666,6 +1729,44 @@ std::string assistant_history_globals(ServiceRig& rig, const std::string& messag
   require(response.find("200 OK") != std::string::npos,
           "assistant history is accepted: " + response);
   return rig.frontend.last_globals();
+}
+
+DGPP_TEST(serve_json_stringToolArgumentsAreCompleteDocuments) {
+  ServiceRig rig;
+  const auto history = [&](const std::string& arguments) {
+    return R"({"role":"assistant","tool_calls":[{"id":"call_1","type":"function",)"
+           R"("function":{"name":"f","arguments":)" +
+           arguments + "}}]}";
+  };
+  for (const std::string& input : {std::string(R"({"x":1e+})"), std::string(R"({"x":01})"),
+                                   std::string(R"({"x":1.2.3})"), std::string(R"({"x":1}junk)"),
+                                   std::string(R"({"x":1}{})"), std::string(R"({"x":1})") + '\0'})
+    expect_invalid_request(
+        post_chat(
+            rig,
+            assistant_history_body(history(json_of(dgpp::minijson::Value::make_string(input)))),
+            "\"param\""),
+        "messages[1].tool_calls[0].function.arguments");
+  for (const auto& arguments :
+       {std::string(R"({"x":1e0})"),
+        json_of(dgpp::minijson::Value::make_string("{\"x\":1e0} \t\r\n"))}) {
+    const auto globals = assistant_history_globals(rig, history(arguments));
+    const auto parsed = dgpp::minijson::parse(globals);
+    require(parsed.root.at("messages")
+                    .items()[1]
+                    .at("tool_calls")
+                    .items()[0]
+                    .at("function")
+                    .at("arguments")
+                    .at("x")
+                    .as_double() == 1.0,
+            "object and complete string tool arguments agree");
+  }
+  const auto custom = assistant_history_globals(
+      rig, R"({"role":"assistant","tool_calls":[{"id":"call_2","type":"custom",)"
+           R"("custom":{"name":"exec","input":"1e+ trailing text"}}]})");
+  require(custom.find("1e+ trailing text") != std::string::npos,
+          "custom tool input remains raw text");
 }
 
 DGPP_TEST(serve_refusalParts_preserveTextAndLaterHistory) {

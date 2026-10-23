@@ -155,6 +155,22 @@ DGPP_TEST(file_inputs_edge_base64ValidationAndUnicodeDetection) {
   check(files.prepare(escaped).body.find("[Document:") != std::string::npos, "escaped file fields normalize");
 }
 
+DGPP_TEST(file_inputs_require_complete_body_before_normalization) {
+  FileInputs files({});
+  for (const std::string& suffix :
+       {std::string("junk"), std::string("{}"), std::string(" \n[]"), std::string(1, '\0')}) {
+    auto req = chat_file("input.txt", "hello 1e+");
+    req.body += suffix;
+    check(!FileInputs::needed(req), "malformed bodies reach the API body validator");
+    file_error([&] { files.prepare(req); }, 400, "body");
+  }
+  auto padded = chat_file("input.txt", "hello 1e+");
+  padded.body += " \t\r\n";
+  check(FileInputs::needed(padded), "JSON whitespace still permits file detection");
+  check(files.prepare(padded).body.find("hello 1e+") != std::string::npos,
+        "document bytes remain literal text");
+}
+
 DGPP_TEST(file_inputs_edge_multipartPreservesBoundaryPrefixesAndRejectsMalformedHeaders) {
   FileInputs files({});
   const std::string content = "line one\r\n--BOUND-not-a-delimiter\r\n--BOUND--also-not-a-delimiter\r\nline two";

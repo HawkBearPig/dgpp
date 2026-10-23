@@ -133,13 +133,34 @@ struct Parser {
             s[pos] == '.' || s[pos] == 'e' || s[pos] == 'E'))
       ++pos;
     std::string_view tok = s.substr(start, pos - start);
+    size_t i = 0;
+    auto digit = [&] { return i < tok.size() && tok[i] >= '0' && tok[i] <= '9'; };
+    if (i < tok.size() && tok[i] == '-') ++i;
+    if (!digit()) fail("malformed number");
+    if (tok[i] == '0') {
+      ++i;
+    } else {
+      while (digit()) ++i;
+    }
+    if (i < tok.size() && tok[i] == '.') {
+      ++i;
+      if (!digit()) fail("malformed number");
+      while (digit()) ++i;
+    }
+    if (i < tok.size() && (tok[i] == 'e' || tok[i] == 'E')) {
+      ++i;
+      if (i < tok.size() && (tok[i] == '+' || tok[i] == '-')) ++i;
+      if (!digit()) fail("malformed number");
+      while (digit()) ++i;
+    }
+    if (i != tok.size()) fail("malformed number");
     int64_t iv{};
     auto r = std::from_chars(tok.data(), tok.data() + tok.size(), iv);
     if (r.ec == std::errc() && r.ptr == tok.data() + tok.size())
       return Value::make_int(iv);
     double dv{};
     auto r2 = std::from_chars(tok.data(), tok.data() + tok.size(), dv);
-    if (r2.ec != std::errc()) fail("malformed number");
+    if (r2.ec != std::errc() || r2.ptr != tok.data() + tok.size()) fail("malformed number");
     return Value::make_double(dv);
   }
 
@@ -213,6 +234,15 @@ ParseResult parse(std::string_view in) {
   Value root = p.any();
   const size_t consumed_after_value = p.pos;
   p.skip_ws();
+  return ParseResult{std::move(root), consumed_after_value};
+}
+
+ParseResult parse_document(std::string_view in) {
+  Parser p{in};
+  Value root = p.any();
+  const size_t consumed_after_value = p.pos;
+  p.skip_ws();
+  if (p.pos != in.size()) p.fail("unexpected trailing input");
   return ParseResult{std::move(root), consumed_after_value};
 }
 

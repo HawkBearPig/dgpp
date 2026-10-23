@@ -64,6 +64,11 @@ are covered by config, sampler, HTTP and journal regressions, including
 greedy penalties without logprobs. This is a host-work reduction; serving
 throughput gains require deployment measurements.
 
+Completion requests validate JSON number syntax and complete document boundaries
+before preparation or file normalization. String-encoded function arguments use
+the same boundary check; parser, file-input and HTTP regressions cover invalid
+syntax, trailing input and valid numeric representations.
+
 The mixed `unsloth/Qwen3.8-27B-NVFP4` checkpoint runs at TP 1/2/4
 with the shipped DFlash2 recipes. Its dense FP4 prefill kernel reuses
 activation fragments across wider warp tiles while preserving the original

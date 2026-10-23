@@ -2358,6 +2358,15 @@ the same machine from the journal and its tokenizer.
 
 ## 11. Runtime and API
 
+The shared JSON parser validates number grammar before conversion, retaining exact
+signed integers when representable and the existing double fallback otherwise.
+Its prefix-parsing API remains available; `parse_document` additionally requires
+only JSON whitespace after the root. Completion bodies use document parsing,
+including before file-input normalization, as do string-encoded function arguments
+in request history. Malformed bodies receive HTTP 400 naming `body`; malformed
+embedded arguments name their history field. This does not change the separate
+model-output parser's precision-preserving fallback.
+
 HTTP request lengths are fully parsed as unsigned decimal integers after trimming
 space/tab padding. Repeated `Content-Length` fields must agree numerically and
 become one canonical field; comma-separated lengths are rejected. Invalid or

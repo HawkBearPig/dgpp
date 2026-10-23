@@ -17,6 +17,13 @@ template/tokenizer across text/image preparation and output decoding.
 Set `DGPP_TP_REAL_MODEL` to select another cached GLM-5.3 checkpoint for that
 frontend test; its default is `unsloth/GLM-5.3-Flash-FP8`.
 
+`minijson_number_*` and `minijson_document_*` cover numeric grammar, integer/double
+representations and document versus prefix parsing. `serve_json_*` exercises both
+completion routes, file preprocessing and string-encoded function arguments with
+the fake engine, including refusal before admission and valid requests afterward.
+Run the service cases with both polling and `DGPP_TEST_STREAM_WAKE=1`; file-input,
+safetensors, cluster-config and tool-parser unit tests cover shared-parser callers.
+
 `serve_admission_bench_test` checks the HTTP/SSE admission benchmark's transport,
 native-overlap assertions, published-counter drain barrier and KV cleanup gate.
 It also checks optional controller metrics sampling against request IDs, sampler
