@@ -1,4 +1,5 @@
 #include <stdexcept>
+#include "kernels/pdl.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -62,6 +63,7 @@ __global__ __launch_bounds__(kThreads, 2) void dense_fp4_decode_kernel(
     const int32_t* __restrict__ act_rows, const MoeSegment* __restrict__ segs,
     const MoeExpertView* __restrict__ views, int which, uint16_t* __restrict__ out,
     uint16_t* __restrict__ up_out, size_t out_stride, int n, int k, int m_tiles) {
+  dgpp_pdl_wait();
   extern __shared__ __align__(16) uint8_t smem[];
   const MoeSegment seg = segs[0];
   if constexpr (Pair) {

@@ -3,11 +3,12 @@
 // encodings must agree, and the produced Kda/Dsa geometry configs carry the
 // trained values rather than the header defaults.
 #include <filesystem>
-#include <functional>
 #include <fstream>
+#include <functional>
 #include <stdexcept>
 #include <string>
 
+#include "../common/temp_dir.hpp"
 #include "common/test.hpp"
 #include "loaders/minijson.hpp"
 #include "models/glm/config.hpp"
@@ -302,10 +303,8 @@ DGPP_TEST(glm_generation_config_rejects_invalid_present_values) {
 
 DGPP_TEST(glm_generation_config_checkpoint_load_allows_only_absence) {
   namespace fs = std::filesystem;
-  const fs::path dir =
-      fs::temp_directory_path() / "dgpp_generation_config_test";
-  fs::remove_all(dir);
-  fs::create_directories(dir);
+  const dgpp::test::TempDir fixture("dgpp_generation_config_test");
+  const fs::path& dir = fixture.path();
 
   const GlmGenerationDefaults missing =
       GlmGenerationDefaults::from_checkpoint_dir(dir.string(), 64);

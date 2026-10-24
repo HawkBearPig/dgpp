@@ -3,6 +3,7 @@
 // the x/max quantize into E4M3 codes. Both are deterministic (max is
 // order-independent; the quantize is elementwise).
 #include "kernels/fp8_per_tensor.hpp"
+#include "kernels/pdl.cuh"
 
 #include <stdexcept>
 
@@ -23,6 +24,7 @@ constexpr int kThreads = 256;
 // *out_max on-stream first; max is order-independent, hence deterministic.
 __global__ void fp8_maxabs_kernel(const uint16_t* __restrict__ data, size_t count,
                                   float* __restrict__ out_max) {
+  dgpp_pdl_wait();
   __shared__ float sRed[kThreads];
   const int tid = threadIdx.x;
   const size_t n8 = count / 8;
@@ -66,6 +68,7 @@ __global__ void fp8_maxabs_kernel(const uint16_t* __restrict__ data, size_t coun
 // precision is relative — but raw-mx scales keep the contract obvious.)
 __global__ void fp8_quant_kernel(const uint16_t* __restrict__ in, uint8_t* __restrict__ out,
                                   size_t count, const float* __restrict__ dev_max) {
+  dgpp_pdl_wait();
   float mx = *dev_max;
   if (mx == 0.f) mx = 1.f;  // all-zero guard (matches the old maxabs policy)
   const float inv = 1.f / mx;

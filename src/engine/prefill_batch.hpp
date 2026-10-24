@@ -137,6 +137,32 @@ struct PrefillBatch {
     run.decode_spans = static_cast<int>(reqs.size());
     run.device_decode_outputs = graph_rows > 0;
     run.snapshots = true;
+    // A lone prompt's chunk names itself and its successor (2026-10-18; the
+    // families' chunk-ahead table staging under the scheduler, which walks
+    // every prefill through here): its host ids by the prompt's own pointer
+    // (the staging's key, stable across ticks) and the next chunk at this
+    // budget on the cursor's cuts, as prefill_chunk() names it. The same
+    // rows the batch copied above; a changed budget next tick just drops
+    // the staging.
+    if (reqs.empty() && cursors.size() == 1) {
+      const auto& cursor = *cursors[0];
+      const int64_t budget = budgets[0] == 0 ? cursor.budget_tokens : budgets[0];
+      run.ids = cursor.ids + (cursor.next - cursor.start);
+      run.pos0 = cursor.next;
+      const int64_t c1 = cursor.next + counts[0];
+      if (c1 < cursor.end) {
+        int64_t c2 = cursor.end;
+        for (const int64_t cut : cursor.cuts)
+          if (cut > c1) c2 = std::min(c2, cut);
+        if (budget > 0) c2 = cursor.relative_budget ? c1 + std::min(c2 - c1, budget)
+                                                    : std::min(c2, (c1 / budget + 1) * budget);
+        if (c2 > c1 && c2 - c1 <= max_tokens_) {
+          run.next_ids = cursor.ids + (c1 - cursor.start);
+          run.next_T = static_cast<int>(c2 - c1);
+          run.next_pos0 = c1;
+        }
+      }
+    }
     if (separate_readers || !core.derived().prefill_batch_fits(run)) {
       if (!reqs.empty()) throw std::invalid_argument("mixed walk exceeds continuation workspace");
       for (size_t s = 0; s < cursors.size(); ++s) core.derived().session_prefill_advance(*cursors[s], budgets[s]);

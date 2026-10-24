@@ -452,6 +452,80 @@ DGPP_TEST(mhc_deferred_comb_is_bitwise_the_fused_finish) {
   }
 }
 
+// A decode batch of sixteen rows and more takes the token-tiled dots
+// (2026-10-23): with the fused finish, the deferred comb and the
+// single-pass exports as the DeepSeek decode site asks them, the tiled
+// form's logits, post, normed, pre and comb are bitwise the per-
+// coefficient fused form's (mhc_set_tiled_form flips the form).
+DGPP_TEST(mhc_decode_rows_tiled_form_is_bitwise_the_fused_form) {
+  for (int T : {16, 20, 40}) {
+    Case c = make_case(real_config(), T, 0xD3C0 + T);
+    c.alloc();
+    const int n = c.cfg.hc_mult, D = c.cfg.hidden;
+    std::vector<uint16_t> ln(D);
+    for (int i = 0; i < D; ++i) ln[i] = float_to_bf16_bits(0.5f + 0.001f * float(i % 97));
+    uint16_t* d_ln = nullptr;
+    uint16_t* d_normed = nullptr;
+    int* d_counters = nullptr;
+    float *d_pre_in = nullptr, *d_pre_out = nullptr, *d_post_f32 = nullptr;
+    DGPP_CUDA_OK(cudaMallocManaged(&d_ln, D * 2));
+    DGPP_CUDA_OK(cudaMallocManaged(&d_normed, size_t(T) * D * 2));
+    DGPP_CUDA_OK(cudaMallocManaged(&d_counters, size_t(T) * sizeof(int)));
+    DGPP_CUDA_OK(cudaMallocManaged(&d_pre_in, size_t(T) * n * sizeof(float)));
+    DGPP_CUDA_OK(cudaMallocManaged(&d_pre_out, size_t(T) * n * sizeof(float)));
+    DGPP_CUDA_OK(cudaMallocManaged(&d_post_f32, size_t(T) * n * sizeof(float)));
+    std::memcpy(d_ln, ln.data(), D * 2);
+    std::memset(d_counters, 0, size_t(T) * sizeof(int));
+    for (int i = 0; i < T * n; ++i) d_pre_in[i] = 0.25f + 0.01f * float(i % 13);
+    std::vector<uint16_t> post_a(size_t(T) * n), comb_a(size_t(T) * n * n), normed_a(size_t(T) * D);
+    std::vector<float> logits_a(size_t(T) * c.cfg.coeff_rows()), pre_a(size_t(T) * n), postf_a(size_t(T) * n);
+    const auto require = [](bool ok, const char* what) {
+      if (!ok) throw std::runtime_error(what);
+    };
+    for (int tiled = 0; tiled < 2; ++tiled) {
+      dgpp::mhc_set_tiled_form(tiled == 1);
+      DGPP_CUDA_OK(cudaMemset(c.d_post, 0xA5, size_t(T) * n * 2));
+      DGPP_CUDA_OK(cudaMemset(c.d_comb, 0xA5, size_t(T) * n * n * 2));
+      DGPP_CUDA_OK(cudaMemset(d_normed, 0xA5, size_t(T) * D * 2));
+      DGPP_CUDA_OK(cudaMemset(d_pre_out, 0, size_t(T) * n * sizeof(float)));
+      DGPP_CUDA_OK(cudaMemset(d_post_f32, 0, size_t(T) * n * sizeof(float)));
+      dgpp::MhcSinglePass sp;
+      sp.pre_in = d_pre_in;
+      sp.pre_out = d_pre_out;
+      sp.post_f32 = d_post_f32;
+      sp.comb_f32 = nullptr;
+      sp.one_round_norm = true;
+      const bool deferred = dgpp::launch_mhc_compute_normed(c.d_streams, c.dev_w, c.cfg, nullptr, c.d_post, c.d_comb,
+                                                            c.d_logits, d_ln, d_normed, 1e-5f, T, nullptr, d_counters,
+                                                            /*defer_comb=*/true, &sp, /*decode_rows=*/true);
+      require(deferred, "a decode batch defers its comb on either form");
+      DGPP_CUDA_OK(cudaDeviceSynchronize());
+      for (size_t i = 0; i < size_t(T) * n * n; ++i) require(c.d_comb[i] == 0xA5A5, "deferred finish must not write comb");
+      dgpp::launch_mhc_comb(c.d_logits, c.dev_w, c.cfg, c.d_comb, T, nullptr);
+      DGPP_CUDA_OK(cudaDeviceSynchronize());
+      if (!tiled) {
+        std::memcpy(post_a.data(), c.d_post, post_a.size() * 2);
+        std::memcpy(comb_a.data(), c.d_comb, comb_a.size() * 2);
+        std::memcpy(normed_a.data(), d_normed, normed_a.size() * 2);
+        std::memcpy(logits_a.data(), c.d_logits, logits_a.size() * 4);
+        std::memcpy(pre_a.data(), d_pre_out, pre_a.size() * 4);
+        std::memcpy(postf_a.data(), d_post_f32, postf_a.size() * 4);
+      } else {
+        require(std::memcmp(logits_a.data(), c.d_logits, logits_a.size() * 4) == 0, "decode tiled logits bitwise the fused form");
+        require(std::memcmp(post_a.data(), c.d_post, post_a.size() * 2) == 0, "decode tiled post bitwise the fused form");
+        require(std::memcmp(normed_a.data(), d_normed, normed_a.size() * 2) == 0, "decode tiled normed bitwise the fused form");
+        require(std::memcmp(pre_a.data(), d_pre_out, pre_a.size() * 4) == 0, "decode tiled pre export bitwise the fused form");
+        require(std::memcmp(postf_a.data(), d_post_f32, postf_a.size() * 4) == 0, "decode tiled post_f32 bitwise the fused form");
+        require(std::memcmp(comb_a.data(), c.d_comb, comb_a.size() * 2) == 0, "decode tiled deferred comb bitwise the fused form");
+      }
+    }
+    dgpp::mhc_set_tiled_form(true);
+    std::printf("[ OK ] mhc decode tiled form: %d rows bitwise the fused per-coefficient form\n", T);
+    cudaFree(d_ln); cudaFree(d_normed); cudaFree(d_counters); cudaFree(d_pre_in); cudaFree(d_pre_out); cudaFree(d_post_f32);
+    c.free_all();
+  }
+}
+
 DGPP_TEST(mhc_end_to_end_pipeline_is_deterministic) {
   // Real pipeline wiring: kernel's own post/comb feed its own update; two
   // full invocations must be bitwise identical (graph-capture premise).

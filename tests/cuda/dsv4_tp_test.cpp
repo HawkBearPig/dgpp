@@ -39,6 +39,7 @@
 
 #include <cuda_runtime.h>
 
+#include "common/bf16_residency.hpp"
 #include "common/cuda_check.hpp"
 #include "common/dtypes.hpp"
 #include "common/log.hpp"
@@ -696,6 +697,72 @@ DGPP_TEST(dsv4_tp_loopback_worlds_2_and_4_match_world_1_at_decode_rows) {
   }
   check_world(2, 30003, dir, cfg, tokens, ref);
   check_world(4, 30004, dir, cfg, tokens, ref);
+}
+
+// The lm head's 12-bit companion (engine.bf16_weights; the DeepSeek-V4.1
+// lever ported 2026-10-20): under bf12 | bf12+bf16 the model packs its head
+// after the load and the decode head GEMV reads the companion through the
+// tensor-core form. The packed values are the bf16 values; the companion
+// GEMV sums each row in another fp32 order, so the gate is the argmax and
+// a rounding-level l2 against the checkpoint residency. This loader grants
+// no release, so both residencies keep the bf16 bytes (the prefill forms).
+DGPP_TEST(dsv4_lm_head_bf12_companion_matches_the_bf16_head) {
+  const std::string dir = (fs::current_path() / "dsv4_tp_fixture_bf12").string();
+  const Dsv4Config cfg = dsv4fx::tiny_config();
+  dsv4fx::write_fixture(cfg, dir);
+  const std::vector<int64_t> prompt = make_tokens(cfg, 160);
+  struct Run {
+    std::vector<float> logits;
+    std::vector<std::vector<float>> steps;
+    size_t matrices = 0, released = 0;
+  };
+  const auto run = [&](dgpp::Bf16Residency mode) {
+    dgpp::set_bf16_residency(mode);
+    Run r;
+    Dsv4Model model(cfg, dir, 512, 2048, Dsv4Residency::Streaming, nullptr, 0, 1, 3);
+    model.set_decode_route_traces(false);
+    r.logits = model.session_prefill(0, prompt).logits;
+    for (int k = 0; k < 4; ++k)
+      r.steps.push_back(model.session_step(0, (prompt[static_cast<size_t>(k)] + 7) % cfg.vocab_size).logits);
+    model.session_close(0);
+    r.matrices = model.bf12_companions().matrices();
+    r.released = model.bf12_companions().released();
+    return r;
+  };
+  const Run plain = run(dgpp::Bf16Residency::Checkpoint);
+  const Run both = run(dgpp::Bf16Residency::Bf12AndBf16);
+  const Run only = run(dgpp::Bf16Residency::Bf12);
+  dgpp::set_bf16_residency(dgpp::Bf16Residency::Checkpoint);
+  require(plain.matrices == 0, "the checkpoint residency packs nothing");
+  require(both.matrices == 1 && only.matrices == 1, "both companion residencies pack the lm head");
+  require(both.released == 0 && only.released == 0, "this loader grants no release: the bf16 head stays");
+  const int V = cfg.vocab_size;
+  const auto compare = [&](const std::vector<float>& a, const std::vector<float>& b, const char* what) {
+    require(!a.empty() && a.size() == b.size(), std::string(what) + ": logits shape");
+    const size_t rows = a.size() / static_cast<size_t>(V);
+    const float* pa = a.data() + (rows - 1) * static_cast<size_t>(V);
+    const float* pb = b.data() + (rows - 1) * static_cast<size_t>(V);
+    int ia = 0, ib = 0;
+    double d = 0, m = 0;
+    for (int i = 0; i < V; ++i) {
+      if (pa[i] > pa[ia]) ia = i;
+      if (pb[i] > pb[ib]) ib = i;
+      d += double(pa[i] - pb[i]) * double(pa[i] - pb[i]);
+      m += double(pb[i]) * double(pb[i]);
+    }
+    const double l2 = std::sqrt(d) / std::max(std::sqrt(m), 1e-30);
+    require(ia == ib, std::string(what) + ": the argmax differs from the bf16 head's");
+    require(l2 < 0.02, std::string(what) + ": the logits beyond rounding of the bf16 head's");
+    return l2;
+  };
+  double worst = 0;
+  for (const Run* r : {&both, &only}) {
+    worst = std::max(worst, compare(r->logits, plain.logits, "prefill last row"));
+    for (int k = 0; k < 4; ++k)
+      worst = std::max(worst, compare(r->steps[static_cast<size_t>(k)], plain.steps[static_cast<size_t>(k)], "decode step"));
+  }
+  std::printf("[ OK ] lm head bf12 companion: the prefill's last row and 4 decode steps within rel l2 %.2e of the bf16 head "
+              "(argmax equal), both residencies packed, the bf16 bytes kept\n", worst);
 }
 
 int main() { return dgpp::test::run_all(); }

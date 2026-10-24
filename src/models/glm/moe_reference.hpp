@@ -36,7 +36,41 @@ struct GlmMoeHostWeights {
   // cols/16] + a global per matrix), 32 = MXFP4 (e8m0 scales [rows,
   // cols/32], no globals — fp4_globals may be empty).
   int fp4_group = 16;
-  int fp4_matrices(int n_experts) const { return (n_experts + (shared_nvfp4 ? 1 : 0)) * 3; }
+  // The per-projection form (2026-10-22, docs/flint_plan.md D2): with
+  // `nvfp4`, [E * 3] flags naming the routed matrices that are fp4 (the
+  // others fp8); empty = every routed matrix fp4. The fp4 vectors hold
+  // the fp4 matrices in index order, the fp8 vectors the fp8 routed ones
+  // in index order then the shared triple.
+  std::vector<uint8_t> fp4_matrix;
+  bool fp4_of(int index, int n_experts) const {
+    if (!nvfp4) return false;
+    if (index >= n_experts * 3) return shared_nvfp4;
+    return fp4_matrix.empty() || fp4_matrix[static_cast<size_t>(index)] != 0;
+  }
+  // A matrix's position inside its format's vectors.
+  int fp4_ordinal(int index, int n_experts) const {
+    const int routed = n_experts * 3;
+    if (fp4_matrix.empty()) return index;
+    int o = 0;
+    for (int i = 0; i < index && i < routed; ++i) o += fp4_matrix[static_cast<size_t>(i)] != 0;
+    return index < routed ? o : o + (index - routed);
+  }
+  int fp8_ordinal(int index, int n_experts) const {
+    const int routed = n_experts * 3;
+    if (packq || (nvfp4 && fp4_matrix.empty())) return index < routed ? index : index - routed;
+    if (!nvfp4) return index;
+    int o = 0;
+    for (int i = 0; i < index && i < routed; ++i) o += fp4_matrix[static_cast<size_t>(i)] == 0;
+    return index < routed ? o : o + (index - routed);
+  }
+  int fp4_matrices(int n_experts) const {
+    int routed = n_experts * 3;
+    if (!fp4_matrix.empty()) {
+      routed = 0;
+      for (uint8_t f : fp4_matrix) routed += f != 0;
+    }
+    return routed + (shared_nvfp4 ? 3 : 0);
+  }
   // The packed-int format (`packq` set, docs/glm53_plan.md D2): the routed
   // experts at packq_bits_routed and (with shared_packq) the shared triple
   // at packq_bits_shared, matrices in index order (expert e matrix m at
@@ -74,6 +108,13 @@ struct GlmMoeHostWeights {
   // (the represented values code x scale) for every format-3 expert, and
   // feeds a format-0 (existing) expert the plain rows.
   int routed_input_transform = 0;
+  // The EXL3 format (2026-10-22, docs/deepseek_v41_flash_exl3_plan.md): every
+  // matrix as a host EXL3 matrix in index order, the shared triple last
+  // ((E + 1) * 3 entries; gate/up rows I cols H, down rows H cols I). The
+  // oracle multiplies the full reconstruct (every rotation in double); the
+  // fp8 / fp4 / packed vectors are unused when set.
+  std::vector<Exl3HostMatrix> exl3;
+  bool exl3_set() const { return !exl3.empty(); }
 };
 
 // Expert payload layout inside GlmMoeHostWeights: expert e's matrix m at
@@ -123,13 +164,16 @@ void glm_moe_ref_forward(const uint16_t* hidden,
                          const GlmMoeHostWeights& w, const GlmMoeConfig& cfg,
                          int tokens, std::vector<uint16_t>& out);
 
-// Build the host-weight views (expert e matrix m, and the shared triple).
+// Build the host-weight views by LOGICAL index (expert e matrix m at
+// e * 3 + m, the shared triple at E * 3 + m; the fp8 vectors' positions
+// are fp8_ordinal's).
 GlmQuantMatrixHost glm_moe_host_view(const GlmMoeHostWeights& w,
                                      const GlmMoeConfig& cfg, int index);
 GlmQuantMatrixHost glm_moe_host_shared(const GlmMoeHostWeights& w,
                                        const GlmMoeConfig& cfg, int m);
 // The NVFP4 expert view (index in [0, E*3), or [0, (E+1)*3) with
-// shared_nvfp4); requires w.nvfp4.
+// shared_nvfp4; under the per-projection form an index fp4_of names);
+// requires w.nvfp4.
 GlmFp4MatrixHost glm_moe_host_view_fp4(const GlmMoeHostWeights& w,
                                        const GlmMoeConfig& cfg, int index);
 // The packed-int expert view (index in [0, E*3), or [0, (E+1)*3) with

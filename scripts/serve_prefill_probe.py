@@ -58,18 +58,36 @@ def prompt_of(words, n_words, nonce, rng):
         " ".join(words[start:start + n_words])
 
 
+ALWAYS_ON = {"seen": False}  # the template has no thinking switch (Flint): --no-think is moot
+
+
 def ask(host, port, model, prompt, no_think=False):
     payload = {"model": model, "messages": [{"role": "user", "content": prompt}],
                "max_tokens": 1, "temperature": 0, "stream": True,
                "stream_options": {"include_usage": True}}
-    if no_think:
+    if no_think and not ALWAYS_ON["seen"]:
         payload["chat_template_kwargs"] = {"enable_thinking": False}
     conn = http.client.HTTPConnection(host, port, timeout=1200)
     t0 = time.perf_counter()
     try:
         conn.request("POST", "/v1/chat/completions", json.dumps(payload),
                      {"Content-Type": "application/json"})
-        result = read_completion(conn.getresponse())
+        response = conn.getresponse()
+        if response.status == 400 and "chat_template_kwargs" in payload:
+            # An always-on template refuses the switch (unsupported_parameter):
+            # the probe measures the prefill alone, so ask again without it.
+            body = response.read(2048)
+            if b"enable_thinking" not in body:
+                raise RuntimeError(f"HTTP 400: {body!r}")
+            ALWAYS_ON["seen"] = True
+            conn.close()
+            del payload["chat_template_kwargs"]
+            conn = http.client.HTTPConnection(host, port, timeout=1200)
+            t0 = time.perf_counter()
+            conn.request("POST", "/v1/chat/completions", json.dumps(payload),
+                         {"Content-Type": "application/json"})
+            response = conn.getresponse()
+        result = read_completion(response)
         ended = time.perf_counter()
     finally:
         conn.close()
@@ -135,7 +153,8 @@ def main():
         raise RuntimeError("invalid token-to-word calibration")
     print(f"[calibrate] 400 words -> {tokens} prompt tokens ({per_word:.3f} tok/word)", flush=True)
     report = {"schema_version": 1, "model": model, "tag": args.tag, "seed": args.seed,
-              "thinking": False if args.no_think else "server_default", "interval_s": args.interval,
+              "thinking": "always_on" if ALWAYS_ON["seen"] else False if args.no_think else "server_default",
+              "interval_s": args.interval,
               "data_sha256": hashlib.sha256(raw).hexdigest(), "calibration": calibration, "samples": []}
     for length in args.lengths:
         n_words = max(8, int((length - 30) / per_word))

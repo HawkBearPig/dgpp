@@ -12,7 +12,7 @@ the original soak alone did not establish those later changes.
 
 ## Original problem
 
-Single-stream dgpp matches or beats vLLM, but per-request throughput collapses
+Single-stream dgpp sits at its step floor, but per-request throughput collapses
 under concurrency (measured: 45 → 9 tok/s @d8k c4). Root causes in the
 scheduler (`src/sched/scheduler.cpp:quantum()`, `1124-1254`):
 
@@ -297,6 +297,51 @@ exercise real MiMo snapshot lifetimes, cross-rank execution, and throughput.
 Measured cache-reclamation results and controller comparisons are recorded in
 [the issue #116 investigation](experiments/issue116-admission.md), including
 the workload differences and limits of those checks.
+
+**Resolved 2026-10-22.** A second field report (one Spark, Qwen3.8-Flash-Next
+NVFP4, five opencode agents, 2026-10-21) measured the same effect at the
+rate level: under five active and four reading requests the adaptive limit
+read 128 tokens — one amount per pass shared by the readers, about 32 each —
+and prompt cost was 1.9–2.4 ms a token against 0.78 idle; fixed 1,024/2,048
+budgets cut it to 1.01–1.08, the five-agent first-token p90 from 58–60 s to
+12–15 s, and aggregate generation rose from 36–46 to 52–56 tok/s, while the
+decoders running beside a probe's prefill went from 9.0 to 11.5 tok/s: the
+small chunks bought no decode responsiveness at the rate level (inter-token
+gaps were not recorded). The mechanism is the one named above, made exact:
+the controller charged the whole tick — the decoders' pass included — to the
+chunk's tokens. Growth is bounded at twice the last quantum, so a quantum
+grows only when its pass is under half the allowance; with decoders live,
+every quantum whose pass ran between 42.5 % and 85 % of the target was
+therefore an absorbing state, and one slow pass (a snapshot cut, a cold
+GEMM shape, a page-fault burst) walked the limit down the ladder for good.
+The controller now learns the decoders' own pass from ticks that only step,
+per decoder-load range, and charges a chunk only for what it adds; the target
+less that pass is the room for tokens (`PrefillLatencyController::observe_decode`,
+`scheduler.prefill_chunks.decode_pass_ms`). The per-reader overhead of a
+walk is still charged to the tokens, which keeps a far smaller band: the
+chunk's own cost must stay under half the room, and it does once the chunk
+is a few hundred tokens. A lone reader is charged no decoders' pass and keeps
+its idle floor.
+
+Measured the same day on one Spark with the one-node Qwen3.8-Flash-Next NVFP4
+template, 39K-token cold prompts, the binary before the change against the
+one after it (two trials each, `scripts/serve_admission_bench.py` and a
+four-reader probe). On the template as shipped (four slots, MTP depth 1,
+bf16 K/V) nothing moved: the prompt's first token 27.2–27.4 s beside one
+decoder before, 27.4–27.6 s after, the limit at 1024 both times, the decoder
+at 38 tok/s; three 13K prompts reading together beside one decoder 29.3–33.8 s
+before (limit 256–1024) and 26.3 s after (1024 throughout). On the field's shape (five slots, MTP depth 3, FP8 K/V, a bigger
+decoders' pass) the ratchet appeared and went away: four 39K prompts reading
+together beside one decoder took 252–267 s to their first tokens with the
+limit at 128–512 (median 256) and three decode-gap misses; after the change
+158–159 s, the limit at 512–1024 (median 512), no misses. One 39K prompt
+beside one decoder went from 39.8–45.7 s to 32.6–38.2 s (limit median 512 →
+1024, the decoder 45.8 → 49.6–50.7 tok/s), beside four decoders from
+44.6–44.7 s to 39.0–39.5 s (aggregate 72–73 → 79 tok/s, decode-gap misses
+4 → 0). Alone, 25.8–27.2 s both. The decoder beside four readers gets one
+verify per pass either way, so its own rate during their prefill is set by
+the pass length (1.7–2.0 tok/s here): the shared walk's trade, bounded by the
+decode-gap target, not something the controller can remove.
 
 ### Shared execution timing
 

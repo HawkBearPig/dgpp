@@ -373,6 +373,30 @@ bool RcLane::post_send_pair(BusPool pool, uint32_t slot, uint32_t seq,
   return true;
 }
 
+bool RcLane::post_write(BusPool pool, const void* local, uint32_t lkey,
+                        uint32_t len, uint64_t remote_addr, uint32_t rkey,
+                        bool signaled, std::string* error) {
+  ibv_qp* qp = qp_[pool == BusPool::kLatency ? 0 : 1];
+  ibv_sge sge{};
+  sge.addr = reinterpret_cast<uint64_t>(local);
+  sge.lkey = lkey;
+  sge.length = len;
+  ibv_send_wr wr{};
+  wr.wr_id = bus_wr_id(pool, BusWr::kWrite, 0);
+  wr.sg_list = &sge;
+  wr.num_sge = 1;
+  wr.opcode = IBV_WR_RDMA_WRITE;
+  wr.send_flags = signaled ? IBV_SEND_SIGNALED : 0;
+  wr.wr.rdma.remote_addr = remote_addr;
+  wr.wr.rdma.rkey = rkey;
+  ibv_send_wr* bad = nullptr;
+  if (ibv_post_send(qp, &wr, &bad) != 0) {
+    *error = "row WRITE post failed errno=" + std::to_string(errno);
+    return false;
+  }
+  return true;
+}
+
 bool RcLane::post_credit_write(BusPool pool, uint32_t slot, uint32_t seq,
                                const BusLaneEndpoint& peer, uint64_t hash,
                                std::string* error) {

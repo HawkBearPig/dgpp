@@ -8,18 +8,13 @@
 #include <string>
 #include <vector>
 
+#include "../common/temp_dir.hpp"
 #include "common/test.hpp"
 #include "models/glm/trace.hpp"
 
 namespace {
 
-namespace fs = std::filesystem;
 using dgpp::GlmRouteTraceLayer;
-
-fs::path temp_path(const char* name) {
-  fs::path p = fs::temp_directory_path() / name;
-  return p;
-}
 
 void require(bool cond, const std::string& what) {
   if (!cond) throw std::runtime_error(what);
@@ -38,7 +33,8 @@ std::vector<GlmRouteTraceLayer> sample_trace() {
 }  // namespace
 
 DGPP_TEST(glm_trace_roundtrip_write_read) {
-  const auto path = temp_path("dgpp_glm_trace_rt.bin");
+  const dgpp::test::TempDir fixture("dgpp_glm_trace");
+  const auto path = fixture.path() / "dgpp_glm_trace_rt.bin";
   const auto layers = sample_trace();
   dgpp::glm_trace_write(path.string(), layers);
   const auto back = dgpp::glm_trace_read(path.string());
@@ -47,14 +43,15 @@ DGPP_TEST(glm_trace_roundtrip_write_read) {
           "header roundtrip");
   require(back[0].ids == layers[0].ids, "ids roundtrip");
   require(back[0].weights == layers[0].weights, "weights roundtrip");
-  fs::remove(path);
+  std::filesystem::remove(path);
 }
 
 DGPP_TEST(glm_trace_writer_pins_the_golden_bytes) {
   // Byte-for-byte the same record the python reader test parses. If this
   // assertion fails, the C++ writer changed the format; if the python one
   // fails, the reader did. They must fail together or not at all.
-  const auto path = temp_path("dgpp_glm_trace_golden.bin");
+  const dgpp::test::TempDir fixture("dgpp_glm_trace");
+  const auto path = fixture.path() / "dgpp_glm_trace_golden.bin";
   dgpp::glm_trace_write(path.string(), sample_trace());
 
   const uint8_t want[] = {
@@ -77,14 +74,15 @@ DGPP_TEST(glm_trace_writer_pins_the_golden_bytes) {
   uint8_t got[sizeof(want)];
   const size_t n = std::fread(got, 1, sizeof(got), f);
   std::fclose(f);
-  fs::remove(path);
+  std::filesystem::remove(path);
   require(n == sizeof(want), "golden size");
   require(std::memcmp(got, want, sizeof(want)) == 0,
           "golden bytes: format drift between C++ writer and spec");
 }
 
 DGPP_TEST(glm_trace_rejects_corruption) {
-  const auto path = temp_path("dgpp_glm_trace_bad.bin");
+  const dgpp::test::TempDir fixture("dgpp_glm_trace");
+  const auto path = fixture.path() / "dgpp_glm_trace_bad.bin";
   dgpp::glm_trace_write(path.string(), sample_trace());
 
   // Truncated file.
@@ -118,5 +116,5 @@ DGPP_TEST(glm_trace_rejects_corruption) {
     }
     require(threw, "bad magic rejected");
   }
-  fs::remove(path);
+  std::filesystem::remove(path);
 }

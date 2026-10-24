@@ -186,6 +186,46 @@ DGPP_TEST(qwen35_binding_validates_a_complete_map) {
   require(!rep_dtype.ok() && rep_dtype.dtype_mismatch == 1, "dtype mismatch fails");
 }
 
+DGPP_TEST(qwen35_binding_counts_the_release_visual_tower) {
+  // The 333 model.visual.* BF16 tensors of unsloth/Qwen3.8-27B-NVFP4, shapes
+  // read off the checkpoint's safetensors headers: counted as vision, never
+  // unexpected, otherwise untouched.
+  const auto c = cfg();
+  auto present = present_map(dgpp::qwen35_expected_text_tensors(c));
+  using dgpp::DType;
+  auto add = [&](const std::string& n, std::vector<int64_t> s) {
+    present.emplace(n, dgpp::QwenTensorDesc{DType::BF16, std::move(s)});
+  };
+  add("model.visual.patch_embed.proj.weight", {1152, 3, 2, 16, 16});
+  add("model.visual.patch_embed.proj.bias", {1152});
+  add("model.visual.pos_embed.weight", {2304, 1152});
+  for (int b = 0; b < 27; ++b) {
+    const std::string p = "model.visual.blocks." + std::to_string(b) + ".";
+    add(p + "attn.qkv.weight", {3456, 1152});
+    add(p + "attn.qkv.bias", {3456});
+    add(p + "attn.proj.weight", {1152, 1152});
+    add(p + "attn.proj.bias", {1152});
+    add(p + "mlp.linear_fc1.weight", {4304, 1152});
+    add(p + "mlp.linear_fc1.bias", {4304});
+    add(p + "mlp.linear_fc2.weight", {1152, 4304});
+    add(p + "mlp.linear_fc2.bias", {1152});
+    add(p + "norm1.weight", {1152});
+    add(p + "norm1.bias", {1152});
+    add(p + "norm2.weight", {1152});
+    add(p + "norm2.bias", {1152});
+  }
+  add("model.visual.merger.norm.weight", {1152});
+  add("model.visual.merger.norm.bias", {1152});
+  add("model.visual.merger.linear_fc1.weight", {4608, 4608});
+  add("model.visual.merger.linear_fc1.bias", {4608});
+  add("model.visual.merger.linear_fc2.weight", {5120, 4608});
+  add("model.visual.merger.linear_fc2.bias", {5120});
+  const auto rep = dgpp::qwen35_validate_text_binding(c, present);
+  require(rep.ok(), "complete map plus tower validates");
+  require(rep.vision == 333, "all tower tensors counted");
+  require(rep.unexpected == 0, "nothing unexpected");
+}
+
 DGPP_TEST(qwen35_binding_tp_geometry) {
   const auto c = cfg();
   dgpp::qwen35_tp_validate_geometry(c, 0, 1);
@@ -197,4 +237,42 @@ DGPP_TEST(qwen35_binding_tp_geometry) {
     threw = true;
   }
   require(threw, "world 3 must fail (intermediate 17408 % 3)");
+}
+
+DGPP_TEST(qwen35_binding_moe_modelopt_table) {
+  // The 122B MoE table: router/shared BF16, routed experts ModelOpt NVFP4
+  // (backbone), MTP experts BF16, attention/GDN BF16, no kv scales.
+  const std::string text = qwen35_fixture::moe_text_json();
+  const std::string quant = qwen35_fixture::kQuantModeloptNvfp4;
+  const auto t = dgpp::minijson::parse(text);
+  const auto q = dgpp::minijson::parse(quant);
+  const auto c = dgpp::Qwen35TextConfig::parse(t.root, &q.root);
+  const auto v = dgpp::qwen35_expected_layer_tensors(c, 0);
+  using dgpp::DType;
+  require_shape(v, "model.language_model.layers.0.mlp.gate.weight", DType::BF16, {256, 3072});
+  require_shape(v, "model.language_model.layers.0.mlp.shared_expert_gate.weight", DType::BF16,
+                {1, 3072});
+  require_shape(v, "model.language_model.layers.0.mlp.shared_expert.gate_proj.weight",
+                DType::BF16, {1024, 3072});
+  require_shape(v, "model.language_model.layers.0.mlp.experts.0.gate_proj.weight", DType::U8,
+                {1024, 1536});
+  require_shape(v, "model.language_model.layers.0.mlp.experts.0.gate_proj.weight_scale",
+                DType::F8_E4M3, {1024, 192});
+  require_shape(v, "model.language_model.layers.0.mlp.experts.0.gate_proj.weight_scale_2",
+                DType::F32, {});
+  require_shape(v, "model.language_model.layers.0.mlp.experts.0.gate_proj.input_scale",
+                DType::F32, {});
+  require_shape(v, "model.language_model.layers.0.mlp.experts.0.down_proj.weight", DType::U8,
+                {3072, 512});
+  const auto full = dgpp::qwen35_expected_layer_tensors(c, 3);
+  require_shape(full, "model.language_model.layers.3.self_attn.q_proj.weight", DType::BF16,
+                {16384, 3072});
+  require(find(full, "model.language_model.layers.3.self_attn.k_scale") == nullptr,
+           "no kv scales in the MoE release");
+  const auto mtp = dgpp::qwen35_expected_layer_tensors(c, 48);
+  require_shape(mtp, "mtp.layers.0.mlp.experts.0.gate_proj.weight", DType::BF16,
+                {1024, 3072});
+  auto present = present_map(dgpp::qwen35_expected_text_tensors(c));
+  const auto rep = dgpp::qwen35_validate_text_binding(c, present);
+  require(rep.ok(), "complete MoE map validates");
 }

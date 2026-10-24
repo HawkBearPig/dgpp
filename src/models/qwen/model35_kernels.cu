@@ -1,5 +1,6 @@
 // Qwen3.5 dense SwiGLU kernel (CUDA TU: __global__ cannot live in model35.cpp).
 #include <cstdint>
+#include "kernels/pdl.cuh"
 
 #include "common/cuda_check.hpp"
 #include "common/dtypes.hpp"
@@ -8,6 +9,7 @@
 // a single bf16 rounding at the store (the gate_act convention).
 __global__ void qwen35_swiglu_kernel(const uint16_t* __restrict__ gate, const uint16_t* __restrict__ up,
                                      uint16_t* __restrict__ out, int64_t n) {
+  dgpp_pdl_wait();
   const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (i >= n) return;
   const float g = dgpp::bf16_bits_to_float(gate[i]);
@@ -34,6 +36,7 @@ __global__ void qwen35_mtp_concat_kernel(const uint16_t* __restrict__ e,
                                          const uint16_t* __restrict__ h,
                                          uint16_t* __restrict__ out, int64_t rows,
                                          int64_t hidden) {
+  dgpp_pdl_wait();
   const int64_t i =
       static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   const int64_t n = rows * hidden * 2;
@@ -50,6 +53,23 @@ void qwen35_mtp_concat_bf16(const uint16_t* e, const uint16_t* h, uint16_t* out,
   const uint64_t n = static_cast<uint64_t>(rows) * static_cast<uint64_t>(hidden) * 2;
   const int blocks = static_cast<int>((n + kThreads - 1) / kThreads);
   qwen35_mtp_concat_kernel<<<blocks, kThreads, 0, stream>>>(e, h, out, rows, hidden);
+  DGPP_CUDA_OK(cudaGetLastError());
+}
+
+__global__ void df1_collect_top1_kernel(const int32_t* __restrict__ ids, int stride,
+                                        int32_t* __restrict__ tok, int n) {
+  dgpp_pdl_wait();
+  const int j = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (j >= n) return;
+  tok[j] = ids[(static_cast<int64_t>(j) + 1) * stride];
+}
+
+void df1_collect_top1(const int32_t* ids, int stride, int32_t* tok, int n,
+                      cudaStream_t stream) {
+  if (n <= 0) return;
+  constexpr int kThreads = 32;
+  const int blocks = (n + kThreads - 1) / kThreads;
+  df1_collect_top1_kernel<<<blocks, kThreads, 0, stream>>>(ids, stride, tok, n);
   DGPP_CUDA_OK(cudaGetLastError());
 }
 

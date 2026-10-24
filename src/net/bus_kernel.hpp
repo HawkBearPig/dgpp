@@ -34,6 +34,10 @@ struct BusRecvView {
   int bulk_slots = 0;
   uint32_t lat_slot_bytes = 0;
   uint32_t bulk_slot_bytes = 0;
+  // The write ring this peer's collective rows land in (bus_types.hpp):
+  // kBusWriteRing rows of write_row_bytes.
+  const uint8_t* write_ring = nullptr;
+  uint32_t write_row_bytes = 0;
 };
 
 // Shared-memory cell budget for the consumer's per-slot last-seen table.
@@ -142,11 +146,20 @@ struct alignas(64) BusAllReduceCtl {
   uint64_t gt_done = 0;
   uint64_t gt_claim[kBusMaxPeers] = {};  // per peer (peer index), gated
   // Graph/stream snapshot's placement hash, published before ready_bits.
-  // Fits the final eight bytes of this cell's existing three cache lines.
+  // Fits the final eight bytes of this cell's first three cache lines.
   uint64_t stage_hash = 0;
+  // The write transport's landing stamps (2026-10-19): block 0's first
+  // proof of a chunk of peer p (its row has landed) — the handshake splits
+  // into staged -> landed (the sender, the fabric) and landed -> proved.
+  uint64_t gt_landed[kBusMaxPeers] = {};
+  // The first block to finish peer p (bitwise negated, the engine's fill
+  // from the block records): the spread to gt_claim[p], the last block,
+  // separates a straggler from uniformly slow proving.
+  uint64_t gt_claim_first_neg[kBusMaxPeers] = {};
+  uint64_t reserved_[2] = {};
 };
-static_assert(sizeof(BusAllReduceCtl) == 192,
-              "BusAllReduceCtl occupies exactly three cache lines");
+static_assert(sizeof(BusAllReduceCtl) == 256,
+              "BusAllReduceCtl occupies exactly four cache lines");
 
 // Everything the kernel needs, built by the engine at claim time.
 struct BusAllReduceView {
@@ -211,7 +224,7 @@ constexpr int kBusMaxGraphGens = 256;       // recorded nodes per graph
 // select one per replay (for example one scalar graph per request slot plus
 // the full row batch). Each variant owns a disjoint generation-cell set;
 // windows still execute strictly one at a time.
-constexpr int kBusMaxGraphVariants = 128;  // two per slot and two per batch family, per verify depth (64 from 2026-09-14: six slots with four families at three scheduled depths need 60; 128 since 2026-10-02: the same recipe at all five depths of a DSpark block needs 100 — the two depths the budget dropped were 1.5 % of a sampled stream)
+constexpr int kBusMaxGraphVariants = 256;  // two per slot and two per batch family, per verify depth (64 from 2026-09-14: six slots with four families at three scheduled depths need 60; 128 since 2026-10-02: the same recipe at all five depths of a DSpark block needs 100 — the two depths the budget dropped were 1.5 % of a sampled stream; 256 since 2026-10-23: sixteen DSpark slots with eight families kept only two of the three scheduled depths at 128 — code and prose paid a fifth row at C1, +2 ms a step — and need 150 for three, 250 for all five)
 // Replay windows armed at once (2026-09-06, the pipelined replay): the
 // engine arms the next replay's window while the previous replay is still
 // running, on a DIFFERENT variant (a variant's cells are in flight until
@@ -220,6 +233,10 @@ constexpr int kBusMaxGraphVariants = 128;  // two per slot and two per batch fam
 constexpr int kBusMaxLiveWindows = 2;
 constexpr int kBusWindowRing = 4;
 constexpr int kBusMaxGraphStageRing = 8;    // staging rows (kStageRing)
+// The write kernel indexes its staging row and the peers' ring rows by the
+// same (gen - 1) % kBusWriteRing — the two rings move together.
+static_assert(static_cast<int>(kBusWriteRing) == kBusMaxGraphStageRing,
+              "the write ring and the staging ring index by one rotation");
 // The stream collectives' cell ring (2026-09-14, plan D9: the eager fold
 // launched on the model's stream in the graph kernel form): generations in
 // flight between the forward thread's issue and the engine's walk — a
@@ -253,6 +270,59 @@ cudaError_t launch_bus_allreduce_graph(const BusAllReduceGraphView& v,
                                        BusAllReduceCtl* cell,
                                        uint64_t deadline_cycles,
                                        cudaStream_t stream);
+
+// ---- the one-sided latency transport (2026-10-19) ---------------------------
+//
+// The graph node's twin over the write ring (bus_types.hpp): a grid of
+// bus_write_blocks(chunks) blocks whose warps each own chunks of the row.
+// Phase 1 lays the source out as self-describing chunks in the
+// generation's staging row (the engine's RDMA WRITE source); each block
+// fences once and sets its own bit in ready_bits — the engine posts when
+// every block's bit is up. Phase 2: every warp polls its own chunks, all
+// peers' copies in flight at once (the poll is the data read), proves
+// each by its trailer, folds in canonical rank order and writes the
+// result. No door cells, no claim rounds, no acks, no credits, and no
+// global coordination at all: beside the L2 prefetch window a dependent
+// memory round trip costs 1-8 us, and one SM cannot keep enough system
+// loads in flight at that latency, so the parallelism is the grid, the
+// coordination is shared memory, and each block reports to the engine
+// through its own pinned record. The chain per element is block_fold_vectors' (bf16
+// in, fp32 accumulation in rank order, one rounding), so the result is
+// bitwise the eager machine's. The cell's stamps keep the timeline's
+// meaning: gt_stage = the last block's row staged, gt_first/gt_last = the
+// first/last peer whose every chunk proved, gt_done = the fold written.
+
+// `recs` is this node's pinned per-block record array (kBusWriteMaxBlocks
+// entries): block b stages its chunks, fences and stores ready = gen; it
+// proves and folds, fences and stores done = gen with its status and
+// stamps. The engine posts when every block's ready carries the
+// generation and completes the generation when every block's done does
+// (it fills the cell's stamps from the records) — no atomics, no last
+// block, nothing a block waits on but the peers' rows.
+struct alignas(64) BusWriteBlockRecord {
+  uint32_t ready = 0;   // the generation whose row this block staged
+  uint32_t done = 0;    // the generation this block finished
+  uint32_t status = 0;  // 0 = folded, 1 = deadline/poison exit
+  uint32_t pad = 0;
+  uint64_t gt_stage = 0;
+  uint64_t gt_done = 0;
+  uint64_t gt_peer[kBusMaxPeers] = {};  // this block's last chunk of peer p proved
+  uint64_t pad2 = 0;
+};
+static_assert(sizeof(BusWriteBlockRecord) == 64, "one line");
+
+cudaError_t launch_bus_allreduce_write(const BusAllReduceGraphView& v,
+                                       int my_rank, const __nv_bfloat16* src,
+                                       __nv_bfloat16* dst, uint32_t elems,
+                                       BusAllReduceCtl* cell,
+                                       BusWriteBlockRecord* recs,
+                                       uint64_t deadline_cycles,
+                                       cudaStream_t stream);
+
+// The host mirror of a chunk's trailer hash: over the 31 data lanes' 496
+// bytes (as laid out in the row) and the (generation, chunk) pair — the
+// tests pin the row format with it.
+uint64_t bus_write_chunk_hash(uint32_t gen, uint32_t chunk, const void* lanes496);
 
 // ---- segment-quantized reduce-scatter/allgather (the prefill class) ------
 //

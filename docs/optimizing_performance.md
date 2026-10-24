@@ -48,8 +48,8 @@ Rules that keep the numbers comparable:
 | key | moves | trades |
 |---|---|---|
 | `engine.kv_capacity` | the shared token capacity of the KV pool | memory; the startup memory plan (`dgpp-serve --memory-plan`) says what fits before anything is allocated |
-| `engine.kv_dtype` (GLM-5.3 family, MiMo, Qwen3.5 mixed releases) | KV bytes per token: `bf16`, `fp8`, and GLM-only `fp4` | the quantized forms change the model's answers; `bf16` is the exact one. On the Qwen3.8-27B NVFP4 release `fp8` is the release's own `kv_cache_scheme` (its shipped per-layer scales), halves the Full layers' pool and cuts long-context decode (262K: 188 -> 156 ms a pass); with the attention math kept in bf16 the cold prefill is slower (316 -> 352 s at 262K: the codes widened in shared memory) — see `engine.prefill_attention` |
-| `engine.prefill_attention` (Qwen3.5 mixed releases on `kv_dtype: "fp8"`) | the prefill attention's arithmetic over the fp8 K/V pool: `bf16` (the widened codes) or `fp8` (Q and the probabilities in e4m3 on the fp8 tensor cores) | `fp8` is the fast long prefill (262K cold prefill 242 s against 352 in bf16 over the same pool, the same decode); it adds a small deviation beyond the cache's own, measured at the bf16 cache's run-to-run floor in the [model card](model_cards/Qwen3.8-27B-NVFP4.md) |
+| `engine.kv_dtype` (GLM-5.3 family, MiMo, Qwen3.5 releases) | KV bytes per token: `bf16`, `fp8`, and GLM-only `fp4` | the quantized forms change the model's answers; `bf16` is the exact one. On the Qwen3.8-27B NVFP4 release `fp8` is the release's own `kv_cache_scheme` (its shipped per-layer scales), halves the Full layers' pool and cuts long-context decode (262K: 188 -> 156 ms a pass); with the attention math kept in bf16 the cold prefill is slower (316 -> 352 s at 262K: the codes widened in shared memory) — see `engine.prefill_attention`. On the FP8 release (no shipped scales: unit scales, 2026-10-18) the same shape: decode at 256K 216 -> 181 ms a pass, cold prefill 395 -> 434 s under bf16 arithmetic and 325 with the fp8 attention, the suite at the bf16 floor |
+| `engine.prefill_attention` (Qwen3.5 releases on `kv_dtype: "fp8"`) | the prefill attention's arithmetic over the fp8 K/V pool: `bf16` (the widened codes) or `fp8` (Q and the probabilities in e4m3 on the fp8 tensor cores) | `fp8` is the fast long prefill (262K cold prefill 242 s against 352 in bf16 over the same pool, the same decode); it adds a small deviation beyond the cache's own, measured at the bf16 cache's run-to-run floor in the [model card](model_cards/Qwen3.8-27B-NVFP4.md) |
 | `engine.bf16_weights` | the resident form of the BF16 matrices decode streams: `checkpoint`, `bf12`, `bf12+bf16` | `bf12` is lossless (the kernels rebuild the exact bits) and both faster and smaller for decode; `bf12` alone slows a prefill chunk slightly, `bf12+bf16` keeps prefill on the BF16 bytes for 0.75 of those matrices' memory more |
 | `engine.dense_weights` (Qwen) | the dense stack's storage: the checkpoint's BF16 or block-FP8 encoded at load | FP8 saves memory and decode bytes; it is a quantization of the dense projections, measured per template in the quality rows |
 | `engine.ngram_table` (Qwen) | the n-gram table resident or mmap'ed from local NVMe | mmap saves its memory; the rows a chunk needs come through the page cache, gathered a chunk ahead |
@@ -72,7 +72,7 @@ Rules that keep the numbers comparable:
 | key | moves | trades |
 |---|---|---|
 | `engine.prefill_budget_tokens`, `engine.prefill_idle_budget_tokens` | shared reader-work policy for all serving families | automatic budgets learn pass cost; explicit positive values cap work. Smaller chunks yield sooner but repeat model walks. The idle ceiling is bounded by native capacity |
-| `engine.decode_gap_target_ms`, `engine.first_token_target_ms` | soft decode-gap and arrival-to-first-token objectives, 1000 ms and 3000 ms respectively by default | tighter targets can reduce throughput; running chunks, long prompts and slot/KV pressure can exceed them. Both zero select fixed budgeting |
+| `engine.decode_gap_target_ms`, `engine.first_token_target_ms` | soft decode-gap and arrival-to-first-token objectives, 1000 ms and 3000 ms respectively by default | tighter targets can reduce throughput; running chunks, long prompts and slot/KV pressure can exceed them. Both zero select fixed budgeting. On the mixed-prefill families the busy budget and the adaptive limit are one amount per pass shared by every reader, not per prompt. Until 2026-10-22 the controller charged the decoders' own pass to the chunk and could settle at 128 tokens beside several readers (a five-agent field deployment on one Spark read a 58–60 s first-token p90 against 12–15 s with fixed 1,024/2,048 budgets); it now learns that pass and charges the chunk only for what it adds |
 | `engine.admission`, `engine.admission_window` | when and how much KV space a request reserves | `full` reserves prompt plus requested output; `grow` reserves incrementally and can shed a request on exhaustion. These settings do not select prefill grouping |
 | `engine.prefill_group` | grouping compatible cold prompts into shared execution | amortizes model walks; batch geometry can change floating-point rounding |
 | `engine.prefill` (DeepSeek) | `bounded` (the model's own recipe) or `exact` | about half the prefill work against parity with the full walk |
@@ -136,7 +136,7 @@ capacity: the GLM/MiMo examples retain 2,048 and Qwen/DeepSeek retain 4,096.
 | --- | --- | --- |
 | Automatic defaults | The four fields above, or omit them | Learn chunk sizes within native capacity. |
 | More frequent decode opportunities | Automatic budgets, `decode_gap_target_ms: 500` | Aim for shorter output gaps; additional passes can reduce throughput. This is a tuning example, not a universal optimum. |
-| Adaptive with explicit caps | `prefill_budget_tokens: 256`, `prefill_idle_budget_tokens: 2048`, retain latency targets | Keep configured work limits while allowing the controller to select smaller chunks. |
+| Adaptive with explicit caps | `prefill_budget_tokens: 256`, `prefill_idle_budget_tokens: 2048`, retain latency targets | Keep configured work limits while allowing the controller to select smaller chunks. The caps bound the controller from above only: this exact configuration under five concurrent coding agents on one Spark produced the 58–60 s first-token p90 above (before the 2026-10-22 controller fix). For several concurrent long-prompt sessions, fixed budgets remain the measured configuration. |
 | Fixed budgets | Positive busy/idle budgets, `decode_gap_target_ms: 0`, `first_token_target_ms: 0` | Disable adaptive resizing while retaining shared execution and early admission. Equal busy/idle values avoid the larger idle allowance. |
 | Monolithic admission | `prefill_budget_tokens: 0` | Disable budgeted interleaving during admission; internal model and snapshot boundaries still apply. |
 
@@ -155,7 +155,12 @@ Tune in this order:
    bounds accepted backlog; increasing it does not create compute capacity.
 2. Choose acceptable first-token waits and output gaps. Begin with automatic
    defaults, then vary one target or cap at a time. Smaller chunks can help
-   another stream while delaying the long prompt's own first token.
+   another stream while delaying the long prompt's own first token. For
+   several concurrent agent sessions with long prompts, compare the defaults
+   against fixed budgets (`prefill_budget_tokens: 1024`,
+   `prefill_idle_budget_tokens: 2048`, both targets 0) on the deployment:
+   the field evidence for that load is fixed budgets, and the busy budget is
+   shared by every reader in a pass.
 3. Compare fixed-work mixed loads using `scripts/serve_admission_bench.py`,
    including cold starts, steady traffic, arrivals, cancellation and recovery.
    Measure elapsed time and latency distributions alongside throughput.

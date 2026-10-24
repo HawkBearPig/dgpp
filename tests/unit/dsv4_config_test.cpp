@@ -170,9 +170,10 @@ DGPP_TEST(dsv4_architecture_registry_dispatches) {
 DGPP_TEST(dsv4_config_reads_the_landed_checkpoint) {
   namespace fs = std::filesystem;
   const char* home = std::getenv("HOME");
-  if (!home) return;
+  if (!home) dgpp::test::skip("HOME is unset; checkpoint cache unavailable");
   const fs::path root = fs::path(home) / ".cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4-Flash-0731/snapshots";
-  if (!fs::is_directory(root)) return;
+  if (!fs::is_directory(root))
+    dgpp::test::skip("checkpoint snapshot directory absent: " + root.string());
   for (const auto& snap : fs::directory_iterator(root)) {
     const fs::path cfg = snap.path() / "config.json";
     if (!fs::exists(cfg)) continue;
@@ -182,4 +183,5 @@ DGPP_TEST(dsv4_config_reads_the_landed_checkpoint) {
     require(c.num_caches() == 41 && c.num_index_caches() == 21 && c.num_hash_layers == 3, "landed schedule");
     return;
   }
+  dgpp::test::skip("no eligible checkpoint config under " + root.string());
 }

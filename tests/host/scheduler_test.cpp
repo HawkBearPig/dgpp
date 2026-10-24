@@ -4907,6 +4907,87 @@ DGPP_TEST(prefill_latency_controller_keys_cost_by_context_and_floors_idle_quanta
   require(!tuning.valid(), "a negative floor has no interpretation");
 }
 
+DGPP_TEST(prefill_latency_controller_charges_the_chunk_only_for_what_it_adds) {
+  // Five decoders step in 400 ms, a chunk adds 0.5 ms a token, the decode-gap
+  // target is 1000 ms: 850 ms of allowance, 450 ms of it left for tokens.
+  dgpp::sched::PrefillLatencyController charged;
+  charged.observe(5, 0, 128, 128, 464);
+  require(charged.limit(5, 0, 1000, 256, 4096, 16, 0, 0) == 128,
+          "charged for the decoders' pass, a 128-token chunk (464 ms: 3.6 ms a token) is an absorbing state");
+  dgpp::sched::PrefillLatencyController c;
+  c.observe_decode(5, 400);
+  require(c.decode_pass(5) == 400 && c.decode_pass(8) == 400 && c.decode_pass(2) == 400 && c.decode_pass(0) == 0,
+          "an unmeasured load borrows the nearest measured pass; no decoders, no pass");
+  c.observe(5, 0, 128, 128, 464);
+  require(c.limit(5, 0, 1000, 256, 4096, 16, 0, 0) == 256,
+          "net of the decoders' pass the chunk costs 0.5 ms a token; growth stays bounded at twice the quantum");
+  c.observe(5, 0, 256, 256, 528);
+  require(c.limit(5, 0, 1000, 256, 4096, 16, 0, 0) == 512, "the ladder climbs");
+  c.observe(5, 0, 512, 512, 656);
+  require(c.limit(5, 0, 1000, 256, 4096, 16, 0, 0) == 512, "450 ms of room at 0.5 ms a token holds 512 tokens, not 1024");
+  require(c.limit(0, 0, 3000, 256, 4096, 16, 0, 0) == 1024,
+          "a lone reader is charged no decoders' pass: the first-token allowance at the borrowed rate, growth-bounded");
+  c.observe_decode(5, 100);
+  require(c.limit(5, 0, 1000, 256, 4096, 16, 0, 0) == 1024, "a cheaper decoders' pass widens the room at once");
+  c.observe_decode(5, 800);
+  require(c.limit(5, 0, 1000, 256, 4096, 16, 0, 0) == 1024,
+          "a dearer one is learned gradually (275 ms after one observation; 800 at once would leave 64)");
+  dgpp::sched::PrefillLatencyController alone;
+  alone.observe_decode(1, 900);
+  alone.observe(1, 0, 256, 256, 1000);
+  require(alone.limit(1, 0, 1000, 256, 4096, 16, 0, 0) == 16,
+          "decoders that alone miss the target leave the chunk at the alignment");
+  alone.observe_decode(1, -1);
+  alone.observe_decode(0, 50);
+  require(alone.decode_pass(1) == 900, "no pass is learned from a bad duration or from no decoders");
+}
+
+DGPP_TEST(scheduler_learns_the_decoders_pass_from_decode_only_ticks) {
+  // The engine steps in 30 ms and a chunk adds 20 ms: under a 100 ms decode-gap
+  // target the whole 50 ms pass charged to 256 tokens (0.2 ms a token) holds
+  // the limit at 256; charged only its own 20 ms (0.08) it may double.
+  struct MixedEngine : AdmissionFairEngine {
+    bool can_mix_prefill(int, const std::vector<int>& reqs) const override { return !reqs.empty(); }
+    std::vector<std::vector<int32_t>> step_batch(const std::vector<int>& reqs) override {
+      std::this_thread::sleep_for(std::chrono::milliseconds(30));
+      return AdmissionFairEngine::step_batch(reqs);
+    }
+    MixedProgress advance_prefill_and_step(int req, int64_t budget, const std::vector<int>& reqs) override {
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+      MixedProgress result;
+      result.prefill = advance_prefill(req, budget);
+      result.decoded = step_batch(reqs);
+      return result;
+    }
+  } engine;
+  engine.arm(0, std::vector<int32_t>(16, 10), 16);
+  engine.arm(1, std::vector<int32_t>(2, 20), 2);
+  dgpp::sched::AdmissionPolicy policy;
+  policy.prefill_early_admission = true;
+  policy.prefill_budget_tokens = 256;
+  policy.prefill_idle_budget_tokens = 2048;
+  policy.prefill_budget_automatic = true;
+  policy.decode_gap_target_ms = 100;
+  Scheduler sched(&engine, {}, 0, policy);
+  sched.submit(make_request("decoder", 5, 16));
+  sched.tick();
+  require(sched.meters().prefill_decode_pass_ms == 0, "a tick that admitted is not a decode-only tick");
+  sched.tick();
+  const double learned = sched.meters().prefill_decode_pass_ms;
+  require(learned >= 30 && learned < 45, "a decode-only tick teaches the controller the decoders' pass");
+  sched.submit(make_request("reader", 600, 2));
+  require(sched.next_prefill_budget() == 256, "the first chunk beside a decoder is the busy budget");
+  sched.tick();
+  require(sched.meters().prefilling == 1, "the reader is in flight after its first chunk");
+  require(sched.meters().prefill_decode_pass_ms == learned, "a mixed tick does not retrain the decoders' pass");
+  require(sched.next_prefill_budget() == 512,
+          "the chunk is charged what it added (20 ms), not the decoders' 30 ms: the limit doubles");
+  sched.cancel("decoder");
+  sched.cancel("reader");
+  sched.tick();
+  require(!sched.has_pending() && engine.pool_blocks_in_use() == 0, "the readers release their resources");
+}
+
 DGPP_TEST(scheduler_adaptive_short_group_does_not_replace_full_quantum_estimate) {
   struct GroupEngine : AdmissionFairEngine {
     bool prefill_group_advance() const override { return true; }

@@ -1,8 +1,7 @@
-# Performance improvement plan from the DGX Spark comparison
+# Performance improvement plan
 
 Analysis date: 2026-09-15. Code reviewed at `3c537b6`.
-Baseline: [dgpp-benchmark-comparison.md](../dgpp-benchmark-comparison.md),
-the dated measurements, deployment templates, and the implementation.
+Baseline: the dated measurements, deployment templates, and the implementation.
 The analysis below describes that baseline. Implementation now includes
 the measurement tools, Qwen's 16-row decode path, fitting batch families,
 and opt-in Qwen prefill continuation. Sections 1–9 retain the
@@ -50,17 +49,15 @@ The most actionable gaps are:
    placement. Establish those deployment variants before attributing the
    entire gap to kernels or drafting.
 
-## 1. What the comparison establishes—and what has already changed
+## 1. What the baseline establishes—and what has already changed
 
-Use forum results to choose experiments, with matched workloads deciding
-whether a change succeeds. Different concurrency, context, quantization,
-thinking settings, prompt classes, and timing definitions are material.
-The original forum pages were not retrievable during this review; their
-figures remain attributed to the supplied comparison. Primary drafter
-sources and deployment authors' repositories were checked separately.
+Matched workloads decide whether a change succeeds: different
+concurrency, context, quantization, thinking settings, prompt classes and
+timing definitions are material, so every target below names its workload
+and timing scope.
 
-Several statements in the comparison and older planning documents need
-qualification against current code:
+Several statements in older planning documents need qualification against
+current code:
 
 | Area | Current evidence | Planning consequence |
 |---|---|---|
@@ -70,7 +67,7 @@ qualification against current code:
 | Qwen batch support | Runtime-sized session state and `kBatchedDraftChain = true` already exist; the serving cap is eight rows and some leaf kernels still enforce it | A bounded widening project, not a fresh batched-MTP implementation |
 | GLM-Flash batch support | Its separate model fixes scratch at `kDecodeRows = 8` and declares `kBatchedDraftChain = false` | Requires state/scratch generalization plus a batched chain |
 | Other families | GLM-4.7 supports up to 32 rows; full GLM supports 16; DeepSeek supports 32 | Run capacity/depth experiments on these paths now, subject to memory and graph limits |
-| DeepSeek C6 | [Measurements](measurements.md) record 106.4 tok/s after group prefill, versus 131.86 from the recipe's own benchmark | The closest recorded target requires about 24% improvement; the forum's 214 figure is a separate reproduction target |
+| DeepSeek C6 | [Measurements](measurements.md) record 106.4 tok/s after group prefill | The six-stream cell is the family's aggregate target; its step is DRAM-bound on the expert bytes, so the lever is the expert reads per step |
 
 The four-slot restriction is conditional: eight plain-decode requests fit
 an eight-row model, whereas four requests with one draft consume all eight
@@ -339,8 +336,6 @@ verification rows and depth distributions alongside acceptance.
 
 "K7" is a depth setting: seven drafts plus the pending/anchor token form
 eight target verification rows. It is not a separate drafting algorithm.
-The [GLM-Flash deployment author's recipe](https://github.com/tonyd2wild/GLM-5.3-Flash-NVFP4-DFlash2-2x-DGX-Spark/blob/main/docs/DFLASH2-SPECULATIVE-DECODING.md)
-uses exactly this interpretation.
 
 A compatible [GLM-5.3-Flash DFlash2 checkpoint](https://huggingface.co/incoai/GLM-5.3-Flash-DFlash2)
 exists. Its [configuration](https://huggingface.co/incoai/GLM-5.3-Flash-DFlash2/blob/main/config.json)

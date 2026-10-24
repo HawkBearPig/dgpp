@@ -139,9 +139,10 @@ DGPP_TEST(glm4_architecture_registry_dispatches) {
 DGPP_TEST(glm4_config_reads_the_landed_checkpoint) {
   namespace fs = std::filesystem;
   const char* home = std::getenv("HOME");
-  if (!home) return;
+  if (!home) dgpp::test::skip("HOME is unset; checkpoint cache unavailable");
   const fs::path root = fs::path(home) / ".cache/huggingface/hub/models--nvidia--GLM-4.7-NVFP4/snapshots";
-  if (!fs::is_directory(root)) return;
+  if (!fs::is_directory(root))
+    dgpp::test::skip("checkpoint snapshot directory absent: " + root.string());
   for (const auto& snap : fs::directory_iterator(root)) {
     const fs::path cfg = snap.path() / "config.json";
     if (!fs::exists(cfg)) continue;
@@ -150,4 +151,5 @@ DGPP_TEST(glm4_config_reads_the_landed_checkpoint) {
     require(c.num_hidden_layers == 92 && c.mtp_layer() == 92 && c.n_routed_experts == 160, "landed values");
     return;
   }
+  dgpp::test::skip("no eligible checkpoint config under " + root.string());
 }

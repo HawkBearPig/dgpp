@@ -1,13 +1,15 @@
 // The cluster config: the schema is checked by name, the
 // engine defaults are the binary's own, the launcher's resolved configuration
 // parses, and the digest is stable and sensitive.
+#include "serve/cluster_config.hpp"
+
+#include <cmath>
 #include <fstream>
 #include <regex>
 #include <stdexcept>
 #include <string>
 
 #include "common/test.hpp"
-#include "serve/cluster_config.hpp"
 
 namespace {
 
@@ -30,6 +32,43 @@ std::string engine_json(const std::string& engine) {
 }
 
 }  // namespace
+
+DGPP_TEST(cluster_config_penalty_defaults_preserve_omission_and_explicit_neutral_values) {
+  const auto absent = dgpp::serve::parse_cluster_config(engine_json("{}"), "t").engine;
+  require(!absent.repetition_penalty && !absent.frequency_penalty && !absent.presence_penalty,
+          "omitted penalty defaults inherit the checkpoint and neutral values");
+  const auto active =
+      dgpp::serve::parse_cluster_config(
+          engine_json(
+              R"({"repetition_penalty":1.25,"frequency_penalty":-0.5,"presence_penalty":0.25})"),
+          "t")
+          .engine;
+  require(active.repetition_penalty == 1.25f && active.frequency_penalty == -0.5f &&
+              active.presence_penalty == 0.25f,
+          "all deployment penalty defaults are parsed");
+  const auto neutral =
+      dgpp::serve::parse_cluster_config(
+          engine_json(R"({"repetition_penalty":1,"frequency_penalty":0,"presence_penalty":-0.0})"),
+          "t")
+          .engine;
+  require(neutral.repetition_penalty == 1.0f && neutral.frequency_penalty == 0.0f &&
+              neutral.presence_penalty == 0.0f && std::signbit(*neutral.presence_penalty),
+          "explicit neutral values are present and retain signed zero");
+  for (const std::string key : {"repetition_penalty", "frequency_penalty", "presence_penalty"}) {
+    for (const std::string bad : {"null", "true", "\"0.5\"", "[]", "1e300", "-3"})
+      require(refusal(engine_json("{\"" + key + "\":" + bad + "}")).find("engine." + key) !=
+                  std::string::npos,
+              "invalid penalty default rejected by name: " + key + "=" + bad);
+  }
+  for (const std::string bad : {"0", "-0.0", "1e-100", "100.1"})
+    require(
+        refusal(engine_json("{\"repetition_penalty\":" + bad + "}")).find("repetition_penalty") !=
+            std::string::npos,
+        "nonpositive, underflowing or excessive repetition penalty rejected");
+  for (const std::string key : {"frequency_penalty", "presence_penalty"})
+    require(refusal(engine_json("{\"" + key + "\":2.01}")).find(key) != std::string::npos,
+            "additive penalties are bounded above");
+}
 
 DGPP_TEST(cluster_config_parses_engine_rope_scaling) {
   // Absent (the default): the Qwen family's plain rope, bit for bit what
@@ -117,8 +156,9 @@ DGPP_TEST(cluster_config_parses_fills_defaults_and_derives_the_world) {
                "prefill_early_admission": true,
                "prefix_min_tokens": 512, "prefix_head_snapshots": false, "mtp_draft": "greedy",
                "mtp_schedule_sampled_scale": 0.5, "mtp_draft_temperature": 0.7, "mtp_verify": "block",
+               "prefill_dense": "streaming", "prefill_fold_overlap": false, "decode_pdl": false, "prefill_window": "scalar", "decode_window": "scalar", "collective_transport": "send",
                "dflash_batch_rows": 32, "dflash_weights": "fp8", "prefill_group": false,
-               "l2_prefetch": false, "l2_prefetch_form": "touch", "l2_prefetch_window_mib": 8,
+               "l2_prefetch": false, "l2_prefetch_form": "touch", "l2_prefetch_full_form": "48x4", "l2_prefetch_window_mib": 8,
                "l2_prefetch_boundary_window_mib": 0, "l2_prefetch_boundary_rate": "full",
                "l2_prefetch_layer_rate": "off", "l2_prefetch_merge": false},
     "paths": {"log_dir": "/var/log/dgpp"}
@@ -138,15 +178,20 @@ DGPP_TEST(cluster_config_parses_fills_defaults_and_derives_the_world) {
               c.engine.prefill_early_admission == std::optional<bool>(true) &&
               c.engine.prefix_min_tokens == 512 && !c.engine.prefix_head_snapshots &&
               c.engine.mtp_draft == "greedy" && c.engine.mtp_schedule_sampled_scale == 0.5 &&
+              c.engine.prefill_dense == "streaming" && !c.engine.prefill_fold_overlap && !c.engine.decode_pdl && c.engine.prefill_window == "scalar" &&
+              c.engine.decode_window == "scalar" &&
+              c.engine.collective_transport == "send" &&
               c.engine.mtp_draft_temperature == 0.7 && c.engine.mtp_verify == "block" &&
               c.engine.dflash_batch_rows == 32 && c.engine.dflash_weights == "fp8" && !c.engine.prefill_group &&
-              !c.engine.l2_prefetch && c.engine.l2_prefetch_form == "touch" && c.engine.l2_prefetch_window_mib == 8 &&
+              !c.engine.l2_prefetch && c.engine.l2_prefetch_form == "touch" && c.engine.l2_prefetch_full_form == "48x4" &&
+              c.engine.l2_prefetch_window_mib == 8 &&
               c.engine.l2_prefetch_boundary_window_mib == 0 && c.engine.l2_prefetch_boundary_rate == "full" &&
               c.engine.l2_prefetch_layer_rate == "off" && !c.engine.l2_prefetch_merge,
           "the given engine knobs");
   {
     const dgpp::serve::ClusterConfig d = dgpp::serve::parse_cluster_config(R"({"model":"m","nodes":["h"]})", "t");
-    require(d.engine.l2_prefetch && d.engine.l2_prefetch_form == "load" && d.engine.l2_prefetch_window_mib == 12 &&
+    require(d.engine.l2_prefetch && d.engine.l2_prefetch_form == "load" && d.engine.l2_prefetch_full_form == "16x8" &&
+            d.engine.l2_prefetch_window_mib == 12 &&
                 d.engine.l2_prefetch_boundary_window_mib == 20 && d.engine.l2_prefetch_boundary_rate == "light" &&
                 d.engine.l2_prefetch_layer_rate == "light" && d.engine.l2_prefetch_merge,
             "the L2 prefetcher's defaults");
@@ -202,7 +247,7 @@ DGPP_TEST(cluster_config_parses_fills_defaults_and_derives_the_world) {
               c.engine.fp8_head == "gemv" && c.engine.draft_head == "exact" && c.engine.draft_head_blocks == 32 &&
               !c.engine.prefill_bf16_partials && !c.engine.prefill_fold_scales &&
               !c.engine.prefill_fp8_gemm && !c.engine.prefill_fp8_per_tensor && c.engine.prefill_activations == "bf16" &&
-              c.engine.prefill_attention == "bf16" &&
+              c.engine.prefill_attention == "bf16" && c.engine.decode_attention == "bf16" &&
               c.engine.dflash_model.empty() &&
               c.engine.dflash_verify_graph && c.engine.dflash_draft_batch && c.engine.dflash_depth == 0 &&
               c.engine.expert_gemm == "wide" && c.engine.expert_gemm_prefetch == 3 &&
@@ -228,6 +273,14 @@ DGPP_TEST(cluster_config_parses_fills_defaults_and_derives_the_world) {
                        (on.engine.prefill_fp8_gemm ? 1 : 0) + (on.engine.prefill_fp8_per_tensor ? 1 : 0);
     require(got && others == 1, "engine." + key + " opt-in alone");
   }
+  // The DeepSeek-V4.1 index budget (2026-10-18): 0 (the checkpoint's) unless the config says.
+  require(c.engine.index_topk == 0 && c.engine.candidate_topk_blocks == 0 && c.engine.candidate_block_size == 0,
+          "the index budget defaults to the checkpoint's");
+  const auto ib = dgpp::serve::parse_cluster_config(
+      R"({"model":"m","nodes":["h"],"engine":{"index_topk":2048,"candidate_topk_blocks":1024,"candidate_block_size":16}})",
+      "t");
+  require(ib.engine.index_topk == 2048 && ib.engine.candidate_topk_blocks == 1024 && ib.engine.candidate_block_size == 16,
+          "the index budget keys parse");
   // The checkpoint's activation recipe (2026-10-15): "bf16" (the default chain) or "native".
   const auto na = dgpp::serve::parse_cluster_config(
       R"({"model":"m","nodes":["h"],"engine":{"prefill_activations":"native"}})", "t");
@@ -243,6 +296,16 @@ DGPP_TEST(cluster_config_parses_fills_defaults_and_derives_the_world) {
     rejected = true;
   }
   require(rejected, "engine.prefill_attention takes bf16 or fp8 only");
+  const auto da = dgpp::serve::parse_cluster_config(
+      R"({"model":"m","nodes":["h"],"engine":{"kv_dtype":"fp8","decode_attention":"fp8"}})", "t");
+  require(da.engine.decode_attention == "fp8" && da.engine.prefill_attention == "bf16",
+          "native decode is independent of prefill");
+  rejected = false;
+  try {
+    (void)dgpp::serve::parse_cluster_config(
+        R"({"model":"m","nodes":["h"],"engine":{"decode_attention":"e4m3"}})", "t");
+  } catch (const std::exception&) { rejected = true; }
+  require(rejected, "engine.decode_attention takes bf16 or fp8 only");
   // The DFlash2 drafter's keys (2026-10-03).
   const auto df = dgpp::serve::parse_cluster_config(
       R"({"model":"m","nodes":["h"],"engine":{"dflash_model":"z-lab/Qwen3.8-27B-DFlash2","dflash_verify_graph":false,"dflash_draft_batch":false,"dflash_depth":4}})", "t");
@@ -278,6 +341,12 @@ DGPP_TEST(cluster_config_parses_fills_defaults_and_derives_the_world) {
   require(table.engine.ngram_table_model == "Qwen/Qwen3.8-Flash-Next-FP8", "ngram_table_model parses");
   require(!refusal(R"({"model":"m","nodes":["h"],"engine":{"ngram_table_model":"nope"}})").empty(),
           "ngram_table_model must be ORG/NAME");
+  require(fp8.engine.engram_source.empty(), "engram_source empty by default");
+  const dgpp::serve::ClusterConfig engram = dgpp::serve::parse_cluster_config(
+      R"({"model":"m","nodes":["h"],"engine":{"engram_source":"deepseek-ai/DeepSeek-V4.1-Flash-1017"}})", "t");
+  require(engram.engine.engram_source == "deepseek-ai/DeepSeek-V4.1-Flash-1017", "engram_source parses");
+  require(!refusal(R"({"model":"m","nodes":["h"],"engine":{"engram_source":"nope"}})").empty(),
+          "engram_source must be ORG/NAME");
   // The bf16 weights' resident form: named by the config, off by default.
   const dgpp::serve::ClusterConfig bf12 = dgpp::serve::parse_cluster_config(
       R"({"model":"m","nodes":["h"],"engine":{"bf16_weights":"bf12"}})", "t");
@@ -452,12 +521,24 @@ DGPP_TEST(cluster_config_refusesUnknownKeysAndBadValuesByName) {
        "'engine.mtp_verify' must be token or block"},
       {R"({"model":"m","nodes":["h"],"engine":{"dflash_weights":"nvfp4"}})",
        "'engine.dflash_weights' must be checkpoint or fp8"},
+      {R"({"model":"m","nodes":["h"],"engine":{"mtp_expert_format":"int8"}})",
+       "'engine.mtp_expert_format' must be \"fp8\", \"bf16_fused\" or \"bf16\""},
       {R"({"model":"m","nodes":["h"],"engine":{"l2_prefetch_layer_rate":"heavy"}})",
        "'engine.l2_prefetch_layer_rate' must be off, light or full"},
       {R"({"model":"m","nodes":["h"],"engine":{"l2_prefetch_form":"walk"}})",
        "'engine.l2_prefetch_form' must be load, lines or touch"},
+      {R"({"model":"m","nodes":["h"],"engine":{"l2_prefetch_full_form":"32x8"}})",
+       "'engine.l2_prefetch_full_form' must be 16x8 or 48x4"},
       {R"({"model":"m","nodes":["h"],"engine":{"mtp_schedule_sampled_scale":1.5}})",
        "'engine.mtp_schedule_sampled_scale' must be in [0, 1]"},
+      {R"({"model":"m","nodes":["h"],"engine":{"prefill_dense":"fast"}})",
+       "'engine.prefill_dense' must be \"auto\", \"tile\" or \"streaming\""},
+      {R"({"model":"m","nodes":["h"],"engine":{"prefill_window":"mma"}})",
+       "'engine.prefill_window' must be \"flash\" or \"scalar\""},
+      {R"({"model":"m","nodes":["h"],"engine":{"decode_window":"split"}})",
+       "'engine.decode_window' must be \"flash\" or \"scalar\""},
+      {R"({"model":"m","nodes":["h"],"engine":{"collective_transport":"doorbell"}})",
+       "'engine.collective_transport' must be \"write\" or \"send\""},
       {R"({"model":"m","nodes":["h"],"engine":{"admission":"fast"}})",
        "'engine.admission' must be \"full\" or \"grow\""},
       {R"({"model":"m","nodes":["h"],"engine":{"prefix_cache_gib":-1}})",
@@ -490,6 +571,14 @@ DGPP_TEST(cluster_config_refusesUnknownKeysAndBadValuesByName) {
        "'engine.draft_head' must be \"exact\" or \"screen\""},
       {R"({"model":"m","nodes":["h"],"engine":{"draft_head_blocks":0}})",
        "'engine.draft_head_blocks' must be in [1, 64]"},
+      {R"({"model":"m","nodes":["h"],"engine":{"index_topk":4096}})",
+       "'engine.index_topk' must be in [0, 2048]"},
+      {R"({"model":"m","nodes":["h"],"engine":{"index_topk":1000}})",
+       "'engine.index_topk' must be 0 (the checkpoint's) or a power of two <= 2048"},
+      {R"({"model":"m","nodes":["h"],"engine":{"candidate_topk_blocks":3}})",
+       "'engine.candidate_topk_blocks' must be 0 (the checkpoint's) or a power of two <= 2048"},
+      {R"({"model":"m","nodes":["h"],"engine":{"candidate_block_size":-1}})",
+       "'engine.candidate_block_size' must be in [0, 1024]"},
       {R"({"model":"m","nodes":["h"],"engine":{"bf16_weights":"fp8"}})",
        "'engine.bf16_weights' must be \"checkpoint\", \"bf12\" or \"bf12+bf16\""},
       {R"({"model":"m","nodes":["h"],"engine":{"bf16_weights":true}})",
@@ -596,6 +685,47 @@ DGPP_TEST(cluster_config_the_yarn512k_template_is_a_deployment_the_engine_reads)
           "request must be admissible in this template");
 }
 
+DGPP_TEST(cluster_config_the_fp4local_template_is_a_deployment_the_engine_reads) {
+  // deploy/cluster_qwen-3.8-flash-next-fp4local_w1.example.json, the
+  // ready-to-run shape for the FP4-Local export (2026-10-17). The resident
+  // footprint (98.2 GiB: the experts with their CSF-wrapped scales and the
+  // resident n-gram table's codes) fits one 121.6 GiB device, so the
+  // template seats a whole model in world 1. What this checks: every field
+  // name in the file is one this parser reads (an unknown one is a hard
+  // failure), and the recipe the loader was validated against — the MTP
+  // draft at depth 3 with the screened head behind the lookup draft, the
+  // BF16 remainder FP8 at load, the table mapped rather than resident, the
+  // Full layers' K/V at fp8 with the fp8 prefill attention (half the bf16
+  // pool, sized here to four full 262144-token contexts; interleaved on one
+  // Spark it measured 1459-1469 t/s prefill at 4-8K depth against 1141-1260
+  // bf16, decode unchanged, 2026-10-18), and the YaRN ramp to a 1M positional
+  // ceiling (the cap, not the pool) — is what the file spells.
+  const std::string path = std::string(DGPP_SOURCE_DIR) +
+                           "/deploy/cluster_qwen-3.8-flash-next-fp4local_w1.example.json";
+  std::ifstream in(path);
+  require(in.good(), "the tracked template is readable: " + path);
+  std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  const dgpp::serve::ClusterConfig c = dgpp::serve::parse_cluster_config(text, path);
+  require(c.model == "nvidia/Qwen3.8-Flash-Next-FP4-Local" && c.world() == 1,
+          "the single-Spark FP4-Local deployment");
+  require(c.engine.mtp && c.engine.mtp_depth == 3 && c.engine.decode_graph &&
+              c.engine.draft_head == "screen" && c.engine.lookup_draft && c.engine.lookup_tail == 2 &&
+              c.engine.ngram_table == "mmap",
+          "the draft and lookup recipe the validation measured");
+  require(c.engine.dense_weights == "fp8" && c.engine.fp8_head == "mma",
+          "the BF16 remainder FP8 at load and the tensor-core head, as the sibling NVFP4 templates");
+  require(c.engine.kv_dtype == "fp8" && c.engine.prefill_attention == "fp8",
+          "the Full layers' K/V at fp8 with the fp8 prefill attention: half the bf16 pool, the long-depth prefill win");
+  require(c.engine.rope_scaling.has_value() && c.engine.rope_scaling->factor == 4.0 &&
+              c.engine.rope_scaling->original_max_position_embeddings == 262144 &&
+              c.engine.rope_scaling->context_limit() == 1048576,
+          "the YaRN ramp to a 1M positional ceiling: the cap moves, not the pool (it costs no K/V bytes)");
+  require(c.engine.max_concurrency == 4 && c.engine.kv_capacity % 64 == 0 &&
+              c.engine.kv_capacity > c.engine.default_max_tokens && c.engine.prefix_cache_gib == 3 &&
+              c.engine.model_alias == "Qwen3.8-Flash-Next-FP4",
+          "four request slots in a pool that clears a maximal answer, and the one-node Qwen prefix arena");
+}
+
 DGPP_TEST(cluster_config_prefill_defaults_to_auto_with_explicit_opt_out) {
   const auto defaults = dgpp::serve::parse_cluster_config(engine_json("{}"), "t");
   require(defaults.engine.prefill_budget_tokens == -1, "unset prefill budget is automatic");
@@ -663,4 +793,11 @@ DGPP_TEST(cluster_config_tokenizer_cache) {
     require(refusal(json).find("tokenizer") != std::string::npos,
             "malformed tokenizer config refused");
   }
+}
+
+DGPP_TEST(cluster_config_prefill_dense_defaults_to_family_policy) {
+  const auto a = dgpp::serve::parse_cluster_config(engine_json("{}"), "test");
+  require(a.engine.prefill_dense == "auto", "automatic family policy is the default");
+  const auto b = dgpp::serve::parse_cluster_config(engine_json(R"({"prefill_dense":"auto"})"), "test");
+  require(b.engine.prefill_dense == "auto", "explicit automatic policy is accepted");
 }

@@ -94,7 +94,7 @@ constexpr int kGemmDecodeRowsDefault = 8;
 // not bitwise (the engine gates' near-tie rule). 256 restores the old
 // lowering (every decode row count through the chunks, fp8 to 128 rows).
 int dense_gemv_rows();
-constexpr int kGemmDecodeLoweringRows = 64;
+constexpr int kGemmDecodeLoweringRows = 96;
 
 // cuBLASLt-backed implementation with per-shape heuristic caching. Decode-
 // shaped bf16 calls (m <= the decode rows, k % 8 == 0, 16B-aligned weight)

@@ -43,7 +43,7 @@ namespace dgpp {
 // to kSpecRows - 1 drafts; kernels/glm_spec.hpp's kSpecMaxDrafts mirrors
 // it).
 constexpr int kDecodeRows = 8;
-constexpr int kDecodeRowsMax = 64;
+constexpr int kDecodeRowsMax = 96;
 constexpr int kSpecRows = 8;  // 2026-09-30: the DFlash2 block (7 drafts + the pending token)
 
 // One forward's rows as the engines read them.

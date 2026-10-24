@@ -499,6 +499,40 @@ DGPP_TEST(dflash2_selector_sampled_walk_proposes_its_draw) {
 
 // ---- the block attention --------------------------------------------------------
 
+DGPP_TEST(dflash_block_attention_skips_context_ceiling_padding) {
+  cudaStream_t s = test_stream();
+  constexpr int rows = 16, valid = 4, dim = 128, slots = 64;
+  const auto q = random_bf16_normal(741, rows * dim, 1.f);
+  const auto k = random_bf16_normal(742, slots * dim, 1.f);
+  const auto v = random_bf16_normal(743, slots * dim, 1.f);
+  std::vector<int64_t> positions(rows, -1);
+  for (int i = 0; i < valid; ++i) positions[i] = 60 + i;
+  const int32_t table = 0;  // one owned page: no entry for position 64
+  DevBuf dq(q.size() * 2), dk(k.size() * 2), dv(v.size() * 2), dp(rows * 8), dt(4);
+  DevBuf out(rows * dim * 2), ref(valid * dim * 2);
+  DevBuf parts(dgpp::dflash2_block_attn_partials_bytes(rows, 1));
+  dq.upload(q.data(), q.size() * 2); dk.upload(k.data(), k.size() * 2); dv.upload(v.data(), v.size() * 2);
+  dp.upload(positions.data(), rows * 8); dt.upload(&table, 4);
+  for (bool split : {false, true}) {
+    if (split)
+      dgpp::dflash2_block_attn_split(cb16(dq), dim, cb16(dk), cb16(dv), ci32(dt), slots, 1,
+          rows, 128, ci64(dp), rows, 1, 1, dim, 1.f / std::sqrt(float(dim)), f32(parts), b16(out), s);
+    else
+      dgpp::dflash2_block_attn(cb16(dq), dim, cb16(dk), cb16(dv), ci32(dt), slots, 1,
+          rows, 128, ci64(dp), rows, 1, 1, dim, 1.f / std::sqrt(float(dim)), b16(out), s);
+    dgpp::dflash2_block_attn(cb16(dq), dim, cb16(dk), cb16(dv), ci32(dt), slots, 1,
+        valid, 128, ci64(dp), valid, 1, 1, dim, 1.f / std::sqrt(float(dim)), b16(ref), s);
+    DGPP_CUDA_OK(cudaStreamSynchronize(s));
+    std::vector<uint16_t> got(rows * dim), want(valid * dim);
+    out.download(got.data(), got.size() * 2); ref.download(want.data(), want.size() * 2);
+    for (size_t i = 0; i < got.size(); ++i) {
+      const float expected = i < want.size() ? dgpp::bf16_bits_to_float(want[i]) : 0.f;
+      require(std::fabs(dgpp::bf16_bits_to_float(got[i]) - expected) < 0.01f,
+              "padded draft rows cannot extend the attention key span");
+    }
+  }
+}
+
 DGPP_TEST(dflash2_block_attends_window_and_block) {
   cudaStream_t s = test_stream();
   const int rows = 8, heads = 4, kv = 2, dim = 128, block_tokens = 16;

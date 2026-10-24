@@ -76,6 +76,19 @@ pins one index per explicitly named device. Check link state, IP/GID
 assignment, routing and consistent MTU on the selected network interfaces.
 Discovery does not prove that corresponding lanes can exchange RDMA traffic.
 
+A DGX Spark's one ConnectX-7 port appears as two verbs devices, one per
+PCIe function (`rocep1s0f0` and `roceP2p1s0f0` here), each behind its own
+x4 link, and both carry traffic over the one cable. Name both as lanes:
+the bus stripes its bulk class (the prefill boundary folds) across the
+lanes, keeps the decode-class messages on the first, and derives each
+queue pair's pace from the port rate over all inbound queue pairs, so the
+port's cap is unchanged while the host-side link doubles. Measured on
+DeepSeek-V4.1-Flash-1017 on four nodes (2026-10-18, the same binary):
+cold prefill 0.514 / 1.572 / 4.715 / 17.916 s at 512 / 2K / 8K / 32K
+tokens with both functions against 0.523 / 1.619 / 5.152 / 19.591 on one
+(−8.5 % at 8K and 32K), decode unchanged. Give the second function an
+address on its own subnet on every node and pin a GID index per device.
+
 Read-only starting points are `rdma link`, `ip -br address`, `ip link`, and
 `scripts/dgpp-cluster doctor --config "$CONFIG"`.
 Only run the fabric probes on an idle test allocation;

@@ -168,8 +168,8 @@ class HttpServer {
   void on_writable(Conn& c);
   void close_conn(Conn& c, bool notify_disconnect);
   bool flush_out(Conn& c);
-  // Parses every complete request from c.in; false when the connection
-  // must close (error responses are already queued).
+  // Parses every complete request from c.in; false when input must stop
+  // (the connection is closed or its terminal response is still draining).
   bool process_requests(Conn& c);
   void queue_response(Conn& c, int status, std::string_view content_type,
                       const std::string& body, bool close_after);

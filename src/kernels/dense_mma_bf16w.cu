@@ -1,5 +1,6 @@
 // The dense tensor-core GEMM over BF16 weights (dense_mma_bf16w.hpp).
 #include "kernels/dense_mma_bf16w.hpp"
+#include "kernels/pdl.cuh"
 
 #include <stdexcept>
 
@@ -155,6 +156,7 @@ template <typename OutT>
 __global__ __launch_bounds__(bf16w::kThreads, 2) void dense_mma_bf16w_kernel(
     const uint16_t* __restrict__ act, size_t act_stride, int act_vec, const uint16_t* __restrict__ w,
     OutT* __restrict__ out, size_t out_stride, int m, int n, int k, int m_tiles) {
+  dgpp_pdl_wait();
   using namespace bf16w;
   extern __shared__ __align__(16) uint8_t smem[];
   const int m_tile = static_cast<int>(blockIdx.x) % m_tiles;
@@ -176,6 +178,7 @@ __global__ __launch_bounds__(bf16w::kThreads, 2) void dense_mma_bf16w_groups_ker
     const uint16_t* __restrict__ ring, int slots, const int32_t* __restrict__ req_ids,
     const int64_t* __restrict__ pos, int group, const uint16_t* __restrict__ w, float* __restrict__ out, int n,
     int k, int m_tiles, int tiles) {
+  dgpp_pdl_wait();
   using namespace bf16w;
   extern __shared__ __align__(16) uint8_t smem[];
   const int row = static_cast<int>(blockIdx.x) / tiles, t = static_cast<int>(blockIdx.x) % tiles;

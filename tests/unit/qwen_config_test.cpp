@@ -250,6 +250,7 @@ DGPP_TEST(qwen_config_parses_the_qad_export) {
   require(c.mtp_experts_nvfp4 && !c.mtp_experts_bf16_fused, "weight-only NVFP4 draft experts");
   require(c.ngram_table_nvfp4 && !c.ngram_table_fp8, "the NVFP4 n-gram table");
   require(c.norms_f32, "the F32 norms");
+  require(!c.experts_nvfp4_csf, "no CSF sidecars on the QAD export");
   // Every refusal names what is missing or wrong.
   require(refusal(text_json(), qad_quant_json("model.language_model.layers.7.mlp.experts")).find("layer 7") !=
               std::string::npos,
@@ -285,6 +286,98 @@ DGPP_TEST(qwen_config_parses_the_qad_export) {
     refused = std::string(e.what()).find("MXFP8") != std::string::npos;
   }
   require(refused, "world 8 refused on the MXFP8 group");
+}
+
+// The FP4-Local export's quantization_config (nvidia/Qwen3.8-Flash-Next-
+// FP4-Local): the QAD schema plus weight_scale_encoding "csf" on every
+// backbone experts entry (the per-group scales arrive as ModelOpt
+// fixed-plus-exceptions sidecars, no plain weight_scale) and quantized
+// vision-tower entries the engine skips (text-only; counted at binding).
+std::string fp4local_quant_json(const std::string& patch_from = "", const std::string& patch_to = "") {
+  std::string q = R"({"quant_method": "modelopt", "quant_algo": "MIXED_PRECISION", "kv_cache_quant_algo": null,
+  "ignore": ["lm_head", "mtp.fc_embedding", "mtp.fc_hidden", "mtp.pre_fc_norm_*",
+             "mtp.hyper_connection_mixer*", "mtp.layers.0.self_attn*", "mtp.layers.0.attn_hyper_connection*",
+             "mtp.layers.0.mlp_hyper_connection*", "mtp.layers.0.mlp.gate", "mtp.layers.0.mlp.shared_expert*"],
+  "quantized_layers": {)";
+  bool first = true;
+  auto add = [&](const std::string& key, const char* algo, int group, const char* enc = nullptr) {
+    if (!first) q += ", ";
+    first = false;
+    q += "\"" + key + "\": {\"quant_algo\": \"" + algo + "\", \"group_size\": " + std::to_string(group);
+    if (enc != nullptr) q += ", \"weight_scale_encoding\": \"" + std::string(enc) + "\"";
+    q += "}";
+  };
+  for (int l = 0; l < 48; ++l) {
+    const std::string p = "model.language_model.layers." + std::to_string(l) + ".";
+    add(p + "mlp.experts", "NVFP4", 16, "csf");
+    if ((l + 1) % 4 == 0)
+      for (const char* m : {"self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj",
+                            "self_attn.indexer.index_qk_proj"})
+        add(p + m, "MXFP8", 32);
+    else
+      for (const char* m : {"linear_attn.in_proj_a", "linear_attn.in_proj_b", "linear_attn.in_proj_qkv",
+                            "linear_attn.in_proj_z", "linear_attn.out_proj"})
+        add(p + m, "MXFP8", 32);
+    for (const char* m : {"mlp.shared_expert.gate_proj", "mlp.shared_expert.up_proj", "mlp.shared_expert.down_proj"})
+      add(p + m, "MXFP8", 32);
+  }
+  add("model.language_model.layers.1.ple.ple_embedding.ngram_embedding", "NVFP4", 16);
+  add("mtp.layers.0.mlp.experts", "W4A16_NVFP4", 16);
+  add("model.visual.blocks.0.attn.proj", "MXFP8", 32);
+  add("model.visual.blocks.0.mlp.linear_fc1", "W4A16_NVFP4", 16);
+  q += "}}";
+  if (!patch_from.empty()) {
+    const size_t at = q.find(patch_from);
+    require(at != std::string::npos, "fp4local patch anchor missing: " + patch_from);
+    q.replace(at, patch_from.size(), patch_to);
+  }
+  return q;
+}
+
+DGPP_TEST(qwen_config_parses_the_fp4local_export) {
+  const dgpp::QwenTextConfig c = parse(text_json(), fp4local_quant_json());
+  require(c.experts_nvfp4 && !c.experts_fp8 && !c.experts_gptq_int4, "NVFP4 routed experts");
+  require(c.dense_mxfp8_shipped && !c.dense_fp8_shipped, "the MXFP8 dense stack");
+  require(c.mtp_experts_nvfp4 && !c.mtp_experts_bf16_fused, "weight-only NVFP4 draft experts");
+  require(c.ngram_table_nvfp4 && !c.ngram_table_fp8, "the NVFP4 n-gram table");
+  require(c.norms_f32, "the F32 norms");
+  require(c.experts_nvfp4_csf, "the CSF-wrapped backbone expert scales");
+  require(!c.mtp_experts_nvfp4_csf, "the draft experts keep their plain scales");
+  // Every refusal names what is wrong.
+  require(refusal(text_json(), fp4local_quant_json("\"weight_scale_encoding\": \"csf\"",
+                                                   "\"weight_scale_encoding\": \"\""))
+                  .find("one export, one form") != std::string::npos,
+          "mixed scale encodings refused");
+  require(refusal(text_json(), fp4local_quant_json("\"weight_scale_encoding\": \"csf\"",
+                                                   "\"weight_scale_encoding\": \"blockwise\""))
+                  .find("weight_scale_encoding") != std::string::npos,
+          "an unknown scale encoding refused");
+  // The draft entries carry their own form: declaring CSF there flips the
+  // draft flag while the backbone stays CSF; unknown or mixed draft
+  // encodings refuse.
+  const char* kMtpPlain =
+      "\"mtp.layers.0.mlp.experts\": {\"quant_algo\": \"W4A16_NVFP4\", \"group_size\": 16}";
+  const char* kMtpCsf =
+      "\"mtp.layers.0.mlp.experts\": {\"quant_algo\": \"W4A16_NVFP4\", \"group_size\": 16, "
+      "\"weight_scale_encoding\": \"csf\"}";
+  {
+    const dgpp::QwenTextConfig m = parse(text_json(), fp4local_quant_json(kMtpPlain, kMtpCsf));
+    require(m.mtp_experts_nvfp4_csf && m.experts_nvfp4_csf, "the draft's own CSF declaration");
+  }
+  require(refusal(text_json(), fp4local_quant_json(kMtpPlain,
+                                                   "\"mtp.layers.0.mlp.experts\": "
+                                                   "{\"quant_algo\": \"W4A16_NVFP4\", \"group_size\": 16, "
+                                                   "\"weight_scale_encoding\": \"bl\"}"))
+                  .find("weight_scale_encoding") != std::string::npos,
+          "an unknown draft scale encoding refused");
+  require(refusal(text_json(),
+                  fp4local_quant_json(
+                      kMtpPlain,
+                      std::string(kMtpCsf) +
+                          ", \"mtp.layers.48.mlp.experts\": {\"quant_algo\": \"W4A16_NVFP4\", "
+                          "\"group_size\": 16}"))
+                  .find("one export, one form") != std::string::npos,
+          "mixed draft encodings refused");
 }
 
 // The AutoRound hybrid's quantization_config (Saren/…-hybrid-MTP_int4RTN),
@@ -332,9 +425,11 @@ DGPP_TEST(qwen_config_parses_the_autoround_hybrid) {
 DGPP_TEST(qwen_config_parses_the_landed_checkpoint_when_present) {
   namespace fs = std::filesystem;
   const char* home = std::getenv("HOME");
-  if (!home) return;
+  if (!home) dgpp::test::skip("HOME is unset; checkpoint cache unavailable");
   const fs::path root = fs::path(home) / ".cache/huggingface/hub/models--Qwen--Qwen3.8-Flash-Next-FP8/snapshots";
-  if (!fs::is_directory(root)) return;  // the gate is optional: a box without the checkpoint
+  if (!fs::is_directory(root))
+    dgpp::test::skip("checkpoint snapshot directory absent: " + root.string());
+  size_t checked = 0;
   for (const auto& snap : fs::directory_iterator(root)) {
     const fs::path cfg = snap.path() / "config.json";
     if (!fs::exists(cfg)) continue;
@@ -343,7 +438,9 @@ DGPP_TEST(qwen_config_parses_the_landed_checkpoint_when_present) {
     const dgpp::QwenTextConfig c = dgpp::QwenTextConfig::from_json_file(cfg.string());
     require(c.num_hidden_layers == 48 && c.num_experts == 512 && c.ple_layer() == 1, "the file's shape");
     require(c.ngram_geometry().padded_rows == 320001536, "the file's n-gram rows");
+    ++checked;
   }
+  if (checked == 0) dgpp::test::skip("no eligible checkpoint config under " + root.string());
 }
 
 DGPP_TEST(architecture_detection_names_the_families) {

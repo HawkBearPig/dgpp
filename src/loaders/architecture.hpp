@@ -19,6 +19,7 @@ enum class ModelArchitecture : int {
   MimoV2,      // MiMoV2ForCausalLM / mimo_v2 (MiMo-V2.6-Flash, 2026-09-22)
   Qwen3_5,     // Qwen3_5ForConditionalGeneration / qwen3_5 (Qwen3.8-27B, text-only support lands first)
   DeepseekV4,  // DeepseekV4ForCausalLM / deepseek_v4 (DeepSeek-V4-Flash-0731, 2026-10-01)
+  Flint,       // FlintForCausalLM / flint (RecursiveSI/flint, the HawkBearPig mixed export, 2026-10-22)
 };
 
 constexpr const char* model_architecture_name(ModelArchitecture a) {
@@ -31,6 +32,7 @@ constexpr const char* model_architecture_name(ModelArchitecture a) {
     case ModelArchitecture::MimoV2: return "mimo_v2";
     case ModelArchitecture::Qwen3_5: return "qwen3_5";
     case ModelArchitecture::DeepseekV4: return "deepseek_v4";
+    case ModelArchitecture::Flint: return "flint";
   }
   return "glm5";
 }

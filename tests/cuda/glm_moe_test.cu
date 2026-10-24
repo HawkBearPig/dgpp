@@ -183,6 +183,8 @@ struct SmallCase {
   std::vector<dgpp::GlmFp4Matrix> expert_mats_fp4;  // NVFP4: E*3 routed
   std::vector<dgpp::GlmPackedMatrix> expert_mats_packq;  // packed-int: (E+1)*3, the shared triple last
   std::vector<void*> d_packq_bytes;
+  std::vector<dgpp::Exl3Matrix> expert_mats_exl3;  // EXL3: (E+1)*3, the shared triple last
+  std::vector<void*> d_exl3_bytes;
   GlmQuantMatrix shared_mats[3];
   // device backing
   uint16_t *d_hidden = nullptr, *d_gate_w = nullptr;
@@ -194,6 +196,29 @@ struct SmallCase {
   uint16_t* d_out = nullptr;
   bool nvfp4() const { return host_w.nvfp4; }
   bool packq() const { return host_w.packq; }
+  bool exl3() const { return host_w.exl3_set(); }
+
+  // A host EXL3 matrix's device twin (managed memory; the tiles 256-aligned
+  // like a loader grant).
+  static dgpp::Exl3Matrix upload_exl3(const dgpp::Exl3HostMatrix& h, std::vector<void*>& owned) {
+    uint8_t* tiles = nullptr;
+    uint16_t* suh = nullptr;
+    uint16_t* svh = nullptr;
+    DGPP_CUDA_OK(cudaMallocManaged(&tiles, h.tiles.size() + 256));
+    DGPP_CUDA_OK(cudaMallocManaged(&suh, h.suh.size() * 2));
+    DGPP_CUDA_OK(cudaMallocManaged(&svh, h.svh.size() * 2));
+    std::memcpy(tiles, h.tiles.data(), h.tiles.size());
+    std::memcpy(suh, h.suh.data(), h.suh.size() * 2);
+    std::memcpy(svh, h.svh.data(), h.svh.size() * 2);
+    owned.push_back(tiles);
+    owned.push_back(suh);
+    owned.push_back(svh);
+    dgpp::Exl3Matrix m = h.view();
+    m.tiles = tiles;
+    m.suh = suh;
+    m.svh = svh;
+    return m;
+  }
 
   void alloc() {
     const int E = cfg.n_experts;
@@ -205,6 +230,19 @@ struct SmallCase {
     DGPP_CUDA_OK(cudaMallocManaged(&d_bias, host_w.router_bias.size() * 4));
     std::memcpy(d_bias, host_w.router_bias.data(),
                 host_w.router_bias.size() * 4);
+
+    if (host_w.exl3_set()) {
+      require(host_w.exl3.size() == static_cast<size_t>(E + 1) * 3, "exl3 case: every matrix and the shared triple");
+      expert_mats_exl3.resize(host_w.exl3.size());
+      for (size_t m = 0; m < host_w.exl3.size(); ++m) expert_mats_exl3[m] = upload_exl3(host_w.exl3[m], d_exl3_bytes);
+      dev_w.router_gate = d_gate_w;
+      dev_w.router_bias = d_bias;
+      dev_w.experts = nullptr;
+      dev_w.experts_exl3 = expert_mats_exl3.data();
+      for (int m = 0; m < 3; ++m) dev_w.shared_exl3[m] = expert_mats_exl3[static_cast<size_t>(E) * 3 + m];
+      DGPP_CUDA_OK(cudaMallocManaged(&d_out, static_cast<size_t>(tokens) * cfg.hidden * 2));
+      return;
+    }
 
     if (host_w.packq) {
       // Every matrix (the routed E*3 and the shared triple) as a packed-int
@@ -238,6 +276,55 @@ struct SmallCase {
       return;
     }
 
+    if (host_w.nvfp4 && !host_w.fp4_matrix.empty()) {
+      // The per-projection form (docs/flint_plan.md D2): both tables, each
+      // routed matrix uploaded into its own; the shared triple fp8.
+      require(!host_w.shared_nvfp4, "mixed case: the shared triple is fp8");
+      expert_mats_fp4.assign(static_cast<size_t>(E) * 3, dgpp::GlmFp4Matrix{});
+      expert_mats.assign(static_cast<size_t>(E + 1) * 3, GlmQuantMatrix{});
+      DGPP_CUDA_OK(cudaMallocManaged(&d_fp4_globals, static_cast<size_t>(E) * 3 * 4));
+      for (int m = 0; m < (E + 1) * 3; ++m) {
+        if (host_w.fp4_of(m, E)) {
+          const dgpp::GlmFp4MatrixHost v = dgpp::glm_moe_host_view_fp4(host_w, cfg, m);
+          uint8_t* pk = nullptr;
+          uint8_t* sc = nullptr;
+          const size_t pn = static_cast<size_t>(v.rows) * v.cols / 2;
+          const size_t sn = static_cast<size_t>(v.rows) * v.cols / v.scale_group;
+          DGPP_CUDA_OK(cudaMallocManaged(&pk, pn));
+          DGPP_CUDA_OK(cudaMallocManaged(&sc, sn));
+          std::memcpy(pk, v.payload, pn);
+          std::memcpy(sc, v.scales, sn);
+          d_fp4_globals[m] = v.global_scale;
+          d_fp4_bytes.push_back(pk);
+          d_fp4_bytes.push_back(sc);
+          expert_mats_fp4[static_cast<size_t>(m)] =
+              dgpp::GlmFp4Matrix{pk, sc, d_fp4_globals + m, v.rows, v.cols, v.scale_group};
+          continue;
+        }
+        auto view = dgpp::glm_moe_host_view(host_w, cfg, m);
+        uint8_t* p = nullptr;
+        float* s = nullptr;
+        const size_t pn = static_cast<size_t>(view.rows) * view.cols;
+        const size_t sn = ((view.rows + 127) / 128) * ((view.cols + 127) / 128);
+        DGPP_CUDA_OK(cudaMallocManaged(&p, pn));
+        DGPP_CUDA_OK(cudaMallocManaged(&s, sn * 4));
+        std::memcpy(p, view.payload, pn);
+        std::memcpy(s, view.scales, sn * 4);
+        d_payloads.push_back(p);
+        d_scales.push_back(s);
+        expert_mats[static_cast<size_t>(m)] = GlmQuantMatrix{p, s, nullptr, view.rows, view.cols};
+      }
+      dev_w.router_gate = d_gate_w;
+      dev_w.router_bias = d_bias;
+      dev_w.experts = expert_mats.data();
+      dev_w.experts_fp4 = expert_mats_fp4.data();
+      dev_w.routed_fp4_mask = 0;
+      for (int m = 0; m < 3; ++m)
+        if (host_w.fp4_matrix[static_cast<size_t>(m)]) dev_w.routed_fp4_mask |= static_cast<uint8_t>(1u << m);
+      for (int m = 0; m < 3; ++m) dev_w.shared[m] = expert_mats[static_cast<size_t>(E) * 3 + m];
+      DGPP_CUDA_OK(cudaMallocManaged(&d_out, static_cast<size_t>(tokens) * cfg.hidden * 2));
+      return;
+    }
     if (host_w.nvfp4) {
       // Routed experts as NVFP4 triples (payload, per-row scales, and one
       // gathered global-scale array, the loader's layout); the shared
@@ -324,6 +411,7 @@ struct SmallCase {
     for (auto* s : d_scales) cudaFree(s);
     for (auto* b : d_fp4_bytes) cudaFree(b);
     for (auto* b : d_packq_bytes) cudaFree(b);
+    for (auto* b : d_exl3_bytes) cudaFree(b);
     cudaFree(d_fp4_globals);
   }
 };
@@ -361,7 +449,8 @@ const char* const kM346Forms[8] = {"444", "334", "446", "333", "666", "443", "33
 SmallCase make_small_case(int E, int H, int I, int K, int tokens,
                           uint64_t seed, bool nvfp4 = false, bool shared_nvfp4 = false,
                           int packq_bits = 0, int fp4_group = 16, int packq_scale_fmt = 0,
-                          int routed_input_transform = 0, const char* const* m346_forms = nullptr) {
+                          int routed_input_transform = 0, const char* const* m346_forms = nullptr,
+                          int routed_fp4_mask = -1, int exl3_bits_routed = 0, int exl3_bits_shared = 0) {
   SmallCase c;
   c.cfg.hidden = H;
   c.cfg.inter = I;
@@ -388,6 +477,14 @@ SmallCase make_small_case(int E, int H, int I, int K, int tokens,
   c.host_w.nvfp4 = nvfp4;
   c.host_w.shared_nvfp4 = nvfp4 && shared_nvfp4;
   c.host_w.fp4_group = fp4_group;
+  // The per-projection form (routed_fp4_mask >= 0, bit w = projection w
+  // NVFP4): every expert the same mix, the shared triple fp8.
+  if (nvfp4 && routed_fp4_mask >= 0) {
+    c.host_w.fp4_matrix.assign(static_cast<size_t>(E) * 3, 0);
+    for (int e = 0; e < E; ++e)
+      for (int m = 0; m < 3; ++m)
+        c.host_w.fp4_matrix[static_cast<size_t>(e) * 3 + m] = static_cast<uint8_t>((routed_fp4_mask >> m) & 1);
+  }
   // Packed-int (packq_bits 4 or 8): the routed experts at that width, the
   // shared triple at int8 (the checkpoint's shape), release-like scales.
   c.host_w.packq = packq_bits != 0;
@@ -463,7 +560,7 @@ SmallCase make_small_case(int E, int H, int I, int K, int tokens,
       }
       continue;
     }
-    if (nvfp4 && (m < E * 3 || c.host_w.shared_nvfp4)) {
+    if (c.host_w.fp4_of(m, E)) {
       std::vector<uint8_t> packed(static_cast<size_t>(rows) * cols / 2);
       for (auto& b : packed) b = static_cast<uint8_t>(rng.next() & 0xFF);
       std::vector<uint8_t> sc(static_cast<size_t>(rows) * cols / fp4_group);
@@ -490,6 +587,18 @@ SmallCase make_small_case(int E, int H, int I, int K, int tokens,
                              payload.end());
     c.host_w.scales.insert(c.host_w.scales.end(), scales.begin(),
                            scales.end());
+  }
+  // The EXL3 case (docs/deepseek_v41_flash_exl3_plan.md): every matrix a
+  // random trellis at the routed or shared width, suh near +-0.03 (the
+  // pack's input scales carry the weight magnitude) and svh near +-1 —
+  // weights of the fp8 case's size; the fp8 vectors above go unused.
+  if (exl3_bits_routed != 0) {
+    c.cfg.exl3_experts = true;
+    for (int m = 0; m < (E + 1) * 3; ++m) {
+      const bool down = m % 3 == 2;
+      const int bits = m < E * 3 ? exl3_bits_routed : exl3_bits_shared;
+      c.host_w.exl3.push_back(dgpp::exl3_random_matrix(rng, down ? H : I, down ? I : H, bits, 0.03f, 1.0f));
+    }
   }
   return c;
 }
@@ -578,6 +687,8 @@ struct RankSlice {
   std::vector<GlmQuantMatrix> mats;  // (E+1)*3, sliced (FP8) / the shared triple (NVFP4)
   std::vector<dgpp::GlmFp4Matrix> mats_fp4;  // E*3 sliced routed (NVFP4)
   std::vector<dgpp::GlmPackedMatrix> mats_packq;  // (E+1)*3 sliced (packed-int)
+  std::vector<dgpp::Exl3Matrix> mats_exl3;        // (E+1)*3 sliced (EXL3)
+  std::vector<void*> owned_exl3;
   std::vector<uint8_t*> owned_payloads;
   std::vector<float*> owned_scales;
   std::vector<uint8_t*> owned_fp4;
@@ -589,6 +700,30 @@ struct RankSlice {
     RankSlice r;
     const int E = c.cfg.n_experts, H = c.cfg.hidden;
     const int64_t I = c.cfg.inter, M = I / world;
+    if (c.exl3()) {
+      // The loader's EXL3 slices in miniature: whole 128-blocks of the
+      // intermediate, the remainder blocks on the lowest ranks for even
+      // experts and on the highest for odd ones (exl3_expert_block_split;
+      // the shared expert as an even layer's) — gate/up rows and down
+      // columns of that range for every routed expert and the shared one.
+      r.mats_exl3.resize(static_cast<size_t>(E + 1) * 3);
+      for (int m = 0; m < (E + 1) * 3; ++m) {
+        const int expert = m / 3;
+        int64_t b0 = 0, bn = 0;
+        dgpp::exl3_expert_block_split(I, world, rank, expert < E ? (expert & 1) : 0, b0, bn);
+        const dgpp::Exl3HostMatrix& full = c.host_w.exl3[static_cast<size_t>(m)];
+        const dgpp::Exl3HostMatrix part = m % 3 == 2 ? dgpp::exl3_host_cols_slice(full, b0, bn)
+                                                      : dgpp::exl3_host_rows_slice(full, b0, bn);
+        r.mats_exl3[static_cast<size_t>(m)] = SmallCase::upload_exl3(part, r.owned_exl3);
+      }
+      r.dev_w.router_gate = c.dev_w.router_gate;
+      r.dev_w.router_bias = c.dev_w.router_bias;
+      r.dev_w.experts = nullptr;
+      r.dev_w.experts_exl3 = r.mats_exl3.data();
+      for (int m = 0; m < 3; ++m) r.dev_w.shared_exl3[m] = r.mats_exl3[static_cast<size_t>(E) * 3 + m];
+      DGPP_CUDA_OK(cudaMallocManaged(&r.d_out, static_cast<size_t>(c.tokens) * H * 2));
+      return r;
+    }
     if (c.packq()) {
       // The loader's packed slices in miniature: gate/up rows [rank*M, +M)
       // as views, down columns packed at word and group granularity
@@ -723,6 +858,7 @@ struct RankSlice {
     for (auto* s : owned_scales) cudaFree(s);
     for (auto* b : owned_fp4) cudaFree(b);
     for (auto* b : owned_packq) cudaFree(b);
+    for (auto* b : owned_exl3) cudaFree(b);
     cudaFree(d_out);
   }
 };
@@ -759,19 +895,33 @@ double bf16_ulp_at(double v) {
 // gap of at most one ulp — the unsliced path measures <= 1) and half an
 // ulp of the folded result. A slicing bug (wrong scale block, wrong column
 // origin) is O(value), thousands of times this bound.
+// `partial_ulps`: each partial's budget in ulps — half an ulp of its bf16
+// rounding plus its own engine-vs-double gap (1.5 for the chains whose
+// unsliced gap measures <= 1 ulp; the EXL3 chain rounds its rotated input
+// rows to fp16 and its unsliced gap measures up to ~2 ulps, so 2.5).
+// `floor_frac`: the expert budget's absolute floor (a fraction of the
+// oracle's RMS) for a chain whose intermediates are not the oracle's bits
+// — the EXL3 chain's fp16-rounded rotated rows flip a gate / up value by
+// an ulp now and then, an absolute error a small, cancelling output
+// inherits (0: no floor; the strict chains' intermediates are the oracle's).
 void require_within_fold_budget(
     const std::vector<uint16_t>& folded,
     const std::vector<std::vector<uint16_t>>& partials,
-    const std::vector<uint16_t>& oracle, const char* label) {
+    const std::vector<uint16_t>& oracle, const char* label, double partial_ulps = 1.5, double floor_frac = 0.0) {
   double worst_ratio = 0;
   long violations = 0;
   double sum_d2 = 0, sum_o2 = 0;
+  double rms = 0;
+  for (size_t i = 0; i < oracle.size(); ++i) rms += std::pow(bf16_bits_to_float(oracle[i]), 2);
+  rms = oracle.empty() ? 0 : std::sqrt(rms / oracle.size());
+  const double floor_abs = floor_frac * rms;
   for (size_t i = 0; i < folded.size(); ++i) {
     const double got = bf16_bits_to_float(folded[i]);
     const double want = bf16_bits_to_float(oracle[i]);
     double budget = 0.5 * bf16_ulp_at(want);
     for (const auto& p : partials)
-      budget += 1.5 * bf16_ulp_at(bf16_bits_to_float(p[i]));
+      budget += partial_ulps * bf16_ulp_at(bf16_bits_to_float(p[i]));
+    budget = std::max(budget, floor_abs);
     const double err = std::abs(got - want);
     worst_ratio = std::max(worst_ratio, err / budget);
     if (err > budget) ++violations;
@@ -1534,6 +1684,7 @@ DGPP_TEST(moe_decode_slot_path_is_bitwise_host_path) {
       {8, 512, 256, 2, 1},   // one decode row
       {8, 512, 256, 2, 3},   // multi-row steps
       {16, 1024, 512, 4, 2},  // wider geometry, K=4
+      {8, 512, 256, 2, 80},  // the 96-row decode batch's sixteen five-row slots (2026-10-23)
   };
   for (const Case& cs : cases) {
     SmallCase c = make_small_case(cs.E, cs.H, cs.I, cs.K, cs.M,
@@ -2291,6 +2442,83 @@ DGPP_TEST(moe_decode_slot_path_is_bitwise_host_path_nvfp4) {
   }
 }
 
+// The per-projection form (2026-10-22, docs/flint_plan.md D2 — Flint's
+// layer 12: gate fp8 / up NVFP4 / down fp8; layer 37: gate and up NVFP4
+// over an fp8 down): the fp8 and fp4 tables both bound with the mask.
+// GIVEN each true mix, WHEN the host path, the decode slot path (the mixed
+// gate/up kernel, or the uniform pair kernel with the other format's
+// down) and the prefill entry (per-launch formats on the grouped chain)
+// run the same rows, THEN the host path sits within the expert budget of
+// the oracle and the other two are bitwise it.
+DGPP_TEST(moe_decode_slot_path_is_bitwise_host_path_mixed) {
+  struct Case {
+    int E, H, I, K, M, mask;
+  };
+  const Case cases[] = {
+      {8, 512, 256, 2, 1, 0b010},    // layer 12's form, one row
+      {8, 512, 256, 2, 3, 0b010},    // multi-row
+      {8, 512, 256, 2, 3, 0b011},    // layer 37's form
+      {8, 512, 256, 2, 2, 0b001},    // gate fp4 / up fp8
+      {8, 512, 256, 2, 2, 0b100},    // fp8 pair, fp4 down
+      {16, 1024, 512, 4, 2, 0b110},  // up + down fp4, K=4
+      {16, 1024, 512, 4, 2, 0b101},
+  };
+  for (const Case& cs : cases) {
+    SmallCase c = make_small_case(cs.E, cs.H, cs.I, cs.K, cs.M, 0xF8F4 + cs.E + cs.M + 16 * cs.mask,
+                                  /*nvfp4=*/true, false, 0, 16, 0, 0, nullptr, cs.mask);
+    c.alloc();
+    require(c.dev_w.mixed() && c.dev_w.routed_fp4_mask == cs.mask, "mixed case: both tables bound");
+    GlmMoeLayer layer(c.dev_w, c.cfg, std::max(cs.M, 1), /*decode_slots=*/cs.M);
+    std::vector<uint16_t> host(static_cast<size_t>(cs.M) * c.cfg.hidden);
+    layer.enqueue(c.d_hidden, c.d_out, cs.M, nullptr);
+    DGPP_CUDA_OK(cudaDeviceSynchronize());
+    std::memcpy(host.data(), c.d_out, host.size() * 2);
+    std::vector<uint16_t> oracle;
+    dgpp::glm_moe_ref_forward(c.d_hidden, c.host_w, c.cfg, c.tokens, oracle);
+    require_within_expert_budget(host, oracle, "mixed host path vs oracle");
+    DGPP_CUDA_OK(cudaMemset(c.d_out, 0x7F, host.size() * 2));
+    layer.enqueue_decode(c.d_hidden, c.d_out, cs.M, nullptr, nullptr);
+    DGPP_CUDA_OK(cudaDeviceSynchronize());
+    std::vector<uint16_t> fused(host.size(), 0x7F7F);
+    std::memcpy(fused.data(), c.d_out, fused.size() * 2);
+    require(std::memcmp(host.data(), fused.data(), host.size() * 2) == 0,
+            "mixed decode slot path must be bitwise-identical to enqueue");
+    // The prefill entry (device segmentation, the tensor-core cores per
+    // launch) against the host path on the same cores (the fp8 pin's form:
+    // the fp8 tensor-core kernel is not bitwise the GEMV core; the fp4 one
+    // is), and within budget of the oracle.
+    GlmMoeLayer hm(c.dev_w, c.cfg, std::max(cs.M, 1), /*decode_slots=*/cs.M);
+    std::vector<uint16_t> host_mma(host.size(), 0x7F7F);
+    hm.enqueue(c.d_hidden, c.d_out, cs.M, nullptr, dgpp::MoeExpertKernel::kMma);
+    DGPP_CUDA_OK(cudaDeviceSynchronize());
+    std::memcpy(host_mma.data(), c.d_out, host_mma.size() * 2);
+    require_within_expert_budget(host_mma, oracle, "mixed host path (mma) vs oracle");
+    GlmMoeLayer cold(c.dev_w, c.cfg, std::max(cs.M, 1), /*decode_slots=*/cs.M);
+    DGPP_CUDA_OK(cudaMemset(c.d_out, 0x7F, host.size() * 2));
+    cold.enqueue_prefill(c.d_hidden, c.d_out, cs.M, nullptr, nullptr);
+    DGPP_CUDA_OK(cudaDeviceSynchronize());
+    std::vector<uint16_t> pre(host.size(), 0x7F7F);
+    std::memcpy(pre.data(), c.d_out, pre.size() * 2);
+    require(std::memcmp(host_mma.data(), pre.data(), host.size() * 2) == 0,
+            "mixed prefill path must be bitwise-identical to the host path on the same cores");
+    // The constructor refuses a mask naming no mix on two bound tables.
+    for (int bad : {0, 7}) {
+      GlmMoeWeights w2 = c.dev_w;
+      w2.routed_fp4_mask = static_cast<uint8_t>(bad);
+      bool threw = false;
+      try {
+        GlmMoeLayer bad_layer(w2, c.cfg, 1, 1);
+      } catch (const std::invalid_argument&) {
+        threw = true;
+      }
+      require(threw, "two bound tables need a true per-projection mix");
+    }
+    c.free_all();
+    std::printf("[ OK ] mixed decode slot path E=%d H=%d I=%d K=%d M=%d mask=%d: bitwise\n",
+                cs.E, cs.H, cs.I, cs.K, cs.M, cs.mask);
+  }
+}
+
 DGPP_TEST(moe_sliced_ranks_fold_matches_unsliced_oracle_nvfp4) {
   struct Case {
     int E, H, I, K, M, world;
@@ -2374,6 +2602,7 @@ DGPP_TEST(moe_decode_slot_path_is_bitwise_host_path_mxfp4) {
       {16, 1024, 512, 4, 2},  // gate k=1024, down k=512, K=4
       {8, 1024, 576, 6, 2},   // the release's world-4 down width (18 chunks: 2 lanes x 9), top-6
       {8, 1024, 576, 6, 5},   // a draft block's five rows: more shared slots than a group of four
+      {8, 1024, 576, 6, 80},  // sixteen five-row slots: the 96-row decode batch (2026-10-23)
   };
   for (const Case& cs : cases) {
     SmallCase c = make_small_case(cs.E, cs.H, cs.I, cs.K, cs.M, 0x3F4CADE + cs.E + cs.M + cs.I,
@@ -2897,4 +3126,122 @@ DGPP_TEST(moe_sliced_ranks_fold_matches_unsliced_oracle_packq) {
            std::to_string(cs.E) + " I=" + std::to_string(cs.I) + " world=" + std::to_string(cs.world)).c_str());
       c.free_all();
     }
+}
+
+// ---- the EXL3 experts (2026-10-22, docs/deepseek_v41_flash_exl3_plan.md §3.3) --
+// The pack's shapes in miniature: hidden 512, an intermediate of 256 or
+// 640 (five blocks: the uneven world-4 slice), routed experts at 3 / 4 / 6
+// bits with a 6-bit shared expert, and the uniform 8-bit pair. The host
+// chain within the expert budget of the double oracle (the full
+// reconstruct); the decode slot path bitwise the host chain (the same
+// core per row); the sliced ranks' fold within the partials' budget.
+DGPP_TEST(moe_exl3_expert_path_matches_oracle) {
+  struct Case { int E, H, I, K, M, rb, sb; };
+  const Case cases[] = {{8, 512, 256, 2, 1, 4, 6}, {8, 512, 256, 2, 5, 3, 6}, {8, 512, 256, 2, 12, 6, 6},
+                        {8, 512, 640, 2, 3, 4, 6}, {4, 256, 128, 2, 7, 8, 8}};
+  for (const Case& cs : cases) {
+    SmallCase c = make_small_case(cs.E, cs.H, cs.I, cs.K, cs.M, 0xE713 + cs.M + cs.rb, false, false, 0, 16, 0, 0,
+                                  nullptr, -1, cs.rb, cs.sb);
+    c.alloc();
+    require(c.dev_w.exl3() && c.dev_w.shared_exl3_set(), "the case binds EXL3 experts and shared expert");
+    run_small_case(c, ("exl3 expert path E=" + std::to_string(cs.E) + " I=" + std::to_string(cs.I) + " M=" +
+                       std::to_string(cs.M) + " bits " + std::to_string(cs.rb) + "/" + std::to_string(cs.sb))
+                          .c_str());
+    c.free_all();
+  }
+}
+
+// The decode slot path's expert-run form (2026-10-23): with few experts
+// and many rows, the expert-sorted order has long equal-expert runs (the
+// shared expert's is every row), so the cases past 16 rows run the 64-row
+// run tile beside the 16-row one, at every compiled width pair, and must
+// stay bitwise the host chain (per row the same core chain); the 80- and
+// 96-row cases cut the shared expert's run into two 64-row groups.
+DGPP_TEST(moe_exl3_decode_slot_path_is_bitwise_host_path) {
+  struct Case { int E, H, I, K, M, rb, sb; };
+  const Case cases[] = {{8, 512, 256, 2, 1, 4, 6},  {8, 512, 256, 2, 3, 3, 6},  {8, 512, 640, 4, 2, 6, 6},
+                        {8, 512, 256, 2, 17, 4, 6}, {8, 512, 640, 4, 40, 3, 6}, {4, 256, 128, 2, 64, 8, 8},
+                        {8, 512, 256, 2, 64, 6, 6}, {4, 256, 128, 2, 80, 4, 6},  {8, 512, 256, 2, 96, 3, 6}};
+  for (const Case& cs : cases) {
+    SmallCase c = make_small_case(cs.E, cs.H, cs.I, cs.K, cs.M, 0xE7D0 + cs.M + cs.rb, false, false, 0, 16, 0, 0,
+                                  nullptr, -1, cs.rb, cs.sb);
+    c.alloc();
+    GlmMoeLayer layer(c.dev_w, c.cfg, std::max(cs.M, 1), /*decode_slots=*/cs.M, /*graph_table_slots=*/1);
+    const size_t n = static_cast<size_t>(cs.M) * c.cfg.hidden;
+    layer.enqueue(c.d_hidden, c.d_out, cs.M, nullptr);
+    DGPP_CUDA_OK(cudaDeviceSynchronize());
+    std::vector<uint16_t> host(n);
+    std::memcpy(host.data(), c.d_out, n * 2);
+    DGPP_CUDA_OK(cudaMemset(c.d_out, 0x7F, n * 2));
+    layer.enqueue_decode(c.d_hidden, c.d_out, cs.M, nullptr, nullptr);
+    DGPP_CUDA_OK(cudaDeviceSynchronize());
+    std::vector<uint16_t> slot(n);
+    std::memcpy(slot.data(), c.d_out, n * 2);
+    require(host == slot, "exl3: the decode slot path must be bitwise the host path");
+    // The decode graph's own table (prepare_graph_table): the routed
+    // entries and the shared triple as EXL3 views — the shared triple was
+    // left unwritten before 2026-10-23 (the real pack's graph decode ran
+    // every layer on a stale shared view; eager decode was right).
+    layer.prepare_graph_table(0, nullptr);
+    DGPP_CUDA_OK(cudaDeviceSynchronize());
+    DGPP_CUDA_OK(cudaMemset(c.d_out, 0x7F, n * 2));
+    layer.enqueue_decode(c.d_hidden, c.d_out, cs.M, nullptr, nullptr, /*table_slot=*/0);
+    DGPP_CUDA_OK(cudaDeviceSynchronize());
+    std::memcpy(slot.data(), c.d_out, n * 2);
+    require(host == slot, "exl3: the decode slot path on the graph table must be bitwise the host path");
+    // The tensor-core prefill entry (the same EXL3 kernels) too.
+    DGPP_CUDA_OK(cudaMemset(c.d_out, 0x7F, n * 2));
+    layer.enqueue_prefill(c.d_hidden, c.d_out, cs.M, nullptr, nullptr);
+    DGPP_CUDA_OK(cudaDeviceSynchronize());
+    std::vector<uint16_t> pre(n);
+    std::memcpy(pre.data(), c.d_out, n * 2);
+    require(host == pre, "exl3: the prefill path must be bitwise the host path");
+    std::printf("[ OK ] exl3 decode + prefill paths bitwise the host path (E=%d I=%d M=%d bits %d/%d)\n", cs.E,
+                cs.I, cs.M, cs.rb, cs.sb);
+    c.free_all();
+  }
+}
+
+DGPP_TEST(moe_exl3_sliced_ranks_fold_matches_unsliced_oracle) {
+  struct Case { int E, H, I, K, M, world, rb, sb; };
+  const Case cases[] = {{8, 512, 640, 2, 3, 4, 4, 6},   // 2/1/1/1 blocks: the uneven split
+                        {8, 512, 640, 2, 2, 2, 3, 6},   // 3/2 blocks
+                        {8, 512, 256, 2, 4, 2, 6, 6}};  // even
+  for (const Case& cs : cases) {
+    SmallCase c = make_small_case(cs.E, cs.H, cs.I, cs.K, cs.M, 0xE75C + cs.world + cs.rb, false, false, 0, 16, 0, 0,
+                                  nullptr, -1, cs.rb, cs.sb);
+    c.alloc();
+    std::vector<uint16_t> oracle;
+    dgpp::glm_moe_ref_forward(c.d_hidden, c.host_w, c.cfg, c.tokens, oracle);
+    std::vector<std::vector<uint16_t>> partials;
+    for (int rank = 0; rank < cs.world; ++rank) {
+      RankSlice slice = RankSlice::make(c, rank, cs.world);
+      GlmMoeConfig cfg = c.cfg;
+      // The rank's buffers' width: the widest slice any parity hands it (the
+      // loader's local_inter); expert 0's own slice may be the narrower one.
+      cfg.inter = static_cast<int>(dgpp::exl3_block_split_max(c.cfg.inter, cs.world));
+      GlmMoeLayer layer(slice.dev_w, cfg, cs.M, /*decode_slots=*/cs.M);
+      const size_t n = static_cast<size_t>(cs.M) * cs.H;
+      layer.enqueue(c.d_hidden, slice.d_out, cs.M, nullptr);
+      DGPP_CUDA_OK(cudaDeviceSynchronize());
+      std::vector<uint16_t> host(n);
+      std::memcpy(host.data(), slice.d_out, n * 2);
+      DGPP_CUDA_OK(cudaMemset(slice.d_out, 0x7F, n * 2));
+      layer.enqueue_decode(c.d_hidden, slice.d_out, cs.M, nullptr, nullptr);
+      DGPP_CUDA_OK(cudaDeviceSynchronize());
+      std::vector<uint16_t> slot(n);
+      std::memcpy(slot.data(), slice.d_out, n * 2);
+      require(host == slot, "exl3 sliced rank: decode slot path must be bitwise the host path");
+      partials.push_back(std::move(host));
+      slice.free_all();
+    }
+    const std::vector<uint16_t> folded = fold_ranks(partials);
+    require_within_fold_budget(folded, partials, oracle,
+                               ("exl3 sliced fold E=" + std::to_string(cs.E) + " I=" + std::to_string(cs.I) +
+                                " world=" + std::to_string(cs.world) + " bits " + std::to_string(cs.rb) + "/" +
+                                std::to_string(cs.sb))
+                                   .c_str(),
+                               /*partial_ulps=*/2.5, /*floor_frac=*/2e-2);
+    c.free_all();
+  }
 }

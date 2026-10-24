@@ -72,10 +72,17 @@ void launch_l2_release(const void* ptr, size_t bytes, cudaStream_t stream);
 // slowed the small kernels it ran beside by as much as it saved on the
 // projection) and whether adjacent ranges merge into one launch.
 enum class L2PrefetchForm { Load, Lines, Touch };  // engine.l2_prefetch_form: load | lines | touch
+// The full-rate window's shape (engine.l2_prefetch_full_form): 16 blocks x 8
+// loads (512 KB in flight, the DRAM rate at the light form's SM footprint;
+// DeepSeek-V4.1's gap kernels run unstretched beside it) or 48 x 4 (768 KB
+// in flight on every SM; GLM-5.3's windows keep their share beside its
+// streaming kernels — 2026-10-20, +0.3-0.8 % a pass at the narrow form).
+enum class L2FullForm { Narrow16x8, Wide48x4 };
 struct L2PrefetchSettings {
   bool enabled = true;
   bool merge = true;
   L2PrefetchForm form = L2PrefetchForm::Load;
+  L2FullForm full_form = L2FullForm::Narrow16x8;
   size_t window_bytes = size_t{12} << 20;           // engine.l2_prefetch_window_mib
   size_t boundary_window_bytes = size_t{20} << 20;  // engine.l2_prefetch_boundary_window_mib (0: the window budget)
   PrefetchRate boundary_rate = PrefetchRate::Light;
@@ -87,6 +94,8 @@ const L2PrefetchSettings& l2_prefetch_settings();
 PrefetchRate l2_prefetch_rate(const std::string& name);
 // "load" | "lines" | "touch" (throws on anything else).
 L2PrefetchForm l2_prefetch_form(const std::string& name);
+// "16x8" | "48x4" (throws on anything else).
+L2FullForm l2_prefetch_full_form(const std::string& name);
 const char* l2_prefetch_rate_name(PrefetchRate rate);
 class WeightPrefetcher {
  public:
@@ -118,8 +127,13 @@ class WeightPrefetcher {
   // ~620 one-tensor kernels per decode step — 40 % of the graph's nodes,
   // and cudaGraphLaunch costs ~0.45 us per node on this host — becomes a
   // few dozen. The pending range launches at the next non-adjacent add,
-  // at the next open_window(), or at join(). DGPP_L2_PREFETCH_MERGE=off
-  // restores one launch per add.
+  // at the next open_window(), or at join(); engine.l2_prefetch_merge false
+  // restores one launch per add. A hole is bridged only inside the pending
+  // range's own allocation — the driver's address range of its first byte
+  // (2026-10-19: the DeepSeek-V4 draft head's fp8 copy, a separate
+  // allocation that landed 1.9 MiB past its layer's image, was bridged,
+  // and the load-form kernel read the unmapped hole; the layout a kernel
+  // change shifts decides whether two allocations fall within kMergeGap).
   void add(const void* ptr, size_t bytes);
   // add() for a range that is its OWN allocation (a bf16 weight's packed
   // companion — IGemm::resident_view — not a span of the layer's image): it
@@ -161,6 +175,7 @@ class WeightPrefetcher {
   void flush_pending();
   bool merge_ = true;
   uintptr_t pending_begin_ = 0, pending_end_ = 0;
+  uintptr_t pending_alloc_end_ = 0;  // the end of the pending range's allocation (0: unknown — no hole bridged)
   size_t launches_ = 0;
   bool enabled_ = true;
   size_t window_bytes_ = kDefaultWindowBytes;

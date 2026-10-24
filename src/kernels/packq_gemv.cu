@@ -1,4 +1,5 @@
 #include "kernels/packq_gemv.hpp"
+#include "kernels/pdl.cuh"
 
 #include <algorithm>
 #include <stdexcept>
@@ -18,6 +19,7 @@ __global__ void packq_gemv_kernel(const uint16_t* __restrict__ act,
                                   const uint8_t* __restrict__ w,
                                   const uint16_t* __restrict__ scales,
                                   OutT* __restrict__ out, int n) {
+  dgpp_pdl_wait();
   extern __shared__ __align__(16) uint16_t sx[];
   packq_gemv::stage_activations<kRows>(act, act_stride, K, sx);
   __syncthreads();

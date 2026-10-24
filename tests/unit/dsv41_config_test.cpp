@@ -189,9 +189,12 @@ DGPP_TEST(dsv41_architecture_registry_dispatches) {
 DGPP_TEST(dsv41_config_reads_the_landed_checkpoint) {
   namespace fs = std::filesystem;
   const char* home = std::getenv("HOME");
-  if (!home) return;
-  const fs::path root = fs::path(home) / ".cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4.1-Flash/snapshots";
-  if (!fs::is_directory(root)) return;
+  if (!home) dgpp::test::skip("HOME is unset; checkpoint cache unavailable");
+  // The 1017 refinement (2026-10-18) ships the same config as the original
+  // release; whichever snapshot the cache holds parses to the same values.
+  for (const char* repo : {"models--deepseek-ai--DeepSeek-V4.1-Flash-1017", "models--deepseek-ai--DeepSeek-V4.1-Flash"}) {
+  const fs::path root = fs::path(home) / ".cache/huggingface/hub" / repo / "snapshots";
+  if (!fs::is_directory(root)) continue;
   for (const auto& snap : fs::directory_iterator(root)) {
     const fs::path cfg = snap.path() / "config.json";
     if (!fs::exists(cfg)) continue;
@@ -201,4 +204,48 @@ DGPP_TEST(dsv41_config_reads_the_landed_checkpoint) {
     require(c.num_kv_sources() == 4 && c.num_index_sources() == 8 && c.candidate_source_layer_id == 20, "landed schedule");
     return;
   }
+  }
+  dgpp::test::skip("no eligible DeepSeek-V4.1-Flash or DeepSeek-V4.1-Flash-1017 checkpoint config in cache");
+}
+
+DGPP_TEST(dsv41_config_applies_the_deployment_index_budget) {
+  // engine.index_topk / candidate_topk_blocks / candidate_block_size
+  // (2026-10-18): each value > 0 replaces the checkpoint's, 0 keeps it, and
+  // the result passes the parser's own checks.
+  dgpp::Dsv41TextConfig c = parse(config_json());
+  c.apply_index_budget(0, 0, 0);
+  require(c.index_topk == 512 && c.candidate_topk_blocks == 2048 && c.candidate_block_size == 8, "zeros keep the checkpoint's");
+  c.apply_index_budget(2048, 0, 0);
+  require(c.index_topk == 2048 && c.candidate_pool_entries() == 16384, "the widened budget");
+  c.apply_index_budget(0, 1024, 16);
+  require(c.index_topk == 2048 && c.candidate_topk_blocks == 1024 && c.candidate_block_size == 16, "the pool's shape");
+  const auto refused = [&](int k, int blocks, int bs) {
+    dgpp::Dsv41TextConfig d = parse(config_json());
+    try {
+      d.apply_index_budget(k, blocks, bs);
+    } catch (const std::exception& e) {
+      return std::string(e.what());
+    }
+    return std::string();
+  };
+  require(has(refused(4096, 0, 0), "engine.index_topk"), "past the select networks");
+  require(has(refused(3, 0, 0), "engine.index_topk"), "not a power of two");
+  require(has(refused(2048, 128, 0), "engine.candidate_topk_blocks"), "a pool of 128 x 8 cannot hold 2048");
+  require(has(refused(0, 3, 0), "engine.candidate_topk_blocks"), "blocks not a power of two");
+  require(has(refused(2048, 256, 4), "engine.candidate_topk_blocks"), "256 x 4 = 1024 < 2048");
+  require(refused(2048, 256, 8).empty(), "256 x 8 = 2048 holds exactly 2048");
+  // A checkpoint without a candidate stage takes no pool shape.
+  const std::string no_candidates =
+      config_json("\"candidate_source_layer_id\": 20,", "\"candidate_source_layer_id\": -1,");
+  dgpp::Dsv41TextConfig n = parse(no_candidates);
+  require(n.candidate_source_layer_id < 0, "no candidate stage parses");
+  n.apply_index_budget(2048, 0, 0);
+  require(n.index_topk == 2048, "the budget alone applies without a candidate stage");
+  bool rejected = false;
+  try {
+    n.apply_index_budget(0, 2048, 0);
+  } catch (const std::exception& e) {
+    rejected = has(e.what(), "engine.candidate_topk_blocks");
+  }
+  require(rejected, "a pool shape without a candidate stage is refused");
 }

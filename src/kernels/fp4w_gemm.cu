@@ -1,5 +1,6 @@
 // The NVFP4-weight GEMM — see fp4w_gemm.hpp.
 #include <stdexcept>
+#include "kernels/pdl.cuh"
 #include <type_traits>
 
 #include <cuda_bf16.h>
@@ -72,6 +73,7 @@ __global__ __launch_bounds__(thread_count(kWarpN), 1) void fp4w_gemm_kernel(
     const uint8_t* __restrict__ scales, size_t scale_stride, const float* __restrict__ global,
     OutT* __restrict__ out, int m, int n, int k, size_t out_stride, const uint8_t* up_payload,
     const uint8_t* up_scales, const float* up_global) {
+  dgpp_pdl_wait();
   extern __shared__ __align__(128) uint8_t smem[];
   static_assert(kWarpN == 32 || kWarpN == 64);
   constexpr int kThreads = thread_count(kWarpN);

@@ -122,7 +122,9 @@ DGPP_TEST(glm_dsa_tp_geometry_accepts_the_deployment_worlds) {
 
 DGPP_TEST(glm_dsa_binding_matches_the_landed_checkpoint) {
   const auto snap = landed_snapshot();
-  if (snap.empty()) return;
+  if (snap.empty())
+    dgpp::test::skip(
+        "required checkpoint snapshot unavailable: HawkBearPig/GLM-5.3-Int4-Int8Mix-RTN-g64");
   namespace fs = std::filesystem;
   const dgpp::GlmDsaTextConfig cfg = dgpp::GlmDsaTextConfig::from_json_file((snap / "config.json").string());
   std::unordered_map<std::string, dgpp::GlmDsaTensorDesc> present;
@@ -368,7 +370,9 @@ DGPP_TEST(glm_dsa_tp_geometry_under_the_mixed346_group) {
 
 DGPP_TEST(glm_dsa_binding_matches_the_landed_nf4i8_checkpoint) {
   const auto snap = landed_snapshot_of("models--HawkBearPig--GLM-5.3-NF4I8-GPTQ-H32-g128");
-  if (snap.empty()) return;
+  if (snap.empty())
+    dgpp::test::skip(
+        "required checkpoint snapshot unavailable: HawkBearPig/GLM-5.3-NF4I8-GPTQ-H32-g128");
   namespace fs = std::filesystem;
   const dgpp::GlmDsaTextConfig cfg = dgpp::GlmDsaTextConfig::from_json_file((snap / "config.json").string());
   std::unordered_map<std::string, dgpp::GlmDsaTensorDesc> present;

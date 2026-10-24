@@ -1,0 +1,24 @@
+{
+  "model": "HawkBearPig/flint-FP8-NVFP4",
+  "world_size": 4,
+  "release": "",
+  "engine": {
+    "max_concurrency": 8,
+    "kv_capacity": 524288,
+    "kv_dtype": "bf16",
+    "bf16_weights": "bf12",
+    "default_max_tokens": 32768,
+    "queue_limit": 8,
+    "max_connections": 64,
+    "decode_graph": true,
+    "mtp": false,
+    "prefix_cache_gib": 3,
+    "admission": "full",
+    "admission_window": 256,
+    "sampling_candidates": 128,
+    "stats_interval_s": 10
+  },
+  "paths": {
+    "resident_cache": ""
+  }
+}

@@ -431,24 +431,26 @@ DGPP_TEST(pick_batch_draft_selects_last_accepted_row_per_request) {
 }
 
 DGPP_TEST(spec_positions_rows64_fills_upper_half_and_rejects_overflow) {
+  // The batch's row bound is dgpp::kPickMaxRows (64 until 2026-10-23, 96 since:
+  // sixteen DSpark slots at the five-row block + the six-row block).
   const int64_t start = 1234;
   auto* pos = device_alloc<int64_t>(1);
-  auto* out = device_alloc<int64_t>(64);
+  auto* out = device_alloc<int64_t>(dgpp::kPickMaxRows);
   DGPP_CUDA_OK(cudaMemcpy(pos, &start, sizeof(start), cudaMemcpyHostToDevice));
-  DGPP_CUDA_OK(cudaMemset(out, 0xff, 64 * sizeof(int64_t)));
-  dgpp::glm_spec_positions(pos, 64, INT64_MAX, out, nullptr);
-  std::vector<int64_t> got(64);
-  DGPP_CUDA_OK(cudaMemcpy(got.data(), out, 64 * sizeof(int64_t), cudaMemcpyDeviceToHost));
-  for (int r = 0; r < 64; ++r) require(got[r] == start + r, "64-row position coverage");
+  DGPP_CUDA_OK(cudaMemset(out, 0xff, dgpp::kPickMaxRows * sizeof(int64_t)));
+  dgpp::glm_spec_positions(pos, dgpp::kPickMaxRows, INT64_MAX, out, nullptr);
+  std::vector<int64_t> got(dgpp::kPickMaxRows);
+  DGPP_CUDA_OK(cudaMemcpy(got.data(), out, dgpp::kPickMaxRows * sizeof(int64_t), cudaMemcpyDeviceToHost));
+  for (int r = 0; r < dgpp::kPickMaxRows; ++r) require(got[r] == start + r, "full-row position coverage");
   bool rejected = false;
   try {
-    dgpp::glm_spec_positions(pos, 65, INT64_MAX, out, nullptr);
+    dgpp::glm_spec_positions(pos, dgpp::kPickMaxRows + 1, INT64_MAX, out, nullptr);
   } catch (const std::invalid_argument&) {
     rejected = true;
   }
   require(rejected, "positions reject a row beyond capacity");
   PickVerdict verdict;
-  for (int r = 0; r < 64; ++r) require(verdict.winners[r] == -1, "winner sentinel in every row");
+  for (int r = 0; r < dgpp::kPickMaxRows; ++r) require(verdict.winners[r] == -1, "winner sentinel in every row");
   std::vector<int64_t> positions(16);
   std::vector<int32_t> ids(64);
   for (int q = 0; q < 16; ++q) positions[q] = q == 11 ? 0 : 100 + q * 10;

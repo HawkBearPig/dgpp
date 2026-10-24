@@ -404,4 +404,12 @@ class QwenLayerStream : public ResidentLayerStream<QwenLoaderFamily> {
   void* table_device_ = nullptr;
 };
 
+// ModelOpt NVFP4 CSF sidecar expansion (loader.cpp): `fixed` is the
+// [rows/16, 16*(1+cols/2)] uint8 stream and `exc` the exception words;
+// returns the plain [rows, cols] E4M3 plane. Throws std::runtime_error on
+// any geometry or content violation.
+std::vector<uint8_t> qwen_csf_scales_expand(const uint8_t* fixed, size_t fixed_bytes,
+                                            const uint32_t* exc, size_t exc_count, int64_t rows,
+                                            int64_t cols);
+
 }  // namespace dgpp

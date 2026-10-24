@@ -174,10 +174,15 @@ class GrammarVocab {
   // the DSML spelling is the family's, not the tokenizer's (a DeepSeek-V4
   // checkpoint passes DsmlDialect::kV4; it must agree with the frontend's
   // markers, which the parser reads).
+  // dsml_dialect and model_opens_thinking are the family's declarations
+  // (ChatMarkers): the tokenizer cannot tell the two DeepSeek families
+  // apart, and whether the model opens its own <think> is the family's
+  // statement, not a prompt's.
   static GrammarVocab from_tokenizer(const Tokenizer& tok,
                                      const std::vector<int64_t>& eos_ids,
                                      int vocab_size,
-                                     DsmlDialect dsml_dialect = DsmlDialect::kV41);
+                                     DsmlDialect dsml_dialect = DsmlDialect::kV41,
+                                     bool model_opens_thinking = false);
 
   int vocab_size() const { return vocab_size_; }
   const ChatMarkers& markers() const { return markers_; }

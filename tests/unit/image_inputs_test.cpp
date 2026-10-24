@@ -356,7 +356,7 @@ DGPP_TEST(qwen_vision_config_geometry_ids_and_refusals) {
   require(c.eps == dgpp::QwenVisionConfig::kLayerNormEps &&
               c.rope_theta == dgpp::QwenVisionConfig::kRopeTheta,
           "an absent eps and theta take the library defaults");
-  require(c.weight_bytes() == 897880544, "the vision weight budget");
+  require(c.weight_bytes() == 897862112, "the vision weight budget");
   require(c.workspace_bytes() > c.weight_bytes() / 32 && c.workspace_bytes() < c.weight_bytes(),
           "the workspace is a fraction of the tower");
   require(dgpp::QwenVisionConfig::kGrid == dgpp::kQwenImageGrid &&

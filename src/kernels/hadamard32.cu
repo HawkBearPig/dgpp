@@ -1,4 +1,5 @@
 #include "kernels/hadamard32.hpp"
+#include "kernels/pdl.cuh"
 
 #include <stdexcept>
 
@@ -12,6 +13,7 @@ namespace {
 __global__ void hadamard32_rows_kernel(const uint16_t* __restrict__ in, size_t in_stride,
                                        uint16_t* __restrict__ out, size_t out_stride, int rows,
                                        int k, int period) {
+  dgpp_pdl_wait();
   const int blocks_per_row = k / kHadamard32Block;
   const long long b = static_cast<long long>(blockIdx.x) * (blockDim.x >> 5) + (threadIdx.x >> 5);
   const long long total = static_cast<long long>(rows) * blocks_per_row;
@@ -33,6 +35,7 @@ __global__ void hadamard32_quant_int8_kernel(const uint16_t* __restrict__ in, si
                                              int8_t* __restrict__ codes, size_t code_stride,
                                              float* __restrict__ scales, size_t scale_stride, int rows,
                                              int k, int period) {
+  dgpp_pdl_wait();
   const int groups_per_row = k / 128;
   const long long g = static_cast<long long>(blockIdx.x) * (blockDim.x >> 5) + (threadIdx.x >> 5);
   const long long total = static_cast<long long>(rows) * groups_per_row;

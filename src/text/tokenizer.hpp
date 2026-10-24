@@ -152,7 +152,7 @@ class Tokenizer {
   uint64_t revision_hash_ = 0;
   int64_t max_id_ = -1;
   // The pinned shape this file matched at load.
-  int pattern_ = 0;            // 0: the GLM regex, 1: the Qwen3.8 regex, 2: the DeepSeek-V4.1 three-stage sequence, 3: the Qwen2 regex (MiMo)
+  int pattern_ = 0;            // 0: the GLM regex, 1: the Qwen3.8 regex, 2: the DeepSeek-V4.1 three-stage sequence, 3: the Qwen2 regex (MiMo), 4: the Flint three-stage sequence (the o200k main pattern)
   bool nfc_ = false;           // normalizer NFC (Qwen)
   bool ignore_merges_ = true;  // model.ignore_merges
 };

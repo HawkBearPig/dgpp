@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <format>
 #include <stdexcept>
 
@@ -126,8 +127,21 @@ void parse_quantization(const minijson::Value& root, Dsv41TextConfig& c) {
            "missing — the engine serves the release's own mixed fp8 / fp4 format "
            "(docs/deepseek_v41_flash_plan.md §0.1); a BF16 checkpoint has no expert path here");
   if (!qc->is_object()) reject("quantization_config", "not an object");
-  if (const std::string m = optional_string(*qc, "quant_method", ""); m != "fp8")
-    reject("quantization_config.quant_method", "only the release's fp8 method is implemented, got '" + m + "'");
+  const std::string method = optional_string(*qc, "quant_method", "");
+  if (method == "exl3") {
+    // The EXL3 trellis pack (docs/deepseek_v41_flash_exl3_plan.md): the mul1
+    // codebook is the one the kernels decode; the widths come from the
+    // k-map (parse_exl3_k_map). The fp8 / fp4 block sizes stay at the
+    // release's values for the Engram tables (fp8 e4m3 + e8m0 per 32).
+    if (const std::string cb = optional_string(*qc, "codebook", ""); cb != "mul1")
+      reject("quantization_config.codebook", "the EXL3 kernels decode the mul1 codebook, got '" + cb + "'");
+    c.weights_exl3 = true;
+    c.fp8_block_size = 32;
+    c.fp4_block_size = 32;
+    return;
+  }
+  if (method != "fp8")
+    reject("quantization_config.quant_method", "the release's fp8 method and the EXL3 pack are implemented, got '" + method + "'");
   if (const std::string a = optional_string(*qc, "activation_scheme", "dynamic"); a != "dynamic")
     reject("quantization_config.activation_scheme", "only dynamic is implemented, got '" + a + "'");
   if (const std::string s = optional_string(*qc, "scale_fmt", ""); s != "ue8m0")
@@ -153,6 +167,89 @@ void parse_quantization(const minijson::Value& root, Dsv41TextConfig& c) {
   require_absent(*qc, "config_groups", "a compressed-tensors layout is not the release format the loader reads");
 }
 
+// exl3_k_map.json (the serving kit's schema, shipped by the pack): the
+// routed and shared widths per backbone layer (shared_overrides on top),
+// the Engram wkv widths per Engram layer, and one width each for the
+// attention stack, the indexer wk, the head and everything under mtp.
+void parse_exl3_k_map(const minijson::Value* km, Dsv41TextConfig& c) {
+  if (!c.weights_exl3) return;
+  if (km == nullptr || !km->is_object())
+    reject("exl3_k_map.json",
+           "an EXL3 pack needs its exl3_k_map.json beside config.json (the per-layer widths the binding "
+           "table states; the serving kit's schema)");
+  auto bits_ok = [](int b) { return b >= 1 && b <= 8; };
+  auto per_layer = [&](const char* key, std::vector<int>& out) {
+    const minijson::Value& v = require(*km, key);
+    if (!v.is_object()) reject(std::string("exl3_k_map.") + key, "not an object of layer -> bits");
+    out.assign(static_cast<size_t>(c.num_hidden_layers), 0);
+    for (const auto& m : v.members()) {
+      int layer = 0;
+      try {
+        layer = std::stoi(std::string(m.key));
+      } catch (...) {
+        reject(std::string("exl3_k_map.") + key, "a key is not a layer index: " + std::string(m.key));
+      }
+      if (layer < 0 || layer >= c.num_hidden_layers)
+        reject(std::string("exl3_k_map.") + key, std::format("layer {} outside the backbone", layer));
+      if (!m.value.is_number() || !bits_ok(static_cast<int>(m.value.as_int())))
+        reject(std::string("exl3_k_map.") + key, std::format("layer {}: the width must be an integer 1..8", layer));
+      out[static_cast<size_t>(layer)] = static_cast<int>(m.value.as_int());
+    }
+    for (int l = 0; l < c.num_hidden_layers; ++l)
+      if (out[static_cast<size_t>(l)] == 0) reject(std::string("exl3_k_map.") + key, std::format("layer {} has no width", l));
+  };
+  if (const std::string cb = optional_string(*km, "codebook", "mul1"); cb != "mul1")
+    reject("exl3_k_map.codebook", "the EXL3 kernels decode the mul1 codebook, got '" + cb + "'");
+  if (const int nl = optional_int(*km, "num_hidden_layers", c.num_hidden_layers); nl != c.num_hidden_layers)
+    reject("exl3_k_map.num_hidden_layers", std::format("{} != config's {}", nl, c.num_hidden_layers));
+  per_layer("routed", c.exl3.routed);
+  per_layer("shared", c.exl3.shared);
+  if (const minijson::Value* ov = km->find("shared_overrides"); ov && ov->is_object()) {
+    for (const auto& m : ov->members()) {
+      const int layer = std::stoi(std::string(m.key));
+      if (layer < 0 || layer >= c.num_hidden_layers || !m.value.is_number() ||
+          !bits_ok(static_cast<int>(m.value.as_int())))
+        reject("exl3_k_map.shared_overrides", "a layer outside the backbone or a width outside 1..8");
+      c.exl3.shared[static_cast<size_t>(layer)] = static_cast<int>(m.value.as_int());
+    }
+  }
+  c.exl3.engram.assign(c.engram_layer_ids.size(), 0);
+  if (!c.engram_layer_ids.empty()) {
+    const minijson::Value& v = require(*km, "engram");
+    if (!v.is_object()) reject("exl3_k_map.engram", "not an object of layer -> bits");
+    for (const auto& m : v.members()) {
+      const int layer = std::stoi(std::string(m.key));
+      const int idx = c.engram_index(layer);
+      if (idx < 0 || !m.value.is_number() || !bits_ok(static_cast<int>(m.value.as_int())))
+        reject("exl3_k_map.engram", std::format("layer {} is not an Engram layer or its width is outside 1..8", layer));
+      c.exl3.engram[static_cast<size_t>(idx)] = static_cast<int>(m.value.as_int());
+    }
+    for (size_t i = 0; i < c.exl3.engram.size(); ++i)
+      if (c.exl3.engram[i] == 0) reject("exl3_k_map.engram", std::format("Engram layer {} has no width", c.engram_layer_ids[i]));
+  }
+  c.exl3.attn = require_int(*km, "attn_default");
+  c.exl3.indexer_wk = require_int(*km, "indexer_wk_bits");
+  c.exl3.head = require_int(*km, "head_bits");
+  c.exl3.mtp = require_int(*km, "mtp_bits");
+  for (const auto& [name, b] : {std::pair{"attn_default", c.exl3.attn}, std::pair{"indexer_wk_bits", c.exl3.indexer_wk},
+                                std::pair{"head_bits", c.exl3.head}, std::pair{"mtp_bits", c.exl3.mtp}})
+    if (!bits_ok(b)) reject(std::string("exl3_k_map.") + name, "the width must be an integer 1..8");
+  // The rotation block: every matrix axis a multiple of 128 (the plan's §2.3).
+  auto block = [&](const char* what, int64_t v) {
+    if (v % 128 != 0) reject(what, std::format("{} must be a multiple of 128 under the EXL3 format (the rotation block)", v));
+  };
+  block("text_config.hidden_size", c.hidden_size);
+  block("text_config.q_lora_rank", c.q_lora_rank);
+  block("text_config.o_lora_rank", c.o_lora_rank);
+  block("text_config.moe_intermediate_size", c.moe_intermediate_size);
+  block("text_config.vocab_size", c.vocab_size);
+  block("text_config.head_dim", c.head_dim);
+  block("text_config.index_head_dim", c.index_head_dim);
+  block("text_config.num_attention_heads x head_dim / o_groups",
+        static_cast<int64_t>(c.num_attention_heads) * c.head_dim / c.o_groups);
+  if (!c.engram_layer_ids.empty()) block("engram head_dim", c.engram_head_dim);
+}
+
 void parse_vision(const minijson::Value& root, Dsv41TextConfig& c) {
   const minijson::Value* vc = root.find("vision_config");
   if (!vc || vc->is_null()) {
@@ -174,7 +271,7 @@ void parse_vision(const minijson::Value& root, Dsv41TextConfig& c) {
 
 }  // namespace
 
-Dsv41TextConfig Dsv41TextConfig::parse(const minijson::Value& root) {
+Dsv41TextConfig Dsv41TextConfig::parse(const minijson::Value& root, const minijson::Value* exl3_k_map) {
   if (!root.is_object()) reject("", "root is not an object");
   Dsv41TextConfig c;
   const std::string model_type = optional_string(root, "model_type", "deepseek_v41");
@@ -319,10 +416,7 @@ Dsv41TextConfig Dsv41TextConfig::parse(const minijson::Value& root) {
   c.index_topk = require_int(t, "index_topk");
   if (c.index_n_heads <= 0) reject("text_config.index_n_heads", "must be positive");
   if (c.index_head_dim != 128) reject("text_config.index_head_dim", "the indexer implements 128 (the index cache row)");
-  if (c.index_topk <= 0 || (c.index_topk & (c.index_topk - 1)) != 0 || c.index_topk > 2048)
-    reject("text_config.index_topk", "must be a power of two <= 2048 (the select networks)");
-  if (c.candidate_source_layer_id >= 0 && c.candidate_pool_entries() < c.index_topk)
-    reject("text_config.candidate_topk_blocks", "the candidate pool must hold at least index_topk entries");
+  c.check_index_budget("text_config.");
   if (c.qk_rope_head_dim > c.index_head_dim) reject("text_config.qk_rope_head_dim", "exceeds index_head_dim");
 
   // --- mHC ------------------------------------------------------------------------
@@ -409,6 +503,7 @@ Dsv41TextConfig Dsv41TextConfig::parse(const minijson::Value& root) {
   }
 
   parse_quantization(root, c);
+  parse_exl3_k_map(exl3_k_map, c);
   parse_vision(root, c);
   return c;
 }
@@ -416,7 +511,50 @@ Dsv41TextConfig Dsv41TextConfig::parse(const minijson::Value& root) {
 Dsv41TextConfig Dsv41TextConfig::from_json_file(const std::string& path) {
   const std::string json = read_file(path);
   const auto parsed = minijson::parse(json);
+  // An EXL3 pack's k-map sits beside config.json.
+  const minijson::Value* qc = parsed.root.find("quantization_config");
+  if (qc && qc->is_object() && optional_string(*qc, "quant_method", "") == "exl3") {
+    const std::filesystem::path km = std::filesystem::path(path).parent_path() / "exl3_k_map.json";
+    if (!std::filesystem::exists(km))
+      reject("exl3_k_map.json", "an EXL3 pack needs its exl3_k_map.json beside config.json (missing from " +
+                                    km.parent_path().string() + ")");
+    // The parsed values view the JSON text: keep it alive through parse()
+    // (a temporary here left every k-map string dangling on the real pack).
+    const std::string kjson = read_file(km.string());
+    const auto kparsed = minijson::parse(kjson);
+    return parse(parsed.root, &kparsed.root);
+  }
   return parse(parsed.root);
+}
+
+void Dsv41TextConfig::check_index_budget(std::string_view where) const {
+  const auto field = [&](const char* name) { return std::string(where) + name; };
+  if (index_topk <= 0 || (index_topk & (index_topk - 1)) != 0 || index_topk > 2048)
+    reject(field("index_topk"), "must be a power of two <= 2048 (the select networks)");
+  if (candidate_source_layer_id >= 0) {
+    if (candidate_topk_blocks <= 0 || (candidate_topk_blocks & (candidate_topk_blocks - 1)) != 0 ||
+        candidate_topk_blocks > 2048)
+      reject(field("candidate_topk_blocks"), "must be a power of two <= 2048 (the candidate select's bound)");
+    if (candidate_block_size <= 0) reject(field("candidate_block_size"), "must be positive with a candidate source");
+    if (candidate_pool_entries() < index_topk)
+      reject(field("candidate_topk_blocks"), "the candidate pool must hold at least index_topk entries");
+  }
+}
+
+void Dsv41TextConfig::apply_index_budget(int index_topk_override, int candidate_topk_blocks_override,
+                                         int candidate_block_size_override) {
+  if (index_topk_override > 0) index_topk = index_topk_override;
+  if (candidate_topk_blocks_override > 0) {
+    if (candidate_source_layer_id < 0)
+      reject("engine.candidate_topk_blocks", "this checkpoint has no candidate stage (candidate_source_layer_id)");
+    candidate_topk_blocks = candidate_topk_blocks_override;
+  }
+  if (candidate_block_size_override > 0) {
+    if (candidate_source_layer_id < 0)
+      reject("engine.candidate_block_size", "this checkpoint has no candidate stage (candidate_source_layer_id)");
+    candidate_block_size = candidate_block_size_override;
+  }
+  check_index_budget("engine.");
 }
 
 bool Dsv41TextConfig::is_kv_source(int l) const { return contains(kv_source_layer_ids, l); }
@@ -467,6 +605,7 @@ GlmMoeConfig Dsv41TextConfig::moe_config(int local_inter, bool draft) const {
   m.norm_topk_prob = norm_topk_prob;
   m.swiglu_limit = swiglu_limit;
   m.router_mode = scoring_func == "sigmoid" ? MoeRouterMode::SigmoidBias : MoeRouterMode::SqrtSoftplusBias;
+  m.exl3_experts = weights_exl3;  // the rotated-row copies the EXL3 kernels read (models/glm/moe.hpp)
   GlmMoeConfig::validate_config(m);
   return m;
 }

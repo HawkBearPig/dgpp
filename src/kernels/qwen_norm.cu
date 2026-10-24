@@ -1,4 +1,5 @@
 #include "kernels/qwen_norm.hpp"
+#include "kernels/pdl.cuh"
 
 #include <stdexcept>
 
@@ -13,6 +14,7 @@ namespace {
 __global__ void rmsnorm_kernel(const uint16_t* __restrict__ x,
                                const uint16_t* __restrict__ weight,
                                uint16_t* __restrict__ y, int dim, float eps) {
+  dgpp_pdl_wait();
   extern __shared__ float staged[];
   __shared__ float warp_sums[32];
   const int64_t row = blockIdx.x;
@@ -33,6 +35,7 @@ __global__ void add_rmsnorm_kernel(uint16_t* __restrict__ resid,
                                    const uint16_t* __restrict__ add,
                                    const uint16_t* __restrict__ weight,
                                    uint16_t* __restrict__ y, int dim, float eps) {
+  dgpp_pdl_wait();
   extern __shared__ float staged[];
   __shared__ float warp_sums[32];
   const int64_t row = blockIdx.x;
@@ -97,6 +100,7 @@ __global__ void group_rmsnorm_kernel(const uint16_t* __restrict__ x,
                                      const NormW* __restrict__ weight,
                                      uint16_t* __restrict__ y, int groups,
                                      int group_dim, float eps) {
+  dgpp_pdl_wait();
   extern __shared__ float staged[];
   __shared__ float warp_sums[32];
   const int64_t row = blockIdx.x;
@@ -118,6 +122,7 @@ __global__ void gated_rmsnorm_kernel(const uint16_t* __restrict__ x,
                                      const uint16_t* __restrict__ gate,
                                      const uint16_t* __restrict__ weight,
                                      uint16_t* __restrict__ y, int dim, float eps) {
+  dgpp_pdl_wait();
   extern __shared__ float staged[];
   __shared__ float warp_sums[32];
   const int64_t row = blockIdx.x;
@@ -205,6 +210,7 @@ __global__ void gated_rmsnorm_swish_kernel(const uint16_t* __restrict__ x,
                                            const uint16_t* __restrict__ gate,
                                            const uint16_t* __restrict__ weight,
                                            uint16_t* __restrict__ y, int dim, float eps) {
+  dgpp_pdl_wait();
   extern __shared__ float staged[];
   __shared__ float warp_sums[32];
   const int64_t row = blockIdx.x;

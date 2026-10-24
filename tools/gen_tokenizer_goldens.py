@@ -256,6 +256,34 @@ MIMO_CASES = QWEN_CASES + [
 ]
 
 
+# The Flint corpus (2026-10-22, docs/flint_plan.md §1.6): the DeepSeek
+# three-stage shape (number runs of at most three, the CJK ranges) with
+# the o200k main pattern over the case classes — upper runs (Lu, Lt, Lm,
+# Lo, M) before lower runs (Ll, Lm, Lo, M) with the contraction suffix —
+# and Flint's own added tokens (the GLM-style role and tool markers).
+FLINT_EOS = "<|" + "end_of_text|>"
+FLINT_CASES = [c for c in CASES if c != EOS and EOS not in c] + [
+    FLINT_EOS, "<|" + "begin_of_text|>", "<|" + "system|>", "<|" + "developer|>", "<|" + "observation|>",
+    FLINT_EOS + THINK_OPEN + " e" + THINK_CLOSE + USER + "u" + ASSIST,
+    "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call>",
+    "<|" + "observation|><tool_response>{\"temp\": 21}</tool_response>",
+    "<tools>\n{\"name\": \"f\"}\n</tools>",
+    # The case classes: capitalized words, all-caps, camelCase, mixed
+    # runs, titlecase and Lm / Lo scripts, marks inside words, the
+    # contraction after an upper run.
+    "HELLO World hello WORLD's ISN'T MacDonald's", "ABCdef abcDEF AbCdEf", "ǅungla ǈubav",
+    "ﬁne ﬂow", "x\u02b0y ʰ ʳ", "สวัสดี ครับ", "مرحباً بكم", "a\u0301b\u0302c", "\u0301abc", "x\u20dd y",
+    "ÀÉÎÕÜ àéîõü Ñandú", "Straße STRASSE", "中文English混合Text日本語テキスト", "abc123def 12345678 x9y",
+    "I'M 'LL 'rE 'VE we'D", "ΑΒΓ αβγ Αβγ", "ПРИВЕТ Привет привет",
+    # The backtracking seams: a shared-class run (Thai, Lo) before capitals
+    # cuts after the last shared character; capitals before it join; a
+    # mark before capitals stands alone; a mark before lowercase joins.
+    "\u0e17ABC", "A\u0e17B", "ABC\u0e17", "\u0e17\u0e17AB\u0e17", "\u0301ABC", "\u0301abc", "\u0301\u0302x", "\u0301!",
+    "ISN'T aBc ÀBc ǅx xǅ ǅ", " ÀB", " \u0e17A", "x\u0e17y", "ABC'S abc's",
+    "a.b,c;d:e", "x->y => z", "(a) [b] {c}", "#tag @user $5 50%",
+]
+
+
 def main():
     import argparse
     ap = argparse.ArgumentParser()
@@ -266,12 +294,14 @@ def main():
     args = ap.parse_args()
     model = args.model
     is_mimo = "MiMo" in model
+    is_flint = "flint" in model.lower()
     is_qwen = "Qwen" in model or is_mimo  # NFC tokenizers
     is_dsv4 = "DeepSeek-V4-" in model  # DeepSeek-V4-Flash-0731 (model_type deepseek_v4), not V4.1
     is_dsv41 = "DeepSeek-V4" in model and not is_dsv4
-    cases = (DSV4_CASES if is_dsv4 else DSV41_CASES if is_dsv41 else MIMO_CASES if is_mimo
+    cases = (FLINT_CASES if is_flint else DSV4_CASES if is_dsv4 else DSV41_CASES if is_dsv41 else MIMO_CASES if is_mimo
              else QWEN_CASES if is_qwen else CASES)
     out_path = args.out_opt or args.out or (
+        "tests/data/flint_tokenizer_goldens.jsonl" if is_flint else
         "tests/data/dsv4_tokenizer_goldens.jsonl" if is_dsv4 else
         "tests/data/dsv41_tokenizer_goldens.jsonl" if is_dsv41 else
         "tests/data/mimo_tokenizer_goldens.jsonl" if is_mimo else

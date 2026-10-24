@@ -147,7 +147,7 @@ DGPP_TEST(full_attention_matches_the_reference_dense_causal) {
         }
         m = nm;
         l = lnew;
-        acc = anew;
+        acc.swap(anew);
       }
       float* out = ref.data() + static_cast<size_t>(r) * qw + h * D;
       const float inv = l > 0.f ? 1.f / l : 0.f;
@@ -232,7 +232,7 @@ static void ref_head(const std::vector<uint16_t>& q, int row, int h, int req, in
     }
     m = nm;
     l = lnew;
-    acc = anew;
+    acc.swap(anew);
   }
   const float inv = l > 0.f ? 1.f / l : 0.f;
   for (int d = 0; d < D; ++d) out[d] = acc[static_cast<size_t>(d)] * inv;

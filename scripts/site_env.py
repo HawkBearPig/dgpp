@@ -16,7 +16,7 @@ SITE_KEYS = (
     "DGPP_HTTP_PORT", "DGPP_FABRIC_PORT", "DGPP_JOURNAL_PORT",
     "DGPP_LOG_DIR", "DGPP_STAGE_DIR", "DGPP_RELEASE_DIR",
     "DGPP_HTTP_BIND", "DGPP_ROCE_DEVICES", "DGPP_ROCE_GID_INDICES",
-    "HF_HOME", "HF_HUB_CACHE", "DGPP_RESIDENT_CACHE_DIR", "DGPP_NODE_OVERRIDES",
+    "HF_HOME", "HF_HUB_CACHE", "DGPP_RESIDENT_CACHE_DIR", "DGPP_RESIDENT_CACHE_VERIFY", "DGPP_NODE_OVERRIDES",
     "DGPP_BUILD_DIR", "DGPP_DATA_DIR",
     "DGPP_LOG_LEVEL", "DGPP_MLOCK", "DGPP_NO_SWAP",
     # The engine's L2 weight-prefetch knobs (src/kernels/l2_prefetch.hpp); site
@@ -26,13 +26,14 @@ SITE_KEYS = (
     # (DGPP_DSV41_DENSE_GEMV=1 for DeepSeek; DGPP_DENSE_GEMV_ROWS=n for the
     # session-core families, kernels/gemm.hpp): every rank the same, or the
     # ranks' walks differ.
-    "DGPP_BUS_TIMELINE", "DGPP_DSV41_DENSE_GEMV", "DGPP_DENSE_GEMV_ROWS", "DGPP_DSV41_EAGER_FOLD",
+    "DGPP_BUS_TIMELINE", "DGPP_BUS_TIMELINE_DUMP", "DGPP_DSV41_DENSE_GEMV", "DGPP_DENSE_GEMV_ROWS", "DGPP_DSV41_EAGER_FOLD",
 )
 NODE_KEYS = ("DGPP_ROCE_DEVICES", "DGPP_ROCE_GID_INDICES", "HF_HUB_CACHE", "DGPP_RESIDENT_CACHE_DIR",
+    "DGPP_RESIDENT_CACHE_VERIFY",
     "DGPP_LOG_LEVEL", "DGPP_MLOCK", "DGPP_NO_SWAP",
     # The engine's L2 weight-prefetch knobs (src/kernels/l2_prefetch.hpp): an A/B runs
     # with the same setting on every rank.
-    "DGPP_BUS_TIMELINE", "DGPP_DSV41_DENSE_GEMV", "DGPP_DENSE_GEMV_ROWS", "DGPP_DSV41_EAGER_FOLD",
+    "DGPP_BUS_TIMELINE", "DGPP_BUS_TIMELINE_DUMP", "DGPP_DSV41_DENSE_GEMV", "DGPP_DENSE_GEMV_ROWS", "DGPP_DSV41_EAGER_FOLD",
 )
 DEFAULTS = {
     "DGPP_HTTP_PORT": "18080", "DGPP_FABRIC_PORT": "29970",
@@ -278,7 +279,8 @@ def cache_environment(values=None, rank=0):
 def server_config(cfg):
     """Keep launcher-only policy out of the engine's strict JSON schema."""
     return {**cfg, "node_env": [
-        {key: value for key, value in env.items() if key != "DGPP_NO_SWAP"}
+        {key: value for key, value in env.items()
+         if key not in ("DGPP_NO_SWAP", "DGPP_RESIDENT_CACHE_VERIFY")}
         for env in cfg["node_env"]]}
 
 

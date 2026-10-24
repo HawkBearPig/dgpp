@@ -1,13 +1,18 @@
 // The Qwen3.8-27B config parser: the release's values parse, the NVFP4
 // mixed release is accepted as such, and the unsupported shapes are refused
 // by name. The architecture registry detects qwen3_5.
+#include <filesystem>
+#include <fstream>
 #include <stdexcept>
 #include <string>
 
+#include "../common/temp_dir.hpp"
 #include "common/test.hpp"
 #include "loaders/architecture.hpp"
 #include "loaders/minijson.hpp"
+#include "models/qwen/binding35.hpp"
 #include "models/qwen/config35.hpp"
+#include "models/qwen/model35.hpp"
 #include "qwen35_config_json.hpp"
 
 namespace {
@@ -153,6 +158,76 @@ DGPP_TEST(qwen35_config_refusals_name_the_field) {
           "dedicated embeddings");
 }
 
+DGPP_TEST(qwen35_config_vision_geometry_and_text_only_parse) {
+  // Transcribed from unsloth/Qwen3.8-27B-NVFP4's root config, whose 333
+  // model.visual.* BF16 tensors this geometry describes.
+  const std::string root = R"({
+    "image_token_id": 248056, "video_token_id": 248057,
+    "vision_start_token_id": 248053, "vision_end_token_id": 248054,
+    "vision_config": {
+      "deepstack_visual_indexes": [], "depth": 27, "dtype": "bfloat16",
+      "hidden_act": "gelu_pytorch_tanh", "hidden_size": 1152,
+      "in_channels": 3, "initializer_range": 0.02,
+      "intermediate_size": 4304, "model_type": "qwen3_5_vision",
+      "num_heads": 16, "num_position_embeddings": 2304,
+      "out_hidden_size": 5120, "patch_size": 16,
+      "spatial_merge_size": 2, "temporal_patch_size": 2}})";
+  const auto r = dgpp::minijson::parse(root);
+  const auto v = dgpp::QwenVisionConfig::parse(r.root, 5120);
+  require(v.depth == 27 && v.hidden == 1152 && v.heads == 16, "tower dims");
+  require(v.intermediate == 4304 && v.output == 5120, "widths");
+  require(v.tokens.start == 248053 && v.tokens.pad == 248056 && v.tokens.end == 248054,
+          "delimiters");
+  require(v.weight_bytes() == 921460192, "tower bytes");
+  // Parsing text_config alone does not infer a tower; from_json_file reads
+  // the root vision_config and image delimiters separately.
+  const dgpp::Qwen35TextConfig c =
+      parse(qwen35_fixture::text_json(), qwen35_fixture::kQuantFp8);
+  require(!c.vision.has_value(), "vision unset by text parse");
+}
+
+DGPP_TEST(qwen35_config_from_json_file_fills_vision_when_present) {
+  // A root config.json envelope: the fixture text_config plus the release's
+  // vision section. from_json_file is the only path that fills the tower.
+  const std::string root = std::string(R"({"text_config": )") + qwen35_fixture::text_json() +
+                           R"(, "quantization_config": )" + qwen35_fixture::kQuantFp8 + R"(,
+    "image_token_id": 248056, "video_token_id": 248057,
+    "vision_start_token_id": 248053, "vision_end_token_id": 248054,
+    "vision_config": {
+      "deepstack_visual_indexes": [], "depth": 27, "dtype": "bfloat16",
+      "hidden_act": "gelu_pytorch_tanh", "hidden_size": 1152,
+      "in_channels": 3, "initializer_range": 0.02,
+      "intermediate_size": 4304, "model_type": "qwen3_5_vision",
+      "num_heads": 16, "num_position_embeddings": 2304,
+      "out_hidden_size": 5120, "patch_size": 16,
+      "spatial_merge_size": 2, "temporal_patch_size": 2}})";
+  const dgpp::test::TempDir fixture("dgpp_qwen35_vision_test");
+  const auto& dir = fixture.path();
+  const auto path = dir / "config.json";
+  {
+    std::ofstream out(path);
+    require(static_cast<bool>(out), "open temp config");
+    out << root;
+  }
+  const dgpp::Qwen35TextConfig c = dgpp::Qwen35TextConfig::from_json_file(path.string());
+  require(c.vision.has_value(), "tower filled from root");
+  require(c.vision->output == 5120 && c.vision->depth == 27, "tower dims");
+  require(c.vision->tokens.pad == 248056, "image token");
+  std::filesystem::remove_all(dir);
+  // Without the section the export stays text-only.
+  const std::string bare = std::string(R"({"text_config": )") + qwen35_fixture::text_json() +
+                           R"(, "quantization_config": )" + qwen35_fixture::kQuantFp8 + R"(})";
+  std::filesystem::create_directories(dir);
+  {
+    std::ofstream out(path);
+    require(static_cast<bool>(out), "open temp config");
+    out << bare;
+  }
+  const dgpp::Qwen35TextConfig t = dgpp::Qwen35TextConfig::from_json_file(path.string());
+  require(!t.vision.has_value(), "no section stays nullopt");
+  std::filesystem::remove_all(dir);
+}
+
 DGPP_TEST(qwen35_config_rope_ramp_plumbing_is_default_off) {
   // The parser never fills the ramp (only the serving layer sets it, from
   // engine.rope_scaling): tables and ceilings are what they were before it
@@ -186,4 +261,73 @@ DGPP_TEST(qwen35_architecture_detects_the_release) {
   require(std::string(dgpp::model_architecture_name(dgpp::ModelArchitecture::Qwen3_5)) ==
               "qwen3_5",
           "name");
+}
+
+DGPP_TEST(qwen35_config_accepts_modelopt_moe) {
+  const std::string text = qwen35_fixture::moe_text_json();
+  const std::string quant = qwen35_fixture::kQuantModeloptNvfp4;
+  const auto t = dgpp::minijson::parse(text);
+  const auto q = dgpp::minijson::parse(quant);
+  const dgpp::Qwen35TextConfig c = dgpp::Qwen35TextConfig::parse(t.root, &q.root);
+  require(c.is_moe, "moe");
+  require(c.hidden_size == 3072, "hidden");
+  require(c.num_hidden_layers == 48, "layers");
+  require(c.num_gdn_layers() == 36, "gdn count");
+  require(c.num_full_layers() == 12, "full count");
+  require(c.num_experts == 256 && c.num_experts_per_tok == 8, "experts");
+  require(c.moe_intermediate_size == 1024 && c.shared_expert_intermediate_size == 1024,
+          "inter");
+  require(c.norm_topk_prob, "norm_topk default");
+  require(c.quant_kind == dgpp::Qwen35QuantKind::Nvfp4Moe, "quant kind");
+  using Q = dgpp::Qwen35TensorQuant;
+  // ModelOpt glob ignore keeps attention/shared/head BF16; experts claim NVFP4.
+  require(c.tensor_quant("model.language_model.layers.0.mlp.experts.0.gate_proj") == Q::Nvfp4,
+          "expert fp4");
+  require(c.tensor_quant("model.language_model.layers.0.linear_attn.in_proj_qkv") == Q::Bf16,
+          "gdn bf16");
+  require(c.tensor_quant("model.language_model.layers.3.self_attn.q_proj") == Q::Bf16,
+          "attn bf16");
+  require(c.tensor_quant("model.language_model.layers.0.mlp.shared_expert.gate_proj") ==
+              Q::Bf16,
+          "shared bf16");
+  require(c.tensor_quant("lm_head") == Q::Bf16, "head bf16");
+  require(c.tensor_quant("mtp.layers.0.mlp.experts.0.gate_proj") == Q::Bf16, "mtp bf16");
+  dgpp::qwen35_tp_validate_geometry(c, 0, 1);
+  dgpp::qwen35_tp_validate_geometry(c, 3, 4);
+}
+
+DGPP_TEST(qwen35_image_spans_must_name_pad_ids) {
+  // Prompt: text text [pad pad pad] text. The pad id is 248056.
+  const std::vector<int64_t> ids = {1, 2, 248056, 248056, 248056, 3};
+  dgpp::ImageInput im;
+  im.offset = 2;
+  im.tokens = 3;
+  const std::vector<dgpp::ImageInput> one = {im};
+  dgpp::qwen35_check_image_pads(ids, 0, one, 248056);  // must not throw
+  const std::vector<int64_t> suffix = {248056, 248056, 3};  // positions 3, 4, 5
+  dgpp::qwen35_check_image_pads(suffix, 3, one, 248056);    // resume mid-span: fine
+  bool threw = false;
+  try {
+    dgpp::qwen35_check_image_pads(ids, 3, one, 248056);  // full ids at a suffix start
+  } catch (const std::invalid_argument&) {
+    threw = true;
+  }
+  require(threw, "positions misaligned with the chunk fail");
+  threw = false;
+  try {
+    std::vector<int64_t> wrong = ids;
+    wrong[3] = 7;
+    dgpp::qwen35_check_image_pads(wrong, 0, one, 248056);  // a non-pad inside
+  } catch (const std::invalid_argument&) {
+    threw = true;
+  }
+  require(threw, "non-pad inside the span fails");
+  threw = false;
+  try {
+    std::vector<int64_t> short_ids = {1, 2, 248056};
+    dgpp::qwen35_check_image_pads(short_ids, 0, one, 248056);  // span overruns ids
+  } catch (const std::invalid_argument&) {
+    threw = true;
+  }
+  require(threw, "span past the ids fails");
 }

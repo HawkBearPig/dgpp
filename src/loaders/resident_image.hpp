@@ -23,8 +23,9 @@
 // blobs. A layer's entry is published AFTER its blob is fully written and
 // synced, so a crash mid-write leaves that layer absent (rebuilt and
 // re-appended next time) and never a torn blob with a valid entry. Every
-// entry carries a 64-bit word fold of its blob; verification on read is
-// opt-in (it costs a pass over 82 GiB).
+// entry carries a 64-bit word fold of its blob, verified on read by default.
+// DGPP_RESIDENT_CACHE_VERIFY=0 skips this payload pass; structural checks
+// always apply.
 //
 // Bitwise: the restored bytes ARE the built bytes — glm_loader_test pins a
 // build-vs-restore round trip byte-for-byte on the fixture.
@@ -39,6 +40,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -52,6 +54,18 @@ class ResidentImage {
   // absent; a file whose header disagrees (version, key, layer count) is
   // replaced. Throws std::runtime_error on I/O failure.
   ResidentImage(const std::string& dir, uint64_t key, int layers);
+  // Opens the image at `key` and reconciles it with the checkpoint's weight
+  // identity `payload` (the loader's fold of its shards' payload samples,
+  // kept beside the image as the `payload` note). The key covers
+  // config.json and the shard HEADERS, so a release that re-ships the same
+  // tensors in the same shards with other values keys to the same file
+  // (DeepSeek-V4.1-Flash-1017 against DeepSeek-V4.1-Flash, 2026-10-18): an
+  // image whose note disagrees is discarded with its notes and recreated
+  // empty (`replaced` reports it); an image without the note — built
+  // before this check — adopts the identity. Throws as the constructor.
+  static std::unique_ptr<ResidentImage> open_for(const std::string& dir, uint64_t key, int layers,
+                                                 uint64_t payload, bool* replaced);
+  static constexpr const char* kPayloadNoteName = "payload";
   ~ResidentImage();
   ResidentImage(const ResidentImage&) = delete;
   ResidentImage& operator=(const ResidentImage&) = delete;
@@ -62,11 +76,19 @@ class ResidentImage {
   size_t layer_bytes(int layer) const;  // 0 when absent
   const std::string& path() const { return path_; }
 
+  // Only an explicit "0" disables payload verification.
+  static bool verification_enabled();
+
   // pread the layer's blob into `dst` (`bytes` must equal layer_bytes).
   // `verify` re-folds the bytes against the entry. Throws on mismatch.
   // `dst` should be 4 KiB-aligned to take the direct path (pinned
   // allocations are); anything else reads buffered, correctly but slower.
-  void read_layer(int layer, void* dst, size_t bytes, bool verify) const;
+  void read_layer(int layer, void* dst, size_t bytes, bool verify = verification_enabled()) const;
+
+  // Recoverable cache read for loaders: absent, stale, unreadable or corrupt
+  // layers return false and are marked absent. The caller must rebuild before
+  // using dst, which may contain a partial or rejected read.
+  bool try_read_layer(int layer, void* dst, size_t bytes);
 
   // Appends the blob at the next 4 KiB boundary, fdatasyncs, then
   // publishes the entry. An already-present layer is rewritten (new blob,

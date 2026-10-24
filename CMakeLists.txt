@@ -182,6 +182,7 @@ add_library(dgpp_kernels STATIC
   src/kernels/bf12_gemv.cu
   src/kernels/bf12_companions.cpp
   src/kernels/mma_gemv.cu
+  src/kernels/exl3_gemv.cu
   src/kernels/dense_mma_bf16w.cu
   src/kernels/dense_fp4_decode.cu
   src/kernels/l2_prefetch.cu
@@ -207,12 +208,13 @@ add_library(dgpp_kernels STATIC
   src/kernels/dflash2.cu
   src/kernels/qsa.cu
   src/kernels/qsa_warp.cu
+  src/kernels/qsa_fp8.cu
   src/kernels/qsa_prefill.cu
   src/kernels/full_attn.cu
   src/kernels/glm4_attn.cu
-  src/kernels/mimo_attn.cu
+  src/kernels/sink_attn.cu
   src/kernels/mimo_mtp_history.cu
-  src/kernels/mimo_attn_prefill.cu
+  src/kernels/sink_attn_prefill.cu
   src/kernels/add_rmsnorm.cu)
 target_link_libraries(dgpp_kernels PUBLIC CUDA::cudart CUDA::cublasLt CUDA::cuda_driver dgpp_core dgpp_rope_scaling)
 dgpp_set_common(dgpp_kernels)
@@ -320,6 +322,16 @@ target_include_directories(dgpp_models_mimo PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/s
 target_link_libraries(dgpp_models_mimo PUBLIC dgpp_loaders dgpp_common)
 dgpp_set_common(dgpp_models_mimo)
 
+# Flint (2026-10-22, docs/flint_plan.md): the host-side config, binding
+# table and attention oracle.
+add_library(dgpp_models_flint STATIC
+  src/models/flint/config.cpp
+  src/models/flint/binding.cpp
+  src/models/flint/attn_reference.cpp)
+target_include_directories(dgpp_models_flint PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(dgpp_models_flint PUBLIC dgpp_loaders dgpp_common)
+dgpp_set_common(dgpp_models_flint)
+
 # The MiMo resident loader (loaders/resident_stream.hpp + the family's builders).
 add_library(dgpp_models_mimo_loader STATIC
   src/models/mimo/loader.cpp)
@@ -327,16 +339,42 @@ target_include_directories(dgpp_models_mimo_loader PUBLIC ${CMAKE_CURRENT_SOURCE
 target_link_libraries(dgpp_models_mimo_loader PUBLIC dgpp_models_mimo dgpp_loaders CUDA::cudart dgpp_device_ranges)
 dgpp_set_common(dgpp_models_mimo_loader)
 
+# The Flint loader (docs/flint_plan.md §2): the shared resident stream over
+# the family's bindings and TP geometry.
+add_library(dgpp_models_flint_loader STATIC
+  src/models/flint/loader.cpp)
+target_include_directories(dgpp_models_flint_loader PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(dgpp_models_flint_loader PUBLIC dgpp_models_flint dgpp_loaders CUDA::cudart dgpp_device_ranges)
+dgpp_set_common(dgpp_models_flint_loader)
+
 # The MiMo layer objects and model (the paged K/V pool first; the layers
 # and the model follow).
+# The paged K/V pool the MiMo and Flint families share (bf16 or fp8 rows
+# per (token, kv head) at the family's head widths).
+add_library(dgpp_models_mimo_kv STATIC
+  src/models/mimo/kv_pool.cpp)
+target_include_directories(dgpp_models_mimo_kv PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(dgpp_models_mimo_kv PUBLIC dgpp_kernels CUDA::cudart)
+dgpp_set_common(dgpp_models_mimo_kv)
+
 add_library(dgpp_models_mimo_layers STATIC
-  src/models/mimo/kv_pool.cpp
   src/models/mimo/layers.cpp
   src/models/mimo/forward.cpp)
 target_include_directories(dgpp_models_mimo_layers PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(dgpp_models_mimo_layers
-  PUBLIC dgpp_models_mimo dgpp_models_mimo_loader dgpp_models_moe dgpp_models_glm dgpp_kernels CUDA::cudart)
+  PUBLIC dgpp_models_mimo dgpp_models_mimo_loader dgpp_models_mimo_kv dgpp_models_moe dgpp_models_glm dgpp_kernels CUDA::cudart)
 dgpp_set_common(dgpp_models_mimo_layers)
+
+# The Flint layers and model (docs/flint_plan.md §3): the sink-attention
+# kernels at qk 128, the BF16 dense MLP, QwenMoeLayer's routed chain and
+# shared-expert tail, the MiMo paged pool at 128 / 128.
+add_library(dgpp_models_flint_layers STATIC
+  src/models/flint/layers.cpp
+  src/models/flint/forward.cpp)
+target_include_directories(dgpp_models_flint_layers PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(dgpp_models_flint_layers
+  PUBLIC dgpp_models_flint dgpp_models_flint_loader dgpp_models_mimo_kv dgpp_models_qwen_moe dgpp_models_moe dgpp_models_glm dgpp_kernels CUDA::cudart)
+dgpp_set_common(dgpp_models_flint_layers)
 
 # The full GLM-5.3 model on the session core (docs/glm53_plan.md G5).
 add_library(dgpp_models_glm_dsa_layers STATIC
@@ -450,15 +488,23 @@ add_library(dgpp_models_qwen_loader STATIC
   src/models/qwen/vision.cpp
   src/models/qwen/loader.cpp
   src/models/qwen/loader35.cpp
-  src/models/qwen/dflash2.cpp)
+  src/models/qwen/dflash2.cpp
+  src/models/qwen/dflash.cpp)
 target_include_directories(dgpp_models_qwen_loader PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(dgpp_models_qwen_loader PUBLIC dgpp_models_qwen dgpp_loaders dgpp_kernels CUDA::cudart dgpp_device_ranges)
 dgpp_set_common(dgpp_models_qwen_loader)
 
 # The Qwen layers (Q3): the MoE on the shared MoE layer, with its oracle.
-add_library(dgpp_models_qwen_layers STATIC
+# The Qwen MoE layer (the routed chain + the BF16 / fp8 shared-expert
+# tail), on its own so the Flint family links it without the Qwen stack.
+add_library(dgpp_models_qwen_moe STATIC
   src/models/qwen/moe_layer.cpp
-  src/models/qwen/moe_reference.cpp
+  src/models/qwen/moe_reference.cpp)
+target_include_directories(dgpp_models_qwen_moe PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(dgpp_models_qwen_moe PUBLIC dgpp_models_qwen dgpp_models_moe dgpp_models_glm dgpp_kernels CUDA::cudart)
+dgpp_set_common(dgpp_models_qwen_moe)
+
+add_library(dgpp_models_qwen_layers STATIC
   src/models/qwen/layers.cpp
   src/models/qwen/kv_pool.cpp
   src/models/qwen/forward.cpp
@@ -466,7 +512,7 @@ add_library(dgpp_models_qwen_layers STATIC
   src/models/qwen/model35_kernels.cu)
 target_include_directories(dgpp_models_qwen_layers PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(dgpp_models_qwen_layers
-  PUBLIC dgpp_models_qwen dgpp_models_qwen_loader dgpp_models_moe dgpp_models_glm dgpp_kernels CUDA::cudart)
+  PUBLIC dgpp_models_qwen dgpp_models_qwen_loader dgpp_models_qwen_moe dgpp_models_moe dgpp_models_glm dgpp_kernels CUDA::cudart)
 dgpp_set_common(dgpp_models_qwen_layers)
 
 # The Qwen forward (Q4): fixture -> smoke; the python reference chain follows.
@@ -501,6 +547,9 @@ add_test(NAME qwen_qsa_prefill
   COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda/qwen_qsa_prefill_test.py
           $<TARGET_FILE:qwen_forward_test>)
 set_tests_properties(qwen_qsa_prefill PROPERTIES RUN_SERIAL TRUE TIMEOUT 360)
+# The decode graph's programmatic edges need every kernel to wait first (engine/graph_pdl.hpp).
+add_test(NAME pdl_wait_audit COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/python/pdl_wait_audit.py ${CMAKE_CURRENT_SOURCE_DIR})
+set_tests_properties(pdl_wait_audit PROPERTIES LABELS "host")
 # QSA always sees BF16 activations, across both expert formats and dense modes.
 foreach(_dense_fp8 IN ITEMS 0 1)
   add_test(NAME qwen_qsa_prefill_nvfp4_dense_${_dense_fp8}
@@ -570,6 +619,22 @@ add_test(NAME qwen_qad_forward_test
           --dump-file ${CMAKE_CURRENT_BINARY_DIR}/qwen_qad_ref.qwndump)
 set_tests_properties(qwen_qad_forward_test PROPERTIES DEPENDS qwen_qad_generate)
 
+# The CSF export is lossless: compare its nested-shard fixture against the
+# independent Python reference generated from the identical plain QAD bytes.
+set(QWEN_FP4LOCAL_FIXTURE ${CMAKE_CURRENT_BINARY_DIR}/qwen_fp4local_fixture)
+add_test(NAME qwen_fp4local_fixture COMMAND qwen_forward_test --write-fixture ${QWEN_FP4LOCAL_FIXTURE} --fp4local)
+add_test(NAME qwen_fp4local_smoke COMMAND qwen_forward_test --smoke ${QWEN_FP4LOCAL_FIXTURE})
+set_tests_properties(qwen_fp4local_smoke PROPERTIES DEPENDS qwen_fp4local_fixture)
+add_test(NAME qwen_fp4local_forward_test
+  COMMAND qwen_forward_test --checkpoint-dir ${QWEN_FP4LOCAL_FIXTURE}
+          --dump-file ${CMAKE_CURRENT_BINARY_DIR}/qwen_qad_ref.qwndump)
+set_tests_properties(qwen_fp4local_forward_test PROPERTIES DEPENDS "qwen_fp4local_fixture;qwen_qad_generate")
+
+add_test(NAME qwen_fp4local_forward_tile
+  COMMAND ${CMAKE_COMMAND} -E env DGPP_TEST_QWEN_PREFILL_TILE=1 $<TARGET_FILE:qwen_forward_test>
+          --checkpoint-dir ${QWEN_FP4LOCAL_FIXTURE} --dump-file ${CMAKE_CURRENT_BINARY_DIR}/qwen_qad_ref.qwndump)
+set_tests_properties(qwen_fp4local_forward_tile PROPERTIES DEPENDS "qwen_fp4local_fixture;qwen_qad_generate")
+
 # The Qwen session surface (Q6 stage A): incremental decode vs the re-forward.
 add_executable(qwen_decode_test tests/cuda/qwen_decode_test.cpp)
 target_include_directories(qwen_decode_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
@@ -577,6 +642,20 @@ target_link_libraries(qwen_decode_test PRIVATE dgpp_models_qwen_layers dgpp_mode
 dgpp_set_common(qwen_decode_test)
 add_test(NAME qwen_decode_test COMMAND qwen_decode_test --fixture ${QWEN_FORWARD_FIXTURE})
 set_tests_properties(qwen_decode_test PROPERTIES DEPENDS qwen_forward_fixture)
+add_test(NAME qwen_fp4local_decode_test COMMAND qwen_decode_test --fixture ${QWEN_FP4LOCAL_FIXTURE})
+add_test(NAME qwen_fp4local_decode_rows_invariance COMMAND qwen_decode_test --fixture ${QWEN_FP4LOCAL_FIXTURE} --rows-invariance)
+set_tests_properties(qwen_fp4local_decode_test qwen_fp4local_decode_rows_invariance
+  PROPERTIES DEPENDS qwen_fp4local_fixture RUN_SERIAL TRUE)
+
+add_test(NAME qwen_fp4local_decode_tile
+  COMMAND ${CMAKE_COMMAND} -E env DGPP_TEST_QWEN_PREFILL_TILE=1 $<TARGET_FILE:qwen_decode_test>
+          --fixture ${QWEN_FP4LOCAL_FIXTURE})
+add_test(NAME qwen_fp4local_decode_rows_invariance_tile
+  COMMAND ${CMAKE_COMMAND} -E env DGPP_TEST_QWEN_PREFILL_TILE=1 $<TARGET_FILE:qwen_decode_test>
+          --fixture ${QWEN_FP4LOCAL_FIXTURE} --rows-invariance)
+set_tests_properties(qwen_fp4local_decode_tile qwen_fp4local_decode_rows_invariance_tile
+  PROPERTIES DEPENDS qwen_fp4local_fixture RUN_SERIAL TRUE)
+
 # Qwen3.8-Flash-Next's decode step is one chain across row counts under the
 # shipped FP8-dense recipe (2026-10-05: the fp8 head and the dense sites on
 # the streaming form from one row, the QSA projections through the dense
@@ -622,6 +701,17 @@ add_test(NAME qwen_image_prefill_test
   COMMAND qwen_image_prefill_test ${CMAKE_CURRENT_BINARY_DIR}/qwen_image_prefill_fixture)
 set_tests_properties(qwen_image_prefill_test PROPERTIES LABELS "gpu" RUN_SERIAL TRUE SKIP_RETURN_CODE 2)
 
+add_executable(qwen35_image_prefill_test tests/cuda/qwen35_image_prefill_test.cpp)
+target_include_directories(qwen35_image_prefill_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
+target_link_libraries(qwen35_image_prefill_test PRIVATE dgpp_models_qwen_layers CUDA::cudart Threads::Threads)
+dgpp_set_common(qwen35_image_prefill_test)
+add_test(NAME qwen35_image_prefill_test
+  COMMAND qwen35_image_prefill_test ${CMAKE_CURRENT_BINARY_DIR}/qwen35_image_prefill_fixture)
+add_test(NAME qwen35_mixed_image_prefill_test
+  COMMAND qwen35_image_prefill_test ${CMAKE_CURRENT_BINARY_DIR}/qwen35_mixed_image_prefill_fixture --mixed)
+set_tests_properties(qwen35_image_prefill_test qwen35_mixed_image_prefill_test
+  PROPERTIES LABELS "gpu" RUN_SERIAL TRUE SKIP_RETURN_CODE 2)
+
 # The MoE layer both families run: GLM's sigmoid+bias router
 # with the FP8 shared expert in the chain, Qwen's softmax router without
 # it (models/qwen/moe_layer.hpp composes the BF16 shared expert on top).
@@ -654,6 +744,9 @@ dgpp_set_common(glm_dsa_bind_check)
 add_executable(dsv41_bind_check apps/dsv41_bind_check.cpp)
 target_link_libraries(dsv41_bind_check PRIVATE dgpp_models_dsv41 dgpp_loaders)
 dgpp_set_common(dsv41_bind_check)
+add_executable(qwen35_bind_check apps/qwen35_bind_check.cpp)
+target_link_libraries(qwen35_bind_check PRIVATE dgpp_models_qwen_loader dgpp_loaders)
+dgpp_set_common(qwen35_bind_check)
 add_executable(dsv4_forward_check apps/dsv4_forward_check.cpp)
 target_include_directories(dsv4_forward_check PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
 target_link_libraries(dsv4_forward_check PRIVATE dgpp_models_dsv4_layers dgpp_bus dgpp_loaders dgpp_sched dgpp_text CUDA::cudart Threads::Threads)
@@ -717,7 +810,7 @@ if(DGPP_ENABLE_IBV)
     src/net/nic_visibility.cu)
   target_link_libraries(dgpp_bus
     PUBLIC dgpp_net CUDA::cudart ${IBVERBS_LIBRARY})
-  target_include_directories(dgpp_bus PUBLIC ${IBVERBS_INCLUDE_DIR})
+  target_include_directories(dgpp_bus SYSTEM PUBLIC ${IBVERBS_INCLUDE_DIR})
   dgpp_set_common(dgpp_bus)
 
   add_executable(bus_check apps/bus_check.cpp)
@@ -781,6 +874,7 @@ if(DGPP_ENABLE_IBV)
   add_executable(dgpp_serve_app apps/dgpp_serve.cpp)
   target_link_libraries(dgpp_serve_app PRIVATE dgpp_models_glm_loader dgpp_models_qwen_layers dgpp_models_glm4_layers dgpp_models_glm_dsa_layers
                                              dgpp_models_dsv41_layers dgpp_models_dsv4_layers dgpp_models_mimo_layers
+                                             dgpp_models_flint_layers
                                              dgpp_loaders dgpp_bus
                                              dgpp_serve CUDA::cudart
                                              Threads::Threads)
@@ -838,6 +932,7 @@ add_executable(unit_tests
   tests/unit/utf8_test.cpp
   tests/unit/arena_test.cpp
   tests/unit/safetensors_test.cpp
+  tests/unit/resident_image_test.cpp
   tests/unit/fp8_test.cpp
   tests/unit/fp4_test.cpp
   tests/unit/latent_format_test.cpp
@@ -856,11 +951,14 @@ add_executable(unit_tests
   tests/unit/net_test.cpp
   tests/unit/cluster_config_test.cpp
   tests/unit/qwen_config_test.cpp
+  tests/unit/qwen_csf_test.cpp
   tests/unit/qwen_image_stage_test.cpp
+  tests/unit/qwen_vision_dequant_test.cpp
   tests/unit/qwen_binding_test.cpp
   tests/unit/qwen35_config_test.cpp
   tests/unit/qwen35_binding_test.cpp
   tests/unit/qwen_dflash2_config_test.cpp
+  tests/unit/qwen_dflash_config_test.cpp
   tests/unit/dflash2_speculator_test.cpp
   tests/unit/qwen_rope_scaling_test.cpp
   tests/unit/glm4_config_test.cpp
@@ -873,6 +971,8 @@ add_executable(unit_tests
   tests/unit/dsv4_binding_test.cpp
   tests/unit/mimo_config_test.cpp
   tests/unit/mimo_binding_test.cpp
+  tests/unit/flint_config_test.cpp
+  tests/unit/flint_binding_test.cpp
   tests/unit/nvfp4_quant_test.cpp
   tests/unit/verify_schedule_test.cpp
   tests/unit/lookup_draft_test.cpp
@@ -881,7 +981,7 @@ target_include_directories(unit_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(unit_tests PRIVATE CUDA::cudart dgpp_loaders
                                         dgpp_models_glm dgpp_models_qwen dgpp_models_qwen_loader
                                         dgpp_models_glm4
-                                        dgpp_models_glm_dsa dgpp_models_dsv41 dgpp_models_dsv4 dgpp_models_mimo
+                                        dgpp_models_glm_dsa dgpp_models_dsv41 dgpp_models_dsv4 dgpp_models_mimo dgpp_models_flint
                                         dgpp_rope_scaling
                                         dgpp_net dgpp_serve Threads::Threads)
 target_compile_definitions(unit_tests PRIVATE DGPP_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
@@ -945,6 +1045,14 @@ dgpp_set_common(dsv41_prompt_test)
 add_test(NAME dsv41_prompt_test
   COMMAND dsv41_prompt_test ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/dsv41_prompt_goldens.jsonl)
 set_tests_properties(dsv41_prompt_test PROPERTIES SKIP_RETURN_CODE 2)
+# The EXL3 trellis host codec (models/exl3_matrix.hpp) against the numpy
+# reference's pins on the LibertAIDAI DeepSeek-V4.1-Flash-1017 pack
+# (docs/deepseek_v41_flash_exl3_plan.md §2.4). CUDA-free.
+add_executable(exl3_codec_test tests/host/exl3_codec_test.cpp)
+target_include_directories(exl3_codec_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(exl3_codec_test PRIVATE dgpp_common)
+dgpp_set_common(exl3_codec_test)
+add_test(NAME exl3_codec_test COMMAND exl3_codec_test)
 # The DeepSeek-V4 (DeepSeek-V4-Flash-0731) prompt renderer's differential
 # gate: the checkpoint's encoding_dsv4.py is the golden source; the same
 # corpus walks its DSML spelling through the tool grammar and parser.
@@ -965,6 +1073,9 @@ set_tests_properties(glm_dsa_tokenizer_test PROPERTIES SKIP_RETURN_CODE 2)
 add_test(NAME mimo_tokenizer_test
   COMMAND tokenizer_test ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/mimo_tokenizer_goldens.jsonl)
 set_tests_properties(mimo_tokenizer_test PROPERTIES SKIP_RETURN_CODE 2)
+add_test(NAME flint_tokenizer_test
+  COMMAND tokenizer_test ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/flint_tokenizer_goldens.jsonl)
+set_tests_properties(flint_tokenizer_test PROPERTIES SKIP_RETURN_CODE 2)
 
 # M6 Stage 3b: the chat-template differential gate (host). Skips with rc 2
 # when the model cache is absent, same as above.
@@ -987,6 +1098,9 @@ set_tests_properties(glm_dsa_chat_template_test PROPERTIES SKIP_RETURN_CODE 2)
 add_test(NAME mimo_chat_template_test
   COMMAND chat_template_test ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/mimo_chat_template_goldens.jsonl)
 set_tests_properties(mimo_chat_template_test PROPERTIES SKIP_RETURN_CODE 2)
+add_test(NAME flint_chat_template_test
+  COMMAND chat_template_test ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/flint_chat_template_goldens.jsonl)
+set_tests_properties(flint_chat_template_test PROPERTIES SKIP_RETURN_CODE 2)
 
 # M6 Stage 4: the serving capstone — HTTP/SSE over epoll + the OpenAI
 # generation service (host-only; the engine adapters live in the apps,
@@ -1086,6 +1200,8 @@ add_test(NAME portability_test
   COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/python/portability_test.py)
 add_test(NAME timed_load_test
   COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/python/timed_load_test.py)
+add_test(NAME serve_campaign_test
+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/python/serve_campaign_test.py)
 add_test(NAME serve_admission_bench_test
   COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/python/serve_admission_bench_test.py)
 add_test(NAME qwen_yarn_release_check_test
@@ -1100,6 +1216,18 @@ add_test(NAME bootstrap_test
   COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/python/bootstrap_test.py)
 add_test(NAME launcher_test
   COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/python/launcher_test.py)
+add_test(NAME cluster_process_swap_test
+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/python/cluster_process_swap_test.py -v
+    ProcessSwapTest.test_invalid_policy_is_rejected
+    ProcessSwapTest.test_version_probe_rejects_invalid_policy
+    ProcessSwapTest.test_preflight_forwards_swap_policy_to_peer_version_probes
+    ProcessSwapTest.test_preflight_respects_resolved_node_swap_policy)
+add_test(NAME cluster_process_swap_systemd_test
+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/python/cluster_process_swap_test.py -v
+    ProcessSwapTest.test_scope_has_zero_swap_and_recorded_group_can_stop_it
+    ProcessSwapTest.test_scope_failure_does_not_run_the_command_without_protection
+    ProcessSwapTest.test_version_probe_uses_zero_swap_scope
+    ProcessSwapTest.test_version_probe_does_not_fall_back_when_scope_fails)
 if(TARGET dgpp_serve_app)
   add_test(NAME serve_startup_test
     COMMAND ${CMAKE_COMMAND} -E env "DGPP_SERVE_TEST_BINARY=$<TARGET_FILE:dgpp_serve_app>"
@@ -1161,6 +1289,18 @@ target_link_libraries(qsa_test PRIVATE dgpp_models_qwen dgpp_kernels CUDA::cudar
 dgpp_set_common(qsa_test)
 add_test(NAME qsa_test COMMAND qsa_test)
 
+add_executable(qwen_fp8_kv_attn_test tests/cuda/qwen_fp8_kv_attn_test.cu)
+target_include_directories(qwen_fp8_kv_attn_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
+target_link_libraries(qwen_fp8_kv_attn_test PRIVATE dgpp_models_qwen dgpp_kernels CUDA::cudart Threads::Threads)
+dgpp_set_common(qwen_fp8_kv_attn_test)
+add_test(NAME qwen_fp8_kv_attn_test COMMAND qwen_fp8_kv_attn_test)
+
+add_executable(qsa_fp8_native_test tests/cuda/qsa_fp8_native_test.cu)
+target_include_directories(qsa_fp8_native_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
+target_link_libraries(qsa_fp8_native_test PRIVATE dgpp_kernels CUDA::cudart Threads::Threads)
+dgpp_set_common(qsa_fp8_native_test)
+add_test(NAME qsa_fp8_native_test COMMAND qsa_fp8_native_test)
+
 add_executable(qwen_ple_test tests/cuda/qwen_ple_test.cu)
 target_include_directories(qwen_ple_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
 target_link_libraries(qwen_ple_test PRIVATE dgpp_models_qwen dgpp_kernels CUDA::cudart Threads::Threads)
@@ -1180,17 +1320,28 @@ target_link_libraries(csa2_layer_test PRIVATE dgpp_models_csa2 dgpp_kernels CUDA
 dgpp_set_common(csa2_layer_test)
 add_test(NAME csa2_layer_test COMMAND csa2_layer_test)
 
+# The dsv41 suites run twice: on the fp8 / MXFP4 release fixture and, as
+# the `_exl3` variants, on the EXL3 pack fixture (DGPP_DSV41_FIXTURE=exl3,
+# tests/cuda/dsv41_fixture.hpp) from their own working directory.
+set(DSV41_EXL3_WORKDIR ${CMAKE_CURRENT_BINARY_DIR}/dsv41_exl3)
+file(MAKE_DIRECTORY ${DSV41_EXL3_WORKDIR})
+set(DSV41_EXL3_ENV ${CMAKE_COMMAND} -E env DGPP_DSV41_FIXTURE=exl3)
+
 add_executable(dsv41_engram_layer_test tests/cuda/dsv41_engram_layer_test.cpp)
 target_include_directories(dsv41_engram_layer_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
 target_link_libraries(dsv41_engram_layer_test PRIVATE dgpp_models_dsv41_layers CUDA::cudart Threads::Threads)
 dgpp_set_common(dsv41_engram_layer_test)
 add_test(NAME dsv41_engram_layer_test COMMAND dsv41_engram_layer_test)
+add_test(NAME dsv41_engram_layer_test_exl3 COMMAND ${DSV41_EXL3_ENV} $<TARGET_FILE:dsv41_engram_layer_test>
+         WORKING_DIRECTORY ${DSV41_EXL3_WORKDIR})
 
 add_executable(dsv41_model_test tests/cuda/dsv41_model_test.cpp)
 target_include_directories(dsv41_model_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
 target_link_libraries(dsv41_model_test PRIVATE dgpp_models_dsv41_layers dgpp_bus dgpp_loaders dgpp_sched dgpp_text CUDA::cudart Threads::Threads)
 dgpp_set_common(dsv41_model_test)
 add_test(NAME dsv41_model_test COMMAND dsv41_model_test)
+add_test(NAME dsv41_model_test_exl3 COMMAND ${DSV41_EXL3_ENV} $<TARGET_FILE:dsv41_model_test>
+         WORKING_DIRECTORY ${DSV41_EXL3_WORKDIR})
 
 # The forward against the python reference dump (numpy: the repo's .venv
 # when present, else the system python).
@@ -1198,59 +1349,72 @@ add_executable(dsv41_forward_test tests/cuda/dsv41_forward_test.cpp)
 target_include_directories(dsv41_forward_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
 target_link_libraries(dsv41_forward_test PRIVATE dgpp_models_dsv41_layers dgpp_bus dgpp_loaders dgpp_sched dgpp_text CUDA::cudart Threads::Threads)
 dgpp_set_common(dsv41_forward_test)
-set(DSV41_FORWARD_FIXTURE ${CMAKE_CURRENT_BINARY_DIR}/dsv41_forward_fixture)
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/.venv/bin/python3)
   set(DSV41_PYTHON ${CMAKE_CURRENT_SOURCE_DIR}/.venv/bin/python3)
 else()
   set(DSV41_PYTHON ${Python3_EXECUTABLE})
 endif()
-add_test(NAME dsv41_forward_fixture COMMAND dsv41_forward_test --write-fixture ${DSV41_FORWARD_FIXTURE})
-add_test(NAME dsv41_forward_smoke COMMAND dsv41_forward_test --smoke ${DSV41_FORWARD_FIXTURE})
-set_tests_properties(dsv41_forward_smoke PROPERTIES DEPENDS dsv41_forward_fixture)
-add_test(NAME dsv41_forward_generate
-  COMMAND ${DSV41_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/tools/dsv41_reference_dump.py gen-pure
-          --checkpoint-dir ${DSV41_FORWARD_FIXTURE} --out ${CMAKE_CURRENT_BINARY_DIR}/dsv41_pure_ref.dump --tokens 40)
-set_tests_properties(dsv41_forward_generate PROPERTIES DEPENDS dsv41_forward_fixture)
-# End to end (the drift of eight layers with fp4 caches: relaxed budgets),
-# writing the engine's layer states; then the teacher-forced dump (every
-# reference layer fed the engine's input to it) under the strict budgets.
-add_test(NAME dsv41_forward_test_e2e
-  COMMAND ${CMAKE_COMMAND} -E env DGPP_DSV41_DUMP_ENGINE_STATES=${CMAKE_CURRENT_BINARY_DIR}/dsv41_engine_states.bin
-          $<TARGET_FILE:dsv41_forward_test> --checkpoint-dir ${DSV41_FORWARD_FIXTURE}
-          --dump-file ${CMAKE_CURRENT_BINARY_DIR}/dsv41_pure_ref.dump --relaxed)
-set_tests_properties(dsv41_forward_test_e2e PROPERTIES DEPENDS dsv41_forward_generate)
-add_test(NAME dsv41_forward_generate_teacher
-  COMMAND ${DSV41_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/tools/dsv41_reference_dump.py gen-pure
-          --checkpoint-dir ${DSV41_FORWARD_FIXTURE} --out ${CMAKE_CURRENT_BINARY_DIR}/dsv41_teacher_ref.dump --tokens 40
-          --teacher ${CMAKE_CURRENT_BINARY_DIR}/dsv41_engine_states.bin)
-set_tests_properties(dsv41_forward_generate_teacher PROPERTIES DEPENDS dsv41_forward_test_e2e)
-add_test(NAME dsv41_forward_test
-  COMMAND dsv41_forward_test --checkpoint-dir ${DSV41_FORWARD_FIXTURE} --dump-file ${CMAKE_CURRENT_BINARY_DIR}/dsv41_teacher_ref.dump)
-set_tests_properties(dsv41_forward_test PROPERTIES DEPENDS dsv41_forward_generate_teacher)
-# The bounded prefill (plan §1.8, the production mode): the same chain
-# against the reference's --prefill bounded walk (the decoder over the
-# last window rows), end to end then teacher-forced.
-add_test(NAME dsv41_forward_generate_bounded
-  COMMAND ${DSV41_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/tools/dsv41_reference_dump.py gen-pure
-          --checkpoint-dir ${DSV41_FORWARD_FIXTURE} --out ${CMAKE_CURRENT_BINARY_DIR}/dsv41_bounded_ref.dump --tokens 40
-          --prefill bounded)
-set_tests_properties(dsv41_forward_generate_bounded PROPERTIES DEPENDS dsv41_forward_fixture)
-add_test(NAME dsv41_forward_test_bounded_e2e
-  COMMAND ${CMAKE_COMMAND} -E env DGPP_DSV41_DUMP_ENGINE_STATES=${CMAKE_CURRENT_BINARY_DIR}/dsv41_engine_states_bounded.bin
-          $<TARGET_FILE:dsv41_forward_test> --checkpoint-dir ${DSV41_FORWARD_FIXTURE}
-          --dump-file ${CMAKE_CURRENT_BINARY_DIR}/dsv41_bounded_ref.dump --relaxed --bounded
-          --exact-dump ${CMAKE_CURRENT_BINARY_DIR}/dsv41_pure_ref.dump
-          --exact-states ${CMAKE_CURRENT_BINARY_DIR}/dsv41_engine_states.bin)
-set_tests_properties(dsv41_forward_test_bounded_e2e PROPERTIES DEPENDS "dsv41_forward_generate_bounded;dsv41_forward_test_e2e")
-add_test(NAME dsv41_forward_generate_teacher_bounded
-  COMMAND ${DSV41_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/tools/dsv41_reference_dump.py gen-pure
-          --checkpoint-dir ${DSV41_FORWARD_FIXTURE} --out ${CMAKE_CURRENT_BINARY_DIR}/dsv41_teacher_bounded_ref.dump --tokens 40
-          --prefill bounded --teacher ${CMAKE_CURRENT_BINARY_DIR}/dsv41_engine_states_bounded.bin)
-set_tests_properties(dsv41_forward_generate_teacher_bounded PROPERTIES DEPENDS dsv41_forward_test_bounded_e2e)
-add_test(NAME dsv41_forward_test_bounded
-  COMMAND dsv41_forward_test --checkpoint-dir ${DSV41_FORWARD_FIXTURE}
-          --dump-file ${CMAKE_CURRENT_BINARY_DIR}/dsv41_teacher_bounded_ref.dump --bounded)
-set_tests_properties(dsv41_forward_test_bounded PROPERTIES DEPENDS dsv41_forward_generate_teacher_bounded)
+# The forward chain on one fixture: S the test-name suffix ("" the release
+# fixture, "_exl3" the EXL3 pack), FIXTURE_ENV the fixture switch's
+# VAR=value (empty for the release).
+function(dsv41_forward_chain S FIXTURE_ENV)
+  set(FIXTURE ${CMAKE_CURRENT_BINARY_DIR}/dsv41_forward_fixture${S})
+  if(FIXTURE_ENV STREQUAL "")
+    set(ENV "")
+  else()
+    set(ENV ${CMAKE_COMMAND} -E env ${FIXTURE_ENV})
+  endif()
+  add_test(NAME dsv41_forward_fixture${S} COMMAND ${ENV} $<TARGET_FILE:dsv41_forward_test> --write-fixture ${FIXTURE})
+  add_test(NAME dsv41_forward_smoke${S} COMMAND ${ENV} $<TARGET_FILE:dsv41_forward_test> --smoke ${FIXTURE})
+  set_tests_properties(dsv41_forward_smoke${S} PROPERTIES DEPENDS dsv41_forward_fixture${S})
+  add_test(NAME dsv41_forward_generate${S}
+    COMMAND ${DSV41_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/tools/dsv41_reference_dump.py gen-pure
+            --checkpoint-dir ${FIXTURE} --out ${CMAKE_CURRENT_BINARY_DIR}/dsv41_pure_ref${S}.dump --tokens 40)
+  set_tests_properties(dsv41_forward_generate${S} PROPERTIES DEPENDS dsv41_forward_fixture${S})
+  # End to end (the drift of eight layers with fp4 caches: relaxed budgets),
+  # writing the engine's layer states; then the teacher-forced dump (every
+  # reference layer fed the engine's input to it) under the strict budgets.
+  add_test(NAME dsv41_forward_test_e2e${S}
+    COMMAND ${CMAKE_COMMAND} -E env ${FIXTURE_ENV} DGPP_DSV41_DUMP_ENGINE_STATES=${CMAKE_CURRENT_BINARY_DIR}/dsv41_engine_states${S}.bin
+            $<TARGET_FILE:dsv41_forward_test> --checkpoint-dir ${FIXTURE}
+            --dump-file ${CMAKE_CURRENT_BINARY_DIR}/dsv41_pure_ref${S}.dump --relaxed)
+  set_tests_properties(dsv41_forward_test_e2e${S} PROPERTIES DEPENDS dsv41_forward_generate${S})
+  add_test(NAME dsv41_forward_generate_teacher${S}
+    COMMAND ${DSV41_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/tools/dsv41_reference_dump.py gen-pure
+            --checkpoint-dir ${FIXTURE} --out ${CMAKE_CURRENT_BINARY_DIR}/dsv41_teacher_ref${S}.dump --tokens 40
+            --teacher ${CMAKE_CURRENT_BINARY_DIR}/dsv41_engine_states${S}.bin)
+  set_tests_properties(dsv41_forward_generate_teacher${S} PROPERTIES DEPENDS dsv41_forward_test_e2e${S})
+  add_test(NAME dsv41_forward_test${S}
+    COMMAND ${ENV} $<TARGET_FILE:dsv41_forward_test> --checkpoint-dir ${FIXTURE} --dump-file ${CMAKE_CURRENT_BINARY_DIR}/dsv41_teacher_ref${S}.dump)
+  set_tests_properties(dsv41_forward_test${S} PROPERTIES DEPENDS dsv41_forward_generate_teacher${S})
+  # The bounded prefill (plan §1.8, the production mode): the same chain
+  # against the reference's --prefill bounded walk (the decoder over the
+  # last window rows), end to end then teacher-forced.
+  add_test(NAME dsv41_forward_generate_bounded${S}
+    COMMAND ${DSV41_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/tools/dsv41_reference_dump.py gen-pure
+            --checkpoint-dir ${FIXTURE} --out ${CMAKE_CURRENT_BINARY_DIR}/dsv41_bounded_ref${S}.dump --tokens 40
+            --prefill bounded)
+  set_tests_properties(dsv41_forward_generate_bounded${S} PROPERTIES DEPENDS dsv41_forward_fixture${S})
+  add_test(NAME dsv41_forward_test_bounded_e2e${S}
+    COMMAND ${CMAKE_COMMAND} -E env ${FIXTURE_ENV} DGPP_DSV41_DUMP_ENGINE_STATES=${CMAKE_CURRENT_BINARY_DIR}/dsv41_engine_states_bounded${S}.bin
+            $<TARGET_FILE:dsv41_forward_test> --checkpoint-dir ${FIXTURE}
+            --dump-file ${CMAKE_CURRENT_BINARY_DIR}/dsv41_bounded_ref${S}.dump --relaxed --bounded
+            --exact-dump ${CMAKE_CURRENT_BINARY_DIR}/dsv41_pure_ref${S}.dump
+            --exact-states ${CMAKE_CURRENT_BINARY_DIR}/dsv41_engine_states${S}.bin)
+  set_tests_properties(dsv41_forward_test_bounded_e2e${S} PROPERTIES DEPENDS "dsv41_forward_generate_bounded${S};dsv41_forward_test_e2e${S}")
+  add_test(NAME dsv41_forward_generate_teacher_bounded${S}
+    COMMAND ${DSV41_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/tools/dsv41_reference_dump.py gen-pure
+            --checkpoint-dir ${FIXTURE} --out ${CMAKE_CURRENT_BINARY_DIR}/dsv41_teacher_bounded_ref${S}.dump --tokens 40
+            --prefill bounded --teacher ${CMAKE_CURRENT_BINARY_DIR}/dsv41_engine_states_bounded${S}.bin)
+  set_tests_properties(dsv41_forward_generate_teacher_bounded${S} PROPERTIES DEPENDS dsv41_forward_test_bounded_e2e${S})
+  add_test(NAME dsv41_forward_test_bounded${S}
+    COMMAND ${ENV} $<TARGET_FILE:dsv41_forward_test> --checkpoint-dir ${FIXTURE}
+            --dump-file ${CMAKE_CURRENT_BINARY_DIR}/dsv41_teacher_bounded_ref${S}.dump --bounded)
+  set_tests_properties(dsv41_forward_test_bounded${S} PROPERTIES DEPENDS dsv41_forward_generate_teacher_bounded${S})
+endfunction()
+dsv41_forward_chain("" "")
+dsv41_forward_chain("_exl3" "DGPP_DSV41_FIXTURE=exl3")
+set(DSV41_FORWARD_FIXTURE ${CMAKE_CURRENT_BINARY_DIR}/dsv41_forward_fixture)
 
 # The DeepSeek-V4.1 session surface: decode vs the re-forward, interleaved
 # slots, the chunked prefill, the prefix snapshots, the eager DSpark speculator.
@@ -1260,6 +1424,9 @@ target_link_libraries(dsv41_decode_test PRIVATE dgpp_models_dsv41_layers dgpp_bu
 dgpp_set_common(dsv41_decode_test)
 add_test(NAME dsv41_decode_test COMMAND dsv41_decode_test --fixture ${DSV41_FORWARD_FIXTURE})
 set_tests_properties(dsv41_decode_test PROPERTIES DEPENDS dsv41_forward_fixture)
+add_test(NAME dsv41_decode_test_exl3 COMMAND ${DSV41_EXL3_ENV} $<TARGET_FILE:dsv41_decode_test>
+         --fixture ${DSV41_FORWARD_FIXTURE}_exl3 WORKING_DIRECTORY ${DSV41_EXL3_WORKDIR})
+set_tests_properties(dsv41_decode_test_exl3 PROPERTIES DEPENDS dsv41_forward_fixture_exl3)
 
 add_executable(dsv41_engram_test tests/cuda/dsv41_engram_test.cu)
 target_include_directories(dsv41_engram_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
@@ -1309,6 +1476,10 @@ add_test(NAME qwen35_forward_smoke COMMAND qwen35_forward_test --smoke ${QWEN35_
 set_tests_properties(qwen35_forward_smoke PROPERTIES DEPENDS qwen35_forward_fixture)
 add_test(NAME qwen35_decode_rows_invariance COMMAND qwen35_forward_test --rows-invariance ${QWEN35_FORWARD_FIXTURE})
 set_tests_properties(qwen35_decode_rows_invariance PROPERTIES DEPENDS qwen35_forward_fixture)
+add_test(NAME qwen35_decode_rows_invariance_kvfp8 COMMAND qwen35_forward_test --rows-invariance ${QWEN35_FORWARD_FIXTURE} --kv-fp8)
+set_tests_properties(qwen35_decode_rows_invariance_kvfp8 PROPERTIES DEPENDS qwen35_forward_fixture)
+add_test(NAME qwen35_decode_rows_invariance_attnfp8 COMMAND qwen35_forward_test --rows-invariance ${QWEN35_FORWARD_FIXTURE} --attn-fp8)
+set_tests_properties(qwen35_decode_rows_invariance_attnfp8 PROPERTIES DEPENDS qwen35_forward_fixture)
 add_test(NAME qwen35_prefill_group_invariance COMMAND qwen35_forward_test --group-invariance ${QWEN35_FORWARD_FIXTURE})
 set_tests_properties(qwen35_prefill_group_invariance PROPERTIES DEPENDS qwen35_forward_fixture)
 add_test(NAME qwen35_forward_generate
@@ -1365,6 +1536,39 @@ add_test(NAME qwen35_mixed_test
   COMMAND qwen35_forward_test --checkpoint-dir ${QWEN35_MIXED_FIXTURE}
           --dump-file ${CMAKE_CURRENT_BINARY_DIR}/qwen35_mixed_teacher.q35dump)
 set_tests_properties(qwen35_mixed_test PROPERTIES DEPENDS qwen35_mixed_generate_teacher)
+# The MoE release (122B layout at toy widths: ModelOpt NVFP4 routed experts,
+# BF16 rest): smoke/rows/group and independent reference/teacher parity.
+set(QWEN35_MOE_FIXTURE ${CMAKE_CURRENT_BINARY_DIR}/qwen35_moe_fixture)
+add_test(NAME qwen35_moe_fixture COMMAND qwen35_forward_test --write-fixture-moe ${QWEN35_MOE_FIXTURE})
+add_test(NAME qwen35_moe_smoke COMMAND qwen35_forward_test --smoke ${QWEN35_MOE_FIXTURE})
+set_tests_properties(qwen35_moe_smoke PROPERTIES DEPENDS qwen35_moe_fixture)
+add_test(NAME qwen35_moe_rows_invariance COMMAND qwen35_forward_test --rows-invariance ${QWEN35_MOE_FIXTURE})
+set_tests_properties(qwen35_moe_rows_invariance PROPERTIES DEPENDS qwen35_moe_fixture)
+add_test(NAME qwen35_moe_group_invariance COMMAND qwen35_forward_test --group-invariance ${QWEN35_MOE_FIXTURE})
+set_tests_properties(qwen35_moe_group_invariance PROPERTIES DEPENDS qwen35_moe_fixture)
+add_test(NAME qwen35_moe_generate
+  COMMAND ${DSV41_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/tools/qwen35_reference_dump.py
+          gen-pure --checkpoint-dir ${QWEN35_MOE_FIXTURE} --tokens 16 --no-mtp
+          --out ${CMAKE_CURRENT_BINARY_DIR}/qwen35_moe_ref.q35dump)
+set_tests_properties(qwen35_moe_generate PROPERTIES DEPENDS qwen35_moe_fixture)
+add_test(NAME qwen35_moe_e2e
+  COMMAND qwen35_forward_test --checkpoint-dir ${QWEN35_MOE_FIXTURE}
+          --dump-file ${CMAKE_CURRENT_BINARY_DIR}/qwen35_moe_ref.q35dump --relaxed
+          --engine-states ${CMAKE_CURRENT_BINARY_DIR}/qwen35_moe_states.bin)
+set_tests_properties(qwen35_moe_e2e PROPERTIES DEPENDS qwen35_moe_generate)
+add_test(NAME qwen35_moe_generate_teacher
+  COMMAND ${DSV41_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/tools/qwen35_reference_dump.py
+          gen-pure --checkpoint-dir ${QWEN35_MOE_FIXTURE} --tokens 16 --no-mtp
+          --teacher ${CMAKE_CURRENT_BINARY_DIR}/qwen35_moe_states.bin
+          --out ${CMAKE_CURRENT_BINARY_DIR}/qwen35_moe_teacher.q35dump)
+set_tests_properties(qwen35_moe_generate_teacher PROPERTIES DEPENDS qwen35_moe_e2e)
+add_test(NAME qwen35_moe_test
+  COMMAND qwen35_forward_test --checkpoint-dir ${QWEN35_MOE_FIXTURE}
+          --dump-file ${CMAKE_CURRENT_BINARY_DIR}/qwen35_moe_teacher.q35dump)
+set_tests_properties(qwen35_moe_test PROPERTIES DEPENDS qwen35_moe_generate_teacher)
+set_tests_properties(qwen35_moe_fixture qwen35_moe_smoke qwen35_moe_rows_invariance
+    qwen35_moe_group_invariance qwen35_moe_generate qwen35_moe_e2e
+    qwen35_moe_generate_teacher qwen35_moe_test PROPERTIES RUN_SERIAL TRUE LABELS "gpu")
 # Exercise the FP4 prefill dispatch at its 1024-row boundary.
 # The short mixed fixture above stays on the decode/short-prefill kernel.
 add_test(NAME qwen35_mixed_prefill_generate
@@ -1430,6 +1634,12 @@ target_include_directories(mimo_attn_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/sr
 target_link_libraries(mimo_attn_test PRIVATE dgpp_models_mimo dgpp_kernels CUDA::cudart Threads::Threads)
 dgpp_set_common(mimo_attn_test)
 add_test(NAME mimo_attn_test COMMAND mimo_attn_test)
+
+add_executable(flint_attn_test tests/cuda/flint_attn_test.cu)
+target_include_directories(flint_attn_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
+target_link_libraries(flint_attn_test PRIVATE dgpp_models_flint dgpp_kernels CUDA::cudart Threads::Threads)
+dgpp_set_common(flint_attn_test)
+add_test(NAME flint_attn_test COMMAND flint_attn_test)
 
 add_executable(add_rmsnorm_test tests/cuda/add_rmsnorm_test.cu)
 target_include_directories(add_rmsnorm_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
@@ -1505,6 +1715,43 @@ add_test(NAME mimo_forward_test
   COMMAND mimo_forward_test --checkpoint-dir ${MIMO_FORWARD_FIXTURE}
           --dump-file ${CMAKE_CURRENT_BINARY_DIR}/mimo_teacher_ref.mdump)
 set_tests_properties(mimo_forward_test PROPERTIES DEPENDS mimo_forward_generate_teacher)
+
+# The Flint loader (docs/flint_plan.md G2) and forward (G5): fixture ->
+# smoke; the python reference end to end (relaxed) -> teacher-forced (strict).
+add_executable(flint_loader_test tests/cuda/flint_loader_test.cpp)
+target_include_directories(flint_loader_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
+target_link_libraries(flint_loader_test PRIVATE dgpp_models_flint_loader dgpp_loaders CUDA::cudart Threads::Threads)
+dgpp_set_common(flint_loader_test)
+add_test(NAME flint_loader_test COMMAND flint_loader_test)
+
+add_executable(flint_forward_test tests/cuda/flint_forward_test.cpp)
+target_include_directories(flint_forward_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
+target_link_libraries(flint_forward_test PRIVATE dgpp_models_flint_layers dgpp_models_glm_loader CUDA::cudart Threads::Threads)
+dgpp_set_common(flint_forward_test)
+set(FLINT_FORWARD_FIXTURE ${CMAKE_CURRENT_BINARY_DIR}/flint_forward_fixture)
+add_test(NAME flint_forward_fixture COMMAND flint_forward_test --write-fixture ${FLINT_FORWARD_FIXTURE})
+add_test(NAME flint_forward_smoke COMMAND flint_forward_test --smoke ${FLINT_FORWARD_FIXTURE})
+set_tests_properties(flint_forward_smoke PROPERTIES DEPENDS flint_forward_fixture)
+add_test(NAME flint_forward_generate
+  COMMAND ${DSV41_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/tools/flint_reference_dump.py
+          gen-pure --checkpoint-dir ${FLINT_FORWARD_FIXTURE}
+          --out ${CMAKE_CURRENT_BINARY_DIR}/flint_pure_ref.fdump)
+set_tests_properties(flint_forward_generate PROPERTIES DEPENDS flint_forward_fixture)
+add_test(NAME flint_forward_test_e2e
+  COMMAND ${CMAKE_COMMAND} -E env DGPP_FLINT_DUMP_ENGINE_STATES=${CMAKE_CURRENT_BINARY_DIR}/flint_engine_states.bin
+          $<TARGET_FILE:flint_forward_test> --checkpoint-dir ${FLINT_FORWARD_FIXTURE}
+          --dump-file ${CMAKE_CURRENT_BINARY_DIR}/flint_pure_ref.fdump --relaxed)
+set_tests_properties(flint_forward_test_e2e PROPERTIES DEPENDS flint_forward_generate)
+add_test(NAME flint_forward_generate_teacher
+  COMMAND ${DSV41_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/tools/flint_reference_dump.py
+          gen-pure --checkpoint-dir ${FLINT_FORWARD_FIXTURE}
+          --out ${CMAKE_CURRENT_BINARY_DIR}/flint_teacher_ref.fdump
+          --teacher ${CMAKE_CURRENT_BINARY_DIR}/flint_engine_states.bin)
+set_tests_properties(flint_forward_generate_teacher PROPERTIES DEPENDS flint_forward_test_e2e)
+add_test(NAME flint_forward_test
+  COMMAND flint_forward_test --checkpoint-dir ${FLINT_FORWARD_FIXTURE}
+          --dump-file ${CMAKE_CURRENT_BINARY_DIR}/flint_teacher_ref.fdump)
+set_tests_properties(flint_forward_test PROPERTIES DEPENDS flint_forward_generate_teacher)
 
 # The full GLM-5.3 forward (docs/glm53_plan.md G5): fixture -> smoke; the
 # python reference -> the dump parity.
@@ -1678,6 +1925,28 @@ if(TEST mimo_forward_fixture)
   set_tests_properties(mimo_decode_test PROPERTIES DEPENDS mimo_forward_fixture)
 endif()
 
+# The Flint session surface (docs/flint_plan.md G4), the TP forwards on
+# loopback worlds 2 and 4 (G5; ports 29964, 29965) and the engines on a
+# loopback world of 2 (G6; port 29969).
+add_executable(flint_decode_test tests/cuda/flint_decode_test.cpp)
+target_include_directories(flint_decode_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
+target_link_libraries(flint_decode_test PRIVATE dgpp_models_flint_layers dgpp_models_glm_loader CUDA::cudart Threads::Threads)
+dgpp_set_common(flint_decode_test)
+add_test(NAME flint_decode_test COMMAND flint_decode_test --fixture ${FLINT_FORWARD_FIXTURE})
+if(TEST flint_forward_fixture)
+  set_tests_properties(flint_decode_test PROPERTIES DEPENDS flint_forward_fixture)
+endif()
+add_executable(flint_tp_test tests/cuda/flint_tp_test.cpp)
+target_include_directories(flint_tp_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
+target_link_libraries(flint_tp_test PRIVATE dgpp_models_flint_layers dgpp_bus dgpp_loaders CUDA::cudart Threads::Threads)
+dgpp_set_common(flint_tp_test)
+add_test(NAME flint_tp_test COMMAND flint_tp_test)
+add_executable(flint_engine_test tests/cuda/flint_engine_test.cpp)
+target_include_directories(flint_engine_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
+target_link_libraries(flint_engine_test PRIVATE dgpp_models_flint_layers dgpp_bus dgpp_loaders dgpp_sched dgpp_text CUDA::cudart Threads::Threads)
+dgpp_set_common(flint_engine_test)
+add_test(NAME flint_engine_test COMMAND flint_engine_test)
+
 # The MiMo TP forwards: loopback worlds 2 and 4 vs world 1 (ports 29962, 29963).
 add_executable(mimo_tp_test tests/cuda/mimo_tp_test.cpp)
 target_include_directories(mimo_tp_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
@@ -1705,6 +1974,10 @@ dgpp_set_common(glm4_load_check)
 add_executable(mimo_load_check apps/mimo_load_check.cpp)
 target_link_libraries(mimo_load_check PRIVATE dgpp_models_mimo_loader dgpp_loaders CUDA::cudart Threads::Threads)
 dgpp_set_common(mimo_load_check)
+
+add_executable(flint_load_check apps/flint_load_check.cpp)
+target_link_libraries(flint_load_check PRIVATE dgpp_models_flint_loader dgpp_loaders CUDA::cudart Threads::Threads)
+dgpp_set_common(flint_load_check)
 
 add_executable(glm_dsa_loader_test tests/cuda/glm_dsa_loader_test.cpp)
 target_include_directories(glm_dsa_loader_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
@@ -1738,6 +2011,8 @@ target_include_directories(dsv41_tp_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
 target_link_libraries(dsv41_tp_test PRIVATE dgpp_models_dsv41_layers dgpp_bus dgpp_loaders CUDA::cudart Threads::Threads)
 dgpp_set_common(dsv41_tp_test)
 add_test(NAME dsv41_tp_test COMMAND dsv41_tp_test)
+add_test(NAME dsv41_tp_test_exl3 COMMAND ${DSV41_EXL3_ENV} $<TARGET_FILE:dsv41_tp_test> WORKING_DIRECTORY ${DSV41_EXL3_WORKDIR})
+set_tests_properties(dsv41_tp_test_exl3 PROPERTIES RUN_SERIAL TRUE)  # the same loopback ports as dsv41_tp_test
 
 # The DeepSeek-V4.1 decode engines: the graph engine's scalar and row-batched
 # replays (the Engram host node inside the walk) against the eager engine
@@ -1747,6 +2022,8 @@ target_include_directories(dsv41_engine_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
 target_link_libraries(dsv41_engine_test PRIVATE dgpp_models_dsv41_layers dgpp_bus dgpp_loaders dgpp_sched dgpp_text CUDA::cudart Threads::Threads)
 dgpp_set_common(dsv41_engine_test)
 add_test(NAME dsv41_engine_test COMMAND dsv41_engine_test)
+add_test(NAME dsv41_engine_test_exl3 COMMAND ${DSV41_EXL3_ENV} $<TARGET_FILE:dsv41_engine_test> WORKING_DIRECTORY ${DSV41_EXL3_WORKDIR})
+set_tests_properties(dsv41_engine_test_exl3 PROPERTIES RUN_SERIAL TRUE)  # the same loopback ports as dsv41_engine_test
 add_test(NAME dsv41_engine_test_draft_screen
   COMMAND ${CMAKE_COMMAND} -E env DGPP_TEST_DRAFT_SCREEN=2 $<TARGET_FILE:dsv41_engine_test>)
 set_tests_properties(dsv41_engine_test_draft_screen PROPERTIES RUN_SERIAL TRUE LABELS "gpu" SKIP_RETURN_CODE 2)
@@ -1792,6 +2069,10 @@ dgpp_set_common(glm4_forward_check)
 add_executable(mimo_forward_check apps/mimo_forward_check.cpp)
 target_link_libraries(mimo_forward_check PRIVATE dgpp_models_mimo_layers dgpp_bus dgpp_loaders dgpp_sched dgpp_text CUDA::cudart Threads::Threads)
 dgpp_set_common(mimo_forward_check)
+
+add_executable(flint_forward_check apps/flint_forward_check.cpp)
+target_link_libraries(flint_forward_check PRIVATE dgpp_models_flint_layers dgpp_bus dgpp_loaders dgpp_sched dgpp_text CUDA::cudart Threads::Threads)
+dgpp_set_common(flint_forward_check)
 
 add_executable(qwen_load_check apps/qwen_load_check.cpp)
 target_link_libraries(qwen_load_check PRIVATE dgpp_models_qwen_loader dgpp_loaders CUDA::cudart Threads::Threads)
@@ -1845,6 +2126,20 @@ foreach(_dense_fp8 IN ITEMS 0 1)
             DGPP_TEST_FILTER=wide $<TARGET_FILE:qwen_engine_test>)
   set_tests_properties(qwen_engine_nvfp4_dense_${_dense_fp8}
     PROPERTIES RESOURCE_LOCK qwen_engine_world LABELS "gpu;rdma" RUN_SERIAL TRUE)
+endforeach()
+foreach(_filter IN ITEMS wide mixed_prefill)
+  add_test(NAME qwen_engine_fp4local_${_filter}
+    COMMAND ${CMAKE_COMMAND} -E env DGPP_TEST_QWEN_FP4LOCAL=1 DGPP_TEST_DENSE_FP8=1
+            DGPP_TEST_FILTER=${_filter} $<TARGET_FILE:qwen_engine_test>)
+  set_tests_properties(qwen_engine_fp4local_${_filter}
+    PROPERTIES RESOURCE_LOCK qwen_engine_world LABELS "gpu;rdma" RUN_SERIAL TRUE)
+endforeach()
+foreach(_filter IN ITEMS wide mixed_prefill)
+  add_test(NAME qwen_engine_fp4local_${_filter}_tile
+    COMMAND ${CMAKE_COMMAND} -E env DGPP_TEST_QWEN_FP4LOCAL=1 DGPP_TEST_DENSE_FP8=1
+            DGPP_TEST_QWEN_PREFILL_TILE=1 DGPP_TEST_FILTER=${_filter} $<TARGET_FILE:qwen_engine_test>)
+  set_tests_properties(qwen_engine_fp4local_${_filter}_tile
+    PROPERTIES RESOURCE_LOCK qwen_engine_world RUN_SERIAL TRUE)
 endforeach()
 set_tests_properties(qwen_engine_test qwen_engine_row_independent qwen_engine_bf12 PROPERTIES RESOURCE_LOCK qwen_engine_world)
 set_tests_properties(qwen_engine_row_independent qwen_engine_bf12 PROPERTIES LABELS "gpu;rdma" RUN_SERIAL TRUE)
@@ -1949,6 +2244,20 @@ dgpp_set_common(bf12_gemv_test)
 add_test(NAME bf12_gemv_test COMMAND bf12_gemv_test)
 set_tests_properties(bf12_gemv_test PROPERTIES SKIP_RETURN_CODE 2)
 
+add_executable(qwen_mtp_test tests/cuda/qwen_mtp_test.cu)
+target_include_directories(qwen_mtp_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(qwen_mtp_test PRIVATE dgpp_kernels CUDA::cudart)
+dgpp_set_common(qwen_mtp_test)
+add_test(NAME qwen_mtp_test COMMAND qwen_mtp_test)
+set_tests_properties(qwen_mtp_test PROPERTIES SKIP_RETURN_CODE 2)
+
+add_executable(dsv41_dspark_test tests/cuda/dsv41_dspark_test.cu)
+target_include_directories(dsv41_dspark_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(dsv41_dspark_test PRIVATE dgpp_kernels CUDA::cudart)
+dgpp_set_common(dsv41_dspark_test)
+add_test(NAME dsv41_dspark_test COMMAND dsv41_dspark_test)
+set_tests_properties(dsv41_dspark_test PROPERTIES SKIP_RETURN_CODE 2)
+
 add_executable(mma_gemv_test tests/cuda/mma_gemv_test.cu)
 target_include_directories(mma_gemv_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(mma_gemv_test PRIVATE dgpp_kernels CUDA::cudart)
@@ -1978,6 +2287,12 @@ target_link_libraries(packq_gemv_test PRIVATE dgpp_kernels dgpp_loaders CUDA::cu
 dgpp_set_common(packq_gemv_test)
 add_test(NAME packq_gemv_test COMMAND packq_gemv_test)
 set_tests_properties(packq_gemv_test PROPERTIES SKIP_RETURN_CODE 2)
+add_executable(exl3_gemv_test tests/cuda/exl3_gemv_test.cu)
+target_include_directories(exl3_gemv_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(exl3_gemv_test PRIVATE dgpp_kernels CUDA::cudart)
+dgpp_set_common(exl3_gemv_test)
+add_test(NAME exl3_gemv_test COMMAND exl3_gemv_test)
+set_tests_properties(exl3_gemv_test PROPERTIES SKIP_RETURN_CODE 2)
 add_executable(head_screen_test tests/cuda/head_screen_test.cu)
 target_include_directories(head_screen_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(head_screen_test PRIVATE dgpp_kernels CUDA::cudart Threads::Threads)
@@ -2177,7 +2492,8 @@ if(DGPP_BUILD_BENCHMARKS)
   # Check every source, including auxiliary translation units, before defining
   # the target so no target properties refer to a skipped benchmark.
   function(dgpp_add_benchmark target)
-    cmake_parse_arguments(BENCH "" "" "SOURCES;LIBRARIES;INCLUDE_DIRECTORIES" ${ARGN})
+    cmake_parse_arguments(BENCH "" ""
+      "SOURCES;LIBRARIES;INCLUDE_DIRECTORIES;SYSTEM_INCLUDE_DIRECTORIES" ${ARGN})
     foreach(source IN LISTS BENCH_SOURCES)
       if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${source}")
         message(STATUS "Skipping benchmark ${target}: missing ${source}")
@@ -2189,8 +2505,14 @@ if(DGPP_BUILD_BENCHMARKS)
     if(BENCH_INCLUDE_DIRECTORIES)
       target_include_directories(${target} PRIVATE ${BENCH_INCLUDE_DIRECTORIES})
     endif()
+    if(BENCH_SYSTEM_INCLUDE_DIRECTORIES)
+      target_include_directories(${target} SYSTEM PRIVATE ${BENCH_SYSTEM_INCLUDE_DIRECTORIES})
+    endif()
     dgpp_set_common(${target})
   endfunction()
+
+  dgpp_add_benchmark(host_penalties_bench
+    SOURCES benchmarks/micro/host_penalties_bench.cpp)
 
   dgpp_add_benchmark(json_mask_bench
     SOURCES tools/json_mask_bench.cpp
@@ -2259,6 +2581,10 @@ if(DGPP_BUILD_BENCHMARKS)
     SOURCES benchmarks/micro/qsa_prefill_bench.cu
     LIBRARIES dgpp_kernels CUDA::cudart)
 
+  dgpp_add_benchmark(qsa_fp8_bench
+    SOURCES benchmarks/micro/qsa_fp8_bench.cu
+    LIBRARIES dgpp_kernels CUDA::cudart)
+
   dgpp_add_benchmark(qsa_index_bench
     SOURCES benchmarks/micro/qsa_index_bench.cu
     LIBRARIES dgpp_models_qwen dgpp_kernels CUDA::cudart)
@@ -2275,7 +2601,7 @@ if(DGPP_BUILD_BENCHMARKS)
     dgpp_add_benchmark(micro_gdr_probe
       SOURCES benchmarks/micro/gdr_probe.cpp src/common/log.cpp
       LIBRARIES CUDA::cudart ${IBVERBS_LIBRARY}
-      INCLUDE_DIRECTORIES ${IBVERBS_INCLUDE_DIR})
+      SYSTEM_INCLUDE_DIRECTORIES ${IBVERBS_INCLUDE_DIR})
 
     # The send-doorbell mapping probe (2026-09-19): mlx5 direct verbs, only
     # where libmlx5 is installed.
@@ -2284,13 +2610,13 @@ if(DGPP_BUILD_BENCHMARKS)
       dgpp_add_benchmark(micro_uar_probe
         SOURCES benchmarks/micro/uar_probe.cpp
         LIBRARIES ${MLX5_LIBRARY} ${IBVERBS_LIBRARY} CUDA::cudart
-        INCLUDE_DIRECTORIES ${IBVERBS_INCLUDE_DIR})
+        SYSTEM_INCLUDE_DIRECTORIES ${IBVERBS_INCLUDE_DIR})
     endif()
 
     dgpp_add_benchmark(micro_ibv_smoke
       SOURCES benchmarks/micro/ibv_smoke.cpp src/net/nic_visibility.cu src/common/log.cpp
       LIBRARIES ${IBVERBS_LIBRARY} CUDA::cudart
-      INCLUDE_DIRECTORIES ${IBVERBS_INCLUDE_DIR})
+      SYSTEM_INCLUDE_DIRECTORIES ${IBVERBS_INCLUDE_DIR})
   endif()
 endif()
 
@@ -2304,27 +2630,33 @@ set_tests_properties(word_cache_test bpe_test unit unit_tests http_server_test s
   qwen_yarn_fixture_test qwen_w4a4_plan_default qwen_w4a4_plan_mode_0 qwen_w4a4_plan_mode_1
   qwen_w4a4_plan_mode_empty qwen_w4a4_plan_mode_invalid PROPERTIES LABELS "host")
 set_tests_properties(checkpoint_audit_test route_trace_test sampling_profile_test
-  site_env_test script_reports_test timed_load_test serve_admission_bench_test qwen_yarn_release_check_test qwen_head_compare_test portability_test spark_cross_test setup_tools_test bootstrap_test launcher_test PROPERTIES LABELS "host;python")
+  site_env_test script_reports_test timed_load_test serve_admission_bench_test qwen_yarn_release_check_test qwen_head_compare_test portability_test spark_cross_test setup_tools_test bootstrap_test launcher_test cluster_process_swap_test PROPERTIES LABELS "host;python")
+set_tests_properties(cluster_process_swap_systemd_test PROPERTIES LABELS "systemd" TIMEOUT 180)
 if(TARGET dgpp_serve_app)
   set_tests_properties(serve_startup_test PROPERTIES LABELS "host;python" TIMEOUT 180)
 endif()
 set_tests_properties(tokenizer_test qwen_tokenizer_test glm4_tokenizer_test dsv41_tokenizer_test
   chat_template_test qwen_chat_template_test glm4_chat_template_test dsv41_prompt_test
-  dsv4_tokenizer_test dsv4_prompt_test
+  dsv4_tokenizer_test dsv4_prompt_test glm_dsa_tokenizer_test mimo_tokenizer_test flint_tokenizer_test
+  glm_dsa_chat_template_test mimo_chat_template_test flint_chat_template_test
   PROPERTIES LABELS "host;checkpoint")
 foreach(_test qwen_forward_fixture qwen_forward_generate glm4_forward_fixture
     glm4_forward_generate mimo_forward_fixture mimo_forward_generate mimo_forward_generate_teacher
+    flint_forward_fixture flint_forward_generate flint_forward_generate_teacher
     glm_forward_fixture glm_forward_generate dsa_dump_generate kda_dump_generate)
   set_tests_properties(${_test} PROPERTIES LABELS "fixture")
 endforeach()
 if(DGPP_ENABLE_IBV)
   set_tests_properties(bus_test bus_selftest glm_tp_test glm4_tp_test glm4_engine_test
     qwen_tp_test qwen_engine_test qwen_engine_fp8_head_4 qwen_engine_fp8_head_256 dsv41_tp_test dsv41_engine_test
-    dsv4_tp_test dsv4_engine_test mimo_tp_test mimo_engine_test PROPERTIES LABELS "gpu;rdma" RUN_SERIAL TRUE)
+    dsv4_tp_test dsv4_engine_test mimo_tp_test mimo_engine_test flint_tp_test flint_engine_test
+    PROPERTIES LABELS "gpu;rdma" RUN_SERIAL TRUE)
   set_tests_properties(nic_regress_selftest PROPERTIES LABELS "gpu;rdma" RUN_SERIAL TRUE)
 endif()
 set_tests_properties(qwen_engine_row_independent qwen_engine_bf12
   qwen_engine_nvfp4_dense_0 qwen_engine_nvfp4_dense_1
+  qwen_engine_fp4local_wide qwen_engine_fp4local_mixed_prefill
+  qwen_engine_fp4local_wide_tile qwen_engine_fp4local_mixed_prefill_tile
   qwen_engine_fp8_wide qwen_engine_fp8_mtp3_rows32
   qwen_engine_mtp3_rows32_row_independent qwen_engine_fp8_mtp3_rows64
   qwen_engine_mtp3_rows64_row_independent

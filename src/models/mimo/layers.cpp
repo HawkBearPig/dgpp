@@ -100,7 +100,7 @@ MimoAttentionLayer::MimoAttentionLayer(const MimoAttnResident& w, const MimoGemm
   DGPP_CUDA_OK(cudaMemset(counters_, 0, counters * sizeof(int)));
   if (const char* v = std::getenv("DGPP_MIMO_ATTN_FUSED"); v && *v) fused_decode_ = std::atoi(v) != 0;
   if (const char* v = std::getenv("DGPP_MIMO_PREFILL_ATTN"); v && *v) tiled_prefill_ = std::string(v) != "chain";
-  if (64 % (lh_ / w_.local_kv_heads) != 0) tiled_prefill_ = false;  // the tiled kernel's 64 query vectors
+  if (kSinkAttnPrefillQueryVecs % (lh_ / w_.local_kv_heads) != 0) tiled_prefill_ = false;  // the tiled kernel's query vectors
 }
 
 MimoAttentionLayer::~MimoAttentionLayer() {

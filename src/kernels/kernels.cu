@@ -1,4 +1,5 @@
 #include "kernels/kernels.hpp"
+#include "kernels/pdl.cuh"
 
 #include <math.h>
 
@@ -18,6 +19,7 @@ __device__ __forceinline__ float sigmoidf_fast(float x) {
 __global__ void rmsnorm_kernel(const uint16_t* __restrict__ x,
                                const uint16_t* __restrict__ w,
                                uint16_t* __restrict__ y, int dim, float eps) {
+  dgpp_pdl_wait();
   const int row = blockIdx.x;
   const int tid = threadIdx.x;
   const int nthreads = blockDim.x;
@@ -57,6 +59,7 @@ __global__ void swiglu_limit_kernel(const uint16_t* __restrict__ gate,
                                     const uint16_t* __restrict__ up,
                                     uint16_t* __restrict__ out, int64_t n,
                                     float limit) {
+  dgpp_pdl_wait();
   int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x;
   if (i >= n) return;
   float g = fminf(fmaxf(bf16_bits_to_float(gate[i]), -limit), limit);
@@ -68,6 +71,7 @@ template <int S>
 __global__ void mhc_mix_kernel(const uint16_t* __restrict__ x,
                                const float* __restrict__ mix,
                                uint16_t* __restrict__ out, int hidden) {
+  dgpp_pdl_wait();
   // x: [B,S,H] contiguous; mix: [B,S,S]; out: [B,S,H]
   const int b = blockIdx.x;
   const int h = threadIdx.x + blockIdx.y * blockDim.x;
@@ -94,6 +98,7 @@ __global__ void mhc_mix_kernel(const uint16_t* __restrict__ x,
 __global__ void argmax_rows_kernel(const float* __restrict__ logits,
                                    int64_t* __restrict__ out_idx,
                                    float* __restrict__ out_val, int cols) {
+  dgpp_pdl_wait();
   const int row = blockIdx.x;
   const int tid = threadIdx.x;
   const int nthreads = blockDim.x;
@@ -137,6 +142,7 @@ __global__ void argmax_rows_kernel(const float* __restrict__ logits,
 __global__ void embed_gather_kernel(const uint16_t* __restrict__ table,
                                     const int64_t* __restrict__ tokens,
                                     uint16_t* __restrict__ out, int hidden) {
+  dgpp_pdl_wait();
   const int t = blockIdx.x;
   const long long tok = tokens[t];
   const uint16_t* src = table + static_cast<size_t>(tok) * hidden;
@@ -148,6 +154,7 @@ __global__ void embed_gather_sliced_kernel(const uint16_t* __restrict__ table,
                                            const int64_t* __restrict__ tokens,
                                            uint16_t* __restrict__ out, int hidden,
                                            int64_t vocab_begin, int64_t vocab_count) {
+  dgpp_pdl_wait();
   const int t = blockIdx.x;
   const long long tok = tokens[t] - vocab_begin;
   uint16_t* dst = out + static_cast<size_t>(t) * hidden;
@@ -160,6 +167,7 @@ __global__ void embed_gather_sliced_kernel(const uint16_t* __restrict__ table,
 }
 
 __global__ void copy_rows_kernel(uint16_t* __restrict__ dst, const uint16_t* __restrict__ src, int hidden) {
+  dgpp_pdl_wait();
   const size_t base = static_cast<size_t>(blockIdx.x) * hidden;
   for (int i = threadIdx.x; i < hidden; i += blockDim.x) dst[base + i] = src[base + i];
 }
@@ -180,6 +188,7 @@ __device__ __forceinline__ uint32_t hash_u32_pair(uint64_t seed, uint64_t idx) {
 
 __global__ void fill_normal_bf16_kernel(uint16_t* dst, uint64_t n,
                                         uint64_t seed, float stddev) {
+  dgpp_pdl_wait();
   uint64_t i = blockIdx.x * static_cast<uint64_t>(blockDim.x) + threadIdx.x;
   if (i >= n) return;
   uint32_t a = hash_u32_pair(seed, i);
@@ -193,6 +202,7 @@ __global__ void fill_normal_bf16_kernel(uint16_t* dst, uint64_t n,
 
 __global__ void fill_normal_fp8_kernel(uint8_t* dst, uint64_t n,
                                        uint64_t seed, float stddev) {
+  dgpp_pdl_wait();
   uint64_t i = blockIdx.x * static_cast<uint64_t>(blockDim.x) + threadIdx.x;
   if (i >= n) return;
   uint32_t a = hash_u32_pair(seed, i);
@@ -205,6 +215,7 @@ __global__ void fill_normal_fp8_kernel(uint8_t* dst, uint64_t n,
 
 __global__ void fill_normal_f32_kernel(float* dst, uint64_t n, uint64_t seed,
                                        float stddev) {
+  dgpp_pdl_wait();
   uint64_t i = blockIdx.x * static_cast<uint64_t>(blockDim.x) + threadIdx.x;
   if (i >= n) return;
   uint32_t a = hash_u32_pair(seed, i);
@@ -218,6 +229,7 @@ __global__ void fill_normal_f32_kernel(float* dst, uint64_t n, uint64_t seed,
 __global__ void add_inplace_kernel(uint16_t* __restrict__ x,
                                    const uint16_t* __restrict__ y,
                                    int64_t n) {
+  dgpp_pdl_wait();
   int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x;
   if (i >= n) return;
   float s = bf16_bits_to_float(x[i]) + bf16_bits_to_float(y[i]);
@@ -226,6 +238,7 @@ __global__ void add_inplace_kernel(uint16_t* __restrict__ x,
 
 __global__ void cast_rows_kernel(const uint16_t* __restrict__ src,
                                  float* __restrict__ dst, int cols) {
+  dgpp_pdl_wait();
   const int row = blockIdx.x;
   const uint16_t* sr = src + static_cast<size_t>(row) * cols;
   float* dr = dst + static_cast<size_t>(row) * cols;
@@ -236,6 +249,7 @@ __global__ void cast_rows_kernel(const uint16_t* __restrict__ src,
 
 __global__ void cast_fp8_kernel(const uint16_t* __restrict__ src,
                                 uint8_t* __restrict__ dst, int64_t n) {
+  dgpp_pdl_wait();
   int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x;
   if (i >= n) return;
   dst[i] = float_to_fp8_e4m3_bits(bf16_bits_to_float(src[i]));
@@ -246,6 +260,7 @@ __global__ void kv_append_kernel(const uint16_t* __restrict__ src,
                                  uint16_t* __restrict__ vc,
                                  const int* __restrict__ dev_abs_first,
                                  int rows, int kv_dim) {
+  dgpp_pdl_wait();
   // src row layout: [K block | V block] at (base + r*src_stride) where base
   // already points at the k-column offset of the fused qkv buffer.
   const int slot = static_cast<int>(blockIdx.x);
@@ -262,17 +277,20 @@ __global__ void kv_append_kernel(const uint16_t* __restrict__ src,
 }
 
 __global__ void bump_i32_kernel(int32_t* p, int delta) {
+  dgpp_pdl_wait();
   if (threadIdx.x == 0) atomicAdd(p, delta);  // single caller => deterministic
 }
 
 __global__ void cpy_i64_kernel(const int64_t* __restrict__ s,
                                int64_t* __restrict__ d) {
+  dgpp_pdl_wait();
   if (threadIdx.x == 0) d[0] = s[0];
 }
 
 __global__ void swiglu_pairs_kernel(const uint16_t* __restrict__ gu,
                                     uint16_t* __restrict__ out, int64_t total,
                                     int inter, float limit) {
+  dgpp_pdl_wait();
   // Interleaved halves per row: g at (2r)*inter+c, u at (2r+1)*inter+c.
   int64_t j = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x;
   if (j >= total) return;
@@ -477,6 +495,7 @@ void fill_random_normal_f32(void* dst, uint64_t n, uint64_t seed,
 }
 
 __global__ void globaltimer_stamp_kernel(uint64_t* out) {
+  dgpp_pdl_wait();
   uint64_t t;
   asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
   *out = t;

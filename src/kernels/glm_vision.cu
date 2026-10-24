@@ -1,4 +1,5 @@
 #include <math_constants.h>
+#include "kernels/pdl.cuh"
 
 #include "common/cuda_check.hpp"
 #include "common/dtypes.hpp"
@@ -8,6 +9,7 @@ namespace dgpp {
 namespace {
 constexpr int B = 256;
 __global__ void patchify(const uint8_t* rgb, uint16_t* out, int width, int n) {
+  dgpp_pdl_wait();
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n * 1176) return;
   const int patch = i / 1176, p = i % 1176, c = p / 392;
@@ -18,6 +20,7 @@ __global__ void patchify(const uint8_t* rgb, uint16_t* out, int width, int n) {
   out[i] = float_to_bf16_bits((rgb[(y * width + x) * 3 + c] * (1.0f / 255.0f) - mean[c]) / std[c]);
 }
 __global__ void swiglu(uint16_t* gate, const uint16_t* up, int count, float limit) {
+  dgpp_pdl_wait();
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= count) return;
   const float g = fminf(bf16_bits_to_float(gate[i]), limit);
@@ -37,6 +40,7 @@ __device__ float sum_reduce(float v, float* buf) {
 }
 __global__ void rmsnorm(const uint16_t* x, const uint16_t* w, uint16_t* y, int rows, int dim,
                         float eps) {
+  dgpp_pdl_wait();
   const int row = blockIdx.x * 4 + threadIdx.y, lane = threadIdx.x;
   if (row >= rows) return;
   x += row * dim;
@@ -71,6 +75,7 @@ __device__ Moments combine_moments(Moments left, Moments right) {
 }
 __global__ void layernorm_gelu(uint16_t* x, const uint16_t* weight, const uint16_t* bias, int dim,
                                uint16_t* normalized) {
+  dgpp_pdl_wait();
   // Welford moments with four adjacent values per thread and warp-pair
   // reduction, matching the CUDA LayerNorm reference's FP32 arithmetic.
   constexpr int threads = 128;
@@ -113,6 +118,7 @@ __global__ void layernorm_gelu(uint16_t* x, const uint16_t* weight, const uint16
 }
 __global__ void pack_qkv(uint16_t* qkv, uint16_t* q, uint16_t* k, uint16_t* v, const uint16_t* qn,
                          const uint16_t* kn, int n, int h, int heads, int gw, float eps) {
+  dgpp_pdl_wait();
   const int row = blockIdx.x, head = blockIdx.y, dim = h / heads;
   // Each block owns one head of one token, with <=256 elements.
   __shared__ float buf[B], norm[256];
@@ -168,6 +174,7 @@ __device__ float attention_score(float score, float scale) {
       float_to_bf16_bits(bf16_bits_to_float(float_to_bf16_bits(score)) * scale));
 }
 __global__ void softmax(const float* scores, uint16_t* probs, int n, float scale) {
+  dgpp_pdl_wait();
   __shared__ float partials[32];
   const int row = blockIdx.x, t = threadIdx.x;
   float largest = -CUDART_INF_F;
@@ -183,6 +190,7 @@ __global__ void softmax(const float* scores, uint16_t* probs, int n, float scale
         float_to_bf16_bits(expf(attention_score(scores[row * n + j], scale) - largest) / denom);
 }
 __global__ void softmax_warp(const float* scores, uint16_t* probs, int rows, int n, float scale) {
+  dgpp_pdl_wait();
   const int row = blockIdx.x * 4 + threadIdx.y, lane = threadIdx.x;
   if (row >= rows) return;
   float largest = -CUDART_INF_F;
@@ -199,6 +207,7 @@ __global__ void softmax_warp(const float* scores, uint16_t* probs, int rows, int
 }
 __global__ void store_attention(const float* tile, uint16_t* out, int rows, int n, int dim,
                                 int heads, int first) {
+  dgpp_pdl_wait();
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i < heads * rows * dim) {
     const int head = i / (rows * dim), row = i / dim % rows, d = i % dim;
@@ -206,6 +215,7 @@ __global__ void store_attention(const float* tile, uint16_t* out, int rows, int 
   }
 }
 __global__ void unhead(const uint16_t* src, uint16_t* dst, int n, int h, int heads) {
+  dgpp_pdl_wait();
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i < n * h) {
     int row = i / h, d = i % h, dim = h / heads;
@@ -213,6 +223,7 @@ __global__ void unhead(const uint16_t* src, uint16_t* dst, int n, int h, int hea
   }
 }
 __global__ void merge(const uint16_t* src, uint16_t* dst, int n, int h) {
+  dgpp_pdl_wait();
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i < n * h) {
     const int group = i / (4 * h), rem = i % (4 * h);
@@ -220,6 +231,7 @@ __global__ void merge(const uint16_t* src, uint16_t* dst, int n, int h) {
   }
 }
 __global__ void broadcast(const uint16_t* src, uint16_t* dst, int count, int h) {
+  dgpp_pdl_wait();
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i < count) dst[i] = src[(i / (4 * h)) * h + i % h];
 }

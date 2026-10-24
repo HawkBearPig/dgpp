@@ -64,6 +64,8 @@ struct QwenGemmWorkspace {
   // channel form) and the block grid's blockwise one; the a8 scratch above
   // serves both.
   const bool* native_prefill = nullptr;
+  // Live per-walk policy: MXFP8 prefill uses the shared weight tile at every chunk size.
+  const bool* prefill_dense_tile = nullptr;
   // The a8 scratch's TMA maps by k (the channel form staged by boxes), set
   // by the model at boot for every dense k it serves.
   struct A8Map {
@@ -275,8 +277,12 @@ class QwenGdnLayer {
 // pool (models/qwen/kv_pool.hpp) hands out per layer: the block table is
 // shared by every layer, blocks_per_request == the pool's total blocks.
 struct QwenQsaCache {
-  uint16_t* k_cache = nullptr;      // bf16 [slots, lkv * D]
-  uint16_t* v_cache = nullptr;      // bf16 [slots, lkv * D]
+  uint16_t* k_cache = nullptr;      // bf16 [slots, lkv * D]; fp8: e4m3 codes (cast to uint8)
+  uint16_t* v_cache = nullptr;      // bf16 [slots, lkv * D]; fp8: e4m3 codes (cast to uint8)
+  float* k_scale = nullptr;         // fp8: per-(slot, kv-head) scale [slots, lkv]; bf16: null
+  float* v_scale = nullptr;         // fp8: per-(slot, kv-head) scale [slots, lkv]; bf16: null
+  bool fp8_prefill_attention = false;
+  bool fp8_decode_attention = false;
   uint16_t* index_cache = nullptr;  // bf16 [pool_slots, Di]
   uint16_t* ring = nullptr;         // bf16 [max_requests, kpool, Di]
   int32_t* block_tables = nullptr;  // int32 [max_requests, blocks_per_request]

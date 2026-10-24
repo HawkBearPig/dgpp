@@ -166,7 +166,7 @@ ClusterConfig parse_cluster_config(const std::string& json, const std::string& w
             "DGPP_ROCE_DEVICES", "DGPP_ROCE_GID_INDICES", "HF_HUB_CACHE", "DGPP_RESIDENT_CACHE_DIR",
             "DGPP_LOG_LEVEL", "DGPP_MLOCK",
             // The bus timeline switch and the dense-lowering A/B switches: every rank the same.
-            "DGPP_BUS_TIMELINE", "DGPP_DSV41_DENSE_GEMV", "DGPP_DENSE_GEMV_ROWS", "DGPP_DSV41_EAGER_FOLD"};
+            "DGPP_BUS_TIMELINE", "DGPP_BUS_TIMELINE_DUMP", "DGPP_DSV41_DENSE_GEMV", "DGPP_DENSE_GEMV_ROWS", "DGPP_DSV41_EAGER_FOLD"};
         for (const Member& setting : node.members()) {
           bool known = false;
           for (const char* key : kNodeKeys) known = known || setting.key == key;
@@ -203,6 +203,15 @@ ClusterConfig parse_cluster_config(const std::string& json, const std::string& w
           if (e.embed_sharding != "replicated" && e.embed_sharding != "vocab")
             fail(what, "'" + ek + "' must be \"replicated\" or \"vocab\"");
         }
+        else if (p.key == "index_topk" || p.key == "candidate_topk_blocks") {
+          // The DeepSeek-V4.1 index budget: 0 = the checkpoint's, else a
+          // power of two the select networks serve (<= 2048).
+          const int value = static_cast<int>(integer(x, ek, what, 0, 2048));
+          if (value != 0 && (value & (value - 1)) != 0)
+            fail(what, "'" + ek + "' must be 0 (the checkpoint's) or a power of two <= 2048");
+          (p.key == "index_topk" ? e.index_topk : e.candidate_topk_blocks) = value;
+        }
+        else if (p.key == "candidate_block_size") e.candidate_block_size = static_cast<int>(integer(x, ek, what, 0, 1024));
         else if (p.key == "attention_weights") {
           e.attention_weights = text(x, ek, what);
           if (e.attention_weights != "checkpoint" && e.attention_weights != "int4")
@@ -221,6 +230,11 @@ ClusterConfig parse_cluster_config(const std::string& json, const std::string& w
         else if (p.key == "ngram_table_model") {
           e.ngram_table_model = text(x, ek, what);
           if (e.ngram_table_model.empty() || std::count(e.ngram_table_model.begin(), e.ngram_table_model.end(), '/') != 1)
+            fail(what, "'" + ek + "' must be a Hugging Face ORG/NAME repository id");
+        }
+        else if (p.key == "engram_source") {
+          e.engram_source = text(x, ek, what);
+          if (e.engram_source.empty() || std::count(e.engram_source.begin(), e.engram_source.end(), '/') != 1)
             fail(what, "'" + ek + "' must be a Hugging Face ORG/NAME repository id");
         }
         else if (p.key == "dense_weights") {
@@ -243,8 +257,9 @@ ClusterConfig parse_cluster_config(const std::string& json, const std::string& w
         }
         else if (p.key == "mtp_expert_format") {
           e.mtp_expert_format = text(x, ek, what);
-          if (e.mtp_expert_format != "fp8" && e.mtp_expert_format != "bf16_fused")
-            fail(what, "'" + ek + "' must be \"fp8\" or \"bf16_fused\"");
+          if (e.mtp_expert_format != "fp8" && e.mtp_expert_format != "bf16_fused" &&
+              e.mtp_expert_format != "bf16")
+            fail(what, "'" + ek + "' must be \"fp8\", \"bf16_fused\" or \"bf16\" (qwen3_5 MoE draft only)");
         }
         else if (p.key == "bf16_weights") {
           e.bf16_weights = text(x, ek, what);
@@ -268,6 +283,10 @@ ClusterConfig parse_cluster_config(const std::string& json, const std::string& w
           e.prefill_attention = text(x, ek, what);
           if (e.prefill_attention != "bf16" && e.prefill_attention != "fp8")
             fail(what, "'" + ek + "' must be \"bf16\" or \"fp8\"");
+        } else if (p.key == "decode_attention") {
+          e.decode_attention = text(x, ek, what);
+          if (e.decode_attention != "bf16" && e.decode_attention != "fp8")
+            fail(what, "'" + ek + "' must be \"bf16\" or \"fp8\"");
         } else if (p.key == "expert_gemm") {
           e.expert_gemm = text(x, ek, what);
           if (e.expert_gemm != "wide" && e.expert_gemm != "wide3" && e.expert_gemm != "wide4" &&
@@ -285,6 +304,26 @@ ClusterConfig parse_cluster_config(const std::string& json, const std::string& w
           e.prefill = text(x, ek, what);
           if (e.prefill != "bounded" && e.prefill != "exact")
             fail(what, "'" + ek + "' must be \"bounded\" or \"exact\"");
+        } else if (p.key == "prefill_dense") {
+          e.prefill_dense = text(x, ek, what);
+          if (e.prefill_dense != "auto" && e.prefill_dense != "tile" && e.prefill_dense != "streaming")
+            fail(what, "'" + ek + "' must be \"auto\", \"tile\" or \"streaming\"");
+        } else if (p.key == "prefill_fold_overlap") {
+          e.prefill_fold_overlap = boolean(x, ek, what);
+        } else if (p.key == "decode_pdl") {
+          e.decode_pdl = boolean(x, ek, what);
+        } else if (p.key == "prefill_window") {
+          e.prefill_window = text(x, ek, what);
+          if (e.prefill_window != "flash" && e.prefill_window != "scalar")
+            fail(what, "'" + ek + "' must be \"flash\" or \"scalar\"");
+        } else if (p.key == "decode_window") {
+          e.decode_window = text(x, ek, what);
+          if (e.decode_window != "flash" && e.decode_window != "scalar")
+            fail(what, "'" + ek + "' must be \"flash\" or \"scalar\"");
+        } else if (p.key == "collective_transport") {
+          e.collective_transport = text(x, ek, what);
+          if (e.collective_transport != "write" && e.collective_transport != "send")
+            fail(what, "'" + ek + "' must be \"write\" or \"send\"");
         } else if (p.key == "rope_scaling") {
           if (!x.is_object()) fail(what, "'" + ek + "' must be an object");
           dgpp::RopeScaling rs;
@@ -361,6 +400,11 @@ ClusterConfig parse_cluster_config(const std::string& json, const std::string& w
           if (e.l2_prefetch_form != "load" && e.l2_prefetch_form != "lines" && e.l2_prefetch_form != "touch")
             fail(what, "'" + ek + "' must be load, lines or touch");
         }
+        else if (p.key == "l2_prefetch_full_form") {
+          e.l2_prefetch_full_form = text(x, ek, what);
+          if (e.l2_prefetch_full_form != "16x8" && e.l2_prefetch_full_form != "48x4")
+            fail(what, "'" + ek + "' must be 16x8 or 48x4");
+        }
         else if (p.key == "l2_prefetch_window_mib") e.l2_prefetch_window_mib = static_cast<int>(integer(x, ek, what, 1, 64));
         else if (p.key == "l2_prefetch_boundary_window_mib")
           e.l2_prefetch_boundary_window_mib = static_cast<int>(integer(x, ek, what, 0, 64));
@@ -389,6 +433,7 @@ ClusterConfig parse_cluster_config(const std::string& json, const std::string& w
           e.mtp_schedule_lambda = number(x, ek, what);
           if (!(e.mtp_schedule_lambda >= 0.0)) fail(what, "'" + ek + "' must be >= 0 (0: the reservation rate)");
         } else if (p.key == "mtp_schedule_min_depth") e.mtp_schedule_min_depth = static_cast<int>(integer(x, ek, what, 1, 5));
+        else if (p.key == "mtp_schedule_options") e.mtp_schedule_options = static_cast<int>(integer(x, ek, what, 0, 6));
         else if (p.key == "mtp_schedule_adapt") e.mtp_schedule_adapt = boolean(x, ek, what);
         else if (p.key == "mtp_schedule_sampled_scale") {
           e.mtp_schedule_sampled_scale = number(x, ek, what);
@@ -417,10 +462,26 @@ ClusterConfig parse_cluster_config(const std::string& json, const std::string& w
         else if (p.key == "lookup_agree") e.lookup_agree = static_cast<int>(integer(x, ek, what, 0, 16));
         else if (p.key == "lookup_tail") e.lookup_tail = static_cast<int>(integer(x, ek, what, 0, 7));
         else if (p.key == "sampling_candidates") e.sampling_candidates = static_cast<int>(integer(x, ek, what, 1, 256));
-        else if (p.key == "prefix_cache_gib") {
+        else if (p.key == "repetition_penalty" || p.key == "frequency_penalty" ||
+                 p.key == "presence_penalty") {
+          const double value = number(x, ek, what);
+          if (p.key == "repetition_penalty") {
+            if (!(value > 0.0 && value <= 100.0) || !(static_cast<float>(value) > 0.0f))
+              fail(what, "'" + ek + "' must be in (0, 100]");
+            e.repetition_penalty = static_cast<float>(value);
+          } else {
+            if (value < -2.0 || value > 2.0) fail(what, "'" + ek + "' must be in [-2, 2]");
+            if (p.key == "frequency_penalty")
+              e.frequency_penalty = static_cast<float>(value);
+            else
+              e.presence_penalty = static_cast<float>(value);
+          }
+        } else if (p.key == "prefix_cache_gib") {
           e.prefix_cache_gib = number(x, ek, what);
-          if (e.prefix_cache_gib < 0.0) fail(what, "'" + ek + "' must be >= 0 (0 turns the cache off)");
-        } else if (p.key == "prefix_min_tokens") e.prefix_min_tokens = static_cast<int>(integer(x, ek, what, 0, 1 << 30));
+          if (e.prefix_cache_gib < 0.0)
+            fail(what, "'" + ek + "' must be >= 0 (0 turns the cache off)");
+        } else if (p.key == "prefix_min_tokens")
+          e.prefix_min_tokens = static_cast<int>(integer(x, ek, what, 0, 1 << 30));
         else if (p.key == "prefix_head_snapshots") e.prefix_head_snapshots = boolean(x, ek, what);
         else if (p.key == "admission") {
           e.admission = text(x, ek, what);

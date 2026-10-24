@@ -1,4 +1,5 @@
 #include "kernels/qwen_mtp.hpp"
+#include "kernels/pdl.cuh"
 
 #include <stdexcept>
 
@@ -11,6 +12,7 @@ namespace {
 __global__ void embed_gather_kernel(const uint16_t* __restrict__ embed,
                                     const int64_t* __restrict__ tokens, uint16_t* __restrict__ out,
                                     int hidden) {
+  dgpp_pdl_wait();
   const int64_t t = blockIdx.x;
   const int64_t tok = tokens[t];
   for (int d = threadIdx.x; d < hidden; d += blockDim.x)
@@ -19,6 +21,7 @@ __global__ void embed_gather_kernel(const uint16_t* __restrict__ embed,
 
 __global__ void fuse_kernel(const uint16_t* __restrict__ ein, const uint16_t* __restrict__ enc,
                             uint16_t* __restrict__ out, int64_t n, int hc, int hidden) {
+  dgpp_pdl_wait();
   const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (i >= n) return;
   const int64_t width = static_cast<int64_t>(hc) * hidden;
@@ -29,22 +32,51 @@ __global__ void fuse_kernel(const uint16_t* __restrict__ ein, const uint16_t* __
   out[i] = float_to_bf16_bits(a + b);
 }
 
+// A row's copy: 16-byte units with eight in flight per thread when the
+// row is aligned (2026-10-20: the element loop — one 2-byte load a
+// thread an iteration, a hundred dependent round trips for a 25,600-wide
+// DeepSeek-V4.1 hyper-state row — took 29 us a store and 12 a gather in
+// the draft block's tail; a copy, so bitwise either way), the element
+// loop otherwise.
+__device__ __forceinline__ void copy_row(const uint16_t* __restrict__ src, uint16_t* __restrict__ dst, int width) {
+  const bool vec = (width % 8) == 0 && (reinterpret_cast<uintptr_t>(src) & 15u) == 0 &&
+                   (reinterpret_cast<uintptr_t>(dst) & 15u) == 0;
+  if (vec) {
+    const int units = width / 8;
+    const uint4* s4 = reinterpret_cast<const uint4*>(src);
+    uint4* d4 = reinterpret_cast<uint4*>(dst);
+    int u = threadIdx.x;
+    for (; u + 7 * static_cast<int>(blockDim.x) < units; u += 8 * blockDim.x) {
+      uint4 v[8];
+#pragma unroll
+      for (int j = 0; j < 8; ++j) v[j] = s4[u + j * blockDim.x];
+#pragma unroll
+      for (int j = 0; j < 8; ++j) d4[u + j * blockDim.x] = v[j];
+    }
+    for (; u < units; u += blockDim.x) d4[u] = s4[u];
+    return;
+  }
+  for (int d = threadIdx.x; d < width; d += blockDim.x) dst[d] = src[d];
+}
+
 __global__ void hidden_store_kernel(const uint16_t* __restrict__ r,
                                     const int32_t* __restrict__ req_ids,
                                     const int64_t* __restrict__ pos, uint16_t* __restrict__ window,
                                     int64_t req_stride, int window_rows, int width) {
+  dgpp_pdl_wait();
   const int64_t row = blockIdx.x;
   const int64_t p = pos[row];
   if (p < 0) return;
   uint16_t* dst = window + static_cast<int64_t>(req_ids[row]) * req_stride +
                   (p % window_rows) * static_cast<int64_t>(width);
-  for (int d = threadIdx.x; d < width; d += blockDim.x) dst[d] = r[row * width + d];
+  copy_row(r + row * width, dst, width);
 }
 
 __global__ void hidden_gather_kernel(const uint16_t* __restrict__ window, int64_t req_stride,
                                      int window_rows, const int32_t* __restrict__ req_ids,
                                      const int64_t* __restrict__ pos, uint16_t* __restrict__ out,
                                      int width) {
+  dgpp_pdl_wait();
   const int64_t row = blockIdx.x;
   const int64_t p = pos[row];
   if (p < 0) {
@@ -53,7 +85,7 @@ __global__ void hidden_gather_kernel(const uint16_t* __restrict__ window, int64_
   }
   const uint16_t* src = window + static_cast<int64_t>(req_ids[row]) * req_stride +
                         (p % window_rows) * static_cast<int64_t>(width);
-  for (int d = threadIdx.x; d < width; d += blockDim.x) out[row * width + d] = src[d];
+  copy_row(src, out + row * width, width);
 }
 
 }  // namespace

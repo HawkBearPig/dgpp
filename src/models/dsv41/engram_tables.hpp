@@ -46,8 +46,10 @@ struct Dsv41EngramSidecar {
 // heads, table sizes, the pad class, the vocabulary): throws
 // std::runtime_error naming the field on any disagreement.
 Dsv41EngramSidecar dsv41_load_engram_sidecar(const std::string& path, const Dsv41TextConfig& cfg);
-// The sidecar of a checkpoint directory (`<dir>/dgpp_engram_tables.json`).
+// The sidecar of a checkpoint directory (`<dir>/dgpp_engram_tables.json`),
+// or, when that has none, of `fallback_dir` (the Engram source snapshot an
+// EXL3 pack reads its tables from).
 Dsv41EngramSidecar dsv41_load_engram_sidecar_for(const std::string& checkpoint_dir,
-                                                 const Dsv41TextConfig& cfg);
+                                                 const Dsv41TextConfig& cfg, const std::string& fallback_dir = "");
 
 }  // namespace dgpp

@@ -1,4 +1,5 @@
 #include "kernels/add_rmsnorm.hpp"
+#include "kernels/pdl.cuh"
 
 #include <stdexcept>
 
@@ -22,12 +23,14 @@ __device__ __forceinline__ double warp_sum(double v) {
 
 // One row per block. Vector v of thread t covers elements [(v * kThreads +
 // t) * 8, +8): a warp's 32 vectors are 512 contiguous bytes.
-template <bool kAdd>
+// kOne: the one-rounding form, y = bf16((x * rstd) * w) (Flint).
+template <bool kAdd, bool kOne>
 __global__ void __launch_bounds__(kThreads) add_rmsnorm_kernel(uint16_t* __restrict__ resid,
                                                                const uint16_t* __restrict__ add,
                                                                const uint16_t* __restrict__ w,
                                                                uint16_t* __restrict__ out, int dim,
                                                                float eps) {
+  dgpp_pdl_wait();
   const int tid = threadIdx.x;
   const size_t row = static_cast<size_t>(blockIdx.x) * dim;
   uint16_t* xr = resid + row;
@@ -91,7 +94,8 @@ __global__ void __launch_bounds__(kThreads) add_rmsnorm_kernel(uint16_t* __restr
   __syncthreads();
   const float rstd = s_rstd;
 
-  // Pass 2 from the registers: u = bf16(x * rstd), y = bf16(w * u).
+  // Pass 2 from the registers: u = bf16(x * rstd), y = bf16(w * u) — or,
+  // under kOne, y = bf16((x * rstd) * w).
 #pragma unroll
   for (int i = 0; i < kMaxVecs; ++i) {
     const bool live = i < nvec || (i == nvec && tid < tail);
@@ -102,12 +106,20 @@ __global__ void __launch_bounds__(kThreads) add_rmsnorm_kernel(uint16_t* __restr
     uint32_t yp[4];
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
-      const uint16_t ulo = float_to_bf16_bits(bf16_bits_to_float(static_cast<uint16_t>(xp[j] & 0xffffu)) * rstd);
-      const uint16_t uhi = float_to_bf16_bits(bf16_bits_to_float(static_cast<uint16_t>(xp[j] >> 16)) * rstd);
-      const uint16_t lo = float_to_bf16_bits(bf16_bits_to_float(static_cast<uint16_t>(wp[j] & 0xffffu)) *
-                                             bf16_bits_to_float(ulo));
-      const uint16_t hi = float_to_bf16_bits(bf16_bits_to_float(static_cast<uint16_t>(wp[j] >> 16)) *
-                                             bf16_bits_to_float(uhi));
+      const float xlo = bf16_bits_to_float(static_cast<uint16_t>(xp[j] & 0xffffu));
+      const float xhi = bf16_bits_to_float(static_cast<uint16_t>(xp[j] >> 16));
+      const float wlo = bf16_bits_to_float(static_cast<uint16_t>(wp[j] & 0xffffu));
+      const float whi = bf16_bits_to_float(static_cast<uint16_t>(wp[j] >> 16));
+      uint16_t lo, hi;
+      if constexpr (kOne) {
+        lo = float_to_bf16_bits(__fmul_rn(__fmul_rn(xlo, rstd), wlo));
+        hi = float_to_bf16_bits(__fmul_rn(__fmul_rn(xhi, rstd), whi));
+      } else {
+        const uint16_t ulo = float_to_bf16_bits(xlo * rstd);
+        const uint16_t uhi = float_to_bf16_bits(xhi * rstd);
+        lo = float_to_bf16_bits(wlo * bf16_bits_to_float(ulo));
+        hi = float_to_bf16_bits(whi * bf16_bits_to_float(uhi));
+      }
       yp[j] = static_cast<uint32_t>(lo) | (static_cast<uint32_t>(hi) << 16);
     }
     *reinterpret_cast<uint4*>(out + row + e0) = make_uint4(yp[0], yp[1], yp[2], yp[3]);
@@ -116,10 +128,9 @@ __global__ void __launch_bounds__(kThreads) add_rmsnorm_kernel(uint16_t* __restr
 
 bool aligned16(const void* p) { return (reinterpret_cast<uintptr_t>(p) & 15u) == 0; }
 
-}  // namespace
-
-void add_rmsnorm_bf16(uint16_t* resid, const uint16_t* add, const uint16_t* weight, uint16_t* out,
-                      int rows, int dim, float eps, cudaStream_t stream) {
+template <bool kOne>
+void launch(uint16_t* resid, const uint16_t* add, const uint16_t* weight, uint16_t* out, int rows, int dim,
+            float eps, cudaStream_t stream) {
   if (rows <= 0) return;
   if (!resid || !weight || !out) throw std::invalid_argument("add_rmsnorm: null buffer");
   if (dim <= 0 || dim % kVecElems != 0 || dim > kAddRmsnormMaxDim)
@@ -127,10 +138,22 @@ void add_rmsnorm_bf16(uint16_t* resid, const uint16_t* add, const uint16_t* weig
   if (!aligned16(resid) || !aligned16(weight) || !aligned16(out) || (add && !aligned16(add)))
     throw std::invalid_argument("add_rmsnorm: rows must be 16-byte aligned");
   if (add)
-    add_rmsnorm_kernel<true><<<rows, kThreads, 0, stream>>>(resid, add, weight, out, dim, eps);
+    add_rmsnorm_kernel<true, kOne><<<rows, kThreads, 0, stream>>>(resid, add, weight, out, dim, eps);
   else
-    add_rmsnorm_kernel<false><<<rows, kThreads, 0, stream>>>(resid, nullptr, weight, out, dim, eps);
+    add_rmsnorm_kernel<false, kOne><<<rows, kThreads, 0, stream>>>(resid, nullptr, weight, out, dim, eps);
   DGPP_CUDA_OK(cudaGetLastError());
+}
+
+}  // namespace
+
+void add_rmsnorm_bf16(uint16_t* resid, const uint16_t* add, const uint16_t* weight, uint16_t* out,
+                      int rows, int dim, float eps, cudaStream_t stream) {
+  launch<false>(resid, add, weight, out, rows, dim, eps, stream);
+}
+
+void add_rmsnorm_bf16_one(uint16_t* resid, const uint16_t* add, const uint16_t* weight, uint16_t* out,
+                          int rows, int dim, float eps, cudaStream_t stream) {
+  launch<true>(resid, add, weight, out, rows, dim, eps, stream);
 }
 
 }  // namespace dgpp

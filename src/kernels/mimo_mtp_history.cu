@@ -1,4 +1,5 @@
 #include <stdexcept>
+#include "kernels/pdl.cuh"
 
 #include "common/cuda_check.hpp"
 #include "kernels/mimo_mtp_history.hpp"
@@ -7,6 +8,7 @@ namespace {
 __global__ void mtp_history_gather(const uint16_t* history, uint16_t* hidden,
                                    const int64_t* positions, int64_t* translated,
                                    const int32_t* ids, int width, int capacity, int layer) {
+  dgpp_pdl_wait();
   const int row = blockIdx.x;
   const int req = ids ? ids[row] : 0;
   const int64_t p = positions[row];
@@ -20,6 +22,7 @@ __global__ void mtp_history_gather(const uint16_t* history, uint16_t* hidden,
 __global__ void mtp_history_store(uint16_t* history, const uint16_t* hidden,
                                   const int64_t* positions, const int32_t* ids, int width,
                                   int capacity, int layer) {
+  dgpp_pdl_wait();
   const int row = blockIdx.x;
   const int req = ids ? ids[row] : 0;
   const int64_t p = positions[row];

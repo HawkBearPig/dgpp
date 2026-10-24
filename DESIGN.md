@@ -1,7 +1,7 @@
 # DGPP Engine Design
 
 This document describes the implemented serving architecture. The
-shared runtime supports the GLM, Qwen, DeepSeek and MiMo architectures listed
+shared runtime supports the GLM, Qwen, DeepSeek, MiMo and Flint architectures listed
 in the [supported-model guide](README.md), with resident loading, tensor
 parallelism, decode graphs, sampling, prefix caching and speculative decoding.
 World size and memory requirements depend on the model
@@ -204,6 +204,19 @@ root precedence `HF_HUB_CACHE`, `HF_HOME/hub`, then
 ambiguous or missing snapshots are errors. `--checkpoint-dir` also
 accepts fixture or staged directories. Each rank loads its own slices
 from the node's checkpoint.
+
+The safetensors reader validates header lengths and payload-relative tensor
+offsets before constructing mapped views. Dimensions and offsets must be
+nonnegative integers; the checked shape product and dtype width must match
+the tensor's byte interval. Scalars and empty tensors remain supported.
+Validation preserves the raw header hash used by resident-image cache keys.
+Resident-image entries are checked for aligned offsets beyond the header/table
+and for byte ranges wholly inside the file. Invalid entries are treated as
+missing layers and rebuilt from the checkpoint.
+Resident-image payload folds are verified before upload by default;
+`DGPP_RESIDENT_CACHE_VERIFY=0` opts out of the payload pass. A read failure,
+size mismatch or failed fold causes that layer to be rebuilt and recached.
+This validation runs during loading and does not change resident inference.
 
 Resident serving loads the rank's weights at startup and keeps them for
 the process lifetime. GLM-5.3-Flash-FP8 requires TP=4 on 128 GB Sparks:
@@ -2120,13 +2133,23 @@ sum. A counter-based SplitMix64 RNG derives draws from the request's
 seed and counter. Greedy selection consumes no random draw.
 
 Defaults come from `generation_config.json`, with explicit handling of
-missing fields and EOS IDs. Process flags and request fields override
-them. Generation stop IDs are resolved separately from the model's
+missing fields and EOS IDs. Deployment penalty defaults, process flags and
+request fields override them in that order; omitted or null request fields
+inherit the served defaults. Generation stop IDs are resolved separately from the model's
 `config.json` EOS: Qwen PLE uses the trained EOS for n-gram padding and
 context resets. `/v1/models` reports effective defaults. The service journals
 sampling parameters as float bits together with the seed, allowing peers
 to reproduce the request's draws. Eager and graph engines both support
 sampling; a backend without that capability rejects stochastic requests.
+
+The full host sampler, eager greedy reports and bus sampling fold skip
+context counting and penalty application when the effective repetition
+penalty is 1 and both additive penalties are positive zero. Active and
+negative-zero parameters retain the original arithmetic; reference samplers
+remain unchanged. The numerical contract is non-NaN logits, round-to-nearest
+and gradual underflow, without preserving floating-point exception flags or
+traps. Greedy requests carrying penalties journal their sampling parameters
+even when they do not request probability reports.
 
 ### Candidate tables and exact fallback
 
@@ -2347,6 +2370,18 @@ schemas fall back to JSON-object mode with a warning. Each peer builds
 the same machine from the journal and its tokenizer.
 
 ## 11. Runtime and API
+
+HTTP request lengths are fully parsed as unsigned decimal integers after trimming
+space/tab padding. Repeated `Content-Length` fields must agree numerically and
+become one canonical field; comma-separated lengths are rejected. Invalid or
+conflicting lengths receive HTTP 400 and close before handler dispatch. Exceptions
+escaping `HttpHandler::handle` retain their diagnostic in server logs and return a
+generic HTTP 500 JSON error. Service-level error responses are unchanged.
+Parser refusals stop further request processing and drain queued responses before
+closing, including earlier pipelined replies under output backpressure. Handler
+exceptions replace only that handler's pending output, preserving earlier replies.
+Input arriving during the drain is discarded without dispatch or buffering so
+unread request bytes do not reset the socket when queued output finishes.
 
 The server separates HTTP processing from model execution. Rank 0 runs
 the text frontend and generation service; every rank runs a scheduler and

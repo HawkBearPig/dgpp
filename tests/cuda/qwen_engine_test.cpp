@@ -380,7 +380,7 @@ void rank_work_mtp(int r, const QwenTextConfig& cfg, const std::string& dir, con
 
 }  // namespace
 
-DGPP_TEST(qwen_engines_world_of_one_request_bound_preserves_mtp_and_slot_reuse) {
+static void check_qwen_request_bound(dgpp::LatentFormat kv_format) {
   struct RestoreModes {
     bool mapped = dgpp::QwenLayerStream::ngram_table_mmap();
     bool fp8 = dgpp::QwenLayerStream::dense_weights_fp8();
@@ -404,7 +404,7 @@ DGPP_TEST(qwen_engines_world_of_one_request_bound_preserves_mtp_and_slot_reuse) 
       cfg.max_position_embeddings = context;
       auto buses = start_world(1, kPort + 20);
       QwenModel model(cfg, dir, 128, 1024, QwenResidency::Resident, nullptr, 0, 1,
-                      4, true, 8, fp8);
+                      4, true, 8, fp8, false, kv_format);
       uint16_t* scratch = nullptr;
       DGPP_CUDA_OK(cudaHostAlloc(reinterpret_cast<void**>(&scratch),
                                  sizeof(uint16_t) * dgpp::kPickScratchElems(1), cudaHostAllocDefault));
@@ -458,6 +458,22 @@ DGPP_TEST(qwen_engines_world_of_one_request_bound_preserves_mtp_and_slot_reuse) 
     // pool stride; the second bounds it by an unaligned per-request ceiling.
     require(run(1024) == run(193),
             "bounding QSA workspace changes a four-slot MTP-1 transcript");
+  }
+}
+
+DGPP_TEST(qwen_engines_world_of_one_request_bound_preserves_mtp_and_slot_reuse) {
+  check_qwen_request_bound(dgpp::LatentFormat::kBf16);
+}
+
+DGPP_TEST(qwen_engines_fp8_attention_preserves_mtp_graph_and_slot_reuse) {
+  struct RestoreAttention {
+    ~RestoreAttention() { QwenModel::set_native_attention(false, false); }
+  } restore;
+  // Exercise each independent switch through mixed prefill, four live
+  // requests, graph replay, MTP verification and a retired/reopened slot.
+  for (bool prefill : {false, true}) {
+    QwenModel::set_native_attention(prefill, !prefill);
+    check_qwen_request_bound(dgpp::LatentFormat::kFp8);
   }
 }
 
@@ -714,9 +730,9 @@ DGPP_TEST(qwen_wide_compaction_fp8_preserves_projection_bits) {
 }
 
 static void check_mixed_prefill_engine(bool scheduled, bool adaptive = false) {
-  const auto cfg = qwenfx::tiny_config();
+  const auto cfg = qwenfx::test_config();
   const std::string dir = "qwen_engine_fixture/mixed_plain";
-  qwenfx::write_fixture(cfg, dir);
+  qwenfx::write_fixture_for(cfg, dir);
   for (const bool compact : {false, true}) {
     auto buses = start_world(1, kPort + 31 + compact);
     require(buses.size() == 1, "mixed plain: world-of-one bus");
@@ -806,9 +822,9 @@ DGPP_TEST(qwen_cached_tail_preserves_native_rows_in_mixed_prefill) {
     bool fp8 = dgpp::QwenLayerStream::dense_weights_fp8();
     ~RestoreDense() { dgpp::QwenLayerStream::set_dense_weights_fp8(fp8); }
   } restore;
-  const auto cfg = qwenfx::tiny_config();
+  const auto cfg = qwenfx::test_config();
   const std::string dir = "qwen_engine_fixture/cached_tail";
-  qwenfx::write_fixture(cfg, dir);
+  qwenfx::write_fixture_for(cfg, dir);
   const auto prompt = smoke_tokens(cfg, 22, 741);
   const std::vector<int64_t> prefix(prompt.begin(), prompt.begin() + 16);
   const auto cold = smoke_tokens(cfg, 248, 742);
@@ -2001,6 +2017,9 @@ DGPP_TEST(qwen_engines_loopback_world_2_lookup_skips_sampled_slots) {
 }
 
 int main() {
+  if (const char* tile = std::getenv("DGPP_TEST_QWEN_PREFILL_TILE"); tile && tile[0] == '1')
+    dgpp::QwenModel::set_default_prefill_dense_tile(true);
+
   // DGPP_TEST_QWEN_GPTQ=1: every case runs the AutoRound hybrid's fixture
   // (tests/cuda/qwen_fixture.hpp), whose dense stack ships as block fp8 —
   // the loader's fp8 dense mode is the only one that reads it.

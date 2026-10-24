@@ -29,8 +29,9 @@ for path in sorted(glob.glob(f"{logdir}/serve_r[0-9].log")):
                 g[0] += float(gm.group(3)) * sum(hist); g[1] += sum(hist)
                 g[2] = [a + b for a, b in zip(g[2], hist)]
             continue
-        for pm in re.finditer(r"rank(\d+) lag (\d+)us last (\d+)x", line):
-            p = peers[pm.group(1)]; p[0] += int(pm.group(2)); p[1] += int(pm.group(3)); p[2] += 1
+        for pm in re.finditer(r"rank(\d+) lag (\d+)us(?: \(landed (\d+)us\))? last (\d+)x", line):
+            p = peers[pm.group(1)]; p[0] += int(pm.group(2)); p[1] += int(pm.group(4)); p[2] += 1
+            if pm.group(3) is not None: p.extend([0] * (4 - len(p))); p[3] += int(pm.group(3))
     if not tl: print(f"rank {rank}: no timeline lines"); continue
     # only full windows (94 gens) after warmup
     full = [t for t in tl if t[-1] >= 90]
@@ -41,8 +42,10 @@ for path in sorted(glob.glob(f"{logdir}/serve_r[0-9].log")):
         w = [sum(x[i] for x in waits) for i in range(6)]
         ev = statistics.median(x[7] for x in waits); od = statistics.median(x[9] for x in waits)
         print(f"        wait hist <20/<50/<100/<200/<500/>=500 us: {w}; even (attention-side) {ev:.1f} us, odd (FFN-side) {od:.1f} us")
-    for p, (lag, last, n) in sorted(peers.items()):
-        print(f"        peer rank{p}: lag {lag/max(n,1):.0f} us avg, arrived last {last} times")
+    for p, v in sorted(peers.items()):
+        lag, last, n = v[0], v[1], v[2]
+        landed = f", landed {v[3]/max(n,1):.0f} us" if len(v) > 3 else ""
+        print(f"        peer rank{p}: lag {lag/max(n,1):.0f} us avg{landed}, arrived last {last} times")
     for k, (total, n, hist) in sorted(gaps.items()):
         pct = [round(100 * h / max(n, 1)) for h in hist]
         print(f"        claim {k}: gap {total/max(n,1):.1f} us avg; % <3/<5/<7/<10/<15/<25/>=25 us: {pct}")

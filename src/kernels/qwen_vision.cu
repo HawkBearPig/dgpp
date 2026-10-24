@@ -1,4 +1,5 @@
 #include <cstdint>
+#include "kernels/pdl.cuh"
 
 #include <math_constants.h>
 
@@ -26,6 +27,7 @@ __device__ inline uint16_t normalize(uint8_t byte) {
 // pixels, so the frame index selects the same byte.
 __global__ void patchify(const uint8_t* rgb, uint16_t* out, int width, int patch, int grid, int in,
                          int64_t total) {
+  dgpp_pdl_wait();
   const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (i >= total) return;
   const int64_t token = i / in;
@@ -49,6 +51,7 @@ __global__ void patchify(const uint8_t* rgb, uint16_t* out, int width, int patch
 // reference's bf16 products.
 __global__ void pos_embed_gather(const uint16_t* table, const int32_t* index, const float* weight,
                                  uint16_t* out, int hidden, int64_t total) {
+  dgpp_pdl_wait();
   const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (i >= total) return;
   const int64_t t = i / hidden;
@@ -78,6 +81,7 @@ __device__ Moments combine_moments(Moments left, Moments right) {
 }
 __global__ void layernorm(const uint16_t* x, const uint16_t* weight, const uint16_t* bias,
                           uint16_t* y, int dim, float eps) {
+  dgpp_pdl_wait();
   // Welford moments with four adjacent values per thread and warp-pair
   // reduction, matching the CUDA LayerNorm reference's FP32 arithmetic.
   constexpr int threads = 128;
@@ -121,6 +125,7 @@ __global__ void layernorm(const uint16_t* x, const uint16_t* weight, const uint1
 // hidden_act gelu_pytorch_tanh: 0.5x(1 + tanh(sqrt(2/pi)(x + 0.044715x^3))).
 template <bool Approximate>
 __global__ void gelu(uint16_t* x, int64_t count) {
+  dgpp_pdl_wait();
   const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (i >= count) return;
   const float v = bf(x[i]);
@@ -133,6 +138,7 @@ __global__ void gelu(uint16_t* x, int64_t count) {
 }
 
 __global__ void residual_add(uint16_t* x, const uint16_t* y, int64_t count) {
+  dgpp_pdl_wait();
   const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (i >= count) return;
   x[i] = fb(bf(x[i]) + bf(y[i]));
@@ -146,6 +152,7 @@ __global__ void residual_add(uint16_t* x, const uint16_t* y, int64_t count) {
 __global__ void split_rope(const uint16_t* qkv, uint16_t* q, uint16_t* k, uint16_t* v,
                            const float* cos_tab, const float* sin_tab, int n, int hidden, int dim,
                            int64_t total) {
+  dgpp_pdl_wait();
   const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (i >= total) return;
   const int64_t t = i / (3 * hidden);
@@ -172,6 +179,7 @@ __global__ void split_rope(const uint16_t* qkv, uint16_t* q, uint16_t* k, uint16
 // head-major [heads, n, dim] -> token-major [n, hidden].
 __global__ void unhead(const uint16_t* attn, uint16_t* out, int n, int hidden, int dim,
                        int64_t total) {
+  dgpp_pdl_wait();
   const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (i >= total) return;
   const int64_t t = i / hidden;
@@ -183,6 +191,7 @@ __global__ void unhead(const uint16_t* attn, uint16_t* out, int n, int hidden, i
 // head-major attention buffer at rows [first, first + tile).
 __global__ void store_attention(const float* tile, uint16_t* attn, int first, int n, int tile_rows,
                                 int dim, int64_t total) {
+  dgpp_pdl_wait();
   const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (i >= total) return;
   const int head = static_cast<int>(i / (static_cast<int64_t>(tile_rows) * dim));
@@ -214,6 +223,7 @@ __device__ float attention_reduce(float value, float* partials) {
   return partials[0];
 }
 __global__ void softmax(const float* scores, uint16_t* probs, int n, float scale) {
+  dgpp_pdl_wait();
   __shared__ float partials[32];
   const int row = blockIdx.x, t = threadIdx.x;
   float largest = -CUDART_INF_F;
@@ -229,6 +239,7 @@ __global__ void softmax(const float* scores, uint16_t* probs, int n, float scale
         float_to_bf16_bits(expf(__fmul_rn(scores[row * n + j], scale) - largest) / denom);
 }
 __global__ void softmax_warp(const float* scores, uint16_t* probs, int rows, int n, float scale) {
+  dgpp_pdl_wait();
   const int row = blockIdx.x * 4 + threadIdx.y, lane = threadIdx.x;
   if (row >= rows) return;
   float largest = -CUDART_INF_F;
@@ -247,6 +258,7 @@ __global__ void softmax_warp(const float* scores, uint16_t* probs, int rows, int
 // Image rows into the hyper-connection embedding: the [row][branch][hidden]
 // layout glm_embed_bcast_streams writes, with every branch the same row.
 __global__ void image_broadcast(const uint16_t* rows, uint16_t* out, int hidden, int64_t total) {
+  dgpp_pdl_wait();
   const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (i >= total) return;
   out[i] = rows[(i / (4 * hidden)) * hidden + i % hidden];

@@ -7,6 +7,7 @@
 // This header depends on CUDA and bus/verbs types. Host-only service tests
 // use a fake engine instead.
 #include <algorithm>
+#include "engine/graph_pdl.hpp"
 #include <array>
 #include <deque>
 #include <thread>
@@ -731,9 +732,11 @@ class GraphEngineAdapter final : public sched::SchedulerEngine {
   // `min_depth`: never verify fewer drafts than this (>= 1).
   // The depth options: every depth in [min_depth, depth] when the bus's
   // graph-variant budget (kBusMaxGraphVariants: two per slot per option
-  // plus two per batch family) holds them, else an even spread that always
-  // keeps the full block; a policy depth rounds UP to the next option
-  // (never fewer drafts than the policy asked — exact either way).
+  // plus two per batch family) holds them — and `max_options`
+  // (engine.mtp_schedule_options, 0 = the budget's count) caps them — else
+  // an even spread that always keeps the full block; a policy depth rounds
+  // UP to the next option (never fewer drafts than the policy asked —
+  // exact either way).
   // base_ms + adapt: lambda follows the modeled throughput (an EWMA of
   // committed / (base + rows.row) over the MTP steps, floored at
   // lambda_tok_per_ms; verify_schedule.hpp) instead of standing at the
@@ -845,6 +848,10 @@ class GraphEngineAdapter final : public sched::SchedulerEngine {
   // (sample::block_verify, the drafts decided jointly; exact, never fewer
   // tokens in expectation) or the token-by-token test. Before the first
   // capture (the verdict node bakes it in).
+  // engine.decode_pdl: the decode graph's kernel edges programmatic (graph_pdl.hpp), set before the first capture.
+  void set_decode_pdl(bool on) { decode_pdl_ = on; }
+  bool decode_pdl() const { return decode_pdl_; }
+  bool decode_pdl_ = true;
   void set_block_verify(bool on) {
     drain();
     for (const std::array<cudaGraphExec_t, 2>& e : scalar_execs_)
@@ -876,7 +883,8 @@ class GraphEngineAdapter final : public sched::SchedulerEngine {
     sched_sampled_scale_ = scale;
   }
   void configure_verify_schedule(bool on, float row_ms, float lambda_tok_per_ms,
-                                 int min_depth = 1, float base_ms = 0.f, bool adapt = false) {
+                                 int min_depth = 1, float base_ms = 0.f, bool adapt = false,
+                                 int max_options = 0) {
     drain();
     for (const std::array<cudaGraphExec_t, 2>& e : scalar_execs_)
       if (e[0] != nullptr)
@@ -922,8 +930,18 @@ class GraphEngineAdapter final : public sched::SchedulerEngine {
         throw std::invalid_argument(
             "engine.mtp_schedule=true requires engine.mtp_schedule_min_depth < engine.mtp_depth; "
             "set engine.mtp_schedule=false to use a fixed verify depth.");
-      const int options = std::min(span, fit);
+      // engine.mtp_schedule_options (2026-10-23): at most this many
+      // options, the same spread — a budget raised for sixteen slots made
+      // every depth an option, and the depth-2 option on the DSpark block
+      // cost the C1 code class 8 % of its tokens a step (the confidence
+      // under-reads the third row there; the three-option set rounds a
+      // policy depth of 2 up to 3).
+      const int options = std::max(1, max_options > 0 ? std::min({span, fit, max_options}) : std::min(span, fit));
       if (block_) {
+        if constexpr (requires { model_->dflash2_confidence(); }) {
+          if (model_->dflash2_confidence() == nullptr)
+            throw std::invalid_argument("engine.mtp_schedule requires a drafter with confidence scores; DFlash v1 has none");
+        }
         // The block drafter: the selector walk writes every draft's
         // confidence (the model's [slot][drafts] table, read by
         // record_confidence_publish); no draft-head path.
@@ -1728,11 +1746,14 @@ class GraphEngineAdapter final : public sched::SchedulerEngine {
 
   int64_t physical_reserve_tokens(int64_t tokens) const {
     // The chained drafts write depth - 1 rows past the verify's last row;
-    // a block drafter's block starts after the last accepted row and spans
-    // the verify's width again. Past the context ceiling, position kernels
-    // stage padding rows. Clamp before adding to avoid overflowing the sum.
+    // a block starts after the last accepted row and writes all its query
+    // rows, which can exceed the verify cap. Past the context ceiling,
+    // position kernels stage padding. Clamp before adding to avoid overflow.
     const int64_t ceiling = model_->max_context();
-    const int64_t tail = block_ ? depth_ + 1 : std::max(0, depth_ - 1);
+    int64_t tail = block_ ? depth_ + 1 : std::max(0, depth_ - 1);
+    if constexpr (requires { model_->block_draft_rows(); }) {
+      if (block_) tail = std::max<int64_t>(tail, model_->block_draft_rows());
+    }
     return tokens >= ceiling ? ceiling : tokens + std::min(tail, ceiling - tokens);
   }
 
@@ -2227,6 +2248,13 @@ class GraphEngineAdapter final : public sched::SchedulerEngine {
       // plan did not name.
       size_t free_before = 0, free_after = 0, total = 0;
       (void)cudaMemGetInfo(&free_before, &total);
+      if (decode_pdl_) {
+        const pdl::EdgeStats st = pdl::programmatic_edges(graph);
+        std::string unlisted;
+        for (const std::string& u : st.unlisted) unlisted += (unlisted.empty() ? "" : ", ") + u.substr(0, 48);
+        DGPP_LOG_INFO("rank {}: graph variant {} programmatic edges: {} of {} edges over {} kernel nodes; plain: {}", rank_,
+                      variant, st.converted, st.edges, st.kernel_nodes, unlisted.empty() ? "none" : unlisted);
+      }
       DGPP_CUDA_OK(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
       cudaGraphDestroy(graph);
       (void)cudaMemGetInfo(&free_after, &total);

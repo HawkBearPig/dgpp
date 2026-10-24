@@ -2,6 +2,7 @@
 // Launchers for the MoE kernels (DESIGN §7.4; semantics in
 // models/glm/moe.hpp). All deterministic (fixed reduction/selection order)
 // and CUDA-graph capturable: no scratch, no host reads.
+#include "common/dtypes.hpp"
 #include <cuda_runtime.h>
 
 #include "models/glm/moe.hpp"
@@ -194,6 +195,19 @@ void launch_moe_accum_ordered_f32_bf16down(float* out, const uint16_t* down, siz
 void launch_moe_round_bf16(uint16_t* out, const float* acc, int64_t n,
                            cudaStream_t stream);
 
+// The EXL3 slot kernels' expert-run classes (kernels/exl3_gemv.cu): a run
+// of up to kMoeRunTileRows rows takes the 16-row tile at its leader's
+// block; a longer run is cut into groups of up to kMoeRunGroupRows rows,
+// each a 64-row tile. The order kernel writes the groups after the run
+// lengths as a launch list (position | rows << 16, -1 past the last), so
+// the 64-row launch's grid is the list's bound, not every position
+// (2026-10-23: 1,400 returning blocks of a 64 KB-smem kernel cost ~240 us
+// a layer when no run exceeded 16 rows). A `runs` buffer holds
+// slots + moe_run_groups_max(slots) entries.
+constexpr int kMoeRunTileRows = 16;
+constexpr int kMoeRunGroupRows = 64;
+DGPP_HD inline int moe_run_groups_max(int slots) { return slots / (kMoeRunTileRows + 1) + 1; }
+
 // ---- decode-slot path (the sync-free MoE, 2026-09-01) --------------------
 //
 // The decode step's MoE without host round-trips: the router leaves
@@ -224,9 +238,12 @@ void launch_moe_round_bf16(uint16_t* out, const float* acc, int64_t n,
 // `shared_early`: the shared expert's slots interleaved with the first
 // routed ones instead of last (the kernel's comment: compute over
 // L2-resident weights beside the routed DRAM stream).
+// `runs` (nullable): runs[p] = the length of the equal-expert run starting
+// at position p of the order, 0 inside a run — the EXL3 slot kernels'
+// expert-run form (kernels/exl3_gemv.hpp).
 void launch_moe_slot_order(const int32_t* ids, int32_t* order, int slots,
                            int top_k, int n_experts, cudaStream_t stream,
-                           bool shared_early = false);
+                           bool shared_early = false, int32_t* runs = nullptr);
 void launch_moe_slot_gate_up_swiglu(
     const uint16_t* x, size_t x_stride, const int32_t* ids,
     const int32_t* order, const MoeExpertView* views, int n_routed,
@@ -390,7 +407,30 @@ void launch_moe_slot_down_fp4(const uint16_t* act, size_t act_stride,
                               const uint8_t* sh_payload, const float* sh_scales,
                               float* out, int out_stride, int slots, int top_k,
                               cudaStream_t stream, int shared_view_base = -1,
-                              int fp4_group = 16, int sh_rs = 7, int sh_cs = 7);
+                              int fp4_group = 16, int sh_rs = 7, int sh_cs = 7,
+                              int* tile_counter = nullptr);
+// The per-projection form's gate/up launch (2026-10-22, docs/flint_plan.md
+// D2): the two projections in different formats — one fp8 (`payload` /
+// `scales`, a 128-row block grid or the re-blocked slice grid), one NVFP4
+// / MXFP4 (`fp4_scales` / `fp4_global`) — `gate_fp4` naming which is
+// which. The fp8 matrix's rows run the fp8 core (row_dots, the fp8 slot
+// kernel's per-row arithmetic), the fp4 matrix's the fp4 core (the fp4
+// slot kernel's), the SwiGLU on the pair with the same rounding points:
+// each dot bitwise its uniform kernel's. The shared slot (n_shared > 0:
+// an fp8 expert on the launch-arg matrices at k_shared, its scale grid
+// sh_rs / sh_cs) runs the fp8 core on both, as the fp4 kernel's does.
+void launch_moe_slot_gate_up_swiglu_mixed(const uint16_t* x, size_t x_stride, const int32_t* ids,
+                                          const int32_t* order, const MoeExpertView* views, int n_routed,
+                                          int k_routed, int n_shared, int k_shared, const uint8_t* sh_gate_payload,
+                                          const float* sh_gate_scales, const uint8_t* sh_up_payload,
+                                          const float* sh_up_scales, uint16_t* act, int act_stride, int slots,
+                                          int top_k, float limit, bool gate_fp4, int fp4_group, cudaStream_t stream,
+                                          int sh_rs = 7, int sh_cs = 7);
+// tile_counter (2026-10-19, required): two device ints the caller zeroes
+// once at allocation. The kernel's blocks steal (slot, row tile) units
+// from the first and the last block out resets both, so consecutive
+// launches on one stream need nothing between them. Bitwise the static
+// grid; the grid is the device's resident blocks of the kernel.
 
 // ---- the packed-int routed experts (2026-09-12, docs/glm53_plan.md D2) ----
 // The same contracts as the FP8 / NVFP4 launchers above over expert-view

@@ -1,4 +1,5 @@
 #include "kernels/glm_spec.hpp"
+#include "kernels/pdl.cuh"
 
 #include <algorithm>
 #include <stdexcept>
@@ -12,11 +13,12 @@ namespace dgpp {
 
 namespace {
 
-constexpr int kUploadMaxWords = 64;
+constexpr int kUploadMaxWords = kPickMaxRows;  // the batch map's requests x rows (16 slots x 5 rows = 80 since 2026-10-23)
 
 template <typename Word>
 __global__ void upload_words_kernel(const Word* __restrict__ src,
                                     Word* __restrict__ dst, int count) {
+  dgpp_pdl_wait();
   const int i = static_cast<int>(threadIdx.x);
   if (i >= count) return;
   cuda::atomic_ref<Word, cuda::thread_scope_system> ref(
@@ -46,6 +48,7 @@ constexpr size_t kUnit = 16;  // one uint4 per thread per iteration
 __global__ void spec_commit_kernel(const PickVerdict* __restrict__ verdict, int rows,
                                    GlmSpecSegments segments, int64_t* __restrict__ session_pos,
                                    const int32_t* request_map, int batch_index) {
+  dgpp_pdl_wait();
   const int req = request_map ? request_map[batch_index] : 0;
   if (req < 0) return;
   const int accepted = verdict->accepted;
@@ -89,6 +92,7 @@ __global__ void spec_commit_kernel(const PickVerdict* __restrict__ verdict, int 
 __global__ void spec_positions_kernel(const int64_t* __restrict__ session_pos,
                                       int rows, int64_t max_context,
                                       int64_t* __restrict__ step_pos) {
+  dgpp_pdl_wait();
   const int r = threadIdx.x;
   if (r >= rows) return;
   const int64_t p = *session_pos + r;
@@ -99,6 +103,7 @@ __global__ void spec_positions_batched_kernel(
     const int64_t* __restrict__ session_pos,
     const int32_t* __restrict__ request_ids, int rows, int rows_per_request,
     int64_t max_context, int64_t* __restrict__ step_pos) {
+  dgpp_pdl_wait();
   const int r = threadIdx.x + blockIdx.x * blockDim.x;
   if (r >= rows) return;
   const int req = request_ids[r];
@@ -112,6 +117,7 @@ __global__ void spec_draft_rows_kernel(const PickVerdict* __restrict__ verdict,
                                        int64_t* __restrict__ step_pos,
                                        int64_t* __restrict__ tokens,
                                        int64_t* __restrict__ next_out) {
+  dgpp_pdl_wait();
   const int accepted = verdict->accepted;
   const int r = threadIdx.x;
   if (r < rows) {
@@ -129,6 +135,7 @@ __global__ void spec_draft_rows_kernel(const PickVerdict* __restrict__ verdict,
 __global__ void spec_next_tokens_kernel(const int64_t* __restrict__ next,
                                         GlmSpecDrafts drafts,
                                         int64_t* __restrict__ tokens) {
+  dgpp_pdl_wait();
   tokens[0] = *next;
   for (int c = 0; c < drafts.count; ++c) {
     const int32_t id = drafts.v[c]->next;
@@ -143,6 +150,7 @@ __global__ void spec_chain_row_kernel(
     const int64_t* __restrict__ block_pos, int chain_index, int64_t max_context,
     int64_t* __restrict__ step_pos, int64_t* __restrict__ tokens,
     int32_t* __restrict__ req_spans) {
+  dgpp_pdl_wait();
   const int row = verify != nullptr ? max(verify->accepted - 1, 0) : src_row;
   const int64_t pos = *block_pos + chain_index;
   const bool fits = pos >= 0 && pos < max_context;
@@ -175,6 +183,7 @@ __global__ void spec_chain_row_window_kernel(
     const int64_t* __restrict__ block_pos, int chain_index, int64_t max_context,
     int64_t* __restrict__ step_pos, int64_t* __restrict__ tokens,
     int32_t* __restrict__ req_spans) {
+  dgpp_pdl_wait();
   const int row = verify != nullptr ? max(verify->accepted - 1, 0) : src_row;
   const int64_t pos = *block_pos + chain_index;
   const bool fits = pos >= 0 && pos < max_context;
@@ -199,6 +208,7 @@ __global__ void spec_draft_rows_batched_kernel(
     const PickVerdict* __restrict__ verdicts, int rows_per_request, int64_t* __restrict__ block_pos,
     int64_t* __restrict__ step_pos, int64_t* __restrict__ tokens, int64_t* __restrict__ next_out,
     const int32_t* request_map) {
+  dgpp_pdl_wait();
   const int q = blockIdx.x;
   const int req = request_map ? request_map[q] : q;
   const PickVerdict& verdict = verdicts[q];
@@ -222,6 +232,7 @@ __global__ void spec_verify_next_tokens_batched_kernel(const PickVerdict* __rest
                                                        int rows_per_request,
                                                        int64_t* __restrict__ tokens,
                                                        const int32_t* request_map) {
+  dgpp_pdl_wait();
   const int q = blockIdx.x;
   const int req = request_map ? request_map[q] : q;
   const bool active = req >= 0 && verify[q].accepted > 0;
@@ -234,6 +245,7 @@ __global__ void spec_next_tokens_batched_kernel(const int64_t* __restrict__ next
                                                 GlmSpecDrafts drafts, int rows_per_request,
                                                 int64_t* __restrict__ tokens,
                                                 const int32_t* request_map) {
+  dgpp_pdl_wait();
   const int q = blockIdx.x;
   const int req = request_map ? request_map[q] : q;
   const bool active = req >= 0 && drafts.v[0][q].accepted > 0;
@@ -258,6 +270,7 @@ __global__ void spec_chain_rows_batched_kernel(
     const int64_t* __restrict__ block_pos, int chain_index, int64_t max_context,
     int64_t* __restrict__ step_pos, int64_t* __restrict__ tokens, int32_t* __restrict__ req_ids,
     int32_t* __restrict__ req_spans, const int32_t* request_map) {
+  dgpp_pdl_wait();
   const int q = blockIdx.x;
   const int req = request_map ? request_map[q] : q;
   const bool active = req >= 0 && verify[q].accepted > 0;
@@ -298,6 +311,7 @@ __global__ void stage_wait_kernel(const uint64_t* __restrict__ pinned_seq,
                                   uint64_t* __restrict__ device_seq,
                                   uint32_t* __restrict__ pinned_late,
                                   int64_t timeout_ns) {
+  dgpp_pdl_wait();
   if (threadIdx.x != 0) return;
   const uint64_t need = *device_seq + 1;
   *device_seq = need;
@@ -317,6 +331,7 @@ __global__ void stage_wait_kernel(const uint64_t* __restrict__ pinned_seq,
 
 __global__ void publish_seq_kernel(uint64_t* __restrict__ device_seq,
                                    uint64_t* __restrict__ pinned_out) {
+  dgpp_pdl_wait();
   if (threadIdx.x != 0) return;
   const uint64_t v = *device_seq + 1;
   *device_seq = v;
@@ -327,6 +342,7 @@ __global__ void publish_f32_kernel(const float* __restrict__ src,
                                    float* __restrict__ pinned_dst, int count,
                                    uint64_t* __restrict__ device_seq,
                                    uint64_t* __restrict__ pinned_seq) {
+  dgpp_pdl_wait();
   for (int i = static_cast<int>(threadIdx.x); i < count; i += static_cast<int>(blockDim.x)) {
     const float v = src[i];
     asm volatile("st.relaxed.sys.global.f32 [%0], %1;" ::"l"(pinned_dst + i), "f"(v) : "memory");
@@ -343,6 +359,7 @@ __global__ void publish_f32_kernel(const float* __restrict__ src,
 __global__ void gather_feed_kernel(const int64_t* __restrict__ feeds, int requests, int feed_rows,
                                    int rows_per_request, int64_t* __restrict__ out,
                                    const int32_t* request_map) {
+  dgpp_pdl_wait();
   const int n = requests * rows_per_request;
   for (int i = static_cast<int>(threadIdx.x); i < n; i += static_cast<int>(blockDim.x)) {
     const int q = i / rows_per_request;
@@ -354,6 +371,7 @@ __global__ void gather_feed_kernel(const int64_t* __restrict__ feeds, int reques
 
 __global__ void upload_words_kernel(const uint32_t* __restrict__ src,
                                     uint32_t* __restrict__ dst, size_t count) {
+  dgpp_pdl_wait();
   for (size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
        i < count; i += static_cast<size_t>(gridDim.x) * blockDim.x) {
     uint32_t v;
@@ -467,6 +485,7 @@ namespace {
 __global__ void device_copy_kernel(uint4* __restrict__ dst,
                                    const uint4* __restrict__ src,
                                    size_t units) {
+  dgpp_pdl_wait();
   for (size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
        i < units; i += static_cast<size_t>(gridDim.x) * blockDim.x)
     dst[i] = src[i];
@@ -489,6 +508,7 @@ void glm_device_copy(void* dst, const void* src, size_t bytes,
 
 namespace {
 __global__ void store_u8x2_kernel(uint8_t* __restrict__ dst, uint8_t a, uint8_t b) {
+  dgpp_pdl_wait();
   dst[0] = a;
   dst[1] = b;
 }
@@ -685,6 +705,7 @@ void glm_spec_chain_rows_batched(const PickVerdict* verify_verdicts,
 
 __global__ void batch_rows_kernel(const int32_t* map, int requests, int rows, int32_t* ids,
                                   int32_t* spans) {
+  dgpp_pdl_wait();
   const int i = threadIdx.x;
   if (i < requests * rows) ids[i] = map[i / rows];
   if (i < requests) {

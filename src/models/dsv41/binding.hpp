@@ -56,6 +56,13 @@ enum class Dsv41TensorRole : uint8_t {
   TablePayload, // F8_E4M3 [rows, 256] (the Engram table, never resident)
   TableScale,   // F8_E8M0 [rows, 8]
   Skipped,      // in the file, not loaded (vision)
+  // The EXL3 quadruple (docs/deepseek_v41_flash_exl3_plan.md §1.1): one
+  // matrix X with input width K and output width N is X.trellis I16
+  // [K/16, N/16, 16 * bits], X.suh F16 [K], X.svh F16 [N], X.mul1 I32 [].
+  Exl3Trellis,
+  Exl3Suh,
+  Exl3Svh,
+  Exl3Marker,
 };
 
 struct Dsv41ExpectedTensor {
@@ -99,6 +106,7 @@ struct Dsv41BindReport {
   size_t unexpected = 0;
   size_t fp4_matrices = 0;      // routed + draft expert matrices
   size_t fp8_matrices = 0;      // dense projections
+  size_t exl3_matrices = 0;     // EXL3 trellis matrices (the pack: every projection, expert and the head)
   size_t engram_tables = 0;
   size_t skipped = 0;           // vision tensors present
   std::vector<std::string> errors;
@@ -120,7 +128,10 @@ Dsv41BindReport dsv41_validate_text_binding(
 // must divide the attention heads (whole output groups per rank), the
 // index heads, the vocabulary, the Engram hash heads and the expert /
 // shared intermediate size, with every intermediate slice a multiple of
-// 32 (the MXFP4 block and the fp8 block).
+// 32 (the MXFP4 block and the fp8 block). Under the EXL3 format the
+// intermediate and the vocabulary are split in whole 128-blocks instead
+// (exl3_block_split: at least one block per rank), and the wo_b input
+// slice must be a 128-multiple (the plan's §2.3).
 void dsv41_tp_validate_geometry(const Dsv41TextConfig& cfg, int rank, int world);
 
 }  // namespace dgpp

@@ -3,9 +3,9 @@
 #include <algorithm>
 #include <arpa/inet.h>
 #include <cctype>
+#include <charconv>
 #include <chrono>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <errno.h>
 #include <fcntl.h>
@@ -355,11 +355,7 @@ void HttpServer::serve() {
         (void)process_requests(*c);
     }
     for (auto& [fd, c] : conns_) {
-      if (c->fd >= 0 && !c->out.empty()) {
-        flush_out(*c);
-        if (c->fd >= 0 && c->closing && c->flushed >= c->out.size())
-          close_conn(*c, /*notify_disconnect=*/false);
-      }
+      if (c->fd >= 0 && !c->out.empty()) flush_out(*c);
     }
     for (auto it = conns_.begin(); it != conns_.end();) {
       if (it->second->fd < 0)
@@ -410,7 +406,7 @@ void HttpServer::accept_new() {
 
 void HttpServer::on_readable(Conn& c) {
   char buf[kReadChunk];
-  while (true) {
+  while (!c.gone) {
     const ssize_t got = ::recv(c.fd, buf, sizeof(buf), 0);
     if (got < 0) {
       if (errno == EAGAIN || errno == EWOULDBLOCK) return;
@@ -422,15 +418,21 @@ void HttpServer::on_readable(Conn& c) {
       close_conn(c, /*notify_disconnect=*/true);
       return;
     }
+    // Once a refusal is queued, discard later input without parsing or
+    // buffering it. Leaving it unread can make close() reset the socket
+    // and discard response bytes that are still in the kernel send queue.
+    if (c.closing) continue;
     c.in.append(buf, static_cast<size_t>(got));
-    if (!process_requests(c)) return;  // error/close already handled
+    if (!process_requests(c)) {
+      if (c.fd < 0) return;
+      continue;  // drain input while the terminal response waits on output
+    }
     if (c.in.size() > kMaxHeaderBytes + max_body_bytes_) {
       queue_response(c, 413, "text/plain",
                      "payload too large: http.max_body_bytes is " +
                          std::to_string(max_body_bytes_) + " bytes", true);
       flush_out(c);
-      close_conn(c, false);
-      return;
+      if (c.fd < 0) return;
     }
   }
 }
@@ -444,7 +446,6 @@ bool HttpServer::process_requests(Conn& c) {
       if (c.in.size() > kMaxHeaderBytes) {
         queue_response(c, 431, "text/plain", "headers too large", true);
         flush_out(c);
-        close_conn(c, false);
         return false;
       }
       return true;  // need more bytes
@@ -455,7 +456,6 @@ bool HttpServer::process_requests(Conn& c) {
       // 20 KiB header value is as oversized as an unterminated one.
       queue_response(c, 431, "text/plain", "headers too large", true);
       flush_out(c);
-      close_conn(c, false);
       return false;
     }
 
@@ -467,7 +467,6 @@ bool HttpServer::process_requests(Conn& c) {
     if (sp1 == std::string_view::npos || sp2 == std::string_view::npos) {
       queue_response(c, 400, "text/plain", "malformed request line", true);
       flush_out(c);
-      close_conn(c, false);
       return false;
     }
     HttpRequest req;
@@ -477,7 +476,6 @@ bool HttpServer::process_requests(Conn& c) {
     if (version != "HTTP/1.1") {
       queue_response(c, 400, "text/plain", "HTTP/1.1 only", true);
       flush_out(c);
-      close_conn(c, false);
       return false;
     }
     const size_t qmark = target.find('?');
@@ -502,7 +500,6 @@ bool HttpServer::process_requests(Conn& c) {
       if (colon == std::string_view::npos) {
         queue_response(c, 400, "text/plain", "malformed header line", true);
         flush_out(c);
-        close_conn(c, false);
         return false;
       }
       std::string key = to_lower(line.substr(0, colon));
@@ -510,8 +507,25 @@ bool HttpServer::process_requests(Conn& c) {
       while (vstart < line.size() && line[vstart] == ' ') ++vstart;
       std::string value(line.substr(vstart));
       if (key == "content-length") {
+        std::string_view length(value);
+        while (!length.empty() && (length.front() == ' ' || length.front() == '\t'))
+          length.remove_prefix(1);
+        while (!length.empty() && (length.back() == ' ' || length.back() == '\t'))
+          length.remove_suffix(1);
+        size_t parsed_length = 0;
+        const auto [end, error] =
+            std::from_chars(length.data(), length.data() + length.size(), parsed_length);
+        if (error != std::errc{} || end != length.data() + length.size() ||
+            (has_len && parsed_length != content_length)) {
+          queue_response(c, 400, "text/plain", "invalid or conflicting Content-Length", true);
+          flush_out(c);
+          return false;
+        }
+        // Keep one canonical field so framing and handler-visible headers agree.
+        if (has_len) continue;
         has_len = true;
-        content_length = static_cast<size_t>(std::strtoull(value.c_str(), nullptr, 10));
+        content_length = parsed_length;
+        value = std::to_string(content_length);
       } else if (key == "transfer-encoding") {
         has_te = true;
       } else if (key == "connection") {
@@ -527,13 +541,11 @@ bool HttpServer::process_requests(Conn& c) {
                      "chunked request bodies unsupported — send Content-Length",
                      true);
       flush_out(c);
-      close_conn(c, false);
       return false;
     }
     if (req.method == "POST" && !has_len) {
       queue_response(c, 411, "text/plain", "Content-Length required", true);
       flush_out(c);
-      close_conn(c, false);
       return false;
     }
     if (content_length > max_body_bytes_) {
@@ -541,7 +553,6 @@ bool HttpServer::process_requests(Conn& c) {
                      "payload too large: http.max_body_bytes is " +
                          std::to_string(max_body_bytes_) + " bytes", true);
       flush_out(c);
-      close_conn(c, false);
       return false;
     }
     if (c.in.size() < head_len + content_length) return true;  // need more
@@ -556,6 +567,7 @@ bool HttpServer::process_requests(Conn& c) {
     // overwritten, its writer freed at the close without notice — the
     // fuzzer's third find, 2026-09-05). respond()/end_stream() clear busy.
     c.busy = true;
+    const size_t response_start = c.out.size();
     try {
       handler_->handle(req, c.writer);
     } catch (const std::exception& e) {
@@ -563,21 +575,17 @@ bool HttpServer::process_requests(Conn& c) {
                      req.path, e.what());
       c.busy = false;
       if (c.fd < 0) return false;  // the handler killed the conn already
-      c.out.clear();
-      c.flushed = 0;
+      // This handler has not flushed yet. Replace only its queued bytes;
+      // an earlier pipelined reply may still be waiting on a writable socket.
+      c.out.resize(response_start);
       c.stream = false;
-      queue_response(c, 500, "text/plain",
-                     std::string("handler error: ") + e.what(), true);
+      queue_response(c, 500, "text/plain", "internal server error", true);
     }
     if (c.fd < 0) return false;  // a disconnect raced the route
     flush_out(c);
     if (c.fd < 0) return false;  // EPIPE while flushing the response
-    if (c.closing && c.flushed >= c.out.size()) {
-      close_conn(c, false);
-      return false;
-    }
   }
-  return true;
+  return false;  // stop reading while the terminal response drains
 }
 
 void HttpServer::on_writable(Conn& c) { flush_out(c); }
@@ -629,6 +637,13 @@ bool HttpServer::flush_out(Conn& c) {
     if (put < 0 && errno == EINTR) continue;
     c.gone = true;  // EPIPE & friends: the client left
     close_conn(c, /*notify_disconnect=*/true);
+    return false;
+  }
+  // A successful send may have only made partial progress on earlier calls.
+  // Close here so every flush path, including EPOLLOUT, drains the entire
+  // queue before releasing the connection and notifying the handler.
+  if (c.closing) {
+    close_conn(c, /*notify_disconnect=*/false);
     return false;
   }
   // Fully drained: back to the plain read set.

@@ -1,4 +1,5 @@
 #include "kernels/dsv41_engram.hpp"
+#include "kernels/pdl.cuh"
 
 #include <stdexcept>
 
@@ -30,6 +31,7 @@ __global__ void hash_ids_rows_kernel(const int64_t* __restrict__ tokens, int row
                                      const int32_t* __restrict__ spans, int num_requests,
                                      const int32_t* __restrict__ ctx, Dsv41EngramHash h,
                                      int32_t* __restrict__ ids) {
+  dgpp_pdl_wait();
   const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   const int64_t per_row = static_cast<int64_t>(h.layers) * h.heads;
   if (i >= static_cast<int64_t>(rows) * per_row) return;
@@ -77,6 +79,7 @@ __global__ void context_rows_kernel(const int64_t* __restrict__ tokens,
                                     const int32_t* __restrict__ spans, int num_requests,
                                     const int32_t* __restrict__ token_map, int keep,
                                     int32_t* __restrict__ ctx, int32_t* __restrict__ ctx_rows) {
+  dgpp_pdl_wait();
   const int q = blockIdx.x * blockDim.x + threadIdx.x;
   if (q >= num_requests) return;
   const int s = spans[2 * q], len = spans[2 * q + 1];
@@ -115,6 +118,7 @@ __device__ __forceinline__ float e8m0_to_float(uint8_t b) {
 // scale (a chunk of 8 lies inside one block of 32).
 __global__ void gather_staged_kernel(const uint8_t* __restrict__ staged, int n, int rows_local,
                                      int head_dim, uint16_t* __restrict__ out) {
+  dgpp_pdl_wait();
   const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
   const int64_t pair = static_cast<int64_t>(blockIdx.x) * (blockDim.x / 32) + warp;
   if (pair >= static_cast<int64_t>(n) * rows_local) return;
@@ -166,6 +170,7 @@ __global__ void gate_rows_kernel(uint16_t* __restrict__ x, const uint16_t* __res
                                  const uint16_t* __restrict__ q_weight,
                                  const uint16_t* __restrict__ k_weight, int rows, int hc,
                                  int hidden, float eps) {
+  dgpp_pdl_wait();
   __shared__ float scratch[kGateThreads / 32];
   const int t = blockIdx.x / hc, i = blockIdx.x % hc;
   if (t >= rows) return;

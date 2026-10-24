@@ -1,4 +1,5 @@
 #include "kernels/fp8_gemm.hpp"
+#include "kernels/pdl.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
@@ -23,6 +24,7 @@ __global__ __launch_bounds__(kQThreads) void fp8_quantize_rows_kernel(const uint
                                                                      size_t act_stride, int m, int k,
                                                                      uint8_t* __restrict__ q,
                                                                      float* __restrict__ scales) {
+  dgpp_pdl_wait();
   const int groups = k / 128;
   const int gid = blockIdx.x * (kQThreads / 32) + threadIdx.x / 32;
   const int lane = threadIdx.x % 32;
@@ -51,6 +53,7 @@ __global__ __launch_bounds__(kTThreads) void fp8_quantize_tokens_kernel(const ui
                                                                        size_t act_stride, int m, int k,
                                                                        uint8_t* __restrict__ q,
                                                                        float* __restrict__ scales) {
+  dgpp_pdl_wait();
   const int row = blockIdx.x;
   if (row >= m) return;
   const uint16_t* src = act + static_cast<size_t>(row) * act_stride;
@@ -110,6 +113,7 @@ __global__ __launch_bounds__(kTThreads) void fp8_swiglu_quantize_tokens_kernel(c
                                                                               size_t stride, int m, int k,
                                                                               uint8_t* __restrict__ q,
                                                                               float* __restrict__ scales) {
+  dgpp_pdl_wait();
   const int row = blockIdx.x;
   if (row >= m) return;
   const uint16_t* gr = gate + static_cast<size_t>(row) * stride;
@@ -198,6 +202,7 @@ __global__ __launch_bounds__(kThreads, 1) void fp8_gemm_kernel(const uint8_t* __
                                                               const float* __restrict__ w_scales, int sbr,
                                                               OutT* __restrict__ out, int m, int n, int k,
                                                               size_t out_stride) {
+  dgpp_pdl_wait();
   extern __shared__ __align__(128) uint8_t smem[];
   uint8_t* sa = smem;
   uint8_t* sb = smem + kStages * kTileBytes;
@@ -407,6 +412,7 @@ __global__ __launch_bounds__(kThreads, 1) void fp8_gemm_channel_tma_kernel(const
                                                                           const float* __restrict__ w_scales,
                                                                           OutT* __restrict__ out, int m, int n, int k,
                                                                           size_t out_stride) {
+  dgpp_pdl_wait();
   extern __shared__ __align__(1024) uint8_t smraw[];
   const unsigned sbase = static_cast<unsigned>(__cvta_generic_to_shared(smraw));
   uint8_t* sm = smraw + ((1024 - (sbase & 1023)) & 1023);

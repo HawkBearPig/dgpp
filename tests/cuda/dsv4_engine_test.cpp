@@ -565,7 +565,7 @@ void rank_work_sched(int r, const Dsv4Config& cfg, const std::string& dir, const
 }
 
 // Six request slots at depth 4 (30 rows, the family's 32-row cap since
-// 2026-09-14; the vLLM recipe's six-stream shape): every slot batched in
+// 2026-09-14; the six-stream serving shape): every slot batched in
 // the 6-slot family under the scheduled depth (forced per-slot depths so
 // the reduced batch variants replay), every transcript the plain eager
 // engine's, both ranks identical.

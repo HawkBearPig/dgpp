@@ -329,6 +329,20 @@ cmake --build --preset release -j 4
 Replace the path with your CUDA 13 installation. `--fresh` resets CMake's
 configuration, not your source or model cache.
 
+To use GCC 15, select it for both C++ and CUDA host compilation in a
+separate build directory. This leaves the GCC 13 baseline build available:
+
+```bash
+CC=gcc-15 CXX=g++-15 CUDAHOSTCXX=g++-15 \
+  cmake --preset ci -B build-ci-gcc15
+cmake --build build-ci-gcc15 -j 4 --target dgpp_serve_app
+```
+
+Install the chosen compiler first and use a CUDA toolkit that supports
+that host compiler. Use a new build directory when changing compilers;
+an existing CMake cache retains its compiler selection. The test targets
+and commands in [testing](testing.md) also apply to this build directory.
+
 ## 6. Download once and sync to peers
 
 Before downloading, check storage on **every node**, for example

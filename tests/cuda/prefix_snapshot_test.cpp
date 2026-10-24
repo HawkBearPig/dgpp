@@ -1,12 +1,15 @@
 // Forced K/V exhaustion at snapshot time, using the real Qwen session core
 // and GLM's separate implementation. No checkpoint downloads or RDMA needed.
+#include <algorithm>
 #include <cstdio>
+
 #include <cstring>
 #include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "common/cuda_check.hpp"
 #include "engine/prefix_arena.hpp"
 #include "models/glm/forward.hpp"
 #include "models/qwen/forward.hpp"
@@ -112,6 +115,46 @@ void check_snapshots(Model& model, int vocab) {
   (void)arena.snapshot_ms();
 }
 
+void check_qwen_fp8_pool_copy() {
+  dgpp::QwenKvPoolShape shape{2, 2, 256, 64, 16, 64, 2, 192};
+  shape.format = dgpp::LatentFormat::kFp8;
+  shape.fp8_prefill_attention = true;
+  shape.fp8_decode_attention = true;
+  dgpp::QwenKvPool pool;
+  pool.init(shape);
+  struct Plane { void* ptr; size_t block_bytes; std::vector<uint8_t> expected; };
+  std::vector<Plane> planes;
+  auto add = [&](void* ptr, size_t block_bytes) {
+    Plane p{ptr, block_bytes, std::vector<uint8_t>(3 * block_bytes)};
+    for (size_t i = 0; i < p.expected.size(); ++i)
+      p.expected[i] = static_cast<uint8_t>(17 * (i % block_bytes) + 31 * (i / block_bytes) + planes.size());
+    DGPP_CUDA_OK(cudaMemcpy(ptr, p.expected.data(), p.expected.size(), cudaMemcpyHostToDevice));
+    std::copy_n(p.expected.begin(), block_bytes, p.expected.begin() + block_bytes);
+    planes.push_back(std::move(p));
+  };
+  for (int layer = 0; layer < shape.layers; ++layer) {
+    const auto c = pool.view(layer);
+    require(c.fp8_prefill_attention && c.fp8_decode_attention, "pool lost its native compute settings");
+    add(c.k_cache, shape.block_tokens * shape.kv_heads * shape.dim);
+    add(c.v_cache, shape.block_tokens * shape.kv_heads * shape.dim);
+    add(c.k_scale, shape.block_tokens * shape.kv_heads * sizeof(float));
+    add(c.v_scale, shape.block_tokens * shape.kv_heads * sizeof(float));
+    add(c.index_cache, shape.block_tokens / shape.kpool * shape.idx_dim * sizeof(uint16_t));
+  }
+  pool.copy_block_contents(0, 1, nullptr);
+  DGPP_CUDA_OK(cudaDeviceSynchronize());
+  for (const auto& p : planes) {
+    std::vector<uint8_t> got(p.expected.size());
+    DGPP_CUDA_OK(cudaMemcpy(got.data(), p.ptr, got.size(), cudaMemcpyDeviceToHost));
+    require(got == p.expected, "pool copy lost a cache plane or overwrote an adjacent block");
+  }
+  shape.format = dgpp::LatentFormat::kBf16;
+  bool rejected = false;
+  try { (void)dgpp::QwenKvPool::cache_bytes(shape); }
+  catch (const std::invalid_argument&) { rejected = true; }
+  require(rejected, "native attention accepted a BF16 pool");
+}
+
 struct FailingModel {
   struct SessionSnapshotMeta { int64_t position = 0; };
   struct SnapshotRequest {};
@@ -128,13 +171,18 @@ struct FailingModel {
 int main(int argc, char** argv) {
   try {
     if (argc != 3) throw std::invalid_argument("usage: prefix_snapshot_test QWEN_FIXTURE GLM_FIXTURE");
-    {
+    check_qwen_fp8_pool_copy();
+    std::puts("[ OK ] Qwen FP8 pool: all code/scale/index planes copy exactly; BF16/native mismatch rejected");
+    for (int mode = 0; mode < 3; ++mode) {
       const auto cfg = dgpp::QwenTextConfig::from_json_file(std::string(argv[1]) + "/config.json");
+      dgpp::QwenModel::set_native_attention(mode == 2, mode == 2);
       dgpp::QwenModel model(cfg, argv[1], 128, 256, dgpp::QwenResidency::Streaming, nullptr,
-                            0, 1, 2, true);
+                            0, 1, 2, true, 0, false, false,
+                            mode ? dgpp::LatentFormat::kFp8 : dgpp::LatentFormat::kBf16);
       check_snapshots(model, cfg.vocab_size);
-      std::puts("[ OK ] Qwen: full-pool prefill/hop skips, parity, pin cleanup and slot reuse");
+      std::printf("[ OK ] Qwen mode %d: full-pool prefill/hop skips, parity, pin cleanup and slot reuse\n", mode);
     }
+    dgpp::QwenModel::set_native_attention(false, false);
     {
       const auto cfg = dgpp::GlmTextConfig::from_json_file(std::string(argv[2]) + "/config.json");
       dgpp::GlmDiagnosticModel model(cfg, argv[2], 256, 512, nullptr, 0, 1,

@@ -92,7 +92,8 @@ def shard_bytes(snapshot):
             raise FileNotFoundError(f"no safetensors shards in {snapshot}")
     total = 0
     for name in names:
-        if not isinstance(name, str) or Path(name).name != name:
+        if (not isinstance(name, str) or not name or "\\" in name or
+                any(part in ("", ".", "..") for part in name.split("/"))):
             raise ValueError("checkpoint index contains an invalid shard path")
         path = snapshot / name
         with path.open("rb") as shard:

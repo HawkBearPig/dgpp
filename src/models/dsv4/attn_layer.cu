@@ -631,7 +631,9 @@ void Dsv4AttnLayer::enqueue_draft_block(const void* hidden_in, Dsv4StatePool& po
                     stream, kRowFormat);
   csa2_dspark_window_slots(pos, rows, block, cfg_.window, cfg_.ring_slots, dlist_, dcounts_, stream);
   attend_rows(pool, req_ids, pool.ring(layer_), cfg_.ring_slots, pool.ring_table_wide(), pool.ring_table_wide_blocks(),
-              req_ids, pos, 0, rows, 1, stream, dlist_, cfg_.window + block, dcounts_, /*split_window=*/false);
+              req_ids, pos, 0, rows, decode_n_split_, stream, dlist_, cfg_.window + block, dcounts_,
+              /*split_window=*/true);  // the decode rows' listed flash form, split like them (2026-10-20; the scalar
+                                       // kernel took 131-170 us a draft layer on DeepSeek-V4.1 against ~20)
   project_out(rows, out, stream);
 }
 

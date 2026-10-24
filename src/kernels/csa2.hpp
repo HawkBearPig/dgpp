@@ -15,8 +15,9 @@
 //     kpool 1 with relu over `pos_sel` = (pos + 1) / ratio - 1 (the
 //     compressed entries visible to a query as a "position"); the
 //     candidate stage (the top-2048 blocks of 8 entries, the newest
-//     block pinned) and the restricted stage (the top-512 among a
-//     candidate list) are the kernels below.
+//     block pinned) and the restricted stage (the top-index_topk — the
+//     release's 512, up to 2048 when a deployment widens the budget —
+//     among a candidate list) are the kernels below.
 // Numerics mirror inference/model.py + kernel.py: the one-rounding
 // RMSNorm (fp32 interior, bf16 out), the complex rotation over adjacent
 // pairs with fp32 angles p * inv_freq[i] and cosf/sinf (no table), the
@@ -67,6 +68,14 @@ void csa2_rope_inv_freq_host(int rope_dim, double theta, int64_t original_seq_le
 // rotation removed). Rows with pos < 0 are left untouched.
 //   x: bf16 at x + r * row_stride + h * head_stride (elements): the FIRST
 //   element of the segment to rotate (the caller offsets to a tail).
+// The two norms behind the paired q/kv projection and the kv rope in one
+// launch per row (2026-10-20): q [rows, q_dim] and kv [rows, kv_dim] normed
+// in place (rmsnorm_bf16's chain), then the kv row's rope_dim elements from
+// element rope_off rotated at pos (rope_apply's math, rope_dim / 2 pairs) —
+// bitwise the three.
+void csa2_norms_rope(void* q, int64_t q_stride, const void* q_w, int q_dim, void* kv, int64_t kv_stride,
+                     const void* kv_w, int kv_dim, float eps, int64_t rope_off, int rope_dim, const int64_t* pos,
+                     const float* inv_freq, int rows, cudaStream_t stream);
 void csa2_rope_apply(void* x, int64_t row_stride, int64_t head_stride, int heads,
                      int rope_dim, const int64_t* pos, const float* inv_freq,
                      bool inverse, int64_t rows, cudaStream_t stream);
@@ -228,6 +237,24 @@ void csa2_logits_prefill(const float* dot, int64_t dot_stride, const float* w_fo
                          const float* k_scale, const int64_t* pos_sel, int rows, int64_t n,
                          int heads, float* logits, int64_t logits_stride,
                          cudaStream_t stream);
+// Prefill, fused (2026-10-18): the same per-row logits straight from the
+// fp8 queries and the gathered keys. One query's 32 heads against 128
+// entries per CTA on the fp8 tensor cores (fp32 accumulation), the per-head
+// dots folded in the fragments — the same terms as csa2_logits_prefill,
+// (w_folded[r, h] * k_scale[j]) * relu(dot), summed in the decode scorer's
+// tree order — so the [rows * heads, n] fp32 dot buffer the GEMM chain
+// wrote and re-read is never materialized (at 128K entries that buffer
+// was 64 MB per four query rows, re-read once per row tile and the whole
+// key set with it: a chunk's cost grew with the square of its position).
+// The dot and the fold are fp32 reductions in another order than the
+// GEMM chain's: equal within fp32 rounding, which the selection's
+// near-tie certification covers. q_fp8: [rows * 32,
+// 128] e4m3; k: [n, 128] e4m3 contiguous (csa2_index_* gathered), k_scale
+// [n]; logits: fp32 [rows, logits_stride], -inf at or past the row's
+// visible count (pos_sel + 1). heads must be 32.
+void csa2_score_prefill(const void* q_fp8, const void* k, const float* w_folded, const float* k_scale,
+                        const int64_t* pos_sel, int rows, int64_t n, int heads, float* logits,
+                        int64_t logits_stride, cudaStream_t stream);
 // Prefill selections over the logits rows: the plain / restricted top-k
 // (cand null: every visible entry; else the block ids as above) and the
 // candidate stage.

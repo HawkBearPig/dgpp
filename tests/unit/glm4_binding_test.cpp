@@ -35,7 +35,8 @@ std::filesystem::path landed_snapshot() {
 
 DGPP_TEST(glm4_binding_table_has_the_release_shape) {
   const auto snap = landed_snapshot();
-  if (snap.empty()) return;
+  if (snap.empty())
+    dgpp::test::skip("required checkpoint snapshot unavailable: nvidia/GLM-4.7-NVFP4");
   const dgpp::Glm4TextConfig cfg = dgpp::Glm4TextConfig::from_json_file((snap / "config.json").string());
   // A dense layer: 2 norms + 4 weights + 3 biases + 2 norms + 2 kv scales + 3 x 4 fp4 = 25.
   const auto dense = dgpp::glm4_expected_layer_tensors(cfg, 0);
@@ -56,7 +57,8 @@ DGPP_TEST(glm4_binding_table_has_the_release_shape) {
 
 DGPP_TEST(glm4_tp_geometry_accepts_the_deployment_worlds) {
   const auto snap = landed_snapshot();
-  if (snap.empty()) return;
+  if (snap.empty())
+    dgpp::test::skip("required checkpoint snapshot unavailable: nvidia/GLM-4.7-NVFP4");
   const dgpp::Glm4TextConfig cfg = dgpp::Glm4TextConfig::from_json_file((snap / "config.json").string());
   for (const int w : {1, 2, 4, 8})
     for (int r = 0; r < w; ++r) dgpp::glm4_tp_validate_geometry(cfg, r, w);
@@ -71,7 +73,8 @@ DGPP_TEST(glm4_tp_geometry_accepts_the_deployment_worlds) {
 
 DGPP_TEST(glm4_binding_matches_the_landed_checkpoint) {
   const auto snap = landed_snapshot();
-  if (snap.empty()) return;
+  if (snap.empty())
+    dgpp::test::skip("required checkpoint snapshot unavailable: nvidia/GLM-4.7-NVFP4");
   namespace fs = std::filesystem;
   const dgpp::Glm4TextConfig cfg = dgpp::Glm4TextConfig::from_json_file((snap / "config.json").string());
   std::unordered_map<std::string, dgpp::Glm4TensorDesc> present;

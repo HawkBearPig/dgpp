@@ -147,7 +147,10 @@ class ModelFrontend {
   // Qwen3.8-Flash-Next and GLM-4.7 templates, not of GLM-5.3-Flash's).
   virtual bool template_reads(std::string_view) const { return false; }
   // Resolve API effort into controls the model actually consumes. Models
-  // with only a thinking switch map every positive effort to that switch.
+  // with only a thinking switch map every positive effort to that switch;
+  // a model whose template reads neither control (Flint, 2026-10-22: the
+  // model opens its own <think> block) takes a positive effort as a
+  // no-op — nothing to set — and refuses "none" as every always-on model.
   virtual ReasoningSettings reasoning_settings(std::string_view effort) const {
     ReasoningSettings out;
     if (effort == "none") {
@@ -157,8 +160,6 @@ class ModelFrontend {
     } else {
       if (template_reads("enable_thinking")) out.enable_thinking = true;
       if (template_reads("reasoning_effort")) out.effort = std::string(effort);
-      if (!out.enable_thinking && !out.effort)
-        throw std::invalid_argument("this model exposes no reasoning control");
     }
     return out;
   }

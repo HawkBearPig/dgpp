@@ -3,8 +3,8 @@
   "world_size": 1,
   "engine": {
     "max_concurrency": 8,
-    "kv_capacity": 524288,
-    "kv_dtype": "bf16",
+    "kv_capacity": 786432,
+    "kv_dtype": "fp8",
     "dense_weights": "fp8",
     "default_max_tokens": 32768,
     "queue_limit": 8,
@@ -15,6 +15,7 @@
     "draft_head": "screen",
     "dflash_weights": "fp8",
     "prefill_activations": "native",
+    "prefill_attention": "fp8",
     "mtp_schedule": true,
     "mtp_schedule_row_ms": 2.0,
     "mtp_schedule_base_ms": 130.0,

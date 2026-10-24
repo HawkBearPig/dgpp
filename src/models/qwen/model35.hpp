@@ -1,8 +1,8 @@
-// Qwen3.5-27B dense model (FP8 text-only, standard pre-norm residual).
+// Qwen3.5-27B dense model (FP8 or mixed NVFP4, standard pre-norm residual).
 //
-// Text-only FP8 first boot: 48 GDN layers (swish gate) + 16 Full GQA layers,
-// dense SwiGLU MLPs, no MoE / hyperconnections / PLE / vision. The
-// attention and GDN layers are the shared qwen4_exp components; the K/V pool
+// 48 GDN layers (swish gate) + 16 Full GQA layers, dense SwiGLU MLPs,
+// and the checkpoint's optional BF16 vision tower. The attention and GDN
+// layers are the shared qwen4_exp components; the K/V pool
 // is a slim QwenKvPool clone without the indexer structures; GDN recurrent
 // and conv state is model-owned per request slot.
 //
@@ -12,9 +12,12 @@
 // core's window holds the post-norm final hidden rows (h_).
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <algorithm>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -24,6 +27,8 @@
 #include "engine/paged_blocks.hpp"
 #include "engine/session_model.hpp"
 #include "models/glm/moe.hpp"
+#include "models/qwen/dflash.hpp"
+#include "models/qwen/moe_layer.hpp"
 #include "kernels/bf12_companions.hpp"
 #include "kernels/draft_head.hpp"
 #include "kernels/gemm.hpp"
@@ -31,8 +36,24 @@
 #include "kernels/glm_spec.hpp"
 #include "loaders/resident_stream.hpp"
 #include "models/quant_matrix.hpp"
+#include "common/image_input.hpp"
 #include "models/qwen/config.hpp"
 #include "models/qwen/config35.hpp"
+
+// Every image span must name pad ids in the prompt it rides with (host-side
+// rule, pinned by unit test; the engine-owned ids outlive the call).
+namespace dgpp {
+inline void qwen35_check_image_pads(const std::vector<int64_t>& ids, int64_t start,
+                                    const std::vector<ImageInput>& images, int64_t pad) {
+  for (const auto& im : images)
+    for (int64_t pos = std::max<int64_t>(start, im.offset); pos < im.offset + im.tokens; ++pos) {
+      if (pos - start < 0 || pos - start >= static_cast<int64_t>(ids.size()) ||
+          ids[static_cast<size_t>(pos - start)] != pad)
+        throw std::invalid_argument("Qwen3.5: image span does not contain image tokens");
+    }
+}
+}  // namespace dgpp
+#include "models/qwen/vision.hpp"
 #include "kernels/l2_prefetch.hpp"
 #include "kernels/latent_format.hpp"
 #include "kernels/sample_pick.hpp"
@@ -159,6 +180,11 @@ void qwen35_swiglu_bf16(const uint16_t* gate, const uint16_t* up, uint16_t* out,
 void qwen35_mtp_concat_bf16(const uint16_t* e, const uint16_t* h, uint16_t* out, int64_t rows,
                             int64_t hidden, cudaStream_t stream);
 
+// The v1 draft's column-0 gather (model35_kernels.cu): tok[j] = ids[(j + 1) * stride]
+// (mask rows 1.., skipping the anchor row's column 0). One kernel, so the
+// captured draft stays kernels-only (no per-draft D2D nodes).
+void df1_collect_top1(const int32_t* ids, int stride, int32_t* tok, int n, cudaStream_t stream);
+
 class Qwen35Model : public SessionModel<Qwen35Model> {
  public:
   using Base = SessionModel<Qwen35Model>;
@@ -250,6 +276,40 @@ class Qwen35Model : public SessionModel<Qwen35Model> {
   // memory plan. An unmaterialized or streamed layer contributes zero bytes.
   size_t resident_layer_bytes(int layer) const { return loader_.resident_layer_span(layer).second; }
 
+  // ---- image inputs ---------------------------------------------------------
+  // The checkpoint's own BF16 tower (vision_ != null when parsed). Its rows
+  // replace the embedding at the prompt's image_token_id positions; decode
+  // graphs are untouched. The DFlash2 draft embeds token ids itself: pad
+  // rows read the pad id's embedding there, so drafts at image positions
+  // are weaker but the verify stays exact.
+  bool supports_images() const { return vision_ != nullptr; }
+  // The pad id repeated once per visual token, -1 without a tower.
+  int64_t image_pad_id() const { return cfg_.vision ? cfg_.vision->tokens.pad : -1; }
+  // The three delimiters, for the serving frontend that renders them.
+  ImageTokens image_tokens() const { return cfg_.vision ? cfg_.vision->tokens : ImageTokens{}; }
+  struct PrefillCursor : Base::PrefillCursor {
+    const std::vector<ImageInput>* images = nullptr;
+  };
+  Outputs session_prefill_images(int req, const std::vector<int64_t>& prompt_ids,
+                                 const std::vector<ImageInput>& images);
+  Outputs session_prefill_images(int req, const std::vector<int64_t>& prompt_ids,
+                                 const std::vector<ImageInput>& images,
+                                 const std::vector<int64_t>& boundaries, SnapshotRequest* snap);
+  Outputs session_prefill_resume_images(int req, const std::vector<int64_t>& suffix_ids,
+                                        const std::vector<ImageInput>& images,
+                                        const std::vector<int64_t>& boundaries,
+                                        SnapshotRequest* snap);
+  // Chunked image prefill (the engine's yield path): validates the images,
+  // borrows them for the cursor's lifetime, and runs the base text machinery
+  // with image state scoped to each advance. This overload is what flips
+  // supports_image_chunked_prefill() on.
+  PrefillCursor session_prefill_begin(int req, const std::vector<int64_t>& prompt,
+                                      int64_t reserve_tokens, int64_t chunk_tokens,
+                                      const std::vector<int64_t>& boundaries = {},
+                                      SnapshotRequest* snap = nullptr, int64_t attach_position = 0,
+                                      const std::vector<ImageInput>* images = nullptr);
+  bool session_prefill_advance(PrefillCursor& cursor, int64_t chunk_tokens = 0);
+
   // ---- the session core's hooks (engine/session_model.hpp) --------------------
   typename Base::Outputs run_rows(const typename Base::RowRun& run);
   void reset_slot_state(int req);
@@ -297,8 +357,16 @@ class Qwen35Model : public SessionModel<Qwen35Model> {
   // through the five bidirectional layers over the plane context; each
   // mask rows' top-K go through the reference chained selector walk, which
   // proposes the `drafts()` following tokens.
-  bool dflash2_enabled() const { return dflash2_; }
-  int dflash2_drafts() const { return dflash2_ ? dfcfg_.drafts() : 0; }
+  bool dflash2_enabled() const { return dflash2_ || dflash1_; }
+  // The verifiable drafts: v2's block; v1's 15 capped by the verify budget
+  // (dflash_depth, at most 7 — kSpecRows).
+  int dflash2_drafts() const {
+    if (dflash1_) return std::min(df1cfg_.drafts(), dflash_depth_ == 0 ? 7 : dflash_depth_);
+    return dflash2_ ? dfcfg_.drafts() : 0;
+  }
+  // Physical rows written by a redraft, independent of the verify cap.
+  int block_draft_rows() const { return dflash1_ ? df1cfg_.query_rows() : dfcfg_.query_rows(); }
+  bool dflash1_enabled() const { return dflash1_; }
   // False without a draft (pool exhausted / context bound): the caller
   // runs the step without speculation.
   bool dflash2_draft(int req, int64_t bonus, std::vector<int32_t>* drafts);
@@ -353,7 +421,7 @@ class Qwen35Model : public SessionModel<Qwen35Model> {
   // walk, no proposals (the default). Before the first capture.
   void dflash2_arm_proposals(const SampleSpec* specs, DraftProposal* proposals,
                              DraftProposal* proposals_host, int stride) {
-    if (specs != nullptr && (proposals == nullptr || stride < dfcfg_.drafts()))
+    if (specs != nullptr && (proposals == nullptr || stride < dflash2_drafts()))
       throw std::invalid_argument("dflash2_arm_proposals: proposals / stride");
     df_specs_ = specs;
     df_props_ = proposals;
@@ -369,12 +437,15 @@ class Qwen35Model : public SessionModel<Qwen35Model> {
   // The mirror the recorded draft of slot `req` publishes (readable once
   // the replay's end event has passed).
   const int32_t* block_drafts_host(int req) const {
+    if (dflash1_)
+      return df1_mirror_h_ + static_cast<size_t>(req) * static_cast<size_t>(df1cfg_.drafts());
     return df_mirror_h_ + static_cast<size_t>(req) * static_cast<size_t>(dfcfg_.drafts());
   }
   // The mask rows' top-k candidate ids the recorded draft walked
   // ([drafts][block_candidates()] per slot; the engine's acceptance
-  // diagnostics rank the verify's correction among them).
-  int block_candidates() const { return dfcfg_.selector_top_k; }
+  // diagnostics rank the verify's correction among them). v1 publishes no
+  // candidate tables (top-1 proposals only) — 0 skips the read.
+  int block_candidates() const { return dflash1_ ? 0 : dfcfg_.selector_top_k; }
   const int32_t* block_candidates_host(int req) const {
     return df_cands_h_ + static_cast<size_t>(req) * static_cast<size_t>(dfcfg_.drafts()) *
                             static_cast<size_t>(dfcfg_.selector_top_k);
@@ -402,6 +473,11 @@ class Qwen35Model : public SessionModel<Qwen35Model> {
                          const std::vector<std::vector<int64_t>>& feds,
                          int* slots_out, std::vector<int>* offs_out);
   void build_layer_objects(const Qwen35LayerResident& r);
+  // MoE MLP (is_moe): routed NVFP4 experts + BF16 shared tail via the
+  // shared QwenMoeLayer (decode fast path vs device prefill path).
+  QwenMoeWeights moe_view(const QwenMoeResident& m);
+  void moe_mlp(const uint16_t* x, uint16_t* out, int tokens, const QwenMoeResident& m,
+               cudaStream_t stream, int table_slot, bool decode);
   // The dense GEMM band for this model's own CublasLtGemm: the shared Qwen
   // rule, plus the streaming mma form for 17..128-row decode batches (the
   // drafter's stacked block forwards and the taps of a wide verify read
@@ -473,6 +549,27 @@ class Qwen35Model : public SessionModel<Qwen35Model> {
   void pack_companions();
   QwenGemmWorkspace gw_;
   Qwen35GlobalsResident globals_;
+  // The visual tower (weights resident, executed on image prefills only).
+  // The cursor retains the engine-owned image vector across yields. Only
+  // an executing prefill borrows it into the model; the scope also invalidates
+  // the shared staging window when entering and leaving a request's walk.
+  std::unique_ptr<QwenVisionEncoder> vision_;
+  Outputs session_prefill_with_images(int req, const std::vector<int64_t>& ids,
+                                      const std::vector<ImageInput>& images,
+                                      const std::vector<int64_t>& boundaries, SnapshotRequest* snap,
+                                      bool resume);
+  void stage_image_embeddings(int64_t first, int64_t end, const std::vector<ImageInput>* images);
+  // Rows [first + shift, first + shift + rows) into dst. `shift` is 0 for
+  // the main walk's embedding and 1 for the MTP draft's, whose row at
+  // position p embeds token p + 1.
+  void apply_image_embeddings(uint16_t* dst, int64_t first, int rows, int shift,
+                              const std::vector<ImageInput>* images);
+  class ImagePrefillScope;
+  const std::vector<ImageInput>* images_for_req(int req) const;
+  void store_request_images(int req, const std::vector<ImageInput>* images);
+  std::vector<const std::vector<ImageInput>*> prefill_images_per_req_;
+  const uint16_t* image_embeddings_ = nullptr;
+  int64_t image_window_first_ = 0, image_window_end_ = 0;
   QwenTextConfig qcfg_;  // adapter: the fields the qwen4_exp layer ctors read
   std::unique_ptr<QwenFullAttnLayer> full_;
   std::unique_ptr<QwenGdnLayer> gdn_;
@@ -564,6 +661,9 @@ class Qwen35Model : public SessionModel<Qwen35Model> {
   MoeSegment* fp4_segs_ = nullptr;      // [max_tokens] device
   MoeExpertView* fp4_views_ = nullptr;  // [layers x 3] resident, [3] slot streaming
   int fp4_view_layers_ = 0;             // 0 = slot mode (streaming)
+  // MoE MLP (is_moe): the routed chain over this rank's expert slice.
+  GlmMoeConfig moe_cfg_ = {};
+  std::unique_ptr<QwenMoeLayer> moe_;
   // MTP draft scratch at max_tokens rows (null when MTP is off): embed rows
   // and their norm, the gathered/gated main hidden and its norm, the
   // [M, 2H] concat, the draft residual, its norm (the chain rows), and the
@@ -613,6 +713,40 @@ class Qwen35Model : public SessionModel<Qwen35Model> {
   DraftProposal* df_props_h_ = nullptr;
   int df_props_stride_ = 0;
   int df_batch_ = 1;  // the stacked draft batch width (slots per forward)
+  // The DFlash v1 drafter (null unless a v1 directory was given):
+  // DFlashConfig + weights, tap map, one block of reusable scratch
+  // (query_rows = 16 rows; C1 scope — batching and capture stay open).
+  bool dflash1_ = false;
+  DFlashConfig df1cfg_;
+  DFlashWeights df1w_;
+  std::vector<int> df1_tap_;  // per main-layer index: the fc slice, else -1
+  uint16_t *df1_resid_ = nullptr, *df1_x_ = nullptr;
+  uint16_t *df1_q_ = nullptr, *df1_k_ = nullptr, *df1_v_ = nullptr;  // roped q/k/v rows
+  uint16_t *df1_attn_ = nullptr, *df1_o_ = nullptr, *df1_mlp_ = nullptr;
+  float* df1_attn_part_ = nullptr;  // the split-key block attention's partials (QR rows)
+  uint16_t *df1_gate_ = nullptr, *df1_up_ = nullptr;  // [query_rows, draft I]
+  uint16_t* df1_h_ = nullptr;       // [query_rows, H] the draft's final norm rows
+  float* df1_logits_ = nullptr;     // [query_rows, V] F32 (the block rows' head rows)
+  void* df1_topk_ws_ = nullptr;     // the top-1 chunk partials
+  size_t df1_topk_ws_bytes_ = 0;
+  int32_t* df1_ids_ = nullptr;   // [query_rows, 16] top-16 per row (the kernel's only K; row's draft is column 0)
+  float* df1_sc_ = nullptr;      // [query_rows, 16]
+  int32_t* df1_zero_ = nullptr;  // [query_rows] zeros (the single-slot append view)
+  int64_t* df1_pos_ = nullptr;   // [query_rows] device
+  int64_t* df1_tokens_ = nullptr;  // [query_rows] device
+  int64_t* df1_io64_h_ = nullptr;  // pinned: query_rows positions then tokens
+  int32_t* df1_tok_ = nullptr;     // [drafts] device (the captured proposal rows)
+  int32_t* df1_tok_h_ = nullptr;   // pinned [drafts]: the proposed drafts
+  int32_t* df1_mirror_h_ = nullptr;  // pinned [max_requests, drafts]: the recorded drafts
+  float* df1_inv_freq_ = nullptr;  // [head_dim/2] F32 rope table
+  // The v1 block forward + mask proposal (eager, one slot): stages
+  // [bonus, mask x D], runs the six layers over the draft planes, and
+  // top-1s each mask row off the shared head.
+  bool dflash1_draft(int req, int64_t bonus, std::vector<int32_t>* drafts);
+  void df1_block_layers(int req, cudaStream_t stream, bool capture);
+  void df1_block_select(bool capture);
+  void df1_capture_draft(int req, const PickVerdict* verdict, int64_t* feed);
+  void df1_store_features(int T, const int32_t* d_req, const int64_t* d_pos);
   // The captured verify's replay state (one static 32-row graph): the
   // pool tables pointer the capture baked in (a mismatch means the pool
   // grew — drop and recapture), and the breakage latch (a failed capture

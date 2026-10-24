@@ -146,6 +146,11 @@ bool bus_slab_layout(size_t lat_slots, size_t lat_slot_bytes, size_t bulk_slots,
   off += (lat_slots + bulk_slots) * 64;
   l.control_off = off;
   off += 64;
+  // The write ring: appended, so every offset above is the version-2
+  // layout's (the exchange frame versions the whole).
+  l.write_row_bytes = bus_write_row_bytes(lat_slot_bytes);
+  l.write_ring_off = off;
+  off += static_cast<size_t>(kBusWriteRing) * l.write_row_bytes;
   l.total_bytes = off;
 
   *out = l;
@@ -214,6 +219,16 @@ uint8_t* BusSlabLayout::credit_staging(uint8_t* base, BusPool pool,
 
 StartSlot* BusSlabLayout::control_cell(uint8_t* base) const {
   return reinterpret_cast<StartSlot*>(base + control_off);
+}
+
+uint8_t* BusSlabLayout::write_row(uint8_t* base, uint32_t row) const {
+  return base + write_ring_off + static_cast<size_t>(row) * write_row_bytes;
+}
+
+uint64_t BusSlabLayout::write_row_remote_addr(uint64_t peer_slab_base,
+                                              uint32_t row) const {
+  return peer_slab_base + write_ring_off +
+         static_cast<uint64_t>(row) * write_row_bytes;
 }
 
 uint64_t BusSlabLayout::completion_remote_addr(uint64_t peer_slab_base,

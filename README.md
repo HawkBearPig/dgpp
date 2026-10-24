@@ -25,6 +25,7 @@ over RoCE. Each quant links to its specific Hugging Face model card.
 | GLM-5.3-Flash (hybrid) | [HawkBearPig/GLM-5.3-Flash-NVFP4-FP8](https://huggingface.co/HawkBearPig/GLM-5.3-Flash-NVFP4-FP8) | 2, 4 | [Two nodes](deploy/cluster_glm-5.3-flash_nvfp4-fp8_w2.example.json), [four nodes](deploy/cluster_glm-5.3-flash_nvfp4-fp8_w4.example.json) |
 | Qwen3.8-Flash-Next | [Qwen/Qwen3.8-Flash-Next-FP8](https://huggingface.co/Qwen/Qwen3.8-Flash-Next-FP8) | 2, 4 | [Two nodes](deploy/cluster_qwen-3.8-flash-next_fp8_w2.example.json), [four nodes](deploy/cluster_qwen-3.8-flash-next_fp8_w4.example.json) |
 | Qwen3.8-Flash-Next | [nvidia/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4) | 1, 2 | [One node](deploy/cluster_qwen-3.8-flash-next_nvfp4_w1.example.json) (256K shared KV pool, 4K busy/idle prefill), [two nodes](deploy/cluster_qwen-3.8-flash-next_nvfp4_w2.example.json) (mapped n-gram table, dense projections FP8 at load) |
+| Qwen3.8-Flash-Next | [nvidia/Qwen3.8-Flash-Next-FP4-Local](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-FP4-Local) | 1 | [One node](deploy/cluster_qwen-3.8-flash-next-fp4local_w1.example.json) (NVIDIA's FP4-Local export: NVFP4 experts with CSF-wrapped per-group scales expanded once at load, the attention and shared experts in their shipped MXFP8, the BF16 remainder encoded to FP8 at load by the deployment policy, a 1M-token fp8 K/V pool with fp8 prefill attention and a YaRN factor 4 ramp to a 1M positional ceiling; [port notes](docs/fp4local_plan.md)) |
 | Qwen3.8-Flash-Next | [Saren/Qwen3.8-Flash-Next-W4A16-AutoRound-hybrid-MTP_int4RTN](https://huggingface.co/Saren/Qwen3.8-Flash-Next-W4A16-AutoRound-hybrid-MTP_int4RTN) | 1 | [One node](deploy/cluster_qwen-3.8-flash-next_autoround-int4_w1.example.json) (AutoRound int4 g128 experts and an int8 g128 head served in their packed form, the n-gram table from the FP8 release's shards via `engine.ngram_table_model`; the template turns on the `prefill_bf16_partials` and `prefill_fp8_gemm` levers, whose measured quality cost is inside the default chain's band — see [accuracy and correctness](#accuracy-and-correctness)) |
 | Qwen3.8-Flash-Next | [RadixArk/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/RadixArk/Qwen3.8-Flash-Next-NVFP4) | 1, 2 | [One node](deploy/cluster_qwen-3.8-flash-next_nvfp4-radixark_w1.example.json) (tuned: 4K prefill chunks with matching prefill budgets, MTP depth 2), [two nodes](deploy/cluster_qwen-3.8-flash-next_nvfp4-radixark_w2.example.json) (same NVFP4 format and engine configuration as the NVIDIA release) |
 | Qwen3.8-Flash-Next | [local-inference-lab/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/local-inference-lab/Qwen3.8-Flash-Next-NVFP4) | 1 | [One node](deploy/cluster_qwen-3.8-flash-next_nvfp4-qad_w1.example.json) (the quantization-aware-distilled export served in its shipped forms: the MXFP8 dense stack and shared experts, the NVFP4 n-gram table resident on the Spark, F32 norms and weight-only NVFP4 draft experts; [card](docs/model_cards/Qwen3.8-Flash-Next-NVFP4-QAD.md)) |
@@ -34,10 +35,14 @@ over RoCE. Each quant links to its specific Hugging Face model card.
 | GLM-5.3 | [HawkBearPig/GLM-5.3-NF4I8-GPTQ-H32-g128](https://huggingface.co/HawkBearPig/GLM-5.3-NF4I8-GPTQ-H32-g128) | 4 | [Four nodes](deploy/cluster_glm-5.3_nf4i8_w4.example.json) (272K FP8 K/V pool) |
 | GLM-5.3 | [HawkBearPig/GLM-5.3-Mixed346-GPTQ-H32-A8-g128](https://huggingface.co/HawkBearPig/GLM-5.3-Mixed346-GPTQ-H32-A8-g128) | 4 | [Four nodes](deploy/cluster_glm-5.3_mixed346_w4.example.json) (272K FP8 K/V pool) |
 | DeepSeek-V4.1-Flash | [deepseek-ai/DeepSeek-V4.1-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash) | 4 | [Four nodes](deploy/cluster_deepseek-v4.1-flash_mxfp4-fp8_w4.example.json) |
+| DeepSeek-V4.1-Flash-1017 | [deepseek-ai/DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017) | 4 | [Four nodes](deploy/cluster_deepseek-v4.1-flash-1017_mxfp4-fp8_w4.example.json) (the V4.1-Flash engine path on the re-trained weights; the indexer budget is a deployment key, `engine.index_topk`, shipped at the checkpoint's 512 with 2048 measured; [card](docs/model_cards/DeepSeek-V4.1-Flash-1017.md)) |
+| DeepSeek-V4.1-Flash-1017 EXL3 | [LibertAIDAI/DeepSeek-V4.1-Flash-1017-EXL3-3.5bpw](https://huggingface.co/LibertAIDAI/DeepSeek-V4.1-Flash-1017-EXL3-3.5bpw) | 4 | [Four nodes](deploy/cluster_deepseek-v4.1-flash-1017_exl3-3.5bpw_w4.example.json) (the 3.5 bpw EXL3 trellis re-pack served through the engine's own trellis kernels, the Engram tables from the base release via `engine.engram_source`; [card](docs/model_cards/DeepSeek-V4.1-Flash-1017-EXL3-3.5bpw.md)) |
 | MiMo-V2.6-Flash | [XiaomiMiMo/MiMo-V2.6-Flash-RL](https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Flash-RL) | 2, 4 | [Two nodes](deploy/cluster_mimo-v2.6-flash_mxfp4-fp8_w2.example.json), [four nodes](deploy/cluster_mimo-v2.6-flash_mxfp4-fp8_w4.example.json) |
+| Flint | [HawkBearPig/flint-FP8-NVFP4](https://huggingface.co/HawkBearPig/flint-FP8-NVFP4) | 1, 2, 4 | [One node](deploy/cluster_flint_fp8-nvfp4_w1.example.json), [two nodes](deploy/cluster_flint_fp8-nvfp4_w2.example.json) and [four nodes](deploy/cluster_flint_fp8-nvfp4_w4.example.json) |
 | DeepSeek-V4-Flash | [deepseek-ai/DeepSeek-V4-Flash-0731](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731) | 2, 4 | [Two nodes](deploy/cluster_deepseek-v4-flash_mxfp4-fp8_w2.example.json), [four nodes](deploy/cluster_deepseek-v4-flash_mxfp4-fp8_w4.example.json) |
 | Qwen3.8-27B | [Qwen/Qwen3.8-27B-FP8](https://huggingface.co/Qwen/Qwen3.8-27B-FP8) | 1, 2, 4 | [One node](deploy/cluster_qwen3.8-27b_fp8_w1.example.json) , [two nodes](deploy/cluster_qwen3.8-27b_fp8_w2.example.json) and [four nodes](deploy/cluster_qwen3.8-27b_fp8_w4.example.json) (the DFlash2 block drafter on every world) |
 | Qwen3.8-27B NVFP4 | [unsloth/Qwen3.8-27B-NVFP4](https://huggingface.co/unsloth/Qwen3.8-27B-NVFP4) | 1, 2, 4 | [One node](deploy/cluster_qwen3.8-27b_nvfp4_w1.example.json) , [two nodes](deploy/cluster_qwen3.8-27b_nvfp4_w2.example.json) and [four nodes](deploy/cluster_qwen3.8-27b_nvfp4_w4.example.json) (the mixed release: NVFP4 MLPs, channel-FP8 attention and head; [card](docs/model_cards/Qwen3.8-27B-NVFP4.md)) |
+| Qwen3.5-122B-A10B NVFP4 | [nvidia/Qwen3.5-122B-A10B-NVFP4](https://huggingface.co/nvidia/Qwen3.5-122B-A10B-NVFP4) | 1, 2, 4 | [One node](deploy/cluster_qwen3.5-122b-a10b_nvfp4_w1.example.json) , [two nodes](deploy/cluster_qwen3.5-122b-a10b_nvfp4_w2.example.json) and [four nodes](deploy/cluster_qwen3.5-122b-a10b_nvfp4_w4.example.json) (ModelOpt NVFP4 routed experts, BF16 rest, MTP draft via `engine.mtp_expert_format: bf16`; [card](docs/model_cards/Qwen3.5-122B-A10B-NVFP4.md)) |
 
 The Qwen NVFP4 templates select streaming MMA for the FP8 vocabulary head
 with `engine.fp8_head: "mma"`, following matched one- and two-Spark
@@ -87,6 +92,20 @@ vectors). See the [model card](docs/model_cards/MiMo-V2.6-Flash.md) and
 [plan](docs/mimo_v26_flash_plan.md). Native blocks 0/1/2 MTP3 and prefill
 work reductions are opt-in; see [MiMo operations](docs/operations.md#mimo-native-mtp-and-prefill-options)
 for settings, memory implications and measured workload tradeoffs.
+
+Flint is served as shipped — the routed experts in the export's
+per-projection FP8 / NVFP4 formats (FP8 block-128 layers, NVFP4 layers,
+and two layers that mix the two across `gate_proj` / `up_proj` /
+`down_proj`), every other tensor BF16 (the projections, the dense and
+shared MLPs and the head resident in their lossless 12-bit form under
+`engine.bf16_weights: "bf12"`) — with its hybrid sliding-window (513,
+sink-biased, RoPE over the whole head) / full-attention (no RoPE)
+GQA, the per-head q / k norms, the ungated BF16 shared expert and the
+checkpoint's own chat template and `<tool_call>` format. The family has
+no draft head: the templates keep `engine.mtp` off. The K/V cache is
+BF16 (`--kv-dtype fp8` selects the fp8 row form). See the
+[model card](docs/model_cards/Flint-FP8-NVFP4.md) and
+[plan](docs/flint_plan.md).
 
 DeepSeek-V4-Flash (the 0731 release) is served as shipped — MXFP4 routed
 experts, FP8 block-128 attention projections and shared expert, BF16
@@ -256,7 +275,9 @@ mapping its n-gram table from NVMe and encoding the dense stack to FP8 at load.
 
 The Qwen sixteen-slot decode graphs and prefill continuation are implemented as
 opt-in controls; the shipped Qwen templates retain four slots and monolithic
-admission. DeepSeek ships at six slots with DSpark depth 4, confidence
+admission. DeepSeek ships at six slots with DSpark depth 4 (the EXL3
+re-pack at sixteen on the family's 96-row decode batch with the five-draft
+block since 2026-10-23), confidence
 scheduling, bounded grouped prefill and the stream-ordered eager collective.
 Full GLM-5.3 ships at eight slots and uses packed tensor-core prefill from 128
 rows. MiMo-V2.6-Flash ships at four slots with MTP depth 1 on two or four
@@ -327,6 +348,10 @@ The build option is off by default; normal setup retains the existing behavior.
 
 ### Send a request
 
+The HTTP server validates request lengths before dispatch; see
+[request limits and HTTP errors](docs/operations.md#large-document-and-agent-requests)
+for accepted length fields and error responses.
+
 Ask the running model a question. This short example requests low reasoning
 effort because reasoning tokens also count toward `max_tokens`:
 
@@ -384,6 +409,10 @@ selected, `up` stages `build-release/dgpp-serve` to the peers. Use
 `--bin build-ci/dgpp-serve` explicitly when deploying a testing build.
 
 ## Configuration
+
+Sampling penalties can default from deployment settings and be overridden
+per request. Host sampling automatically skips neutral penalty preparation;
+see [sampling defaults](docs/operations.md#sampling-penalty-defaults).
 
 Use the [configuration reference](docs/configuration.md) for site settings,
 deployment options, defaults and their effects on memory, response time and

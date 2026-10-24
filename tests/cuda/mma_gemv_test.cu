@@ -4,10 +4,11 @@
 // result identical at m = 1 and inside an m = 30 batch, fp8 and bf16), the
 // fp32 and bf16 epilogues agreeing bit for bit, and a cold timing line
 // beside the GEMV cores it replaces (informational).
-#include <cmath>
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -18,10 +19,11 @@
 #include "common/cuda_check.hpp"
 #include "common/dtypes.hpp"
 #include "common/test.hpp"
+#include "kernels/bf12_gemv.hpp"
 #include "kernels/bf16_gemv.hpp"
 #include "kernels/dense_mma_bf16w.hpp"
-#include "kernels/glm_moe_launch.hpp"
 #include "kernels/fp8_dequant.hpp"
+#include "kernels/glm_moe_launch.hpp"
 #include "kernels/mma_gemv.hpp"
 #include "kernels/scale_gemm.hpp"
 
@@ -64,6 +66,9 @@ double max_rel_err(const Problem& p, const std::vector<float>& got, F wv) {
   double worst = 0;
   for (int i = 0; i < p.m; ++i)
     for (int j = 0; j < p.n; ++j) {
+      if (!std::isfinite(got[size_t(i) * p.n + j]))
+        throw std::runtime_error("non-finite output at row " + std::to_string(i) + " column " +
+                                 std::to_string(j));
       double ref = 0, mag = 0;
       for (int c = 0; c < p.k; ++c) {
         const double a = dgpp::bf16_bits_to_float(p.act[size_t(i) * p.k + c]), w = wv(j, c);
@@ -90,6 +95,30 @@ struct Dev {
 std::vector<float> fetch_f(const float* d, size_t n) { std::vector<float> h(n); DGPP_CUDA_OK(cudaMemcpy(h.data(), d, n * 4, cudaMemcpyDeviceToHost)); return h; }
 std::vector<uint16_t> fetch_b(const uint16_t* d, size_t n) { std::vector<uint16_t> h(n); DGPP_CUDA_OK(cudaMemcpy(h.data(), d, n * 2, cudaMemcpyDeviceToHost)); return h; }
 }  // namespace
+
+DGPP_TEST(mma_gemv_oracle_rejects_nonfinite_outputs) {
+  const Problem p{1, 3, 1, 0, 0, {}, {}, {}, {dgpp::float_to_bf16_bits(1.f)}};
+  const auto weight = [](int row, int) { return double(row + 1); };
+  const std::vector<float> correct{1.f, 2.f, 3.f};
+  require(max_rel_err(p, correct, weight) == 0, "exact finite output must match the oracle");
+  require(max_rel_err(p, {1.f, 2.f, 4.f}, weight) > 2e-3,
+          "incorrect finite output must exceed the oracle budget");
+  for (float value :
+       {std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::infinity(),
+        -std::numeric_limits<float>::infinity()}) {
+    for (size_t column = 0; column < correct.size(); ++column) {
+      auto got = correct;
+      got[column] = value;
+      bool rejected = false;
+      try {
+        (void)max_rel_err(p, got, weight);
+      } catch (const std::runtime_error& e) {
+        rejected = std::string(e.what()).find("non-finite output") != std::string::npos;
+      }
+      require(rejected, "non-finite output must not pass the oracle comparison");
+    }
+  }
+}
 
 DGPP_TEST(mma_gemv_fp8_matches_oracle_and_is_m_invariant) {
   const Problem p = make(30, 1024, 512, 5, 5, 0x9E3779B97F4A7C15ull);
@@ -161,6 +190,64 @@ DGPP_TEST(mma_gemv_fp8_wide_forms_match_oracle_and_the_scalar_form) {
   std::printf("[ OK ] mma_gemv fp8: fixture-sized shapes at every form match the oracle\n");
 }
 
+// The wide forms' bf16 epilogue (the shared expert aside at sixteen DSpark
+// slots is an 80-row fp8 -> bf16 launch, 2026-10-23): bf16(f32) at 4 and 8
+// tiles, and every row bitwise its m = 64 / m = 16 launch.
+DGPP_TEST(mma_gemv_fp8_wide_bf16_epilogue_matches_f32_and_is_m_invariant) {
+  for (int m : {80, 100}) {
+    const Problem p = make(m, 512, 1024, 5, 5, 0x6A09E667F3BCC909ull + m);
+    Dev d(p);
+    dgpp::launch_mma_gemv_fp8_f32(d.act, p.k, d.w8, d.scales, d.outf, p.m, p.n, p.k, 0, p.rs, p.cs, nullptr);
+    dgpp::launch_mma_gemv_fp8_bf16(d.act, p.k, d.w8, d.scales, d.outb, p.m, p.n, p.k, 0, p.rs, p.cs, nullptr);
+    DGPP_CUDA_OK(cudaDeviceSynchronize());
+    const std::vector<float> full = fetch_f(d.outf, size_t(p.m) * p.n);
+    const std::vector<uint16_t> fullb = fetch_b(d.outb, size_t(p.m) * p.n);
+    size_t bad = 0, first = 0;
+    for (size_t i = 0; i < fullb.size(); ++i)
+      if (fullb[i] != dgpp::float_to_bf16_bits(full[i])) { if (!bad) first = i; ++bad; }
+    if (bad) std::printf("[ .. ] fp8 wide bf16 m=%d: %zu of %zu elements differ from bf16(f32); first at row %zu col %zu\n", m, bad, fullb.size(), first / p.n, first % p.n);
+    require(bad == 0, "fp8 wide bf16 epilogue != bf16(f32 epilogue) at m=" + std::to_string(m));
+    for (int m2 : {16, 64}) {
+      for (int r0 = 0; r0 + m2 <= p.m; r0 += m2) {
+        dgpp::launch_mma_gemv_fp8_bf16(d.act + size_t(r0) * p.k, p.k, d.w8, d.scales, d.outb, m2, p.n, p.k, 0, p.rs, p.cs, nullptr);
+        DGPP_CUDA_OK(cudaDeviceSynchronize());
+        const std::vector<uint16_t> part = fetch_b(d.outb, size_t(m2) * p.n);
+        for (int i = 0; i < m2; ++i)
+          require(std::memcmp(part.data() + size_t(i) * p.n, fullb.data() + size_t(r0 + i) * p.n, size_t(p.n) * 2) == 0,
+                  "fp8 wide bf16: row " + std::to_string(r0 + i) + " differs at m=" + std::to_string(m2) + " from m=" + std::to_string(m));
+      }
+    }
+    std::printf("[ OK ] mma_gemv fp8 wide bf16 epilogue at m=%d: bf16(f32), bitwise the 16/64-row launches\n", m);
+  }
+}
+
+// With a split workspace, every tile form keeps one chain: rows of an
+// 80-row launch (the eight-tile form, 2026-10-23) bitwise their 5-row and
+// 40-row launches at a small n that splits (n = 128 -> 2 blocks at the
+// decode width).
+DGPP_TEST(mma_gemv_fp8_split_chain_is_the_same_at_80_rows) {
+  const Problem p = make(80, 128, 2048, 5, 5, 0xBB67AE8584CAA73Bull);
+  Dev d(p);
+  const size_t ws_bytes = size_t(64) << 20;
+  void* ws = nullptr;
+  DGPP_CUDA_OK(cudaMalloc(&ws, ws_bytes));
+  dgpp::launch_mma_gemv_fp8_bf16(d.act, p.k, d.w8, d.scales, d.outb, p.m, p.n, p.k, 0, p.rs, p.cs, nullptr, ws, ws_bytes);
+  DGPP_CUDA_OK(cudaDeviceSynchronize());
+  const std::vector<uint16_t> full = fetch_b(d.outb, size_t(p.m) * p.n);
+  for (int m2 : {5, 40, 64}) {
+    for (int r0 = 0; r0 + m2 <= p.m; r0 += m2) {
+      dgpp::launch_mma_gemv_fp8_bf16(d.act + size_t(r0) * p.k, p.k, d.w8, d.scales, d.outb, m2, p.n, p.k, 0, p.rs, p.cs, nullptr, ws, ws_bytes);
+      DGPP_CUDA_OK(cudaDeviceSynchronize());
+      const std::vector<uint16_t> part = fetch_b(d.outb, size_t(m2) * p.n);
+      for (int i = 0; i < m2; ++i)
+        require(std::memcmp(part.data() + size_t(i) * p.n, full.data() + size_t(r0 + i) * p.n, size_t(p.n) * 2) == 0,
+                "split chain: row " + std::to_string(r0 + i) + " differs at m=" + std::to_string(m2) + " from m=80");
+    }
+  }
+  cudaFree(ws);
+  std::printf("[ OK ] mma_gemv fp8 with a split workspace: the 80-row launch's rows are bitwise their 5/40/64-row launches\n");
+}
+
 DGPP_TEST(mma_gemv_bf16_matches_oracle_and_is_m_invariant) {
   const Problem p = make(30, 1024, 512, 7, 7, 0xD1B54A32D192ED03ull);
   Dev d(p);
@@ -220,14 +307,14 @@ DGPP_TEST(dense_mma_bf16w_matches_oracle_and_is_row_invariant) {
 
 // The swiglu form: bitwise the clamp launch followed by the plain fp8 GEMV.
 DGPP_TEST(mma_gemv_fp8_swiglu_form_is_bitwise_the_clamp_then_the_gemv) {
-  const Problem p = make(6, 1024, 512, 7, 7, 0x7F4A7C159E3779B9ull);
+  const Problem p = make(100, 1024, 512, 7, 7, 0x7F4A7C159E3779B9ull);  // rows for the 8-tile form too
   Dev d(p);
   // gate = the problem's activations, up = a second set (the weights' first rows reused as bf16 values).
   uint16_t* up; uint16_t* act;
   DGPP_CUDA_OK(cudaMalloc(&up, size_t(p.m) * p.k * 2)); DGPP_CUDA_OK(cudaMalloc(&act, size_t(p.m) * p.k * 2));
   DGPP_CUDA_OK(cudaMemcpy(up, p.w16.data(), size_t(p.m) * p.k * 2, cudaMemcpyHostToDevice));
   for (const float limit : {10.0f, 0.25f}) {
-    for (int m : {1, 4, 6}) {
+    for (int m : {1, 4, 6, 80, 100}) {
       dgpp::launch_moe_swiglu_clamp(d.act, up, act, int64_t(m) * p.k, limit, nullptr);
       dgpp::launch_mma_gemv_fp8_f32(act, p.k, d.w8, d.scales, d.outf, m, p.n, p.k, 0, p.rs, p.cs, nullptr);
       DGPP_CUDA_OK(cudaDeviceSynchronize());
@@ -539,6 +626,116 @@ DGPP_TEST(mma_gemv_split_k_small_n_sites) {
     for (int c = 0; c < copies; ++c) { cudaFree(w[c]); cudaFree(sc[c]); }
   }
   cudaFree(act); cudaFree(out); cudaFree(ws);
+}
+
+// The bf12 form (the lm head's 12-bit companion under the tensor-core
+// chain): bitwise the bf16 launch at every decode width, f32 and bf16
+// outputs, on a matrix with escapes and rows the encoder kept raw; a
+// partial last block; k of one and five super-blocks. The form declines a
+// tail (k not whole super-blocks) and the widths above the decode forms.
+DGPP_TEST(mma_gemv_bf12_form_is_bitwise_the_bf16_form) {
+  std::mt19937_64 rng(2026);
+  std::uniform_real_distribution<float> uf(-1.f, 1.f);
+  std::uniform_int_distribution<int> ex(-4, 4);
+  std::uniform_int_distribution<int> outlier(0, 199);
+  std::uniform_real_distribution<float> mag(0.5f, 1.f);
+  for (auto [n, k] : std::vector<std::pair<int, int>>{{1032, 1024}, {4104, 5120}}) {
+    std::vector<uint16_t> w(size_t(n) * k);
+    // Nine exponents inside the row's fifteen-code window, one element in
+    // two hundred far outside it: escapes on most rows, under the row budget.
+    for (auto& x : w)
+      x = dgpp::float_to_bf16_bits(std::ldexp(uf(rng) < 0 ? -mag(rng) : mag(rng), ex(rng) + (outlier(rng) == 0 ? 24 : 0)));
+    // Two rows past the escape budget: kept bf16 by the encoder.
+    for (int r : {5, n - 1})
+      for (int c = 0; c < k; ++c) w[size_t(r) * k + c] = dgpp::float_to_bf16_bits(std::ldexp(uf(rng), (c & 1) ? 20 : -30));
+    const dgpp::Bf12Host h = dgpp::bf12_encode(w.data(), n, k);
+    require(h.ok && h.raw_rows >= 2 && h.escapes > 0,
+            "bf12 form: the fixture packs with escapes and raw rows (ok " + std::to_string(h.ok) + " raw " +
+                std::to_string(h.raw_rows) + " escapes " + std::to_string(h.escapes) + ")");
+    uint16_t* dw; uint8_t* dp; uint32_t* dr; uint32_t* de; uint16_t* draw;
+    DGPP_CUDA_OK(cudaMalloc(&dw, w.size() * 2)); DGPP_CUDA_OK(cudaMemcpy(dw, w.data(), w.size() * 2, cudaMemcpyHostToDevice));
+    DGPP_CUDA_OK(cudaMalloc(&dp, h.packed.size())); DGPP_CUDA_OK(cudaMemcpy(dp, h.packed.data(), h.packed.size(), cudaMemcpyHostToDevice));
+    DGPP_CUDA_OK(cudaMalloc(&dr, h.rows.size() * 4)); DGPP_CUDA_OK(cudaMemcpy(dr, h.rows.data(), h.rows.size() * 4, cudaMemcpyHostToDevice));
+    DGPP_CUDA_OK(cudaMalloc(&de, std::max<size_t>(h.esc.size(), 1) * 4)); DGPP_CUDA_OK(cudaMemcpy(de, h.esc.data(), h.esc.size() * 4, cudaMemcpyHostToDevice));
+    DGPP_CUDA_OK(cudaMalloc(&draw, std::max<size_t>(h.raw.size(), 8) * 2)); DGPP_CUDA_OK(cudaMemcpy(draw, h.raw.data(), h.raw.size() * 2, cudaMemcpyHostToDevice));
+    dgpp::Bf12Matrix pm; pm.packed = dp; pm.rows = dr; pm.esc = de; pm.raw = draw; pm.n = n; pm.k = k;
+    std::vector<uint16_t> act(size_t(32) * k);
+    for (auto& x : act) x = dgpp::float_to_bf16_bits(uf(rng));
+    uint16_t* da; DGPP_CUDA_OK(cudaMalloc(&da, act.size() * 2)); DGPP_CUDA_OK(cudaMemcpy(da, act.data(), act.size() * 2, cudaMemcpyHostToDevice));
+    float* o1; float* o2; uint16_t* b1; uint16_t* b2;
+    DGPP_CUDA_OK(cudaMalloc(&o1, size_t(32) * n * 4)); DGPP_CUDA_OK(cudaMalloc(&o2, size_t(32) * n * 4));
+    DGPP_CUDA_OK(cudaMalloc(&b1, size_t(32) * n * 2)); DGPP_CUDA_OK(cudaMalloc(&b2, size_t(32) * n * 2));
+    for (int m : {1, 3, 8, 16, 17, 32}) {
+      require(dgpp::mma_gemv_bf12_accepts(pm, m), "bf12 form: accepts the decode width");
+      DGPP_CUDA_OK(cudaMemset(o2, 0xFF, size_t(32) * n * 4)); DGPP_CUDA_OK(cudaMemset(b2, 0xFF, size_t(32) * n * 2));
+      dgpp::launch_mma_gemv_bf16_f32(da, k, dw, o1, m, n, k, n, nullptr);
+      require(dgpp::launch_mma_gemv_bf12_f32(da, k, pm, o2, m, n, k, n, nullptr), "bf12 form: the f32 launch applies");
+      dgpp::launch_mma_gemv_bf16_bf16(da, k, dw, b1, m, n, k, n, nullptr);
+      require(dgpp::launch_mma_gemv_bf12_bf16(da, k, pm, b2, m, n, k, n, nullptr), "bf12 form: the bf16 launch applies");
+      DGPP_CUDA_OK(cudaDeviceSynchronize());
+      const auto f1 = fetch_f(o1, size_t(m) * n), f2 = fetch_f(o2, size_t(m) * n);
+      require(std::memcmp(f1.data(), f2.data(), f1.size() * 4) == 0,
+              "bf12 form: f32 output differs from the bf16 form at m=" + std::to_string(m) + " n=" + std::to_string(n) + " k=" + std::to_string(k));
+      const auto g1 = fetch_b(b1, size_t(m) * n), g2 = fetch_b(b2, size_t(m) * n);
+      require(std::memcmp(g1.data(), g2.data(), g1.size() * 2) == 0,
+              "bf12 form: bf16 output differs from the bf16 form at m=" + std::to_string(m) + " n=" + std::to_string(n));
+    }
+    require(!dgpp::mma_gemv_bf12_accepts(pm, 33), "bf12 form: declines the widths above the decode forms");
+    require(!dgpp::launch_mma_gemv_bf12_f32(da, k, pm, o2, 33, n, k, n, nullptr), "bf12 form: 33 rows not launched");
+    cudaFree(dw); cudaFree(dp); cudaFree(dr); cudaFree(de); cudaFree(draw); cudaFree(da);
+    cudaFree(o1); cudaFree(o2); cudaFree(b1); cudaFree(b2);
+  }
+  {
+    // A companion with a tail (k = 2560: two super-blocks and 512 columns) is declined.
+    dgpp::Bf12Matrix pm; pm.n = 64; pm.k = 2560;
+    pm.packed = reinterpret_cast<const uint8_t*>(1); pm.rows = reinterpret_cast<const uint32_t*>(1);
+    pm.esc = reinterpret_cast<const uint32_t*>(1); pm.raw = reinterpret_cast<const uint16_t*>(1);
+    require(!dgpp::mma_gemv_bf12_accepts(pm, 4), "bf12 form: declines a tail");
+  }
+}
+
+DGPP_TEST(mma_gemv_fp8_pair_is_bitwise_the_two_launches) {
+  // The two-segment decode form against two single launches, bitwise, on
+  // the DeepSeek-V4.1 projection pairs (wq_a with wkv: 1280 + 512 rows of
+  // k = 5120; two wo_a groups: 1024 + 1024 of k = 4096, distinct
+  // activations) at 1, 4, 8 and 16 rows, the 32 x 32 scale grid.
+  const size_t ws_bytes = 64u << 20;
+  void* ws = nullptr;
+  DGPP_CUDA_OK(cudaMalloc(&ws, ws_bytes));
+  struct Pair { int n0, n1, k; bool same_act; };
+  for (const Pair pr : {Pair{1280, 512, 5120, true}, Pair{1024, 1024, 4096, false}}) {
+    for (const int m : {1, 4, 8, 16}) {
+      const int n = pr.n0 + pr.n1, k = pr.k;
+      std::vector<uint8_t> hw(size_t(n) * k);
+      for (size_t i = 0; i < hw.size(); ++i) hw[i] = static_cast<uint8_t>(0x30 + ((i * 2654435761u) >> 13) % 0x20);
+      const int sr = (n + 31) / 32, sc = (k + 31) / 32;
+      std::vector<float> hs(size_t(sr) * sc);
+      for (size_t i = 0; i < hs.size(); ++i) hs[i] = 0.5f + float((i * 40503u) & 0xFF) / 512.f;
+      std::vector<uint16_t> ha(size_t(2 * m) * k);
+      for (size_t i = 0; i < ha.size(); ++i) ha[i] = 0x3C00 | static_cast<uint16_t>((i * 2246822519u) & 0x3FF);
+      uint8_t* dw = nullptr; float* ds = nullptr; uint16_t* da = nullptr; uint16_t *o_single = nullptr, *o_pair = nullptr;
+      DGPP_CUDA_OK(cudaMalloc(&dw, hw.size())); DGPP_CUDA_OK(cudaMalloc(&ds, hs.size() * 4)); DGPP_CUDA_OK(cudaMalloc(&da, ha.size() * 2));
+      DGPP_CUDA_OK(cudaMalloc(&o_single, size_t(m) * n * 2)); DGPP_CUDA_OK(cudaMalloc(&o_pair, size_t(m) * n * 2));
+      DGPP_CUDA_OK(cudaMemcpy(dw, hw.data(), hw.size(), cudaMemcpyHostToDevice));
+      DGPP_CUDA_OK(cudaMemcpy(ds, hs.data(), hs.size() * 4, cudaMemcpyHostToDevice));
+      DGPP_CUDA_OK(cudaMemcpy(da, ha.data(), ha.size() * 2, cudaMemcpyHostToDevice));
+      const uint16_t* a0 = da; const uint16_t* a1 = pr.same_act ? da : da + size_t(m) * k;
+      const uint8_t* w1 = dw + size_t(pr.n0) * k; const float* s1 = ds + (size_t(pr.n0) / 32) * sc;
+      // the two single launches (the split form: the workspace passed), outputs side by side at stride n
+      dgpp::launch_mma_gemv_fp8_bf16(a0, k, dw, ds, o_single, m, pr.n0, k, n, 5, 5, nullptr, ws, ws_bytes);
+      dgpp::launch_mma_gemv_fp8_bf16(a1, k, w1, s1, o_single + pr.n0, m, pr.n1, k, n, 5, 5, nullptr, ws, ws_bytes);
+      require(dgpp::mma_gemv_pair_ok(dw, w1, a0, a1, k, m, pr.n0, pr.n1, k, ws, ws_bytes), "the pair form holds for the shape");
+      dgpp::launch_mma_gemv_fp8_bf16_pair(a0, dw, ds, o_pair, pr.n0, n, a1, w1, s1, o_pair + pr.n0, pr.n1, n, k, m, k, 5, 5,
+                                          nullptr, ws, ws_bytes);
+      DGPP_CUDA_OK(cudaDeviceSynchronize());
+      std::vector<uint16_t> hs1(size_t(m) * n), hp(size_t(m) * n);
+      DGPP_CUDA_OK(cudaMemcpy(hs1.data(), o_single, hs1.size() * 2, cudaMemcpyDeviceToHost));
+      DGPP_CUDA_OK(cudaMemcpy(hp.data(), o_pair, hp.size() * 2, cudaMemcpyDeviceToHost));
+      require(hs1 == hp, "the pair launch is bitwise the two launches at m=" + std::to_string(m) + " n0=" + std::to_string(pr.n0));
+      cudaFree(dw); cudaFree(ds); cudaFree(da); cudaFree(o_single); cudaFree(o_pair);
+    }
+  }
+  cudaFree(ws);
 }
 
 int main() { return dgpp::test::run_all(); }

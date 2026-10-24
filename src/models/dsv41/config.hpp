@@ -18,6 +18,7 @@
 // requantized: the engine consumes these bytes as they are (plan D2).
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "loaders/minijson.hpp"
@@ -127,13 +128,56 @@ struct Dsv41TextConfig {
   // --- weight formats ----------------------------------------------------
   int fp8_block_size = 32;   // one e8m0 scale per 32x32 block of a dense fp8 matrix
   int fp4_block_size = 32;   // one e8m0 scale per 32 codes along K of an fp4 matrix
+  // The EXL3 trellis pack (2026-10-22, docs/deepseek_v41_flash_exl3_plan.md
+  // §1, §4): quantization_config.quant_method "exl3" with the mul1
+  // codebook — every projection, expert, head and draft matrix an EXL3
+  // quadruple, the Engram tables from the base checkpoint (the extra shard
+  // directory), the routers / weights_proj / Markov head stored F16 and the
+  // Engram q/k weights F32. The per-matrix widths come from the pack's
+  // exl3_k_map.json beside config.json (the serving kit's schema), which
+  // the binding table needs to state every trellis shape.
+  bool weights_exl3 = false;
+  struct Exl3Bits {
+    std::vector<int> routed;  // [num_hidden_layers]
+    std::vector<int> shared;  // [num_hidden_layers], shared_overrides applied
+    std::vector<int> engram;  // one per Engram layer, by ordinal
+    int attn = 6;             // wq_a, wq_b, wkv, wo_a slices, wo_b, the indexer wq_b, the compressors
+    int indexer_wk = 8;
+    int head = 6;
+    int mtp = 6;              // every matrix under mtp.S.
+  };
+  Exl3Bits exl3;
+  // The width of a matrix class at layer l (a draft stage: mtp everywhere).
+  int exl3_bits_attention(int l) const { return is_draft(l) ? exl3.mtp : exl3.attn; }
+  int exl3_bits_indexer_wk(int l) const { return is_draft(l) ? exl3.mtp : exl3.indexer_wk; }
+  int exl3_bits_routed(int l) const { return is_draft(l) ? exl3.mtp : exl3.routed[static_cast<size_t>(l)]; }
+  int exl3_bits_shared(int l) const { return is_draft(l) ? exl3.mtp : exl3.shared[static_cast<size_t>(l)]; }
+  int exl3_bits_engram(int l) const { return exl3.engram[static_cast<size_t>(engram_index(l))]; }
   bool vision_present = false;
   Dsv41VisionConfig vision;
 
   // Parses config.json's root object. Throws std::runtime_error naming the
-  // offending field on anything unsupported.
-  static Dsv41TextConfig parse(const minijson::Value& root);
+  // offending field on anything unsupported. `exl3_k_map`: the parsed
+  // exl3_k_map.json an EXL3 pack ships (required for one, ignored for the
+  // release format).
+  static Dsv41TextConfig parse(const minijson::Value& root, const minijson::Value* exl3_k_map = nullptr);
+  // The file form reads exl3_k_map.json beside an EXL3 pack's config.json.
   static Dsv41TextConfig from_json_file(const std::string& path);
+
+  // The deployment's index budget (engine.index_topk, engine.candidate_topk_blocks,
+  // engine.candidate_block_size; 2026-10-18): each value > 0 replaces the
+  // checkpoint's, 0 keeps it. The result passes the parser's own checks
+  // (powers of two within the select networks' 2048, a candidate pool that
+  // holds at least index_topk entries); a violation throws std::runtime_error
+  // naming the engine key. The indexer selects more (or fewer) compressed
+  // entries per query than the release trained at: the attention reads
+  // exactly the entries the budget names, so this changes the model's
+  // output — a quality lever, never a lossless one.
+  void apply_index_budget(int index_topk_override, int candidate_topk_blocks_override,
+                          int candidate_block_size_override);
+  // The budget's checks (shared by parse and apply_index_budget); `where`
+  // prefixes the field in the error ("text_config." or "engine.").
+  void check_index_budget(std::string_view where) const;
 
   // --- derived layer facts ------------------------------------------------
   // Layers are indexed 0..num_hidden_layers-1 (the backbone) and

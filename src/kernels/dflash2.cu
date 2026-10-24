@@ -1,4 +1,5 @@
 #include "kernels/dflash2.hpp"
+#include "kernels/pdl.cuh"
 
 #include <cmath>
 #include <stdexcept>
@@ -54,6 +55,7 @@ __global__ void grouped_conv_kernel(const uint16_t* __restrict__ x, const uint16
                                     const uint16_t* __restrict__ base, uint16_t* __restrict__ out,
                                     int block_rows, int hidden, int group_size,
                                     int64_t delta_row_stride) {
+  dgpp_pdl_wait();
   const int64_t r = blockIdx.x;
   const uint16_t* xr = x + r * hidden;
   const bool has_prev = (r % block_rows) >= 1;
@@ -74,6 +76,7 @@ __global__ void grouped_conv_kernel(const uint16_t* __restrict__ x, const uint16
 
 __global__ void acc_kernel(float* __restrict__ acc, const float* __restrict__ src, int64_t n,
                            int beta) {
+  dgpp_pdl_wait();
   const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (i >= n) return;
   acc[i] = beta ? acc[i] + src[i] : src[i];
@@ -87,6 +90,7 @@ template <bool Add, typename InT>
 __global__ void rmsnorm_kernel(const InT* __restrict__ x, const uint16_t* __restrict__ w,
                                uint16_t* __restrict__ y, uint16_t* __restrict__ resid, int dim,
                                float eps) {
+  dgpp_pdl_wait();
   __shared__ float red[8];
   const int64_t row = blockIdx.x;
   const InT* xr = x + row * dim;
@@ -119,6 +123,7 @@ __global__ void norm_rope_kernel(const uint16_t* __restrict__ x, int64_t x_strid
                                  const uint16_t* __restrict__ w, const int64_t* __restrict__ pos,
                                  const float* __restrict__ inv_freq, uint16_t* __restrict__ out,
                                  int64_t out_stride, int dim, int half, float eps) {
+  dgpp_pdl_wait();
   const int64_t row = blockIdx.x;
   const int head = blockIdx.y;
   const int64_t p = pos[row];
@@ -175,6 +180,7 @@ __global__ void block_attn_kernel(const uint16_t* __restrict__ q, int64_t q_stri
                                   int blocks_per_request, int block_rows, int64_t window,
                                   const int64_t* __restrict__ pos, float scale,
                                   uint16_t* __restrict__ out, int heads, int kv_heads, int dim) {
+  dgpp_pdl_wait();
   const int row = blockIdx.x;
   const int kvh = blockIdx.y;
   const int nwarp = blockDim.x >> 5;
@@ -185,7 +191,12 @@ __global__ void block_attn_kernel(const uint16_t* __restrict__ q, int64_t q_stri
   // The block's span off its first row's position (device-read: a
   // recorded draft takes the committed position).
   const int64_t p0 = pos[row - row % block_rows];
-  const int64_t ctx_end = p0 - 1, blk_lo = p0, blk_hi = p0 + block_rows - 1;
+  const int64_t ctx_end = p0 - 1, blk_lo = p0;
+  // A block at the context ceiling has padding positions. Only valid
+  // rows own K/V; reading the nominal end could touch an unowned page.
+  int last_valid = block_rows - 1;
+  while (last_valid > 0 && pos[row - row % block_rows + last_valid] < 0) --last_valid;
+  const int64_t blk_hi = p0 + last_valid;
   const int64_t lo = p - window + 1;  // keys below lo are windowed out
   for (int hh = warp; hh < hpq; hh += nwarp) {
     const int head = kvh * hpq + hh;
@@ -248,6 +259,7 @@ __global__ void block_attn_split_kernel(const uint16_t* __restrict__ q, int64_t 
                                         int blocks_per_request, int block_rows, int64_t window,
                                         const int64_t* __restrict__ pos, float scale,
                                         float* __restrict__ partials, int heads, int kv_heads, int dim) {
+  dgpp_pdl_wait();
   const int row = blockIdx.x;
   const int kvh = blockIdx.y;
   const int split = blockIdx.z;
@@ -257,7 +269,12 @@ __global__ void block_attn_split_kernel(const uint16_t* __restrict__ q, int64_t 
   const int hpq = heads / kv_heads;
   const int64_t p = pos[row];
   const int64_t p0 = pos[row - row % block_rows];
-  const int64_t ctx_end = p0 - 1, blk_lo = p0, blk_hi = p0 + block_rows - 1;
+  const int64_t ctx_end = p0 - 1, blk_lo = p0;
+  // A block at the context ceiling has padding positions. Only valid
+  // rows own K/V; reading the nominal end could touch an unowned page.
+  int last_valid = block_rows - 1;
+  while (last_valid > 0 && pos[row - row % block_rows + last_valid] < 0) --last_valid;
+  const int64_t blk_hi = p0 + last_valid;
   const int64_t lo = p - window + 1;
   const int64_t ctx_lo = lo > 0 ? lo : 0;
   // This split's share of the context keys (empty for a short context).
@@ -317,24 +334,36 @@ __global__ void block_attn_split_kernel(const uint16_t* __restrict__ q, int64_t 
 }
 
 // One warp per (row, head): the splits' partials merged at the global max
-// (fixed order over the splits), the output rounded once to bf16.
+// (fixed order over the splits), the output rounded once to bf16. Lane s
+// holds split s's m and l (kBlockAttnSplits = the warp's lanes): the maximum
+// by shuffle, each split's weight formed once by its lane and broadcast in
+// split order (2026-10-20: every lane read every split's m for the maximum
+// and its m and l again in the merge, and computed the weight itself — the
+// same arithmetic in the same order, so the outputs are bitwise).
+static_assert(kBlockAttnSplits == 32, "block_attn_combine_kernel: one lane per split");
 __global__ void block_attn_combine_kernel(const float* __restrict__ partials, int heads, int dim,
                                           uint16_t* __restrict__ out) {
+  dgpp_pdl_wait();
   const int row = blockIdx.x;
   const int head = blockIdx.y;
   const int lane = threadIdx.x;
   const float* base = partials + static_cast<size_t>(row * heads + head) * kBlockAttnSplits * (dim + 2);
-  float M = -INFINITY;
-  for (int s = 0; s < kBlockAttnSplits; ++s) M = fmaxf(M, base[s * (dim + 2) + dim]);
+  const float m_lane = base[lane * (dim + 2) + dim];
+  const float l_lane = base[lane * (dim + 2) + dim + 1];
+  float M = m_lane;
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1) M = fmaxf(M, __shfl_xor_sync(0xffffffffu, M, o));
+  const float w_lane = (M != -INFINITY && m_lane != -INFINITY) ? std::exp(m_lane - M) : 0.0f;
   const int d0 = lane * 4;
   float l = 0.0f, acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
   if (M != -INFINITY) {
     for (int s = 0; s < kBlockAttnSplits; ++s) {
-      const float* part = base + s * (dim + 2);
-      const float ms = part[dim];
+      const float ms = __shfl_sync(0xffffffffu, m_lane, s);
       if (ms == -INFINITY) continue;
-      const float w = std::exp(ms - M);
-      l += part[dim + 1] * w;
+      const float w = __shfl_sync(0xffffffffu, w_lane, s);
+      const float ls = __shfl_sync(0xffffffffu, l_lane, s);
+      const float* part = base + s * (dim + 2);
+      l += ls * w;
 #pragma unroll
       for (int j = 0; j < 4; ++j) acc[j] += part[d0 + j] * w;
     }
@@ -403,6 +432,7 @@ template <int K>
 __global__ void __launch_bounds__(kTopkThreads)
     topk_chunk_kernel(const float* __restrict__ logits, int64_t vocab, int chunks, Cand* __restrict__ partial,
                       int32_t* __restrict__ ids, float* __restrict__ scores) {
+  dgpp_pdl_wait();
   constexpr int S = kTopkThreads;
   __shared__ Cand sl[K * S];
   __shared__ Cand ml[K * S];
@@ -443,6 +473,7 @@ template <int K>
 __global__ void __launch_bounds__(kTopkThreads)
     topk_merge_kernel(const Cand* __restrict__ partial, int chunks, int32_t* __restrict__ ids,
                       float* __restrict__ scores) {
+  dgpp_pdl_wait();
   constexpr int S = kTopkThreads;
   __shared__ Cand sl[K * S];
   __shared__ Cand ml[K * S];
@@ -490,6 +521,7 @@ __global__ void selector_kernel(const int32_t* __restrict__ ids, const float* __
                                 int steps, int k, int rank, const int64_t* __restrict__ pos,
                                 const SampleSpec* __restrict__ spec, DraftProposal* __restrict__ proposal,
                                 DraftProposal* __restrict__ proposal_host, float* __restrict__ conf) {
+  dgpp_pdl_wait();
   extern __shared__ float sm[];
   const int32_t anchor = static_cast<int32_t>(*anchor_tok);
   float* h = sm;                  // [rank]
@@ -631,6 +663,7 @@ __global__ void stage_block_kernel(const PickVerdict* __restrict__ verdict,
                                    const int64_t* __restrict__ session_pos, int64_t mask_id, int rows,
                                    int64_t max_context, int64_t* __restrict__ pos,
                                    int64_t* __restrict__ tokens) {
+  dgpp_pdl_wait();
   const int j = threadIdx.x;
   if (j >= rows) return;
   const int64_t p = *session_pos + j;
@@ -641,6 +674,7 @@ __global__ void stage_block_kernel(const PickVerdict* __restrict__ verdict,
 __global__ void block_feed_kernel(const PickVerdict* __restrict__ verdict,
                                   const int32_t* __restrict__ drafts, int count,
                                   int64_t* __restrict__ tokens) {
+  dgpp_pdl_wait();
   const int j = threadIdx.x;
   if (j > count) return;
   tokens[j] = j == 0 ? static_cast<int64_t>(verdict->next) : static_cast<int64_t>(drafts[j - 1]);
@@ -648,12 +682,14 @@ __global__ void block_feed_kernel(const PickVerdict* __restrict__ verdict,
 
 __global__ void publish_drafts_kernel(const int32_t* __restrict__ drafts, int32_t* __restrict__ pinned,
                                       int count) {
+  dgpp_pdl_wait();
   const int j = threadIdx.x;
   if (j >= count) return;
   asm volatile("st.release.sys.global.s32 [%0], %1;" ::"l"(pinned + j), "r"(drafts[j]) : "memory");
 }
 
 __global__ void publish_words_kernel(const int32_t* __restrict__ src, int32_t* __restrict__ pinned, int count) {
+  dgpp_pdl_wait();
   for (int j = blockIdx.x * blockDim.x + threadIdx.x; j < count; j += gridDim.x * blockDim.x)
     asm volatile("st.release.sys.global.s32 [%0], %1;" ::"l"(pinned + j), "r"(src[j]) : "memory");
 }
@@ -663,6 +699,7 @@ __global__ void stage_block_batched_kernel(const PickVerdict* __restrict__ verdi
                                            const int64_t* __restrict__ session_pos, int64_t mask_id,
                                            int rows, int64_t max_context, int64_t* __restrict__ pos,
                                            int64_t* __restrict__ tokens) {
+  dgpp_pdl_wait();
   const int q = blockIdx.x;
   const int j = threadIdx.x;
   if (j >= rows) return;
@@ -675,6 +712,7 @@ __global__ void stage_block_batched_kernel(const PickVerdict* __restrict__ verdi
 __global__ void block_feed_batched_kernel(const PickVerdict* __restrict__ verdicts,
                                           const int32_t* __restrict__ drafts, int count, int rows,
                                           int64_t* __restrict__ feeds) {
+  dgpp_pdl_wait();
   const int q = blockIdx.x;
   const int j = threadIdx.x;
   if (j >= rows) return;
@@ -690,6 +728,7 @@ __global__ void block_feed_batched_kernel(const PickVerdict* __restrict__ verdic
 
 __global__ void publish_drafts_batched_kernel(const int32_t* __restrict__ drafts,
                                               int32_t* __restrict__ pinned, int count) {
+  dgpp_pdl_wait();
   const int q = blockIdx.x;
   const int j = threadIdx.x;
   if (j >= count) return;
@@ -711,6 +750,7 @@ __device__ __forceinline__ uint32_t digit_value(uint16_t b) {
 __global__ void topk_stage_kernel(const int32_t* __restrict__ ids, const float* __restrict__ scores,
                                   int rows, int k, int32_t vocab_begin, int rank, int world,
                                   uint16_t* __restrict__ table, size_t elems) {
+  dgpp_pdl_wait();
   const size_t slots = static_cast<size_t>(rows) * world * k;
   for (size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < slots;
        i += static_cast<size_t>(gridDim.x) * blockDim.x) {
@@ -740,6 +780,7 @@ __global__ void topk_stage_kernel(const int32_t* __restrict__ ids, const float* 
 template <int K>
 __global__ void topk_merge_kernel(const uint16_t* __restrict__ table, int world,
                                   int32_t* __restrict__ ids, float* __restrict__ scores) {
+  dgpp_pdl_wait();
   const int row = blockIdx.x;
   __shared__ Cand cands[kPickMaxWorld * K];
   const int n = world * K;

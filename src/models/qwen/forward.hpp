@@ -57,6 +57,7 @@
 #include "engine/session_model.hpp"
 #include "kernels/bf12_companions.hpp"
 #include "kernels/draft_head.hpp"
+#include "kernels/latent_format.hpp"
 #include "kernels/l2_prefetch.hpp"
 #include "kernels/gemm.hpp"
 #include "kernels/mma_gemv.hpp"
@@ -76,6 +77,8 @@ class QwenVisionEncoder;  // models/qwen/vision.hpp; built only when the
 
 class QwenModel : public SessionModel<QwenModel> {
  public:
+  static void set_default_prefill_dense_tile(bool enabled);
+
   using Base = SessionModel<QwenModel>;
   using Outputs = Base::Outputs;
   using SessionSnapshotMeta = Base::SessionSnapshotMeta;
@@ -131,12 +134,18 @@ class QwenModel : public SessionModel<QwenModel> {
   QwenModel(const QwenTextConfig& cfg, const std::string& checkpoint_dir, int max_tokens,
             int64_t max_cache_tokens, QwenResidency residency = QwenResidency::Streaming,
             BoundaryReducer* boundary = nullptr, int tp_rank = 0, int tp_world = 1,
-            int max_requests = 1, bool mtp = false, int decode_rows = 0, bool fp8_head_mma = false, bool serving_logits = false);
+            int max_requests = 1, bool mtp = false, int decode_rows = 0, bool fp8_head_mma = false,
+            bool serving_logits = false, LatentFormat kv_format = LatentFormat::kBf16);
   bool fp8_head_mma() const { return fp8_head_mma_; }
   // The draft head's screen (kernels/head_screen.hpp): the candidate cap
   // the model was built with (QwenLayerStream::draft_head_blocks() under
   // MTP), 0 = every draft reads the exact head.
   int draft_head_blocks() const { return draft_head_.blocks(); }
+  LatentFormat kv_format() const { return kv_format_; }
+  static void set_native_attention(bool prefill, bool decode) {
+    fp8_prefill_attention_ = prefill;
+    fp8_decode_attention_ = decode;
+  }
   ~QwenModel();
   QwenModel(const QwenModel&) = delete;
   QwenModel& operator=(const QwenModel&) = delete;
@@ -148,7 +157,8 @@ class QwenModel : public SessionModel<QwenModel> {
   static MemoryPlan plan_memory(const QwenTextConfig& cfg, int max_tokens, int64_t max_cache_tokens,
                                 int tp_rank = 0, int tp_world = 1,
                                 QwenResidency residency = QwenResidency::Streaming,
-                                int max_requests = 1, bool mtp = false, int decode_rows = 0, bool serving_logits = false);
+                                int max_requests = 1, bool mtp = false, int decode_rows = 0,
+                                bool serving_logits = false, LatentFormat kv_format = LatentFormat::kBf16);
 
   // The cold diagnostic forward: one request on slot 0 (which must be
   // closed), fresh state, every row's logits; the slot is closed after.
@@ -252,6 +262,9 @@ class QwenModel : public SessionModel<QwenModel> {
 
  private:
   const bool fp8_head_mma_;
+  const LatentFormat kv_format_;  // the QSA K/V cache's dtype (bf16 | fp8)
+  inline static bool fp8_prefill_attention_ = false;
+  inline static bool fp8_decode_attention_ = false;
   static constexpr int kBlockTokens = 64;
   static constexpr int kPrefillChunkTokens = 4096;
 
@@ -338,6 +351,9 @@ class QwenModel : public SessionModel<QwenModel> {
   QwenTextConfig cfg_;
   QwenLayerStream loader_;
   CublasLtGemm gemm_;
+  void configure_gemm_rows(int tokens, bool decode);
+  bool prefill_dense_tile_enabled_ = false;
+  bool prefill_dense_tile_ = false;
   void* gemm_ws_ = nullptr;
   size_t gemm_ws_bytes_ = 0;
   QwenGemmWorkspace gw_;

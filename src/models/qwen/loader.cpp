@@ -188,6 +188,56 @@ bool read_npy_ids(const std::string& path, std::vector<int32_t>* ids, std::strin
 bool g_mtp_experts_bf16_fused = false;
 }  // namespace
 
+// Expand ModelOpt NVFP4 CSF sidecars (codec
+// byte-window4-fixed-stream-u24-exceptions/1, per the vLLM csf_scales
+// reader) to a plain [rows, cols] E4M3 scale plane: per 16-row slab, one
+// base byte per row, then the rows' 4-bit codes low-nibble-first; a scale
+// byte is base + code, and each exception word's high 8 bits replace the
+// byte at its low-24-bit flat position. Pure host integer arithmetic;
+// throws std::runtime_error on any geometry or content violation.
+std::vector<uint8_t> qwen_csf_scales_expand(const uint8_t* fixed, size_t fixed_bytes,
+                                            const uint32_t* exc, size_t exc_count, int64_t rows,
+                                            int64_t cols) {
+  auto bad = [](const std::string& what) -> std::vector<uint8_t> {
+    throw std::runtime_error("CSF scale expansion: " + what);
+  };
+  if (rows <= 0 || cols <= 0 || rows % 16 != 0 || cols % 2 != 0)
+    bad("plane [" + std::to_string(rows) + ", " + std::to_string(cols) + "] is not 16-row / even-col");
+  if (fixed == nullptr || (exc_count != 0 && exc == nullptr)) bad("null sidecar data");
+  const int64_t slab = 16 * (1 + cols / 2);
+  if (fixed_bytes != static_cast<size_t>(rows / 16) * static_cast<size_t>(slab))
+    bad("fixed stream has " + std::to_string(fixed_bytes) + " bytes, want " +
+        std::to_string(rows / 16 * slab));
+  std::vector<uint8_t> out(static_cast<size_t>(rows) * static_cast<size_t>(cols));
+  for (int64_t g = 0; g < rows / 16; ++g) {
+    const uint8_t* base = fixed + static_cast<size_t>(g) * static_cast<size_t>(slab);
+    const uint8_t* packed = base + 16;
+    for (int64_t r = 0; r < 16; ++r) {
+      const unsigned b = base[static_cast<size_t>(r)];
+      if (b > 240) bad("row base " + std::to_string(b) + " exceeds 240");
+      uint8_t* dst = out.data() + static_cast<size_t>(g * 16 + r) * static_cast<size_t>(cols);
+      for (int64_t c = 0; c < cols / 2; ++c) {
+        const unsigned p = packed[static_cast<size_t>(r) * static_cast<size_t>(cols / 2) +
+                                  static_cast<size_t>(c)];
+        dst[2 * static_cast<size_t>(c)] = static_cast<uint8_t>(b + (p & 0xF));
+        dst[2 * static_cast<size_t>(c) + 1] = static_cast<uint8_t>(b + (p >> 4));
+      }
+    }
+  }
+  const size_t n = out.size();
+  for (size_t i = 0; i < exc_count; ++i) {
+    // The exceptions stream is a safetensors tensor and is not word-aligned,
+    // so read each little-endian word bytewise rather than dereferencing the
+    // caller's uint32_t* (UB / a fault on strict-alignment targets).
+    uint32_t w;
+    std::memcpy(&w, reinterpret_cast<const uint8_t*>(exc) + i * 4, 4);
+    const size_t pos = static_cast<size_t>(w & 0xFFFFFFu);
+    if (pos >= n) bad("exception position " + std::to_string(pos) + " outside " + std::to_string(n));
+    out[pos] = static_cast<uint8_t>(w >> 24);
+  }
+  return out;
+}
+
 // The per-class builders (loaders/weight_build.hpp's primitives).
 struct QwenLoaderFamily::Builder : WeightBuilder<QwenExpectedTensor> {
   const QwenTextConfig& cfg;
@@ -756,14 +806,17 @@ struct QwenLoaderFamily::Builder : WeightBuilder<QwenExpectedTensor> {
       m.expert_globals = static_cast<float*>(bump.alloc(static_cast<size_t>(E) * 3 * sizeof(float)));
       m.experts_weight_only = weight_only;
       if (!weight_only) m.act_scales = static_cast<float*>(bump.alloc(2 * sizeof(float)));
+      // The scale form follows the scope: the FP4-Local export wraps the
+      // backbone's expert scales as CSF and keeps the draft's plain.
+      const bool mo_csf = is_mtp_layer ? cfg.mtp_experts_nvfp4_csf : cfg.experts_nvfp4_csf;
       for (int e = 0; e < E; ++e) {
         const std::string ep = p + "experts." + std::to_string(e) + ".";
         float* g = m.expert_globals + static_cast<size_t>(e) * 3;
-        m.experts_fp4[static_cast<size_t>(e) * 3 + 0] = load_fp4_rows_mo(ep + "gate_proj", r * I, I, g + 0, !weight_only);
+        m.experts_fp4[static_cast<size_t>(e) * 3 + 0] = load_fp4_rows_mo(ep + "gate_proj", r * I, I, g + 0, !weight_only, mo_csf);
         m.act_scale_w13 = std::max(m.act_scale_w13, last_input_scale_);
-        m.experts_fp4[static_cast<size_t>(e) * 3 + 1] = load_fp4_rows_mo(ep + "up_proj", r * I, I, g + 1, !weight_only);
+        m.experts_fp4[static_cast<size_t>(e) * 3 + 1] = load_fp4_rows_mo(ep + "up_proj", r * I, I, g + 1, !weight_only, mo_csf);
         m.act_scale_w13 = std::max(m.act_scale_w13, last_input_scale_);
-        m.experts_fp4[static_cast<size_t>(e) * 3 + 2] = load_fp4_cols_mo(ep + "down_proj", r * I, I, g + 2, !weight_only);
+        m.experts_fp4[static_cast<size_t>(e) * 3 + 2] = load_fp4_cols_mo(ep + "down_proj", r * I, I, g + 2, !weight_only, mo_csf);
         m.act_scale_w2 = std::max(m.act_scale_w2, last_input_scale_);
       }
       // The layer's activation scales go into the image with the weights: a
@@ -854,16 +907,63 @@ struct QwenLoaderFamily::Builder : WeightBuilder<QwenExpectedTensor> {
     if (copy) std::memcpy(&last_input_scale_, source(base + ".input_scale").data, 4);
     (void)load_raw(base + ".input_scale");
   }
+  // A CSF-wrapped NVFP4 scale plane (the caller's CSF form: config
+  // experts_nvfp4_csf for the backbone, mtp_experts_nvfp4_csf for the
+  // draft): the full [N, full_cols/16] E4M3 plane for `base`, expanded
+  // once from its fixed + exceptions sidecars. Empty in plan mode
+  // (accounting only), where the tabled tensors do not exist yet: the
+  // fixed stream's size is analytic (16 row-base bytes + 8 bytes of
+  // low-nibble-first codes per 16-row slab, the expander's contract —
+  // 16 * (1 + cols/2) per slab), so both modes count exactly that; the
+  // exceptions stream is data-dependent (a property of the quantized
+  // values, not of the geometry), so it is read in copy mode but not
+  // part of the source-byte plan.
+  //
+  // The whole plane is expanded even for a row slice (the FP4 row loader):
+  // the exception words address the full matrix by flat position, so a
+  // windowed expansion would have to filter and rebase them. Every rank
+  // therefore expands its own copy of each expert's sidecars under tensor
+  // parallelism; the disk read is one pass regardless (consumed() drops the
+  // whole tensor), and the plan-vs-read invariant was validated at world 1.
+  std::vector<uint8_t> load_csf_plane(const std::string& base, int64_t N, int64_t full_cols) {
+    const int64_t C = full_cols / kFp4Group;
+    source_bytes += static_cast<size_t>(N / 16) * static_cast<size_t>(16 + full_cols / 2);
+    std::vector<uint8_t> plane;
+    if (!copy) return plane;
+    const TensorInfo& tf = source(base + ".weight_scale.nvfp4_csf_fixed");
+    const TensorInfo& te = source(base + ".weight_scale.nvfp4_csf_exceptions");
+    if (tf.dtype != DType::U8) fail("'" + tf.name + "' is not U8");
+    if (te.dtype != DType::U32) fail("'" + te.name + "' is not U32");
+    if (tf.data_end < tf.data_begin || te.data_end < te.data_begin)
+      fail("sidecar offsets of '" + base + "' run backwards");
+    const size_t ebytes = static_cast<size_t>(te.data_end - te.data_begin);
+    if (ebytes % 4 != 0) fail("'" + te.name + "' is not a whole U32 count");
+    plane = qwen_csf_scales_expand(static_cast<const uint8_t*>(tf.data),
+                                   static_cast<size_t>(tf.data_end - tf.data_begin),
+                                   static_cast<const uint32_t*>(te.data), ebytes / 4, N, C);
+    consumed(tf);
+    consumed(te);
+    return plane;
+  }
   GlmFp4Matrix load_fp4_rows_mo(const std::string& base, int64_t row_start, int64_t rows, float* global,
-                                bool with_input_scale = true) {
+                                bool with_input_scale, bool csf) {
     const QwenExpectedTensor& ep = expected(base + ".weight");
-    const QwenExpectedTensor& es = expected(base + ".weight_scale");
     const int64_t N = ep.shape[0];
     const int64_t cols = ep.shape[1] * 2;
     fp4_check_cols(cols, who.c_str());
     check_range(base, row_start, rows, N);
-    if (es.shape[0] != N || es.shape[1] != cols / kFp4Group) fail("NVFP4 scale geometry mismatch on " + base);
     const size_t pc = static_cast<size_t>(cols / 2), sc = static_cast<size_t>(cols / kFp4Group);
+    // The scale source: the tabled plain weight_scale, or the CSF sidecars
+    // expanded once (the caller's csf form).
+    std::vector<uint8_t> csf_plane;
+    const QwenExpectedTensor* es = nullptr;
+    if (csf) {
+      csf_plane = load_csf_plane(base, N, cols);
+    } else {
+      es = &expected(base + ".weight_scale");
+      if (es->shape[0] != N || es->shape[1] != cols / kFp4Group)
+        fail("NVFP4 scale geometry mismatch on " + base);
+    }
     GlmFp4Matrix q;
     q.rows = rows;
     q.cols = cols;
@@ -871,33 +971,46 @@ struct QwenLoaderFamily::Builder : WeightBuilder<QwenExpectedTensor> {
     q.scales = static_cast<const uint8_t*>(bump.alloc(static_cast<size_t>(rows) * sc));
     if (copy) {
       const TensorInfo& tp = source(ep.name);
-      const TensorInfo& ts = source(es.name);
       std::memcpy(bump.host(const_cast<uint8_t*>(q.payload)),
                   static_cast<const uint8_t*>(tp.data) + static_cast<size_t>(row_start) * pc,
                   static_cast<size_t>(rows) * pc);
-      std::memcpy(bump.host(const_cast<uint8_t*>(q.scales)),
-                  static_cast<const uint8_t*>(ts.data) + static_cast<size_t>(row_start) * sc,
-                  static_cast<size_t>(rows) * sc);
+      if (csf) {
+        std::memcpy(bump.host(const_cast<uint8_t*>(q.scales)),
+                    csf_plane.data() + static_cast<size_t>(row_start) * sc,
+                    static_cast<size_t>(rows) * sc);
+      } else {
+        const TensorInfo& ts = source(es->name);
+        std::memcpy(bump.host(const_cast<uint8_t*>(q.scales)),
+                    static_cast<const uint8_t*>(ts.data) + static_cast<size_t>(row_start) * sc,
+                    static_cast<size_t>(rows) * sc);
+        consumed(ts);
+      }
       consumed(tp);
-      consumed(ts);
     }
     note_read(ep, static_cast<size_t>(rows) * pc);
-    note_read(es, static_cast<size_t>(rows) * sc);
+    if (!csf) note_read(*es, static_cast<size_t>(rows) * sc);
     load_global_reciprocal_into(base, global, with_input_scale);
     q.global_scale = global;
     return q;
   }
   GlmFp4Matrix load_fp4_cols_mo(const std::string& base, int64_t col_start, int64_t cols, float* global,
-                                bool with_input_scale = true) {
+                                bool with_input_scale, bool csf) {
     const QwenExpectedTensor& ep = expected(base + ".weight");
-    const QwenExpectedTensor& es = expected(base + ".weight_scale");
     const int64_t N = ep.shape[0];
     const int64_t full = ep.shape[1] * 2;
     fp4_check_cols(full, who.c_str());
     fp4_check_cols(cols, who.c_str());
     if (col_start % kFp4Group != 0) fail("NVFP4 column slice of " + base + " is not 16-aligned");
     check_range(base, col_start, cols, full);
-    if (es.shape[0] != N || es.shape[1] != full / kFp4Group) fail("NVFP4 scale geometry mismatch on " + base);
+    std::vector<uint8_t> csf_plane;
+    const QwenExpectedTensor* es = nullptr;
+    if (csf) {
+      csf_plane = load_csf_plane(base, N, full);
+    } else {
+      es = &expected(base + ".weight_scale");
+      if (es->shape[0] != N || es->shape[1] != full / kFp4Group)
+        fail("NVFP4 scale geometry mismatch on " + base);
+    }
     const size_t pc_full = static_cast<size_t>(full / 2), sc_full = static_cast<size_t>(full / kFp4Group);
     const size_t pc = static_cast<size_t>(cols / 2), sc = static_cast<size_t>(cols / kFp4Group);
     GlmFp4Matrix q;
@@ -907,9 +1020,16 @@ struct QwenLoaderFamily::Builder : WeightBuilder<QwenExpectedTensor> {
     q.scales = static_cast<const uint8_t*>(bump.alloc(static_cast<size_t>(N) * sc));
     if (copy) {
       const TensorInfo& tp = source(ep.name);
-      const TensorInfo& ts = source(es.name);
       const uint8_t* sp = static_cast<const uint8_t*>(tp.data);
-      const uint8_t* ss = static_cast<const uint8_t*>(ts.data);
+      const uint8_t* ss;
+      const TensorInfo* scale_source = nullptr;
+      if (csf) {
+        ss = csf_plane.data();
+      } else {
+        const TensorInfo& ts = source(es->name);
+        ss = static_cast<const uint8_t*>(ts.data);
+        scale_source = &ts;
+      }
       uint8_t* hp = bump.host(const_cast<uint8_t*>(q.payload));
       uint8_t* hs = bump.host(const_cast<uint8_t*>(q.scales));
       if (cols == full) {
@@ -921,11 +1041,13 @@ struct QwenLoaderFamily::Builder : WeightBuilder<QwenExpectedTensor> {
           std::memcpy(hs + row * sc, ss + row * sc_full + col_start / kFp4Group, sc);
         }
       }
+      // Keep the prefetched scale pages mapped until the column copy is
+      // complete. Discarding earlier refaults them and leaves them cached.
+      if (scale_source) consumed(*scale_source);
       consumed(tp);
-      consumed(ts);
     }
     note_read(ep, static_cast<size_t>(N) * pc);
-    note_read(es, static_cast<size_t>(N) * sc);
+    if (!csf) note_read(*es, static_cast<size_t>(N) * sc);
     load_global_reciprocal_into(base, global, with_input_scale);
     q.global_scale = global;
     return q;

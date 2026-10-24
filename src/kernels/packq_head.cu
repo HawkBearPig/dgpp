@@ -1,4 +1,5 @@
 #include "kernels/packq_head.hpp"
+#include "kernels/pdl.cuh"
 
 #include <algorithm>
 #include <cmath>
@@ -229,6 +230,7 @@ constexpr float kBoundSlack = 1.0e-3f;   // fp32 rounding of A and of the exact 
 constexpr float kBoundEps = 1.0e-6f;
 
 __global__ void head_prepare_kernel(int32_t* __restrict__ lo, int m, int32_t* __restrict__ cand_count) {
+  dgpp_pdl_wait();
   if (threadIdx.x < static_cast<unsigned>(m)) lo[threadIdx.x] = ordered_of(-INFINITY);
   if (threadIdx.x == 0) *cand_count = 0;
 }
@@ -241,6 +243,7 @@ struct OutMap {
   }
 };
 __global__ void head_fill_kernel(float* __restrict__ out, size_t elems) {
+  dgpp_pdl_wait();
   const size_t stride = static_cast<size_t>(gridDim.x) * blockDim.x;
   for (size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < elems; i += stride)
     out[i] = -INFINITY;
@@ -267,6 +270,7 @@ __global__ void __launch_bounds__(packq_gemv::kThreads)
     head_pass1_kernel(const uint16_t* __restrict__ act, size_t act_stride, const uint8_t* __restrict__ w,
                       const uint16_t* __restrict__ scales, int n, PackqHeadMode mode, int row0,
                       float* __restrict__ ab, int32_t* __restrict__ lo, float* __restrict__ out, OutMap om) {
+  dgpp_pdl_wait();
   using G = Geom<kBits, K, SF>;
   extern __shared__ __align__(16) uint16_t sx[];
   float* sabs = reinterpret_cast<float*>(sx + static_cast<size_t>(kRows) * K);
@@ -335,6 +339,7 @@ __global__ void __launch_bounds__(packq_gemv::kThreads)
                       const uint16_t* __restrict__ scales, int n, PackqHeadMode mode, int row0,
                       const float* __restrict__ ab, const int32_t* __restrict__ lo, float* __restrict__ out,
                       OutMap om) {
+  dgpp_pdl_wait();
   using G = Geom<kBits, K, SF>;
   extern __shared__ __align__(16) uint16_t sx[];
   __shared__ float slo[kRows];
@@ -400,6 +405,7 @@ __global__ void __launch_bounds__(256)
     head_candidates_kernel(int n, PackqHeadMode mode, int row0, const float* __restrict__ ab,
                            const int32_t* __restrict__ lo, float* __restrict__ out, OutMap om,
                            int32_t* __restrict__ cand, int32_t* __restrict__ cand_count) {
+  dgpp_pdl_wait();
   if (!rows_all_greedy(mode, row0, kRows)) return;
   const int row = static_cast<int>(blockIdx.x) * 256 + threadIdx.x;
   bool c = false;
@@ -427,6 +433,7 @@ __global__ void __launch_bounds__(packq_gemv::kThreads)
                            const uint16_t* __restrict__ scales, int n, PackqHeadMode mode, int row0,
                            const int32_t* __restrict__ cand, const int32_t* __restrict__ cand_count,
                            float* __restrict__ out, OutMap om) {
+  dgpp_pdl_wait();
   using G = Geom<kBits, K, SF>;
   static_assert(G::rows_per_warp == 1, "the list form needs a row per warp");
   extern __shared__ __align__(16) uint16_t sx[];

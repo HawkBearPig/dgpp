@@ -354,7 +354,7 @@ def main(*, phase_runner=None, settle=None):
                 table[(n, c)] = statistics.median(rates)
                 base += c
                 save()
-        print(f"== per-class wall aggregate tokens/s (prefill included), {draw}, max_tokens {args.max_tokens}")
+        print(f"== per-class wall aggregate tokens/s (client wall time: prefill and queueing included — the engine's decode-only rate is timed_load's table), {draw}, max_tokens {args.max_tokens}")
         print("| class | " + " | ".join(f"c={c}" for c in cs) + " |")
         print("|---|" + "---|" * len(cs))
         for n in names:

@@ -1,4 +1,5 @@
 #include "kernels/glm4_attn.hpp"
+#include "kernels/pdl.cuh"
 
 #include <cmath>
 #include <stdexcept>
@@ -51,6 +52,7 @@ __global__ void qkv_finish_kernel(const float* __restrict__ q_dot, int64_t q_str
                                   int blocks_per_request, int block_tokens,
                                   uint16_t* __restrict__ q_out, int64_t q_out_stride,
                                   uint16_t* __restrict__ k_cache, uint16_t* __restrict__ v_cache) {
+  dgpp_pdl_wait();
   const int heads_total = local_heads + 2 * kv_heads;
   const int item = static_cast<int>(blockIdx.x) * (blockDim.x / 32) + threadIdx.x / 32;
   if (item >= rows * heads_total) return;
@@ -155,6 +157,7 @@ __global__ void attn_partial_kernel(const uint16_t* __restrict__ q, int64_t q_st
                                     int blocks_per_request, float scale,
                                     float* __restrict__ m_ws, float* __restrict__ l_ws,
                                     float* __restrict__ c_ws) {
+  dgpp_pdl_wait();
   extern __shared__ __align__(16) uint16_t smem[];
   const int hpk = local_heads / kv_heads;
   const int r = static_cast<int>(blockIdx.x);
@@ -252,6 +255,7 @@ __global__ void attn_partial_kernel(const uint16_t* __restrict__ q, int64_t q_st
     __syncwarp();
     // The V accumulation: lane owns dims [4l, 4l + 4).
     for (int tt = 0; tt < n; ++tt) {
+  dgpp_pdl_wait();
       const float pt = pbuf[warp * kTile + tt];
       const uint2 vv = *reinterpret_cast<const uint2*>(vt + tt * D + lane * 4);
       creg[0] = fmaf(pt, bf16_bits_to_float(static_cast<uint16_t>(vv.x & 0xFFFFu)), creg[0]);
@@ -274,6 +278,7 @@ __global__ void attn_partial_kernel(const uint16_t* __restrict__ q, int64_t q_st
 __global__ void attn_combine_kernel(const float* __restrict__ m_ws, const float* __restrict__ l_ws,
                                     const float* __restrict__ c_ws, int n_split, int local_heads,
                                     uint16_t* __restrict__ out) {
+  dgpp_pdl_wait();
   const int r = static_cast<int>(blockIdx.x);
   const int h = static_cast<int>(blockIdx.y);
   const int d = threadIdx.x;  // D threads

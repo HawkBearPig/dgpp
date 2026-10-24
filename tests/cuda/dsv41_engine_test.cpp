@@ -571,7 +571,7 @@ void rank_work_sched(int r, const Dsv41TextConfig& cfg, const std::string& dir, 
 }
 
 // Six request slots at depth 4 (30 rows, the family's 32-row cap since
-// 2026-09-14; the vLLM recipe's six-stream shape): every slot batched in
+// 2026-09-14; the six-stream serving shape): every slot batched in
 // the 6-slot family under the scheduled depth (forced per-slot depths so
 // the reduced batch variants replay), every transcript the plain eager
 // engine's, both ranks identical.
@@ -584,8 +584,8 @@ struct WideOutcome {
 };
 
 void rank_work_wide(int r, const Dsv41TextConfig& cfg, const std::string& dir,
-                    const std::vector<std::vector<int64_t>>& prompts, CollectiveBus* bus, ConstructBarrier* barrier,
-                    WideOutcome* out) {
+                    const std::vector<std::vector<int64_t>>& prompts, int slots, CollectiveBus* bus,
+                    ConstructBarrier* barrier, WideOutcome* out) {
   bool arrived = false;
   const auto arrive_once = [&] {
     if (arrived) return;
@@ -594,22 +594,24 @@ void rank_work_wide(int r, const Dsv41TextConfig& cfg, const std::string& dir,
   };
   uint16_t* scratch = nullptr;
   try {
-    const int slots = 6, depth = 4;
-    const int decode_rows = slots * (1 + depth);  // 30
+    const int depth = 4;
+    const int decode_rows = slots * (1 + depth);  // 30 at six slots, 60 at twelve (the 64-row cap since 2026-10-23)
     // Six slots x two 128-token blocks each (the prompt and its decode,
     // plus the chain rows) need more pool than the three-slot worlds' 512.
-    const int64_t cache = 4 * kCache;
+    const int64_t cache = static_cast<int64_t>((slots + 2) / 2) * kCache;
     BusBoundaryReducer reducer(*bus, wait_timeout_ms());
     // Both models at the same decode rows: the GEMM lowering follows the
     // decode rows into short prefills (glm53-sixteen-row trap 1), so an
     // oracle at the default rows would prefill these prompts on another
     // kernel and diverge at near-ties.
-    Dsv41Model eager(cfg, dir, kMaxTokens, cache, Dsv41Residency::Resident, &reducer, r, kWorld, slots, /*mtp=*/false,
+    // The forward's rows hold the decode batch (sixteen slots x 5 = 80 > kMaxTokens).
+    const int max_tokens = std::max(kMaxTokens, decode_rows);
+    Dsv41Model eager(cfg, dir, max_tokens, cache, Dsv41Residency::Resident, &reducer, r, kWorld, slots, /*mtp=*/false,
                      decode_rows);
-    Dsv41Model mtp(cfg, dir, kMaxTokens, cache, Dsv41Residency::Resident, &reducer, r, kWorld,
+    Dsv41Model mtp(cfg, dir, max_tokens, cache, Dsv41Residency::Resident, &reducer, r, kWorld,
                    slots,
                    /*mtp=*/true, decode_rows, /*serving_logits=*/true);
-    require(mtp.max_decode_rows() == decode_rows, "the model takes the 30-row decode batch");
+    require(mtp.max_decode_rows() == decode_rows, "the model takes the slots x 5 decode batch");
     DGPP_CUDA_OK(cudaHostAlloc(reinterpret_cast<void**>(&scratch),
                                sizeof(uint16_t) * dgpp::kPickScratchElems(kWorld), cudaHostAllocDefault));
     arrive_once();
@@ -662,7 +664,7 @@ void rank_work_wide(int r, const Dsv41TextConfig& cfg, const std::string& dir,
   }
 }
 
-void check_wide_world(uint16_t port) {
+void check_wide_world(uint16_t port, int slots) {
   const Dsv41TextConfig cfg = dsv41fx::tiny_config();
   const std::string dir = (fs::current_path() / "dsv41_engine_fixture").string();
   dsv41fx::write_fixture(cfg, dir);
@@ -670,14 +672,15 @@ void check_wide_world(uint16_t port) {
   std::vector<std::vector<int64_t>> prompts;
   const uint64_t seeds[6] = {0x9E3779B97F4A7C15ull, 0xD1B54A32D192ED03ull, 0x2545F4914F6CDD1Dull,
                              0x3C6EF372FE94F82Bull, 0x1F83D9ABFB41BD6Bull, 0x5BE0CD19137E2179ull};
-  for (int q = 0; q < 6; ++q) prompts.push_back(smoke_tokens(cfg, 11 + 2 * q, seeds[q]));
+  for (int q = 0; q < slots; ++q)
+    prompts.push_back(smoke_tokens(cfg, 11 + 2 * (q % 6), seeds[q % 6] + 0x1000003ull * static_cast<uint64_t>(q / 6)));
   std::vector<std::unique_ptr<CollectiveBus>> buses = start_world(kWorld, port);
   require(!buses.empty(), "the loopback bus world failed to start");
   std::vector<WideOutcome> outs(kWorld);
   ConstructBarrier barrier(kWorld);
   std::vector<std::thread> workers;
   for (int r = 0; r < kWorld; ++r)
-    workers.emplace_back(rank_work_wide, r, std::cref(cfg), std::cref(dir), std::cref(prompts),
+    workers.emplace_back(rank_work_wide, r, std::cref(cfg), std::cref(dir), std::cref(prompts), slots,
                          buses[static_cast<size_t>(r)].get(), &barrier, &outs[static_cast<size_t>(r)]);
   for (auto& t : workers) t.join();
   for (int r = 0; r < kWorld; ++r) require(outs[static_cast<size_t>(r)].error.empty(), outs[static_cast<size_t>(r)].error);
@@ -686,10 +689,13 @@ void check_wide_world(uint16_t port) {
   const WideOutcome& o = outs[0];
   std::string hist;
   for (size_t i = 0; i < o.batch_hist.size(); ++i) hist += (i ? " " : "") + std::to_string(o.batch_hist[i]);
-  DGPP_LOG_INFO("world 2 six slots x depth 4 (30 rows): families {} | {} batched steps, 6-slot family replays per depth option [{}]",
-                ids_text(o.families), o.steps6, hist);
-  require(o.families == std::vector<int>{2, 3, 4, 6}, "the six-slot world builds the 2/3/4/6 families");
-  for (int q = 0; q < 6; ++q)
+  DGPP_LOG_INFO("world 2 {} slots x depth 4 ({} rows): families {} | {} batched steps, widest family replays per depth option [{}]",
+                slots, slots * 5, ids_text(o.families), o.steps6, hist);
+  if (slots == 6)
+    require(o.families == std::vector<int>{2, 3, 4, 6}, "the six-slot world builds the 2/3/4/6 families");
+  else
+    require(!o.families.empty() && o.families.back() == slots, "the wide world's widest family is the slot count");
+  for (int q = 0; q < slots; ++q)
     require(o.wide[static_cast<size_t>(q)] == o.eager[static_cast<size_t>(q)],
             "slot " + std::to_string(q) + "'s six-slot batched transcript differs from the plain eager engine's");
   uint64_t total = 0;
@@ -797,7 +803,18 @@ DGPP_TEST(dsv41_engines_loopback_world_2_dspark_depth_2_matches_plain_decode) { 
 
 DGPP_TEST(dsv41_engines_loopback_world_2_scheduled_verify_depth_is_exact) { check_sched_world(kPort + 3); }
 
-DGPP_TEST(dsv41_engines_loopback_world_2_six_slots_at_depth_4_batched_scheduled_is_exact) { check_wide_world(kPort + 4); }
+DGPP_TEST(dsv41_engines_loopback_world_2_six_slots_at_depth_4_batched_scheduled_is_exact) { check_wide_world(kPort + 4, 6); }
+// Twelve slots x depth 4 = 60 rows: the family's 64-row decode batch
+// (2026-10-23) — the same gates as the six-slot world at its widest.
+DGPP_TEST(dsv41_engines_loopback_world_2_twelve_slots_at_depth_4_batched_scheduled_is_exact) {
+  check_wide_world(kPort + 12, 12);  // 29973: the dsv41 TP test holds kPort + 5
+}
+// Sixteen slots x depth 4 = 80 rows: the family's 96-row decode batch
+// (2026-10-23 pm; the cap left 64 for sixteen five-row draft blocks) —
+// the long expert runs cut into 64-row groups, the capped family unused.
+DGPP_TEST(dsv41_engines_loopback_world_2_sixteen_slots_at_depth_4_batched_scheduled_is_exact) {
+  check_wide_world(kPort + 13, 16);  // 29974
+}
 
 DGPP_TEST(dsv41_engines_loopback_world_2_graph_matches_eager) {
   const Dsv41TextConfig cfg = dsv41fx::tiny_config();

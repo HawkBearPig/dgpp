@@ -16,6 +16,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -28,10 +29,12 @@
 #include "common/test.hpp"
 #include "dsv41_fixture.hpp"
 #include "glm_rng.hpp"
+#include "loaders/safetensors.hpp"
 #include "models/dsv41/binding.hpp"
 #include "models/dsv41/config.hpp"
 #include "models/dsv41/engram_tables.hpp"
 #include "models/dsv41/loader.hpp"
+#include "models/exl3_matrix.hpp"
 
 namespace {
 namespace fs = std::filesystem;
@@ -521,3 +524,347 @@ DGPP_TEST(dsv41_loader_engram_sidecar_loads_and_refuses_by_name) {
 }
 
 int main() { return dgpp::test::run_all(); }
+
+// ---- the EXL3 pack (2026-10-22, docs/deepseek_v41_flash_exl3_plan.md §4-5) ----
+// The tiny EXL3 pack: every matrix an EXL3 quadruple re-tiled n-tile-major
+// into its slice — wq_b's head rows, wo_a one matrix per local group, wo_b's
+// group columns, the experts' and the shared expert's 128-block slices of
+// the intermediate (2/1/1/1 blocks of 640 at world 4, 3/2 at world 2), the
+// Engram wkv's K ranges of the rank's hash heads, main_proj and the
+// compressors / indexer whole, the head's 128-aligned vocabulary rows —
+// with their suh / svh ranges; the pack's F16 natives as bf16 (checked)
+// or f32; the byte formulas; the resident image; the tables admitted from
+// a second directory; the refusals by name.
+namespace {
+
+std::vector<uint8_t> f16_as_bf16(const std::vector<uint8_t>& f16) {
+  std::vector<uint8_t> out(f16.size());
+  for (size_t i = 0; i < f16.size() / 2; ++i) {
+    uint16_t h;
+    std::memcpy(&h, f16.data() + i * 2, 2);
+    const uint16_t b = dgpp::float_to_bf16_bits(dgpp::fp16_bits_to_float(h));
+    std::memcpy(out.data() + i * 2, &b, 2);
+  }
+  return out;
+}
+std::vector<uint8_t> f16_as_f32(const std::vector<uint8_t>& f16) {
+  std::vector<uint8_t> out(f16.size() * 2);
+  for (size_t i = 0; i < f16.size() / 2; ++i) {
+    uint16_t h;
+    std::memcpy(&h, f16.data() + i * 2, 2);
+    const float v = dgpp::fp16_bits_to_float(h);
+    std::memcpy(out.data() + i * 4, &v, 4);
+  }
+  return out;
+}
+
+Fixture write_exl3_fixture(const char* name = "dsv41_loader_exl3_fixture") {
+  Fixture fx;
+  fx.cfg = dsv41fx::tiny_exl3_config();
+  fx.dir = (fs::current_path() / name).string();
+  dsv41fx::write_fixture(fx.cfg, fx.dir);
+  fx.table = dgpp::dsv41_expected_text_tensors(fx.cfg);
+  return fx;
+}
+
+// An EXL3 matrix against the checkpoint: output rows [row0, +rows) and the
+// packed input column ranges (empty: every column), re-tiled as the loader
+// re-tiles (exl3_retile over the k-tile ranges), with the suh / svh ranges.
+void check_exl3(const Fixture& fx, const dgpp::Exl3Matrix& m, const std::string& base, int64_t row0, int64_t rows,
+                const Ranges& ranges_in, const std::string& tag) {
+  const auto& et = fx.expected(base + ".trellis");
+  const int64_t K = et.shape[0] * 16, N = et.shape[1] * 16;
+  const int bits = static_cast<int>(et.shape[2] / 16);
+  Ranges ranges = ranges_in;
+  if (ranges.empty()) ranges.emplace_back(0, K);
+  int64_t cols = 0;
+  for (const auto& [start, count] : ranges) cols += count;
+  require(m.rows == rows && m.cols == cols && m.bits == bits, tag + " geometry");
+  const std::vector<uint8_t> trellis = fx.bytes(base + ".trellis");
+  const size_t tb = dgpp::exl3_tile_bytes(bits);
+  std::vector<uint8_t> want_tiles(static_cast<size_t>(rows / 16) * static_cast<size_t>(cols / 16) * tb);
+  {
+    size_t at = 0;
+    for (int64_t nt = row0 / 16; nt < (row0 + rows) / 16; ++nt)
+      for (const auto& [start, count] : ranges)
+        for (int64_t kt = start / 16; kt < (start + count) / 16; ++kt, ++at)
+          std::memcpy(want_tiles.data() + at * tb,
+                      trellis.data() + (static_cast<size_t>(kt) * static_cast<size_t>(N / 16) + static_cast<size_t>(nt)) * tb, tb);
+  }
+  std::vector<uint8_t> want_suh;
+  const std::vector<uint8_t> suh = fx.bytes(base + ".suh");
+  for (const auto& [start, count] : ranges)
+    want_suh.insert(want_suh.end(), suh.begin() + start * 2, suh.begin() + (start + count) * 2);
+  expect_device_equals(m.tiles, want_tiles, tag + " tiles");
+  expect_device_equals(m.suh, want_suh, tag + " suh");
+  expect_device_equals(m.svh, host_rows(fx.bytes(base + ".svh"), 2, row0, rows), tag + " svh");
+}
+void check_exl3_full(const Fixture& fx, const dgpp::Exl3Matrix& m, const std::string& base, const std::string& tag) {
+  check_exl3(fx, m, base, 0, fx.expected(base + ".trellis").shape[1] * 16, {}, tag);
+}
+
+void check_layer_exl3(const Fixture& fx, const Dsv41LayerStream& s, const dgpp::Dsv41LayerResident& r) {
+  const Dsv41TextConfig& cfg = fx.cfg;
+  const dgpp::Dsv41LocalGeometry& g = s.geometry();
+  const int world = s.world(), rank = s.rank();
+  const std::string p = dgpp::dsv41_layer_prefix(cfg, r.layer);
+  const std::string tag = "exl3 world " + std::to_string(world) + " rank " + std::to_string(rank) + " layer " +
+                          std::to_string(r.layer) + " ";
+  const bool draft = cfg.is_draft(r.layer);
+  require(r.attn.exl3() && r.moe.exl3(), tag + "the EXL3 views are bound");
+  require(r.attn.wq_a.payload == nullptr && r.moe.experts.empty() && r.moe.shared[0].payload == nullptr,
+          tag + "the release-format views stay unset");
+  // Attention.
+  const std::string ap = p + "attn.";
+  const int64_t hd = cfg.head_dim, ol = cfg.o_lora_rank;
+  check_exl3_full(fx, r.attn.wq_a_x, ap + "wq_a", tag + "wq_a");
+  check_exl3_full(fx, r.attn.wkv_x, ap + "wkv", tag + "wkv");
+  check_exl3(fx, r.attn.wq_b_x, ap + "wq_b", g.head_begin * hd, g.local_heads * hd, {}, tag + "wq_b");
+  require(static_cast<int>(r.attn.wo_a_x.size()) == g.local_groups, tag + "wo_a one matrix per local group");
+  for (int gi = 0; gi < g.local_groups; ++gi)
+    check_exl3_full(fx, r.attn.wo_a_x[static_cast<size_t>(gi)], ap + "wo_a.slice." + std::to_string(g.group_begin + gi),
+                    tag + "wo_a group " + std::to_string(gi));
+  check_exl3(fx, r.attn.wo_b_x, ap + "wo_b", 0, cfg.hidden_size, {{g.group_begin * ol, g.local_groups * ol}}, tag + "wo_b");
+  if (cfg.is_index_source(r.layer)) {
+    require(r.attn.index_source(), tag + "indexer present");
+    check_exl3_full(fx, r.attn.idx_wq_b_x, ap + "indexer.wq_b", tag + "indexer wq_b");
+    expect_device_equals(r.attn.idx_wp, f16_as_bf16(fx.bytes(ap + "indexer.weights_proj.weight")), tag + "weights_proj as bf16");
+  } else {
+    require(!r.attn.index_source() && r.attn.idx_wp == nullptr, tag + "no indexer");
+  }
+  if (cfg.is_kv_source(r.layer)) {
+    require(r.attn.kv_source(), tag + "kv source present");
+    check_exl3_full(fx, r.attn.idx_wk_x, ap + "indexer.wk", tag + "index keys wk");
+    require(r.attn.idx_wk_x.bits == cfg.exl3.indexer_wk, tag + "wk at the indexer width");
+    expect_device_equals(r.attn.idx_k_norm, fx.bytes(ap + "indexer.k_norm.weight"), tag + "index keys norm");
+    check_exl3_full(fx, r.attn.comp_wkv_x, ap + "compressor.wkv", tag + "compressor wkv");
+    expect_device_equals(r.attn.comp_norm, fx.bytes(ap + "compressor.norm.weight"), tag + "compressor norm");
+    if (cfg.compress_ratio(r.layer) > 1)
+      check_exl3_full(fx, r.attn.comp_wgate_x, ap + "compressor.wgate", tag + "compressor wgate");
+    else
+      require(r.attn.comp_wgate_x.tiles == nullptr, tag + "no gate at ratio 1");
+  } else {
+    require(!r.attn.kv_source() && r.attn.idx_wk_x.tiles == nullptr, tag + "no compressor");
+  }
+  // MoE: the F16 router as bf16, the F16 bias as f32, the 128-block slices.
+  const std::string mp = p + "ffn.";
+  expect_device_equals(r.moe.router, f16_as_bf16(fx.bytes(mp + "gate.weight")), tag + "router as bf16");
+  expect_device_equals(r.moe.router_bias, f16_as_f32(fx.bytes(mp + "gate.bias")), tag + "router bias as f32");
+  // The geometry: the even slice's begin, the widest slice's width; each
+  // expert's own slice alternates by parity (exl3_expert_block_split), the
+  // shared expert's by the layer's.
+  int64_t I0 = 0, I = 0, S0 = 0, S = 0;
+  dgpp::exl3_block_split(cfg.moe_intermediate_size, world, rank, I0, I);
+  dgpp::exl3_block_split(cfg.shared_expert_inter(), world, rank, S0, S);
+  const int64_t Imax = dgpp::exl3_block_split_max(cfg.moe_intermediate_size, world);
+  const int64_t Smax = dgpp::exl3_block_split_max(cfg.shared_expert_inter(), world);
+  require(g.inter_begin == I0 && g.local_inter == Imax && g.shared_inter_begin == S0 && g.local_shared_inter == Smax,
+          tag + "the block-split geometry");
+  require(r.moe.local_inter == Imax && r.moe.local_shared_inter == Smax, tag + "moe inter");
+  const int E = draft ? cfg.dspark_n_routed_experts : cfg.n_routed_experts;
+  require(r.moe.n_experts == E && static_cast<int>(r.moe.experts_x.size()) == E * 3, tag + "expert count");
+  const int rb = cfg.exl3_bits_routed(r.layer), sb = cfg.exl3_bits_shared(r.layer);
+  for (int e = 0; e < E; ++e) {
+    const std::string ep = mp + "experts." + std::to_string(e) + ".";
+    const dgpp::Exl3Matrix* t = r.moe.experts_x.data() + static_cast<size_t>(e) * 3;
+    int64_t e0 = 0, en = 0;
+    dgpp::exl3_expert_block_split(cfg.moe_intermediate_size, world, rank, e & 1, e0, en);
+    check_exl3(fx, t[0], ep + "w1", e0, en, {}, tag + "expert gate");
+    check_exl3(fx, t[1], ep + "w3", e0, en, {}, tag + "expert up");
+    check_exl3(fx, t[2], ep + "w2", 0, cfg.hidden_size, {{e0, en}}, tag + "expert down");
+    require(t[0].bits == rb && t[2].bits == rb, tag + "expert width");
+  }
+  int64_t s0 = 0, sn = 0;
+  dgpp::exl3_expert_block_split(cfg.shared_expert_inter(), world, rank, r.layer & 1, s0, sn);
+  const std::string sp = mp + "shared_experts.";
+  check_exl3(fx, r.moe.shared_x[0], sp + "w1", s0, sn, {}, tag + "shared gate");
+  check_exl3(fx, r.moe.shared_x[1], sp + "w3", s0, sn, {}, tag + "shared up");
+  check_exl3(fx, r.moe.shared_x[2], sp + "w2", 0, cfg.hidden_size, {{s0, sn}}, tag + "shared down");
+  require(r.moe.shared_x[0].bits == sb, tag + "shared width");
+  // Engram: the wkv's K ranges, the F32 q / k weights as bf16.
+  if (cfg.has_engram(r.layer)) {
+    require(r.engram.present, tag + "engram present");
+    Ranges ranges;
+    const int64_t ehd = cfg.engram_head_dim;
+    for (int n = 0; n < cfg.engram_max_ngram_size - 1; ++n)
+      ranges.emplace_back((static_cast<int64_t>(n) * cfg.engram_n_heads + g.engram_head_begin) * ehd,
+                          static_cast<int64_t>(g.engram_heads_local) * ehd);
+    check_exl3(fx, r.engram.wkv_x, p + "engram.wkv", 0, static_cast<int64_t>(cfg.hidden_size) * (cfg.hc_mult + 1), ranges,
+               tag + "engram wkv");
+    expect_device_equals(r.engram.q_weight, f32_as_bf16(fx.bytes(p + "engram.q_weight")), tag + "engram q as bf16");
+    expect_device_equals(r.engram.k_weight, f32_as_bf16(fx.bytes(p + "engram.k_weight")), tag + "engram k as bf16");
+  } else {
+    require(!r.engram.present && r.engram.wkv_x.tiles == nullptr, tag + "no engram");
+  }
+  // Draft: main_proj EXL3 at the mtp width, the F16 Markov head and confidence.
+  if (draft) {
+    const int stage = cfg.draft_stage(r.layer);
+    if (stage == 0) {
+      check_exl3_full(fx, r.draft.main_proj_x, p + "main_proj", tag + "main_proj");
+      require(r.draft.main_proj_x.bits == cfg.exl3.mtp, tag + "main_proj at the mtp width");
+    } else {
+      require(r.draft.main_proj_x.tiles == nullptr, tag + "no main_proj past stage 0");
+    }
+    if (stage == cfg.num_nextn_predict_layers - 1) {
+      expect_device_equals(r.draft.markov_head, f16_as_bf16(fx.bytes(p + "markov_head.head.weight")), tag + "markov head as bf16");
+      expect_device_equals(r.draft.confidence, f16_as_f32(fx.bytes(p + "confidence_head.proj.weight")), tag + "confidence as f32");
+    }
+  }
+  require(r.bytes == Dsv41LayerStream::layer_bytes(cfg, r.layer, rank, world), tag + "layer bytes formula");
+}
+
+// Patches one f16 element of a tensor in the fixture's shard.
+void patch_f16(const std::string& dir, const std::string& name, size_t index, uint16_t bits) {
+  auto f = dgpp::SafetensorsFile::open((fs::path(dir) / "model.safetensors").string());
+  uint64_t at = 0;
+  bool found = false;
+  f->for_each([&](const dgpp::TensorInfo& t) {
+    if (t.name == name) {
+      at = t.data_begin + index * 2;
+      found = true;
+    }
+  });
+  require(found, "patch: tensor present");
+  f.reset();
+  std::fstream io((fs::path(dir) / "model.safetensors").string(), std::ios::in | std::ios::out | std::ios::binary);
+  io.seekp(static_cast<std::streamoff>(at));
+  io.write(reinterpret_cast<const char*>(&bits), 2);
+}
+
+}  // namespace
+
+DGPP_TEST(dsv41_loader_exl3_slices_every_class_byte_exact_at_worlds_1_2_4) {
+  const Fixture fx = write_exl3_fixture();
+  require(fx.cfg.weights_exl3, "the fixture is the EXL3 pack");
+  const int layers = fx.cfg.max_layer();
+  for (const int world : {1, 2, 4}) {
+    for (int rank = 0; rank < world; ++rank) {
+      const auto head = world > 1 ? dgpp::Dsv41HeadSharding::VocabSharded : dgpp::Dsv41HeadSharding::Full;
+      Dsv41LayerStream s(fx.cfg, fx.dir, rank, world, dgpp::Dsv41Residency::Streaming, head, /*resident_mtp=*/true);
+      for (int l = 0; l < layers; ++l) {
+        const uint64_t before = s.source_bytes_read();
+        const auto& r = s.load_layer(l);
+        check_layer_exl3(fx, s, r);
+        require(s.source_bytes_read() - before == Dsv41LayerStream::planned_layer_source_bytes(fx.cfg, l, rank, world),
+                "exl3: the source-byte plan equals the bytes read");
+        s.release_layer();
+      }
+    }
+  }
+}
+
+DGPP_TEST(dsv41_loader_exl3_globals_head_rows_on_blocks) {
+  const Fixture fx = write_exl3_fixture();
+  for (const int world : {1, 2, 4}) {
+    for (int rank = 0; rank < world; ++rank) {
+      const auto head = world > 1 ? dgpp::Dsv41HeadSharding::VocabSharded : dgpp::Dsv41HeadSharding::Full;
+      Dsv41LayerStream s(fx.cfg, fx.dir, rank, world, dgpp::Dsv41Residency::Streaming, head);
+      const auto& g = s.load_globals();
+      expect_device_equals(g.embed, fx.bytes("embed.weight"), "exl3 embed");
+      expect_device_equals(g.final_norm, fx.bytes("norm.weight"), "exl3 final norm");
+      require(g.lm_head == nullptr && g.lm_head_x.tiles != nullptr, "exl3: the head is the EXL3 view");
+      int64_t b = 0, n = 0;
+      if (world > 1) dgpp::exl3_block_split(fx.cfg.vocab_size, world, rank, b, n);
+      else n = fx.cfg.vocab_size;
+      require(g.lm_vocab_begin == b && g.lm_vocab_count == n, "exl3 head rows on 128-blocks");
+      check_exl3(fx, g.lm_head_x, "head", b, n, {}, "exl3 head slice");
+      require(g.bytes == Dsv41LayerStream::globals_bytes(fx.cfg, rank, world, head), "exl3 globals formula");
+    }
+  }
+}
+
+DGPP_TEST(dsv41_loader_exl3_resident_image_round_trip) {
+  const Fixture fx = write_exl3_fixture();
+  const fs::path cache = fs::current_path() / "dsv41_loader_exl3_image_cache";
+  fs::remove_all(cache);
+  const std::string saved = Dsv41LayerStream::resident_image_dir();
+  Dsv41LayerStream::set_resident_image_dir(cache.string());
+  const int layers = fx.cfg.max_layer();
+  std::vector<std::vector<uint8_t>> built(static_cast<size_t>(layers));
+  {
+    Dsv41LayerStream s(fx.cfg, fx.dir, 3, 4, dgpp::Dsv41Residency::Resident, dgpp::Dsv41HeadSharding::VocabSharded,
+                       /*resident_mtp=*/true);
+    for (int l = 0; l < layers; ++l) {
+      const auto& r = s.load_layer(l);
+      check_layer_exl3(fx, s, r);
+      const auto span = s.resident_layer_span(l);
+      built[static_cast<size_t>(l)] = device_bytes(span.first, span.second);
+    }
+    (void)s.load_globals();
+    require(s.image_layers_captured() == layers, "exl3: every layer captured");
+  }
+  {
+    Dsv41LayerStream s(fx.cfg, fx.dir, 3, 4, dgpp::Dsv41Residency::Resident, dgpp::Dsv41HeadSharding::VocabSharded,
+                       /*resident_mtp=*/true);
+    for (int l = 0; l < layers; ++l) {
+      const auto& r = s.load_layer(l);
+      const auto span = s.resident_layer_span(l);
+      require(device_bytes(span.first, span.second) == built[static_cast<size_t>(l)], "exl3: the image restores the bytes");
+      check_layer_exl3(fx, s, r);
+    }
+    require(s.image_layers_restored() == layers, "exl3: every layer restored");
+  }
+  Dsv41LayerStream::set_resident_image_dir(saved);
+  fs::remove_all(cache);
+}
+
+DGPP_TEST(dsv41_loader_exl3_engram_tables_from_the_source_directory) {
+  // The pack's shape: no tables in the checkpoint, the tables alone in a
+  // second directory named as the Engram source.
+  Fixture fx;
+  fx.cfg = dsv41fx::tiny_exl3_config();
+  fx.dir = (fs::current_path() / "dsv41_loader_exl3_split_fixture").string();
+  const std::string tables = (fs::current_path() / "dsv41_loader_exl3_split_tables").string();
+  dsv41fx::write_fixture_split(fx.cfg, fx.dir, tables);
+  fx.table = dgpp::dsv41_expected_text_tensors(fx.cfg);
+  // Without the source the binding fails naming the tables.
+  bool refused = false;
+  try {
+    Dsv41LayerStream s(fx.cfg, fx.dir, 0, 1, dgpp::Dsv41Residency::Streaming, dgpp::Dsv41HeadSharding::Full);
+  } catch (const std::exception& e) {
+    refused = std::string(e.what()).find("engram.embed") != std::string::npos;
+  }
+  require(refused, "exl3: a pack without the tables and no Engram source is refused naming them");
+  Dsv41LayerStream::set_engram_source_dir(tables);
+  for (const int world : {1, 4}) {
+    for (int rank = 0; rank < world; ++rank) {
+      Dsv41LayerStream s(fx.cfg, fx.dir, rank, world, dgpp::Dsv41Residency::Resident,
+                         world > 1 ? dgpp::Dsv41HeadSharding::VocabSharded : dgpp::Dsv41HeadSharding::Full);
+      const dgpp::Dsv41EngramTables& t = s.load_engram_tables();
+      require(t.tables.size() == fx.cfg.engram_layer_ids.size(), "exl3: the tables mapped from the source");
+      const std::string p1 = dgpp::dsv41_layer_prefix(fx.cfg, fx.cfg.engram_layer_ids[0]) + "engram.embed.";
+      const std::vector<uint8_t> payload = fx.bytes(p1 + "weight");
+      require(std::memcmp(t.tables[0]->payload_row(7), payload.data() + 7 * fx.cfg.engram_head_dim, fx.cfg.engram_head_dim) == 0,
+              "exl3: a table row read from the source directory");
+      for (int l = 0; l < fx.cfg.max_layer(); ++l) check_layer_exl3(fx, s, s.load_layer(l));
+    }
+  }
+  Dsv41LayerStream::set_engram_source_dir("");
+}
+
+DGPP_TEST(dsv41_loader_exl3_refuses_inexact_natives_and_a_pack_without_its_k_map) {
+  Fixture fx = write_exl3_fixture("dsv41_loader_exl3_refusal_fixture");
+  // The k-map beside config.json is what the file form reads.
+  const Dsv41TextConfig from_file = Dsv41TextConfig::from_json_file((fs::path(fx.dir) / "config.json").string());
+  require(from_file.weights_exl3 && from_file.exl3.routed == fx.cfg.exl3.routed && from_file.exl3.head == 6,
+          "exl3: from_json_file reads the k-map");
+  fs::remove(fs::path(fx.dir) / "exl3_k_map.json");
+  bool refused = false;
+  try {
+    (void)Dsv41TextConfig::from_json_file((fs::path(fx.dir) / "config.json").string());
+  } catch (const std::exception& e) {
+    refused = std::string(e.what()).find("exl3_k_map") != std::string::npos;
+  }
+  require(refused, "exl3: a pack without its k-map is refused naming it");
+  // An f16 router value that is not bf16-exact: the checked load refuses it by name.
+  patch_f16(fx.dir, "layers.0.ffn.gate.weight", 5, 0x3C01);  // 1.0009765625: three more mantissa bits than bf16
+  refused = false;
+  try {
+    Dsv41LayerStream s(fx.cfg, fx.dir, 0, 1, dgpp::Dsv41Residency::Streaming, dgpp::Dsv41HeadSharding::Full);
+    (void)s.load_layer(0);
+  } catch (const std::exception& e) {
+    refused = std::string(e.what()).find("layers.0.ffn.gate.weight") != std::string::npos &&
+              std::string(e.what()).find("bf16-exact") != std::string::npos;
+  }
+  require(refused, "exl3: an f16 native that is not bf16-exact is refused naming the tensor");
+}

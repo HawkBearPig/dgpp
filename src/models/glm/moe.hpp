@@ -32,6 +32,7 @@
 #include <stdexcept>
 #include <string>
 
+#include "models/exl3_matrix.hpp"
 #include "models/quant_matrix.hpp"
 
 namespace dgpp {
@@ -89,6 +90,12 @@ struct GlmMoeConfig {
   // (kMoeInputHadamard32Int8), sized with the scratch; off for every other
   // family (no bytes).
   bool routed_int8_activations = false;
+  // The EXL3 contract (2026-10-22, docs/deepseek_v41_flash_exl3_plan.md
+  // §3.3): the layer keeps the rotated fp16 copies of the expert-input rows
+  // (gate and up, each by its matrix's suh) and of the SwiGLU rows (by the
+  // down suh) the EXL3 kernels read, sized with the scratch; off for every
+  // other family (no bytes). Set with experts_exl3 bound.
+  bool exl3_experts = false;
   MoeRouterMode router_mode = MoeRouterMode::SigmoidBias;
 
   // Weight bytes of one routed expert (payload + block scales): the number
@@ -154,7 +161,19 @@ struct GlmMoeWeights {
   // GLM-5.3 (the composed hybrid); NVFP4 for GLM-4.7.
   const GlmQuantMatrix* experts = nullptr;
   const GlmFp4Matrix* experts_fp4 = nullptr;
-  bool nvfp4() const { return experts_fp4 != nullptr; }
+  // The uniform NVFP4 / MXFP4 table (every routed matrix in experts_fp4).
+  bool nvfp4() const { return experts_fp4 != nullptr && experts == nullptr; }
+  // The per-projection form (2026-10-22, docs/flint_plan.md D2): BOTH
+  // tables bound and `routed_fp4_mask` bit w (0 gate, 1 up, 2 down)
+  // naming projection w NVFP4 — read from experts_fp4[e * 3 + w] — else
+  // fp8 (experts[e * 3 + w]); the other table's entry stays unset. The
+  // slot kernels run each phase on its format (a mixed gate/up pair on
+  // the mixed kernel), the grouped chain picks per launch.
+  uint8_t routed_fp4_mask = 0;
+  bool mixed() const { return experts_fp4 != nullptr && experts != nullptr; }
+  bool fp4_of(int which) const {
+    return experts_fp4 != nullptr && (experts == nullptr || ((routed_fp4_mask >> which) & 1u));
+  }
   // W4A4 activation scales (the checkpoint's max input_scale over the layer's
   // experts, gate/up and down; 0 = quantize with a dynamic per-row scale).
   float act_scale_w13 = 0.0f, act_scale_w2 = 0.0f;
@@ -189,6 +208,16 @@ struct GlmMoeWeights {
   int routed_input_transform = 0;
   bool routed_hadamard32() const { return routed_input_transform == 1 || routed_input_transform == 2; }
   bool routed_activation_int8() const { return routed_input_transform == 2; }
+  // The EXL3 trellis format (2026-10-22, docs/deepseek_v41_flash_exl3_plan.md
+  // §3.3): routed triples [n_experts * 3] as Exl3Matrix (gate, up, down;
+  // one width per layer) and the shared expert as an EXL3 triple read as
+  // view-table entry n_experts (kernels/exl3_gemv.hpp). Exactly one of
+  // experts / experts_fp4 / experts_packed / experts_exl3 is set; an EXL3
+  // routed table needs an EXL3 shared expert, or none.
+  const Exl3Matrix* experts_exl3 = nullptr;
+  Exl3Matrix shared_exl3[3];
+  bool exl3() const { return experts_exl3 != nullptr; }
+  bool shared_exl3_set() const { return shared_exl3[0].tiles != nullptr; }
 };
 constexpr int kMoeInputPlain = 0;
 constexpr int kMoeInputHadamard32 = 1;
@@ -240,6 +269,24 @@ struct MoeExpertView {
     v.packed_scales = m.scales;
     v.bits = m.bits;
     v.packed_scale_fmt = m.scale_fmt;
+    return v;
+  }
+  // The EXL3 interpretation (2026-10-22): payload = the n-tile-major tiles,
+  // the suh / svh vectors, the width (0: not EXL3) and the matrix's own N
+  // and K (the shared expert's differ from the routed slice's).
+  const uint16_t* exl3_suh = nullptr;
+  const uint16_t* exl3_svh = nullptr;
+  int exl3_bits = 0;
+  int exl3_rows = 0;
+  int exl3_cols = 0;
+  static MoeExpertView of(const Exl3Matrix& m) {
+    MoeExpertView v;
+    v.payload = m.tiles;
+    v.exl3_suh = m.suh;
+    v.exl3_svh = m.svh;
+    v.exl3_bits = m.bits;
+    v.exl3_rows = static_cast<int>(m.rows);
+    v.exl3_cols = static_cast<int>(m.cols);
     return v;
   }
 };

@@ -554,6 +554,10 @@ class Scheduler {
     int64_t prefill_chunk_available_tokens = 0;  // min(budget, remaining prompt), before structural cuts
     int64_t prefill_chunk_computed_tokens = 0;
     int64_t prefill_adaptive_limit_tokens = 0;  // last leader-selected ceiling; 0 = fixed policy
+    // The decoders' own pass the controller takes out of the allowance
+    // before sizing a chunk, at the last tick's load (ms; 0 with no
+    // decoders, none measured yet, or fixed budgeting).
+    double prefill_decode_pass_ms = 0.0;
     int64_t mixed_steps = 0;  // subset of decode_steps that also advanced prefill
     double mixed_ms = 0.0;    // included in BOTH prefill_ms and step_ms; subtract once when summing
     double prefill_ms = 0.0;
@@ -885,6 +889,7 @@ class Scheduler {
   PrefillLatencyController prefill_latency_;
   int64_t prefill_pass_budget_tokens_ = 0;  // before final-tail allocation trims
   int64_t prefill_adaptive_limit_tokens_ = 0;
+  double prefill_decode_pass_ms_ = 0;  // meters: the learned decoders' pass at the last tick's load
   int64_t grows_ = 0;              // growth events (meters)
   int64_t pool_sheds_ = 0;         // requests shed at exhaustion (meters)
   int64_t prompts_prefilled_ = 0;  // the throughput line's counters (meters)

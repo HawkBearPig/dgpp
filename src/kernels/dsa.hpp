@@ -203,6 +203,21 @@ void dsa_latent_append(const void* latent_rows, const int32_t* req_ids,
                        float* latent_scale = nullptr,
                        const void* rope_rows = nullptr, int rope_dim = 0);
 
+// The decode walk's tail behind the q projection in one launch per row
+// (2026-10-20, kernels/dsa.cu decode_tail_fp8block_kernel): the q rope over
+// q_rope_dim elements (q_rope_dim / 2 pairs) of each of q_heads heads at
+// q + head * q_head_stride, the row's ring slot
+// into `slots` (pos % ring_slots, -1 for a negative position), the window
+// slot list and counts, the entry position into `entry_out` when it is
+// given (ratio > 0), and the latent row's fp8-block append into the ring at
+// that slot (ring_table: the ring's block table, one block of ring_slots
+// tokens per request). Bitwise the five kernels it replaces.
+void dsa_decode_tail_fp8block(void* q, int64_t q_row_stride, int64_t q_head_stride, int q_heads, int q_rope_dim,
+                              const int64_t* pos, const float* inv_freq, int64_t* slots, int ring_slots, int window,
+                              int32_t* wlist, int32_t* wcounts, int64_t* entry_out, int ratio, const void* kv_rows,
+                              const int32_t* req_ids, const int32_t* ring_table, void* ring, int kv_lora, int rows,
+                              cudaStream_t stream);
+
 // Gather a request's pools [0, n_pools) into a contiguous buffer for the
 // prefill logits GEMM.
 void dsa_gather_index_pools(const int32_t* block_table, int pools_per_block,
@@ -379,6 +394,17 @@ bool dsa_attn_dense(const void* q_tilde, const void* latent_cache,
 // dsa_attn_partial takes them, each 16-row slab (one query row) walking its
 // own list. Requires local_heads a multiple of 16 (returns false otherwise,
 // as for kv_lora outside 512/256); combine with dsa_attn_combine.
+// `group` (2026-10-23): kAttnSplitGroup merges each kAttnSplitGroup
+// consecutive splits of a row — the last of the group's blocks to arrive
+// folds the per-split partials from L2 with the finish's formula into the
+// group's partial (mg_ws / lg_ws / cg_ws, n_split / kAttnSplitGroup per
+// row) and discards the dead per-split rows from L2 — so the finish reads
+// eight times fewer partials and the per-split ones never write back. The
+// grouping is fixed per request, so a row's output is the same whatever
+// rows share the launch. n_split must be a multiple of the group;
+// `tickets` holds ceil(rows * local_heads / 32) * n_split / group ints,
+// zero at rest (each group's last block resets its own).
+constexpr int kAttnSplitGroup = 8;
 bool dsa_attn_listed(const void* q_tilde, const void* latent_cache,
                      const int32_t* req_ids, const int32_t* topk, int topk_stride,
                      const int32_t* counts, int rows, int n_split, int local_heads,
@@ -386,7 +412,13 @@ bool dsa_attn_listed(const void* q_tilde, const void* latent_cache,
                      int blocks_per_request, float scale, float* m_ws, float* l_ws,
                      float* c_ws, cudaStream_t stream,
                      LatentFormat format = LatentFormat::kBf16,
-                     const float* latent_scale = nullptr, int rope = 0);
+                     const float* latent_scale = nullptr, int rope = 0,
+                     int blocks_total = -1, int group = 1, int32_t* tickets = nullptr,
+                     float* mg_ws = nullptr, float* lg_ws = nullptr, float* cg_ws = nullptr);
+// blocks_total (2026-10-19): the pool's physical block count, the bound a
+// table entry must lie under; -1 = blocks_per_request (a table whose row
+// width is the pool: the paged main caches). The decode window's ring is
+// a one-entry table per request over max_requests regions: pass that.
 
 // Merge the split partials into normalized c rows: c_out[r,h,:] =
 // (sum_s p_s * c_s) / (sum_s p_s * l_s), p_s = exp(m_s - max m).

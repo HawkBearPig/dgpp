@@ -22,8 +22,12 @@ default chain is exact; the two lossy levers are explicit keys
 templates ship it, half the head's bytes a decode row at the same
 HumanEval / GSM8K; `engine.prefill_fp8_per_tensor` runs the prefill GEMMs
 on cuBLASLt's per-tensor e4m3 kernels — off, it changes long-context
-transcripts). The checkpoint's own BF16 K/V rows are cached as BF16: 2 KiB
-a token a kv head, four kv heads of 256 at world 1.
+transcripts). The Full layers' K/V (four kv heads of 256 at world 1) are
+cached as e4m3 codes at unit scales (`engine.kv_dtype: "fp8"`, 2026-10-18:
+the release ships no `kv_cache_scheme`, so the codes are the e4m3 rounding
+of K and V, the common scale-free fp8 cache — 1 KiB a token a kv head
+against 2 in bf16, which `"bf16"` restores) with the prefill attention on
+the fp8 tensor cores (`engine.prefill_attention: "fp8"`); see Measurements.
 
 ## Architecture
 
@@ -43,12 +47,13 @@ block of seven drafts from one anchor.
 ## Serving
 
 **One Spark** (`cluster_qwen3.8-27b_fp8_w1`): the drafter recipe. 27.5 GiB
-of weights, a 524,288-token BF16 KV pool (42.0 GiB, two full contexts), the
-3.6 GiB drafter and its five K/V planes, eight request slots and a 20 GiB
-prefix arena, the plan at 102 GiB of the node's 116 (sized to the node on
-2026-10-17 — a world-1 boot ends 6–8 GiB below its plan at listening, so
-the recipe leaves that room; a 256K pool and a 1.5 GiB arena at 62 GiB
-until then); the graph engine records the block proposal inside the decode
+of weights, a 786,432-token fp8 K/V pool (39.0 GiB, three full contexts),
+the 3.6 GiB drafter and its five K/V planes, eight request slots and a
+20 GiB prefix arena, the plan at 100 GiB of the node's 116 with the
+replicated BF16 image tower (sized to the node on 2026-10-17 — a world-1
+boot ends 6–8 GiB below its plan at listening, so the recipe leaves that
+room; a 256K bf16 pool and a 1.5 GiB arena at 62 GiB until then, a
+524,288-token bf16 pool for a day); the graph engine records the block proposal inside the decode
 step (the 8-row verify and the drafter's forward in one graph, as on the
 fabric — the template since 2026-10-05; the eager engine's transcripts 4/4,
 chat 71 against 95 ms a token), the drafter's five block matrices served as
@@ -75,11 +80,11 @@ Sparks 205 / 301 / 352 / 310 / 216 tok/s at 92 ms a step with the one-chain
 split-K of 2026-10-05, 184 / 273 / 326 / 284 / 196 at 106 before it, 154 /
 270 / 320 / 260 / 170 at 117 for whole blocks; C1 level; transcripts matched
 across the tested isolated, scheduled-depth and joining-co-tenant cases); 15.0 GiB of weights
-and a 63 GiB KV pool a rank (1,572,864 tokens, six full contexts) with a
-16 GiB prefix arena on two Sparks, eight slots; on four Sparks a
-2,097,152-token pool (one full context per slot, full admission) with a
-32 GiB arena, 91 GiB planned a rank (since 2026-10-17; 256K pools and 1.5 GiB
-arenas before). The MTP
+and a 52 GiB fp8 K/V pool a rank (2,097,152 tokens, one full context per
+slot, full admission) with a 24 GiB prefix arena on two Sparks, eight
+slots, 102 GiB planned a rank; on four Sparks the same pool at 26 GiB a
+rank with a 48 GiB arena, 92 GiB planned (since 2026-10-18; 256K bf16 pools
+and 1.5 GiB arenas until 2026-10-17). The MTP
 depth-3 world is available as an alternative to each template's DFlash
 default (`--no-dflash --mtp --mtp-depth 3`),
 plain decode `--no-dflash`. Greedy C1 by class (prose / code / json / math /
@@ -131,6 +136,30 @@ one-pass budgets); the native recipe reads 1.90 / 6.49 / 27.9 s with no
 bridge at all, and the 300-item HumanEval / GSM8K / schema set reads
 161/164, 294/300 and 100/100 under both chains on the same binary, needles
 at 32K and 128K 6/6 with 3/3 controls.
+`engine.kv_dtype: "fp8"` with `engine.prefill_attention: "fp8"` (set by
+the FP8 templates since 2026-10-18) caches the Full layers' K/V as e4m3
+codes at unit scales — this release ships no `kv_cache_scheme`, so the
+codes are the plain e4m3 rounding of K and V — and runs the prefill
+attention on the fp8 tensor cores. Gated on one Spark against the bf16
+cache (one boot each, the same seed): the teacher-forced probe (128
+positions of a fixed continuation on a 115K-token document, the top-5
+logprobs at every position) puts the fp8 pool's next-token argmax at
+127/128 of the bf16 cache's with a mean KL of 0.0054 nats (median 0.0009)
+and 127/128 at 0.0055 (median 0.0017) with the fp8 attention on top, the
+reference token never outside the fp8 top-5 (the mixed release's
+calibrated scales read 126/127 and 119/128 at 0.015 and 0.039 on
+2026-10-16, the bf16 boot-to-boot floor 124/127 and 122/128); five
+needles per document at 32K and 128K over two seeds 20/20 and at 258K 5/5
+in every mode, with every control found; the 300-item HumanEval / GSM8K /
+schema set 161/164, 294/300, 100/100 on the bf16 cache, the same on the
+fp8 pool, 159/164, 295/300, 100/100 with the fp8 attention (the campaign
+legs' run-to-run band is 158–161 and 292–296). Cold prefill of the needle
+documents at 32K / 128K / 258K: 28.5 / 150 / 387 s on the bf16 cache,
+29.1 / 160 / 425 on the fp8 pool under bf16 arithmetic (the codes widened
+in shared memory), 27.3 / 132 / 320 with the fp8 attention; the 262K
+bucket 395 → 325 s; decode at 256K 216 → 181 ms a pass in both fp8 modes
+(half the K/V bytes), 137 → 135 at a short context.
+
 Physics on one GB10 (248 GB/s): a T=1 step streams 27 GB — 105 ms — and
 measures 114; at world 2 a rank streams 12.2 GB (49 ms) plus the head's
 reads and measures 63 T=1 / 74.5 an MTP pass, GPU-busy 98.9 % with the 135

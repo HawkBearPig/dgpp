@@ -17,6 +17,14 @@
 
 #include "kernels/flag_protocol_types.hpp"
 
+// The write ring's geometry helpers are shared by the engine (host) and
+// the kernel (device).
+#if defined(__CUDACC__)
+#define DGPP_BUS_HD __host__ __device__
+#else
+#define DGPP_BUS_HD
+#endif
+
 namespace dgpp::net {
 
 // ---- work-request id codec ---------------------------------------------------
@@ -26,7 +34,7 @@ namespace dgpp::net {
 //   bits 40..43  wr kind (kWrPayload / kWrDoorbell / kWrCredit)
 //   bits 44..63  reserved
 enum class BusPool : uint64_t { kLatency = 0, kBulk = 1 };
-enum class BusWr : uint64_t { kPayload = 0, kDoorbell = 1, kCredit = 2 };
+enum class BusWr : uint64_t { kPayload = 0, kDoorbell = 1, kCredit = 2, kWrite = 3 };
 
 inline uint64_t bus_wr_id(BusPool pool, BusWr kind, uint32_t slot) {
   return (static_cast<uint64_t>(slot) & 0xffffffffULL) |
@@ -95,8 +103,9 @@ constexpr uint32_t kBusErrorMagic = 0x52424744;     // 'DGBR' little-endian
 constexpr uint32_t kBusReadyMagic = 0x59424744;     // 'DGBY' little-endian
 constexpr uint32_t kBusGoMagic = 0x4f424744;        // 'DGBO' little-endian
 // Version 2 includes a final u32 in collective placement hashes. Reject
-// older peers before they can disagree on the visibility gate.
-constexpr uint8_t kBusExchangeVersion = 2;
+// older peers before they can disagree on the visibility gate. Version 3
+// (2026-10-19) appends the write ring to the slab layout.
+constexpr uint8_t kBusExchangeVersion = 3;
 constexpr size_t kBusExchangeHeaderBytes = 32;
 constexpr size_t kBusExchangeLaneBytes = 48;
 constexpr size_t kBusMaxLanes = 2;
@@ -159,6 +168,27 @@ bool bus_rank_exchange_decode(const uint8_t* in, size_t len,
 //   [ ack cells: lat | bulk ]                 <- consumer kernel publishes
 //   [ credit staging: lat | bulk ]            <- our credit WRITE sources
 //   [ control cell ]                          <- orderly kernel stop
+//   [ write ring: kBusWriteRing rows ]        <- the peer's collective rows
+//                                                land here by RDMA WRITE
+//
+// The write ring (2026-10-19, the one-sided latency transport): the
+// decode step's collectives no longer travel as SEND pairs claimed through
+// door cells, acked and credited. The sender's kernel lays its row out in
+// 512-byte CHUNKS — 31 lanes of 16 bytes of bf16 (248 elements) and one
+// trailer lane {hash, generation, chunk} — the engine RDMA-WRITEs the row
+// into every peer's ring at row (generation - 1) % kBusWriteRing, and the
+// receiving kernel folds the chunks as they prove: a chunk is consumed
+// the moment its 16-byte trailer's generation matches and its hash folds
+// from the 31 data lanes as read. No ordering is assumed between the NIC's
+// writes of different 16-byte units (the fabric showed a 64-byte line's
+// last unit visible before its first, 2026-10-19); a torn chunk fails its
+// hash and is re-read. The warps poll at a gentle cadence (the poll is
+// the data read): on this fabric a NIC write's one-way latency grows with
+// the GPU's poll rate on its destination, whatever each poll reads. Ring reuse needs no credit: a rank starts
+// generation g + kBusWriteRing only after its generation g + 1 completed,
+// which needed every peer's g + 1 row, which every peer wrote only after
+// finishing generation g — so every peer has consumed row g by then
+// (kBusWriteRing >= 2 suffices; the depth is slack).
 
 struct BusSlabLayout {
   size_t lat_slots = 0;
@@ -175,6 +205,8 @@ struct BusSlabLayout {
   size_t ack_off = 0;
   size_t credit_staging_off = 0;
   size_t control_off = 0;
+  size_t write_ring_off = 0;   // kBusWriteRing rows of write_row_bytes
+  size_t write_row_bytes = 0;  // bus_write_row_bytes(lat_slot_bytes)
 
   size_t pool_slots(BusPool pool) const {
     return pool == BusPool::kLatency ? lat_slots : bulk_slots;
@@ -191,12 +223,56 @@ struct BusSlabLayout {
   FlagAck* ack_cell(uint8_t* base, BusPool pool, uint32_t slot) const;
   uint8_t* credit_staging(uint8_t* base, BusPool pool, uint32_t slot) const;
   StartSlot* control_cell(uint8_t* base) const;
+  uint8_t* write_row(uint8_t* base, uint32_t row) const;
 
   // Remote completion-cell address for pool/slot, given the peer's slab base
   // (both sides use the same layout, so the peer computes ours identically).
   uint64_t completion_remote_addr(uint64_t peer_slab_base, BusPool pool,
                                   uint32_t slot) const;
+  // The peer's write-ring row our collective WRITE for `row` targets.
+  uint64_t write_row_remote_addr(uint64_t peer_slab_base, uint32_t row) const;
 };
+
+// The write ring's geometry (see the slab layout above).
+constexpr uint32_t kBusWriteRing = 8;           // rows per (peer, lane) slab
+constexpr uint32_t kBusWriteChunkBytes = 512;   // one warp: 32 lanes x 16 bytes
+constexpr uint32_t kBusWriteChunkElems = 248;   // 31 data lanes x 8 bf16
+constexpr uint32_t kBusWriteDataLanes = 31;     // lane 31 carries the trailer
+inline uint32_t bus_write_chunks(size_t bf16_elems) {
+  return static_cast<uint32_t>((bf16_elems + kBusWriteChunkElems - 1) / kBusWriteChunkElems);
+}
+// The chunked row for a payload of `payload_bytes` (a latency slot): every
+// row of the ring and every staging row is this long.
+inline size_t bus_write_row_bytes(size_t payload_bytes) {
+  return static_cast<size_t>(bus_write_chunks(payload_bytes / 2)) * kBusWriteChunkBytes;
+}
+// Lane striping (2026-10-19): with two lanes (the Spark's two PCIe
+// functions of one port) a row's chunks split into contiguous runs, run
+// l written through lane l's queue pair into the peer's lane-l slab ring
+// at the chunks' own offsets — the DMA of a row then crosses both x4
+// links. [begin, end) of lane `lane`'s run; empty runs are legal.
+DGPP_BUS_HD inline void bus_write_lane_run(uint32_t chunks, int lanes, int lane,
+                                                   uint32_t* begin, uint32_t* end) {
+  const uint32_t per = (chunks + static_cast<uint32_t>(lanes) - 1) / static_cast<uint32_t>(lanes);
+  const uint32_t b = per * static_cast<uint32_t>(lane);
+  *begin = b < chunks ? b : chunks;
+  const uint32_t e = b + per;
+  *end = e < chunks ? e : chunks;
+}
+// The write kernel's grid for a row (the engine waits for every block's
+// ready bit): eight warps a block, one chunk round per warp when the row
+// is short, at most 32 blocks.
+constexpr uint32_t kBusWriteWarpsPerBlock = 8;
+constexpr uint32_t kBusWriteMaxBlocks = 16;
+DGPP_BUS_HD inline uint32_t bus_write_blocks(uint32_t chunks) {
+  uint32_t blocks = (chunks + kBusWriteWarpsPerBlock - 1) / kBusWriteWarpsPerBlock;
+  if (blocks == 0) blocks = 1;
+  return blocks > kBusWriteMaxBlocks ? kBusWriteMaxBlocks : blocks;
+}
+DGPP_BUS_HD inline int bus_write_lane_of(uint32_t chunks, int lanes, uint32_t chunk) {
+  const uint32_t per = (chunks + static_cast<uint32_t>(lanes) - 1) / static_cast<uint32_t>(lanes);
+  return static_cast<int>(chunk / per);
+}
 
 // Derived geometry from raw counts; returns false when the counts are not
 // usable (zero slots, slot bytes not a multiple of 64 or below the doorbell

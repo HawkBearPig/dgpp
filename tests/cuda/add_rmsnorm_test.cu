@@ -91,7 +91,64 @@ void compare_case(int rows, int dim, int profile, bool with_add, float eps, std:
   require(bad_x == 0 && bad_o == 0, msg);
 }
 
+// The one-rounding form against a host oracle: the bf16 add, the fp64 sum
+// of squares, rstd = rsqrt(mean + eps) in fp32, y = bf16((x * rstd) * w).
+// The device's rsqrtf may sit an ulp from the host's 1/sqrt, which flips a
+// bf16 rounding on about one element in 65k: every element within one
+// bf16 ulp, at least 99.9 % bitwise; the residual bitwise.
+void compare_one_rounding(int rows, int dim, int profile, bool with_add, float eps, std::mt19937& rng) {
+  const std::vector<uint16_t> x0 = random_rows(rng, rows, dim, profile);
+  const std::vector<uint16_t> y = random_rows(rng, rows, dim, profile);
+  std::vector<uint16_t> w(static_cast<size_t>(dim));
+  std::normal_distribution<float> n01(1.f, 0.3f);
+  for (auto& e : w) e = dgpp::float_to_bf16_bits(n01(rng));
+  std::vector<uint16_t> want_x(x0.size()), want_o(x0.size());
+  for (int r = 0; r < rows; ++r) {
+    const size_t off = static_cast<size_t>(r) * dim;
+    double ss = 0.0;
+    for (int d = 0; d < dim; ++d) {
+      float v = dgpp::bf16_bits_to_float(x0[off + d]);
+      if (with_add) v = dgpp::bf16_bits_to_float(dgpp::float_to_bf16_bits(v + dgpp::bf16_bits_to_float(y[off + d])));
+      want_x[off + d] = dgpp::float_to_bf16_bits(v);
+      ss += static_cast<double>(v) * static_cast<double>(v);
+    }
+    const float rstd = 1.0f / std::sqrt(static_cast<float>(ss / dim) + eps);
+    for (int d = 0; d < dim; ++d) {
+      const float v = dgpp::bf16_bits_to_float(want_x[off + d]);
+      const float t = v * rstd;
+      want_o[off + d] = dgpp::float_to_bf16_bits(t * dgpp::bf16_bits_to_float(w[d]));
+    }
+  }
+  DevBuf d_w = up(w), d_y = up(y), d_x = up(x0), d_out(x0.size() * 2);
+  cudaStream_t s = nullptr;
+  dgpp::add_rmsnorm_bf16_one(static_cast<uint16_t*>(d_x.p), with_add ? static_cast<const uint16_t*>(d_y.p) : nullptr,
+                             static_cast<const uint16_t*>(d_w.p), static_cast<uint16_t*>(d_out.p), rows, dim, eps, s);
+  DGPP_CUDA_OK(cudaStreamSynchronize(s));
+  const auto gx = down<uint16_t>(d_x, x0.size()), go = down<uint16_t>(d_out, x0.size());
+  size_t bad_x = 0, off_by_one = 0, far = 0;
+  for (size_t i = 0; i < x0.size(); ++i) {
+    bad_x += gx[i] != want_x[i];
+    if (go[i] == want_o[i]) continue;
+    const float a = dgpp::bf16_bits_to_float(go[i]), b = dgpp::bf16_bits_to_float(want_o[i]);
+    const float ulp = std::ldexp(1.0f, std::ilogb(std::fabs(b) > 0 ? b : 1.f) - 7);
+    if (std::fabs(a - b) <= ulp * 1.0001f) ++off_by_one;
+    else ++far;
+  }
+  char msg[200];
+  std::snprintf(msg, sizeof msg, "one-rounding dim %d profile %d add %d: residual mismatches %zu, off-by-one %zu, far %zu",
+                dim, profile, with_add ? 1 : 0, bad_x, off_by_one, far);
+  require(bad_x == 0 && far == 0 && off_by_one * 1000 <= x0.size(), msg);
+}
+
 }  // namespace
+
+DGPP_TEST(add_rmsnorm_one_rounding_matches_the_oracle) {
+  std::mt19937 rng(20261022);
+  for (int dim : {256, 1024, 2048, 4096})
+    for (int profile = 0; profile < 4; ++profile)
+      for (bool add : {false, true}) compare_one_rounding(dim == 4096 ? 300 : 64, dim, profile, add, 1e-6f, rng);
+  compare_one_rounding(37, 2048, 0, true, 1e-5f, rng);
+}
 
 DGPP_TEST(add_rmsnorm_matches_the_chain) {
   std::mt19937 rng(20260922);

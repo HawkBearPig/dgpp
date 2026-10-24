@@ -1,4 +1,5 @@
 #include <stdexcept>
+#include "kernels/pdl.cuh"
 #include <algorithm>
 #include <cstdlib>
 #include <string>
@@ -152,6 +153,7 @@ __global__ __launch_bounds__(kThreads) void packq_gemm_kernel(
     const uint16_t* __restrict__ scales, const MoeSegment* __restrict__ segs,
     const MoeExpertView* __restrict__ views, int which, const int32_t* __restrict__ act_rows,
     OutT* __restrict__ out, size_t out_stride, int m, int n, int k, int n_tiles, bool vector_act) {
+  dgpp_pdl_wait();
   constexpr int kK = Tile<Planes>::kK;
   constexpr int kActStride = Tile<Planes>::kActStride;
   constexpr int kCodeStride = kK * Bits / 8 + 16;
@@ -949,6 +951,7 @@ __global__ __launch_bounds__(kWarps * 32, kWideMinBlocks) void packq_gemm_wide_k
     const MoeTile* __restrict__ tiles, const int32_t* __restrict__ tile_count, int prefetch_ahead,
     OutT* __restrict__ out2, int which2, const int8_t* __restrict__ act_q, size_t act_q_stride,
     const float* __restrict__ act_s, size_t act_s_stride, int bits) {
+  dgpp_pdl_wait();
   extern __shared__ __align__(16) uint8_t wide_smem[];
   constexpr bool kM346 = SF == packq_gemv::kScaleBf16G128Mixed346;
   constexpr int kCodeStride = wide_code_stride(SF);

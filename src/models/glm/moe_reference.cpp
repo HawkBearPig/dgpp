@@ -192,8 +192,11 @@ void swiglu_oracle(const std::vector<uint16_t>& gate,
 
 GlmQuantMatrixHost glm_moe_host_view(const GlmMoeHostWeights& w,
                                      const GlmMoeConfig& cfg, int index) {
-  // Payload layout: [E*3 expert matrices][3 shared matrices], each expert
-  // triple ordered gate, up, down; gate/up [I, H], down [H, I].
+  // Payload layout: [the fp8 expert matrices in index order][3 shared
+  // matrices], each expert triple ordered gate, up, down; gate/up [I, H],
+  // down [H, I]. `index` is the LOGICAL index (e * 3 + m, the shared
+  // triple at E * 3 + m); its position in the fp8 vectors is fp8_ordinal
+  // (every matrix has the same element count, so the offsets stride by it).
   const int64_t I = cfg.inter, H = cfg.hidden;
   GlmQuantMatrixHost m;
   const bool down = index % 3 == 2;
@@ -202,8 +205,9 @@ GlmQuantMatrixHost glm_moe_host_view(const GlmMoeHostWeights& w,
   const int64_t numel = m.rows * m.cols;
   const int64_t scale_numel =
       ((m.rows + 127) / 128) * ((m.cols + 127) / 128);
-  const size_t p_off = static_cast<size_t>(index) * numel;
-  const size_t s_off = static_cast<size_t>(index) * scale_numel;
+  const int ord = w.fp8_ordinal(index, cfg.n_experts);
+  const size_t p_off = static_cast<size_t>(ord) * numel;
+  const size_t s_off = static_cast<size_t>(ord) * scale_numel;
   if (p_off + numel > w.payloads.size() || s_off + scale_numel > w.scales.size())
     throw std::invalid_argument("glm_moe_host_view: index out of range");
   m.payload = w.payloads.data() + p_off;
@@ -213,8 +217,9 @@ GlmQuantMatrixHost glm_moe_host_view(const GlmMoeHostWeights& w,
 
 GlmQuantMatrixHost glm_moe_host_shared(const GlmMoeHostWeights& w,
                                        const GlmMoeConfig& cfg, int m) {
-  // Under NVFP4 the fp8 vectors hold only the shared triple.
-  return glm_moe_host_view(w, cfg, (w.nvfp4 || w.packq) ? m : cfg.n_experts * 3 + m);
+  // The shared triple follows the fp8 routed matrices (none under uniform
+  // NVFP4 / packq, the fp8 ones of a per-projection mix).
+  return glm_moe_host_view(w, cfg, cfg.n_experts * 3 + m);
 }
 
 GlmPackedMatrixHost glm_moe_host_view_packq(const GlmMoeHostWeights& w,
@@ -250,8 +255,9 @@ GlmPackedMatrixHost glm_moe_host_view_packq(const GlmMoeHostWeights& w,
 
 GlmFp4MatrixHost glm_moe_host_view_fp4(const GlmMoeHostWeights& w,
                                        const GlmMoeConfig& cfg, int index) {
-  if (!w.nvfp4 || index < 0 || index >= w.fp4_matrices(cfg.n_experts))
+  if (!w.nvfp4 || index < 0 || !w.fp4_of(index, cfg.n_experts))
     throw std::invalid_argument("glm_moe_host_view_fp4: not an NVFP4 index");
+  const int ord = w.fp4_ordinal(index, cfg.n_experts);
   const int64_t I = cfg.inter, H = cfg.hidden;
   GlmFp4MatrixHost m;
   const bool down = index % 3 == 2;
@@ -262,15 +268,15 @@ GlmFp4MatrixHost glm_moe_host_view_fp4(const GlmMoeHostWeights& w,
     throw std::invalid_argument("glm_moe_host_view_fp4: the fp4 scale group must be 16 or 32");
   m.scale_group = w.fp4_group;
   const int64_t pbytes = m.rows * m.cols / 2, sbytes = m.rows * m.cols / w.fp4_group;
-  const size_t p_off = static_cast<size_t>(index) * pbytes;
-  const size_t s_off = static_cast<size_t>(index) * sbytes;
+  const size_t p_off = static_cast<size_t>(ord) * pbytes;
+  const size_t s_off = static_cast<size_t>(ord) * sbytes;
   const bool mx = w.fp4_group == 32;
   if (p_off + pbytes > w.fp4_payloads.size() || s_off + sbytes > w.fp4_scales.size() ||
-      (!mx && static_cast<size_t>(index) >= w.fp4_globals.size()))
+      (!mx && static_cast<size_t>(ord) >= w.fp4_globals.size()))
     throw std::invalid_argument("glm_moe_host_view_fp4: index out of range");
   m.payload = w.fp4_payloads.data() + p_off;
   m.scales = w.fp4_scales.data() + s_off;
-  m.global_scale = mx ? 1.0f : w.fp4_globals[static_cast<size_t>(index)];
+  m.global_scale = mx ? 1.0f : w.fp4_globals[static_cast<size_t>(ord)];
   return m;
 }
 
@@ -381,14 +387,18 @@ void glm_moe_ref_forward(const uint16_t* hidden, const GlmMoeHostWeights& w,
     double divisor;
   };
   auto weights_for = [&](int index) -> Mat {
-    if (w.nvfp4 && (index < E * 3 || w.shared_nvfp4)) {
+    if (w.exl3_set()) {
+      if (index < 0 || static_cast<size_t>(index) >= w.exl3.size())
+        throw std::invalid_argument("glm_moe_ref_forward: EXL3 matrix index out of range");
+      return Mat{exl3_reconstruct(w.exl3[static_cast<size_t>(index)]), 1.0};
+    }
+    if (w.fp4_of(index, E)) {
       const GlmFp4MatrixHost v = glm_moe_host_view_fp4(w, cfg, index);
       return Mat{dequant_fp4_weights(v), static_cast<double>(v.global_scale)};
     }
     if (w.packq && (index < E * 3 || w.shared_packq))
       return Mat{dequant_packq_weights(glm_moe_host_view_packq(w, cfg, index)), 1.0};
-    const int fp8_index = (w.nvfp4 || w.packq) ? index - E * 3 : index;
-    return Mat{dequant_bf16_weights(glm_moe_host_view(w, cfg, fp8_index)), 1.0};
+    return Mat{dequant_bf16_weights(glm_moe_host_view(w, cfg, index)), 1.0};
   };
 
   // Per token: the fp32-chain semantics in double — the down projection's

@@ -1,4 +1,5 @@
 #include "kernels/kda.hpp"
+#include "kernels/pdl.cuh"
 
 #include <algorithm>
 #include <cmath>
@@ -31,6 +32,7 @@ __global__ void kda_conv_kernel(const uint16_t* __restrict__ src,
                                 const int32_t* __restrict__ request_ids,
                                 const int64_t* __restrict__ positions,
                                 const int32_t* __restrict__ request_spans) {
+  dgpp_pdl_wait();
   const int c = blockIdx.x * blockDim.x + threadIdx.x;
   if (c >= channels) return;
   int t0 = 0;
@@ -112,6 +114,7 @@ __global__ void kda_conv_tiled_kernel(const uint16_t* __restrict__ src, int64_t 
                                       const uint16_t* __restrict__ weight,
                                       const uint16_t* __restrict__ state, int state_width,
                                       uint16_t* __restrict__ dst, int tokens, int channels) {
+  dgpp_pdl_wait();
   const int c = blockIdx.x * blockDim.x + threadIdx.x;
   if (c >= channels) return;
   const int a = blockIdx.y * kConvTileTokens;
@@ -146,6 +149,7 @@ template <int CW>
 __global__ void kda_conv_state_kernel(const uint16_t* __restrict__ src, int64_t src_stride,
                                       uint16_t* __restrict__ state, int state_width, int tokens,
                                       int channels) {
+  dgpp_pdl_wait();
   const int c = blockIdx.x * blockDim.x + threadIdx.x;
   if (c >= channels) return;
 #pragma unroll
@@ -165,6 +169,7 @@ __global__ void kda_gated_rmsnorm_kernel(const uint16_t* __restrict__ x,
                                          const uint16_t* __restrict__ weight,
                                          uint16_t* __restrict__ y, int dim,
                                          float eps) {
+  dgpp_pdl_wait();
   const int64_t row = blockIdx.x;
   const uint16_t* xr = x + row * dim;
   const uint16_t* gr = gate + row * dim;
@@ -294,6 +299,7 @@ __global__ __launch_bounds__(kRecurrentBlock) void kda_recurrent_kernel(
     const int32_t* __restrict__ request_ids,
     const int64_t* __restrict__ positions,
     const int32_t* __restrict__ request_spans, KdaReplay replay) {
+  dgpp_pdl_wait();
   constexpr int kCols = K / kRecurrentLanes;  // columns owned per lane
   static_assert(K % kRecurrentLanes == 0, "K must split across the lanes");
 

@@ -90,7 +90,7 @@ int main(int argc, char** argv) {
       auto fn = candidate ? dgpp::qsa_attn_prefill_partial : dgpp::qsa_attn_partial;
       fn(q.p, qw, k.p, v.p, req.p, lists.p, selected, counts.p, rows, splits, heads, kv, dim,
          block, table.p, blocks, 1.0f / 16, candidate ? m1.p : m0.p, candidate ? l1.p : l0.p,
-         candidate ? c1.p : c0.p, nullptr);
+         candidate ? c1.p : c0.p, nullptr, nullptr, nullptr);
     };
     cudaGraph_t graphs[2]{};
     cudaGraphExec_t execs[2]{};
@@ -101,7 +101,8 @@ int main(int argc, char** argv) {
         DGPP_CUDA_OK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
         auto fn = b ? dgpp::qsa_attn_prefill_partial : dgpp::qsa_attn_partial;
         fn(q.p, qw, k.p, v.p, req.p, lists.p, selected, counts.p, rows, splits, heads, kv, dim,
-           block, table.p, blocks, 1.0f / 16, b ? m1.p : m0.p, b ? l1.p : l0.p, b ? c1.p : c0.p, stream);
+           block, table.p, blocks, 1.0f / 16, b ? m1.p : m0.p, b ? l1.p : l0.p, b ? c1.p : c0.p, stream,
+           nullptr, nullptr);
         DGPP_CUDA_OK(cudaStreamEndCapture(stream, &graphs[b]));
         DGPP_CUDA_OK(cudaGraphInstantiate(&execs[b], graphs[b], nullptr, nullptr, 0));
       }

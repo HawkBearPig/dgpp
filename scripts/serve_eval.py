@@ -5,7 +5,7 @@ structured extraction that is exact — for the checkpoint the world serves,
 so deployments can be compared on the same items with the same settings.
 
     serve_eval.py HOST PORT --out DIR [--tasks humaneval,gsm8k,extract]
-        [--limit N] [--concurrency C] [--max-tokens N]
+        [--limit N] [--concurrency C] [--max-tokens N] [--retry-max-tokens N]
         [--reasoning-effort low|medium|high] [--data DIR] [--seed N]
 
 Tasks (greedy, temperature 0, the served model from GET /v1/models):
@@ -24,6 +24,17 @@ Tasks (greedy, temperature 0, the served model from GET /v1/models):
 Writes <out>/<task>.jsonl (one line per item: id, pass, reply, tokens),
 <out>/summary.json, and prints the summary. Every item is independent, so
 --concurrency C keeps C requests in flight.
+
+The token cap and the retry (2026-10-22): every item is first asked under
+the standard output cap (--max-tokens; 512 for extraction), and the pass
+rate is that budget's verdict — the comparable number across checkpoints.
+An item the server cut at the cap (finish_reason "length") is then asked
+once more at --retry-max-tokens (0 disables the retry); its record keeps
+the retry under "retry" (reply, tokens, verdict) and the summary counts,
+per task, the retried items, those that completed within the larger cap
+and those that then passed. A model that reaches the right answer only
+with more tokens is a behaviour worth seeing, not a hidden failure — and
+the standard-budget score is never changed by it.
 """
 import argparse
 import concurrent.futures
@@ -37,6 +48,7 @@ import sys
 import tempfile
 import time
 from data_paths import data_dir, require_file
+from humaneval_program import humaneval_program
 
 ap = argparse.ArgumentParser()
 ap.add_argument("host")
@@ -46,6 +58,8 @@ ap.add_argument("--tasks", default="humaneval,gsm8k,extract")
 ap.add_argument("--limit", type=int, default=300)
 ap.add_argument("--concurrency", type=int, default=4)
 ap.add_argument("--max-tokens", type=int, default=2048)
+ap.add_argument("--retry-max-tokens", type=int, default=8192,
+                help="the larger cap a response cut at the standard cap is asked once more under (0: no retry)")
 ap.add_argument("--reasoning-effort", default="low")
 ap.add_argument("--no-think", action="store_true",
                 help="chat_template_kwargs.enable_thinking=false (the templates that read it: "
@@ -118,17 +132,13 @@ def humaneval_items():
     return [json.loads(l) for l in open(path)][: args.limit]
 
 
-def humaneval_run(item):
+def humaneval_run(item, max_tokens=None):
     prompt = ("Complete the following Python function. Reply with the complete "
               "function (imports, signature and body) in one ```python code block "
               "and nothing else.\n\n```python\n" + item["prompt"] + "```")
-    r = chat([{"role": "user", "content": prompt}])
+    r = chat([{"role": "user", "content": prompt}], max_tokens=max_tokens)
     code = fenced_code(r["content"])
-    # The problem's prompt carries the imports the tests assume; prepend it
-    # when the reply omitted the header (a body-only reply).
-    if item["entry_point"] not in code:
-        code = item["prompt"] + code
-    program = code + "\n\n" + item["test"] + "\n\n" + f"check({item['entry_point']})\n"
+    program = humaneval_program(item, code)
     with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as f:
         f.write(program)
         path = f.name
@@ -165,12 +175,12 @@ def last_number(text):
         return None
 
 
-def gsm8k_run(i_item):
+def gsm8k_run(i_item, max_tokens=None):
     i, item = i_item
     gold = float(item["answer"].split("####")[-1].strip().replace(",", ""))
     prompt = (item["question"] + "\n\nSolve this step by step, then give the "
               "final numeric answer on its own line as: #### <number>")
-    r = chat([{"role": "user", "content": prompt}])
+    r = chat([{"role": "user", "content": prompt}], max_tokens=max_tokens)
     got = last_number(r["content"])
     ok = got is not None and abs(got - gold) < 1e-6
     return dict(id=f"gsm8k-{i}", ok=ok, gold=gold, got=got, **r)
@@ -216,11 +226,14 @@ def extract_items():
     return items
 
 
-def extract_run(item):
+EXTRACT_MAX_TOKENS = 512  # the standard cap of the extraction items
+
+
+def extract_run(item, max_tokens=None):
     prompt = ("Extract the customer's name, age, city, email and order_total from the text "
               "below as JSON.\n\nText: " + item["text"])
     rf = {"type": "json_schema", "json_schema": {"name": "customer", "schema": SCHEMA, "strict": True}}
-    r = chat([{"role": "user", "content": prompt}], max_tokens=512, response_format=rf)
+    r = chat([{"role": "user", "content": prompt}], max_tokens=max_tokens or EXTRACT_MAX_TOKENS, response_format=rf)
     try:
         got = json.loads(r["content"])
     except json.JSONDecodeError:
@@ -238,7 +251,9 @@ TASKS = {
     "extract": (extract_items, extract_run),
 }
 
-summary = {"model": MODEL, "settings": dict(max_tokens=args.max_tokens, reasoning_effort=args.reasoning_effort, no_think=args.no_think,
+summary = {"model": MODEL, "settings": dict(max_tokens=args.max_tokens, extract_max_tokens=EXTRACT_MAX_TOKENS,
+                                            retry_max_tokens=args.retry_max_tokens,
+                                            reasoning_effort=args.reasoning_effort, no_think=args.no_think,
                                             limit=args.limit, seed=args.seed), "tasks": {}}
 for task in args.tasks.split(","):
     items_fn, run_fn = TASKS[task]
@@ -252,18 +267,40 @@ for task in args.tasks.split(","):
             if done % 20 == 0 or done == len(items):
                 passed = sum(1 for x in results if x["ok"])
                 print(f"  {task}: {done}/{len(items)} done, {passed} pass, {time.time() - t0:.0f}s", flush=True)
+    # The retry: every response the server cut at the standard cap is asked
+    # once more at the larger cap. The verdict under the standard cap stands
+    # in `ok`; the retry's record (reply, tokens, its own verdict) goes under
+    # "retry" and the summary counts how many completed and passed there.
+    capped = [i for i, x in enumerate(results) if x.get("finish") == "length"]
+    retry_cap = args.retry_max_tokens
+    if capped and retry_cap > 0:
+        t1 = time.time()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=args.concurrency) as pool:
+            retries = list(pool.map(lambda i: run_fn(items[i], max_tokens=retry_cap), capped))
+        for i, r in zip(capped, retries):
+            results[i]["retry"] = dict(max_tokens=retry_cap, **{k: v for k, v in r.items() if k not in ("id", "gold")})
+        completed = sum(1 for r in retries if r.get("finish") == "stop")
+        print(f"  {task}: {len(capped)} at the {('%d' % EXTRACT_MAX_TOKENS) if task == 'extract' else ('%d' % args.max_tokens)}-token cap retried at "
+              f"{retry_cap}: {completed} completed, {sum(1 for r in retries if r['ok'])} pass, {time.time() - t1:.0f}s", flush=True)
     with open(os.path.join(args.out, f"{task}.jsonl"), "w") as f:
         for res in results:
             f.write(json.dumps(res) + "\n")
     n = len(results)
     passed = sum(1 for x in results if x["ok"])
     toks = [x["completion_tokens"] for x in results if x.get("completion_tokens")]
+    retried = [x["retry"] for x in results if x.get("retry")]
     summary["tasks"][task] = dict(n=n, passed=passed, rate=round(passed / n, 4) if n else None,
                                   seconds=round(time.time() - t0),
                                   mean_completion_tokens=round(sum(toks) / len(toks)) if toks else None,
-                                  truncated=sum(1 for x in results if x.get("finish") == "length"))
-    print(f"== {task}: {passed}/{n} = {100 * passed / n:.1f} %  ({summary['tasks'][task]['seconds']} s, "
-          f"mean {summary['tasks'][task]['mean_completion_tokens']} completion tokens, "
-          f"{summary['tasks'][task]['truncated']} truncated)", flush=True)
+                                  truncated=len(capped),
+                                  retry_max_tokens=retry_cap if capped and retry_cap > 0 else None,
+                                  retried=len(retried),
+                                  retry_completed=sum(1 for r in retried if r.get("finish") == "stop"),
+                                  retry_passed=sum(1 for r in retried if r.get("ok")))
+    st = summary["tasks"][task]
+    print(f"== {task}: {passed}/{n} = {100 * passed / n:.1f} %  ({st['seconds']} s, "
+          f"mean {st['mean_completion_tokens']} completion tokens, {st['truncated']} at the cap"
+          + (f"; retried at {st['retry_max_tokens']}: {st['retry_completed']} completed, {st['retry_passed']} pass" if st['retried'] else "")
+          + ")", flush=True)
 json.dump(summary, open(os.path.join(args.out, "summary.json"), "w"), indent=2)
 print(json.dumps(summary["tasks"]))

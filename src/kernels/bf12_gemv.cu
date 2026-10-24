@@ -1,4 +1,5 @@
 #include "kernels/bf12_gemv.hpp"
+#include "kernels/pdl.cuh"
 
 #include <algorithm>
 #include <array>
@@ -30,6 +31,7 @@ __global__ void bf12_gemv_kernel(const uint16_t* __restrict__ act, size_t act_st
                                  const uint32_t* __restrict__ esc,
                                  const uint16_t* __restrict__ raw, void* __restrict__ out, int n,
                                  int k, size_t row_bytes) {
+  dgpp_pdl_wait();
   extern __shared__ __align__(16) uint16_t sx[];
   gemv::stage_activations<kRows>(act, act_stride, k, sx);
   __syncthreads();
@@ -96,6 +98,7 @@ __global__ void bf12_gemv_wide_kernel(const uint16_t* __restrict__ act, size_t a
                                       const uint32_t* __restrict__ esc,
                                       const uint16_t* __restrict__ raw, void* __restrict__ out,
                                       int n, int k, size_t row_bytes) {
+  dgpp_pdl_wait();
   extern __shared__ __align__(16) uint16_t sx[];
   const int warp = threadIdx.x / 32;
   const int lane = threadIdx.x % 32;
@@ -167,6 +170,7 @@ struct Bf12GemvMulti {
 
 template <int kRows, bool kOutF32, int kSB>
 __global__ void bf12_gemv_multi_kernel(Bf12GemvMulti mp, int k, size_t row_bytes) {
+  dgpp_pdl_wait();
   extern __shared__ __align__(16) uint16_t sx[];
   const int bid = static_cast<int>(blockIdx.x);
   int which = 0;
@@ -271,38 +275,7 @@ void launch_depth(const uint16_t* act, size_t act_stride, const Bf12Matrix& w, v
 
 // ---- expansion (bf12-only residency's prefill path) ------------------------
 
-// One step of one lane: eight elements' bf16 bits as one 16-byte vector.
-__device__ __forceinline__ uint4 expand_step(uint32_t lo, uint32_t hi, uint32_t ew, uint32_t base7,
-                                             int c0, const uint32_t* __restrict__ esc,
-                                             uint32_t esc_b, uint32_t esc_e) {
-  uint32_t v[8];
-#pragma unroll
-  for (int j = 0; j < 8; ++j) {
-    const uint32_t b = ((j < 4 ? lo : hi) >> (8 * (j & 3))) & 0xFFu;
-    const uint32_t code = (ew >> (4 * j)) & 0xFu;
-    v[j] = ((b & 0x80u) << 8) | (b & 0x7Fu) | (base7 + (code << 7));
-  }
-  const uint32_t any15 = ew & (ew >> 1) & (ew >> 2) & (ew >> 3) & 0x11111111u;
-  if (any15 != 0u) {
-    for (int j = 0; j < 8; ++j) {
-      if (((ew >> (4 * j)) & 0xFu) != 0xFu) continue;
-      const uint32_t col = static_cast<uint32_t>(c0 + j);
-      for (uint32_t e = esc_b; e < esc_e; ++e) {
-        const uint32_t ent = esc[e];
-        if ((ent >> 16) == col) {
-          v[j] = ent & 0xFFFFu;
-          break;
-        }
-      }
-    }
-  }
-  uint4 o;
-  o.x = v[0] | (v[1] << 16);
-  o.y = v[2] | (v[3] << 16);
-  o.z = v[4] | (v[5] << 16);
-  o.w = v[6] | (v[7] << 16);
-  return o;
-}
+using bf12_gemv::expand_step;
 
 // A warp is one weight row, a lane its sixteen bytes of every segment — the
 // GEMV's ownership, so every load and every store is a whole line's share
@@ -313,6 +286,7 @@ __global__ void bf12_expand_kernel(const uint8_t* __restrict__ w, const uint32_t
                                    const uint32_t* __restrict__ esc,
                                    const uint16_t* __restrict__ raw, uint16_t* __restrict__ out,
                                    int row0, int nrows, int k, size_t row_bytes) {
+  dgpp_pdl_wait();
   const int warp = threadIdx.x / 32;
   const int lane = threadIdx.x % 32;
   const int local = blockIdx.x * gemv::kWarps + warp;

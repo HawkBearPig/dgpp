@@ -1538,6 +1538,96 @@ DGPP_TEST(dsa_listed_attention_matches_split_kernel_and_reference) {
   }
 }
 
+
+// The listed kernel's split groups (2026-10-23, kAttnSplitGroup): eight
+// consecutive splits of a row merge in a thread-block cluster and publish
+// one partial, the finish's formula over the group. Against the per-split
+// form + the combine: the two-level merge is fp32 rounding-level (rel l2
+// < 1e-5); run to run bitwise; and a row's output does not depend on the
+// rows beside it — the first seven rows alone reproduce the 41-row batch's
+// rows bitwise (the grouping is per request, not per batch). 32 splits at
+// 16/512 and 64/512; counts from 3 to 283, so most groups hold empty splits.
+DGPP_TEST(dsa_listed_attention_split_groups_merge_like_the_combine) {
+  for (const DenseCase gc : {DenseCase{16, 512}, DenseCase{64, 512}}) {
+    DsaConfig cfg{};
+    cfg.num_heads = gc.num_heads;
+    cfg.kv_lora_rank = gc.kv_lora;
+    const DsaGeometry g = DsaGeometry::from_config(cfg);
+    const int local_heads = g.local_heads, nope = cfg.qk_nope_head_dim;
+    const int v = cfg.v_head_dim, kv_lora = cfg.kv_lora_rank;
+    const int block_tokens = cfg.block_tokens;
+    const int rows = 41, max_selected = 300, few = 7;
+    const int n_blocks = 2, total_tokens = n_blocks * block_tokens;
+    std::vector<int32_t> tokens(size_t(rows) * max_selected, -1), counts(rows), req_ids(rows, 0);
+    for (int r = 0; r < rows; ++r) {
+      counts[r] = (r % 2 == 0) ? 3 + r : 283 - 5 * r;
+      for (int i = 0; i < counts[r]; ++i)
+        tokens[size_t(r) * max_selected + i] = int32_t((r * 131 + i * 17) % total_tokens);
+    }
+    auto q = random_bf16_bits(211 + gc.num_heads, int64_t(rows) * local_heads * nope, -2, 1);
+    auto kv_b = random_bf16_bits(212 + gc.kv_lora, int64_t(local_heads) * (nope + v) * kv_lora, -2, 1);
+    auto latent = random_bf16_bits(213, int64_t(total_tokens) * kv_lora, -2, 1);
+    std::vector<int32_t> bt = {1, 0};
+    const float scale = 1.0f / std::sqrt(float(nope));
+    DevBuf dq(q.size() * 2), dkb(kv_b.size() * 2), dlat(latent.size() * 2), dtopk(tokens.size() * 4), dcnt(rows * 4),
+        dri(rows * 4), dbt(8), dqt(size_t(rows) * local_heads * kv_lora * 2);
+    dq.upload(q.data(), q.size() * 2);
+    dkb.upload(kv_b.data(), kv_b.size() * 2);
+    dlat.upload(latent.data(), latent.size() * 2);
+    dtopk.upload(tokens.data(), tokens.size() * 4);
+    dcnt.upload(counts.data(), counts.size() * 4);
+    dri.upload(req_ids.data(), req_ids.size() * 4);
+    dbt.upload(bt.data(), bt.size() * 4);
+    dsa_absorb_q(dq.p, dkb.p, dqt.p, rows, local_heads, nope, v, kv_lora, 0);
+    const int n_split = 32;
+    const size_t n = size_t(rows) * local_heads * kv_lora;
+    DevBuf dm(size_t(rows) * n_split * local_heads * 4), dl(size_t(rows) * n_split * local_heads * 4),
+        dc(size_t(rows) * n_split * local_heads * kv_lora * 4), dout(n * 4);
+    const int n_groups = n_split / kAttnSplitGroup;
+    DevBuf dmg(size_t(rows) * n_groups * local_heads * 4), dlg(size_t(rows) * n_groups * local_heads * 4),
+        dcg(size_t(rows) * n_groups * local_heads * kv_lora * 4), dtick(size_t(rows) * local_heads / 32 * n_groups * 4 + 4096);
+    DGPP_CUDA_OK(cudaMemset(dtick.p, 0, size_t(rows) * local_heads / 32 * n_groups * 4 + 4096));
+    auto run = [&](int group, int nrows, std::vector<float>& out) {
+      DGPP_CUDA_OK(cudaMemset(dm.p, 0xFF, size_t(rows) * n_split * local_heads * 4));
+      DGPP_CUDA_OK(cudaMemset(dmg.p, 0xFF, size_t(rows) * n_groups * local_heads * 4));
+      DGPP_CUDA_OK(cudaMemset(dout.p, 0, n * 4));
+      const bool ok = dsa_attn_listed(dqt.p, dlat.p, static_cast<const int32_t*>(dri.p),
+                                      static_cast<const int32_t*>(dtopk.p), max_selected,
+                                      static_cast<const int32_t*>(dcnt.p), nrows, n_split, local_heads, kv_lora,
+                                      block_tokens, static_cast<const int32_t*>(dbt.p), n_blocks, scale,
+                                      static_cast<float*>(dm.p), static_cast<float*>(dl.p), static_cast<float*>(dc.p),
+                                      0, LatentFormat::kBf16, nullptr, 0, -1, group, static_cast<int32_t*>(dtick.p),
+                                      static_cast<float*>(dmg.p), static_cast<float*>(dlg.p), static_cast<float*>(dcg.p));
+      if (!ok) throw std::runtime_error("listed kernel refused the geometry");
+      const bool grouped = group > 1;
+      dsa_attn_combine(static_cast<const float*>(grouped ? dmg.p : dm.p), static_cast<const float*>(grouped ? dlg.p : dl.p),
+                       static_cast<const float*>(grouped ? dcg.p : dc.p), nrows, n_split / group, local_heads, kv_lora,
+                       static_cast<float*>(dout.p), 0);
+      DGPP_CUDA_OK(cudaDeviceSynchronize());
+      out.assign(n, 0.f);
+      dout.download(out.data(), n * 4);
+    };
+    std::vector<float> flat, grouped, again, head;
+    run(1, rows, flat);
+    run(kAttnSplitGroup, rows, grouped);
+    run(kAttnSplitGroup, rows, again);
+    run(kAttnSplitGroup, few, head);
+    require_bitwise("grouped listed attention repeat", again.data(), grouped.data(), n * 4);
+    require_bitwise("grouped listed attention: the first rows alone", head.data(), grouped.data(),
+                    size_t(few) * local_heads * kv_lora * 4);
+    double d2 = 0, y2 = 0;
+    for (size_t i = 0; i < n; ++i) {
+      const double d = double(grouped[i]) - double(flat[i]);
+      d2 += d * d;
+      y2 += double(flat[i]) * double(flat[i]);
+    }
+    const double l2 = std::sqrt(d2 / std::max(y2, 1e-30));
+    std::printf("[ OK ] listed attention split groups heads=%d kv=%d: grouped vs per-split merge l2_rel %.3g\n",
+                gc.num_heads, gc.kv_lora, l2);
+    if (l2 > 1e-5) throw std::runtime_error("the split groups' merge diverges from the per-split combine");
+  }
+}
+
 DGPP_TEST(dsa_dense_attention_matches_split_kernel_and_reference) {
   for (const DenseCase dc : {DenseCase{64, 512}, DenseCase{16, 512}, DenseCase{16, 256}})
     run_dense_attention_case(dc);

@@ -56,9 +56,11 @@
 #include "engine/boundary_reducer.hpp"
 #include "engine/decode_outputs.hpp"
 #include "engine/memory_plan.hpp"
+#include "kernels/bf12_companions.hpp"
 #include "engine/session_model.hpp"
 #include "kernels/gemm.hpp"
 #include "kernels/draft_head.hpp"
+#include "kernels/l2_prefetch.hpp"
 #include "kernels/glm_mhc_launch.hpp"
 #include "kernels/glm_spec.hpp"
 #include "models/dsv41/config.hpp"
@@ -120,6 +122,56 @@ class Dsv41Model : public SessionModel<Dsv41Model> {
   // constructor's default is exact — the gates' parity mode).
   static void set_default_prefill_bounded(bool on) { s_default_prefill_bounded = on; }
   static bool default_prefill_bounded() { return s_default_prefill_bounded; }
+  // The prefill walk's dense projections (engine.prefill_dense): the
+  // fp8-weight tile GEMM (true, the default) or the streaming decode form
+  // for every projection a prefill row runs — the CSA2 layer's, the Engram
+  // projection's and the draft's main projection's. Decode rows always run
+  // the streaming form. Every model built from here on takes the default.
+  static void set_default_prefill_dense_tile(bool on) { s_default_prefill_dense_tile = on; }
+  void set_prefill_dense_tile(bool on) {
+    prefill_dense_tile_ = on;
+    if (csa2_) csa2_->set_prefill_dense_tile(on);
+  }
+  // The prefill walk's window attention (engine.prefill_window): the flash
+  // listed kernel (true, the default) or the scalar partial kernel the
+  // decode window runs. Every model built from here on takes the default.
+  static void set_default_prefill_window_flash(bool on) { s_default_prefill_window_flash = on; }
+  void set_prefill_window_flash(bool on) {
+    prefill_window_flash_ = on;
+    if (csa2_) csa2_->set_prefill_window_flash(on);
+  }
+  // The decode window attention (engine.decode_window, 2026-10-19): the
+  // flash listed kernel unsplit on a side stream beside the main source
+  // (true, the default) or the scalar partial kernel split eight ways.
+  static void set_default_decode_window_flash(bool on) { s_default_decode_window_flash = on; }
+  void set_decode_window_flash(bool on) {
+    decode_window_flash_ = on;
+    if (csa2_) csa2_->set_decode_window_flash(on);
+  }
+  // The fused mHC decode site (mhc_site_fused) on or off: the tests'
+  // bisection handle; the unfused form is the prefill recipe's.
+  void set_decode_mhc_fused(bool on) { decode_mhc_fused_ = on; }
+  void set_decode_window_beside(bool on) { decode_window_beside_ = on; }  // the tests' bisection handle
+  // The prefill's fold overlap (engine.prefill_fold_overlap; the
+  // DeepSeek-V4 walk's form, here since 2026-10-18): a walk of min_rows
+  // rows or more on a multi-rank world runs each layer as two row blocks,
+  // the boundary a row of the request's block grid nearest the middle, so
+  // every boundary fold lands under the other block's compute — the
+  // attention per block, the mHC site and the router per block, the expert
+  // chain over every row, the accumulation per block, and block B's MoE
+  // fold under the next layer's block A. Bitwise the one-block walk
+  // (dsv41_tp_test's gates). Tests lower min_rows and may run the row-block
+  // form without a reducer. Every model built from here on takes the default.
+  static constexpr int kFoldOverlapMinRows = 512;
+  static void set_default_prefill_fold_overlap(bool on) { s_default_prefill_fold_overlap = on; }
+  void set_prefill_fold_overlap(bool on, int min_rows = kFoldOverlapMinRows, bool without_reducer = false);
+  bool prefill_fold_overlap() const { return fold_overlap_; }
+  uint64_t debug_overlap_async_folds() const { return overlap_async_folds_; }
+  // The lm head's 12-bit companion (engine.bf16_weights): tests read its counters.
+  const Bf12Companions& bf12_companions() const { return bf12_; }
+  // The Engram chunk-ahead staging's counters (tests): prestages published and claimed.
+  uint64_t debug_engram_prestage_publishes() const { return engram_ ? engram_->debug_prestage_publishes() : 0; }
+  uint64_t debug_engram_prestage_claims() const { return engram_ ? engram_->debug_prestage_claims() : 0; }
 
   // The cold diagnostic forward: one request on slot 0, fresh state, every
   // row's logits; capture_layers: every layer's residual streams [T, 4, H]
@@ -136,10 +188,11 @@ class Dsv41Model : public SessionModel<Dsv41Model> {
 
   static constexpr int prefill_chunk_tokens() { return kPrefillChunkTokens; }
   static constexpr int kv_block_tokens_static() { return kBlockTokens; }
-  // 32 since 2026-09-14 (16 before): six request slots at DSpark depth 4
-  // (30 rows) in one batched replay — the vLLM recipe's six-stream
-  // aggregate; kDecodeRowsMax bounds it.
-  static constexpr int decode_rows_cap() { return 32; }
+  // 64 since 2026-10-23 (32 from 2026-09-14, 16 before): twelve request
+  // slots at DSpark depth 4 (60 rows) in one batched replay — the
+  // aggregate past six streams, where the step's fixed costs (collectives,
+  // the small kernels) amortize over more rows; kDecodeRowsMax bounds it.
+  static constexpr int decode_rows_cap() { return 96; }
   // The group prefill (session_prefill_group): a span's longest prompt —
   // each span fits the walk. Bounded prefill packs the spans' final
   // windows into decoder space before projecting their last rows.
@@ -263,8 +316,61 @@ class Dsv41Model : public SessionModel<Dsv41Model> {
   void mhc_site(const uint16_t* streams, const GlmMhcWeights& w, const uint16_t* ln, int T, bool decode,
                 int decode_prefix = 0);
   void stream_update(const uint16_t* sublayer_out, int T);
+  // The fused decode site (2026-10-19, DeepSeek-V4's form): the finish in
+  // the dots launch (mhc_counters_'s tickets), the one-rounding norm in
+  // it (x_ written; collapsed_ not stored), the comb — read by the stream
+  // update alone — deferred to mhc_side_ and joined by join_comb.
+  void mhc_site_fused(const uint16_t* streams, const GlmMhcWeights& w, const uint16_t* ln, size_t r, int count,
+                      MhcSinglePass sp);
+  void join_comb();
   uint16_t* stage(uint16_t* fallback, int T, int width, bool capture);
   void fold(uint16_t* buf, int T, int width, bool capture);
+  // The fold overlap (set_prefill_fold_overlap): the layer as the row
+  // blocks [0, TA) and [TA, T). On entry the previous layer's block-B MoE
+  // fold may be outstanding (ffn_b_pending_: A's streams updated in nxt_,
+  // B's in cur_ awaiting its update); `flush` lands it before returning.
+  void enqueue_layer_overlap(const Dsv41LayerResident& r, int layer, int T, int TA, const WalkRows& rows, bool flush);
+  void mhc_site_rows(const uint16_t* streams, const GlmMhcWeights& w, const uint16_t* ln, int r0, int rows,
+                     int decode_prefix);
+  void update_rows(const uint16_t* sublayer_out, int r0, int rows);
+  void swap_pre();
+  bool begin_fold_after(uint16_t* buf, int r0, int n, cudaEvent_t ready, int width = 0);  // width 0: hidden
+  void begin_pending_fold();
+  void flush_overlap();
+  // The block boundary of a walk of T rows: the row nearest T/2 at which
+  // the attention may start a chunk (a span's start, or a row on its
+  // request's block grid inside a publishing span), at least a block from
+  // either end, past any decode prefix. 0: none (the one-block walk).
+  int overlap_boundary(int T, const WalkRows& rows) const;
+  // The lm head's bf12 companion (kernels/bf12_companions.hpp): packed after
+  // the load under engine.bf16_weights bf12 | bf12+bf16 — the decode head
+  // GEMV (the draft's base logits and the verify's, 331 MB per rank per
+  // read on the 1017 checkpoint at world 4) reads 12 bits per weight; the
+  // prefill head keeps its tile path, expanding from the companion when
+  // the bf16 bytes went back (one slot: the prefill head runs once a walk).
+  static constexpr int kBf12ExpandSlots = 1;
+  Bf12Companions bf12_;
+  static inline bool s_default_prefill_fold_overlap = true;
+  bool fold_overlap_ = s_default_prefill_fold_overlap;
+  int fold_overlap_min_rows_ = kFoldOverlapMinRows;
+  bool fold_overlap_without_reducer_ = false;
+  // The Engram chunk-ahead staging due this walk (run_rows names it; the
+  // last Engram layer issues it after its embed consumed the claimed rows).
+  struct PrestageDue {
+    const int64_t* ids = nullptr;
+    int rows = 0;
+    int64_t pos0 = 0;
+    int req = -1;
+    const int64_t* prefix = nullptr;
+    int n_prefix = 0;
+  } prestage_due_;
+  void prestage_after_embed(int table_index);
+  bool ffn_b_pending_ = false;        // block B's MoE fold is outstanding (its rows accumulated)
+  bool ffn_b_begun_ = false;          // ... and submitted to the bus (else only its event stands)
+  cudaEvent_t ov_ev_[6] = {};         // the blocks' producers: attention A, B; accumulation A, B; Engram projection A, B
+  int overlap_rows_ = 0;              // the pending fold's walk rows and block boundary
+  int overlap_ta_ = 0;
+  uint64_t overlap_async_folds_ = 0;  // folds begun asynchronously (tests)
   void gather_embedding(const int64_t* tokens, int T, bool capture);
   // The DSpark pieces (mtp): the first draft call of a step (the rings, the
   // block, base_logits_, row 0) and a chain row (block row draft_row_).
@@ -272,6 +378,28 @@ class Dsv41Model : public SessionModel<Dsv41Model> {
                    bool capture, int head_rows, int batch_requests, int source_row = 0);
   void draft_chain_row(int req, const int64_t* tokens, bool capture, int head_rows, int batch_requests);
   const Dsv41DraftResident& draft_stage(int stage);
+  // The decode walk's boundary prefetch windows (kernels/l2_prefetch.hpp;
+  // bit-identical on or off; resident stacks only): before the attention
+  // fold the MoE site's replicated bytes and the shared expert, before the
+  // MoE fold the next layer's attention side (or the head's), each under
+  // the collective and the mHC site behind it; an Engram layer's own fold
+  // carries its attention side (the Engram projection runs first). The
+  // CSA2 layer opens its in-layer windows (Csa2Layer::set_prefetcher).
+  bool prefetching(bool decode) const {
+    return decode && prefetch_.enabled() && loader_.residency() == Dsv41Residency::Resident;
+  }
+  void prefetch_fp8(const GlmQuantMatrix& m);
+  void prefetch_exl3(const Exl3Matrix& m);
+  void prefetch_bf16(const uint16_t* w, size_t bytes, int rows);
+  // The lm head's logits (fp32 [rows, lm_vocab_count]) for `rows` hidden
+  // rows: the bf16 / bf12 head through the GEMM, or the EXL3 head's launcher.
+  void head_logits(const uint16_t* h, int rows, float* out, cudaStream_t stream);
+  void prefetch_mhc(const uint16_t* fn, const uint16_t* norm, int rows);
+  void prefetch_attention_weights(const Dsv41LayerResident& r, int rows);
+  void prefetch_ffn_side(const Dsv41LayerResident& r, int rows);
+  void prefetch_attention_side(int layer, int rows);
+  void prefetch_head(const uint16_t* norm, bool draft, int rows);
+  WeightPrefetcher prefetch_;
   int target_ordinal(int layer) const;
   int32_t* ctx(int req) const { return d_ctx_ + static_cast<size_t>(req) * 4; }
   float* spec_tails(int tail_ord, int row) const {
@@ -289,6 +417,8 @@ class Dsv41Model : public SessionModel<Dsv41Model> {
   bool dense_mma_ = true;  // the dense projections' and head's decode form (DGPP_DSV41_DENSE_GEMV=1: the GEMV chunks)
   void* gemm_ws_ = nullptr;
   size_t gemm_ws_bytes_ = 0;
+  void* exl3_ws_ = nullptr;  // the EXL3 GEMV's own (head, DSpark main projection); zeroed at allocation
+  size_t exl3_ws_bytes_ = 0;
   Dsv41GlobalsResident globals_;
   GlmMoeConfig moe_cfg_;
   GlmMhcConfig mhc_cfg_;
@@ -329,6 +459,14 @@ class Dsv41Model : public SessionModel<Dsv41Model> {
   float* pre_nxt_ = nullptr;
   float* one_hot_ = nullptr;        // [M, 4] = (1, 0, 0, 0): layer 0's collapse
   float* mhc_logits_ = nullptr;     // [M, 24]
+  int* mhc_counters_ = nullptr;     // [M] the fused finish's tickets, zero at rest
+  cudaStream_t mhc_side_ = nullptr;
+  cudaEvent_t mhc_fork_ = nullptr;
+  cudaEvent_t mhc_join_ = nullptr;
+  bool comb_pending_ = false;       // a deferred comb the next stream update joins
+  cudaStream_t attn_side_ = nullptr;  // the decode window beside the main source (Csa2Layer::set_decode_side)
+  cudaEvent_t attn_fork_ = nullptr;
+  cudaEvent_t attn_join_ = nullptr;
   uint16_t* engram_kv_ = nullptr;   // [M, 5H] the fold's fallback
   int32_t* d_ctx_ = nullptr;        // [R, 4] the Engram contexts
   int32_t* spec_ctx_ = nullptr;     // [max(M, rows), 4] per-row contexts
@@ -336,6 +474,14 @@ class Dsv41Model : public SessionModel<Dsv41Model> {
   // DSpark (mtp).
   static inline bool s_default_prefill_bounded = false;
   bool prefill_bounded_ = s_default_prefill_bounded;
+  static inline bool s_default_prefill_dense_tile = true;
+  bool prefill_dense_tile_ = s_default_prefill_dense_tile;
+  static inline bool s_default_prefill_window_flash = true;
+  bool prefill_window_flash_ = s_default_prefill_window_flash;
+  static inline bool s_default_decode_window_flash = true;
+  bool decode_window_flash_ = s_default_decode_window_flash;
+  bool decode_mhc_fused_ = true;
+  bool decode_window_beside_ = true;
   int debug_layer_limit_ = 0;
   // The bounded prefill's segment of the last walk (the draft's prefill
   // rows map into main_hidden_ through it) and the tail carried between a

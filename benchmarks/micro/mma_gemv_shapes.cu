@@ -39,11 +39,13 @@ double time_us(F&& launch, int iters) {
 int main(int argc, char** argv) {
   int iters = 40, world = 4;
   std::string forms = "mma,w2,w4,w8,chunk,swiglu";
+  bool dsv41 = false;  // -d: DeepSeek-V4.1-Flash's attention projections per rank (TP = world), 32 x 32 scale grid
   int opt{};
-  while ((opt = getopt(argc, argv, "i:W:f:")) != -1) {
+  while ((opt = getopt(argc, argv, "i:W:f:d")) != -1) {
     if (opt == 'i') iters = atoi(optarg);
     if (opt == 'W') world = atoi(optarg);
     if (opt == 'f') forms = optarg;
+    if (opt == 'd') dsv41 = true;
   }
   const int H = 5120, I = 17408 / world, QW = 24 * 256 / world, KVW = 256 * (4 >= world ? 4 / world : 1);
   const int GK = 16 * 128 / world, GV = 48 * 128 / world;  // GDN key / value widths
@@ -53,6 +55,13 @@ int main(int argc, char** argv) {
       {"gdn in_proj qkz [2K+V x H]", 2 * GK + GV, H}, {"gdn in_proj v [V x H]", GV, H},
       {"gdn out [H x V]", H, GV}, {"attn qkv [2QW x H]", 2 * QW, H}, {"attn kv [KVW x H]", KVW, H},
       {"attn out [H x QW]", H, QW}, {"lm head [V/w x H]", V, H}};
+  const int scale_shift = dsv41 ? 5 : 7;  // the scale grid's block size as a shift
+  if (dsv41) {
+    const int lh = 64 / world, lg = 8 / world;  // heads, o groups per rank
+    shapes = {{"wkv [512 x H]", 512, H}, {"wq_a [1280 x H]", 1280, H}, {"wq_b [lh*512 x 1280]", lh * 512, 1280},
+              {"idx_wq_b [32*128 x 1280]", 32 * 128, 1280}, {"wo_a group [1024 x 8*512]", 1024, 8 * 512},
+              {"wo_b [H x lg*1024]", H, lg * 1024}};
+  }
   // Scales grid: 128 x 128 blocks (rs = cs = 7), f32 ones.
   size_t ws_bytes = 64u << 20;
   void* ws = nullptr;
@@ -68,7 +77,8 @@ int main(int argc, char** argv) {
   printf("world %d, %d copies rotated (cold L2), %d iters; us per launch / GB/s (weight bytes / time)\n", world, kCopies, iters);
   for (const Shape& s : shapes) {
     const size_t wbytes = size_t(s.n) * s.k;
-    const int sr = (s.n + 127) / 128, sc = (s.k + 127) / 128;
+    const int sb = 1 << scale_shift;
+    const int sr = (s.n + sb - 1) / sb, sc = (s.k + sb - 1) / sb;
     std::vector<uint8_t*> w(kCopies); std::vector<float*> sc_(kCopies);
     for (int c = 0; c < kCopies; ++c) {
       DGPP_CUDA_OK(cudaMalloc(&w[c], wbytes));
@@ -87,17 +97,22 @@ int main(int argc, char** argv) {
       if (forms.find("mma") != std::string::npos) {
         dgpp::mma_gemv_set_decode_width(0);
         report("mma", time_us([&](int c) {
-          dgpp::launch_mma_gemv_fp8_bf16(act, s.k, w[c], sc_[c], out, m, s.n, s.k, s.n, 7, 7, nullptr, ws, ws_bytes); }, iters));
+          dgpp::launch_mma_gemv_fp8_bf16(act, s.k, w[c], sc_[c], out, m, s.n, s.k, s.n, scale_shift, scale_shift, nullptr, ws, ws_bytes); }, iters));
+      }
+      if (forms.find("unsplit") != std::string::npos) {
+        dgpp::mma_gemv_set_decode_width(0);
+        report("unsplit", time_us([&](int c) {
+          dgpp::launch_mma_gemv_fp8_bf16(act, s.k, w[c], sc_[c], out, m, s.n, s.k, s.n, scale_shift, scale_shift, nullptr, nullptr, 0); }, iters));
       }
       for (int width : {2, 4, 8}) {
         const std::string tag = "w" + std::to_string(width);
         if (forms.find(tag) == std::string::npos) continue;
         dgpp::mma_gemv_set_decode_width(width);
         report(tag.c_str(), time_us([&](int c) {
-          dgpp::launch_mma_gemv_fp8_bf16(act, s.k, w[c], sc_[c], out, m, s.n, s.k, s.n, 7, 7, nullptr, ws, ws_bytes); }, iters));
+          dgpp::launch_mma_gemv_fp8_bf16(act, s.k, w[c], sc_[c], out, m, s.n, s.k, s.n, scale_shift, scale_shift, nullptr, ws, ws_bytes); }, iters));
         dgpp::mma_gemv_set_decode_width(0);
       }
-      if (forms.find("chunk") != std::string::npos && m <= 4) {
+      if (forms.find("chunk") != std::string::npos && m <= 8) {
         report("chunk", time_us([&](int c) {
           dgpp::launch_scale_gemm_bf16(act, s.k, w[c], sc_[c], out, m, s.n, s.k, nullptr, s.n, /*mma_from_rows=*/0); }, iters));
       }

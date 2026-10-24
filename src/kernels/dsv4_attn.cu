@@ -1,4 +1,5 @@
 #include "kernels/dsv4_attn.hpp"
+#include "kernels/pdl.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
@@ -40,6 +41,7 @@ __device__ __forceinline__ float block_sum(float v, float* red /*[8]*/) {
 
 // ---- the query's per-head normalization -------------------------------------
 __global__ void q_head_rmsnorm_kernel(uint16_t* q, int dim, float eps) {
+  dgpp_pdl_wait();
   __shared__ float red[8];
   uint16_t* x = q + int64_t(blockIdx.x) * dim;
   float ss = 0.0f;
@@ -83,6 +85,7 @@ __device__ __forceinline__ void act_quant_row_smem(float* row /*[512]*/, float* 
 }
 
 __global__ void act_quant_nope_kernel(uint16_t* x, int64_t row_stride, const int64_t* pos) {
+  dgpp_pdl_wait();
   __shared__ float row[kDsv4Latent];
   __shared__ float red[8];
   const int64_t r = blockIdx.x;
@@ -110,6 +113,7 @@ __global__ void act_quant_nope_kernel(uint16_t* x, int64_t row_stride, const int
 __global__ void kv_tail_kernel(uint16_t* kv, const uint16_t* w, float eps, const int32_t* req_ids,
                                const int64_t* pos, const float* inv_freq, const int32_t* ring_table,
                                int ring_slots, uint8_t* ring, int window, int32_t* wlist, int32_t* wcounts) {
+  dgpp_pdl_wait();
   __shared__ float row[kDsv4Latent];
   __shared__ float red[8];
   const int64_t r = blockIdx.x;
@@ -175,6 +179,7 @@ __global__ void kv_tail_kernel(uint16_t* kv, const uint16_t* w, float eps, const
 // on the rounded values): one block per (row, head).
 __global__ void q_head_rmsnorm_rope_kernel(uint16_t* q, int heads, float eps, const int64_t* pos,
                                            const float* inv_freq) {
+  dgpp_pdl_wait();
   __shared__ float red[8];
   uint16_t* x = q + int64_t(blockIdx.x) * kDsv4Latent;
   float ss = 0.0f;
@@ -222,6 +227,7 @@ __device__ __forceinline__ void hadamard128_smem(float* a, float* b) {
 }
 
 __global__ void hadamard128_kernel(uint16_t* x) {
+  dgpp_pdl_wait();
   __shared__ float a[128];
   __shared__ float b[128];
   uint16_t* xr = x + int64_t(blockIdx.x) * 128;
@@ -232,6 +238,7 @@ __global__ void hadamard128_kernel(uint16_t* x) {
 }
 
 __global__ void fold_weights_kernel(const uint16_t* w, const float* q_scale, float* out, int64_t n, float scale) {
+  dgpp_pdl_wait();
   const int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
   if (i >= n) return;
   const float ws = bf16_bits_to_float(float_to_bf16_bits(__fmul_rn(bf16_bits_to_float(w[i]), scale)));
@@ -242,6 +249,7 @@ __global__ void fold_weights_kernel(const uint16_t* w, const float* q_scale, flo
 __global__ void comp_ring_write_kernel(const float* kv, const float* score, const float* ape,
                                        const int32_t* req_ids, const int64_t* pos, int wide, int ratio, int slots,
                                        float* ring) {
+  dgpp_pdl_wait();
   const int64_t r = blockIdx.x;
   const int64_t p = pos[r];
   if (p < 0) return;
@@ -452,6 +460,7 @@ __global__ void comp_publish_main_decode_kernel(const float* ring, int ratio, in
                                                 const uint16_t* norm_w, float eps, const float* inv_freq,
                                                 const int32_t* block_tables, int blocks_per_request,
                                                 int entries_per_block, uint16_t* cache) {
+  dgpp_pdl_wait();
   __shared__ float row[kDsv4Latent];
   __shared__ float red[8];
   const int64_t r = blockIdx.x;
@@ -473,6 +482,7 @@ __global__ void comp_publish_main_lazy_kernel(const float* kv, const float* scor
                                               const uint16_t* norm_w, float eps, const float* inv_freq,
                                               const int32_t* block_tables, int blocks_per_request,
                                               int entries_per_block, uint16_t* cache) {
+  dgpp_pdl_wait();
   __shared__ float row[kDsv4Latent];
   __shared__ float red[8];
   const int64_t r = blockIdx.x;
@@ -489,6 +499,7 @@ __global__ void comp_publish_main_lazy_kernel(const float* kv, const float* scor
 
 __global__ void u_ring_write_kernel(const uint16_t* hidden_rows, size_t hidden_stride, const int32_t* req_ids,
                                     const int64_t* pos, int vecs, int hidden, int slots, uint16_t* ring) {
+  dgpp_pdl_wait();
   const int64_t r = blockIdx.x;
   const int64_t p = pos[r];
   if (p < 0) return;
@@ -503,6 +514,7 @@ __global__ void comp_publish_index_decode_kernel(const float* ring, int ratio, i
                                                  const int32_t* block_tables, int blocks_per_request,
                                                  int entries_per_block, uint8_t* index_k, float* index_scale,
                                                  unsigned* violations) {
+  dgpp_pdl_wait();
   __shared__ float a[128];
   __shared__ float b[128];
   __shared__ float red[8];
@@ -524,6 +536,7 @@ __global__ void comp_publish_main_prefill_kernel(const float* kv, const float* s
                                                  int slots, int64_t pos0, const uint16_t* norm_w, float eps,
                                                  const float* inv_freq, const int32_t* block_table,
                                                  int entries_per_block, uint16_t* cache) {
+  dgpp_pdl_wait();
   __shared__ float row[kDsv4Latent];
   __shared__ float red[8];
   const int g = blockIdx.x;
@@ -539,6 +552,7 @@ __global__ void comp_publish_index_prefill_kernel(const float* kv, const float* 
                                                   const float* inv_freq, const int32_t* block_table,
                                                   int entries_per_block, uint8_t* index_k, float* index_scale,
                                                   unsigned* violations) {
+  dgpp_pdl_wait();
   __shared__ float a[128];
   __shared__ float b[128];
   __shared__ float red[8];
@@ -552,6 +566,7 @@ __global__ void comp_publish_index_prefill_kernel(const float* kv, const float* 
 }
 
 __global__ void dense_list_kernel(const int64_t* pos_sel, int stride, int32_t* list, int32_t* counts) {
+  dgpp_pdl_wait();
   const int r = blockIdx.x;
   const int64_t v = pos_sel[r] + 1;
   const int n = v < 0 ? 0 : (v > stride ? stride : int(v));
@@ -561,6 +576,7 @@ __global__ void dense_list_kernel(const int64_t* pos_sel, int stride, int32_t* l
 
 __global__ void hash_bias_rows_kernel(const int64_t* tokens, const int32_t* tid2eid, int vocab, int top_k,
                                       int n_experts, float* out) {
+  dgpp_pdl_wait();
   const int r = blockIdx.x;
   float* row = out + int64_t(r) * n_experts;
   for (int e = threadIdx.x; e < n_experts; e += blockDim.x) row[e] = 0.0f;

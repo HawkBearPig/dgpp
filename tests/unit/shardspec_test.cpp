@@ -1,8 +1,10 @@
+#include "loaders/shardspec.hpp"
+
 #include <cstdio>
 #include <filesystem>
 
+#include "../common/temp_dir.hpp"
 #include "common/test.hpp"
-#include "loaders/shardspec.hpp"
 
 namespace fs = std::filesystem;
 
@@ -24,8 +26,8 @@ DGPP_TEST(shardspec_parse_and_lookup) {
   })";
   // ShardedCheckpoint expects a file path; eager_bind=false skips mmap of
   // nonexistent shard files while exercising parsing + lookup.
-  fs::path dir = fs::temp_directory_path() / "dgpp_shspec_test";
-  fs::create_directories(dir);
+  const dgpp::test::TempDir fixture("dgpp_shspec_test");
+  const fs::path& dir = fixture.path();
   auto spec_path = dir / "spec.json";
   {
     FILE* f = fopen(spec_path.c_str(), "wb");

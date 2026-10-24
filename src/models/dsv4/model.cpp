@@ -1,6 +1,7 @@
 #include "models/dsv4/model.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -222,6 +223,20 @@ Dsv4Model::Dsv4Model(const Dsv4Config& cfg, const std::string& checkpoint_dir, i
     h_route_weights_ = pinned_alloc<float>(layers * M * K);
   }
   DGPP_CUDA_OK(cudaStreamSynchronize(stream_));
+  // The lm head's 12-bit companion (engine.bf16_weights; bitwise the bf16
+  // values; 2026-10-20, the DeepSeek-V4.1 port's lever): the tensor-core
+  // decode form reads 12 bits per weight through it (mma_gemv.hpp's bf12
+  // form) for the verify head's read each pass; the bf16 bytes stay
+  // resident for the prefill forms (the tensor-core instance refuses the
+  // release, and this loader grants none).
+  if (Bf12Companions::enabled() && globals_.lm_head != nullptr) {
+    const auto t0 = std::chrono::steady_clock::now();
+    bf12_.pack_and_release(globals_.lm_head, lm_vocab_count_, cfg_.hidden_size, gemm_, stream_,
+                           [](const void*) { return false; });
+    bf12_.finish(gemm_, kBf12ExpandSlots);
+    bf12_.log_summary(loader_.rank(),
+                      std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+  }
   log_memory_ledger("dsv4: model ready");
 }
 
@@ -294,6 +309,9 @@ Dsv4Model::MemoryPlan Dsv4Model::plan_memory(const Dsv4Config& cfg, int max_toke
   const size_t R = static_cast<size_t>(max_requests);
   const size_t H = static_cast<size_t>(cfg.hidden_size);
   const size_t V = static_cast<size_t>(Dsv4LayerStream::lm_vocab_count(cfg, tp_rank, tp_world, head));
+  if (Bf12Companions::enabled())
+    plan.add("bf16 decode packing (the lm head's 12-bit companion)",
+             Bf12Companions::planned_bytes(static_cast<int64_t>(V), static_cast<int64_t>(cfg.hidden_size)));
   size_t staging = 0;
   if (residency == Dsv4Residency::Resident) {
     plan.add("model weights (resident)", Dsv4LayerStream::resident_bytes(cfg, tp_rank, tp_world, head, mtp));
@@ -725,9 +743,15 @@ void Dsv4Model::prefetch_head(const Dsv4HcHeadResident& hc, const uint16_t* norm
   prefetch_.open_window(stream_, kPrefetchWindowBytes, prefetch_.boundary_rate());
   prefetch_mhc(hc.fn, norm);
   if (draft && draft_head_fp8_ != nullptr)
-    prefetch_.add(draft_head_fp8_, static_cast<size_t>(lm_vocab_count_) * H);
-  else if (globals_.lm_head)
-    prefetch_.add(globals_.lm_head, static_cast<size_t>(lm_vocab_count_) * H * 2);
+    prefetch_.add_isolated(draft_head_fp8_, static_cast<size_t>(lm_vocab_count_) * H);  // its own allocation
+  else if (globals_.lm_head) {
+    // The bytes the decode head read will stream: the companion's when
+    // the tensor-core form takes it (gemm.hpp resident_view).
+    const void* view = nullptr;
+    size_t view_bytes = 0;
+    gemm_.resident_view(globals_.lm_head, static_cast<size_t>(lm_vocab_count_) * H * 2, max_decode_rows_, &view, &view_bytes);
+    prefetch_.add_view(globals_.lm_head, view, view_bytes);
+  }
 }
 
 void Dsv4Model::debug_drop_draft_screen() {

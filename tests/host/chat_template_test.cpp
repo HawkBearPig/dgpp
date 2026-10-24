@@ -29,6 +29,7 @@ char** g_argv = nullptr;
 #include "loaders/minijson.hpp"
 #include "text/chat_template.hpp"
 #include "text/tokenizer.hpp"
+#include "loaders/architecture.hpp"
 #include "text/tool_parser.hpp"
 #include "text/tool_grammar.hpp"
 #include "models/glm/config.hpp"
@@ -72,6 +73,12 @@ bool corpus_is_mimo(const std::string& golden_path) {
 bool corpus_is_qwen(const std::string& golden_path) {
   return corpus_model(golden_path).find("Qwen") != std::string::npos || corpus_is_mimo(golden_path);
 }
+// The Flint corpus (2026-10-22): the GLM marker family, but the generation
+// prompt ends at <|assistant|> and the model opens its own <think> block —
+// the parser and the grammar start outside reasoning.
+bool corpus_is_flint(const std::string& golden_path) {
+  return corpus_model(golden_path).find("flint") != std::string::npos;
+}
 std::string read_text_file(const std::string& path) {
   std::ifstream f(path);
   if (!f) throw std::runtime_error("cannot open " + path);
@@ -104,7 +111,8 @@ EosVocab eos_and_vocab(const std::string& config_path) {
 
 DGPP_TEST(qwen_reasoning_effort_renders_each_level) {
   const std::string golden = golden_path(g_argc, g_argv);
-  if (!corpus_is_qwen(golden) || corpus_is_mimo(golden)) return;
+  if (!corpus_is_qwen(golden) || corpus_is_mimo(golden))
+    dgpp::test::skip("requires the Qwen corpus, excluding MiMo");
   std::string err;
   const std::string snap = dgpp::hf::model_dir(corpus_model(golden), &err);
   if (snap.empty()) {
@@ -211,6 +219,106 @@ DGPP_TEST(reasoning_effort_edge_nativeControlsForEveryCheckpoint) {
     require(none.enable_thinking == false && !none.effort, "none disables thinking without a fabricated effort token");
   } catch (const std::invalid_argument&) { none_rejected = true; }
   require(none_rejected == !tpl.reads("enable_thinking"), "always-on checkpoint explicitly refuses none");
+}
+
+// The prompt-tail rules over every checkpoint cached on this node that
+// serves through a chat template (2026-10-22, the Flint rule): each
+// family's generation prompt — thinking on, thinking off where the
+// template reads a switch — rendered by the engine's template renderer
+// and tokenized by the checkpoint's tokenizer, under the family's
+// declaration (ChatMarkers::model_opens_thinking, the ServeFamily's
+// statement: Flint and MiMo-V2.6) and without it. The contract: no
+// prompt leaves thinking to the model without the declaration; under it
+// only a prompt the template left unsettled does — Flint's and MiMo's
+// generation prompts, never a GLM or Qwen one (they open <think> or
+// close the block), so the declaration is the family's alone and a
+// prompt's tokens never select it. DeepSeek serves through its own
+// prompt builder (dsv41_prompt_test pins its tails).
+DGPP_TEST(generation_prompt_tails_across_the_cached_checkpoints) {
+  namespace fs = std::filesystem;
+  const char* hub_env = std::getenv("HF_HUB_CACHE");
+  const fs::path hub = hub_env && *hub_env ? fs::path(hub_env)
+                                            : fs::path(std::getenv("HOME") ? std::getenv("HOME") : "") / ".cache/huggingface/hub";
+  if (!fs::is_directory(hub)) dgpp::test::skip("no Hugging Face cache on this node");
+  int checked = 0, declared = 0;
+  for (const auto& entry : fs::directory_iterator(hub)) {
+    const std::string name = entry.path().filename().string();
+    if (name.rfind("models--", 0) != 0 || !fs::is_directory(entry.path() / "snapshots")) continue;
+    fs::path snap;
+    for (const auto& s : fs::directory_iterator(entry.path() / "snapshots"))
+      if (fs::exists(s.path() / "config.json") && fs::exists(s.path() / "tokenizer.json") && fs::exists(s.path() / "chat_template.jinja"))
+        snap = s.path();
+    if (snap.empty()) continue;
+    dgpp::ModelArchitecture arch;
+    try {
+      arch = dgpp::detect_architecture_file((snap / "config.json").string());
+    } catch (const std::exception&) {
+      continue;  // a drafter or another non-served checkpoint
+    }
+    if (arch == dgpp::ModelArchitecture::DeepseekV41 || arch == dgpp::ModelArchitecture::DeepseekV4) continue;
+    // The family's declaration, as apps/dgpp_serve.cpp's ServeFamily states it.
+    const bool family_declares = arch == dgpp::ModelArchitecture::Flint || arch == dgpp::ModelArchitecture::MimoV2;
+    const auto tok = dgpp::text::Tokenizer::load((snap / "tokenizer.json").string());
+    const auto tpl = dgpp::text::ChatTemplate::load((snap / "chat_template.jinja").string());
+    dgpp::text::ChatMarkers silent = dgpp::text::ChatMarkers::from_tokenizer(tok);
+    if (!silent.reasoning_available()) continue;
+    silent.model_opens_thinking = false;
+    dgpp::text::ChatMarkers declaring = silent;
+    declaring.model_opens_thinking = true;
+    const auto render = [&](int thinking /* -1 unset, 0 off, 1 on */) {
+      std::vector<dgpp::text::Value> ms;
+      dgpp::text::Value::Members u;
+      u.emplace_back("role", dgpp::text::Value::string_value("user"));
+      u.emplace_back("content", dgpp::text::Value::string_value("What is the capital of France?"));
+      ms.push_back(dgpp::text::Value::map_value(std::move(u)));
+      dgpp::text::Value::Members g;
+      g.emplace_back("messages", dgpp::text::Value::list_value(std::move(ms)));
+      g.emplace_back("add_generation_prompt", dgpp::text::Value::boolean(true));  // as the service renders
+      if (thinking >= 0) g.emplace_back("enable_thinking", dgpp::text::Value::boolean(thinking == 1));
+      return tok.encode(tpl.render(dgpp::text::Value::map_value(std::move(g))));
+    };
+    const std::string tag = name.substr(8);
+    const auto tail_of = [&](const std::vector<int64_t>& prompt) {
+      std::string out = " [tail:";
+      for (size_t i = prompt.size() >= 4 ? prompt.size() - 4 : 0; i < prompt.size(); ++i) {
+        std::string piece = tok.decode({prompt[i]}, false);
+        for (char& c : piece) if (c == '\n') c = '~';
+        out += " " + std::to_string(prompt[i]) + "'" + piece + "'";
+      }
+      return out + "]";
+    };
+    // The plain generation prompt; where the template reads the switch,
+    // thinking on and off (MiMo's template acts on false alone — on, it
+    // writes the bare header; Qwen's and GLM's open <think> on).
+    std::vector<std::vector<int64_t>> prompts = {render(-1)};
+    if (tpl.reads("enable_thinking")) {
+      prompts.push_back(render(1));
+      prompts.push_back(render(0));
+      require(silent.prompt_opens_thinking(prompts[1]) == !family_declares,
+              tag + ": thinking on opens <think> where the template writes it" + tail_of(prompts[1]));
+      require(!silent.prompt_opens_thinking(prompts[2]), tag + ": thinking off does not open" + tail_of(prompts[2]));
+    }
+    for (size_t i = 0; i < prompts.size(); ++i) {
+      const std::vector<int64_t>& prompt = prompts[i];
+      require(!silent.prompt_leaves_thinking_to_model(prompt),
+              tag + ": without the declaration nothing is left to the model" + tail_of(prompt));
+      // Under the declaration: unsettled iff the template wrote no marker —
+      // Flint's and MiMo's generation prompts with thinking unset or on,
+      // nothing else; thinking off settles it everywhere.
+      const bool unsettled = declaring.prompt_leaves_thinking_to_model(prompt);
+      const bool expected = family_declares && i < 2;
+      require(unsettled == expected,
+              tag + (expected ? ": the generation prompt is the model's choice" : ": the template settles it") +
+                  tail_of(prompt));
+    }
+    ++checked;
+    if (family_declares) ++declared;
+    std::printf("[ .. ] %s: generation prompt %s\n", tag.c_str(),
+                family_declares ? "left to the model (the family's declaration)"
+                                : silent.prompt_opens_thinking(prompts[0]) ? "opens <think>" : "closes the block");
+  }
+  require(checked > 0, "at least one cached checkpoint renders through a chat template");
+  std::printf("[ .. ] prompt tails checked on %d cached checkpoints (%d families declaring the model's choice)\n", checked, declared);
 }
 
 DGPP_TEST(custom_tools_and_references_over_the_real_tokenizer) {
@@ -441,8 +549,7 @@ bool json_equal(const dgpp::minijson::Value& a, const dgpp::minijson::Value& b) 
 DGPP_TEST(glm_tool_call_render_encode_parse_roundTrip) {
   const std::string kGoldenPath = golden_path(g_argc, g_argv);
   if (corpus_is_qwen(kGoldenPath)) {
-    DGPP_LOG_INFO("glm_tool_call_render_encode_parse_roundTrip: GLM format only; the Qwen corpus has its own gate");
-    return;
+    dgpp::test::skip("requires a GLM-format corpus; the Qwen corpus has its own gate");
   }
   const std::string model_id = corpus_model(kGoldenPath);
   std::string err;
@@ -516,7 +623,7 @@ DGPP_TEST(glm_tool_call_render_encode_parse_roundTrip) {
       std::vector<int64_t> ids = tok.encode(turn);
       ids.push_back(observation[0]);
       dgpp::text::ToolCallParser::Options opts;
-      opts.start_in_reasoning = true;
+      opts.start_in_reasoning = !corpus_is_flint(kGoldenPath);
       dgpp::text::ToolCallParser parser(
           markers,
           [&](const std::vector<int64_t>& v) { return tok.decode(v, true); },
@@ -578,7 +685,7 @@ bool has_custom_call(const dgpp::minijson::Value& calls) {
 // arguments through the <function=...><parameter=...> text format.
 DGPP_TEST(qwen_tool_call_render_encode_parse_roundTrip) {
   const std::string kGoldenPath = golden_path(g_argc, g_argv);
-  if (!corpus_is_qwen(kGoldenPath)) return;
+  if (!corpus_is_qwen(kGoldenPath)) dgpp::test::skip("requires a Qwen-format corpus");
   const std::string model_id = corpus_model(kGoldenPath);
   std::string err;
   const std::string snap = dgpp::hf::model_dir(model_id, &err);
@@ -789,7 +896,7 @@ bool check_golden_key_closure(const dgpp::text::GrammarVocab& vocab,
   dgpp::text::GrammarState closed(
       &vocab,
       golden_tool_spec(tools, calls, dgpp::text::GrammarSpec::Mode::kRequired, true, "", false),
-      thinks, /*model_may_open_thinking=*/vocab.markers().xml_compact);
+      thinks, /*model_may_open_thinking=*/vocab.markers().model_opens_thinking);
   size_t offset = 0;
   for (const int64_t id : ids) {
     const std::string bytes = tok.decode(id, false);
@@ -810,7 +917,7 @@ bool check_golden_key_closure(const dgpp::text::GrammarVocab& vocab,
 
 DGPP_TEST(qwen_tool_grammar_accepts_the_golden_turns_over_the_real_tokenizer) {
   const std::string kGoldenPath = golden_path(g_argc, g_argv);
-  if (!corpus_is_qwen(kGoldenPath)) return;
+  if (!corpus_is_qwen(kGoldenPath)) dgpp::test::skip("requires a Qwen-format corpus");
   const std::string model_id = corpus_model(kGoldenPath);
   std::string err;
   const std::string snap = dgpp::hf::model_dir(model_id, &err);
@@ -828,12 +935,15 @@ DGPP_TEST(qwen_tool_grammar_accepts_the_golden_turns_over_the_real_tokenizer) {
   for (const auto& a : tok.added_tokens())
     if (a.content == "<|im_end|>" || a.content == "<|endoftext|>") eos.push_back(a.id);
   require(eos.size() == 2, "the Qwen EOS ids");
-  const dgpp::text::GrammarVocab vocab =
-      dgpp::text::GrammarVocab::from_tokenizer(tok, eos, static_cast<int>(tok.max_id() + 1));
+  const bool mimo = corpus_is_mimo(kGoldenPath);
+  // MiMo's family declares the model's own <think>; the vocabulary carries
+  // it as the server builds it.
+  const dgpp::text::GrammarVocab vocab = dgpp::text::GrammarVocab::from_tokenizer(
+      tok, eos, static_cast<int>(tok.max_id() + 1), dgpp::text::DsmlDialect::kV41, /*model_opens_thinking=*/mimo);
   require(vocab.usable() && vocab.markers().tool_format() == dgpp::text::ToolFormat::kQwenXml,
           "the grammar vocabulary is the Qwen format");
-  const bool mimo = corpus_is_mimo(kGoldenPath);
   require(vocab.markers().xml_compact == mimo, "the XML dialect follows the tokenizer");
+  require(vocab.markers().model_opens_thinking == mimo, "the model's choice is the family's declaration");
   require(vocab.call_turn_eos() == (mimo ? 151645 : 248046), "the call-turn EOS is <|im_end|>");
   const auto accept_turn = [&](dgpp::text::GrammarState& grammar, const std::vector<int64_t>& ids,
                                const std::string& name) {
@@ -1023,8 +1133,7 @@ DGPP_TEST(qwen_tool_grammar_accepts_the_golden_turns_over_the_real_tokenizer) {
 DGPP_TEST(glm_tool_grammar_accepts_the_golden_turns_over_the_real_tokenizer) {
   const std::string kGoldenPath = golden_path(g_argc, g_argv);
   if (corpus_is_qwen(kGoldenPath)) {
-    DGPP_LOG_INFO("glm_tool_grammar_accepts_the_golden_turns_over_the_real_tokenizer: GLM format only; the Qwen corpus has its own gate");
-    return;
+    dgpp::test::skip("requires a GLM-format corpus; the Qwen corpus has its own gate");
   }
   const std::string model_id = corpus_model(kGoldenPath);
   std::string err;
@@ -1077,12 +1186,12 @@ DGPP_TEST(glm_tool_grammar_accepts_the_golden_turns_over_the_real_tokenizer) {
       turn.erase(0, std::string("<|assistant|>").size());
       std::vector<int64_t> ids = tok.encode(turn);
       ids.push_back(vocab.call_turn_eos());
-      opt_out_turns += check_golden_key_closure(vocab, tok, tools, *tcs, turn, ids, true, name);
+      opt_out_turns += check_golden_key_closure(vocab, tok, tools, *tcs, turn, ids, !corpus_is_flint(kGoldenPath), name);
       // Required (parallel): every turn is accepted; the grammar ends the
       // turn only on EOS.
       dgpp::text::GrammarState g(
           &vocab, golden_tool_spec(tools, *tcs, dgpp::text::GrammarSpec::Mode::kRequired, true, ""),
-          /*prompt_opens_thinking=*/true);
+          /*prompt_opens_thinking=*/!corpus_is_flint(kGoldenPath));
       for (size_t j = 0; j < ids.size(); ++j) {
         require(g.allows(ids[j]),
                 name + ": id " + std::to_string(ids[j]) + " (" +
@@ -1100,7 +1209,7 @@ DGPP_TEST(glm_tool_grammar_accepts_the_golden_turns_over_the_real_tokenizer) {
           (ffn ? *ffn : first).at("name").as_string());
       dgpp::text::GrammarState single(
           &vocab,
-          golden_tool_spec(tools, *tcs, dgpp::text::GrammarSpec::Mode::kRequired, false, ""), true);
+          golden_tool_spec(tools, *tcs, dgpp::text::GrammarSpec::Mode::kRequired, false, ""), !corpus_is_flint(kGoldenPath));
       int calls_seen = 0;
       bool refused_second = false;
       for (size_t j = 0; j < ids.size(); ++j) {
@@ -1118,16 +1227,18 @@ DGPP_TEST(glm_tool_grammar_accepts_the_golden_turns_over_the_real_tokenizer) {
       // A stray EOS before the call is refused while the call is owed.
       dgpp::text::GrammarState owed(
           &vocab, golden_tool_spec(tools, *tcs, dgpp::text::GrammarSpec::Mode::kRequired, true, ""),
-          true);
+          !corpus_is_flint(kGoldenPath));
       require(!owed.allows(vocab.call_turn_eos()) && !owed.allows(154827),
               name + ": EOS refused while a call is owed");
       // A name outside the tools: refused at its first byte.
       dgpp::text::GrammarState wrong(
           &vocab,
           golden_tool_spec(tools, *tcs, dgpp::text::GrammarSpec::Mode::kNamed, true, first_name),
-          true);
-      owed.advance(vocab.markers().think_close.id);
-      wrong.advance(vocab.markers().think_close.id);
+          !corpus_is_flint(kGoldenPath));
+      if (!corpus_is_flint(kGoldenPath)) {  // the GLM prompt opened <think>; Flint's grammars start at the top
+        owed.advance(vocab.markers().think_close.id);
+        wrong.advance(vocab.markers().think_close.id);
+      }
       wrong.advance(vocab.markers().tool_call_open.id);
       const std::vector<int64_t> zebra = tok.encode("zebra_tool");
       require(!zebra.empty() && !wrong.allows(zebra[0]),
@@ -1239,8 +1350,7 @@ DGPP_TEST(glm_json_grammar_accepts_tokenized_documents_over_the_real_tokenizer) 
   // reported.
   const std::string kGoldenPath = golden_path(g_argc, g_argv);
   if (corpus_is_qwen(kGoldenPath)) {
-    DGPP_LOG_INFO("json grammar: the GLM config; the Qwen corpus has its own gate");
-    return;
+    dgpp::test::skip("requires a GLM-format corpus; the Qwen corpus has its own gate");
   }
   const std::string model_id = corpus_model(kGoldenPath);
   std::string err;
@@ -1253,7 +1363,12 @@ DGPP_TEST(glm_json_grammar_accepts_tokenized_documents_over_the_real_tokenizer) 
   const dgpp::text::Tokenizer tok = dgpp::text::Tokenizer::load(
       (std::filesystem::path(snap) / "tokenizer.json").string());
   const EosVocab cfg = eos_and_vocab((std::filesystem::path(snap) / "config.json").string());
-  const dgpp::text::GrammarVocab vocab = dgpp::text::GrammarVocab::from_tokenizer(tok, cfg.eos, cfg.vocab);
+  // Flint's family declares the model's own <think> (the vocabulary
+  // carries it, as the server builds it); GLM's prompt opens the block.
+  const bool flint = corpus_is_flint(kGoldenPath);
+  const dgpp::text::GrammarVocab vocab = dgpp::text::GrammarVocab::from_tokenizer(
+      tok, cfg.eos, cfg.vocab, dgpp::text::DsmlDialect::kV41, /*model_opens_thinking=*/flint);
+  require(vocab.markers().model_opens_thinking == flint, "the declaration is the family's");
   const auto t0 = std::chrono::steady_clock::now();
   vocab.prepare_json();
   const double build_s =
@@ -1320,8 +1435,19 @@ DGPP_TEST(glm_json_grammar_accepts_tokenized_documents_over_the_real_tokenizer) 
     dgpp::text::GrammarSpec spec;
     spec.mode = dgpp::text::GrammarSpec::Mode::kJson;
     spec.json_schema = d.schema;
-    dgpp::text::GrammarState g(&vocab, spec, /*prompt_opens_thinking=*/true);
-    std::vector<int64_t> ids = {vocab.markers().think_close.id};
+    // GLM: the prompt opened <think>, the document follows the close.
+    // Flint (the 2026-10-22 campaign's defect): the prompt ends at
+    // <|assistant|>, the model opens <think>, reasons, closes it and then
+    // writes the document — the grammar admits the block under the
+    // family's declaration and constrains the document after it.
+    dgpp::text::GrammarState g(&vocab, spec, /*prompt_opens_thinking=*/!flint,
+                               /*model_may_open_thinking=*/vocab.markers().model_opens_thinking);
+    std::vector<int64_t> ids;
+    if (flint) {
+      ids.push_back(vocab.markers().think_open.id);
+      for (const int64_t id : tok.encode("The user wants the fields of the schema.\n")) ids.push_back(id);
+    }
+    ids.push_back(vocab.markers().think_close.id);
     for (const int64_t id : tok.encode(d.text)) ids.push_back(id);
     ids.push_back(cfg.eos[0]);
     bool ok = true;
@@ -1358,6 +1484,25 @@ DGPP_TEST(glm_json_grammar_accepts_tokenized_documents_over_the_real_tokenizer) 
       require(!ok, std::string("violating document accepted: ") + d.text);
       ++refused;
     }
+  }
+  if (flint) {
+    // Without the declaration (a vocabulary built as for GLM) the model's
+    // opener is refused at the first position — the campaign's garbled
+    // extraction outputs; under it the opener and the document are both
+    // admitted at the top, and no opener once the document began.
+    const dgpp::text::GrammarVocab undeclared =
+        dgpp::text::GrammarVocab::from_tokenizer(tok, cfg.eos, cfg.vocab);
+    undeclared.prepare_json();
+    dgpp::text::GrammarSpec spec;
+    spec.mode = dgpp::text::GrammarSpec::Mode::kJson;
+    spec.json_schema = kSchema;
+    dgpp::text::GrammarState silent(&undeclared, spec, false, undeclared.markers().model_opens_thinking);
+    require(!silent.allows(vocab.markers().think_open.id), "undeclared: the opener is refused at the top");
+    dgpp::text::GrammarState declared(&vocab, spec, false, vocab.markers().model_opens_thinking);
+    require(declared.allows(vocab.markers().think_open.id), "declared: the opener is admitted at the top");
+    require(declared.allows(tok.encode("{")[0]), "declared: the document may also start at once");
+    declared.advance(tok.encode("{")[0]);
+    require(!declared.allows(vocab.markers().think_open.id), "declared: no opener once the document began");
   }
   // A structural position under the closed schema: after {" only the
   // declared names' spellings remain, and the count says so.

@@ -42,6 +42,17 @@ void add_fp4(TensorList& out, const std::string& base, int64_t rows, int64_t col
   add(out, base + ".scale", DType::F8_E8M0, {rows, cols / block}, cls, layer, expert, Dsv41TensorRole::Fp4Scale);
 }
 
+// One EXL3 matrix with input width K and output width N at `bits`.
+void add_exl3(TensorList& out, const std::string& base, int64_t K, int64_t N, int bits, Dsv41WeightClass cls,
+              int layer, int expert = -1) {
+  if (K % 128 != 0 || N % 128 != 0 || bits < 1 || bits > 8)
+    throw std::invalid_argument("dsv41 binding: EXL3 K and N must be multiples of 128 at a width 1..8 on " + base);
+  add(out, base + ".trellis", DType::I16, {K / 16, N / 16, 16LL * bits}, cls, layer, expert, Dsv41TensorRole::Exl3Trellis);
+  add(out, base + ".suh", DType::F16, {K}, cls, layer, expert, Dsv41TensorRole::Exl3Suh);
+  add(out, base + ".svh", DType::F16, {N}, cls, layer, expert, Dsv41TensorRole::Exl3Svh);
+  add(out, base + ".mul1", DType::I32, {}, cls, layer, expert, Dsv41TensorRole::Exl3Marker);
+}
+
 void expect_attention(TensorList& out, const std::string& p, const Dsv41TextConfig& cfg, int layer) {
   const int64_t H = cfg.hidden_size;
   const int64_t heads = cfg.num_attention_heads, hd = cfg.head_dim;
@@ -51,6 +62,35 @@ void expect_attention(TensorList& out, const std::string& p, const Dsv41TextConf
   add_bf16(out, p + "q_norm.weight", {ql}, Dsv41WeightClass::LayerNorm, layer);
   add_bf16(out, p + "kv_norm.weight", {hd}, Dsv41WeightClass::LayerNorm, layer);
   add_f32(out, p + "attn_sink", {heads}, c, layer);
+  if (cfg.weights_exl3) {
+    // The pack (docs/deepseek_v41_flash_exl3_plan.md §1.1): every projection
+    // an EXL3 matrix; wo_a as one matrix per output group (slice.g: the
+    // group's heads to its o_lora rows); the compressors and the indexer's
+    // wq_b and wk EXL3 too; weights_proj stored F16.
+    const int ab = cfg.exl3_bits_attention(layer);
+    add_exl3(out, p + "wq_a", H, ql, ab, c, layer);
+    add_exl3(out, p + "wq_b", ql, heads * hd, ab, c, layer);
+    add_exl3(out, p + "wkv", H, hd, ab, c, layer);
+    for (int g = 0; g < og; ++g) add_exl3(out, p + "wo_a.slice." + std::to_string(g), heads * hd / og, ol, ab, c, layer);
+    add_exl3(out, p + "wo_b", og * ol, H, ab, c, layer);
+    if (cfg.is_index_source(layer)) {
+      const std::string ip = p + "indexer.";
+      const int64_t ih = cfg.index_n_heads, id = cfg.index_head_dim;
+      add_exl3(out, ip + "wq_b", ql, ih * id, ab, Dsv41WeightClass::Indexer, layer);
+      add(out, ip + "weights_proj.weight", DType::F16, {ih, H}, Dsv41WeightClass::Indexer, layer);
+      if (cfg.is_kv_source(layer)) {
+        add_exl3(out, ip + "wk", hd, id, cfg.exl3_bits_indexer_wk(layer), Dsv41WeightClass::Indexer, layer);
+        add_bf16(out, ip + "k_norm.weight", {id}, Dsv41WeightClass::LayerNorm, layer);
+      }
+    }
+    if (cfg.is_kv_source(layer)) {
+      const std::string cp = p + "compressor.";
+      add_exl3(out, cp + "wkv", H, hd, ab, Dsv41WeightClass::Compressor, layer);
+      if (cfg.compress_ratio(layer) > 1) add_exl3(out, cp + "wgate", H, hd, ab, Dsv41WeightClass::Compressor, layer);
+      add_bf16(out, cp + "norm.weight", {hd}, Dsv41WeightClass::LayerNorm, layer);
+    }
+    return;
+  }
   add_fp8(out, p + "wq_a", ql, H, c, layer, b);
   add_fp8(out, p + "wq_b", heads * hd, ql, c, layer, b);
   add_fp8(out, p + "wkv", hd, H, c, layer, b);
@@ -83,6 +123,25 @@ void expect_moe(TensorList& out, const std::string& p, const Dsv41TextConfig& cf
   const int64_t S = cfg.shared_expert_inter();
   const bool draft = cfg.is_draft(layer);
   const int64_t E = draft ? cfg.dspark_n_routed_experts : cfg.n_routed_experts;
+  if (cfg.weights_exl3) {
+    // The pack stores the routers F16 (the bias too); the experts are EXL3
+    // at the layer's routed / shared widths (a draft stage: mtp).
+    add(out, p + "gate.weight", DType::F16, {E, H}, Dsv41WeightClass::Router, layer);
+    add(out, p + "gate.bias", DType::F16, {E}, Dsv41WeightClass::Router, layer);
+    if (cfg.vision_present) add_f32(out, p + "gate.bias_vl", {E}, Dsv41WeightClass::Router, layer);
+    const int rb = cfg.exl3_bits_routed(layer), sb = cfg.exl3_bits_shared(layer);
+    for (int e = 0; e < E; ++e) {
+      const std::string ep = p + "experts." + std::to_string(e) + ".";
+      add_exl3(out, ep + "w1", H, I, rb, Dsv41WeightClass::RoutedExpert, layer, e);
+      add_exl3(out, ep + "w2", I, H, rb, Dsv41WeightClass::RoutedExpert, layer, e);
+      add_exl3(out, ep + "w3", H, I, rb, Dsv41WeightClass::RoutedExpert, layer, e);
+    }
+    const std::string sp = p + "shared_experts.";
+    add_exl3(out, sp + "w1", H, S, sb, Dsv41WeightClass::SharedExpert, layer);
+    add_exl3(out, sp + "w2", S, H, sb, Dsv41WeightClass::SharedExpert, layer);
+    add_exl3(out, sp + "w3", H, S, sb, Dsv41WeightClass::SharedExpert, layer);
+    return;
+  }
   add_bf16(out, p + "gate.weight", {E, H}, Dsv41WeightClass::Router, layer);
   add_f32(out, p + "gate.bias", {E}, Dsv41WeightClass::Router, layer);
   if (cfg.vision_present) add_f32(out, p + "gate.bias_vl", {E}, Dsv41WeightClass::Router, layer);
@@ -118,6 +177,13 @@ void expect_engram(TensorList& out, const std::string& p, const Dsv41TextConfig&
       Dsv41TensorRole::TablePayload);
   add(out, ep + "embed.scale", DType::F8_E8M0, {rows, hd / cfg.fp4_block_size}, Dsv41WeightClass::EngramTable,
       layer, -1, Dsv41TensorRole::TableScale);
+  if (cfg.weights_exl3) {
+    add_exl3(out, ep + "wkv", cfg.engram_width(), static_cast<int64_t>(cfg.hidden_size) * (cfg.hc_mult + 1),
+             cfg.exl3_bits_engram(layer), Dsv41WeightClass::Engram, layer);
+    add_f32(out, ep + "q_weight", {cfg.hc_mult, cfg.hidden_size}, Dsv41WeightClass::Engram, layer);
+    add_f32(out, ep + "k_weight", {cfg.hc_mult, cfg.hidden_size}, Dsv41WeightClass::Engram, layer);
+    return;
+  }
   add_fp8(out, ep + "wkv", static_cast<int64_t>(cfg.hidden_size) * (cfg.hc_mult + 1), cfg.engram_width(),
           Dsv41WeightClass::Engram, layer, cfg.fp8_block_size);
   add_bf16(out, ep + "q_weight", {cfg.hc_mult, cfg.hidden_size}, Dsv41WeightClass::Engram, layer);
@@ -129,15 +195,20 @@ void expect_draft_extras(TensorList& out, const std::string& p, const Dsv41TextC
   const int64_t H = cfg.hidden_size, V = cfg.vocab_size, R = cfg.dspark_markov_rank;
   const Dsv41WeightClass c = Dsv41WeightClass::Draft;
   if (stage == 0) {
-    add_fp8(out, p + "main_proj", H, H * static_cast<int64_t>(cfg.dspark_target_layer_ids.size()), c, layer,
-            cfg.fp8_block_size);
+    if (cfg.weights_exl3)
+      add_exl3(out, p + "main_proj", H * static_cast<int64_t>(cfg.dspark_target_layer_ids.size()), H, cfg.exl3.mtp, c,
+               layer);
+    else
+      add_fp8(out, p + "main_proj", H, H * static_cast<int64_t>(cfg.dspark_target_layer_ids.size()), c, layer,
+              cfg.fp8_block_size);
     add_bf16(out, p + "main_norm.weight", {H}, Dsv41WeightClass::LayerNorm, layer);
   }
   if (stage == cfg.num_nextn_predict_layers - 1) {
     add_bf16(out, p + "norm.weight", {H}, Dsv41WeightClass::LayerNorm, layer);
     add_bf16(out, p + "markov_head.embed.weight", {V, R}, c, layer);
-    add_bf16(out, p + "markov_head.head.weight", {V, R}, c, layer);
-    add_bf16(out, p + "confidence_head.proj.weight", {1, H + R}, c, layer);
+    // The pack stores the Markov head and the confidence head F16.
+    add(out, p + "markov_head.head.weight", cfg.weights_exl3 ? DType::F16 : DType::BF16, {V, R}, c, layer);
+    add(out, p + "confidence_head.proj.weight", cfg.weights_exl3 ? DType::F16 : DType::BF16, {1, H + R}, c, layer);
   }
 }
 
@@ -169,7 +240,10 @@ std::vector<Dsv41ExpectedTensor> dsv41_expected_global_tensors(const Dsv41TextCo
   const int64_t H = cfg.hidden_size;
   add_bf16(out, "embed.weight", {cfg.vocab_size, H}, Dsv41WeightClass::Embed, -1);
   add_bf16(out, "norm.weight", {H}, Dsv41WeightClass::FinalNorm, -1);
-  add_bf16(out, "head.weight", {cfg.vocab_size, H}, Dsv41WeightClass::LmHead, -1);
+  if (cfg.weights_exl3)
+    add_exl3(out, "head", H, cfg.vocab_size, cfg.exl3.head, Dsv41WeightClass::LmHead, -1);
+  else
+    add_bf16(out, "head.weight", {cfg.vocab_size, H}, Dsv41WeightClass::LmHead, -1);
   return out;
 }
 
@@ -260,6 +334,7 @@ Dsv41BindReport dsv41_validate_text_binding(
     switch (e.role) {
       case Dsv41TensorRole::Fp4Payload: ++rep.fp4_matrices; break;
       case Dsv41TensorRole::Fp8Payload: ++rep.fp8_matrices; break;
+      case Dsv41TensorRole::Exl3Trellis: ++rep.exl3_matrices; break;
       case Dsv41TensorRole::TablePayload: ++rep.engram_tables; break;
       case Dsv41TensorRole::Skipped: ++rep.skipped; break;
       default: break;
@@ -299,9 +374,21 @@ void dsv41_tp_validate_geometry(const Dsv41TextConfig& cfg, int rank, int world)
     fail("o_groups must divide by world (a rank holds whole output groups of wo_a)");
   if (cfg.num_attention_heads % world != 0) fail("num_attention_heads must divide by world");
   if (cfg.index_n_heads % world != 0) fail("index_n_heads must divide by world");
-  if (cfg.vocab_size % world != 0) fail("vocab_size must divide by world (the head is vocab-sharded)");
   if (!cfg.engram_layer_ids.empty() && cfg.engram_n_heads % world != 0)
     fail("engram_n_heads must divide by world (the tables are sharded by hash head)");
+  if (cfg.weights_exl3) {
+    // Whole 128-blocks per rank (the plan's §2.3): the intermediate and the
+    // vocabulary need at least one block per rank; the wo_b input slice (a
+    // rank's groups x o_lora) and the head-block slice are 128-multiples
+    // by the config's own checks.
+    for (const int inter : {cfg.moe_intermediate_size, cfg.shared_expert_inter()})
+      if (inter / 128 < world) fail("an intermediate size must hold at least one 128-block per rank (EXL3)");
+    if (cfg.vocab_size / 128 < world) fail("vocab_size must hold at least one 128-block per rank (the EXL3 head)");
+    if (((static_cast<int64_t>(cfg.o_groups) * cfg.o_lora_rank) / world) % 128 != 0)
+      fail("the wo_b input slice must be a multiple of 128 (the EXL3 rotation block)");
+    return;
+  }
+  if (cfg.vocab_size % world != 0) fail("vocab_size must divide by world (the head is vocab-sharded)");
   for (const int inter : {cfg.moe_intermediate_size, cfg.shared_expert_inter()}) {
     if (inter % world != 0) fail("an intermediate size must divide by world");
     if ((inter / world) % 32 != 0)

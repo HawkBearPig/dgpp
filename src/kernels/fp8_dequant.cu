@@ -1,4 +1,5 @@
 #include "kernels/fp8_dequant.hpp"
+#include "kernels/pdl.cuh"
 
 #include <stdexcept>
 
@@ -32,6 +33,7 @@ __global__ void fp8_dequant_blocks_kernel(const uint8_t* __restrict__ payload,
                                           uint16_t* __restrict__ out,
                                           int64_t rows, int64_t cols,
                                           int64_t scale_cols, int rs, int cs) {
+  dgpp_pdl_wait();
   const int64_t i =
       static_cast<int64_t>(blockIdx.x) * kThreads + threadIdx.x;
   const int64_t total = rows * cols;

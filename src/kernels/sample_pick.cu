@@ -1,4 +1,5 @@
 #include "kernels/sample_pick.hpp"
+#include "kernels/pdl.cuh"
 
 #include <cmath>
 #include <mutex>
@@ -252,6 +253,7 @@ __global__ void __launch_bounds__(kChunkThreads)
                           const uint32_t* __restrict__ masks, int mask_stride,
                           double* __restrict__ maxes, const PickVerdict* __restrict__ row_select,
                           int source_row_stride, const int32_t* request_map) {
+  dgpp_pdl_wait();
   __shared__ float fred[32];
   __shared__ uint64_t kred[32];
   const int c = blockIdx.x;
@@ -324,6 +326,7 @@ __global__ void __launch_bounds__(kChunkThreads)
                            const double* __restrict__ maxes, double* __restrict__ partials,
                            const PickVerdict* __restrict__ row_select, int source_row_stride,
                            const int32_t* request_map) {
+  dgpp_pdl_wait();
   __shared__ double terms[kChunkThreads];
   __shared__ float fred[32];
   const int c = blockIdx.x;
@@ -502,6 +505,7 @@ __global__ void __launch_bounds__(kLocalThreads) sample_local_kernel(
     int nchunks, const uint64_t* __restrict__ carry_digest, uint16_t* __restrict__ table,
     PickLocal* __restrict__ locals, const PickVerdict* __restrict__ row_select,
     int source_row_stride, const int32_t* request_map) {
+  dgpp_pdl_wait();
   __shared__ uint32_t hist[kRadixBins];
   __shared__ int found[3];
   __shared__ int sel_count;
@@ -1278,6 +1282,7 @@ __global__ void __launch_bounds__(kVerdictThreads) sample_verdict_kernel(
     const DraftProposal* __restrict__ proposals_in, DraftProposal* __restrict__ proposals_out,
     DraftProposal* __restrict__ proposals_out_host, int draft_index, const int32_t* request_map,
     int block_verify) {
+  dgpp_pdl_wait();
   // One row's split composite keys at a time (hi = ~primary, lo = id; the
   // empty slot is the maximal key) — the merge is per row, and T rows of
   // keys would not fit the static shared bound — with every row's merged
@@ -1859,6 +1864,7 @@ __global__ void sample_digest_kernel(const uint16_t* __restrict__ digests,
                                      PickVerdict* __restrict__ verdicts,
                                      PickVerdict* __restrict__ device_verdicts,
                                      uint64_t* __restrict__ carry_digest) {
+  dgpp_pdl_wait();
   PickVerdict* src = device_verdicts != nullptr ? device_verdicts : verdicts;
   uint64_t digest = requests == 1 ? 0 : splitmix64(requests);
   for (int q = 0; q < requests; ++q) {
@@ -1897,6 +1903,7 @@ __global__ void sample_digest_kernel(const uint16_t* __restrict__ digests,
 __global__ void count_tokens_kernel(int32_t* __restrict__ counts,
                                     const int64_t* __restrict__ ids, int n,
                                     int vocab_size) {
+  dgpp_pdl_wait();
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n) return;
   const int64_t t = ids[i];
@@ -1922,6 +1929,7 @@ void check_common(int rows, int world, int rank, int candidates,
 
 __global__ void adjust_count_kernel(int32_t* __restrict__ counts, int64_t token,
                                     int delta, int vocab_size) {
+  dgpp_pdl_wait();
   if (threadIdx.x == 0 && token >= 0 && token < vocab_size)
     counts[token] += delta;
 }
@@ -2059,6 +2067,7 @@ namespace {
 __global__ void draft_confidence_kernel(const SampleOutcome* __restrict__ outcomes,
                                         int slot_stride, int request, int depth,
                                         float* __restrict__ dst) {
+  dgpp_pdl_wait();
   const int c = static_cast<int>(threadIdx.x);
   if (c >= depth) return;
   // The outcome lives in pinned memory the verdict kernel wrote earlier on

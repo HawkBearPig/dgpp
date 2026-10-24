@@ -4,6 +4,7 @@
   "release": "",
   "engine": {
     "max_concurrency": 8,
+    "l2_prefetch_full_form": "48x4",
     "kv_capacity": 122880,
     "kv_dtype": "bf16",
     "bf16_weights": "bf12",

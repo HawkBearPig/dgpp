@@ -48,6 +48,10 @@ ChatMarkers ChatMarkers::from_tokenizer(const Tokenizer& tok) {
   {
     const std::vector<int64_t> nl = tok.encode("\n");
     if (nl.size() == 1) m.newline = ChatMarker{nl[0], "\n"};
+    for (int run = 1; run <= 4; ++run) {
+      const std::vector<int64_t> ids = tok.encode(std::string(static_cast<size_t>(run), '\n'));
+      if (ids.size() == 1) m.newline_ids.push_back(ids[0]);
+    }
   }
   return m;
 }

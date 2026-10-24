@@ -6,6 +6,15 @@ prompt/token deltas equal the completed requests' usage, with a five-second
 deadline. Polling is outside the client and engine timing intervals.
 Arguments and JSON fields are the same as serve_load, plus each phase's
 engine counters and decode tokens/s. Warmup and isolation are reconciled too.
+
+Two rates come out of every phase, and the tables keep them apart:
+  decode tok/s  (engine)  tokens generated / the engine's decode-step time —
+                prefill and queueing excluded; the headline throughput, the
+                figure docs/benchmarks.md reports by concurrency.
+  wall tok/s    (client)  tokens generated / the request group's wall time —
+                prefill and queueing included; the service-level view.
+The per-class table printed first is the decode rate; serve_load's own
+table (the wall rate) follows it.
 """
 import math
 import time
@@ -63,6 +72,7 @@ def reconciled_metrics(host, port, before=None, requests=(), *, timeout=5):
 class TimedLoad:
     def __init__(self):
         self.previous = None
+        self.decode_rates = []  # (class, concurrency, engine tok/s) per measured phase
 
     def settle(self, host, port, requests):
         self.previous = reconciled_metrics(host, port, self.previous, requests)
@@ -84,13 +94,31 @@ class TimedLoad:
                             "tokens_per_s": tokens * 1000 / delta["step_ms"]}
         if reports is not None:
             reports.append(result)
-        print(f"   engine decode: {result['engine']['tokens_per_s']:.3f} tok/s", flush=True)
+        self.decode_rates.append((label.strip() or "mixed", c, result["engine"]["tokens_per_s"]))
+        print(f"   engine decode: {result['engine']['tokens_per_s']:.3f} tok/s (decode steps only; the wall rate above includes prefill)", flush=True)
         return rate
+
+
+def decode_table(rates):
+    """Median decode-only rate per (class, concurrency) over the repetitions, as a markdown table."""
+    import statistics
+    cells = {}
+    for cls, c, rate in rates:
+        cells.setdefault((cls, c), []).append(rate)
+    classes = list(dict.fromkeys(cls for cls, _, _ in rates))
+    cs = sorted({c for _, c, _ in rates})
+    lines = ["== per-class engine decode tokens/s (decode steps only; prefill and queueing excluded)",
+             "| class | " + " | ".join(f"c={c}" for c in cs) + " |", "|---|" + "---|" * len(cs)]
+    for cls in classes:
+        lines.append(f"| {cls} | " + " | ".join(f"{statistics.median(cells[(cls, c)]):.1f}" if (cls, c) in cells else "—" for c in cs) + " |")
+    return "\n".join(lines)
 
 
 def main():
     load = TimedLoad()
     serve_load.main(phase_runner=load.phase, settle=load.settle)
+    if load.decode_rates:
+        print(decode_table(load.decode_rates), flush=True)
 
 
 if __name__ == "__main__":

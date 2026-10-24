@@ -46,6 +46,7 @@
 #include "loaders/weight_build.hpp"
 #include "models/dsv41/binding.hpp"
 #include "models/dsv41/config.hpp"
+#include "models/exl3_matrix.hpp"
 #include "models/quant_matrix.hpp"
 
 namespace dgpp {
@@ -74,12 +75,21 @@ struct Dsv41AttnResident {
   const uint16_t* comp_wkv = nullptr;   // bf16 [head_dim, hidden]
   const uint16_t* comp_wgate = nullptr; // bf16 [head_dim, hidden]
   const uint16_t* comp_norm = nullptr;  // bf16 [head_dim]
+  // The EXL3 pack's projections (docs/deepseek_v41_flash_exl3_plan.md §3.1;
+  // the fp8 / bf16 members above stay unset): the same slices as the fp8
+  // ones — wq_b's rows per head block, wo_a one matrix per LOCAL group
+  // (the group's heads x head_dim -> o_lora), wo_b's packed input columns
+  // of those groups; the compressors and the indexer's wq_b / wk EXL3 too.
+  Exl3Matrix wq_a_x, wkv_x, wq_b_x, wo_b_x;
+  std::vector<Exl3Matrix> wo_a_x;  // [local_groups]
+  Exl3Matrix idx_wq_b_x, idx_wk_x, comp_wkv_x, comp_wgate_x;
   int local_heads = 0;
   int head_begin = 0;
   int local_groups = 0;
   int group_begin = 0;
-  bool index_source() const { return idx_wq_b.payload != nullptr; }
-  bool kv_source() const { return comp_wkv != nullptr; }
+  bool exl3() const { return wq_a_x.tiles != nullptr; }
+  bool index_source() const { return idx_wq_b.payload != nullptr || idx_wq_b_x.tiles != nullptr; }
+  bool kv_source() const { return comp_wkv != nullptr || comp_wkv_x.tiles != nullptr; }
 };
 
 struct Dsv41MoeResident {
@@ -87,9 +97,17 @@ struct Dsv41MoeResident {
   const float* router_bias = nullptr;   // f32 [E]
   GlmQuantMatrix shared[3];             // fp8: w1, w3 [S/W, hidden]; w2 [hidden, S/W]
   std::vector<GlmFp4Matrix> experts;    // [E * 3]: w1, w3, w2 per expert (MXFP4, inter-sliced)
+  // The EXL3 pack's experts: [E * 3] gate, up, down per expert and the
+  // shared triple, sliced on the intermediate in whole 128-blocks (the
+  // uneven split alternating by parity, exl3_expert_block_split: a
+  // matrix's own rows / cols carry its width, local_inter the widest);
+  // the fp4 / fp8 members stay unset.
+  std::vector<Exl3Matrix> experts_x;
+  Exl3Matrix shared_x[3];
+  bool exl3() const { return !experts_x.empty(); }
   int n_experts = 0;
-  int64_t local_inter = 0;              // I/W
-  int64_t local_shared_inter = 0;       // S/W
+  int64_t local_inter = 0;              // this rank's intermediate slice (I/W, or the EXL3 block split's widest)
+  int64_t local_shared_inter = 0;       // this rank's shared slice
   // The view-table order the MoE layer expects: gate (w1), up (w3), down (w2).
   const GlmFp4Matrix& expert(int e, int i) const { return experts[static_cast<size_t>(e) * 3 + i]; }
 };
@@ -107,12 +125,14 @@ struct Dsv41EngramResident {
   bool present = false;
   int table_index = -1;                 // ordinal among the Engram layers
   GlmQuantMatrix wkv;                   // fp8 [(hc + 1) * hidden, rows_local * head_dim]: this rank's K columns
+  Exl3Matrix wkv_x;                     // the EXL3 pack's (the same K columns)
   const uint16_t* q_weight = nullptr;   // bf16 [hc, hidden]
   const uint16_t* k_weight = nullptr;   // bf16 [hc, hidden]
 };
 
 struct Dsv41DraftResident {
   GlmQuantMatrix main_proj;                 // stage 0: fp8 [hidden, targets * hidden]
+  Exl3Matrix main_proj_x;                   // stage 0, the EXL3 pack
   const uint16_t* main_norm = nullptr;      // stage 0: bf16 [hidden]
   const uint16_t* norm = nullptr;           // last stage: bf16 [hidden]
   const uint16_t* markov_embed = nullptr;   // last stage: bf16 [vocab, rank], replicated
@@ -138,6 +158,7 @@ struct Dsv41GlobalsResident {
   int embed_vocab_count = 0;
   const uint16_t* final_norm = nullptr;  // bf16 [hidden]
   const uint16_t* lm_head = nullptr;     // bf16 [lm_vocab_count, hidden]
+  Exl3Matrix lm_head_x;                  // the EXL3 pack's head rows [lm_vocab_begin, +lm_vocab_count)
   int lm_vocab_begin = 0;
   int lm_vocab_count = 0;
   size_t bytes = 0;
@@ -204,8 +225,17 @@ struct Dsv41LocalGeometry {
   int world = 1, rank = 0;
   int local_heads = 0, head_begin = 0;      // attention heads
   int local_groups = 0, group_begin = 0;    // wo_a / wo_b output groups
-  int64_t local_inter = 0;                  // moe_intermediate_size / W
-  int64_t local_shared_inter = 0;           // shared_expert_inter() / W
+  // The intermediate slices: [inter_begin, +local_inter) of
+  // moe_intermediate_size and [shared_inter_begin, +local_shared_inter) of
+  // shared_expert_inter() — I/W each under the release format; under EXL3
+  // whole 128-blocks: inter_begin is the even-parity slice's begin and
+  // local_inter the widest slice (640 at world 4), each expert's own slice
+  // being exl3_expert_block_split's (5/5/4/4 blocks on even experts,
+  // 4/4/5/5 on odd; the shared expert by the layer's parity).
+  int64_t local_inter = 0;
+  int64_t inter_begin = 0;
+  int64_t local_shared_inter = 0;
+  int64_t shared_inter_begin = 0;
   int engram_heads_local = 0, engram_head_begin = 0;
   int lm_vocab_begin = 0, lm_vocab_count = 0;
   int embed_vocab_begin = 0, embed_vocab_count = 0;
@@ -223,7 +253,9 @@ struct Dsv41LoaderFamily {
   using PresentMap = std::unordered_map<std::string, Dsv41TensorDesc>;
   struct Builder;  // models/dsv41/loader.cpp
   static const char* who() { return "dsv41 loader"; }
-  static uint64_t loader_format() { return 1; }
+  // 2 since 2026-10-23: the experts' intermediate slices alternate by parity
+  // (exl3_expert_block_split), so an image of the one-rule layout is stale.
+  static uint64_t loader_format() { return 2; }
   static int max_layer(const Config& c) { return c.max_layer(); }
   static int main_layers(const Config& c) { return c.num_hidden_layers; }
   static std::vector<Expected> layer_table(const Config& c, int layer) {
@@ -238,6 +270,13 @@ struct Dsv41LoaderFamily {
                             LayerBump& bump, GlobalsResident& out, uint64_t& source_bytes,
                             uint64_t& verbatim_bytes, LoaderHeadSharding head);
   static size_t globals_bytes(const Config& c, int rank, int world, LoaderHeadSharding head);
+  // The Engram tables from another snapshot (the EXL3 pack ships none; the
+  // base checkpoint's shards 47 / 48 hold them): the stream admits the
+  // table tensors from this directory when the checkpoint's own shards do
+  // not carry them (loaders/resident_stream.hpp's extra shard directory).
+  // Empty: the checkpoint's own. Set before the stream opens.
+  static std::string extra_shard_dir();
+  static bool admit_extra_tensor(const std::string& name);
   static size_t extra_resident_bytes(const Config&, int, int) { return 0; }
   static size_t min_staging_bytes() { return 0; }
   static void after_restore(const Config&, int, const LoaderTensorMap&, LayerResident&) {}
@@ -254,6 +293,11 @@ class Dsv41LayerStream : public ResidentLayerStream<Dsv41LoaderFamily> {
 
   static void set_resident_image_dir(const std::string& dir);
   static const std::string& resident_image_dir();
+  // The Engram source snapshot (engine.engram_source): where the tables'
+  // shards — and the Engram sidecar, when the checkpoint has none — are
+  // read from. Empty: the checkpoint directory.
+  static void set_engram_source_dir(const std::string& dir);
+  static const std::string& engram_source_dir();
   // The deployment's `engine.embed_sharding` ("vocab": each rank holds its
   // lm-head slice of the embedding; "replicated": the whole table).
   static void set_embed_vocab_sharded(bool on);

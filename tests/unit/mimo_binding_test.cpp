@@ -159,7 +159,8 @@ DGPP_TEST(mimo_tp_geometry_accepts_the_deployment_worlds) {
 
 DGPP_TEST(mimo_binding_matches_the_landed_checkpoint) {
   const auto snap = landed_snapshot();
-  if (snap.empty()) return;
+  if (snap.empty())
+    dgpp::test::skip("required checkpoint snapshot unavailable: XiaomiMiMo/MiMo-V2.6-Flash-RL");
   namespace fs = std::filesystem;
   // Only once every shard of the index is present (the download may be in flight).
   {
@@ -168,7 +169,8 @@ DGPP_TEST(mimo_binding_matches_the_landed_checkpoint) {
     const auto parsed = dgpp::minijson::parse(text);
     for (const auto& m : parsed.root.at("weight_map").members()) {
       const fs::path shard = snap / std::string(m.value.as_string());
-      if (!fs::exists(shard)) return;
+      if (!fs::exists(shard))
+        dgpp::test::skip("checkpoint download incomplete; missing shard: " + shard.string());
     }
   }
   const dgpp::MimoTextConfig cfg = dgpp::MimoTextConfig::from_json_file((snap / "config.json").string());

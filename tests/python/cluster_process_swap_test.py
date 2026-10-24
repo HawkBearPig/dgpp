@@ -1,4 +1,4 @@
-"""Exercise the launcher's swap policy in a real, small systemd user scope."""
+"""Check swap policy validation/propagation and real, small systemd user scopes."""
 import json
 import os
 from pathlib import Path
@@ -33,13 +33,37 @@ class ProcessSwapTest(unittest.TestCase):
             os.killpg(proc.pid, signal.SIGKILL)
         proc.wait(timeout=10)
 
-    def test_scope_has_zero_swap_and_recorded_group_can_stop_it(self):
+    def require_systemd_run(self):
         if not shutil.which("systemd-run"):
             self.skipTest("systemd-run is unavailable")
-        manager = subprocess.run(["systemctl", "--user", "show", "--property=ControlGroup"],
-                                 capture_output=True, timeout=10)
+
+    def require_swap_scope(self):
+        self.require_systemd_run()
+        if not shutil.which("systemctl"):
+            self.skipTest("systemctl is unavailable")
+        try:
+            manager = subprocess.run(
+                ["systemctl", "--user", "show", "--property=ControlGroup", "--value"],
+                capture_output=True, text=True, timeout=10)
+        except subprocess.TimeoutExpired:
+            self.skipTest("systemd user manager did not respond")
         if manager.returncode:
             self.skipTest("systemd user manager is unavailable")
+        group = manager.stdout.strip()
+        if not group.startswith("/"):
+            self.skipTest("systemd user manager has no cgroup")
+        cgroup = Path("/sys/fs/cgroup") / group.lstrip("/")
+        try:
+            controllers = (cgroup / "cgroup.controllers").read_text().split()
+            (cgroup / "memory.swap.max").read_text()
+            (cgroup / "memory.swap.current").read_text()
+        except (FileNotFoundError, PermissionError):
+            self.skipTest("cgroup v2 memory/swap controls are unavailable")
+        if "memory" not in controllers:
+            self.skipTest("cgroup v2 memory controller is unavailable for user scopes")
+
+    def test_scope_has_zero_swap_and_recorded_group_can_stop_it(self):
+        self.require_swap_scope()
         ready = self.directory / "ready.json"
         code = """
 import json, os, signal, sys
@@ -76,8 +100,8 @@ signal.pause()
         self.assertIsNone(cluster_process.running(self.state))
 
     def test_scope_failure_does_not_run_the_command_without_protection(self):
-        if not shutil.which("systemd-run"):
-            self.skipTest("systemd-run is unavailable")
+        # A working manager is deliberately unnecessary for this failure path.
+        self.require_systemd_run()
         marker = self.directory / "must-not-exist"
         env = {**self.env, "XDG_RUNTIME_DIR": str(self.directory),
                "DBUS_SESSION_BUS_ADDRESS": "unix:path=" + str(self.directory / 'missing-bus')}
@@ -114,20 +138,14 @@ print(json.dumps({'arguments': sys.argv[1:],
         return binary
 
     def test_version_probe_uses_zero_swap_scope(self):
-        if not shutil.which('systemd-run'):
-            self.skipTest('systemd-run is unavailable')
-        manager = subprocess.run(['systemctl', '--user', 'show', '--property=ControlGroup'],
-                                 capture_output=True, timeout=10)
-        if manager.returncode:
-            self.skipTest('systemd user manager is unavailable')
+        self.require_swap_scope()
         result = cluster_doctor.server_version(str(self.version_binary()), self.env)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout),
                          {'arguments': ['--version'], 'swap_max': '0', 'swap_current': '0'})
 
     def test_version_probe_does_not_fall_back_when_scope_fails(self):
-        if not shutil.which('systemd-run'):
-            self.skipTest('systemd-run is unavailable')
+        self.require_systemd_run()
         env = {**self.env, 'XDG_RUNTIME_DIR': str(self.directory),
                'DBUS_SESSION_BUS_ADDRESS': 'unix:path=' + str(self.directory / 'missing-bus')}
         result = cluster_doctor.server_version(str(self.version_binary()), env)

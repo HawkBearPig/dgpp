@@ -1,4 +1,5 @@
 #include "kernels/glm_mhc_launch.hpp"
+#include "kernels/pdl.cuh"
 
 #include <cstdint>
 #include <stdexcept>
@@ -149,6 +150,7 @@ __global__ void mhc_comb_kernel(const float* __restrict__ logits_in,
                                 uint16_t* __restrict__ comb_out, int tokens,
                                 float hc_eps, int sinkhorn_iters,
                                 float* __restrict__ comb_f32) {
+  dgpp_pdl_wait();
   __shared__ float comb_seed[kN * kN];
   const int token = blockIdx.x;
   if (token >= tokens) return;
@@ -350,6 +352,7 @@ __global__ void mhc_dots_kernel(const uint16_t* __restrict__ streams,
                                 float* __restrict__ logits, int tokens,
                                 int hidden, float norm_eps,
                                 MhcFinishArgs fin) {
+  dgpp_pdl_wait();
   __shared__ float scratch[kThreads / 32];
   __shared__ int s_last;
 
@@ -485,6 +488,7 @@ __global__ __launch_bounds__(kThreads) void mhc_dots_tiled_kernel(
     const uint16_t* __restrict__ streams, const uint16_t* __restrict__ fn,
     float* __restrict__ logits, int tokens, int hidden, float norm_eps,
     MhcFinishArgs fin) {
+  dgpp_pdl_wait();
   extern __shared__ __align__(16) uint4 tile_smem[];
   uint4* sX = tile_smem;                                   // [4][256]
   uint4* sF = tile_smem + kTileTokens * kTileChunkVecs;    // [12][256], two halves
@@ -578,7 +582,7 @@ __global__ __launch_bounds__(kThreads) void mhc_dots_tiled_kernel(
   __syncthreads();  // the logits are visible to this block's finish
   for (int i = 0; i < kTileTokens; ++i) {
     if (t0 + i >= tokens) break;
-    mhc_finish_block<kPerThread>(t0 + i, streams, logits, fin, hidden);
+    mhc_finish_block<kPerThread>(t0 + i, streams, logits, fin, hidden, fin.defer_comb != 0);
     __syncthreads();  // the finish's shared state is reused by the next token
   }
 }
@@ -587,6 +591,7 @@ template <int kPerThread>
 __global__ void mhc_finish_kernel(const uint16_t* __restrict__ streams,
                                   const float* __restrict__ logits_in,
                                   MhcFinishArgs fin, int tokens, int hidden) {
+  dgpp_pdl_wait();
   const int token = blockIdx.x;
   if (token >= tokens) return;
   mhc_finish_block<kPerThread>(token, streams, logits_in, fin, hidden);
@@ -602,6 +607,7 @@ __global__ void mhc_stream_update_f32_kernel(const float* __restrict__ post,
                                              const uint16_t* __restrict__ streams_in,
                                              uint16_t* __restrict__ streams_out,
                                              int tokens, int hidden) {
+  dgpp_pdl_wait();
   const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   const size_t total = static_cast<size_t>(tokens) * hidden;
   if (idx >= total) return;
@@ -633,6 +639,7 @@ __global__ void mhc_collapse_normed_kernel(const uint16_t* __restrict__ streams,
                                            uint16_t* __restrict__ collapsed,
                                            uint16_t* __restrict__ normed,
                                            int tokens, int hidden, float ln_eps) {
+  dgpp_pdl_wait();
   __shared__ float fscratch[kThreads / 32];
   const int token = blockIdx.x;
   if (token >= tokens) return;
@@ -714,6 +721,7 @@ __global__ void mhc_stream_update_kernel(const uint16_t* __restrict__ post,
                                          const uint16_t* __restrict__ streams_in,
                                          uint16_t* __restrict__ streams_out,
                                          int tokens, int hidden) {
+  dgpp_pdl_wait();
   const size_t idx =
       static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   const size_t total = static_cast<size_t>(tokens) * hidden;
@@ -742,6 +750,7 @@ __global__ void mhc_stream_update_kernel(const uint16_t* __restrict__ post,
 __global__ void mhc_final_mean_kernel(const uint16_t* __restrict__ streams,
                                       uint16_t* __restrict__ out, int tokens,
                                       int hidden) {
+  dgpp_pdl_wait();
   const size_t idx =
       static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   const size_t total = static_cast<size_t>(tokens) * hidden;
@@ -809,6 +818,7 @@ __device__ __forceinline__ void ldmatrix_x2(uint32_t (&r)[2], const void* smem) 
 __global__ __launch_bounds__(mhc_mma::kThreads, 2) void mhc_dots_mma_kernel(
     const uint16_t* __restrict__ streams, const uint16_t* __restrict__ fn,
     float* __restrict__ logits, int tokens, int K, float norm_eps) {
+  dgpp_pdl_wait();
   using namespace mhc_mma;
   extern __shared__ __align__(16) uint8_t smem[];
   __shared__ float s_ssq[BM];
@@ -950,6 +960,10 @@ void launch_dots(const uint16_t* streams, const GlmMhcWeights& w,
 // same chain whatever rows share the launch, so a prompt prefilled with
 // others is bitwise the prompt alone (DeepSeek-V4.1-Flash, 2026-09-14).
 int g_mhc_tile_min_tokens = 16;
+// Decode rows at or above which the token-tiled kernel serves a decode
+// batch (mhc_compute's decode_rows): below it the per-coefficient fused
+// form fills the SMs with one block per (coefficient, token).
+constexpr int kMhcDecodeTileMinTokens = 16;
 
 template <int kPerThread>
 void launch_dots_tiled(const uint16_t* streams, const GlmMhcWeights& w,
@@ -973,13 +987,15 @@ template <bool kVec>
 void launch_dots_by_width(const uint16_t* streams, const GlmMhcWeights& w,
                           const GlmMhcConfig& cfg, float* logits_scratch,
                           const MhcFinishArgs& fin, bool fused, int tokens,
-                          cudaStream_t stream, bool allow_tiled = true) {
+                          cudaStream_t stream, bool allow_tiled = true, bool allow_gemm = true) {
   const int per_thread = (cfg.hidden + kThreads - 1) / kThreads;
   if (kVec && allow_tiled && tokens >= g_mhc_tile_min_tokens && g_mhc_tiled_enabled) {
     // The prefill forms run the finish themselves whatever `fused` says
     // (the two-launch form's finish kernel is then skipped): the tensor-
-    // core dots (K % 64 == 0) or the token-tiled kernel.
-    if (g_mhc_prefill_gemm && ((kN * cfg.hidden) % mhc_mma::BK) == 0) {
+    // core dots (K % 64 == 0) or the token-tiled kernel. A decode batch
+    // (allow_gemm false) takes the token-tiled kernel only — the one
+    // bitwise the per-coefficient form — and keeps its deferred comb.
+    if (allow_gemm && g_mhc_prefill_gemm && ((kN * cfg.hidden) % mhc_mma::BK) == 0) {
       if (per_thread <= 8)
         launch_dots_gemm<8>(streams, w, cfg, logits_scratch, fin, tokens, stream);
       else if (per_thread <= 16)
@@ -1063,14 +1079,20 @@ bool launch_mhc_compute_normed(const uint16_t* streams, const GlmMhcWeights& w,
   }
   // The tiled prefill form runs the finish in-block with comb included,
   // whatever defer_comb says: only the fused per-coefficient form defers.
-  const bool tiled = vec && !decode_rows && tokens >= g_mhc_tile_min_tokens && g_mhc_tiled_enabled;
-  if (tiled) fin.defer_comb = 0;
+  // A decode batch of kMhcDecodeTileMinTokens rows and more takes the
+  // token-tiled kernel too (2026-10-23: the per-coefficient form re-reads
+  // the coefficient matrix per token — 80 us a site at forty rows against
+  // the tile's ~15; bitwise, the tile keeps the per-coefficient chain) and
+  // keeps its deferred comb; fewer decode rows stay on the fused form.
+  const bool decode_tiled = decode_rows && tokens >= kMhcDecodeTileMinTokens;
+  const bool tiled = vec && (!decode_rows || decode_tiled) && tokens >= g_mhc_tile_min_tokens && g_mhc_tiled_enabled;
+  if (tiled && !decode_rows) fin.defer_comb = 0;
   if (vec)
     launch_dots_by_width<true>(streams, w, cfg, logits_scratch, fin, fused,
-                               tokens, stream, /*allow_tiled=*/!decode_rows);
+                               tokens, stream, /*allow_tiled=*/tiled, /*allow_gemm=*/!decode_rows);
   else
     launch_dots_by_width<false>(streams, w, cfg, logits_scratch, fin, fused,
-                                tokens, stream, /*allow_tiled=*/!decode_rows);
+                                tokens, stream, /*allow_tiled=*/tiled, /*allow_gemm=*/!decode_rows);
   if (fused) return fin.defer_comb != 0;
   if (tiled) return false;  // finished in-block
   // The per-thread register slice must cover hidden / kThreads elements.

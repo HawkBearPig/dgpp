@@ -99,7 +99,7 @@ void require(bool condition, const std::string& what) {
 int main(int argc, char** argv) {
   try {
     std::string family = "deepseek", only;
-    int rows = 5, ctx = 131072, iters = 30, warmup = 5;
+    int rows = 5, ctx = 131072, iters = 30, warmup = 5, select_k_arg = 0;
     bool graph = true, cold_only = false;
     for (int i = 1; i < argc; ++i) {
       std::string arg = argv[i];
@@ -125,6 +125,8 @@ int main(int argc, char** argv) {
         iters = std::stoi(value);
       else if (arg == "--warmup")
         warmup = std::stoi(value);
+      else if (arg == "--select-k")  // the index budget (engine.index_topk); 0: the family's default
+        select_k_arg = std::stoi(value);
       else
         throw std::invalid_argument("unknown argument " + arg);
     }
@@ -138,7 +140,8 @@ int main(int argc, char** argv) {
     const int compression = family == "deepseek-encoder" ? 2 : 1;
     const int kpool = family == "flash" ? 4 : 1;
     const int ppb = 128 / kpool / compression;
-    const int select_k = family == "full" ? 2048 : 512;
+    const int select_k = select_k_arg > 0 ? select_k_arg : (family == "full" ? 2048 : 512);
+    require(select_k > 0 && (select_k & (select_k - 1)) == 0 && select_k <= dgpp::kSelectMaxK, "bad select_k");
     const int reference_k = csa ? 1 : select_k;
     const int max_selected = select_k * kpool + kpool - 1;
     const int entries = ctx / kpool / compression;
@@ -233,6 +236,13 @@ int main(int argc, char** argv) {
                                      candidate_blocks, candidate_counts.p, block_size, top.p,
                                      counts.p, stream);
     };
+    // The fused prefill scorer over the cache read as a contiguous [stride,
+    // 128] key buffer (the rows' visible entries bound the reads): the
+    // per-row logits of the prefill selection, timed per `rows` queries at
+    // this context. Runs last — it overwrites the logits buffer.
+    auto score_prefill = [&] {
+      dgpp::csa2_score_prefill(dq.p, dk.p, dw.p, ds.p, dp.p, rows, stride, 32, logits.p, stride, stream);
+    };
     std::vector<int32_t> expected_top, expected_counts, expected_candidates,
         expected_candidate_counts;
     if (csa) {
@@ -305,7 +315,8 @@ int main(int argc, char** argv) {
                 {"combined", [&] {
                    candidate();
                    listed();
-                 }}};
+                 }},
+                {"score_prefill", score_prefill}};
     require(only.empty() || std::any_of(stages.begin(), stages.end(),
                                         [&](const auto& stage) { return stage.first == only; }),
             "unknown stage for family");

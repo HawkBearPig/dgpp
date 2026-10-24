@@ -376,5 +376,5 @@ loader test pins the repack against GPTQ's own dequant. On the real
 checkpoint, `qwen_load_check --streaming` beside the production server
 bound every tensor and loaded three layers plus the draft at 1.31 GiB per
 layer (about 66.6 GiB resident for the whole model). The resident load,
-the serve gates and the throughput campaign against the author's published
-numbers are the next step and need an idle Spark.
+the serve gates and the throughput campaign are the next step and need an
+idle Spark.

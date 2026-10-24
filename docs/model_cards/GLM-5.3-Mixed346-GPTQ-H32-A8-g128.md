@@ -105,3 +105,12 @@ GSM8K 291/300, schema extraction 100/100 (NF4I8 157 / 294 / 100, Int4/Int8 160 /
 At two and four requests 87 and 141 ms per pass (37.3–39.1 and 47.3–52.0 wall tok/s). In situ on rank 0 (nsys, a 2K prefill): the int8
 tensor-core gate/up tile 2.30 ms per launch against the Int4 tile's 2.55, the down tile 3.84
 against 3.54; the decode slot kernels 224 / 109 µs against 231 / 110.
+
+### The window's full form (2026-10-20)
+
+The L2 weight prefetcher's full-rate windows took a narrower kernel shape on 2026-10-20 (16 blocks × 8 loads, 512 KB
+in flight, the DRAM rate at the light form's SM footprint; DeepSeek-V4.1, Qwen3.8 and GLM-5.3-Flash measured ahead on
+it). This family's windows run beside its streaming kernels, where the bytes in flight set a window's share, and the
+narrow form cost it 0.3–0.8 % a pass at C1 (code 62.29 → 62.47/62.78 ms per pass on two boots; the 48 × 4 form rebuilt
+for attribution read 62.29 again). The three GLM-5.3 templates therefore ship `engine.l2_prefetch_full_form: "48x4"`;
+the key's default is `16x8` (`docs/configuration.md`).

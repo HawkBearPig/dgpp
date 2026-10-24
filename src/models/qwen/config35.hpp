@@ -20,6 +20,7 @@
 #include "kernels/rope_scaling.hpp"
 #include "loaders/minijson.hpp"
 #include "models/qwen/config.hpp"
+#include "models/qwen/vision_config.hpp"
 
 namespace dgpp {
 
@@ -28,6 +29,8 @@ enum class Qwen35LayerKind : int { Gdn, Full };
 enum class Qwen35QuantKind : int {
   Fp8Block,   // e4m3 + BF16 128x128 block scales, dynamic activations
   Nvfp4Mixed, // compressed-tensors mixed: MLP nvfp4 group16, attn FP8, kv 8b hint
+  Nvfp4Moe,   // ModelOpt NVFP4 (nvidia/Qwen3.5-122B-A10B-NVFP4): routed
+              // experts nvfp4 group16 (ModelOpt naming), rest BF16
 };
 
 // The format one matrix carries in the Nvfp4Mixed release: which
@@ -80,7 +83,18 @@ struct Qwen35TextConfig {
   bool attn_output_gate = true;
 
   // --- dense SwiGLU MLP ----------------------------------------------------
+  // Dense variant only (is_moe == false). MoE variant uses moe_* below.
   int intermediate_size = 17408;
+
+  // --- MoE (qwen3_5_moe_text only) -------------------------------------------
+  bool is_moe = false;
+  int num_experts = 0;
+  int num_experts_per_tok = 0;
+  int moe_intermediate_size = 0;
+  int shared_expert_intermediate_size = 0;
+  // Softmax top-k router with renormalization (transformers default true;
+  // the 122B checkpoint omits the field, the base class defaults it true).
+  bool norm_topk_prob = true;
 
   // --- MTP ------------------------------------------------------------------
   int mtp_num_layers = 1;  // 0 or 1; the draft layer is a Full layer
@@ -89,6 +103,12 @@ struct Qwen35TextConfig {
   Qwen35QuantKind quant_kind = Qwen35QuantKind::Fp8Block;
   // Nvfp4Mixed only: the parsed config_groups (null for Fp8Block).
   std::shared_ptr<const Qwen35QuantGroups> quant_groups;
+
+  // --- visual tower ----------------------------------------------------------
+  // Parsed when the checkpoint carries one (both 27B releases do). A
+  // text-only export stays nullopt. Geometry is validated before loading
+  // the encoder so an unsupported tower fails before the first request.
+  std::optional<QwenVisionConfig> vision;
 
   static Qwen35TextConfig parse(const minijson::Value& text_config,
                                 const minijson::Value* quantization_config);

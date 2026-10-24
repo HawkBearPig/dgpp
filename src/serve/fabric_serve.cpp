@@ -211,13 +211,14 @@ std::string encode_journal_tick(const GenerationService::PassEvents& events) {
         out.push_back(']');
       }
       // The sampling spec rides for stochastic requests and for greedy ones
-      // that ask for logprobs; a plain greedy request's record is
+      // that ask for logprobs or carry penalties; a plain greedy request's record is
       // byte-identical to the pre-sampling format.
       if (r.logprobs >= 0) {
         out += ",\"lp\":";
         append_json_int(&out, r.logprobs);
       }
-      if (r.sampling.temperature > 0.0f || r.logprobs >= 0) {
+      if (r.sampling.temperature > 0.0f || r.logprobs >= 0 ||
+          sample::needs_context_penalties(r.sampling)) {
         const sample::Params& g = r.sampling;
         out += ",\"g\":{\"t\":";
         append_json_int(&out, float_bits(g.temperature));
@@ -423,6 +424,8 @@ std::string encode_journal_settings(const WorldSettings& s) {
   append_json_string(&out, s.prefill_activations);
   out += ",\"pfattn\":";
   append_json_string(&out, s.prefill_attention);
+  out += ",\"dcattn\":";
+  append_json_string(&out, s.decode_attention);
   out += ",\"dfm\":";
   append_json_string(&out, s.dflash_model);
   out += std::format(",\"dfvg\":{},\"dfdb\":{},\"dfdp\":{}", s.dflash_verify_graph ? 1 : 0,
@@ -434,6 +437,8 @@ std::string encode_journal_settings(const WorldSettings& s) {
                      s.l2_prefetch_window_mib, s.l2_prefetch_boundary_window_mib);
   out += ",\"l2f\":";
   append_json_string(&out, s.l2_prefetch_form);
+  out += ",\"l2ff\":";
+  append_json_string(&out, s.l2_prefetch_full_form);
   out += ",\"l2b\":";
   append_json_string(&out, s.l2_prefetch_boundary_rate);
   out += ",\"l2l\":";
@@ -445,6 +450,16 @@ std::string encode_journal_settings(const WorldSettings& s) {
   out += std::format(",\"compact\":{}", s.compact_batches ? 1 : 0);
   out += ",\"pf\":";
   append_json_string(&out, s.prefill);
+  out += ",\"pfd\":";
+  append_json_string(&out, s.prefill_dense);
+  out += std::format(",\"pfo\":{}", s.prefill_fold_overlap ? 1 : 0);
+  out += std::format(",\"pdl\":{}", s.decode_pdl ? 1 : 0);
+  out += ",\"pfw\":";
+  append_json_string(&out, s.prefill_window);
+  out += ",\"dcw\":";
+  append_json_string(&out, s.decode_window);
+  out += ",\"ctr\":";
+  append_json_string(&out, s.collective_transport);
   // The opt-in YaRN ramp: absent when off, so a record from a plain run
   // carries no key at all (an older peer decodes it to "off", which is
   // what it would have run anyway — a world never mixes the two).
@@ -460,11 +475,20 @@ std::string encode_journal_settings(const WorldSettings& s) {
   append_json_string(&out, s.mtp_head);
   out += ",\"attw\":";
   append_json_string(&out, s.attention_weights);
+  // The DeepSeek-V4.1 index budget: absent when the checkpoint's (a record
+  // from a plain run carries no key; an older peer decodes it to 0).
+  if (s.index_topk > 0) out += std::format(",\"itopk\":{}", s.index_topk);
+  if (s.candidate_topk_blocks > 0) out += std::format(",\"ctb\":{}", s.candidate_topk_blocks);
+  if (s.candidate_block_size > 0) out += std::format(",\"cbs\":{}", s.candidate_block_size);
   out += std::format(",\"mss\":{},\"msrow\":{:.17g},\"msbase\":{:.17g},\"mslam\":{:.17g},\"msmin\":{},\"msad\":{},"
                      "\"msss\":{:.17g}",
                      s.mtp_schedule ? 1 : 0, s.mtp_schedule_row_ms, s.mtp_schedule_base_ms,
                      s.mtp_schedule_lambda, s.mtp_schedule_min_depth, s.mtp_schedule_adapt ? 1 : 0,
                      s.mtp_schedule_sampled_scale);
+  // The depth-option cap (2026-10-23): absent when 0 (an older peer decodes
+  // a missing key to 0; a peer without the key would differ in the digest
+  // and refuse the world, as every setting does).
+  if (s.mtp_schedule_options > 0) out += std::format(",\"msopt\":{}", s.mtp_schedule_options);
   out += ",\"mdr\":";
   append_json_string(&out, s.mtp_draft);
   out += std::format(",\"mdt\":{:.17g}", s.mtp_draft_temperature);
@@ -682,6 +706,7 @@ JournalRecord decode_journal_line(std::string_view line) {
     if (const dgpp::minijson::Value* pa = v.find("pfact")) s.prefill_activations = std::string(pa->as_string());
     // The prefill attention's arithmetic (2026-10-16): records before it carry none (bf16).
     if (const dgpp::minijson::Value* pt = v.find("pfattn")) s.prefill_attention = std::string(pt->as_string());
+    if (const dgpp::minijson::Value* dt = v.find("dcattn")) s.decode_attention = std::string(dt->as_string());
     // The DFlash2 drafter (2026-10-03): records before it carry none.
     if (const dgpp::minijson::Value* dfm = v.find("dfm")) s.dflash_model = std::string(dfm->as_string());
     if (v.find("dfvg")) s.dflash_verify_graph = flag("dfvg");
@@ -698,6 +723,7 @@ JournalRecord decode_journal_line(std::string_view line) {
     if (const dgpp::minijson::Value* w = v.find("l2w")) s.l2_prefetch_window_mib = static_cast<int>(w->as_int());
     if (const dgpp::minijson::Value* w = v.find("l2bw")) s.l2_prefetch_boundary_window_mib = static_cast<int>(w->as_int());
     if (const dgpp::minijson::Value* f = v.find("l2f")) s.l2_prefetch_form = std::string(f->as_string());
+    if (const dgpp::minijson::Value* f = v.find("l2ff")) s.l2_prefetch_full_form = std::string(f->as_string());
     if (const dgpp::minijson::Value* r = v.find("l2b")) s.l2_prefetch_boundary_rate = std::string(r->as_string());
     if (const dgpp::minijson::Value* r = v.find("l2l")) s.l2_prefetch_layer_rate = std::string(r->as_string());
     // The expert GEMM's form and companions (2026-09-30): records before them carry the defaults.
@@ -708,6 +734,21 @@ JournalRecord decode_journal_line(std::string_view line) {
     if (v.find("npre")) s.ngram_prestage = flag("npre");
     // Records before 2026-09-14 carry no prefill mode: bounded.
     if (const dgpp::minijson::Value* pf = v.find("pf")) s.prefill = std::string(pf->as_string());
+    // Older records carry no dense form: preserve each family's default.
+    if (const dgpp::minijson::Value* pfd = v.find("pfd")) s.prefill_dense = std::string(pfd->as_string());
+    else s.prefill_dense = "auto";
+    // Records before the fold overlap key (2026-10-18) carry none: on.
+    s.prefill_fold_overlap = v.find("pfo") ? flag("pfo") : true;
+    s.decode_pdl = v.find("pdl") ? flag("pdl") : true;
+    // Records before the window kernel key (2026-10-18) carry none: flash.
+    if (const dgpp::minijson::Value* pfw = v.find("pfw")) s.prefill_window = std::string(pfw->as_string());
+    else s.prefill_window = "flash";
+    if (const dgpp::minijson::Value* dcw = v.find("dcw")) s.decode_window = std::string(dcw->as_string());
+    else s.decode_window = "flash";
+    // Records before the transport key (2026-10-19) carry none: send,
+    // the form every such binary runs.
+    if (const dgpp::minijson::Value* ctr = v.find("ctr")) s.collective_transport = std::string(ctr->as_string());
+    else s.collective_transport = "send";
     // Records without the rope ramp key carry none: the plain table
     // (records before the knob, 2026-09-18, and every plain run since).
     if (const dgpp::minijson::Value* rs = v.find("rs")) {
@@ -736,6 +777,17 @@ JournalRecord decode_journal_line(std::string_view line) {
     // Records before 2026-10-09 carry no draft-head form: the checkpoint's.
     if (const dgpp::minijson::Value* mh = v.find("mtph")) s.mtp_head = std::string(mh->as_string());
     if (const dgpp::minijson::Value* aw = v.find("attw")) s.attention_weights = std::string(aw->as_string());
+    // Records before 2026-10-18 carry no index budget: the checkpoint's.
+    const auto budget = [&](const char* key, int hi) {
+      const dgpp::minijson::Value* b = v.find(key);
+      if (!b) return 0;
+      if (!b->is_number() || b->as_int() < 1 || b->as_int() > hi)
+        throw std::runtime_error(std::string("journal: settings record with a bad index budget ") + key);
+      return static_cast<int>(b->as_int());
+    };
+    s.index_topk = budget("itopk", 2048);
+    s.candidate_topk_blocks = budget("ctb", 2048);
+    s.candidate_block_size = budget("cbs", 1024);
     // Records before 2026-09-14 carry no scheduled verify depth: off.
     if (const dgpp::minijson::Value* mss = v.find("mss")) {
       s.mtp_schedule = mss->as_int() != 0;
@@ -743,6 +795,8 @@ JournalRecord decode_journal_line(std::string_view line) {
       s.mtp_schedule_base_ms = field(v, "msbase", "settings").as_double();
       s.mtp_schedule_lambda = field(v, "mslam", "settings").as_double();
       s.mtp_schedule_min_depth = static_cast<int>(field(v, "msmin", "settings").as_int());
+      if (const dgpp::minijson::Value* msopt = v.find("msopt")) s.mtp_schedule_options = static_cast<int>(msopt->as_int());
+      else s.mtp_schedule_options = 0;
       // Records before the adaptive lambda (2026-09-14, later) carry no msad: fixed.
       if (const dgpp::minijson::Value* msad = v.find("msad")) s.mtp_schedule_adapt = msad->as_int() != 0;
       else s.mtp_schedule_adapt = false;
@@ -784,9 +838,14 @@ JournalRecord decode_journal_line(std::string_view line) {
         (s.dense_weights != "checkpoint" && s.dense_weights != "fp8") ||
         !parse_bf16_residency(s.bf16_weights, nullptr) ||
         (s.prefill != "bounded" && s.prefill != "exact") ||
+        (s.prefill_dense != "auto" && s.prefill_dense != "tile" && s.prefill_dense != "streaming") ||
+        (s.prefill_window != "flash" && s.prefill_window != "scalar") ||
+        (s.decode_window != "flash" && s.decode_window != "scalar") ||
+        (s.collective_transport != "write" && s.collective_transport != "send") ||
         (s.embed_sharding != "replicated" && s.embed_sharding != "vocab") ||
         (s.mtp_head != "checkpoint" && s.mtp_head != "fp8") ||
         (s.prefill_attention != "bf16" && s.prefill_attention != "fp8") ||
+        (s.decode_attention != "bf16" && s.decode_attention != "fp8") ||
         (s.attention_weights != "checkpoint" && s.attention_weights != "int4"))
       throw std::runtime_error("journal: settings record with impossible values");
     return rec;
@@ -992,7 +1051,7 @@ JournalRecord decode_journal_line(std::string_view line) {
                                    "' carries an invalid sampling spec: " +
                                    e.what());
         }
-        if (!(p.temperature > 0.0f) && r.logprobs < 0)
+        if (!(p.temperature > 0.0f) && r.logprobs < 0 && !sample::needs_context_penalties(p))
           throw std::runtime_error("journal: submit '" + r.id +
                                    "' carries a greedy sampling spec");
         if (r.logprobs >= 0 && p.logprobs != r.logprobs)

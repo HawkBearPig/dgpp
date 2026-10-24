@@ -1224,6 +1224,9 @@ int run_rows_invariance(const std::string& dir) {
 }
 
 int main(int argc, char** argv) {
+  if (const char* tile = std::getenv("DGPP_TEST_QWEN_PREFILL_TILE"); tile && tile[0] == '1')
+    dgpp::QwenModel::set_default_prefill_dense_tile(true);
+
   std::string fixture, checkpoint, ids_text;
   bool fp8_head = false, prefill_head = false, dense_fp8 = false, rows_invariance = false;
   int steps = 4;

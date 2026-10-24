@@ -5,6 +5,10 @@
 // core). These pin: the merge is the exact global top-k under ties, the
 // RNG is counter-reproducible, penalties follow the HF warper formulas,
 // and the documented filter edge cases hold.
+#include "sample/sampler.hpp"
+
+#include <bit>
+#include <cfenv>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -15,7 +19,7 @@
 #include <vector>
 
 #include "common/test.hpp"
-#include "sample/sampler.hpp"
+#include "engine/eager_engine.hpp"
 
 namespace {
 
@@ -415,6 +419,152 @@ DGPP_TEST(apply_penalties_touches_only_its_slice) {
   apply_penalties(v.data(), 2, 0, p, counts);
   require(same_bits(v[0], 1.0f), "id 0 untouched");
   require(same_bits(v[1], 0.0f), "id 1 penalized");
+}
+
+DGPP_TEST(context_penalties_preserve_active_and_signed_zero_arithmetic) {
+  for (const int begin : {0, 17}) {
+    const std::vector<int32_t> context{begin - 1, begin,     begin,    begin + 1,
+                                       begin + 2, begin + 3, begin + 6};
+    for (int regime = 0; regime < 8; ++regime) {
+      Params p;
+      if (regime == 1) p.frequency_penalty = -0.0f;
+      if (regime == 2) p.presence_penalty = -0.0f;
+      if (regime == 3) p.repetition_penalty = 1.1f;
+      if (regime == 4) p.frequency_penalty = 0.25f;
+      if (regime == 5) p.presence_penalty = -0.5f;
+      if (regime == 6) p.repetition_penalty = 0.9f;
+      if (regime == 7) {
+        p.repetition_penalty = 2.0f;
+        p.frequency_penalty = 0.25f;
+        p.presence_penalty = 0.5f;
+      }
+      require(dgpp::sample::needs_context_penalties(p) == (regime != 0),
+              "only positive-zero neutral parameters omit penalty preparation");
+      const std::vector<float> input{
+          123.0f, -0.0f, -0.0f, 4.0f, -2.0f, 0.0f, -std::numeric_limits<float>::infinity(), 456.0f};
+      auto want = input, got = input;
+      apply_penalties(want.data() + 1, 6, begin, p, count_context(context));
+      dgpp::sample::apply_context_penalties(got.data() + 1, 6, begin, p, context);
+      for (size_t i = 0; i < got.size(); ++i)
+        require(same_bits(got[i], want[i]), "context penalty slice or arithmetic changed");
+    }
+  }
+}
+
+DGPP_TEST(context_penalties_neutral_omits_arithmetic) {
+  // A signaling NaN is a diagnostic sentinel, not a valid inference logit:
+  // the old neutral fma quiets it, making a missed shortcut observable.
+  std::fenv_t saved;
+  require(std::feholdexcept(&saved) == 0, "save the floating-point environment");
+  struct RestoreEnvironment {
+    const std::fenv_t* saved;
+    ~RestoreEnvironment() { std::fesetenv(saved); }
+  } restore{&saved};
+  const float sentinel = std::bit_cast<float>(0x7f800001u);
+  float logit = sentinel;
+  dgpp::sample::apply_context_penalties(&logit, 1, 0, Params{}, {0, 0});
+  require(same_bits(logit, sentinel), "neutral preparation must leave logits untouched");
+}
+
+DGPP_TEST(context_penalties_neutral_preserves_subnormals_zeros_and_infinities) {
+  const float tiny = std::numeric_limits<float>::denorm_min();
+  const float inf = std::numeric_limits<float>::infinity();
+  std::vector<float> got{0.0f,
+                         -0.0f,
+                         tiny,
+                         -tiny,
+                         std::numeric_limits<float>::min(),
+                         std::numeric_limits<float>::max(),
+                         inf,
+                         -inf};
+  auto want = got;
+  const std::vector<int32_t> context{0, 1, 1, 2, 3, 4, 5, 6, 7};
+  Params p;
+  apply_penalties(want.data(), static_cast<int>(want.size()), 0, p, count_context(context));
+  dgpp::sample::apply_context_penalties(got.data(), static_cast<int>(got.size()), 0, p, context);
+  for (size_t i = 0; i < got.size(); ++i)
+    require(same_bits(got[i], want[i]), "neutral arithmetic preserves every supported float class");
+}
+
+DGPP_TEST(host_greedy_penalties_follow_effective_parameters_without_consuming_rng) {
+  const auto sample = dgpp::make_w1_sample(4);
+  dgpp::DecodeOutputs out;
+  out.lm_vocab_begin = 0;
+  out.lm_vocab_count = 4;
+  out.logits = {5.0f, 4.0f, 3.0f, -0.0f};
+  const std::vector<int32_t> context{0, 0, 0, 3};
+  const uint32_t words = 0xe;  // exclude the unpenalized winner
+  dgpp::text::TokenMask mask;
+  mask.vocab = 4;
+  mask.allowed = 3;
+  mask.words = {words};
+  const float bias[] = {0.0f, 0.0f, 2.0f, 0.0f};
+  for (int regime = 0; regime < 6; ++regime) {
+    auto p = dgpp::sample::greedy_params();
+    p.logprobs = 3;
+    if (regime == 1) p.repetition_penalty = 2.0f;
+    if (regime == 2) p.frequency_penalty = 0.5f;
+    if (regime == 3) p.presence_penalty = 2.0f;
+    if (regime == 4) p.frequency_penalty = -0.0f;
+    if (regime == 5) p.presence_penalty = -0.0f;
+    for (bool constrained : {false, true}) {
+      auto adjusted = out.logits;
+      apply_penalties(adjusted.data(), 4, 0, p, count_context(context));
+      dgpp::sample::apply_bias(adjusted.data(), 4, 0, constrained ? bias : nullptr);
+      dgpp::sample::apply_mask(adjusted.data(), 4, 0, constrained ? &words : nullptr, 4);
+      const auto want = dgpp::sample::greedy_from_prefix(
+          sort_slice(adjusted.data(), 4, 0),
+          sharded_scaled_logsumexp(adjusted.data(), {{0, 4}}, 1.0f), 3);
+      Rng rng{42, 7};
+      const auto got =
+          sample(out, p, rng, context, constrained ? &mask : nullptr, constrained ? bias : nullptr);
+      require(results_identical(got, want) && rng.counter == 7,
+              "greedy tokens and reports match original arithmetic without a draw");
+      require(got.token == (constrained ? 2 : (regime >= 1 && regime <= 3 ? 1 : 0)),
+              "active penalties change the winner; neutral values retain it");
+    }
+  }
+}
+
+DGPP_TEST(neutral_host_sampling_preserves_bias_mask_reports_and_rng) {
+  constexpr int vocab = 17;
+  const std::vector<VocabSlice> layout = vocab_layout(vocab, 3);
+  FixtureRng fx;
+  const auto logits = make_logits(vocab, fx);
+  std::vector<float> bias(vocab, 0.0f);
+  bias[3] = 10.0f;
+  const uint32_t mask = (1u << vocab) - 2;  // token zero is absent
+  for (int regime = 0; regime < 6; ++regime) {
+    Params p;
+    p.temperature = 0.8f;
+    p.logprobs = 5;
+    if (regime == 1) p.top_k = 4;
+    if (regime == 2) p.top_p = 0.9f;
+    if (regime == 3) p.min_p = 0.1f;
+    if (regime == 4) p.frequency_penalty = -0.0f;
+    if (regime == 5) p.presence_penalty = 0.3f;
+    for (uint64_t seed = 0; seed < 4; ++seed) {
+      Rng a{seed, 3}, b{seed, 3};
+      std::vector<int32_t> context{0, 0, 1, 3, 3, 16};
+      for (int step = 0; step < 4; ++step) {
+        auto adjusted = logits;
+        apply_penalties(adjusted.data(), vocab, 0, p, count_context(context));
+        dgpp::sample::apply_bias(adjusted.data(), vocab, 0, bias.data());
+        dgpp::sample::apply_mask(adjusted.data(), vocab, 0, &mask, vocab);
+        Params already_adjusted = p;
+        already_adjusted.repetition_penalty = 1.0f;
+        already_adjusted.frequency_penalty = already_adjusted.presence_penalty = 0.0f;
+        const Result want =
+            sample_reference_sharded(adjusted.data(), vocab, layout, already_adjusted, a, {});
+        const Result got =
+            sample_full_logits(logits.data(), vocab, layout, p, b, context, &mask, bias.data());
+        require(results_identical(got, want) && a.counter == b.counter &&
+                    b.counter == static_cast<uint64_t>(step + 4) && got.token != 0,
+                "host sampling changed bias, mask, reports or RNG draws");
+        context.push_back(got.token);
+      }
+    }
+  }
 }
 
 DGPP_TEST(min_p_drops_tail_never_sampled) {

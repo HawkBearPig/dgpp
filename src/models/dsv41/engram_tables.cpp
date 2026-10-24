@@ -116,13 +116,19 @@ Dsv41EngramSidecar dsv41_load_engram_sidecar(const std::string& path, const Dsv4
 }
 
 Dsv41EngramSidecar dsv41_load_engram_sidecar_for(const std::string& checkpoint_dir,
-                                                 const Dsv41TextConfig& cfg) {
+                                                 const Dsv41TextConfig& cfg, const std::string& fallback_dir) {
   const std::filesystem::path p = std::filesystem::path(checkpoint_dir) / kDsv41EngramSidecarName;
-  if (!std::filesystem::exists(p))
-    throw std::runtime_error(
-        "engram sidecar missing: " + p.string() +
-        " (generate it with `python3 tools/dsv41_engram_tables.py --model-dir <snapshot>`)");
-  return dsv41_load_engram_sidecar(p.string(), cfg);
+  if (std::filesystem::exists(p)) return dsv41_load_engram_sidecar(p.string(), cfg);
+  // An EXL3 pack ships the base release's tokenizer and no sidecar: the
+  // Engram source snapshot's (engine.engram_source) serves it.
+  if (!fallback_dir.empty()) {
+    const std::filesystem::path q = std::filesystem::path(fallback_dir) / kDsv41EngramSidecarName;
+    if (std::filesystem::exists(q)) return dsv41_load_engram_sidecar(q.string(), cfg);
+  }
+  throw std::runtime_error(
+      "engram sidecar missing: " + p.string() +
+      (fallback_dir.empty() ? std::string() : " (and in the Engram source " + fallback_dir + ")") +
+      " (generate it with `python3 tools/dsv41_engram_tables.py --model-dir <snapshot>`)");
 }
 
 }  // namespace dgpp

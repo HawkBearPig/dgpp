@@ -40,6 +40,7 @@
 // engine.prefill_attention = fp8, the compute form (Q and P in e4m3 on the
 // fp8 tensor cores) — their sections below.
 #include "kernels/full_attn.hpp"
+#include "kernels/pdl.cuh"
 
 #include <cmath>
 #include <stdexcept>
@@ -165,6 +166,7 @@ __global__ __launch_bounds__(32) void full_attn_row_kernel(
     int local_heads, int kv_heads, int block_tokens, const int32_t* __restrict__ block_tables,
     int blocks_per_request, float scale, const float* __restrict__ kv_scales, float* __restrict__ out,
     float* __restrict__ partials, int splits) {
+  dgpp_pdl_wait();
   extern __shared__ __align__(16) uint16_t sm[];
   // fp8: the staged codes sit past the bf16 tile; the scales fold into the
   // softmax scale (k) and the output (v).
@@ -357,16 +359,66 @@ __global__ __launch_bounds__(32) void full_attn_row_kernel(
 
 // One block per (row, KV group): every head's 256 outputs from the splits'
 // (m, l, acc) — the largest maximum, the rescaled denominators, the sum.
+// The group's (head, split) m and l are staged once per block and one
+// thread per head forms the maximum, the splits' weights and the
+// denominator from shared memory (2026-10-20: each of the 256 threads
+// re-read every split's m for the maximum and its m and l again in the
+// merge, and computed the weight itself — the same arithmetic in the same
+// order, so the outputs are bitwise); the element loop reads its partials
+// and the staged weights.
+constexpr int kCombineMaxGroup = 16;  // kPartialFloats carries 16 heads' m and l
 __global__ __launch_bounds__(256) void full_attn_combine_kernel(const float* __restrict__ partials,
                                                                  int splits, int local_heads, int kv_heads,
                                                                  const float* __restrict__ v_scale,
                                                                  float* __restrict__ out) {
+  dgpp_pdl_wait();
+  __shared__ float s_m[kCombineMaxGroup * kMaxSplits];
+  __shared__ float s_l[kCombineMaxGroup * kMaxSplits];
+  __shared__ float s_w[kCombineMaxGroup * kMaxSplits];
+  __shared__ float s_lt[kCombineMaxGroup];
   const float vs = v_scale != nullptr ? *v_scale : 1.f;
   const int64_t r = blockIdx.x;
   const int kvh = blockIdx.y;
   const int group = local_heads / kv_heads;
   const int d = threadIdx.x;
   const float* base = partials + (r * kv_heads + kvh) * static_cast<int64_t>(splits) * kPartialFloats;
+  if (group <= kCombineMaxGroup && splits <= kMaxSplits) {
+    for (int i = threadIdx.x; i < group * splits; i += blockDim.x) {
+      const int h = i / splits, s = i - h * splits;
+      s_m[i] = base[s * kPartialFloats + 16 * kD + h];
+      s_l[i] = base[s * kPartialFloats + 16 * kD + 16 + h];
+    }
+    __syncthreads();
+    if (threadIdx.x < group) {
+      const int h = threadIdx.x;
+      float mt = -INFINITY;
+      for (int s = 0; s < splits; ++s) mt = fmaxf(mt, s_m[h * splits + s]);
+      float lt = 0.f;
+      if (mt != -INFINITY) {
+        for (int s = 0; s < splits; ++s) {
+          const float ms = s_m[h * splits + s];
+          if (ms == -INFINITY) continue;
+          const float w = exp2f(ms - mt);
+          lt += s_l[h * splits + s] * w;
+          s_w[h * splits + s] = w;
+        }
+      }
+      s_lt[h] = lt;
+    }
+    __syncthreads();
+    for (int h = 0; h < group; ++h) {
+      const float lt = s_lt[h];
+      float o = 0.f;
+      if (lt > 0.f) {
+        for (int s = 0; s < splits; ++s) {
+          if (s_m[h * splits + s] == -INFINITY) continue;
+          o += base[s * kPartialFloats + h * kD + d] * s_w[h * splits + s];
+        }
+      }
+      out[(r * local_heads + kvh * group + h) * kD + d] = (lt > 0.f ? o / lt : 0.f) * vs;
+    }
+    return;
+  }
   for (int h = 0; h < group; ++h) {
     float mt = -INFINITY;
     for (int s = 0; s < splits; ++s) mt = fmaxf(mt, base[s * kPartialFloats + 16 * kD + h]);
@@ -392,6 +444,7 @@ __global__ __launch_bounds__(kMaxTileGroup * 32) void full_attn_tile_kernel(
     const uint16_t* __restrict__ v_cache, const int32_t* __restrict__ bt, const int64_t* __restrict__ pos,
     int rows, int local_heads, int kv_heads, int block_shift, int width_shift, float scale,
     float* __restrict__ out) {
+  dgpp_pdl_wait();
   extern __shared__ __align__(16) uint16_t sm[];
   const int r0 = blockIdx.x * kQTile;
   const int kvh = blockIdx.y;
@@ -628,6 +681,7 @@ __global__ __launch_bounds__(kMaxTileGroup * 32) void full_attn_tile_tma_kernel(
     const uint16_t* __restrict__ q, int64_t q_row_stride, const int32_t* __restrict__ bt,
     const int64_t* __restrict__ pos, int rows, int local_heads, int kv_heads, int block_shift, float scale,
     const float* __restrict__ kv_scales, float* __restrict__ out) {
+  dgpp_pdl_wait();
   extern __shared__ __align__(1024) uint8_t smraw[];
   // The stages need 1 KB alignment for the swizzle: carve them past the
   // first aligned boundary and put the barriers in the slack.
@@ -931,6 +985,7 @@ __global__ __launch_bounds__(kMaxTileGroup * 32) void full_attn_tile_fp8c_kernel
     const uint16_t* __restrict__ q, int64_t q_row_stride, const int32_t* __restrict__ bt,
     const int64_t* __restrict__ pos, int rows, int local_heads, int kv_heads, int block_shift, float scale,
     const float* __restrict__ kv_scales, float* __restrict__ out) {
+  dgpp_pdl_wait();
   extern __shared__ __align__(1024) uint8_t smraw[];
   const unsigned sbase = static_cast<unsigned>(__cvta_generic_to_shared(smraw));
   uint8_t* sm = smraw + ((1024 - (sbase & 1023)) & 1023);
@@ -1183,6 +1238,7 @@ __global__ __launch_bounds__(kMaxTileGroup * 32) void full_attn_block_decode_ker
     const int32_t* __restrict__ block_tables, int blocks_per_request, int local_heads, int kv_heads,
     int block_shift, float scale, const float* __restrict__ kv_scales, float* __restrict__ out,
     float* __restrict__ partials, int splits) {
+  dgpp_pdl_wait();
   extern __shared__ __align__(1024) uint8_t smraw[];
   const unsigned sbase = static_cast<unsigned>(__cvta_generic_to_shared(smraw));
   uint8_t* sm = smraw + ((1024 - (sbase & 1023)) & 1023);

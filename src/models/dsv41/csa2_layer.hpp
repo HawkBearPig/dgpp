@@ -33,7 +33,9 @@
 
 #include "kernels/csa2.hpp"
 #include "kernels/gemm.hpp"
+#include "kernels/l2_prefetch.hpp"
 #include "models/dsv41/csa2_state.hpp"
+#include "models/exl3_matrix.hpp"
 #include "models/quant_matrix.hpp"
 
 namespace dgpp {
@@ -43,6 +45,9 @@ struct Csa2Config {
   // (rows 1..32 in one launch, the weights read once) or the 4-row GEMV
   // chunks. Tolerance-equal forms; the model sets every site alike.
   bool dense_mma = true;
+  // An EXL3 pack (docs/deepseek_v41_flash_exl3_plan.md): the projections
+  // take the EXL3 launchers and the layer carries their workspace.
+  bool exl3 = false;
   int hidden = 5120;
   int q_lora = 1280;
   int o_lora = 1024;
@@ -65,6 +70,13 @@ struct Csa2Config {
 
 struct Csa2LayerWeights {
   GlmQuantMatrix wq_a, wkv, wq_b, wo_a, wo_b;  // fp8, 32 x 32 grids
+  // The EXL3 pack's projections (docs/deepseek_v41_flash_exl3_plan.md §3):
+  // set instead of the fp8 / bf16 members (wo_a one matrix per local
+  // group; the compressors and the indexer's wq_b / wk EXL3 too). Every
+  // site then runs the EXL3 launchers (kernels/exl3_gemv.hpp).
+  Exl3Matrix wq_a_x, wkv_x, wq_b_x, wo_b_x, idx_wq_b_x, idx_wk_x, comp_wkv_x, comp_wgate_x;
+  std::vector<Exl3Matrix> wo_a_x;
+  bool exl3() const { return wq_a_x.tiles != nullptr; }
   const uint16_t* q_norm = nullptr;
   const uint16_t* kv_norm = nullptr;
   const float* attn_sink = nullptr;    // f32 [local_heads]
@@ -95,6 +107,30 @@ class Csa2Layer {
                               size_t dot_budget = 64ull << 20);
 
   void rebind(const Csa2LayerWeights& w, int layer);
+  // The decode walk's in-layer L2 prefetch window (kernels/l2_prefetch.hpp;
+  // bit-identical on or off): the output projections wo_a / wo_b under the
+  // selection and the attention. Null (the default) or a disabled
+  // prefetcher: none.
+  void set_prefetcher(WeightPrefetcher* p) { prefetch_ = p; }
+  // The prefill walk's dense form (engine.prefill_dense; scale_gemm.hpp
+  // prefill_tile): the fp8-weight tile GEMM (true) or the streaming decode
+  // form (false) for every projection a prefill enqueue runs.
+  void set_prefill_dense_tile(bool on) { prefill_dense_tile_ = on; }
+  // The prefill's window source on the flash listed kernel (true, the
+  // default; engine.prefill_window flash) or the scalar partial kernel
+  // (scalar, the decode window's kernel: the decode audit's form).
+  void set_prefill_window_flash(bool on) { prefill_window_flash_ = on; }
+  // The decode window (engine.decode_window, 2026-10-19): flash = the
+  // flash listed kernel unsplit (one block per row and head group); scalar
+  // = the scalar partial kernel split kWinDecodeSplit ways (the form until
+  // then). And the side stream the decode window runs on beside the main
+  // source's kernel (set by the model; null = in line).
+  void set_decode_window_flash(bool on) { decode_window_flash_ = on; }
+  void set_decode_side(cudaStream_t stream, cudaEvent_t fork, cudaEvent_t join) {
+    side_stream_ = stream;
+    side_fork_ = fork;
+    side_join_ = join;
+  }
   // GEMM plans for `tokens` rows and the shared-memory opt-ins; outside capture.
   bool prepare(int tokens);
 
@@ -122,7 +158,7 @@ class Csa2Layer {
   // ratio-2 kv sources.
   void enqueue_decode(const void* hidden_in, Csa2StatePool& pool, const int32_t* req_ids, const int64_t* pos,
                       const int32_t* req_spans, int num_requests, int tokens, void* out, cudaStream_t stream,
-                      float* tail_snapshots = nullptr);
+                      float* tail_snapshots = nullptr, bool prefetch = true);
 
   // ---- the DSpark draft (plan D8) on a window-only draft layer ----------------
   // append_window_rows: the ring rows of `n` real tokens — x [n, hidden] the
@@ -185,7 +221,10 @@ class Csa2Layer {
     size_t pos, req_ids, req_zero, slots, pos_sel, entries, ent_pos, scratch_pos, iota, one_block;
     size_t wlist, wcounts, wscratch, dlist, dcounts, topk, counts, cand, cand_counts;
     size_t m_main, l_main, c_main, m_win, l_win, c_win;
-    size_t gather_k, gather_scale, dot, logits, select_ws, counter, violations;
+    size_t m_grp_main, l_grp_main, c_grp_main, m_grp_win, l_grp_win, c_grp_win, tickets;
+    size_t tickets_per_source = 0;  // ints per source (the window's follow the main's)
+    size_t gather_k, gather_scale, logits, select_ws, counter, violations;
+    size_t exl3_ws = 0, exl3_ws_bytes = 0;
     int tile_cap = 0;
     int64_t max_entries = 0;
     int ws_slots = 0;
@@ -205,8 +244,12 @@ class Csa2Layer {
   void require_shape(const SelShape& have, const SelShape& want, const char* what) const;
 
   // The projections and the window row of `tokens` rows at `pos` (device).
-  void project_q_kv(const void* hidden_in, int tokens, const int64_t* pos, cudaStream_t stream);
+  // rope_q false: the q rope is left to the decode tail kernel (enqueue_decode).
+  void project_q_kv(const void* hidden_in, int tokens, const int64_t* pos, cudaStream_t stream, bool rope_q = true);
   void project_kv(const void* hidden_in, int tokens, const int64_t* pos, cudaStream_t stream);
+  // The compressor's projections (bf16 matmul or the EXL3 launchers).
+  void compress_project(const void* hidden_in, int tokens, float* kv, float* score, cudaStream_t stream);
+  void compress_latent(const void* hidden_in, int tokens, cudaStream_t stream);
   void indexer_query(const void* hidden_in, int tokens, const int64_t* pos, cudaStream_t stream);
   // The index keys and the main rows of `n` entries (entries_ / ent_pos_
   // set; latent_ holds the normed, unrotated latents).
@@ -222,9 +265,29 @@ class Csa2Layer {
   void attend_rows(Csa2StatePool& pool, const int32_t* req_ids_win, const uint8_t* win_cache, int win_block_tokens,
                    const int32_t* win_table, const int32_t* req_ids_main, const int64_t* pos, int row0, int rows,
                    int n_split_main, cudaStream_t stream, const int32_t* list, int list_stride,
-                   const int32_t* counts, bool split_window = false, int sel_base = 0);
+                   const int32_t* counts, bool split_window = false, int sel_base = 0, bool flash_window = false);
   void project_out(int tokens, void* out, cudaStream_t stream);
   void validate_pool(const Csa2StatePool& pool) const;
+
+  // The decode windows (see set_prefetcher): opened where the chain is
+  // about to go latency-bound and the bytes before them have been
+  // consumed. An in-layer window's byte budget (the L2 holds 24 MB).
+  static constexpr size_t kWindowBudget = size_t{18} << 20;
+  bool windows() const { return prefetch_windows_ && prefetch_ != nullptr && prefetch_->enabled(); }
+  void window_fp8(const GlmQuantMatrix& m);
+  void open_output_window(cudaStream_t stream);  // wo_a / wo_b, before the selection and the attention
+  WeightPrefetcher* prefetch_ = nullptr;
+  bool prefetch_windows_ = false;  // enabled for this decode / draft enqueue
+  // The prefill walk's dense form (scale_gemm.hpp prefill_tile): every row
+  // of a prefill enqueue takes the fp8-weight tile GEMM; decode and draft
+  // rows keep the streaming form. Set by the prefill entry points.
+  bool prefill_tile_ = false;
+  bool prefill_dense_tile_ = true;  // the configured form (set_prefill_dense_tile)
+  bool prefill_window_flash_ = true;  // set_prefill_window_flash
+  bool decode_window_flash_ = true;   // set_decode_window_flash
+  cudaStream_t side_stream_ = nullptr;  // set_decode_side
+  cudaEvent_t side_fork_ = nullptr;
+  cudaEvent_t side_join_ = nullptr;
 
   IGemm& gemm_;
   Csa2Config cfg_;
@@ -249,6 +312,12 @@ class Csa2Layer {
   int64_t dbg_logits_stride_ = 0, dbg_logits_entries_ = 0;
   void* gemm_ws_ = nullptr;
   size_t gemm_ws_bytes_ = 0;
+  // The EXL3 launchers' workspace (the rotated rows and the narrow sites'
+  // split partials; kernels/exl3_gemv.hpp): a span of the scratch sized
+  // for the widest site (Layout::exl3_ws).
+  void* exl3_ws_ = nullptr;
+  size_t exl3_ws_bytes_ = 0;
+  void window_exl3(const Exl3Matrix& m);
   std::vector<int64_t> host_i64_;
   std::vector<int32_t> host_i32_;
 
@@ -292,10 +361,19 @@ class Csa2Layer {
   float* m_win_ = nullptr;        // [ws_win_rows, lh]
   float* l_win_ = nullptr;
   float* c_win_ = nullptr;        // [ws_win_rows, lh, 512]
+  // The decode split groups' partials (kernels/dsa.hpp kAttnSplitGroup):
+  // one per group of eight splits, per source, and the groups' tickets.
+  float* m_grp_main_ = nullptr;   // [ws_slots / 8, lh]
+  float* l_grp_main_ = nullptr;
+  float* c_grp_main_ = nullptr;   // [ws_slots / 8, lh, 512]
+  float* m_grp_win_ = nullptr;
+  float* l_grp_win_ = nullptr;
+  float* c_grp_win_ = nullptr;
+  int32_t* tickets_main_ = nullptr;  // [row pairs x groups], zero at rest
+  int32_t* tickets_win_ = nullptr;
   uint8_t* gather_k_ = nullptr;   // [max_entries, 128]
   float* gather_scale_ = nullptr; // [max_entries]
-  float* dot_ = nullptr;          // [tile_cap * 32, max_entries]
-  float* logits_ = nullptr;       // [tile_cap, max_entries]
+  float* logits_ = nullptr;       // [tile_cap, max_entries]: the fused scorer's row tile (the budget)
   void* select_ws_ = nullptr;
   int32_t* counter_ws_ = nullptr;
   unsigned* violations_ = nullptr;

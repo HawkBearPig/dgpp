@@ -181,6 +181,7 @@ struct CollectiveBus::Impl {
     // before r would reorder the RQ and misalign the sender's cursor.
     uint32_t recycle_cursor[2] = {0, 0};
     size_t in_flight_count = 0;
+    uint64_t write_posts = 0;  // the one-sided transport's row WRITEs (signal cadence)
     // Bulk pacing: the earliest time the next bulk stripe may post on
     // this lane (BusOptions::bulk_pace_gbps).
     Clock::time_point bulk_next_post{};
@@ -209,6 +210,28 @@ struct CollectiveBus::Impl {
   bool quiesced = false;
   bool stopped = false;
   std::thread engine;
+  // The engine loop's iteration times (2026-10-20): the loop body IS the
+  // handshake's notice latency, so its histogram (<2 <5 <10 <20 <50 >=50
+  // us) and maximum, kept per graph window and printed with the window
+  // timeline, bound what the notice can add and show the outliers (an
+  // interrupt, a completion burst, a lock) that reach the fold as skew.
+  uint64_t loop_hist[6] = {};
+  uint64_t loop_n = 0;
+  double loop_max_us = 0;
+  // DGPP_BUS_TIMELINE_DUMP=<dir> (2026-10-20): every graph generation's
+  // stamps (its own clock: start, staged, first and last peer gated, done;
+  // per peer landed and claimed), buffered per window and appended to
+  // <dir>/bus_gens_rank<r>.tsv at the window's timeline log, so one
+  // collective can be aligned across the ranks offline (the symmetric sums
+  // of a pair's landing times give the path, their differences the pair's
+  // relative lateness up to the clocks' constant offset).
+  struct GenRecord {
+    uint64_t gen, start, stage, first, last, done;
+    uint64_t landed[kBusMaxPeers], claim[kBusMaxPeers];
+  };
+  std::vector<GenRecord> gen_dump;
+  FILE* gen_dump_file = nullptr;
+  bool gen_dump_checked = false;
 
   // One stream per consumer kernel: a persistent kernel starves every
   // launch queued behind it on the same stream, so the lane-1 consumer
@@ -247,6 +270,64 @@ struct CollectiveBus::Impl {
   cudaStream_t collective_stream = nullptr;
   BusAllReduceCtl* ar_ctl = nullptr;
   BusBulkScratch* bulk_scratch = nullptr;  // the bulk grid's shared records
+  // The one-sided transport's per-block records (pinned): one array of
+  // kBusWriteMaxBlocks per graph cell, then per stream cell.
+  BusWriteBlockRecord* write_recs = nullptr;
+  static constexpr size_t kWriteRecCells =
+      static_cast<size_t>(kBusMaxGraphVariants) * kBusMaxGraphGens + kBusStreamRing;
+  BusWriteBlockRecord* write_recs_of(int variant, int node) const {
+    return write_recs + (static_cast<size_t>(variant) * kBusMaxGraphGens + static_cast<size_t>(node)) * kBusWriteMaxBlocks;
+  }
+  BusWriteBlockRecord* write_recs_of_stream(int cell) const {
+    return write_recs + (static_cast<size_t>(kBusMaxGraphVariants) * kBusMaxGraphGens + static_cast<size_t>(cell)) * kBusWriteMaxBlocks;
+  }
+  // The records of a cell, graph or stream (the cell arrays are contiguous).
+  BusWriteBlockRecord* write_recs_of_cell(const BusAllReduceCtl* cell) const {
+    if (cell >= graph_cells && cell < graph_cells + static_cast<size_t>(kBusMaxGraphVariants) * kBusMaxGraphGens)
+      return write_recs + static_cast<size_t>(cell - graph_cells) * kBusWriteMaxBlocks;
+    return write_recs_of_stream(static_cast<int>(cell - strm.cells));
+  }
+  // The write transport's aggregate of a generation's block records: every
+  // block staged (post) / every block done (complete; the cell's stamps and
+  // status are filled from the records).
+  void write_aggregate(BusAllReduceCtl* cell, uint32_t seq, uint32_t elems, bool* ready_all, bool* done_all) {
+    const BusWriteBlockRecord* recs = write_recs_of_cell(cell);
+    const uint32_t blocks = bus_write_blocks(bus_write_chunks(elems));
+    bool ready = true, done = true;
+    for (uint32_t b = 0; b < blocks; ++b) {
+      ready = ready && acquire_u32(&recs[b].ready) == seq;
+      done = done && acquire_u32(&recs[b].done) == seq;
+    }
+    *ready_all = ready;
+    *done_all = done;
+    if (!done) return;
+    uint64_t stage = 0, finish = 0, first = 0, last = 0;
+    uint32_t status = 0;
+    uint64_t claim[kBusMaxPeers] = {};
+    uint64_t claim_first[kBusMaxPeers] = {};
+    for (uint32_t b = 0; b < blocks; ++b) {
+      stage = std::max(stage, recs[b].gt_stage);
+      finish = std::max(finish, recs[b].gt_done);
+      status |= recs[b].status;
+      for (size_t p = 0; p < peer_ranks.size() && p < kBusMaxPeers; ++p) {
+        claim[p] = std::max(claim[p], recs[b].gt_peer[p]);
+        if (recs[b].gt_peer[p] != 0 && (claim_first[p] == 0 || recs[b].gt_peer[p] < claim_first[p]))
+          claim_first[p] = recs[b].gt_peer[p];
+      }
+    }
+    for (size_t p = 0; p < peer_ranks.size() && p < kBusMaxPeers; ++p) {
+      cell->gt_claim[p] = claim[p];
+      cell->gt_claim_first_neg[p] = claim_first[p] != 0 ? ~claim_first[p] : 0;
+      if (claim[p] != 0 && (first == 0 || claim[p] < first)) first = claim[p];
+      last = std::max(last, claim[p]);
+    }
+    cell->gt_stage = stage;
+    cell->gt_done = finish;
+    cell->gt_first = first;
+    cell->gt_last = last;
+    __atomic_store_n(&cell->status, status, __ATOMIC_RELEASE);
+  }
+  bool write_transport() const { return opt.latency_transport == BusLatencyTransport::kWrite; }
   // Collective sequence number: the engine thread is the only writer; the
   // submitter reads it (relaxed) for staging-handout rotation. Atomic so
   // that read is race-free by the letter, not just by the protocol.
@@ -289,13 +370,17 @@ struct CollectiveBus::Impl {
   // recorded launch and the engine's posting agree forever.
   static_assert(kStageRing == kBusMaxGraphStageRing,
                 "the engine's staging ring must match the graph protocol's");
-  uint8_t* stage_block = nullptr;  // [peers + 1][kStageRing][lat_slot_bytes]
+  uint8_t* stage_block = nullptr;  // [peers + 1][kStageRing][stage_pitch()]
   std::vector<ibv_mr*> stage_mrs;  // one per distinct device (lkey source)
+  // A staging row's pitch: the write ring's chunked row (2026-10-19),
+  // which is the latency slot and its trailers — the send machinery's
+  // rows use the first lat_slot_bytes of it.
+  size_t stage_pitch() const { return layout.write_row_bytes; }
   uint8_t* stage_buf(size_t peer, int gen) const {
     return stage_block +
            ((peer * static_cast<size_t>(kStageRing) +
              static_cast<size_t>(((gen % kStageRing) + kStageRing) % kStageRing)) *
-            static_cast<size_t>(opt.lat_slot_bytes));
+            stage_pitch());
   }
   // The pre-stage handout row (index `peers`, after every peer row).
   uint8_t* self_buf(size_t peer_count, int gen) const {
@@ -307,7 +392,7 @@ struct CollectiveBus::Impl {
   uint8_t* bulk_arena_row(size_t peer) const {
     return stage_block +
            ((peer_ranks.size() + 1) * static_cast<size_t>(kStageRing) *
-                static_cast<size_t>(opt.lat_slot_bytes)) +
+                stage_pitch()) +
            peer * static_cast<size_t>(bulk_seg_bytes());
   }
   uint64_t* bulk_staged_counters() const {
@@ -448,6 +533,12 @@ struct CollectiveBus::Impl {
       double compute_us = 0;
       uint64_t prev_gt_done = 0;
       double max_handshake_us = 0, max_skew_us = 0, max_total_us = 0;
+      // The window's shortest handshake and, per peer, the shortest staging
+      // -> landed (2026-10-20): the path's own latency (engine notice, post,
+      // wire, the peer's poll) shows at the minimum, where the averages
+      // carry the peers' lateness.
+      double min_handshake_us = 0;
+      double peer_land_min_us[kBusMaxPeers] = {};
       uint64_t max_total_gen = 0;  // gen_seq of the window's worst total
       uint64_t first_gt_start = 0; // the window's first generation's entry
       uint64_t gate_waits = 0;
@@ -459,6 +550,10 @@ struct CollectiveBus::Impl {
       double wait_even_us = 0, wait_odd_us = 0;
       uint64_t n_even = 0, n_odd = 0;
       double peer_lag_us[kBusMaxPeers] = {};  // staging written -> peer gated
+      double peer_land_us[kBusMaxPeers] = {};  // staging written -> the peer's row landed (write transport)
+      uint64_t peer_land_n[kBusMaxPeers] = {};
+      double peer_first_us[kBusMaxPeers] = {};  // staging written -> the first warp proved the peer
+
       uint64_t peer_last[kBusMaxPeers] = {};  // times this peer arrived last
       // The gaps between consecutive claims in claim order (2026-09-19): the
       // kernel claims one peer per round, a gate pass over its payload in
@@ -561,6 +656,8 @@ struct CollectiveBus::Impl {
     view.bulk_slots = static_cast<int>(opt.bulk_slots);
     view.lat_slot_bytes = static_cast<uint32_t>(opt.lat_slot_bytes);
     view.bulk_slot_bytes = static_cast<uint32_t>(opt.bulk_slot_bytes);
+    view.write_ring = layout.write_row(slab, 0);
+    view.write_row_bytes = static_cast<uint32_t>(layout.write_row_bytes);
     return view;
   }
 
@@ -886,6 +983,8 @@ struct CollectiveBus::Impl {
       ar_ctl->gt_start = ar_ctl->gt_stage = ar_ctl->gt_first =
           ar_ctl->gt_last = ar_ctl->gt_done = 0;
       for (uint64_t& g : ar_ctl->gt_claim) g = 0;
+      for (uint64_t& g : ar_ctl->gt_landed) g = 0;
+      for (uint64_t& g : ar_ctl->gt_claim_first_neg) g = 0;
       ar_ctl->stamp_reduce_done = 0;
       __atomic_store_n(&ar_ctl->dbg_gate_waits, 0, __ATOMIC_RELAXED);
       __atomic_store_n(&ar_ctl->dbg_gate_spins, 0, __ATOMIC_RELAXED);
@@ -1213,6 +1312,23 @@ struct CollectiveBus::Impl {
   //   fold       last peer gated -> fold done
   void accumulate_timeline(GraphState::Timeline& t, const BusAllReduceCtl& c) {
     if (c.gt_start == 0 || c.gt_done < c.gt_start) return;
+    if (!gen_dump_checked) {
+      gen_dump_checked = true;
+      if (const char* d = std::getenv("DGPP_BUS_TIMELINE_DUMP"); d && *d) {
+        const std::string path = std::string(d) + "/bus_gens_rank" + std::to_string(opt.my_rank) + ".tsv";
+        gen_dump_file = std::fopen(path.c_str(), "a");
+        if (gen_dump_file) {
+          std::fprintf(gen_dump_file, "# rank %d peers", opt.my_rank);
+          for (int r : peer_ranks) std::fprintf(gen_dump_file, " %d", r);
+          std::fprintf(gen_dump_file, "\n# gen start stage first last done landed[p]... claim[p]...\n");
+        }
+      }
+    }
+    if (gen_dump_file) {
+      GenRecord g{c.gen_seq, c.gt_start, c.gt_stage, c.gt_first, c.gt_last, c.gt_done, {}, {}};
+      for (size_t p = 0; p < kBusMaxPeers; ++p) { g.landed[p] = c.gt_landed[p]; g.claim[p] = c.gt_claim[p]; }
+      gen_dump.push_back(g);
+    }
     auto us = [](uint64_t a, uint64_t b) {
       return b > a ? static_cast<double>(b - a) / 1000.0 : 0.0;
     };
@@ -1231,6 +1347,7 @@ struct CollectiveBus::Impl {
     t.fold_us += fold;
     t.total_us += total;
     t.max_handshake_us = std::max(t.max_handshake_us, hs);
+    if (t.n == 1 || hs < t.min_handshake_us) t.min_handshake_us = hs;
     t.max_skew_us = std::max(t.max_skew_us, skew);
     if (total > t.max_total_us) {
       t.max_total_us = total;
@@ -1246,6 +1363,13 @@ struct CollectiveBus::Impl {
     size_t last = 0;
     for (size_t p = 0; p < peer_ranks.size(); ++p) {
       t.peer_lag_us[p] += us(c.gt_stage, c.gt_claim[p]);
+      if (c.gt_landed[p] != 0) {
+        const double landed = us(c.gt_stage, c.gt_landed[p]);
+        if (t.peer_land_n[p] == 0 || landed < t.peer_land_min_us[p]) t.peer_land_min_us[p] = landed;
+        t.peer_land_us[p] += landed;
+        ++t.peer_land_n[p];
+      }
+      if (c.gt_claim_first_neg[p] != 0) t.peer_first_us[p] += us(c.gt_stage, ~c.gt_claim_first_neg[p]);
       if (c.gt_claim[p] > c.gt_claim[last]) last = p;
     }
     ++t.peer_last[last];
@@ -1287,7 +1411,7 @@ struct CollectiveBus::Impl {
         "{:.1f} + handshake {:.1f} + skew {:.1f} + fold {:.1f}; engine post "
         "{:.1f}; max handshake {:.1f} skew {:.1f} total {:.1f} "
         "(gen {}); gate waits {}; arm->gen0 {:.1f} us; passes/gen {:.0f}; "
-        "compute between gens {:.1f} us",
+        "compute between gens {:.1f} us; min handshake {:.1f} us",
         opt.my_rank, graph.adopted_variant, t.n, t.total_us / n,
         t.copy_us / n, t.handshake_us / n, t.skew_us / n, t.fold_us / n,
         t.post_us / n,
@@ -1297,7 +1421,7 @@ struct CollectiveBus::Impl {
             ? static_cast<double>(t.first_gt_start - graph.armed_gt) / 1000.0
             : 0.0,
         static_cast<double>(t.passes) / n,
-        t.n > 1 ? t.compute_us / static_cast<double>(t.n - 1) : 0.0);
+        t.n > 1 ? t.compute_us / static_cast<double>(t.n - 1) : 0.0, t.min_handshake_us);
     ::dgpp::logf(lvl,
         "graph window wait: rank {} hist(<20 <50 <100 <200 <500 >=500 us) {} "
         "{} {} {} {} {}; even gens {} avg {:.1f} us, odd gens {} avg {:.1f} us",
@@ -1308,8 +1432,13 @@ struct CollectiveBus::Impl {
     std::string peers_txt;
     for (size_t p = 0; p < peer_ranks.size(); ++p)
       peers_txt += " rank" + std::to_string(peer_ranks[p]) + " lag " +
-                   std::to_string(static_cast<int>(t.peer_lag_us[p] / n)) +
-                   "us last " + std::to_string(t.peer_last[p]) + "x;";
+                   std::to_string(static_cast<int>(t.peer_lag_us[p] / n)) + "us" +
+                   (t.peer_land_n[p] != 0
+                        ? " (landed " + std::to_string(static_cast<int>(t.peer_land_us[p] / static_cast<double>(t.peer_land_n[p]))) +
+                              "us min " + std::to_string(static_cast<int>(t.peer_land_min_us[p])) +
+                              "us, first proved " + std::to_string(static_cast<int>(t.peer_first_us[p] / static_cast<double>(t.peer_land_n[p]))) + "us)"
+                        : std::string()) +
+                   " last " + std::to_string(t.peer_last[p]) + "x;";
     ::dgpp::logf(lvl, "graph window peers: rank {} (staging written -> peer "
                   "payload gated, avg; times arrived last):{}",
                   opt.my_rank, peers_txt);
@@ -1322,6 +1451,26 @@ struct CollectiveBus::Impl {
     }
     ::dgpp::logf(lvl, "graph window claims: rank {} (gaps between consecutive claims, hist "
                   "<3 <5 <7 <10 <15 <25 >=25 us):{}", opt.my_rank, gaps_txt);
+    ::dgpp::logf(lvl, "graph window engine loop: rank {} iterations {} hist(<2 <5 <10 <20 <50 >=50 us) {} {} {} {} {} {}; max {:.1f} us",
+                  opt.my_rank, loop_n, loop_hist[0], loop_hist[1], loop_hist[2], loop_hist[3], loop_hist[4], loop_hist[5], loop_max_us);
+    loop_n = 0;
+    loop_max_us = 0;
+    for (auto& h : loop_hist) h = 0;
+    if (gen_dump_file && !gen_dump.empty()) {
+      for (const GenRecord& g : gen_dump) {
+        std::fprintf(gen_dump_file, "%llu %llu %llu %llu %llu %llu", static_cast<unsigned long long>(g.gen),
+                     static_cast<unsigned long long>(g.start), static_cast<unsigned long long>(g.stage),
+                     static_cast<unsigned long long>(g.first), static_cast<unsigned long long>(g.last),
+                     static_cast<unsigned long long>(g.done));
+        for (size_t p = 0; p < peer_ranks.size() && p < kBusMaxPeers; ++p)
+          std::fprintf(gen_dump_file, " %llu", static_cast<unsigned long long>(g.landed[p]));
+        for (size_t p = 0; p < peer_ranks.size() && p < kBusMaxPeers; ++p)
+          std::fprintf(gen_dump_file, " %llu", static_cast<unsigned long long>(g.claim[p]));
+        std::fputc('\n', gen_dump_file);
+      }
+      std::fflush(gen_dump_file);
+      gen_dump.clear();
+    }
     t = GraphState::Timeline{};
   }
 
@@ -1492,7 +1641,16 @@ struct CollectiveBus::Impl {
     bool worked = false;
     const uint32_t seq = static_cast<uint32_t>(gen);
     const uint64_t ready = acquire_u64(&cell->ready_bits);
-    const uint64_t done = acquire_u64(&cell->done_seq);
+    uint64_t done = acquire_u64(&cell->done_seq);
+    // The write transport reports per block: posting when every block has
+    // staged, completion when every block is done (the poison path still
+    // goes through done_seq).
+    bool write_ready = false;
+    if (write_transport()) {
+      bool write_done = false;
+      write_aggregate(cell, seq, elems, &write_ready, &write_done);
+      if (write_done) done = seq;
+    }
 
     // The flight activates BEFORE the done check: a fast peer can stamp
     // this kernel's done within one engine pass of its ready (the fold
@@ -1578,7 +1736,51 @@ struct CollectiveBus::Impl {
     // graph reservations and eager pickups share one execution-ordered
     // generation counter, so shape switches and between-window eager work
     // cannot make the cursor and claim diverge).
-    if (graph.flight.posted_bits != all_peers_mask() && ready != 0) {
+    if (graph.flight.posted_bits != all_peers_mask() && write_transport() && write_ready) {
+      // The one-sided transport: the kernel's chunked row (the generation's
+      // staging row, every chunk its own proof) RDMA-WRITTEN into each
+      // peer's write ring at row (gen-1) % kBusWriteRing, lane 0. No slot,
+      // no doorbell, no credit — the ring's reuse is the protocol's
+      // (bus_types.hpp). Signaled every 16th post per lane so the SQ
+      // retires and errors surface.
+      const auto post_t0 = Clock::now();
+      const uint32_t row = static_cast<uint32_t>((gen - 1) % kBusWriteRing);
+      const uint8_t* src_row = stage_buf(0, static_cast<int>((gen - 1) % Impl::kStageRing));
+      const uint32_t chunks = bus_write_chunks(elems);
+      const int lanes = static_cast<int>(lane_count());
+      for (size_t p = 0; p < peer_ranks.size(); ++p) {
+        if ((graph.flight.posted_bits >> p) & 1) continue;
+        // The row's chunks in contiguous runs, one per lane (bus_types.hpp,
+        // bus_write_lane_run): each run through its lane's queue pair into
+        // the peer's lane slab ring at the chunks' own offsets.
+        for (int l = 0; l < lanes; ++l) {
+          uint32_t run_begin = 0, run_end = 0;
+          bus_write_lane_run(chunks, lanes, l, &run_begin, &run_end);
+          if (run_end <= run_begin) continue;
+          LaneState& lane = peers[p][static_cast<size_t>(l)];
+          const size_t off = static_cast<size_t>(run_begin) * kBusWriteChunkBytes;
+          const uint32_t run_bytes = static_cast<uint32_t>(static_cast<size_t>(run_end - run_begin) * kBusWriteChunkBytes);
+          const bool signaled = (lane.write_posts % 16) == 15;
+          std::string error;
+          if (!lane.lane->post_write(
+                  BusPool::kLatency, src_row + off, lane.stage_lkey, run_bytes,
+                  lane.lane->layout().write_row_remote_addr(lane.peer_endpoint.slab_base, row) + off,
+                  lane.peer_endpoint.rkey, signaled, &error)) {
+            fail_lane(lane, error);
+            graph_fail("graph row write failed: " + error);
+            return true;
+          }
+          ++lane.write_posts;
+          lane.last_progress = Clock::now();
+          ++lane.stats.posts;
+          lane.stats.bytes_sent += run_bytes;
+        }
+        graph.flight.posted_bits |= 1ULL << p;
+        graph.flight.progressed_at = Clock::now();
+        worked = true;
+      }
+      tl->post_us += elapsed_us(post_t0);
+    } else if (graph.flight.posted_bits != all_peers_mask() && ready != 0 && !write_transport()) {
       const auto post_t0 = Clock::now();
       // The row the kernel wrote — peer row 0 of ring slot
       // (g-1)%kStageRing, shared by every peer's post (the graph kernel
@@ -1993,6 +2195,8 @@ struct CollectiveBus::Impl {
       ar_ctl->gt_start = ar_ctl->gt_stage = ar_ctl->gt_first =
           ar_ctl->gt_last = ar_ctl->gt_done = 0;
       for (uint64_t& g : ar_ctl->gt_claim) g = 0;
+      for (uint64_t& g : ar_ctl->gt_landed) g = 0;
+      for (uint64_t& g : ar_ctl->gt_claim_first_neg) g = 0;
       ar_ctl->stamp_reduce_done = 0;
       // TEMP hunt stamp reset (small-collective corruption).
       __atomic_store_n(&ar_ctl->dbg_first_cell, 0, __ATOMIC_RELAXED);
@@ -2640,6 +2844,7 @@ struct CollectiveBus::Impl {
     int idle = 0;
     for (;;) {
       if (stopping.load(std::memory_order_relaxed) && drained()) break;
+      const auto loop_t0 = Clock::now();
       const bool graph_worked = graph_pass();
       const bool stream_worked = stream_pass();
       const bool coll_worked = collective_pass();
@@ -2648,6 +2853,12 @@ struct CollectiveBus::Impl {
       const bool recycled = recycle_pass();
       const bool credited = credits_pass();
       const bool watched = watchdog_pass();
+      {
+        const double it_us = elapsed_us(loop_t0);
+        ++loop_n;
+        ++loop_hist[it_us < 2 ? 0 : it_us < 5 ? 1 : it_us < 10 ? 2 : it_us < 20 ? 3 : it_us < 50 ? 4 : 5];
+        if (it_us > loop_max_us) loop_max_us = it_us;
+      }
       if (graph_worked || stream_worked || coll_worked || worked || polled ||
           recycled || credited || watched) {
         idle = 0;
@@ -3117,7 +3328,7 @@ bool CollectiveBus::start(std::string* error) {
   {
     const size_t stage_bytes =
         (impl.peer_ranks.size() + 1) *
-        static_cast<size_t>(Impl::kStageRing) * opt.lat_slot_bytes;
+        static_cast<size_t>(Impl::kStageRing) * impl.stage_pitch();
     const size_t arena_bytes =
         impl.peer_ranks.size() * impl.bulk_seg_bytes();
     const size_t counters_bytes =  // the staged counters, then the
@@ -3277,9 +3488,29 @@ bool CollectiveBus::start(std::string* error) {
                cudaGetErrorString(scratch_err);
       return false;
     }
+    // The one-sided transport's per-block records: pinned, zeroed once (a
+    // record carries its generation, so stale values never match).
+    const cudaError_t recs_err = cudaMallocHost(
+        reinterpret_cast<void**>(&impl.write_recs),
+        Impl::kWriteRecCells * kBusWriteMaxBlocks * sizeof(BusWriteBlockRecord));
+    if (recs_err != cudaSuccess || impl.write_recs == nullptr) {
+      cudaFree(impl.bulk_scratch);
+      impl.bulk_scratch = nullptr;
+      cudaFreeHost(impl.strm.cells);
+      impl.strm.cells = nullptr;
+      cudaFreeHost(impl.graph_cells);
+      impl.graph_cells = nullptr;
+      cudaFreeHost(impl.ar_ctl);
+      impl.ar_ctl = nullptr;
+      *error = std::string("write record alloc failed: ") + cudaGetErrorString(recs_err);
+      return false;
+    }
+    for (size_t i = 0; i < Impl::kWriteRecCells * kBusWriteMaxBlocks; ++i) impl.write_recs[i] = BusWriteBlockRecord{};
     const cudaError_t stream_err = cudaStreamCreateWithFlags(
         &impl.collective_stream, cudaStreamNonBlocking);
     if (stream_err != cudaSuccess) {
+      cudaFreeHost(impl.write_recs);
+      impl.write_recs = nullptr;
       cudaFree(impl.bulk_scratch);
       impl.bulk_scratch = nullptr;
       cudaFreeHost(impl.strm.cells);
@@ -3879,6 +4110,8 @@ uint64_t CollectiveBus::allreduce_stream(cudaStream_t stream, const void* device
     cell->stamp_reduce_done = 0;
     cell->gt_start = cell->gt_stage = cell->gt_first = cell->gt_last = cell->gt_done = 0;
     for (uint64_t& g : cell->gt_claim) g = 0;
+    for (uint64_t& g : cell->gt_landed) g = 0;
+    for (uint64_t& g : cell->gt_claim_first_neg) g = 0;
     __atomic_store_n(&cell->dbg_gate_waits, 0, __ATOMIC_RELAXED);
     __atomic_store_n(&cell->dbg_gate_spins, 0, __ATOMIC_RELAXED);
     __atomic_store_n(&cell->gen_seq, gen, __ATOMIC_RELEASE);
@@ -3897,11 +4130,17 @@ uint64_t CollectiveBus::allreduce_stream(cudaStream_t stream, const void* device
   v.stage_row_base = reinterpret_cast<uint16_t*>(impl.stage_buf(0, 0));
   v.send_peers = static_cast<int>(impl.peer_ranks.size());
   v.stage_ring = Impl::kStageRing;
-  v.stage_row_bytes = static_cast<uint32_t>(options_.lat_slot_bytes);
-  const cudaError_t launch = launch_bus_allreduce_graph(
-      v, options_.my_rank, static_cast<const __nv_bfloat16*>(device_src),
-      static_cast<__nv_bfloat16*>(device_dst), static_cast<uint32_t>(bf16_elems), cell,
-      impl.strm.deadline_cycles, stream);
+  v.stage_row_bytes = static_cast<uint32_t>(impl.stage_pitch());
+  const cudaError_t launch =
+      impl.write_transport()
+          ? launch_bus_allreduce_write(
+                v, options_.my_rank, static_cast<const __nv_bfloat16*>(device_src),
+                static_cast<__nv_bfloat16*>(device_dst), static_cast<uint32_t>(bf16_elems), cell,
+                impl.write_recs_of_stream(cell_idx), impl.strm.deadline_cycles, stream)
+          : launch_bus_allreduce_graph(
+                v, options_.my_rank, static_cast<const __nv_bfloat16*>(device_src),
+                static_cast<__nv_bfloat16*>(device_dst), static_cast<uint32_t>(bf16_elems), cell,
+                impl.strm.deadline_cycles, stream);
   if (launch != cudaSuccess) {
     // No kernel will stamp this generation: fail the era (the walk's
     // drain-fail poisons the queue) — the numbering cannot be given back.
@@ -4146,6 +4385,8 @@ bool CollectiveBus::graph_replay_arm(std::string* error, int variant) {
       cell->gt_start = cell->gt_stage = cell->gt_first = cell->gt_last =
           cell->gt_done = 0;
       for (uint64_t& g : cell->gt_claim) g = 0;
+    for (uint64_t& g : cell->gt_landed) g = 0;
+    for (uint64_t& g : cell->gt_claim_first_neg) g = 0;
       __atomic_store_n(&cell->dbg_gate_waits, 0, __ATOMIC_RELAXED);
       __atomic_store_n(&cell->dbg_gate_spins, 0, __ATOMIC_RELAXED);
       __atomic_store_n(&cell->gen_seq, first + g, __ATOMIC_RELEASE);
@@ -4390,16 +4631,21 @@ bool CollectiveBus::allreduce_record(cudaStream_t capture_stream,
   v.stage_row_base = reinterpret_cast<uint16_t*>(impl.stage_buf(0, 0));
   v.send_peers = static_cast<int>(impl.peer_ranks.size());
   v.stage_ring = Impl::kStageRing;
-  v.stage_row_bytes = static_cast<uint32_t>(options_.lat_slot_bytes);
+  v.stage_row_bytes = static_cast<uint32_t>(impl.stage_pitch());
 
-  const cudaError_t launch = launch_bus_allreduce_graph(
-      v, options_.my_rank,
-      static_cast<const __nv_bfloat16*>(device_src),
-      static_cast<__nv_bfloat16*>(device_dst),
-      static_cast<uint32_t>(bf16_elems),
-      &impl.graph_variant_cells(variant)[shape.gens],
-      impl.graph.deadline_cycles,
-      capture_stream);
+  const cudaError_t launch =
+      impl.write_transport()
+          ? launch_bus_allreduce_write(
+                v, options_.my_rank, static_cast<const __nv_bfloat16*>(device_src),
+                static_cast<__nv_bfloat16*>(device_dst), static_cast<uint32_t>(bf16_elems),
+                &impl.graph_variant_cells(variant)[shape.gens],
+                impl.write_recs_of(variant, shape.gens), impl.graph.deadline_cycles,
+                capture_stream)
+          : launch_bus_allreduce_graph(
+                v, options_.my_rank, static_cast<const __nv_bfloat16*>(device_src),
+                static_cast<__nv_bfloat16*>(device_dst), static_cast<uint32_t>(bf16_elems),
+                &impl.graph_variant_cells(variant)[shape.gens], impl.graph.deadline_cycles,
+                capture_stream);
   if (launch != cudaSuccess) {
     *error = std::string("graph collective kernel launch failed: ") +
              cudaGetErrorString(launch);
@@ -4617,6 +4863,10 @@ void CollectiveBus::stop() {
   if (impl.bulk_scratch) {
     cudaFree(impl.bulk_scratch);
     impl.bulk_scratch = nullptr;
+  }
+  if (impl.write_recs) {
+    cudaFreeHost(impl.write_recs);
+    impl.write_recs = nullptr;
   }
   // Staging block: deregister before the lanes/devices go away (the MRs
   // hang off the device PDs), then free the pinned block.

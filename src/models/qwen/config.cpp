@@ -389,10 +389,16 @@ QwenTextConfig QwenTextConfig::parse(const minijson::Value& tc,
       static const char* kShared[] = {"mlp.shared_expert.gate_proj", "mlp.shared_expert.up_proj",
                                       "mlp.shared_expert.down_proj"};
       bool table_seen = false, mtp_seen = false;
+      bool csf_seen = false, plain_seen = false, mtp_csf_seen = false, mtp_plain_seen = false;
       const std::string layers_prefix = "model.language_model.layers.";
       for (const auto& m : ql->members()) {
         const std::string key = m.key;
         if (!m.value.is_object()) bad("quantized_layers['" + key + "'] is not an object");
+        // The vision tower is never served (text-only; its tensors are
+        // counted, not validated, at binding): note its presence, skip
+        // its form. The FP4-Local export quantizes it (W4A16_NVFP4 +
+        // MXFP8); other releases leave it out entirely.
+        if (key.rfind("model.visual.", 0) == 0) continue;
         const std::string algo = optional_string(m.value, "quant_algo", "");
         const int64_t group = optional_int64(m.value, "group_size", -1);
         auto want = [&](const char* a, int64_t g, const char* what) {
@@ -409,6 +415,17 @@ QwenTextConfig QwenTextConfig::parse(const minijson::Value& tc,
           if (c.mtp_layer() < 0) bad("'" + key + "' declared without a draft layer");
           if (algo != "W4A16_NVFP4" && algo != "NVFP4") want("W4A16_NVFP4", 16, "the draft experts");
           if (group != 16) want(algo.c_str(), 16, "the draft experts");
+          // The draft experts carry their own scale form: the FP4-Local
+          // export wraps only the backbone's as CSF, the draft keeping the
+          // plain E4M3 weight_scale (the loader picks the form per scope).
+          const std::string mtp_enc = optional_string(m.value, "weight_scale_encoding", "");
+          if (mtp_enc == "csf")
+            mtp_csf_seen = true;
+          else if (mtp_enc.empty())
+            mtp_plain_seen = true;
+          else
+            bad("'" + key + "' declares weight_scale_encoding '" + mtp_enc +
+                "' (only \"csf\" is implemented)");
           mtp_seen = true;
           continue;
         }
@@ -420,6 +437,18 @@ QwenTextConfig QwenTextConfig::parse(const minijson::Value& tc,
         const std::string module = key.substr(dot + 1);
         if (module == "mlp.experts") {
           want("NVFP4", 16, "the routed experts");
+          // The FP4-Local export wraps every backbone experts entry's
+          // per-group scales as ModelOpt CSF sidecars
+          // (weight_scale_encoding "csf"); the plain E4M3 weight_scale is
+          // then absent and the loader expands the sidecars once. Mixed
+          // encodings across layers refuse: one export, one form.
+          const std::string enc = optional_string(m.value, "weight_scale_encoding", "");
+          if (enc == "csf")
+            csf_seen = true;
+          else if (enc.empty())
+            plain_seen = true;
+          else
+            bad("'" + key + "' declares weight_scale_encoding '" + enc + "' (only \"csf\" is implemented)");
           experts_seen[static_cast<size_t>(layer)] = true;
           continue;
         }
@@ -452,8 +481,14 @@ QwenTextConfig QwenTextConfig::parse(const minijson::Value& tc,
       }
       if (!c.ple_layer_ids.empty() && !table_seen) bad("the n-gram table's form is not declared");
       if (c.mtp_layer() >= 0 && !mtp_seen) bad("the draft layer's experts are not declared");
+      if (csf_seen && plain_seen)
+        bad("some routed-experts entries declare weight_scale_encoding \"csf\" and some do not (one export, one form)");
+      if (mtp_csf_seen && mtp_plain_seen)
+        bad("the draft experts mix weight_scale_encoding \"csf\" and plain entries (one export, one form)");
       c.experts_fp8 = false;
       c.experts_nvfp4 = true;
+      c.experts_nvfp4_csf = csf_seen;
+      c.mtp_experts_nvfp4_csf = mtp_csf_seen;
       c.dense_mxfp8_shipped = true;
       c.mtp_experts_nvfp4 = c.mtp_layer() >= 0;
       c.ngram_table_nvfp4 = table_seen;

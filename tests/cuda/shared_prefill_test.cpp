@@ -618,6 +618,22 @@ DGPP_TEST(shared_prefill_qwen35) {
     }, cfg.vocab_size);
   }
 }
+DGPP_TEST(shared_prefill_qwen35_moe) {
+  const auto cfg = qwen35fx::tiny_moe_config();
+  const std::string dir = "shared_qwen35_moe_fixture";
+  qwen35fx::write_moe_fixture(dir);
+  Qwen35LayerStream::set_mtp_expert_format("bf16");
+  try {
+    check<Qwen35Model>([&](bool mtp, bool) {
+      return std::make_unique<Qwen35Model>(cfg, dir, 256, 2048, LoaderResidency::Resident,
+                                          nullptr, 0, 1, 4, 16, mtp);
+    }, cfg.vocab_size);
+  } catch (...) {
+    Qwen35LayerStream::set_mtp_expert_format("fp8");
+    throw;
+  }
+  Qwen35LayerStream::set_mtp_expert_format("fp8");
+}
 DGPP_TEST(shared_prefill_qwen35_per_tensor) {
   const auto cfg = qwen35fx::tiny_config();
   const std::string dir = "shared_qwen35_per_tensor_fixture";

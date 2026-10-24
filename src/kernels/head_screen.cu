@@ -1,4 +1,5 @@
 #include "kernels/head_screen.hpp"
+#include "kernels/pdl.cuh"
 
 #include <algorithm>
 #include <cmath>
@@ -173,6 +174,7 @@ template <class Src>
 __global__ void __launch_bounds__(kBuildThreads) head_screen_build_kernel(
     Src src, const int8_t* __restrict__ sign, int n, int k,
     uint32_t* __restrict__ codes, float* __restrict__ step_out, float* __restrict__ rms_row) {
+  dgpp_pdl_wait();
   extern __shared__ __align__(16) float xs[];
   uint8_t* cs8 = reinterpret_cast<uint8_t*>(xs + k);
   float* red = reinterpret_cast<float*>(cs8 + k);
@@ -221,6 +223,7 @@ __global__ void __launch_bounds__(kBuildThreads) head_screen_build_kernel(
 
 __global__ void __launch_bounds__(kB) head_screen_rms_blk_kernel(const float* __restrict__ rms_row, int n,
                                                                  float* __restrict__ rms_blk) {
+  dgpp_pdl_wait();
   __shared__ float red[kB / 32];
   const int b = blockIdx.x, t = threadIdx.x, row = b * kB + t;
   const float v = row < n ? rms_row[row] : 0.f;
@@ -236,6 +239,7 @@ __global__ void __launch_bounds__(kPrepThreads) head_screen_prep_kernel(const ui
                                                                         const int8_t* __restrict__ sign, int k,
                                                                         int8_t* __restrict__ xq,
                                                                         float* __restrict__ xmeta) {
+  dgpp_pdl_wait();
   extern __shared__ __align__(16) float xs[];
   float* red = xs + k;
   int* redi = reinterpret_cast<int*>(red + 8);
@@ -282,6 +286,7 @@ __global__ void __launch_bounds__(kB) head_screen_screen_kernel(const uint32_t* 
                                                                 const float* __restrict__ xmeta, int n, int k,
                                                                 int row0, int rows_in, int nb,
                                                                 float* __restrict__ bmax) {
+  dgpp_pdl_wait();
   extern __shared__ __align__(16) int8_t sx8[];
   __shared__ float red[kB / 32][kRows];
   const int t = threadIdx.x, kc = k / 16;
@@ -396,6 +401,7 @@ __global__ void __launch_bounds__(kSelectThreads) head_screen_select_kernel(cons
                                                                             const float* __restrict__ xmeta,
                                                                             int nb, int cap, float delta,
                                                                             int32_t* __restrict__ cand) {
+  dgpp_pdl_wait();
   extern __shared__ __align__(16) float sm[];
   float* bm = sm;
   float* sig = bm + nb;
@@ -453,6 +459,7 @@ __global__ void __launch_bounds__(kB) head_screen_rescore_kernel(const int32_t* 
                                                                  size_t act_stride, int n, int k,
                                                                  RescoreWeights w, float* __restrict__ out,
                                                                  size_t out_stride) {
+  dgpp_pdl_wait();
   extern __shared__ __align__(16) uint16_t sx16[];
   __shared__ int is_cand;
   const int b = blockIdx.x, row = blockIdx.y, t = threadIdx.x, warp = t >> 5, lane = t & 31;
@@ -504,6 +511,7 @@ __global__ void __launch_bounds__(kB) head_screen_rescore_packq_kernel(const int
                                                                        const uint8_t* __restrict__ w,
                                                                        const uint16_t* __restrict__ scales,
                                                                        float* __restrict__ out, size_t out_stride) {
+  dgpp_pdl_wait();
   constexpr int SF = packq_gemv::kScaleF16G128;
   using F = packq_gemv::Fmt<8, SF>;
   constexpr int kRowChunks = K / F::codes_per_chunk;

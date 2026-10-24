@@ -181,6 +181,7 @@ DGPP_TEST(dsv41_engram_layer_stages_rows_from_the_mmap_bitwise_the_host_lookup) 
       const dgpp::Dsv41LayerResident& r = s.load_layer(cfg.engram_layer_ids[0]);
       dgpp::Dsv41EngramLayerWeights w;
       w.wkv = r.engram.wkv;
+      w.wkv_x = r.engram.wkv_x;  // the EXL3 fixture's (DGPP_DSV41_FIXTURE=exl3)
       w.q_weight = r.engram.q_weight;
       w.k_weight = r.engram.k_weight;
       w.table_index = 0;

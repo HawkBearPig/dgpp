@@ -1,4 +1,5 @@
 #include "kernels/pick.hpp"
+#include "kernels/pdl.cuh"
 
 #include <cmath>
 #include <limits>
@@ -86,6 +87,7 @@ __global__ __launch_bounds__(kLocalThreads) void pick_local_kernel(
     const uint64_t* __restrict__ carry_digest, uint16_t* __restrict__ table,
     PickLocal* __restrict__ locals,
     const PickVerdict* __restrict__ row_select, int source_row_stride) {
+  dgpp_pdl_wait();
   const int row = blockIdx.x;
   const int selected = row_select ? max(row_select[row].accepted - 1, 0) : 0;
   const int logits_row =
@@ -161,6 +163,7 @@ __global__ void pick_verdict_kernel(const uint16_t* __restrict__ table,
                                     PickVerdict* __restrict__ verdicts,
                                     PickVerdict* __restrict__ device_verdicts,
                                     uint64_t* __restrict__ carry_digest) {
+  dgpp_pdl_wait();
   int32_t winners[kPickMaxRows];
   for (int r = 0; r < rows; ++r) {
     Pair best{0.0f, kNoId};

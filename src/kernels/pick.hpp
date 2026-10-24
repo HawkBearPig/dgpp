@@ -32,7 +32,7 @@ namespace dgpp {
 constexpr int kPickLogitDigits = 6;  // 36 bits carry the float's 32
 constexpr int kPickIdDigits = 3;     // 18 bits carry a vocab id (< 262144)
 constexpr int kPickSlotsPerRank = kPickLogitDigits + kPickIdDigits;
-constexpr int kPickMaxRows = 64;      // dgpp::kDecodeRowsMax (engine/decode_outputs.hpp)
+constexpr int kPickMaxRows = 96;      // dgpp::kDecodeRowsMax (engine/decode_outputs.hpp)
 constexpr int kPickMaxRequests = 16;  // one verdict per fixed request slot (the GLM-5.3 decode batch's cap)
 constexpr int kPickMaxWorld = 8;
 constexpr uint64_t kPickDigestBits = 6ull * kPickSlotsPerRank;  // 54
@@ -67,6 +67,8 @@ struct PickVerdict {
   int32_t accepted = 0;
   int32_t next = -1;
   int32_t winners[kPickMaxRows] = {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+                                   -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+                                   -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
                                    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
                                    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
                                    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1};

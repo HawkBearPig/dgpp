@@ -1,4 +1,5 @@
 #include "kernels/latent_format.hpp"
+#include "kernels/pdl.cuh"
 #include "kernels/qwen_ple.hpp"
 
 #include <stdexcept>
@@ -23,6 +24,7 @@ __global__ void hash_ids_kernel(const int32_t* __restrict__ tokens, int n, int32
                                 const int64_t* __restrict__ head_vocab,
                                 const int64_t* __restrict__ head_offset, int heads,
                                 int heads_per_ngram, int32_t* __restrict__ ids) {
+  dgpp_pdl_wait();
   const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (i >= static_cast<int64_t>(n) * heads) return;
   const int t = static_cast<int>(i / heads);
@@ -83,6 +85,7 @@ __global__ void hash_ids_rows_kernel(const int64_t* __restrict__ tokens, int row
                                      const int64_t* __restrict__ head_vocab,
                                      const int64_t* __restrict__ head_offset, int heads,
                                      int heads_per_ngram, int32_t* __restrict__ ids) {
+  dgpp_pdl_wait();
   const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (i >= static_cast<int64_t>(rows) * heads) return;
   const int t = static_cast<int>(i / heads);
@@ -110,6 +113,7 @@ __global__ void context_rows_kernel(const int64_t* __restrict__ tokens,
                                     const int64_t* __restrict__ pos,
                                     const int32_t* __restrict__ spans, int num_requests,
                                     int32_t* __restrict__ ctx, int32_t* __restrict__ ctx_rows) {
+  dgpp_pdl_wait();
   const int q = blockIdx.x * blockDim.x + threadIdx.x;
   if (q >= num_requests) return;
   const int s = spans[2 * q], len = spans[2 * q + 1];
@@ -145,6 +149,7 @@ __global__ void gather_kernel(const uint8_t* __restrict__ table, int64_t row_beg
                               int64_t rows, float scale, const int32_t* __restrict__ ids,
                               int n, int heads, int head_begin, int heads_local,
                               int head_dim, uint16_t* __restrict__ out) {
+  dgpp_pdl_wait();
   const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
   const int64_t pair = static_cast<int64_t>(blockIdx.x) * (blockDim.x / 32) + warp;
   if (pair >= static_cast<int64_t>(n) * heads_local) return;
@@ -182,6 +187,7 @@ __global__ void gate_kernel(const uint16_t* __restrict__ key_n,
                             const uint16_t* __restrict__ query_n,
                             const uint16_t* __restrict__ value, uint16_t* __restrict__ gated,
                             int hc, int hidden, float inv_sqrt_h_divisor) {
+  dgpp_pdl_wait();
   __shared__ float warp_sums[kGateThreads / 32];
   __shared__ float s_gate;
   const int64_t row = blockIdx.x;  // t * hc + i
@@ -216,6 +222,7 @@ __global__ void conv_kernel(const uint16_t* __restrict__ un, const uint16_t* __r
                             uint16_t* __restrict__ state, const uint16_t* __restrict__ weight,
                             const uint16_t* __restrict__ residual, uint16_t* __restrict__ out,
                             int n, int channels) {
+  dgpp_pdl_wait();
   constexpr int S = (W - 1) * D;
   const int c = blockIdx.x * blockDim.x + threadIdx.x;
   if (c >= channels) return;
@@ -254,6 +261,7 @@ __global__ void conv_rows_kernel(const uint16_t* __restrict__ un, const uint16_t
                                  const int64_t* __restrict__ pos,
                                  const int32_t* __restrict__ spans, int channels,
                                  uint16_t* __restrict__ snapshots, int snapshot_rows) {
+  dgpp_pdl_wait();
   constexpr int S = (W - 1) * D;
   const int c = blockIdx.x * blockDim.x + threadIdx.x;
   if (c >= channels) return;
@@ -401,6 +409,7 @@ void qwen_ple_gather_bf16(const uint8_t* table, int64_t row_begin, int64_t rows,
 // staged buffer, the chunk arithmetic gather_kernel's.
 __global__ void gather_staged_kernel(const uint8_t* __restrict__ staged, float scale, int n,
                                      int heads_local, int head_dim, uint16_t* __restrict__ out) {
+  dgpp_pdl_wait();
   const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
   const int64_t pair = static_cast<int64_t>(blockIdx.x) * (blockDim.x / 32) + warp;
   if (pair >= static_cast<int64_t>(n) * heads_local) return;
@@ -454,6 +463,7 @@ __global__ void gather_fp4_kernel(const uint8_t* __restrict__ codes, const uint8
                                   int64_t row_begin, int64_t rows, float global,
                                   const int32_t* __restrict__ ids, int n, int heads, int head_begin,
                                   int heads_local, int head_dim, uint16_t* __restrict__ out) {
+  dgpp_pdl_wait();
   const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
   const int64_t pair = static_cast<int64_t>(blockIdx.x) * (blockDim.x / 32) + warp;
   if (pair >= static_cast<int64_t>(n) * heads_local) return;
@@ -473,6 +483,7 @@ __global__ void gather_fp4_kernel(const uint8_t* __restrict__ codes, const uint8
 __global__ void gather_staged_fp4_kernel(const uint8_t* __restrict__ staged_codes,
                                          const uint8_t* __restrict__ staged_scales, float global, int n,
                                          int heads_local, int head_dim, uint16_t* __restrict__ out) {
+  dgpp_pdl_wait();
   const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
   const int64_t pair = static_cast<int64_t>(blockIdx.x) * (blockDim.x / 32) + warp;
   if (pair >= static_cast<int64_t>(n) * heads_local) return;
@@ -568,6 +579,7 @@ void qwen_ple_conv_bf16(const uint16_t* un, const uint16_t* gv, uint16_t* state,
 namespace {
 __global__ void publish_stage_kernel(uint64_t* __restrict__ device_seq, uint64_t* __restrict__ pinned_seq,
                                      int32_t* __restrict__ pinned_rows, int rows) {
+  dgpp_pdl_wait();
   if (threadIdx.x != 0) return;
   asm volatile("st.relaxed.sys.global.s32 [%0], %1;" ::"l"(pinned_rows), "r"(rows) : "memory");
   __threadfence_system();

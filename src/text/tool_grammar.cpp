@@ -48,7 +48,8 @@ GrammarVocab::GrammarVocab(std::vector<std::string> texts, ChatMarkers markers,
 
 GrammarVocab GrammarVocab::from_tokenizer(const Tokenizer& tok,
                                           const std::vector<int64_t>& eos_ids,
-                                          int vocab_size, DsmlDialect dsml_dialect) {
+                                          int vocab_size, DsmlDialect dsml_dialect,
+                                          bool model_opens_thinking) {
   const int64_t max_id = tok.max_id();
   std::vector<std::string> texts(
       static_cast<size_t>(std::max<int64_t>(max_id + 1, 0)));
@@ -66,6 +67,7 @@ GrammarVocab GrammarVocab::from_tokenizer(const Tokenizer& tok,
   }
   ChatMarkers markers = ChatMarkers::from_tokenizer(tok);
   markers.dsml_dialect = dsml_dialect;
+  markers.model_opens_thinking = model_opens_thinking;
   return GrammarVocab(std::move(texts), std::move(markers), eos_ids, vocab_size, call_eos);
 }
 

@@ -1,4 +1,5 @@
 #include "kernels/scale_gemm.hpp"
+#include "kernels/pdl.cuh"
 
 #include <algorithm>
 #include <cstdlib>
@@ -41,6 +42,7 @@ __global__ void scale_gemm_kernel(const uint16_t* __restrict__ act,
                                   const float* __restrict__ scales,
                                   OutT* __restrict__ out, int m, int n,
                                   int k, size_t out_stride, int rs, int cs) {
+  dgpp_pdl_wait();
   const int n0 = blockIdx.x * BN;
   const int m0 = blockIdx.y * BM;
   const int scale_cols = (k + (1 << cs) - 1) >> cs;
@@ -170,6 +172,7 @@ __global__ void scale_gemv_kernel(const uint16_t* __restrict__ act,
                                   const float* __restrict__ scales,
                                   OutT* __restrict__ out, int n, int k,
                                   size_t out_stride, int rs, int cs, int span) {
+  dgpp_pdl_wait();
   extern __shared__ __align__(16) uint16_t sx[];
   fp8_gemv::stage_activations<kRows>(act, act_stride, k, sx);
   __syncthreads();
@@ -471,9 +474,17 @@ void launch_scale_gemm_grid_bf16(const uint16_t* act, size_t act_row_stride_elem
                                  const uint8_t* w_payload, const float* w_scales,
                                  uint16_t* out, int m, int n, int k, cudaStream_t stream,
                                  size_t out_row_stride_elems, int rs, int cs, bool decode_mma,
-                                 void* ws, size_t ws_bytes) {
+                                 void* ws, size_t ws_bytes, bool prefill_tile) {
   // (rs / cs reach the core's scale indexing unchanged: the per-vector
   // lookup scale_row[(c0 + i) >> cs] covers the channel grid too.)
+  // The prefill walk's form (the header): the fp8-weight tile GEMM on this
+  // grid for every row count the shape allows.
+  if (prefill_tile && m >= 1 && n > 0 && k > 0 && cs >= 4 && rs >= 0 && rs <= 7 && cs <= 7 &&
+      fp8w_gemm_shape_ok(act, act_row_stride_elems, k)) {
+    launch_fp8w_gemm_bf16(act, act_row_stride_elems, w_payload, w_scales, out, m, n, k, Fp8wScale::PerWeight,
+                          stream, out_row_stride_elems, rs, cs);
+    return;
+  }
   if (decode_mma && m >= 1 && n > 0 && k > 0 && cs >= 4 &&
       mma_gemv_shape_ok(w_payload, act, act_row_stride_elems, m, k)) {
     launch_mma_gemv_fp8_bf16(act, act_row_stride_elems, w_payload, w_scales, out, m, n, k,
@@ -488,7 +499,13 @@ void launch_scale_gemm_grid_f32(const uint16_t* act, size_t act_row_stride_elems
                                 const uint8_t* w_payload, const float* w_scales, float* out,
                                 int m, int n, int k, cudaStream_t stream,
                                 size_t out_row_stride_elems, int rs, int cs, bool decode_mma,
-                                void* ws, size_t ws_bytes) {
+                                void* ws, size_t ws_bytes, bool prefill_tile) {
+  if (prefill_tile && m >= 1 && n > 0 && k > 0 && cs >= 4 && rs >= 0 && rs <= 7 && cs <= 7 &&
+      fp8w_gemm_shape_ok(act, act_row_stride_elems, k)) {
+    launch_fp8w_gemm_f32(act, act_row_stride_elems, w_payload, w_scales, out, m, n, k, Fp8wScale::PerWeight,
+                         stream, out_row_stride_elems, rs, cs);
+    return;
+  }
   if (decode_mma && m >= 1 && n > 0 && k > 0 && cs >= 4 &&
       mma_gemv_shape_ok(w_payload, act, act_row_stride_elems, m, k)) {
     launch_mma_gemv_fp8_f32(act, act_row_stride_elems, w_payload, w_scales, out, m, n, k,
@@ -513,14 +530,26 @@ void check_e8m0_grid(const uint16_t* act, size_t act_stride, const uint8_t* w, c
 void launch_scale_gemm_grid_e8m0_bf16(const uint16_t* act, size_t act_row_stride_elems, const uint8_t* w_payload,
                                       const uint8_t* w_scales, uint16_t* out, int m, int n, int k,
                                       cudaStream_t stream, size_t out_row_stride_elems, int rs, int cs, void* ws,
-                                      size_t ws_bytes) {
+                                      size_t ws_bytes, bool prefill_tile) {
+  if (prefill_tile && m >= 1 && n > 0 && k > 0 && rs >= 0 && rs <= 7 && cs >= 4 && cs <= 7 &&
+      fp8w_gemm_shape_ok(act, act_row_stride_elems, k)) {
+    launch_fp8w_gemm_e8m0_bf16(act, act_row_stride_elems, w_payload, w_scales, out, m, n, k,
+                                  stream, out_row_stride_elems, rs, cs);
+    return;
+  }
   check_e8m0_grid(act, act_row_stride_elems, w_payload, w_scales, m, n, k, cs);
   launch_mma_gemv_fp8e8m0_bf16(act, act_row_stride_elems, w_payload, w_scales, out, m, n, k, out_row_stride_elems,
                                rs, cs, stream, ws, ws_bytes);
 }
 void launch_scale_gemm_grid_e8m0_f32(const uint16_t* act, size_t act_row_stride_elems, const uint8_t* w_payload,
                                      const uint8_t* w_scales, float* out, int m, int n, int k, cudaStream_t stream,
-                                     size_t out_row_stride_elems, int rs, int cs, void* ws, size_t ws_bytes) {
+                                     size_t out_row_stride_elems, int rs, int cs, void* ws, size_t ws_bytes, bool prefill_tile) {
+  if (prefill_tile && m >= 1 && n > 0 && k > 0 && rs >= 0 && rs <= 7 && cs >= 4 && cs <= 7 &&
+      fp8w_gemm_shape_ok(act, act_row_stride_elems, k)) {
+    launch_fp8w_gemm_e8m0_f32(act, act_row_stride_elems, w_payload, w_scales, out, m, n, k,
+                                  stream, out_row_stride_elems, rs, cs);
+    return;
+  }
   check_e8m0_grid(act, act_row_stride_elems, w_payload, w_scales, m, n, k, cs);
   launch_mma_gemv_fp8e8m0_f32(act, act_row_stride_elems, w_payload, w_scales, out, m, n, k, out_row_stride_elems,
                               rs, cs, stream, ws, ws_bytes);
@@ -545,6 +574,7 @@ struct Fp8GemvMulti {
 template <int kRows>
 __global__ void scale_gemv_multi_kernel(Fp8GemvMulti mp, const uint16_t* __restrict__ act,
                                         size_t act_stride, int k) {
+  dgpp_pdl_wait();
   extern __shared__ __align__(16) uint16_t sx[];
   const int bid = static_cast<int>(blockIdx.x);
   int which = 0;

@@ -117,6 +117,41 @@ __device__ __forceinline__ void consume_step(uint32_t lo, uint32_t hi, uint32_t 
   }
 }
 
+// One step of one lane: eight elements' bf16 bits as one 16-byte vector
+// (the expansion kernel and the tensor-core decode form's fragments).
+// base7: the row's window base at the bf16 exponent field ((base23 >> 23) << 7).
+__device__ __forceinline__ uint4 expand_step(uint32_t lo, uint32_t hi, uint32_t ew, uint32_t base7,
+                                             int c0, const uint32_t* __restrict__ esc,
+                                             uint32_t esc_b, uint32_t esc_e) {
+  uint32_t v[8];
+#pragma unroll
+  for (int j = 0; j < 8; ++j) {
+    const uint32_t b = ((j < 4 ? lo : hi) >> (8 * (j & 3))) & 0xFFu;
+    const uint32_t code = (ew >> (4 * j)) & 0xFu;
+    v[j] = ((b & 0x80u) << 8) | (b & 0x7Fu) | (base7 + (code << 7));
+  }
+  const uint32_t any15 = ew & (ew >> 1) & (ew >> 2) & (ew >> 3) & 0x11111111u;
+  if (any15 != 0u) {
+    for (int j = 0; j < 8; ++j) {
+      if (((ew >> (4 * j)) & 0xFu) != 0xFu) continue;
+      const uint32_t col = static_cast<uint32_t>(c0 + j);
+      for (uint32_t e = esc_b; e < esc_e; ++e) {
+        const uint32_t ent = esc[e];
+        if ((ent >> 16) == col) {
+          v[j] = ent & 0xFFFFu;
+          break;
+        }
+      }
+    }
+  }
+  uint4 o;
+  o.x = v[0] | (v[1] << 16);
+  o.y = v[2] | (v[3] << 16);
+  o.z = v[4] | (v[5] << 16);
+  o.w = v[6] | (v[7] << 16);
+  return o;
+}
+
 // A lane's tail loads, issued together (at most six vectors).
 struct TailLoads {
   uint4 pair_sm, pair_exp, full_sm, full_exp, part_sm, part_exp;

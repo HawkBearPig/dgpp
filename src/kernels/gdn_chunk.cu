@@ -20,6 +20,7 @@
 // kda_recurrent_kernel by bf16 rounding of the matrix operands (the same
 // class as FLA/SGLang). The model-level gate is BFCL / tool-eval.
 #include "kernels/gdn_chunk.hpp"
+#include "kernels/pdl.cuh"
 
 #include <mma.h>
 
@@ -72,6 +73,7 @@ __global__ __launch_bounds__(kPrepThreads) void gdn_chunk_prep_kernel(
     const float* __restrict__ dt_bias, int tokens, int heads, int kv_ratio, float scale,
     __nv_bfloat16* __restrict__ w_out, __nv_bfloat16* __restrict__ u_out, __nv_bfloat16* __restrict__ qg_out,
     __nv_bfloat16* __restrict__ kd_out, __nv_bfloat16* __restrict__ p_out, float* __restrict__ decay_out) {
+  dgpp_pdl_wait();
   extern __shared__ __align__(128) uint8_t smem_raw[];
   PrepSmem& s = *reinterpret_cast<PrepSmem*>(smem_raw);
   const int chunk = blockIdx.x, h = blockIdx.y, chunks = gridDim.x;
@@ -316,6 +318,7 @@ __global__ __launch_bounds__(kStateThreads) void gdn_chunk_state_kernel(
     const __nv_bfloat16* __restrict__ qg_in, const __nv_bfloat16* __restrict__ kd_in,
     const __nv_bfloat16* __restrict__ p_in, const float* __restrict__ decay_in, float* __restrict__ state,
     uint16_t* __restrict__ out, int tokens, int heads) {
+  dgpp_pdl_wait();
   extern __shared__ __align__(128) uint8_t smem_raw[];
   uint8_t* p = smem_raw;
   auto take = [&](size_t bytes) {

@@ -114,6 +114,16 @@ struct ChatMarkers {
   // the tokenizer (the MiMo tokenizers carry the <|mimo_audio_start|>
   // marker).
   bool xml_compact = false;
+  // The family's declaration (ServeFamily::model_opens_thinking, stated
+  // by the family the checkpoint's architecture selects — never inferred
+  // from a prompt's tokens): its template's generation prompt opens no
+  // reasoning block and the model opens its own <think> (MiMo-V2.6's
+  // ends in "assistant\n", Flint's at "<|assistant|>\n"). The parser then
+  // splits the block the model opens, the usage counts it and the
+  // constrained-decoding grammar admits it before the answer. False for
+  // the families whose templates settle it (GLM's and Qwen's generation
+  // prompts end inside <think> or with a closed block).
+  bool model_opens_thinking = false;
   // The template's role markers (<|system|>, <|user|>, <|assistant|>,
   // <|observation|>; <|im_start|>, <|im_end|>), the ones the tokenizer
   // has: their positions in a prompt are the prefix cache's structural
@@ -123,6 +133,18 @@ struct ChatMarkers {
   // Qwen template's generation prompt ends in "<think>\n", the GLM one
   // in "<think>" — both open the reply inside the reasoning.
   ChatMarker newline;
+  // The ids that are a run of newlines alone ("\n", "\n\n", ... up to four,
+  // each when it encodes to one id): the whitespace a template writes
+  // after a closed block (Qwen's enable_thinking=false form ends in
+  // "</think>\n\n", one id for the pair) that prompt_leaves_thinking_to_model
+  // steps over. Includes `newline` when it exists.
+  std::vector<int64_t> newline_ids;
+  bool is_newline_run(int64_t id) const {
+    if (newline.available() && id == newline.id) return true;
+    for (const int64_t n : newline_ids)
+      if (n == id) return true;
+    return false;
+  }
 
   // Whether a rendered prompt leaves the reply inside an opened <think>
   // (its last token is think_open, or think_open followed by the bare
@@ -135,24 +157,24 @@ struct ChatMarkers {
     return newline.available() && prompt.size() >= 2 && prompt.back() == newline.id &&
            prompt[prompt.size() - 2] == think_open.id;
   }
-  // Whether a rendered prompt leaves the choice to the model: the reasoning
-  // markers exist but the prompt's tail carries neither — the MiMo-V2.6
-  // template's generation prompt ends in "assistant\n" and the model opens
-  // <think> itself (its enable_thinking=false form ends in "<think></think>",
-  // which settles it). GLM's and Qwen's templates always end in one of the
-  // two markers (a bare newline after them aside); the rule is nonetheless
-  // confined to the MiMo dialect (xml_compact) so that every other family's
-  // constrained decoding keeps its opening state bit for bit whatever a
+  // Whether a rendered prompt leaves the choice to the model: the family
+  // declares that it does (model_opens_thinking) and the template settled
+  // nothing itself — the prompt's tail neither opens <think> (thinking
+  // on) nor closes a block (MiMo's enable_thinking=false form ends in
+  // "<think></think>", Qwen's in "</think>\n\n"), newline runs after the
+  // markers aside. The declaration is the family's alone: a prompt's
+  // tokens never select the rule, so every other family's parser and
+  // constrained decoding keep their opening state bit for bit whatever a
   // prompt's tail (the loopback gates feed synthetic prompts).
   bool prompt_leaves_thinking_to_model(const std::vector<int64_t>& prompt) const {
-    if (!xml_compact) return false;
-    if (!think_open.available() || !think_close.available() || prompt.empty()) return false;
+    if (!model_opens_thinking || !think_open.available() || !think_close.available() || prompt.empty())
+      return false;
     if (prompt_opens_thinking(prompt)) return false;
     size_t n = prompt.size();
-    for (int k = 0; k < 3 && n > 0; ++k) {
+    for (int k = 0; k < 4 && n > 0; ++k) {
       const int64_t id = prompt[n - 1];
       if (id == think_open.id || id == think_close.id) return false;
-      if (!newline.available() || id != newline.id) break;
+      if (!is_newline_run(id)) break;
       --n;
     }
     return true;

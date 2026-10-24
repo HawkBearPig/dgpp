@@ -1,4 +1,5 @@
 #include "kernels/glm_norm.hpp"
+#include "kernels/pdl.cuh"
 
 #include <stdexcept>
 
@@ -84,6 +85,7 @@ __global__ void glm_rmsnorm_kernel(const uint16_t* __restrict__ x,
                                    const uint16_t* __restrict__ w,
                                    uint16_t* __restrict__ y, int dim,
                                    float eps) {
+  dgpp_pdl_wait();
   const int row = blockIdx.x;
   extern __shared__ float smem[];  // [dim] staging for the second pass
   rmsnorm_row_two_rounding(x + static_cast<size_t>(row) * dim, w,
@@ -93,6 +95,7 @@ __global__ void glm_rmsnorm_kernel(const uint16_t* __restrict__ x,
 __global__ void glm_residual_add_rmsnorm_kernel(uint16_t* __restrict__ x, const uint16_t* __restrict__ add,
                                                 const uint16_t* __restrict__ w, uint16_t* __restrict__ y,
                                                 int dim, float eps) {
+  dgpp_pdl_wait();
   const int row = blockIdx.x;
   extern __shared__ float smem[];
   residual_add_rmsnorm_row(x + static_cast<size_t>(row) * dim, add + static_cast<size_t>(row) * dim, w,
@@ -110,6 +113,7 @@ __global__ void glm_rmsnorm_quant_int8_kernel(const uint16_t* __restrict__ x, co
                                               uint16_t* __restrict__ y, int8_t* __restrict__ codes,
                                               size_t code_stride, float* __restrict__ scales,
                                               size_t scale_stride, int dim, float eps) {
+  dgpp_pdl_wait();
   const int row = blockIdx.x;
   extern __shared__ float smem[];
   const uint16_t* xr = x + static_cast<size_t>(row) * dim;
@@ -168,6 +172,7 @@ __global__ void glm_residual_add_rmsnorm_quant_int8_kernel(uint16_t* __restrict_
                                                            int8_t* __restrict__ codes, size_t code_stride,
                                                            float* __restrict__ scales, size_t scale_stride, int dim,
                                                            float eps) {
+  dgpp_pdl_wait();
   const int row = blockIdx.x;
   extern __shared__ float smem[];
   uint16_t* xr = x + static_cast<size_t>(row) * dim;
@@ -236,6 +241,7 @@ __global__ void glm_mtp_input_kernel(const uint16_t* __restrict__ embed,
                                      const uint16_t* __restrict__ hnorm,
                                      uint16_t* __restrict__ out, int hidden,
                                      float eps) {
+  dgpp_pdl_wait();
   const int t = blockIdx.x;
   extern __shared__ float smem[];
   uint16_t* dst = out + static_cast<size_t>(t) * 2 * hidden;
@@ -262,6 +268,7 @@ __global__ void glm_mtp_input_kernel(const uint16_t* __restrict__ embed,
 __global__ void glm_residual_add_kernel(uint16_t* __restrict__ x,
                                         const uint16_t* __restrict__ y,
                                         int64_t n) {
+  dgpp_pdl_wait();
   const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (i < n)
     x[i] = float_to_bf16_bits(bf16_bits_to_float(x[i]) +
@@ -276,6 +283,7 @@ __global__ void glm_rows_scatter_kernel(const uint16_t* __restrict__ rows,
                                         uint16_t* __restrict__ cache,
                                         int64_t request_cache_stride,
                                         int hidden) {
+  dgpp_pdl_wait();
   const int t = blockIdx.x;
   const int64_t pos = positions[t];
   if (pos < 0) return;
@@ -293,6 +301,7 @@ __global__ void glm_embed_bcast_kernel(const uint16_t* __restrict__ table,
                                        const int64_t* __restrict__ tokens,
                                        uint16_t* __restrict__ streams,
                                        int hidden) {
+  dgpp_pdl_wait();
   const int t = blockIdx.x;
   const uint16_t* src =
       table + static_cast<int64_t>(tokens[t]) * hidden;

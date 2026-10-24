@@ -21,6 +21,7 @@
 #include <cuda_runtime.h>
 
 #include "common/cuda_check.hpp"
+#include "kernels/pdl.cuh"
 #include "common/dtypes.hpp"
 #include "kernels/dsa.hpp"
 #include "kernels/latent_format.hpp"
@@ -332,6 +333,7 @@ __device__ inline void fwht128_smem(float* x) {
 
 __global__ void fwht_quant_rows_kernel(const uint16_t* q, uint8_t* q_fp8,
                                        float* q_scale) {
+  dgpp_pdl_wait();
   extern __shared__ float xs[];  // [128]
   const int64_t r = blockIdx.x;
   const uint16_t* row = q + r * 128;
@@ -357,6 +359,7 @@ __global__ void fwht_quant_rows_kernel(const uint16_t* q, uint8_t* q_fp8,
 
 __global__ void fold_weights_kernel(const float* weights, const float* q_scale,
                                     float* out, int64_t n, float scale) {
+  dgpp_pdl_wait();
   const int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
   if (i < n) out[i] = (weights[i] * q_scale[i]) * scale;
 }
@@ -364,6 +367,7 @@ __global__ void fold_weights_kernel(const float* weights, const float* q_scale,
 __global__ void k_layernorm_kernel(const uint16_t* k_raw, int64_t k_stride,
                                    const uint16_t* w, const uint16_t* b,
                                    uint16_t* k_out, int dim, float eps) {
+  dgpp_pdl_wait();
   const int64_t r = blockIdx.x;
   const uint16_t* row = k_raw + r * k_stride;
   __shared__ float red[32];
@@ -401,6 +405,7 @@ __global__ void fused_qkv_rmsnorm_kernel(const uint16_t* qkv, int64_t row_stride
                                          uint16_t* q_c, uint16_t* kv_c, int q_dim,
                                          int kv_dim, const uint16_t* q_w,
                                          const uint16_t* kv_w, float eps) {
+  dgpp_pdl_wait();
   const int64_t r = blockIdx.x;
   const uint16_t* row = qkv + r * row_stride;
   __shared__ float red[32];
@@ -472,6 +477,7 @@ __global__ void kpool_compress_write_kernel(
     int64_t gate_stride, const float* ape, const int32_t* block_table,
     int pools_per_block, int64_t first_pool, int n_pools, uint8_t* index_k,
     float* index_scale, int kpool, int dim) {
+  dgpp_pdl_wait();
   const int i = blockIdx.x;
   if (i >= n_pools) return;
   const int64_t pool = first_pool + i;
@@ -515,6 +521,7 @@ __global__ void kpool_tail_seed_kernel(const uint16_t* k, int64_t k_stride,
                                        const int32_t* req_ids,
                                        const int64_t* pos, int64_t tokens,
                                        uint16_t* tail, int kpool, int dim) {
+  dgpp_pdl_wait();
   const int64_t i = blockIdx.x;
   if (i >= tokens) return;
   const int32_t req = req_ids[i];
@@ -549,6 +556,7 @@ __global__ void kpool_decode_update_kernel(
     int blocks_per_request, uint16_t* tail, uint8_t* index_k,
     float* index_scale, int pools_per_block, int kpool, int dim,
     uint16_t* tail_snapshots) {
+  dgpp_pdl_wait();
   const int span = blockIdx.x;
   const int t0 = req_spans[span * 2];
   const int t1 = t0 + req_spans[span * 2 + 1];
@@ -666,6 +674,7 @@ __global__ void latent_append_kernel(const uint16_t* latent_rows,
                                      uint8_t* latent_cache, int kv_lora,
                                      size_t row_bytes, const uint16_t* rope_rows,
                                      int rope) {
+  dgpp_pdl_wait();
   const int64_t i = blockIdx.x;
   const int64_t phys = latent_physical_slot(req_ids, pos, block_tables,
                                             blocks_per_request, block_tokens, i);
@@ -701,6 +710,7 @@ __global__ void latent_append_fp8_kernel(const uint16_t* latent_rows,
                                          float* latent_scale, int kv_lora,
                                          size_t row_bytes, const uint16_t* rope_rows,
                                          int rope) {
+  dgpp_pdl_wait();
   __shared__ float red[kLatentAppendThreads];
   const int64_t i = blockIdx.x;
   const int64_t phys = latent_physical_slot(req_ids, pos, block_tables,
@@ -748,6 +758,7 @@ __global__ void latent_append_fp4_kernel(const uint16_t* latent_rows,
                                          float* latent_scale, int kv_lora,
                                          size_t cache_row_bytes,
                                          const uint16_t* rope_rows, int rope) {
+  dgpp_pdl_wait();
   __shared__ float red[kLatentAppendThreads];
   const int64_t i = blockIdx.x;
   const int64_t phys = latent_physical_slot(req_ids, pos, block_tables,
@@ -799,15 +810,13 @@ __global__ void latent_append_fp4_kernel(const uint16_t* latent_rows,
 // fp8_block: thread t quantizes elements [8t, 8t+8) with the e8m0 scale of
 // its 32-element group (four consecutive lanes; kv_lora <= 1024, a
 // multiple of 32) — the reference's act_quant(block 32, ue8m0) bitwise.
-__global__ void latent_append_fp8block_kernel(const uint16_t* latent_rows,
-                                              const int32_t* req_ids,
-                                              const int64_t* pos,
-                                              const int32_t* block_tables,
-                                              int blocks_per_request,
-                                              int block_tokens, uint8_t* latent_cache,
-                                              int kv_lora, size_t cache_row_bytes,
-                                              const uint16_t* rope_rows, int rope) {
-  const int64_t i = blockIdx.x;
+// One row's fp8-block append (the kernel's body, 2026-10-20: the decode
+// tail kernel below runs it behind the row's rope and slot work).
+__device__ __forceinline__ void latent_append_fp8block_row(const uint16_t* latent_rows, const int32_t* req_ids,
+                                                           const int64_t* pos, const int32_t* block_tables,
+                                                           int blocks_per_request, int block_tokens,
+                                                           uint8_t* latent_cache, int kv_lora, size_t cache_row_bytes,
+                                                           const uint16_t* rope_rows, int rope, int64_t i) {
   const int64_t phys = latent_physical_slot(req_ids, pos, block_tables,
                                             blocks_per_request, block_tokens, i);
   if (phys < 0) return;
@@ -851,6 +860,64 @@ __global__ void latent_append_fp8block_kernel(const uint16_t* latent_rows,
   *reinterpret_cast<uint2*>(row + e0) = packed;
 }
 
+__global__ void latent_append_fp8block_kernel(const uint16_t* latent_rows,
+                                              const int32_t* req_ids,
+                                              const int64_t* pos,
+                                              const int32_t* block_tables,
+                                              int blocks_per_request,
+                                              int block_tokens, uint8_t* latent_cache,
+                                              int kv_lora, size_t cache_row_bytes,
+                                              const uint16_t* rope_rows, int rope) {
+  dgpp_pdl_wait();
+  latent_append_fp8block_row(latent_rows, req_ids, pos, block_tables, blocks_per_request, block_tokens, latent_cache,
+                             kv_lora, cache_row_bytes, rope_rows, rope, blockIdx.x);
+}
+
+// The decode walk's tail behind the q projection, one block per row
+// (2026-10-20): the q rope (rope_apply_kernel's per-pair math), the row's
+// ring slot (ring_slot_positions_kernel), its window slot list
+// (window_slots_decode_kernel), its entry position when the layer has a
+// ratio (entry_positions_kernel), then the latent row's fp8-block append
+// into the ring at that slot — five launches of 1-4 us whose bodies are
+// these, element for element in the same order: bitwise each kernel's.
+__global__ void __launch_bounds__(256) decode_tail_fp8block_kernel(
+    uint16_t* q, int64_t q_row_stride, int64_t q_head_stride, int q_heads, int q_half, const int64_t* pos,
+    const float* inv_freq, int64_t* slots, int ring_slots, int window, int32_t* wlist, int32_t* wcounts,
+    int64_t* entry_out, int ratio, const uint16_t* kv_rows, const int32_t* req_ids, const int32_t* ring_table,
+    uint8_t* ring, int kv_lora, size_t cache_row_bytes) {
+  dgpp_pdl_wait();
+  const int64_t r = blockIdx.x;
+  const int64_t p = pos[r];
+  if (p >= 0) {
+    for (int idx = threadIdx.x; idx < q_heads * q_half; idx += blockDim.x) {
+      const int i = idx % q_half;
+      const int h = idx / q_half;
+      uint16_t* v = q + r * q_row_stride + int64_t(h) * q_head_stride + 2 * i;
+      const float ang = __fmul_rn(float(p), inv_freq[i]);
+      const float c = cosf(ang);
+      const float sn = sinf(ang);
+      const float x0 = bf16_bits_to_float(v[0]), x1 = bf16_bits_to_float(v[1]);
+      v[0] = float_to_bf16_bits(x0 * c - x1 * sn);
+      v[1] = float_to_bf16_bits(x1 * c + x0 * sn);
+    }
+  }
+  if (threadIdx.x == 0) {
+    slots[r] = p < 0 ? -1 : p % ring_slots;
+    if (entry_out != nullptr) entry_out[r] = p < 0 ? -1 : (p + 1) / ratio - 1;
+  }
+  {
+    const int n = p < 0 ? 0 : int(min(int64_t(window), p + 1));
+    for (int k = threadIdx.x; k < window; k += blockDim.x) {
+      const int64_t qp = p - (n - 1) + k;  // ascending positions
+      wlist[r * window + k] = k < n ? int32_t(qp % ring_slots) : -1;
+    }
+    if (threadIdx.x == 0) wcounts[r] = n;
+  }
+  __syncthreads();  // the slot is written for the append's lookup
+  latent_append_fp8block_row(kv_rows, req_ids, slots, ring_table, 1, ring_slots, ring, kv_lora, cache_row_bytes,
+                             nullptr, 0, r);
+}
+
 // fp4_block: thread b quantizes block b (16 elements) with its own
 // absolute e4m3 scale (kv_lora <= 2048, a multiple of 16) — the
 // reference's fp4_act_quant(block 16, e4m3 scales) bitwise.
@@ -862,6 +929,7 @@ __global__ void latent_append_fp4block_kernel(const uint16_t* latent_rows,
                                               int block_tokens, uint8_t* latent_cache,
                                               int kv_lora, size_t cache_row_bytes,
                                               const uint16_t* rope_rows, int rope) {
+  dgpp_pdl_wait();
   const int64_t i = blockIdx.x;
   const int64_t phys = latent_physical_slot(req_ids, pos, block_tables,
                                             blocks_per_request, block_tokens, i);
@@ -909,6 +977,7 @@ __global__ void gather_index_pools_kernel(const int32_t* block_table,
                                           const float* index_scale,
                                           int64_t n_pools, uint8_t* out_k,
                                           float* out_scale, int dim) {
+  dgpp_pdl_wait();
   const int64_t j = blockIdx.x;
   if (j >= n_pools) return;
   const int32_t blk = block_table[j / pools_per_block];
@@ -1056,6 +1125,7 @@ struct PrefillKeyFn {
 // last block zeroes them after consuming them.
 __global__ void select_counter_reset_kernel(int32_t* counter, int32_t* hist_rows,
                                             int hist_words) {
+  dgpp_pdl_wait();
   if (threadIdx.x < 2) counter[threadIdx.x] = 0;
   // The rows' histograms start at zero every call: the
   // workspace is not zeroed at allocation, and a row's histogram used to
@@ -1188,6 +1258,7 @@ __global__ void select_decode_kernel(
     int pools_per_block, int heads, int select_k, int kpool, int max_selected,
     int32_t* topk_out, int32_t* out_counts, uint64_t* keys_ws,
     int64_t keys_stride, int32_t* hist_ws, int32_t* counter_ws) {
+  dgpp_pdl_wait();
   extern __shared__ uint64_t smem_u64[];
   // Layout: [q8: rows x [16 chunks][32 heads] x 8 bytes][k rows: warps x 4 x
   //         32 u32][w: rows*heads f32][hist: kSelectHistBins i32]
@@ -1566,6 +1637,7 @@ __global__ void prefill_score_keys_kernel(
     const float* dot, int64_t stride, const float* w, const float* scales,
     const int64_t* pos, int64_t n_pools, int select_k, int kpool,
     uint64_t* keys) {
+  dgpp_pdl_wait();
   const int r = blockIdx.y;
   const int64_t visible = min((pos[r] + 1) / kpool, n_pools);
   const int64_t p = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -1600,6 +1672,7 @@ __global__ void prefill_fused_score_keys_kernel(
     const uint8_t* q, const uint8_t* k, const float* w, const float* scales,
     const int64_t* pos, int rows, int64_t pools, int64_t stride,
     int select_k, int kpool, uint64_t* keys) {
+  dgpp_pdl_wait();
   constexpr int S = 144, N = 128;
   __shared__ __align__(16) uint8_t a[32 * S];
   __shared__ __align__(16) uint8_t b[N * S];
@@ -1696,6 +1769,7 @@ __global__ void prefill_select_keys_kernel(
     const uint64_t* keys, int64_t stride, const int64_t* pos,
     int64_t n_pools, int select_k, int kpool, int max_selected,
     int32_t* topk_out, int32_t* out_counts, int parts, uint64_t* partials) {
+  dgpp_pdl_wait();
   extern __shared__ uint32_t smem[];
   uint32_t* best_hi = smem;
   uint32_t* best_lo = best_hi + select_k;
@@ -1796,6 +1870,7 @@ __global__ void prefill_select_keys_kernel(
 __global__ void prefill_merge_keys_kernel(
     uint64_t* partials, const int64_t* pos, int parts, int step,
     int select_k, int kpool, int max_selected, int32_t* topk_out, int32_t* out_counts) {
+  dgpp_pdl_wait();
   extern __shared__ uint32_t smem[];
   uint32_t* hi = smem;
   uint32_t* lo = hi + 2 * select_k;
@@ -1832,6 +1907,7 @@ __global__ void select_prefill_kernel(const float* dot, int64_t dot_stride,
                                       int select_k, int kpool,
                                       int max_selected, int32_t* topk_out,
                                       int32_t* out_counts) {
+  dgpp_pdl_wait();
   extern __shared__ uint64_t smem_u64[];
   uint32_t* best_hi = reinterpret_cast<uint32_t*>(smem_u64);  // [select_k]
   uint32_t* best_lo = best_hi + select_k;                     // [select_k]
@@ -1880,6 +1956,7 @@ constexpr int kAbsorbThreads = kAbsorbGroups * kAbsorbGroupThreads;
 __global__ __launch_bounds__(kAbsorbThreads) void absorb_q_kernel(
     const uint16_t* q, const uint16_t* kv_b, uint16_t* q_tilde,
     int local_heads, int nope, int v, int kv_lora, int rope) {
+  dgpp_pdl_wait();
   const int64_t r = blockIdx.x;
   const int h = blockIdx.y;
   const int head_rows = nope + v;
@@ -1945,6 +2022,7 @@ template <int kTile>
 __global__ __launch_bounds__(kAbsorbThreads) void absorb_q_rows_kernel(
     const uint16_t* q, const uint16_t* kv_b, uint16_t* q_tilde, int rows,
     int local_heads, int nope, int v, int kv_lora, int rope) {
+  dgpp_pdl_wait();
   const int r0 = blockIdx.x * kTile;
   const int h = blockIdx.y;
   const int head_rows = nope + v;
@@ -2038,6 +2116,7 @@ __global__ void attn_partial_kernel(
     int kv_lora, int rope, int block_tokens, const int32_t* block_tables,
     int blocks_per_request, float scale, float* m_ws, float* l_ws,
     float* c_ws) {
+  dgpp_pdl_wait();
   const int64_t r = blockIdx.x;
   const int s = blockIdx.y;
   const int hpb = local_heads / gridDim.z;  // heads per block
@@ -2332,10 +2411,15 @@ namespace dense {
 constexpr int kM = 32;             // (row, head) M-rows per block
 constexpr int kTile = 32;          // latent tokens per tile
 constexpr int kThreads = 256;      // 8 warps: 2 slabs x 4 column quarters
-constexpr int kExchangeFloats = 16 * 32;  // one warp's S partial (C layout)
 // KV: the value width (kv_lora); SD: the score width (kv_lora + rope, the
-// cache row and the absorbed query — plan D3). Flash: SD == KV.
-template <int KV, int SD>
+// cache row and the absorbed query — plan D3). Flash: SD == KV. NTOK: the
+// tokens a slab's S tile spans (16 listed, kTile dense) — the exchange
+// holds one warp's S partial in the C layout, 4 floats per n8 tile per
+// lane. Shared memory holds the latent tile and the exchange; the Q~
+// fragments live in registers (2026-10-18: 83 KB per block held one
+// block per SM at the 512 widths, and the kernel was issue-latency-bound
+// at two warps per scheduler; two blocks fit now).
+template <int KV, int SD, int NTOK = kTile>
 struct Geo {
   static_assert(SD >= KV && SD % 64 == 0 && KV % 32 == 0, "dsa flash geometry");
   static constexpr int SQ = SD + 8;        // padded smem row (u16 elements)
@@ -2343,8 +2427,8 @@ struct Geo {
   static constexpr int NT = CW / 8;        // n8 tiles per warp (PV)
   static constexpr int KW = SD / 4;        // k dims per warp (S)
   static constexpr int KS = KW / 16;       // k16 steps per warp (S)
-  static constexpr size_t smem_bytes =
-      size_t(kM + kTile) * SQ * 2 + size_t(8) * kExchangeFloats * 4;
+  static constexpr int XF = NTOK * 16;     // one warp's S partial: NTOK/8 n8 tiles x 4 floats x 32 lanes
+  static constexpr size_t smem_bytes = size_t(kTile) * SQ * 2 + size_t(8) * XF * 4;
 };
 }  // namespace dense
 
@@ -2383,27 +2467,59 @@ __device__ __forceinline__ void attn_anomaly_record(int64_t tok, int32_t blk,
   }
 }
 
-template <int KV, int SD, bool kListed, LatentFormat F>
-__global__ __launch_bounds__(dense::kThreads, 2) void attn_flash_kernel(
+// Two blocks per SM where two of the geometry's shared tiles fit (the 256
+// widths); one at 512, where the 83 KB tile already allows one — the
+// register budget then holds the prefetched tile beside the accumulators.
+template <int KV, int SD, bool kListed>
+constexpr int attn_flash_min_blocks() {
+  // The dynamic tile, the listed walk's static address round (below) and
+  // the driver's 1 KB per block, twice, within the SM's 100 KB — for the
+  // rope-less widths only. The 512 + 64 tail's kernel holds nine k16 steps
+  // of Q~ fragments and nine fetches per tile and does not fit the
+  // two-block register budget without spilling; compiled that way it
+  // faulted DeepSeek-V4's mixed walk (shared_prefill_test, 2026-10-18)
+  // while the same source at one block, or the two-block build of the
+  // 512-wide kernels, ran clean — so that geometry keeps one block.
+  const size_t block_smem = dense::Geo<KV, SD, kListed ? 16 : dense::kTile>::smem_bytes +
+                            (kListed ? size_t(2) * 512 * 4 : size_t(8)) + 1024;
+  return (kListed && SD == KV && 2 * block_smem <= size_t(100) * 1024) ? 2 : 1;  // the dense tile spills at 128 too
+}
+
+// kGroup (2026-10-23, the decode batch past a few rows): the kGroup
+// consecutive splits of a row pair also publish ONE merged partial per
+// group (the epilogue below: the last of the group's blocks to arrive
+// merges the eight per-split partials from L2 with the finish's formula,
+// writes the group's partial and discards the eight dead rows from L2 so
+// they never write back) — the per-split partials of forty rows at
+// thirty-two main and eight window splits were fifty megabytes a layer,
+// written by this kernel and read back by the finish, 160 us a layer each
+// way at the DRAM rate. A cluster form (distributed shared memory) was
+// measured first: it wins only past forty rows, since clusters beyond the
+// twelve co-resident ones schedule in coarse waves (+35 us a layer at ten
+// to twenty rows). 1 = a partial per split (the prefill tile and the
+// scalar form's layout).
+template <int KV, int SD, bool kListed, LatentFormat F, int kGroup = 1>
+__global__ __launch_bounds__(dense::kThreads, (attn_flash_min_blocks<KV, SD, kListed>())) void attn_flash_kernel(
     const uint16_t* __restrict__ q_tilde, const uint8_t* __restrict__ latent,
     const float* __restrict__ latent_scale,
     const int32_t* __restrict__ req_ids, const int64_t* __restrict__ pos,
     const int32_t* __restrict__ topk, int topk_stride,
     const int32_t* __restrict__ counts, int rows, int n_split, int local_heads,
     int block_tokens, const int32_t* __restrict__ block_tables,
-    int blocks_per_request, float scale, float* __restrict__ m_ws,
-    float* __restrict__ l_ws, float* __restrict__ c_ws) {
-  using G = dense::Geo<KV, SD>;
-  constexpr int SQ = G::SQ, CW = G::CW, NT = G::NT, KW = G::KW, KS = G::KS;
+    int blocks_per_request, int blocks_total, float scale, float* __restrict__ m_ws,
+    float* __restrict__ l_ws, float* __restrict__ c_ws, int32_t* __restrict__ tickets,
+    float* __restrict__ mg_ws, float* __restrict__ lg_ws, float* __restrict__ cg_ws) {
+  dgpp_pdl_wait();
+  constexpr int NTOK = kListed ? 16 : dense::kTile;  // tokens per tile (per slab when listed)
+  using G = dense::Geo<KV, SD, NTOK>;
+  constexpr int SQ = G::SQ, CW = G::CW, NT = G::NT, KW = G::KW, KS = G::KS, XF = G::XF;
   constexpr int M = dense::kM;
   constexpr size_t kRowBytes = latent_cache_row_bytes(F, KV, SD - KV);
-  constexpr int NTOK = kListed ? 16 : dense::kTile;  // tokens per tile (per slab when listed)
   constexpr int JT = NTOK / 8;    // n8 tiles of tokens in S
   constexpr int KK = NTOK / 16;   // k16 steps of tokens in P.L
   extern __shared__ __align__(16) uint8_t dsmem[];
-  uint16_t* sQ = reinterpret_cast<uint16_t*>(dsmem);          // [M][SQ]
-  uint16_t* sLall = sQ + M * SQ;                               // dense: [32][SQ]; listed: [2][16][SQ]
-  float* sX = reinterpret_cast<float*>(sLall + dense::kTile * SQ);  // [8][16*32]
+  uint16_t* sLall = reinterpret_cast<uint16_t*>(dsmem);        // dense: [32][SQ]; listed: [2][16][SQ]
+  float* sX = reinterpret_cast<float*>(sLall + dense::kTile * SQ);  // [8][XF]
 
   const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
   const int slab = warp / 4, quarter = warp % 4;
@@ -2461,14 +2577,20 @@ __global__ __launch_bounds__(dense::kThreads, 2) void attn_flash_kernel(
     n_tiles = max(s_tiles[0], s_tiles[1]);
   }
 
-  // Q~ tile into shared memory (zero past the last M-row).
-  for (int idx = threadIdx.x; idx < M * (SD / 8); idx += dense::kThreads) {
-    const int mm = idx / (SD / 8), c8 = idx % (SD / 8);
-    uint4 val = make_uint4(0, 0, 0, 0);
-    if (m0 + mm < total_m)
-      val = *reinterpret_cast<const uint4*>(q_tilde + int64_t(m0 + mm) * SD +
-                                            c8 * 8);
-    *reinterpret_cast<uint4*>(sQ + mm * SQ + c8 * 8) = val;
+  // Q~ fragments of this warp's two rows over its k-quarter, in the mma's
+  // A layout, from global once per block (zero past the last M-row).
+  uint32_t qa[KS][4];
+  {
+    const uint16_t* q_lo = q_tilde + int64_t(m_lo) * SD;
+    const uint16_t* q_hi = q_tilde + int64_t(m_hi) * SD;
+#pragma unroll
+    for (int ks = 0; ks < KS; ++ks) {
+      const int k0 = quarter * KW + ks * 16 + cc;
+      qa[ks][0] = v_lo ? *reinterpret_cast<const uint32_t*>(q_lo + k0) : 0u;
+      qa[ks][1] = v_hi ? *reinterpret_cast<const uint32_t*>(q_hi + k0) : 0u;
+      qa[ks][2] = v_lo ? *reinterpret_cast<const uint32_t*>(q_lo + k0 + 8) : 0u;
+      qa[ks][3] = v_hi ? *reinterpret_cast<const uint32_t*>(q_hi + k0 + 8) : 0u;
+    }
   }
 
   float acc[NT][4];
@@ -2477,62 +2599,106 @@ __global__ __launch_bounds__(dense::kThreads, 2) void attn_flash_kernel(
   float m_lo_run = -INFINITY, m_hi_run = -INFINITY;
   float l_lo = 0.f, l_hi = 0.f;
 
+  // ---- the gather (2026-10-18) ------------------------------------------------
+  // A listed row cost three dependent global loads (the list, the block
+  // table, the cache row), eight rows per thread in turn, with one block
+  // resident per SM: the DeepSeek-V4.1 32K prefill's largest kernel ran at
+  // a few percent of every limit. The listed addresses are now resolved
+  // per round of kAddrRound tokens into shared memory — once per token,
+  // not once per thread per token — and a tile's rows are fetched in two
+  // halves whose loads issue together; the second block on the SM covers
+  // the latency. The rows decoded and their placement are unchanged:
+  // bitwise the previous walk.
+  constexpr int kAddrRound = 512;
+  constexpr int kTilesPerRound = kAddrRound / NTOK;
+  constexpr int GTHREADS = kListed ? 128 : dense::kThreads;  // the gather's threads (per slab when listed)
+  constexpr int TPT = NTOK * (SD / 8) / GTHREADS;              // uint4 per thread per tile
+  constexpr int HALF = (TPT + 3) / 4;  // uint4 per pass: four passes, the registers of two blocks per SM
+  static_assert(NTOK * (SD / 8) % GTHREADS == 0, "the gather's uint4s divide its threads");
+  __shared__ int32_t s_phys[2][kListed ? kAddrRound : 1];
+  const int gtid = threadIdx.x % GTHREADS;
+  const auto resolve_round = [&](int t_round0) {
+    if constexpr (kListed) {
+      for (int i = gtid; i < kAddrRound; i += GTHREADS) {
+        const int t = t_round0 + i;
+        int32_t phys = -1;
+        if (t < t_end) {
+          // The gather is guarded: a token outside the table row or a
+          // block outside the pool zero-fills the row and records the first
+          // anomaly instead of faulting the context — the listed kernel
+          // read an unmapped page on the fabric once in ~10 eager rows of
+          // the fallback path; the record names the values.
+          const int64_t tok = list[t];
+          const int64_t bidx = tok >= 0 ? tok / block_tokens : -1;
+          // The block must lie in the pool: blocks_total physical blocks
+          // (the table's row width bounds the index into the row; a
+          // one-entry table over many physical blocks — the decode
+          // window's ring, request r's region r — is bounded by the
+          // pool's count, 2026-10-19).
+          const int32_t blk = (bidx >= 0 && bidx < blocks_per_request) ? bt[bidx] : -1;
+          if (blk >= 0 && blk < blocks_total)
+            phys = static_cast<int32_t>(int64_t(blk) * block_tokens + (tok % block_tokens));
+          else
+            attn_anomaly_record(tok, blk, qrow_first, s, t, t_end - t_begin);
+        }
+        s_phys[slab][i] = phys;
+      }
+    }
+  };
+  // The tile's rows into the shared tile (zero-filled past the slab's live
+  // tokens), HALF uint4 per thread per pass.
+  const auto fetch_tile = [&](int tile) {
+    const int t0 = t_begin + tile * NTOK;
+    const int n = max(0, min(NTOK, t_end - t0));
+#pragma unroll
+    for (int h = 0; h < TPT; h += HALF) {
+      uint4 val[HALF];
+#pragma unroll
+      for (int k = 0; k < HALF; ++k) {
+        const int idx = gtid + (h + k) * GTHREADS;
+        const int tt = idx / (SD / 8), c8 = idx % (SD / 8);
+        uint4 v = make_uint4(0, 0, 0, 0);
+        if (h + k < TPT && tt < n) {
+          int64_t phys;
+          if constexpr (kListed) {
+            phys = s_phys[slab][(tile % kTilesPerRound) * NTOK + tt];
+          } else {
+            const int64_t tok = t0 + tt;
+            const int32_t blk = bt[tok / block_tokens];
+            phys = int64_t(blk) * block_tokens + (tok % block_tokens);
+          }
+          if (phys >= 0) v = LatentTile<F>::load8(latent, latent_scale, phys, kRowBytes, KV, c8 * 8);
+        }
+        val[k] = v;
+      }
+#pragma unroll
+      for (int k = 0; k < HALF; ++k) {
+        if (h + k >= TPT) break;
+        const int idx = gtid + (h + k) * GTHREADS;
+        const int tt = idx / (SD / 8), c8 = idx % (SD / 8);
+        *reinterpret_cast<uint4*>(sL + tt * SQ + c8 * 8) = val[k];
+      }
+    }
+  };
+  resolve_round(t_begin);
+
   for (int tile = 0; tile < n_tiles; ++tile) {
     const int t0 = t_begin + tile * NTOK;
     const int n = max(0, min(NTOK, t_end - t0));  // this slab's live tokens
-    __syncthreads();  // the previous tile's readers are done (and sQ landed)
-    // Latent tile gather (zero-filled past n). Dense: the whole block fills
-    // the shared tile; listed: each slab's 128 threads fill their own.
-    if constexpr (kListed) {
-      const int tid = threadIdx.x % 128;
-      for (int idx = tid; idx < NTOK * (SD / 8); idx += 128) {
-        const int tt = idx / (SD / 8), c8 = idx % (SD / 8);
-        uint4 val = make_uint4(0, 0, 0, 0);
-        if (tt < n) {
-          // The gather is guarded: a token outside the table
-          // row or a block outside the pool zero-fills the row and records
-          // the first anomaly instead of faulting the context — the listed
-          // kernel read an unmapped page on the fabric once in ~10 eager
-          // rows of the fallback path; the record names the values.
-          const int64_t tok = list[t0 + tt];
-          const int64_t bidx = tok >= 0 ? tok / block_tokens : -1;
-          const int32_t blk = (bidx >= 0 && bidx < blocks_per_request) ? bt[bidx] : -1;
-          if (blk >= 0 && blk < blocks_per_request) {
-            const int64_t phys = int64_t(blk) * block_tokens + (tok % block_tokens);
-            val = LatentTile<F>::load8(latent, latent_scale, phys, kRowBytes, KV, c8 * 8);
-          } else if (c8 == 0) {
-            attn_anomaly_record(tok, blk, qrow_first, s, t0 + tt, n);
-          }
-        }
-        *reinterpret_cast<uint4*>(sL + tt * SQ + c8 * 8) = val;
-      }
-    } else {
-      for (int idx = threadIdx.x; idx < NTOK * (SD / 8); idx += dense::kThreads) {
-        const int tt = idx / (SD / 8), c8 = idx % (SD / 8);
-        uint4 val = make_uint4(0, 0, 0, 0);
-        if (tt < n) {
-          const int64_t tok = t0 + tt;
-          const int32_t blk = bt[tok / block_tokens];
-          const int64_t phys = int64_t(blk) * block_tokens + (tok % block_tokens);
-          val = LatentTile<F>::load8(latent, latent_scale, phys, kRowBytes, KV, c8 * 8);
-        }
-        *reinterpret_cast<uint4*>(sL + tt * SQ + c8 * 8) = val;
-      }
-    }
+    (void)t0;  // the dense mask reads it
+    if (tile > 0 && tile % kTilesPerRound == 0) resolve_round(t0);  // the round's addresses, ahead of its first fetch
+    __syncthreads();  // the previous tile's readers are done; the round's addresses landed
+    fetch_tile(tile);
     __syncthreads();
 
     // S partial over this warp's k-quarter: 16 rows x NTOK tokens.
     float sp[JT][4];
 #pragma unroll
     for (int j = 0; j < JT; ++j) sp[j][0] = sp[j][1] = sp[j][2] = sp[j][3] = 0.f;
-    const int arow_lo = slab * 16 + r;
 #pragma unroll
     for (int ks = 0; ks < KS; ++ks) {
       const int k0 = quarter * KW + ks * 16;
-      const uint32_t a0 = *reinterpret_cast<const uint32_t*>(&sQ[arow_lo * SQ + k0 + cc]);
-      const uint32_t a1 = *reinterpret_cast<const uint32_t*>(&sQ[(arow_lo + 8) * SQ + k0 + cc]);
-      const uint32_t a2 = *reinterpret_cast<const uint32_t*>(&sQ[arow_lo * SQ + k0 + cc + 8]);
-      const uint32_t a3 = *reinterpret_cast<const uint32_t*>(&sQ[(arow_lo + 8) * SQ + k0 + cc + 8]);
+      const uint32_t a0 = qa[ks][0], a1 = qa[ks][1], a2 = qa[ks][2], a3 = qa[ks][3];
 #pragma unroll
       for (int j = 0; j < JT; ++j) {
         const int tn = j * 8 + r;  // token within the tile (the n index)
@@ -2543,7 +2709,7 @@ __global__ __launch_bounds__(dense::kThreads, 2) void attn_flash_kernel(
     }
     // Exchange: every warp of the slab sums the four quarters in the same
     // order, so the slab's warps hold bitwise-identical S.
-    float* mine = sX + warp * dense::kExchangeFloats + lane * 16;
+    float* mine = sX + warp * XF + lane * (JT * 4);
 #pragma unroll
     for (int j = 0; j < JT; ++j) {
       mine[j * 4 + 0] = sp[j][0];
@@ -2557,11 +2723,11 @@ __global__ __launch_bounds__(dense::kThreads, 2) void attn_flash_kernel(
     for (int j = 0; j < JT; ++j) {
 #pragma unroll
       for (int i = 0; i < 4; ++i) {
-        const float* q0 = sX + (slab * 4 + 0) * dense::kExchangeFloats + lane * 16 + j * 4 + i;
+        const float* q0 = sX + (slab * 4 + 0) * XF + lane * (JT * 4) + j * 4 + i;
         float v = q0[0];
-        v += q0[1 * dense::kExchangeFloats];
-        v += q0[2 * dense::kExchangeFloats];
-        v += q0[3 * dense::kExchangeFloats];
+        v += q0[1 * XF];
+        v += q0[2 * XF];
+        v += q0[3 * XF];
         sc[j][i] = v;
       }
     }
@@ -2662,21 +2828,176 @@ __global__ __launch_bounds__(dense::kThreads, 2) void attn_flash_kernel(
   };
   publish(m_lo, m_lo_run, l_lo, 0);
   publish(m_hi, m_hi_run, l_hi, 1);
+  if constexpr (kGroup > 1) {
+    // The group merge: splits s0 .. s0 + kGroup - 1 of this row pair take a
+    // ticket (tickets[blockIdx.x * n_groups + g], zero at rest, reset by
+    // the last — replay-safe), and the LAST block to arrive merges the
+    // group's partials from L2 with the finish kernel's formula — mhat =
+    // max m_s, w_s = exp(m_s - mhat), l = sum w_s l_s, c = sum w_s c_s in
+    // split order — into the group's partial at split index g of
+    // n_split / kGroup (mg_ws / lg_ws / cg_ws), then discards the eight
+    // dead c rows from L2. The grouping is fixed per request (kGroup
+    // splits a group whatever the batch), so a row's output does not
+    // depend on the rows beside it; an empty split (m = -inf, l = 0,
+    // c = 0) weighs nothing and an empty group publishes m = -inf, which
+    // the finish skips. The fence / ticket order is the router's: a block
+    // fences its partial before its ticket; the last fences again before
+    // reading them (L2 loads: the rows were written by other SMs).
+    __shared__ int s_last;
+    __shared__ float s_w[kGroup][M];
+    const int g = s / kGroup;
+    const int n_groups = n_split / kGroup;
+    const int s0 = g * kGroup;
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      int32_t* t = tickets + static_cast<int64_t>(blockIdx.x) * n_groups + g;
+      const int ticket = atomicAdd(t, 1);
+      s_last = ticket == kGroup - 1 ? 1 : 0;
+      if (s_last) *t = 0;
+    }
+    __syncthreads();
+    if (!s_last) return;
+    __threadfence();
+    for (int mrow = static_cast<int>(threadIdx.x); mrow < M; mrow += dense::kThreads) {
+      const int m = m0 + mrow;
+      if (m >= total_m) continue;
+      const int qr = m / local_heads, h = m % local_heads;
+      float mb[kGroup], lb[kGroup];
+      float mhat = -INFINITY;
+#pragma unroll
+      for (int b = 0; b < kGroup; ++b) {
+        const int64_t idx = (int64_t(qr) * n_split + s0 + b) * local_heads + h;
+        mb[b] = __ldcg(m_ws + idx);
+        lb[b] = __ldcg(l_ws + idx);
+        mhat = fmaxf(mhat, mb[b]);
+      }
+      float lsum = 0.f;
+#pragma unroll
+      for (int b = 0; b < kGroup; ++b) {
+        const float w = (mhat == -INFINITY || mb[b] == -INFINITY) ? 0.f : expf(mb[b] - mhat);
+        lsum += w * lb[b];
+        s_w[b][mrow] = w;
+      }
+      const int64_t gidx = (int64_t(qr) * n_groups + g) * local_heads + h;
+      mg_ws[gidx] = mhat;
+      lg_ws[gidx] = lsum;
+    }
+    __syncthreads();
+    // The c rows: M rows x KV columns as float4s over the block, kPer
+    // outputs a thread a round with every group vector of the round
+    // loaded before the first add — 16 L2 loads in flight a thread (one
+    // output a round left one block reading 512 KB at ~20 GB/s: a 25 us
+    // tail on every launch, 2026-10-23). A dead output (an M-row past the
+    // batch) loads the block's first row and stores nothing.
+    constexpr int V4 = KV / 4;
+    constexpr int kPer = 2;
+    const int qr0 = m0 / local_heads, h0 = m0 % local_heads;
+    for (int i0 = static_cast<int>(threadIdx.x); i0 < M * V4; i0 += kPer * dense::kThreads) {
+      float4 v[kPer][kGroup];
+      int mrow[kPer], col[kPer], qr[kPer], h[kPer];
+      bool live[kPer];
+#pragma unroll
+      for (int u = 0; u < kPer; ++u) {
+        const int i = i0 + u * dense::kThreads;
+        live[u] = i < M * V4 && m0 + i / V4 < total_m;
+        mrow[u] = live[u] ? i / V4 : 0;
+        col[u] = live[u] ? (i % V4) * 4 : 0;
+        const int m = m0 + mrow[u];
+        qr[u] = live[u] ? m / local_heads : qr0;
+        h[u] = live[u] ? m % local_heads : h0;
+#pragma unroll
+        for (int b = 0; b < kGroup; ++b)
+          v[u][b] = __ldcg(reinterpret_cast<const float4*>(
+              c_ws + ((int64_t(qr[u]) * n_split + s0 + b) * local_heads + h[u]) * KV + col[u]));
+      }
+#pragma unroll
+      for (int u = 0; u < kPer; ++u) {
+        if (!live[u]) continue;
+        float4 csum = make_float4(0.f, 0.f, 0.f, 0.f);
+#pragma unroll
+        for (int b = 0; b < kGroup; ++b) {
+          const float w = s_w[b][mrow[u]];
+          csum.x += w * v[u][b].x;
+          csum.y += w * v[u][b].y;
+          csum.z += w * v[u][b].z;
+          csum.w += w * v[u][b].w;
+        }
+        const int64_t gidx = (int64_t(qr[u]) * n_groups + g) * local_heads + h[u];
+        *reinterpret_cast<float4*>(cg_ws + gidx * KV + col[u]) = csum;
+      }
+    }
+    // The group's per-split c rows are dead: discard their 128-byte lines
+    // from L2 (the rows are 2 KB on a 256-byte-aligned buffer) so the
+    // fifty megabytes a layer never write back to DRAM — after every
+    // thread's merge reads of them (a thread ahead discarded lines a
+    // thread behind was still loading: the group-prefill invariance gate
+    // and the 40-step decode budget caught it, 2026-10-23).
+    __syncthreads();
+    constexpr int kLines = KV * 4 / 128;
+    for (int i = static_cast<int>(threadIdx.x); i < kGroup * M * kLines; i += dense::kThreads) {
+      const int b = i / (M * kLines), rem = i % (M * kLines), mrow = rem / kLines, line = rem % kLines;
+      const int m = m0 + mrow;
+      if (m >= total_m) continue;
+      const int qr = m / local_heads, h = m % local_heads;
+      const float* row = c_ws + ((int64_t(qr) * n_split + s0 + b) * local_heads + h) * KV;
+      asm volatile("discard.global.L2 [%0], 128;" ::"l"(row + line * 32) : "memory");
+    }
+  }
 }
 
+constexpr int kCombineStagedSplits = 128;
 __global__ void attn_combine_kernel(const float* m_ws, const float* l_ws,
                                     const float* c_ws, int n_split,
                                     int local_heads, int kv_lora,
                                     float* c_out) {
+  dgpp_pdl_wait();
   // One block per (row, head): the old (row)-block form launched one block
   // for single-row decode — a single SM merging 64 heads x 512 dims.
+  // Every split's m and l are staged once per block, one thread per split
+  // (2026-10-20: every thread read every split's m for the maximum and its
+  // m and l again per element, and recomputed the exponentials; thread 0
+  // now forms the maximum, the weights p_s = exp(m_s - mhat) and the
+  // denominator from shared memory — the same arithmetic in the same
+  // order, so the outputs are bitwise; csa2's finish has the same form);
+  // the element loop reads its n_split c values and the staged weights.
+  __shared__ float s_m[kCombineStagedSplits];
+  __shared__ float s_l[kCombineStagedSplits];
+  __shared__ float s_p[kCombineStagedSplits];
+  __shared__ float s_mhat;
+  __shared__ float s_den;
   const int64_t r = blockIdx.x;
   const int h = blockIdx.y;
   const int64_t base_m = (r * n_split) * local_heads + h;
-  float mhat = -INFINITY;
-  for (int s = 0; s < n_split; ++s)
-    mhat = fmaxf(mhat, m_ws[base_m + int64_t(s) * local_heads]);
   const int64_t total = int64_t(local_heads) * kv_lora;
+  const bool staged = n_split <= kCombineStagedSplits;
+  float mhat = -INFINITY;
+  if (staged) {
+    for (int s = threadIdx.x; s < n_split; s += blockDim.x) {
+      s_m[s] = m_ws[base_m + int64_t(s) * local_heads];
+      s_l[s] = l_ws[base_m + int64_t(s) * local_heads];
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      float mx = -INFINITY;
+      for (int s = 0; s < n_split; ++s) mx = fmaxf(mx, s_m[s]);
+      float den = 0.0f;
+      if (mx != -INFINITY) {
+        for (int s = 0; s < n_split; ++s) {
+          const float p = expf(s_m[s] - mx);
+          s_p[s] = p;
+          den += p * s_l[s];
+        }
+      }
+      s_mhat = mx;
+      s_den = den;
+    }
+    __syncthreads();
+    mhat = s_mhat;
+  } else {
+    for (int s = 0; s < n_split; ++s)
+      mhat = fmaxf(mhat, m_ws[base_m + int64_t(s) * local_heads]);
+  }
   for (int64_t i = int64_t(h) * kv_lora + threadIdx.x;
        i < int64_t(h + 1) * kv_lora; i += blockDim.x) {
     if (mhat == -INFINITY) {
@@ -2685,11 +3006,16 @@ __global__ void attn_combine_kernel(const float* m_ws, const float* l_ws,
     }
     float num = 0.0f;
     float den = 0.0f;
-    for (int s = 0; s < n_split; ++s) {
-      const float p =
-          expf(m_ws[base_m + int64_t(s) * local_heads] - mhat);
-      num += p * c_ws[(r * n_split + s) * total + i];
-      den += p * l_ws[base_m + int64_t(s) * local_heads];
+    if (staged) {
+      for (int s = 0; s < n_split; ++s) num += s_p[s] * c_ws[(r * n_split + s) * total + i];
+      den = s_den;
+    } else {
+      for (int s = 0; s < n_split; ++s) {
+        const float p =
+            expf(m_ws[base_m + int64_t(s) * local_heads] - mhat);
+        num += p * c_ws[(r * n_split + s) * total + i];
+        den += p * l_ws[base_m + int64_t(s) * local_heads];
+      }
     }
     c_out[r * total + i] = (den > 0.0f) ? num / den : 0.0f;
   }
@@ -2710,6 +3036,7 @@ constexpr int kVoutThreads = 32 * kVoutRowsPerBlock;
 __global__ __launch_bounds__(kVoutThreads) void vout_gemm_kernel(
     const float* c, const uint16_t* kv_b, uint16_t* out, int local_heads,
     int nope, int v, int kv_lora) {
+  dgpp_pdl_wait();
   const int64_t r = blockIdx.x;
   const int h = blockIdx.y;
   const int d0 = blockIdx.z * kVoutRowsPerBlock;
@@ -2764,6 +3091,7 @@ constexpr int kVoutTileRows = 4;
 __global__ __launch_bounds__(kVoutThreads) void vout_rows_kernel(
     const float* c, const uint16_t* kv_b, uint16_t* out, int rows,
     int local_heads, int nope, int v, int kv_lora) {
+  dgpp_pdl_wait();
   const int h = blockIdx.y;
   const int d0 = blockIdx.x * kVoutRowsPerBlock;
   const int t0 = blockIdx.z * kVoutTileRows;
@@ -2859,6 +3187,7 @@ __global__ __launch_bounds__(proj::kThreads) void absorb_q_mma_kernel(
     const uint16_t* __restrict__ q, const uint16_t* __restrict__ kv_b,
     uint16_t* __restrict__ q_tilde, int rows, int local_heads, int nope, int v,
     int kv_lora, int rope) {
+  dgpp_pdl_wait();
   using namespace proj;
   __shared__ __align__(16) uint16_t sA[BM][BK_PAD];
   __shared__ __align__(16) uint16_t sB[BN][BK_PAD];
@@ -2944,6 +3273,7 @@ __global__ __launch_bounds__(proj::kThreads) void vout_mma_kernel(
     const float* __restrict__ c, const uint16_t* __restrict__ kv_b,
     uint16_t* __restrict__ out, int rows, int local_heads, int nope, int v,
     int kv_lora) {
+  dgpp_pdl_wait();
   using namespace proj;
   __shared__ __align__(16) uint16_t sHi[BM][VBK_PAD];
   __shared__ __align__(16) uint16_t sMid[BM][VBK_PAD];
@@ -3176,6 +3506,7 @@ __global__ void rope_interleave_kernel(
     const uint16_t* __restrict__ table, int64_t table_positions,
     uint16_t* __restrict__ out, int64_t out_row_stride, int64_t out_head_stride,
     int64_t total) {
+  dgpp_pdl_wait();
   const int64_t idx = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
   if (idx >= total) return;
   const int i = int(idx % half);
@@ -3244,6 +3575,7 @@ __device__ __forceinline__ void rope_pair(const uint16_t* __restrict__ src, uint
 __global__ void rope_interleave_multi_kernel(RopeSegsDev segs, int half, const int64_t* __restrict__ pos,
                                              const uint16_t* __restrict__ table, int64_t table_positions,
                                              int64_t total) {
+  dgpp_pdl_wait();
   int64_t idx = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
   if (idx >= total) return;
   int s = 0;
@@ -3395,6 +3727,7 @@ void dsa_kpool_decode_update(const void* k, int64_t k_stride,
 __global__ void dsa_zero_padding_rows_kernel(const int64_t* __restrict__ pos,
                                              uint16_t* __restrict__ out,
                                              int hidden) {
+  dgpp_pdl_wait();
   const int t = blockIdx.x;
   if (pos[t] >= 0) return;
   uint16_t* row = out + static_cast<size_t>(t) * hidden;
@@ -3471,6 +3804,26 @@ void dsa_latent_append(const void* latent_rows, const int32_t* req_ids,
   DGPP_CUDA_OK(cudaGetLastError());
 }
 
+void dsa_decode_tail_fp8block(void* q, int64_t q_row_stride, int64_t q_head_stride, int q_heads, int q_rope_dim,
+                              const int64_t* pos, const float* inv_freq, int64_t* slots, int ring_slots, int window,
+                              int32_t* wlist, int32_t* wcounts, int64_t* entry_out, int ratio, const void* kv_rows,
+                              const int32_t* req_ids, const int32_t* ring_table, void* ring, int kv_lora, int rows,
+                              cudaStream_t stream) {
+  if (rows <= 0) return;
+  if (q_rope_dim <= 0 || q_rope_dim % 2 != 0) throw std::invalid_argument("dsa_decode_tail_fp8block: rope_dim must be even");
+  const int q_half = q_rope_dim / 2;
+  if (!q || !pos || !inv_freq || !slots || !wlist || !wcounts || !kv_rows || !req_ids || !ring_table || !ring)
+    throw std::invalid_argument("dsa_decode_tail_fp8block: null buffer");
+  if (entry_out != nullptr && ratio <= 0) throw std::invalid_argument("dsa_decode_tail_fp8block: a ratio for the entry positions");
+  if (kv_lora % 32 != 0 || kv_lora > 1024) throw std::invalid_argument("dsa_decode_tail_fp8block: kv_lora a multiple of 32 up to 1024");
+  const size_t cache_row_bytes = latent_row_bytes(LatentFormat::kFp8Block, kv_lora);
+  decode_tail_fp8block_kernel<<<unsigned(rows), 256, 0, stream>>>(
+      static_cast<uint16_t*>(q), q_row_stride, q_head_stride, q_heads, q_half, pos, inv_freq, slots, ring_slots, window,
+      wlist, wcounts, entry_out, ratio, static_cast<const uint16_t*>(kv_rows), req_ids, ring_table,
+      static_cast<uint8_t*>(ring), kv_lora, cache_row_bytes);
+  DGPP_CUDA_OK(cudaGetLastError());
+}
+
 void dsa_gather_index_pools(const int32_t* block_table, int pools_per_block,
                             const void* index_k, const float* index_scale,
                             int64_t n_pools, void* out_k, float* out_scale,
@@ -3484,7 +3837,7 @@ void dsa_gather_index_pools(const int32_t* block_table, int pools_per_block,
 
 namespace {
 constexpr int kSelectMaxRows = 8;      // rows per launch: the kernel's shared-memory bound
-constexpr int kSelectLayoutRows = 32;  // rows the workspace is laid out for (the decode batch's cap; 32 since 2026-09-14 for DeepSeek-V4.1's six-slot batch)
+constexpr int kSelectLayoutRows = 96;  // rows the workspace is laid out for: the decode batch's cap (the engine's kDecodeRowsMax; 96 since 2026-10-23 for sixteen DSpark slots, 64 for twelve earlier that day, 32 from 2026-09-14 for six)
 constexpr int kSelectDefaultGrid = 96;  // measured optimum (dsa_select_bench, 2026-09-06)
 size_t select_align256(size_t b) { return (b + 255) / 256 * 256; }
 size_t select_keys_bytes(int rows, int64_t pools) {
@@ -3497,7 +3850,7 @@ size_t select_hist_bytes(int rows) {
 
 size_t dsa_select_workspace_bytes(int max_rows, int64_t max_pools) {
   if (max_rows <= 0 || max_rows > kSelectLayoutRows || max_pools <= 0)
-    throw std::invalid_argument("dsa_select_workspace_bytes: rows in [1, 32], pools > 0");
+    throw std::invalid_argument("dsa_select_workspace_bytes: rows in [1, 96], pools > 0");
   // Laid out for kSelectLayoutRows rows regardless of max_rows:
   // the histograms follow the keys at a FIXED offset the launcher derives
   // the same way, whatever row count a call brings. (They used to follow
@@ -3839,7 +4192,7 @@ void dsa_attn_partial(const void* q_tilde, const void* latent_cache,
 }
 
 namespace {
-template <int KV, int SD, bool kListed, LatentFormat F>
+template <int KV, int SD, bool kListed, LatentFormat F, int kGroup>
 void launch_attn_flash_variant(dim3 grid, const void* q_tilde,
                                const void* latent_cache, const float* latent_scale,
                                const int32_t* req_ids, const int64_t* pos,
@@ -3847,17 +4200,18 @@ void launch_attn_flash_variant(dim3 grid, const void* q_tilde,
                                const int32_t* counts, int rows, int n_split,
                                int local_heads, int block_tokens,
                                const int32_t* block_tables, int blocks_per_request,
-                               float scale, float* m_ws, float* l_ws, float* c_ws,
+                               int blocks_total, float scale, float* m_ws, float* l_ws, float* c_ws,
+                               int32_t* tickets, float* mg_ws, float* lg_ws, float* cg_ws,
                                cudaStream_t stream) {
-  attn_flash_kernel<KV, SD, kListed, F><<<grid, dense::kThreads,
-                                          dense::Geo<KV, SD>::smem_bytes, stream>>>(
+  constexpr size_t kSmem = dense::Geo<KV, SD, kListed ? 16 : dense::kTile>::smem_bytes;
+  attn_flash_kernel<KV, SD, kListed, F, kGroup><<<grid, dense::kThreads, kSmem, stream>>>(
       static_cast<const uint16_t*>(q_tilde),
       static_cast<const uint8_t*>(latent_cache), latent_scale, req_ids, pos, topk,
       topk_stride, counts, rows, n_split, local_heads, block_tokens, block_tables,
-      blocks_per_request, scale, m_ws, l_ws, c_ws);
+      blocks_per_request, blocks_total, scale, m_ws, l_ws, c_ws, tickets, mg_ws, lg_ws, cg_ws);
 }
 
-template <int KV, int SD, bool kListed>
+template <int KV, int SD, bool kListed, int kGroup>
 void launch_attn_flash_format(LatentFormat format, dim3 grid, const void* q_tilde,
                               const void* latent_cache, const float* latent_scale,
                               const int32_t* req_ids, const int64_t* pos,
@@ -3865,38 +4219,39 @@ void launch_attn_flash_format(LatentFormat format, dim3 grid, const void* q_tild
                               const int32_t* counts, int rows, int n_split,
                               int local_heads, int block_tokens,
                               const int32_t* block_tables, int blocks_per_request,
-                              float scale, float* m_ws, float* l_ws, float* c_ws,
+                              int blocks_total, float scale, float* m_ws, float* l_ws, float* c_ws,
+                              int32_t* tickets, float* mg_ws, float* lg_ws, float* cg_ws,
                               cudaStream_t stream) {
   switch (format) {
     case LatentFormat::kBf16:
-      launch_attn_flash_variant<KV, SD, kListed, LatentFormat::kBf16>(
+      launch_attn_flash_variant<KV, SD, kListed, LatentFormat::kBf16, kGroup>(
           grid, q_tilde, latent_cache, latent_scale, req_ids, pos, topk, topk_stride,
           counts, rows, n_split, local_heads, block_tokens, block_tables,
-          blocks_per_request, scale, m_ws, l_ws, c_ws, stream);
+          blocks_per_request, blocks_total, scale, m_ws, l_ws, c_ws, tickets, mg_ws, lg_ws, cg_ws, stream);
       break;
     case LatentFormat::kFp8:
-      launch_attn_flash_variant<KV, SD, kListed, LatentFormat::kFp8>(
+      launch_attn_flash_variant<KV, SD, kListed, LatentFormat::kFp8, kGroup>(
           grid, q_tilde, latent_cache, latent_scale, req_ids, pos, topk, topk_stride,
           counts, rows, n_split, local_heads, block_tokens, block_tables,
-          blocks_per_request, scale, m_ws, l_ws, c_ws, stream);
+          blocks_per_request, blocks_total, scale, m_ws, l_ws, c_ws, tickets, mg_ws, lg_ws, cg_ws, stream);
       break;
     case LatentFormat::kFp4:
-      launch_attn_flash_variant<KV, SD, kListed, LatentFormat::kFp4>(
+      launch_attn_flash_variant<KV, SD, kListed, LatentFormat::kFp4, kGroup>(
           grid, q_tilde, latent_cache, latent_scale, req_ids, pos, topk, topk_stride,
           counts, rows, n_split, local_heads, block_tokens, block_tables,
-          blocks_per_request, scale, m_ws, l_ws, c_ws, stream);
+          blocks_per_request, blocks_total, scale, m_ws, l_ws, c_ws, tickets, mg_ws, lg_ws, cg_ws, stream);
       break;
     case LatentFormat::kFp8Block:
-      launch_attn_flash_variant<KV, SD, kListed, LatentFormat::kFp8Block>(
+      launch_attn_flash_variant<KV, SD, kListed, LatentFormat::kFp8Block, kGroup>(
           grid, q_tilde, latent_cache, latent_scale, req_ids, pos, topk, topk_stride,
           counts, rows, n_split, local_heads, block_tokens, block_tables,
-          blocks_per_request, scale, m_ws, l_ws, c_ws, stream);
+          blocks_per_request, blocks_total, scale, m_ws, l_ws, c_ws, tickets, mg_ws, lg_ws, cg_ws, stream);
       break;
     case LatentFormat::kFp4Block:
-      launch_attn_flash_variant<KV, SD, kListed, LatentFormat::kFp4Block>(
+      launch_attn_flash_variant<KV, SD, kListed, LatentFormat::kFp4Block, kGroup>(
           grid, q_tilde, latent_cache, latent_scale, req_ids, pos, topk, topk_stride,
           counts, rows, n_split, local_heads, block_tokens, block_tables,
-          blocks_per_request, scale, m_ws, l_ws, c_ws, stream);
+          blocks_per_request, blocks_total, scale, m_ws, l_ws, c_ws, tickets, mg_ws, lg_ws, cg_ws, stream);
       break;
   }
 }
@@ -3909,8 +4264,17 @@ bool launch_attn_flash(const void* q_tilde, const void* latent_cache,
                        int block_tokens, const int32_t* block_tables,
                        int blocks_per_request, float scale, float* m_ws,
                        float* l_ws, float* c_ws, cudaStream_t stream,
-                       LatentFormat format, const float* latent_scale, int rope) {
+                       LatentFormat format, const float* latent_scale, int rope,
+                       int blocks_total, int group, int32_t* tickets, float* mg_ws, float* lg_ws,
+                       float* cg_ws) {
   if (rows <= 0) return true;
+  if (blocks_total < 0) blocks_total = blocks_per_request;
+  // The split groups (listed form only): 1, or kAttnSplitGroup dividing
+  // n_split with the tickets and the group partials' buffers.
+  if (group != 1 && (!kListed || group != kAttnSplitGroup || n_split % kAttnSplitGroup != 0 || tickets == nullptr ||
+                     mg_ws == nullptr || lg_ws == nullptr || cg_ws == nullptr))
+    throw std::invalid_argument(
+        "dsa attention: the split group must be 1, or kAttnSplitGroup dividing n_split with tickets and group buffers (listed form)");
   // The compiled geometries: 512 and 256 without a tail, 512 + 64 with one.
   if (rope == 0 && kv_lora != 512 && kv_lora != 256) return false;  // caller falls back
   if (rope != 0 && !(kv_lora == 512 && rope == 64)) return false;
@@ -3922,21 +4286,32 @@ bool launch_attn_flash(const void* q_tilde, const void* latent_cache,
   dsa_prepare_kernel_smem();
   const int total_m = rows * local_heads;
   dim3 grid{unsigned((total_m + dense::kM - 1) / dense::kM), unsigned(n_split)};
-  if (rope == 64) {
-    launch_attn_flash_format<512, 576, kListed>(
-        format, grid, q_tilde, latent_cache, latent_scale, req_ids, pos, topk,
-        topk_stride, counts, rows, n_split, local_heads, block_tokens, block_tables,
-        blocks_per_request, scale, m_ws, l_ws, c_ws, stream);
-  } else if (kv_lora == 512) {
-    launch_attn_flash_format<512, 512, kListed>(
-        format, grid, q_tilde, latent_cache, latent_scale, req_ids, pos, topk,
-        topk_stride, counts, rows, n_split, local_heads, block_tokens, block_tables,
-        blocks_per_request, scale, m_ws, l_ws, c_ws, stream);
+  const auto dispatch = [&](auto group_tag) {
+    constexpr int kG = decltype(group_tag)::value;
+    if (rope == 64) {
+      launch_attn_flash_format<512, 576, kListed, kG>(
+          format, grid, q_tilde, latent_cache, latent_scale, req_ids, pos, topk,
+          topk_stride, counts, rows, n_split, local_heads, block_tokens, block_tables,
+          blocks_per_request, blocks_total, scale, m_ws, l_ws, c_ws, tickets, mg_ws, lg_ws, cg_ws, stream);
+    } else if (kv_lora == 512) {
+      launch_attn_flash_format<512, 512, kListed, kG>(
+          format, grid, q_tilde, latent_cache, latent_scale, req_ids, pos, topk,
+          topk_stride, counts, rows, n_split, local_heads, block_tokens, block_tables,
+          blocks_per_request, blocks_total, scale, m_ws, l_ws, c_ws, tickets, mg_ws, lg_ws, cg_ws, stream);
+    } else {
+      launch_attn_flash_format<256, 256, kListed, kG>(
+          format, grid, q_tilde, latent_cache, latent_scale, req_ids, pos, topk,
+          topk_stride, counts, rows, n_split, local_heads, block_tokens, block_tables,
+          blocks_per_request, blocks_total, scale, m_ws, l_ws, c_ws, tickets, mg_ws, lg_ws, cg_ws, stream);
+    }
+  };
+  if constexpr (kListed) {
+    if (group == kAttnSplitGroup)
+      dispatch(std::integral_constant<int, kAttnSplitGroup>{});
+    else
+      dispatch(std::integral_constant<int, 1>{});
   } else {
-    launch_attn_flash_format<256, 256, kListed>(
-        format, grid, q_tilde, latent_cache, latent_scale, req_ids, pos, topk,
-        topk_stride, counts, rows, n_split, local_heads, block_tokens, block_tables,
-        blocks_per_request, scale, m_ws, l_ws, c_ws, stream);
+    dispatch(std::integral_constant<int, 1>{});
   }
   DGPP_CUDA_OK(cudaGetLastError());
   return true;
@@ -3954,7 +4329,7 @@ bool dsa_attn_dense(const void* q_tilde, const void* latent_cache,
                                   nullptr, rows, n_split, local_heads, kv_lora,
                                   block_tokens, block_tables, blocks_per_request,
                                   scale, m_ws, l_ws, c_ws, stream, format,
-                                  latent_scale, rope);
+                                  latent_scale, rope, -1, 1, nullptr, nullptr, nullptr, nullptr);
 }
 
 bool dsa_attn_listed(const void* q_tilde, const void* latent_cache,
@@ -3963,12 +4338,13 @@ bool dsa_attn_listed(const void* q_tilde, const void* latent_cache,
                      int kv_lora, int block_tokens, const int32_t* block_tables,
                      int blocks_per_request, float scale, float* m_ws, float* l_ws,
                      float* c_ws, cudaStream_t stream, LatentFormat format,
-                     const float* latent_scale, int rope) {
+                     const float* latent_scale, int rope, int blocks_total, int group, int32_t* tickets,
+                     float* mg_ws, float* lg_ws, float* cg_ws) {
   return launch_attn_flash<true>(q_tilde, latent_cache, req_ids, nullptr, topk,
                                  topk_stride, counts, rows, n_split, local_heads,
                                  kv_lora, block_tokens, block_tables,
                                  blocks_per_request, scale, m_ws, l_ws, c_ws, stream,
-                                 format, latent_scale, rope);
+                                 format, latent_scale, rope, blocks_total, group, tickets, mg_ws, lg_ws, cg_ws);
 }
 
 void dsa_attn_combine(const float* m_ws, const float* l_ws, const float* c_ws,

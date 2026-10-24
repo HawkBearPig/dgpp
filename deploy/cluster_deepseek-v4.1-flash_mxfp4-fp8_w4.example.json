@@ -15,6 +15,7 @@
     "mtp_depth": 4,
     "mtp_schedule": true,
     "mtp_schedule_lambda": 0.045,
+    "mtp_verify": "block",
     "prefix_cache_gib": 14,
     "admission": "full",
     "admission_window": 256,

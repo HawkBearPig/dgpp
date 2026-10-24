@@ -5,9 +5,9 @@ Checkpoint: `Saren/Qwen3.8-Flash-Next-W4A16-AutoRound-hybrid-MTP_int4RTN`
 `Qwen/Qwen3.8-Flash-Next-FP8`'s shards (or the byte-identical
 `Saren/Qwen3.8-Flash-Next-ple-table-fp8`, 48.7 GiB).
 
-Goal: serve it on a single Spark at world 1, meet or beat the decode
-throughput the author publishes for it under vLLM, and pass the same
-correctness and accuracy gates the NVFP4 single-Spark template passes.
+Goal: serve it on a single Spark at world 1 at the decode throughput its
+bytes allow, and pass the same correctness and accuracy gates the NVFP4
+single-Spark template passes.
 
 Status (2026-09-28, late): S1 done (the packed core at group 128 / f16
 scales, both widths, the slot bench at the Qwen geometry beats the fp4
@@ -58,18 +58,16 @@ The only freedom is summation order, as for every family. The cheap
 alternative (replicate each g128 scale into two g64 bf16 scales) is rejected:
 it rounds every scale by up to 2^-9 and costs 3 % more expert bytes.
 
-**The target, decoded.** The author's table is greedy (`temperature: 0.0`),
-thinking on, single stream, completion tokens divided by the whole request's
-wall time (TTFT inside), MTP depth 3, on the five prompts of
-`bench_qwen35.sh` (§6.1). The cells to beat (tok/s): Q&A 49.1, Code 59.1,
-JSON 62.6, Math 55.5, LongCode 60.3. Their draft accepts 2.65 of 3 on code
-classes and about 2.1 of 3 in thinking-heavy text. Our NVFP4 template today,
-greedy with thinking off: code 49.0 at depth 1, up to 60.7 at depth 2 (§2.3).
-Beating 62.6 needs at most 16 ms per token, which no depth-2 pass can reach;
-it needs depth 3 (already implemented for every family, §2.4) at a pass
-within a few ms of its byte floor and a chain whose acceptance is the
-model's. The int4 experts themselves are worth about 1–1.5 ms of the pass;
-the checkpoint is not what makes the author's stack fast.
+**The target, decoded.** The checkpoint's own five-prompt bench
+(`bench_qwen35.sh`, §6.1) is greedy (`temperature: 0.0`), thinking on,
+single stream, completion tokens divided by the whole request's wall time
+(TTFT inside), MTP depth 3. Our NVFP4 template today, greedy with thinking
+off: code 49.0 at depth 1, up to 60.7 at depth 2 (§2.3). A single stream
+past 60 tok/s on these prompts needs at most 16 ms per token, which no
+depth-2 pass can reach; it needs depth 3 (already implemented for every
+family) at a pass within a few ms of its byte floor and a chain whose
+acceptance is the model's. The int4 experts themselves are worth about
+1–1.5 ms of the pass; the checkpoint is not what sets the pace.
 
 **The standard.** We serve the same bytes, so we are faster unless our
 engine leaves an operation short of its physical limit. Every such
@@ -202,29 +200,6 @@ serial. At depth 3 the three draft heads are about 7.5 ms of the pass.
 | deeper (depth 2), all classes | 44.0–60.7 | | | |
 | plain | 32.7 | 30.5 | 1 | |
 
-### 2.4 The competitor's metric
-
-`bench_qwen35.sh` (§6.1) posts one chat completion per prompt, `temperature
-0.0`, no thinking flag (so the server's default: thinking on), and reports
-completion tokens over the whole request's wall time. The cells (MTP=3,
-int4 draft experts, `DRAFT_VOCAB=1`, prefix caching on):
-
-| class | prompt tokens | gen tokens | tok/s to beat | implied ms per token if TTFT ≈ 0.15 s |
-|---|---|---|---|---|
-| Q&A | 65 | 57.5 | 49.1 | ~17.7 |
-| Code | 72 | 275.8 | 59.1 | ~16.4 |
-| JSON | 90 | 841.8 | 62.6 | ~15.8 |
-| Math | 71 | 64 (cap) | 55.5 | ~15.7 |
-| LongCode | 79 | 2048 (cap) | 60.3 | ~16.5 |
-
-Code / JSON / LongCode are from the MTP_int4RTN card (its "second run",
-temperature 0); Q&A / Math from the repository README (bf16 drafter,
-2026-09-09). Their acceptance: 88.5 % (2.65 of 3) on the code classes,
-about 70 % (2.1 of 3) with thinking-heavy output.
-
-Our engine's depth counters are unconditional (`pk` = "at least k drafts
-accepted this step"), so "2.65 of 3" compares to our p1 + p2 + p3.
-
 ## 3. Design decisions
 
 **D1. One resident form: packq with group 128 and F16 scales.** The packq
@@ -309,7 +284,7 @@ template runs depth 4. The shipped depth for this template is whichever
 wins the five-class measurement in §6; the plan's arithmetic says 3.
 
 **D10. The draft head's vocabulary subset is an opt-in lever, exact by
-construction.** The author's `DRAFT_VOCAB=1` scores the draft over the
+construction.** The checkpoint recipe's `DRAFT_VOCAB=1` scores the draft over the
 65,536 most frequent ids (+3–5 % decode, acceptance unchanged on English /
 code, worse on CJK). The verify stays full-vocabulary, so greedy output is
 unchanged and the sampled ratio verify stays exact (the residual (P − Q)+
@@ -528,8 +503,9 @@ Gates:
 
 ### S6. The throughput program (3–5 days, needs the node)
 
-See §6. Exit: the five `bench_qwen35.sh` cells met or beaten on the shipped
-recipe with `mtp_draft_vocab` off, with every S5 gate still green on that
+See §6. Exit: the five `bench_qwen35.sh` cells measured and recorded on
+the shipped recipe with `mtp_draft_vocab` off, each at its depth-3 pass
+within a few ms of the byte floor, with every S5 gate still green on that
 recipe. The subset lever is measured and recorded separately.
 
 ### S7. Ship (0.5 day)
@@ -546,7 +522,7 @@ recipe; the memory note.
 
 ### 6.1 The measurement, verbatim
 
-`bench_qwen35.sh` (albond's script the author cites): five prompts, one
+`bench_qwen35.sh` (the checkpoint recipe's five-prompt bench): five prompts, one
 request each, two runs, `temperature 0.0`, no thinking flag, `model:
 "qwen"`, `max_tokens` 256 / 512 / 1024 / 64 / 2048:
 
@@ -614,14 +590,13 @@ grow by 50 MB of K/V (0.2 ms): that growth is a defect to profile next
 
 **Acceptance is the model's, not the engine's.** With the same draft
 weights and a correct feed, greedy acceptance at every chain position is a
-property of the checkpoint and of the text being decoded. The author
-measures 2.65 of 3 accepted draft tokens on code classes; on the same
-prompts with thinking off our chain accepts 2.65 of 3 (p1/p2/p3 95/89/81 %),
-so the feed is right (the verify is exact: transcripts identical across
-depths 1/2/3 and against the plain world). In reasoning text the same chain
-accepts 1.78 of 3 (77/58/43 %), and our greedy trajectories on the thinking-on
-prompts reason longer than the author's (a different greedy path of the
-same prompt under different summation orders; task quality is at the FP8
+property of the checkpoint and of the text being decoded. On the bench's
+code prompts with thinking off our chain accepts 2.65 of 3 (p1/p2/p3
+95/89/81 %), and the feed is right (the verify is exact: transcripts
+identical across depths 1/2/3 and against the plain world). In reasoning
+text the same chain accepts 1.78 of 3 (77/58/43 %), and our greedy
+trajectories on the thinking-on prompts reason at length (the greedy path
+of a prompt depends on the summation orders; task quality is at the FP8
 baseline, §5 S5). That is what the thinking-on cells measure beyond the pass.
 
 ### 6.4 What the cells look like at the floor
@@ -630,12 +605,9 @@ At the 48 ms floor with the measured acceptance: code text (3.65 tokens
 per pass, thinking off) 13.2 ms per token, 76 tok/s; reasoning text (2.78
 per pass) 17.3 ms per token, 58 tok/s. Scaling the measured thinking-on
 cells (43.2 / 47.7 / 61.9 / 51.2 / 45.2 at the 56–60 ms pass) to the
-floor: Q&A 54, Code 60, JSON 77, Math 64, LongCode 56 against the author's
-49.1 / 59.1 / 62.6 / 55.5 / 60.3. Four cells clear at the floor; LongCode
-with our 2048-token reasoning trajectory lands 6 % under it at the floor
-(the author's completion of that prompt is code text). With thinking off
-every cell clears the author's implied 63–68 by 10 % or more at the floor
-and matches them at today's pass (55.4 / 59.1 / 63.1 / – / 59.6).
+floor: Q&A 54, Code 60, JSON 77, Math 64, LongCode 56 (LongCode's
+2048-token reasoning trajectory holds it lowest). With thinking off,
+today's pass reads 55.4 / 59.1 / 63.1 / – / 59.6.
 
 ### 6.4a Status 2026-09-29 04:45 (S6 rounds 1–3)
 
@@ -651,10 +623,9 @@ transcripts and 58/58 on the Qwen, pick and KDA suites
    `process_madvise`.
 
 The pass: 60–62 → ~57 ms (stats ms/step; 59.7 at step 100 under nsys);
-the author's cells thinking on 44.8 / 49.5 / 63.7 / 51.4 / 46.8, off
-57.0 / 60.7 / 65.0 / 21.9 / 61.3 (JSON thinking on above the author's
-62.6; every thinking-off cell above the author's implied 63–68 except
-Q&A). What the rounds established about the floor: the read line rate is
+the five bench cells thinking on 44.8 / 49.5 / 63.7 / 51.4 / 46.8, off
+57.0 / 60.7 / 65.0 / 21.9 / 61.3. What the rounds established about the
+floor: the read line rate is
 248–256 GB/s sustained and the clock holds (2.5 GHz at 60 W in decode),
 but a 65 GB working set walks 32K 2 MB pages per pass and every
 streaming kernel runs 8–10 % below its isolated rate in the step — an 8
@@ -699,8 +670,9 @@ fabric worlds; kept behind `DGPP_QWEN_GR_BF12=on`).
 
 1. Depth 3 on the recipe as built: `bench_qwen35.sh` twice, the
    `timed_load --think` protocol, retire lines with p1 / p2 / p3 per prompt.
-   Compare acceptance to the author's per class; a shortfall goes to the
-   chain reference gate first (§7, item 1).
+   Record acceptance per class; a chain that accepts less than the
+   model's own draft would goes to the chain reference gate first (§7,
+   item 1).
 2. The world-1 profile (`scripts/fabric_qwen_profile.sh`,
    `nsys_step_breakdown.py`): every class against the table above.
 3. Close the gaps in the order of the table: chain latency, dense-stack
@@ -754,10 +726,10 @@ the transcript gate. `DGPP_QWEN_HEAD_PLANES=off` keeps the row layout.
 
 ### 6.7 The draft vocabulary slice (opt-in; `engine.draft_vocab`)
 
-The author's D10: the draft head scores a fixed subset of the vocabulary
+The recipe's D10: the draft head scores a fixed subset of the vocabulary
 (a `.npy` of ids; `tools/build_draft_vocab.py` builds one from the
 tokenizer's alphabet, its added tokens and the most frequent merges by BPE
-rank — 64,934 of the author's 65,536 ids, 99.1 %). The draft's rows are
+rank — 64,934 of the recipe's 65,536 ids, 99.1 %). The draft's rows are
 gathered into their own plane-layout matrix at load; the draft's head call
 scatters the slice's logits to their ids over a `-inf` row, so the pick and
 the verify are unchanged; a token outside the set is never proposed and
@@ -862,8 +834,7 @@ levers end here: 53.5–53.6 ms a step at short context, 56.3 from 12K to
 
 ### 6.12 The prefill (2026-09-29, round 17)
 
-Against the author's ~2,100–2,200 tok/s the hybrid prefilled at 1,340
-tok/s (2K) and ~1,600 (8K–47K). The 32K profile (22.0 s of GPU time): the
+The hybrid prefilled at 1,340 tok/s (2K) and ~1,600 (8K–47K). The 32K profile (22.0 s of GPU time): the
 packed-int expert GEMMs 34 %, cuBLAS / cutlass dense GEMMs 15 %, the
 hyper-connection elementwise passes 12 %, the GDN chunked recurrence 8 %,
 the expert accumulation 6 %, the n-gram stage wait 5 %, the listed
@@ -935,24 +906,7 @@ latency still on the table. On the fabric (session U, four legs, bitwise
 by the long-prompt sha): 2K 1.40 → 1.29 s, 8K 4.61 → 4.42, 32K 18.46 →
 17.82 (−7 / −4 / −4 %); 32K at 1,840 tok/s.
 
-### 6.14 The reference on this box, and round 19 (2026-09-30)
-
-The author's stack — their repository on the pinned
-`vllm/vllm-openai:qwen38-flash-next` image with NVIDIA's model package,
-their serve settings, the n-gram table mmap'ed from the local FP8 snapshot
-— served here and probed with our prompts: best of two 1.12 / 4.42 / 15.42
-s at 2K / 8K / 32K against our 1.29 / 4.41 / 17.7. The card's ~2,100 tok/s
-holds at 32K on an NVMe-backed table; at 2K–8K the reference runs ~1,825.
-Its kernels per 8,192-token chunk (nsys inside the container; the trace
-loses its last ~40 s at shutdown even with buffer flushes, but complete
-chunks were captured): Marlin experts 677 ms against our 1,250; fp8
-blockwise cutlass dense GEMMs 580 against our bf16 822 + dequant 114;
-moe_sum over bf16 partials 97 against our fp32 ordered 310; the GDN chunk
-kernels 462 against 540; the QSA attention, indexer and the
-hyper-connection glue level; its n-gram gather a synchronous ~0.4 s gap
-per chunk against our 56 ms per 4,096-token chunk. Their lead is the
-expert GEMM's efficiency (a bitwise problem on our side) and two
-accuracy trades (fp8 activations on the dense stack, bf16 partials).
+### 6.14 Round 19 (2026-09-30)
 
 Round 19 (the 2026-09-28-qwen-autoround-int4 measurements,
 sessions X–Z3): SHIPPED the chunk-ahead n-gram staging — the next chunk's
@@ -968,11 +922,10 @@ bitwise. Measured and not shipped: the four-token router tile (+0.25 s at
 register-decode three-stage expert GEMM (level; opt-in), the gate and up
 projections as one launch (level to +1 %; opt-in). The bf16 down
 partials (−3..−4 %, not bitwise) stay opt-in. Left: the expert GEMM at
-~40–45 % of the tensor peak against Marlin's ~65 % — ncu on device
-memory shows it issue-side bound (barrier 24 %, wait 15 %, long
-scoreboard 15 % of the warp cycles; two barriers a k-step, a 32 x 32
-warp tile), so the next form is a larger warp tile with the same chain —
-and the two accuracy trades.
+~40–45 % of the tensor peak — ncu on device memory shows it issue-side
+bound (barrier 24 %, wait 15 %, long scoreboard 15 % of the warp cycles;
+two barriers a k-step, a 32 x 32 warp tile), so the next form is a larger
+warp tile with the same chain — and the two accuracy trades.
 
 ### 6.15 The accuracy trades as deployment keys (2026-09-30, round 20)
 
@@ -1134,13 +1087,13 @@ Each item is a measured or suspected distance from a floor, with its fix.
 None is a reason to lose a cell; each is work.
 
 1. **Chained draft acceptance below the model's.** Our depth-2 p2 measured
-   0.6–0.84 on code where the author's implied per-position rate is ~0.9.
+   0.6–0.84 on code, under what the model's own draft should give.
    Fix path: extend `tools/qwen_reference_dump.py --mtp` to chained depth
    (the reference draft rows at positions 2 and 3, fed exactly as the
    SGLang semantics we implement), gate `qwen_forward_test` and the real
    `qwen_forward_check` on them, and fix whatever the diff names. If the
    reference itself reproduces our lower rate on our prompts, the gap is
-   prompt mix and the author's prompts settle it.
+   prompt mix and the bench's prompts settle it.
 2. **The n-gram gather serializes page faults.** Measured 2026-09-29: the
    PLE layer's host node leaves the GPU idle 772 us per pass (the staging
    is forked at the pass's start and joined at layer 2, ~1.9 ms later, so
@@ -1208,7 +1161,7 @@ None is a reason to lose a cell; each is work.
 9. **Cold boot transposes 56 GiB on the CPU.** Once per image; the device
    transpose kernel if it exceeds a minute.
 10. **`usage.completion_tokens` accounting** must include reasoning tokens
-    for the author's script to compare like for like; checked in S5.
+    for the bench script's token counts; checked in S5.
 
 Out of scope, stated: worlds 2 and 4 (D8), the base hybrid repo with BF16
 draft experts, the vision tower.

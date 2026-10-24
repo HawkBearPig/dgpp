@@ -428,6 +428,10 @@ std::string model_object(const ServiceConfig& scfg, const std::string& model_id,
   append_json_float(&out, d.min_p);
   out.append(",\"repetition_penalty\":");
   append_json_float(&out, d.repetition_penalty);
+  out.append(",\"frequency_penalty\":");
+  append_json_float(&out, d.frequency_penalty);
+  out.append(",\"presence_penalty\":");
+  append_json_float(&out, d.presence_penalty);
   out.append("}},\"tools\":{\"available\":");
   out.append(tools_available ? "true" : "false");
   out.append(",\"constrained\":");
@@ -608,14 +612,14 @@ GenerationService::GenerationService(const ServiceConfig& cfg,
                            static_cast<uint64_t>(std::random_device{}()));
   DGPP_LOG_INFO(
       "serve: sampling {} — defaults temperature {} top_p {} top_k {} min_p "
-      "{} repetition_penalty {}; seedless requests {}",
+      "{} repetition_penalty {} frequency_penalty {} presence_penalty {}; seedless requests {}",
       sampling_available_ ? "available" : "unavailable (greedy engine)",
       cfg_.sampling_defaults.temperature, cfg_.sampling_defaults.top_p,
       cfg_.sampling_defaults.top_k, cfg_.sampling_defaults.min_p,
-      cfg_.sampling_defaults.repetition_penalty,
-      cfg_.fixed_seed.has_value()
-          ? "use the fixed seed " + std::to_string(*cfg_.fixed_seed)
-          : std::string("draw a fresh seed each"));
+      cfg_.sampling_defaults.repetition_penalty, cfg_.sampling_defaults.frequency_penalty,
+      cfg_.sampling_defaults.presence_penalty,
+      cfg_.fixed_seed.has_value() ? "use the fixed seed " + std::to_string(*cfg_.fixed_seed)
+                                  : std::string("draw a fresh seed each"));
   DGPP_LOG_INFO(
       "serve: tool calls {}; tool_choice/parallel_tool_calls {}; reasoning {}",
       markers_.tool_calls_available()
@@ -1685,7 +1689,12 @@ bool GenerationService::parse_chat(const dgpp::minijson::Value& body,
           return refuse("this model accepts text content only", at + ".type", "unsupported_content_type");
         const auto* text = part.find(is_refusal ? "refusal" : "text");
         if (!text || !text->is_string()) return refuse("content part text must be a string", at);
-        parts.push_back(is_refusal ? Value::make_object({{"type", Value::make_string("text")}, {"text", *text}}) : part);
+        if (is_refusal) {
+          parts.push_back(
+              Value::make_object({{"type", Value::make_string("text")}, {"text", *text}}));
+        } else {
+          parts.push_back(part);
+        }
       }
       // only thinking parts: the visible content is empty
       normalized_content = (saw_thinking && parts.empty()) ? Value::make_string("")
@@ -2755,6 +2764,10 @@ void GenerationService::route_metrics_prometheus(HttpResponseWriter& w) {
             int64_t{policy.prefill_latency.idle_floor_tokens});
   out.gauge("dgpp_prefill_adaptive_limit_tokens", "Last leader-selected prefill ceiling; 0 means fixed budgeting.",
             m.prefill_adaptive_limit_tokens);
+  out.gauge("dgpp_prefill_decode_pass_ms",
+            "The decoders' own pass the controller takes out of the allowance before sizing a chunk, at the last "
+            "tick's load; 0 with no decoders, none measured or fixed budgeting.",
+            m.prefill_decode_pass_ms);
   out.counter("dgpp_first_token_target_misses_total", "Choices whose first token exceeded the configured latency target.",
               static_cast<int64_t>(st.first_token_target_misses));
   out.counter("dgpp_decode_gap_target_misses_total", "Token-producing passes exceeding a request's decode gap target.",
@@ -3042,6 +3055,11 @@ void GenerationService::route_metrics(HttpResponseWriter& w) {  Scheduler::Meter
   append_json_int(&out, m.prefill_chunk_computed_tokens);
   out.append(",\"adaptive_limit_tokens\":");
   append_json_int(&out, m.prefill_adaptive_limit_tokens);
+  {
+    char dbuf[48];
+    std::snprintf(dbuf, sizeof(dbuf), ",\"decode_pass_ms\":%.1f", m.prefill_decode_pass_ms);
+    out.append(dbuf);
+  }
   out.append("}");
   out.append("}");
   out.append(",\"service\":{\"requests_total\":");

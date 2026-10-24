@@ -7507,10 +7507,7 @@ DGPP_TEST(glm_tp_shard_parity_nvfp4) {
 DGPP_TEST(glm_tp_forward_parity_real) {
   const char* model_env = std::getenv("DGPP_TP_REAL_MODEL");
   if (!model_env || !*model_env) {
-    DGPP_LOG_INFO("glm_tp_forward_parity_real: skipped (set "
-                  "DGPP_TP_REAL_MODEL=ORG/NAME to run against the real "
-                  "checkpoint)");
-    return;
+    dgpp::test::skip("set DGPP_TP_REAL_MODEL=ORG/NAME to run against the real checkpoint");
   }
   const std::string model_id = model_env;
   std::string err;

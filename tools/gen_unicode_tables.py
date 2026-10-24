@@ -15,6 +15,7 @@ and the Qwen3.8 scanner its sibling with [\\p{L}\\p{M}]+, a single
 need four Unicode predicates on codepoints:
 
   is_letter      Unicode General_Category L* (Lu, Ll, Lt, Lm, Lo)
+  is_lower       Ll; is_upper_or_title: Lu, Lt (the Flint pattern's case classes)
   is_mark        Unicode General_Category M* (Mn, Mc, Me)
   is_number      Unicode General_Category N* (Nd, Nl, No)
   is_white_space Unicode White_Space property (NOT category Zs alone:
@@ -71,6 +72,11 @@ def main():
         "src/text/unicode_tables.hpp"
     letters = ranges_of(
         lambda cp: unicodedata.category(chr(cp)) in ("Lu", "Ll", "Lt", "Lm", "Lo"))
+    # The Flint pattern's case classes (2026-10-22): [\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]
+    # and [\p{Ll}\p{Lm}\p{Lo}\p{M}] — Ll and Lu+Lt as tables, the rest is
+    # letter-minus-case plus the marks.
+    lowers = ranges_of(lambda cp: unicodedata.category(chr(cp)) == "Ll")
+    uppers = ranges_of(lambda cp: unicodedata.category(chr(cp)) in ("Lu", "Lt"))
     marks = ranges_of(
         lambda cp: unicodedata.category(chr(cp)) in ("Mn", "Mc", "Me"))
     numbers = ranges_of(
@@ -168,6 +174,10 @@ namespace dgpp::text::unicode {{
 
 {emit("Letter", letters, "General_Category L* (Lu, Ll, Lt, Lm, Lo)")}
 
+{emit("Lower", lowers, "General_Category Ll — the Flint pattern's lowercase class")}
+
+{emit("Upper", uppers, "General_Category Lu, Lt — the Flint pattern's uppercase class")}
+
 {emit("Mark", marks, "General_Category M* (Mn, Mc, Me)")}
 
 {emit("Number", numbers, "General_Category N* (Nd, Nl, No)")}
@@ -208,6 +218,12 @@ inline bool is_white_space(uint32_t cp) {{
 }}
 inline bool is_mark(uint32_t cp) {{
   return in_ranges(kMarkRanges, std::size(kMarkRanges), cp);
+}}
+inline bool is_lower(uint32_t cp) {{
+  return in_ranges(kLowerRanges, std::size(kLowerRanges), cp);
+}}
+inline bool is_upper_or_title(uint32_t cp) {{
+  return in_ranges(kUpperRanges, std::size(kUpperRanges), cp);
 }}
 inline bool is_punctuation(uint32_t cp) {{
   return in_ranges(kPunctRanges, std::size(kPunctRanges), cp);

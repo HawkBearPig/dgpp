@@ -249,6 +249,9 @@ void test_settings_handshake() {
   sent.fabric_port = 29970;
   sent.max_concurrency = 2;
   sent.kv_capacity = 4096;
+  sent.kv_dtype = "fp8";
+  sent.prefill_attention = "fp8";
+  sent.decode_attention = "fp8";
   sent.default_max_tokens = 32;
   sent.queue_limit = 8;
   sent.decode_graph = true;
@@ -259,6 +262,12 @@ void test_settings_handshake() {
   sent.mtp_schedule_row_ms = 3.7;
   sent.mtp_schedule_base_ms = 24.3;
   sent.mtp_schedule_sampled_scale = 0.9;
+  sent.prefill_dense = "streaming";
+  sent.prefill_fold_overlap = false;
+  sent.decode_pdl = false;
+  sent.prefill_window = "scalar";
+  sent.decode_window = "scalar";
+  sent.collective_transport = "send";
   sent.lookup_draft = true;
   sent.lookup_nmin = 3;
   sent.lookup_nstrong = 5;
@@ -294,6 +303,12 @@ void test_settings_handshake() {
     require(got.mtp_draft == "greedy", "the sampled requests' draft rule travels with the settings");
     require(got.mtp_schedule && got.mtp_schedule_sampled_scale == 0.9,
             "the sampled requests' schedule scale travels with the settings");
+    require(got.prefill_dense == "streaming", "the prefill dense form travels with the settings");
+    require(!got.prefill_fold_overlap, "the prefill fold overlap flag travels with the settings");
+    require(!got.decode_pdl, "the decode pdl flag travels with the settings");
+    require(got.prefill_window == "scalar", "the prefill window kernel travels with the settings");
+    require(got.decode_window == "scalar", "the decode window kernel travels with the settings");
+    require(got.collective_transport == "send", "the collective transport travels with the settings");
     require(got.lookup_draft && got.lookup_nmin == 3 && got.lookup_nstrong == 5 && got.lookup_agree == 1,
             "the lookup thresholds travel with the settings");
     require(got.lookup_tail == 2, "the lookup tail travels with the settings");
@@ -521,9 +536,17 @@ void test_journal_codec() {
     ws.stats_interval_s = 0.1;
     ws.reasoning_in_content = true;
     ws.kv_dtype = "fp8";
+    ws.prefill_attention = "fp8";
+    ws.decode_attention = "fp8";
     ws.bf16_weights = "bf12";
     ws.compact_batches = true;
     ws.fp8_head = "mma";
+    // The DeepSeek-V4.1 index budget rides the record too (2026-10-18): a
+    // peer selecting 512 entries beside a head selecting 2048 would attend
+    // different context.
+    ws.index_topk = 2048;
+    ws.candidate_topk_blocks = 1024;
+    ws.candidate_block_size = 16;
     // The opt-in rope knob rides the record: a peer that ran without it
     // would rope at different frequencies from rank 0 — silently
     // divergent text, the reason the settings record exists at all.
@@ -535,6 +558,40 @@ void test_journal_codec() {
         dgpp::serve::encode_journal_settings(ws));
     require(sr.settings && !sr.warm && !sr.stop && sr.world_settings == ws,
             "codec: the settings record round-trips");
+    {
+      std::string legacy = dgpp::serve::encode_journal_settings(ws);
+      const std::string key = ",\"dcattn\":\"fp8\"";
+      const size_t at = legacy.find(key);
+      require(at != std::string::npos, "codec: decode attention is encoded");
+      legacy.erase(at, key.size());
+      require(dgpp::serve::decode_journal_line(legacy).world_settings.decode_attention == "bf16",
+              "codec: legacy settings keep BF16 decode arithmetic");
+      // A record without the index budget keys (every run before 2026-10-18,
+      // and every run at the checkpoint's budget) decodes to 0: the checkpoint's.
+      for (const char* key : {",\"itopk\":2048", ",\"ctb\":1024", ",\"cbs\":16"}) {
+        const size_t where = legacy.find(key);
+        require(where != std::string::npos, "codec: the index budget is encoded");
+        legacy.erase(where, std::string(key).size());
+      }
+      const auto plain_budget = dgpp::serve::decode_journal_line(legacy).world_settings;
+      require(plain_budget.index_topk == 0 && plain_budget.candidate_topk_blocks == 0 &&
+                  plain_budget.candidate_block_size == 0,
+              "codec: legacy settings keep the checkpoint's index budget");
+      {
+        auto wide = ws;
+        wide.index_topk = 4096;
+        bool refused = false;
+        try { (void)dgpp::serve::decode_journal_line(dgpp::serve::encode_journal_settings(wide)); }
+        catch (const std::runtime_error&) { refused = true; }
+        require(refused, "codec: an index budget past the select networks is rejected");
+      }
+      auto invalid = ws;
+      invalid.decode_attention = "fp4";
+      bool rejected = false;
+      try { (void)dgpp::serve::decode_journal_line(dgpp::serve::encode_journal_settings(invalid)); }
+      catch (const std::runtime_error&) { rejected = true; }
+      require(rejected, "codec: invalid decode arithmetic is rejected");
+    }
     {
       // A record from before the entry policy (2026-09-28) carries neither
       // key: no floor, no head cut, what that rank 0 ran.
@@ -1684,6 +1741,42 @@ int main() {
   } catch (const std::exception& e) {
     std::fprintf(stderr, "FAIL: %s\n", e.what());
     return 1;
+  }
+}
+
+DGPP_TEST(journal_greedy_penalties_reach_every_rank_without_logprobs) {
+  for (int regime = 0; regime < 6; ++regime) {
+    GenerationService::PassEvents events;
+    dgpp::sched::SchedulerRequest request;
+    request.id = "penalties";
+    request.prompt = {1, 2, 3};
+    request.max_steps = 2;
+    auto& p = request.sampling;
+    if (regime == 1) p.repetition_penalty = 1.25f;
+    if (regime == 2) p.frequency_penalty = 0.5f;
+    if (regime == 3) p.presence_penalty = -0.25f;
+    if (regime == 4) p.frequency_penalty = -0.0f;
+    if (regime == 5) p.presence_penalty = -0.0f;
+    events.submits.push_back(request);
+    const auto line = dgpp::serve::encode_journal_tick(events);
+    require((line.find("\"g\":{") != std::string::npos) == (regime != 0),
+            "greedy penalties carry their sampling spec without requesting reports");
+    const auto decoded = dgpp::serve::decode_journal_line(line);
+    require(decoded.submits.size() == 1 && decoded.submits[0].logprobs == -1,
+            "penalty transport does not enable logprobs");
+    const auto& got = decoded.submits[0].sampling;
+    const auto same = [](float a, float b) { return std::memcmp(&a, &b, sizeof(a)) == 0; };
+    require(same(got.temperature, p.temperature) &&
+                same(got.repetition_penalty, p.repetition_penalty) &&
+                same(got.frequency_penalty, p.frequency_penalty) &&
+                same(got.presence_penalty, p.presence_penalty),
+            "peers receive the leader's exact effective penalties");
+    std::vector<float> leader{3.0f, -0.0f, 2.0f, 4.0f}, peer = leader;
+    const std::vector<int32_t> context{0, 0, 1, 2, 3};
+    dgpp::sample::apply_context_penalties(leader.data(), 4, 0, p, context);
+    dgpp::sample::apply_context_penalties(peer.data(), 4, 0, got, context);
+    require(std::memcmp(leader.data(), peer.data(), leader.size() * sizeof(float)) == 0,
+            "leader and peer apply identical penalty arithmetic");
   }
 }
 

@@ -1,4 +1,10 @@
 #include "kernels/l2_prefetch.hpp"
+#include "kernels/pdl.cuh"
+
+#include <cuda.h>
+
+#include <format>
+#include <stdexcept>
 
 #include <algorithm>
 #include <cstdint>
@@ -12,13 +18,24 @@ namespace dgpp {
 namespace {
 
 constexpr int kThreads = 256;
-// Full: 48 blocks x 4 loads x 16 B x 256 threads = 768 KB in flight — line
-// rate (~205 GB/s measured) at ~3 us of added latency for other traffic.
-// Light: 16 x 2 = 128 KB in flight — ~165 GB/s, well under a microsecond
-// of queue. (96 x 8 = 3 MB reached 215 GB/s and made every memory access
-// on the box wait ~12 us: the bus handshake went 9 -> 26 us.)
-constexpr int kFullBlocks = 48;
-constexpr int kFullUnroll = 4;
+// Full: 16 blocks x 8 loads x 16 B x 256 threads = 512 KB in flight — the
+// DRAM ceiling (232 GB/s on a cold 18 MiB window) at the Light form's SM
+// footprint. Its first form, 48 x 4 (768 KB), reached the same rate but
+// sat on every SM: a gap-shaped latency chain (small L2-bound kernels and
+// a spin) ran x1.21 beside it, x1.03 beside 16 x 8 — and on the fabric the
+// boundary windows at that form lengthened the fold and update segments of
+// a DeepSeek-V4.1 decode layer by 71 us against the 28 us they saved on the
+// projections (2026-10-20). The stretch follows the footprint and the bytes
+// in flight (24 x 8 and 32 x 8 at 768 KB-1 MB: x1.18-1.24), not the rate.
+// Light: 16 x 2 = 128 KB in flight — 187 GB/s cold, x1.01 on the chain.
+// (96 x 8 = 3 MB reached 215 GB/s and made every memory access on the box
+// wait ~12 us: the bus handshake went 9 -> 26 us.)
+// Both forms stay built: engine.l2_prefetch_full_form picks one per template
+// (the narrow form is the default; GLM-5.3 ships the wide one).
+constexpr int kNarrowBlocks = 16;
+constexpr int kNarrowUnroll = 8;
+constexpr int kWideBlocks = 48;
+constexpr int kWideUnroll = 4;
 constexpr int kLightUnroll = 2;
 constexpr int kLightBlocksDefault = 16;
 // DGPP_L2_PREFETCH_LIGHT_BLOCKS: the Light rate's grid (tuning knob).
@@ -33,6 +50,7 @@ __device__ uint32_t g_prefetch_sink[2];
 template <int kUnroll>
 __global__ __launch_bounds__(kThreads) void l2_prefetch_kernel(
     const uint4* __restrict__ p, size_t vec_count) {
+  dgpp_pdl_wait();
   const size_t stride = static_cast<size_t>(gridDim.x) * kThreads;
   size_t i = static_cast<size_t>(blockIdx.x) * kThreads + threadIdx.x;
   uint32_t fold = 0;
@@ -60,12 +78,15 @@ __global__ __launch_bounds__(kThreads) void l2_prefetch_kernel(
 // tuned to exactly that trade).
 __global__ __launch_bounds__(kThreads) void l2_prefetch_lines_kernel(
     const uint8_t* __restrict__ p, size_t lines) {
+  dgpp_pdl_wait();
   const size_t stride = static_cast<size_t>(gridDim.x) * kThreads;
   for (size_t i = static_cast<size_t>(blockIdx.x) * kThreads + threadIdx.x; i < lines; i += stride)
     asm volatile("prefetch.global.L2 [%0];" ::"l"(p + i * 128));
 }
 
 L2PrefetchSettings g_l2_settings;  // l2_prefetch_configure, before any model is built
+bool full_form_wide() { return g_l2_settings.full_form == L2FullForm::Wide48x4; }
+int full_blocks() { return full_form_wide() ? kWideBlocks : kNarrowBlocks; }
 bool env_prefetch_form_lines() { return g_l2_settings.form == L2PrefetchForm::Lines; }
 
 // The touch form (2026-09-29, the Qwen depth-3 profiles with the prefetch on
@@ -82,6 +103,7 @@ bool env_prefetch_form_touch() { return g_l2_settings.form == L2PrefetchForm::To
 size_t env_touch_stride_bytes() { return size_t{64} << 10; }
 __global__ __launch_bounds__(kThreads) void l2_touch_pages_kernel(const uint8_t* __restrict__ p, size_t touches,
                                                                  size_t stride_bytes) {
+  dgpp_pdl_wait();
   const size_t stride = static_cast<size_t>(gridDim.x) * kThreads;
   for (size_t i = static_cast<size_t>(blockIdx.x) * kThreads + threadIdx.x; i < touches; i += stride)
     asm volatile("prefetch.global.L2 [%0];" ::"l"(p + i * stride_bytes));
@@ -120,6 +142,11 @@ L2PrefetchForm l2_prefetch_form(const std::string& name) {
   if (name == "touch") return L2PrefetchForm::Touch;
   throw std::invalid_argument("l2 prefetch form: load, lines or touch (got '" + name + "')");
 }
+L2FullForm l2_prefetch_full_form(const std::string& name) {
+  if (name == "16x8") return L2FullForm::Narrow16x8;
+  if (name == "48x4") return L2FullForm::Wide48x4;
+  throw std::invalid_argument("l2 prefetch full form: 16x8 or 48x4 (got '" + name + "')");
+}
 
 namespace {
 
@@ -146,6 +173,23 @@ void launch_persisting(const uint4* p, size_t vecs, int blocks, cudaStream_t str
   DGPP_CUDA_OK(cudaLaunchKernelEx(&cfg, l2_prefetch_kernel<kUnroll>, p, vecs));
 }
 
+// The device allocation holding `p`: [base, end) from the driver. False for
+// host, managed or unknown memory (nothing is clamped or bridged then).
+static bool device_allocation(uintptr_t p, uintptr_t* base, uintptr_t* end) {
+  cudaPointerAttributes attrs{};
+  if (cudaPointerGetAttributes(&attrs, reinterpret_cast<const void*>(p)) != cudaSuccess) {
+    cudaGetLastError();
+    return false;
+  }
+  if (attrs.type != cudaMemoryTypeDevice) return false;
+  CUdeviceptr b = 0;
+  size_t size = 0;
+  if (cuMemGetAddressRange(&b, &size, static_cast<CUdeviceptr>(p)) != CUDA_SUCCESS) return false;
+  *base = static_cast<uintptr_t>(b);
+  *end = static_cast<uintptr_t>(b) + size;
+  return true;
+}
+
 void launch_l2_prefetch(const void* ptr, size_t bytes, PrefetchRate rate,
                         cudaStream_t stream, bool persisting) {
   if (ptr == nullptr || bytes == 0 || rate == PrefetchRate::Off) return;
@@ -155,24 +199,47 @@ void launch_l2_prefetch(const void* ptr, size_t bytes, PrefetchRate rate,
   const uintptr_t begin = reinterpret_cast<uintptr_t>(ptr) & ~uintptr_t{15};
   const uintptr_t end =
       (reinterpret_cast<uintptr_t>(ptr) + bytes + 15) & ~uintptr_t{15};
+  // The guard (2026-10-19): a range never reads past the allocation that
+  // holds its first byte — the merge below keeps ranges inside one
+  // allocation, and a caller's over-long range is clamped here with one
+  // warning per process (the forms read every line they are given).
+  uintptr_t end_clamped = end;
+  {
+    uintptr_t base = 0, alloc_end = 0;
+    if (device_allocation(begin, &base, &alloc_end) && end > alloc_end) {
+      static bool warned = false;
+      if (!warned) {
+        warned = true;
+        DGPP_LOG_WARN("l2 prefetch: a range at {:#x} ({} bytes) runs {} bytes past its allocation [{:#x}, {:#x}); clamped",
+                      reinterpret_cast<uintptr_t>(ptr), bytes, end - alloc_end, base, alloc_end);
+      }
+      end_clamped = alloc_end & ~uintptr_t{15};
+      if (end_clamped <= begin) return;
+    }
+  }
   const uint4* p = reinterpret_cast<const uint4*>(begin);
-  const size_t vecs = (end - begin) / 16;
+  const size_t vecs = (end_clamped - begin) / 16;
   if (persisting) {
-    if (rate == PrefetchRate::Full)
-      launch_persisting<kFullUnroll>(p, vecs, kFullBlocks, stream);
+    if (rate == PrefetchRate::Full && full_form_wide())
+      launch_persisting<kWideUnroll>(p, vecs, kWideBlocks, stream);
+    else if (rate == PrefetchRate::Full)
+      launch_persisting<kNarrowUnroll>(p, vecs, kNarrowBlocks, stream);
     else
       launch_persisting<kLightUnroll>(p, vecs, light_blocks(), stream);
     return;
   }
   if (rate == PrefetchRate::Full) {
-    l2_prefetch_kernel<kFullUnroll><<<kFullBlocks, kThreads, 0, stream>>>(p, vecs);
+    if (full_form_wide())
+      l2_prefetch_kernel<kWideUnroll><<<kWideBlocks, kThreads, 0, stream>>>(p, vecs);
+    else
+      l2_prefetch_kernel<kNarrowUnroll><<<kNarrowBlocks, kThreads, 0, stream>>>(p, vecs);
   } else if (env_prefetch_form_touch()) {
     const size_t sb = env_touch_stride_bytes();
-    const size_t touches = (end - begin + sb - 1) / sb;
+    const size_t touches = (end_clamped - begin + sb - 1) / sb;
     l2_touch_pages_kernel<<<static_cast<unsigned>(std::min<size_t>(light_blocks(), (touches + kThreads - 1) / kThreads)),
                             kThreads, 0, stream>>>(reinterpret_cast<const uint8_t*>(begin), touches, sb);
   } else if (env_prefetch_form_lines()) {
-    const size_t lines = (end - begin + 127) / 128;
+    const size_t lines = (end_clamped - begin + 127) / 128;
     l2_prefetch_lines_kernel<<<light_blocks(), kThreads, 0, stream>>>(
         reinterpret_cast<const uint8_t*>(begin), lines);
   } else {
@@ -182,6 +249,7 @@ void launch_l2_prefetch(const void* ptr, size_t bytes, PrefetchRate rate,
 }
 
 __global__ __launch_bounds__(kThreads) void l2_release_kernel(const uint8_t* p, size_t lines) {
+  dgpp_pdl_wait();
   const size_t stride = static_cast<size_t>(gridDim.x) * kThreads;
   for (size_t i = static_cast<size_t>(blockIdx.x) * kThreads + threadIdx.x; i < lines; i += stride)
     asm volatile("applypriority.global.L2::evict_normal [%0], 128;" ::"l"(p + i * 128) : "memory");
@@ -192,7 +260,7 @@ void launch_l2_release(const void* ptr, size_t bytes, cudaStream_t stream) {
   const uintptr_t begin = reinterpret_cast<uintptr_t>(ptr) & ~uintptr_t{127};
   const uintptr_t end = (reinterpret_cast<uintptr_t>(ptr) + bytes + 127) & ~uintptr_t{127};
   const size_t lines = (end - begin) / 128;
-  l2_release_kernel<<<kFullBlocks, kThreads, 0, stream>>>(reinterpret_cast<const uint8_t*>(begin), lines);
+  l2_release_kernel<<<full_blocks(), kThreads, 0, stream>>>(reinterpret_cast<const uint8_t*>(begin), lines);
   DGPP_CUDA_OK(cudaGetLastError());
 }
 
@@ -262,6 +330,7 @@ void WeightPrefetcher::flush_pending() {
     ++launches_;
   }
   pending_begin_ = pending_end_ = 0;
+  pending_alloc_end_ = 0;
 }
 
 void WeightPrefetcher::open_window(cudaStream_t main, size_t budget_bytes,
@@ -295,13 +364,19 @@ void WeightPrefetcher::add(const void* ptr, size_t bytes) {
   if (pending_end_ > pending_begin_ && b >= pending_begin_ &&
       b <= pending_end_ + kMergeGap) {
     // Extend the pending range; the bridged gap (a neighbouring tensor of
-    // the same layer, read soon anyway) is charged to the budget too.
+    // the same layer, read soon anyway) is charged to the budget too — and
+    // bridged only inside the pending range's allocation (an abutting
+    // range joins whatever its allocation): the hole between two
+    // allocations is unmapped.
     const size_t gap = b > pending_end_ ? b - pending_end_ : 0;
     const size_t take = std::min(bytes, remaining_ > gap ? remaining_ - gap : 0);
     if (take == 0) return;
-    remaining_ -= gap + take;
-    pending_end_ = std::max(pending_end_, b + take);
-    return;
+    const bool inside = gap == 0 || (pending_alloc_end_ != 0 && b + take <= pending_alloc_end_);
+    if (inside) {
+      remaining_ -= gap + take;
+      pending_end_ = std::max(pending_end_, b + take);
+      return;
+    }
   }
   const size_t take = std::min(bytes, remaining_);
   if (take == 0) return;
@@ -309,6 +384,8 @@ void WeightPrefetcher::add(const void* ptr, size_t bytes) {
   flush_pending();
   pending_begin_ = b;
   pending_end_ = b + take;
+  uintptr_t base = 0, alloc_end = 0;
+  pending_alloc_end_ = device_allocation(b, &base, &alloc_end) ? alloc_end : 0;
 }
 
 void WeightPrefetcher::add_isolated(const void* ptr, size_t bytes) {

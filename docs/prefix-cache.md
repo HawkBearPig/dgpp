@@ -93,12 +93,28 @@ The one-node Qwen recipes are the exception on purpose: their 47.7 GiB n-gram
 table is mmap'ed from the checkpoint and served through the page cache, and a
 field log showed fresh text prefilling three to four times slower than text
 the server had seen, so the memory not given to the arena is what keeps that
-cache warm. The MiMo and RadixArk recipes could not be re-planned here (no
+cache warm. Measure before assuming that: the five-agent deployment above
+moved its arena from 6 to 12 GiB, which cut the page cache from 16.4–16.9 to
+10.5–11.0 GiB and cost 4–7 % idle prefill, while loaded prefill, decode,
+reclaim (8–35 MiB/s), major faults (2–8/s) and memory-stall time were
+unchanged — the table fits in neither — and the arena, not the page cache,
+was that workload's binding limit. Compare idle prefill and major faults
+(`pgmajfault` in `/proc/vmstat`) before and after moving memory to the arena. The MiMo and RadixArk recipes could not be re-planned here (no
 checkpoint on the fabric); the RadixArk two-node budget is an estimate from the
 NVIDIA checkpoint's plan and the one-node one follows the page-cache rule.
 Concurrency alone does not specify how much historical cache to retain: with
 the entry floor a conversation costs about two slots per turn, and an arena
 holds that many turns of history across every conversation it serves.
+An agent client's turn is many calls (a field log: 1–34, median 4), and each
+call leaves about three entries — the deepest cut, a body cut and the close
+entry at retire — so an idle session survives about slots ÷ 3 other calls
+(eviction is LRU with no time expiry). In that deployment (one Spark,
+Qwen3.8-Flash-Next NVFP4, five coding agents, 2026-10-21) 55 slots kept a
+session paused five minutes and lost one paused ten; 111 slots held ten
+minutes (34–39 other calls) and not twenty (72). Size such an arena as three
+times the other calls an idle session must survive, plus the active requests;
+the document working-set estimate below (about 20 slots for that load)
+undercounts agent turns.
 
 ## Size for the working set
 

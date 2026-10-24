@@ -41,6 +41,21 @@ struct PrefillLatencyTuning {
 // limit, never their own clocks. The caller supplies completed pass durations
 // including decode, snapshots and other work that delays the next yield.
 //
+// The decoders' own pass (2026-10-22): a mixed pass carries the decode rows
+// whether or not it reads anything, so its duration is the decoders' step
+// plus what the chunk adds. Charging the whole pass to the chunk's tokens
+// made a small chunk look dear per token, and the limit it produced made
+// the next one dearer still: growth is bounded at twice the last quantum,
+// so a quantum grows only when its pass is under half the allowance, and
+// with decoders live every quantum whose pass ran between 42.5 % and 85 %
+// of the target was an absorbing state — one slow pass walked the limit
+// down the ladder for good. A field report (one Spark, five opencode
+// agents, 2026-10-21) read the limit at 128 tokens — 32 per reader — for
+// whole runs, at twice the idle prompt cost per token. The controller now
+// learns the decoders' pass from decode-only ticks at each load and charges
+// the chunk only for what it adds; the target less that pass is the room
+// for tokens. A lone reader has no decoders' pass and keeps its idle floor.
+//
 // The cost is kept per decoder-load range AND per context range
 // (2026-10-15): a chunk's cost per token grows with the position it starts
 // at (the full-attention families read every earlier key), so one estimate
@@ -58,12 +73,39 @@ class PrefillLatencyController {
     // Final tails and snapshot cuts are not representative full quanta.
     if (tokens <= 0 || tokens < offered / 2 || !(ms > 0) || !std::isfinite(ms)) return;
     auto& sample = samples_[bucket(decoders)][context_bucket(context)];
-    const double rate = ms / static_cast<double>(tokens);
+    // What the chunk added to the pass the decoders would have run anyway.
+    const double rate = std::max(0.0, ms - decode_pass(decoders)) / static_cast<double>(tokens);
     // React immediately to a slowdown, recover gradually as work gets cheaper.
     const double weight = tuning.recovery_pct / 100.0;
     sample.ms_per_token = sample.tokens == 0 || rate > sample.ms_per_token
         ? rate : (1 - weight) * sample.ms_per_token + weight * rate;
     sample.tokens = tokens;
+  }
+
+  // A tick that only stepped `decoders` (nothing read, nothing admitted):
+  // the pass a mixed tick at this load pays before it reads a token.
+  // Cheaper at once, dearer gradually: an overestimate oversizes the next
+  // chunk and misses the target; an underestimate only charges the chunk
+  // for a little of the decoders' work, which is where the estimate stood
+  // before this pass was measured at all.
+  void observe_decode(int decoders, double ms, const PrefillLatencyTuning& tuning = {}) {
+    if (decoders <= 0 || !(ms > 0) || !std::isfinite(ms)) return;
+    double& pass = decode_ms_[bucket(decoders)];
+    const double weight = tuning.recovery_pct / 100.0;
+    pass = pass == 0 || ms < pass ? ms : (1 - weight) * pass + weight * ms;
+  }
+
+  // The learned decoders' pass at this load (0: none measured, or no decoders).
+  double decode_pass(int decoders) const {
+    if (decoders <= 0) return 0;
+    // Own load first, then the nearest measured load below (a lighter
+    // batch steps for less), then the nearest above.
+    const size_t own = bucket(decoders);
+    for (size_t b = own + 1; b-- > 1;)
+      if (decode_ms_[b] > 0) return decode_ms_[b];
+    for (size_t b = own + 1; b < kLoads; ++b)
+      if (decode_ms_[b] > 0) return decode_ms_[b];
+    return 0;
   }
 
   // `context`: the position the next chunk starts at; `floor`: the smallest
@@ -79,8 +121,11 @@ class PrefillLatencyController {
     // the floor applies once a chunk's cost has been measured.
     if (!sample) return waves(std::min(cap, std::max(alignment, initial / alignment * alignment)), cap, alignment, wave);
     // Leave room for cost variation and arrivals. Bound upward exploration;
-    // the first unmeasured workload starts at the shared busy budget.
-    const double predicted = std::min<double>(cap, (1 - tuning.headroom_pct / 100.0) * target_ms / sample->ms_per_token);
+    // the first unmeasured workload starts at the shared busy budget. The
+    // decoders' pass comes out of the allowance before any token does.
+    const double room = (1 - tuning.headroom_pct / 100.0) * target_ms - decode_pass(decoders);
+    double predicted = 0;
+    if (room > 0) predicted = sample->ms_per_token > 0 ? std::min<double>(cap, room / sample->ms_per_token) : cap;
     const int64_t rows = std::min<int64_t>(static_cast<int64_t>(predicted), sample->tokens * tuning.growth_factor);
     const int64_t bound = std::min(cap, std::max(alignment, rows / alignment * alignment));
     // A small geometric set avoids oscillating among new GEMM shapes (and
@@ -130,6 +175,7 @@ class PrefillLatencyController {
     return nullptr;
   }
   std::array<std::array<Sample, kContexts>, kLoads> samples_{};
+  std::array<double, kLoads> decode_ms_{};  // the decoders' own pass per load; 0 unmeasured
 };
 
 }  // namespace dgpp::sched

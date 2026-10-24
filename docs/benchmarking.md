@@ -5,7 +5,10 @@ high-bandwidth tests in a maintenance window: they can consume both RoCE
 lanes and more than 25 GB/s of shared memory bandwidth.
 
 For serving throughput by model, world size, concurrency and prompt class,
-see [the serving benchmarks](benchmarks.md). Platform conclusions appear in
+see [the serving benchmarks](benchmarks.md); its "Workload and timing" section
+is the method of record (what a deployment's row set contains, the validity
+checks, how decode and prefill are reported), and
+`scripts/serve_campaign.py` runs that whole set for one template in one command. Platform conclusions appear in
 [measurements](measurements.md). Keep raw measurements, traces and run logs in
 ignored local storage or external artifacts; publish concise findings and
 validation limitations in the PR.

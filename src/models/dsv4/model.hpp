@@ -47,6 +47,7 @@
 #include "engine/memory_plan.hpp"
 #include "engine/session_model.hpp"
 #include "kernels/gemm.hpp"
+#include "kernels/bf12_companions.hpp"
 #include "kernels/glm_mhc_launch.hpp"
 #include "kernels/glm_spec.hpp"
 #include "kernels/l2_prefetch.hpp"
@@ -235,6 +236,7 @@ class Dsv4Model : public SessionModel<Dsv4Model> {
  public:
   void set_prefill_fold_overlap(bool on) { fold_overlap_ = on; }  // tests: the one-block walk beside it
   uint64_t debug_overlap_async_folds() const { return overlap_async_folds_; }
+  const Bf12Companions& bf12_companions() const { return bf12_; }
  private:
   uint16_t* stage(uint16_t* fallback, int T, int width, bool capture);
   void fold(uint16_t* buf, int T, int width, bool capture);
@@ -276,6 +278,10 @@ class Dsv4Model : public SessionModel<Dsv4Model> {
   Dsv4Config cfg_;
   Dsv4LayerStream loader_;
   CublasLtGemm gemm_;
+  // The lm head's 12-bit companion (engine.bf16_weights): the tensor-core decode
+  // form reads it (mma_gemv.hpp's bf12 form); the bf16 bytes stay for prefill.
+  Bf12Companions bf12_;
+  static constexpr int kBf12ExpandSlots = 1;
   bool dense_mma_ = true;  // the dense projections' and head's decode form
   void* gemm_ws_ = nullptr;
   size_t gemm_ws_bytes_ = 0;

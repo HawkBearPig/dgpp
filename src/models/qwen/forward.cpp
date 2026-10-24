@@ -28,6 +28,7 @@
 
 namespace dgpp {
 namespace {
+bool default_prefill_dense_tile = false;
 
 template <class T>
 T* dev_alloc(size_t n) {
@@ -51,11 +52,19 @@ void d2d(void* dst, const void* src, size_t bytes, cudaStream_t stream) {
 
 }  // namespace
 
+void QwenModel::set_default_prefill_dense_tile(bool enabled) { default_prefill_dense_tile = enabled; }
+
+void QwenModel::configure_gemm_rows(int tokens, bool decode) {
+  prefill_dense_tile_ = prefill_dense_tile_enabled_ && !decode;
+  qwen_configure_gemm_rows(gemm_, tokens, decode);
+}
+
 QwenModel::QwenModel(const QwenTextConfig& cfg, const std::string& checkpoint_dir, int max_tokens,
                      int64_t max_cache_tokens, QwenResidency residency, BoundaryReducer* boundary,
                      int tp_rank, int tp_world, int max_requests, bool mtp, int decode_rows,
-                     bool fp8_head_mma, bool serving_logits)
+                     bool fp8_head_mma, bool serving_logits, LatentFormat kv_format)
     : fp8_head_mma_(fp8_head_mma),
+      kv_format_(kv_format),
       cfg_(cfg),
       loader_(cfg, checkpoint_dir, tp_rank, tp_world, residency,
               tp_world > 1 ? QwenHeadSharding::VocabSharded : QwenHeadSharding::Full,
@@ -102,6 +111,8 @@ QwenModel::QwenModel(const QwenTextConfig& cfg, const std::string& checkpoint_di
   gemm_ws_bytes_ = std::max<size_t>(64u << 20, gemm_.query_workspace_bytes(max_tokens_, lm_vocab_count_, H, DType::BF16));
   gemm_ws_ = dev_alloc<char>(gemm_ws_bytes_);
   gw_ = QwenGemmWorkspace{&gemm_, gemm_ws_, gemm_ws_bytes_};
+  prefill_dense_tile_enabled_ = default_prefill_dense_tile;
+  gw_.prefill_dense_tile = &prefill_dense_tile_;
   if (QwenLayerStream::dense_weights_fp8() || cfg_.dense_mxfp8_shipped) {
     // The FP8 dense stack's prefill bridge: the largest dense matrix of
     // this rank's slice, in BF16 (the at-load fp8 form, or the QAD export's
@@ -191,6 +202,9 @@ QwenModel::QwenModel(const QwenTextConfig& cfg, const std::string& checkpoint_di
     shape.block_tokens = kBlockTokens;
     shape.max_requests = max_requests_;
     shape.token_slots = max_cache_tokens_;
+    shape.format = kv_format_;
+    shape.fp8_prefill_attention = fp8_prefill_attention_;
+    shape.fp8_decode_attention = fp8_decode_attention_;
     pool_.init(shape);
     spec_ring_ = dev_alloc<uint16_t>(static_cast<size_t>(num_qsa_) * rows * ring_elems());
   }
@@ -264,7 +278,8 @@ QwenModel::QwenModel(const QwenTextConfig& cfg, const std::string& checkpoint_di
 QwenModel::MemoryPlan QwenModel::plan_memory(const QwenTextConfig& cfg, int max_tokens,
                                              int64_t max_cache_tokens, int tp_rank, int tp_world,
                                              QwenResidency residency, int max_requests, bool mtp,
-                                             int decode_rows, bool serving_logits) {
+                                             int decode_rows, bool serving_logits,
+                                             LatentFormat kv_format) {
   if (max_tokens <= 0) throw std::invalid_argument("plan_memory: max_tokens must be positive");
   if (max_requests <= 0 || max_requests > kPickMaxRequests)
     throw std::invalid_argument("plan_memory: max_requests must be in [1, kPickMaxRequests]");
@@ -351,7 +366,12 @@ QwenModel::MemoryPlan QwenModel::plan_memory(const QwenTextConfig& cfg, int max_
     shape.block_tokens = kBlockTokens;
     shape.max_requests = max_requests;
     shape.token_slots = cache_tokens;
-    plan.add("kv cache pool (K/V bf16, compressed index keys, rings)", QwenKvPool::cache_bytes(shape));
+    shape.format = kv_format;
+    shape.fp8_prefill_attention = fp8_prefill_attention_;
+    shape.fp8_decode_attention = fp8_decode_attention_;
+    plan.add(std::string("kv cache pool (K/V ") + (kv_format == LatentFormat::kFp8 ? "fp8" : "bf16") +
+                 ", compressed index keys, rings)",
+             QwenKvPool::cache_bytes(shape));
   }
   // Activations and the token rows.
   const size_t logits_rows =
@@ -767,6 +787,7 @@ void QwenModel::build_layer_objects(const QwenLayerResident& r) {
     moe_ = std::make_unique<QwenMoeLayer>(moe_view(r.moe), moe_cfg_, gemm_, max_tokens_, max_decode_rows_,
                                           table_slots);
     moe_->set_mma_from_rows(gw_.mma_from_rows);
+    moe_->set_prefill_dense_tile(prefill_dense_tile_enabled_);
   } else {
     moe_->rebind(moe_view(r.moe));
   }
@@ -977,7 +998,7 @@ QwenModel::Outputs QwenModel::run_rows(const RowRun& run) {
   if (run.all_rows && T > logits_capacity_rows_)
     throw std::invalid_argument("Qwen serving head: use full diagnostic storage for an all-row forward");
   walk_rows_ = T;
-  qwen_configure_gemm_rows(gemm_, T, run.decode);
+  configure_gemm_rows(T, run.decode);
   if (run.capture && loader_.residency() != QwenResidency::Resident)
     throw std::logic_error("run_rows: a capture needs a resident stack");
   const int H = cfg_.hidden_size, W = cfg_.hc_count * H;
@@ -1070,14 +1091,14 @@ QwenModel::Outputs QwenModel::run_rows(const RowRun& run) {
         pending.y += static_cast<size_t>(row0) * H;
         pending.gates += static_cast<size_t>(row0) * cfg_.hc_count;
       }
-      qwen_configure_gemm_rows(gemm_, count, decode);
+      configure_gemm_rows(count, decode);
       if (count == T)
         site.mix(r_, output, T, stream_, &pending);
       else
         site.mix_group(r_ + static_cast<size_t>(row0) * W,
                        output + static_cast<size_t>(row0) * H, count, row0, stream_, &pending);
     });
-    qwen_configure_gemm_rows(gemm_, T, run.decode);
+    configure_gemm_rows(T, run.decode);
   };
   for (int layer = 0; layer < cfg_.num_hidden_layers; ++layer) {
     const QwenLayerResident& r = loader_.load_layer(layer);
@@ -1103,19 +1124,19 @@ QwenModel::Outputs QwenModel::run_rows(const RowRun& run) {
       // before its norm, the key consumed before the value's handout.
       uint16_t* key = stage(ple_->key_partial(), W);
       for_each_kernel_group([&](int row0, int count, bool decode, int) {
-        qwen_configure_gemm_rows(gemm_, count, decode);
+        configure_gemm_rows(count, decode);
         ple_->project_key(key + static_cast<size_t>(row0) * W, count, stream_, row0);
       });
-      qwen_configure_gemm_rows(gemm_, T, run.decode);
+      configure_gemm_rows(T, run.decode);
       if (run.decode) prefetch_ple_key_side(r);
       fold(key, W);
       ple_->norm_key(key, T, stream_);
       uint16_t* value = stage(ple_->value_partial(), H);
       for_each_kernel_group([&](int row0, int count, bool decode, int) {
-        qwen_configure_gemm_rows(gemm_, count, decode);
+        configure_gemm_rows(count, decode);
         ple_->project_value(value + static_cast<size_t>(row0) * H, count, stream_, row0);
       });
-      qwen_configure_gemm_rows(gemm_, T, run.decode);
+      configure_gemm_rows(T, run.decode);
       if (run.decode) prefetch_ple_value_side(r);
       fold(value, H);
       ple_->finish(r_, value, ple_conv_state_, ple_conv_elems_, d_req, d_pos, d_spans, num_requests, T,
@@ -1181,11 +1202,11 @@ QwenModel::Outputs QwenModel::run_rows(const RowRun& run) {
           int end = begin, rows = 0;
           while (rows < count) rows += shared_spans[end++].rows;
           const auto group = std::span(shared_spans).subspan(begin, end - begin);
-          qwen_configure_gemm_rows(gemm_, count, decode);
+          configure_gemm_rows(count, decode);
           gdn_->enqueue_spans(x_ + static_cast<size_t>(row0) * H,
                               attn_out + static_cast<size_t>(row0) * H, count, group, stream_);
         });
-        qwen_configure_gemm_rows(gemm_, T, run.decode);
+        configure_gemm_rows(T, run.decode);
       } else {
         gdn_->enqueue(x_, gdn_rec(req, gdn_ordinal), gdn_conv(req, gdn_ordinal), attn_out, T, stream_,
                       rec_snap, conv_snap, replay);
@@ -1231,11 +1252,11 @@ QwenModel::Outputs QwenModel::run_rows(const RowRun& run) {
           int end = begin, rows = 0;
           while (rows < count) rows += shared_spans[end++].rows;
           const auto group = std::span(shared_spans).subspan(begin, end - begin);
-          qwen_configure_gemm_rows(gemm_, count, decode);
+          configure_gemm_rows(count, decode);
           qsa_->enqueue_spans(x_ + static_cast<size_t>(row0) * H, count, group.front().map,
                               group, cache, attn_out + static_cast<size_t>(row0) * H, stream_);
         });
-        qwen_configure_gemm_rows(gemm_, T, run.decode);
+        configure_gemm_rows(T, run.decode);
       } else {
         qsa_->enqueue(x_, T, qrows, cache, attn_out, stream_);
       }
@@ -1266,7 +1287,7 @@ QwenModel::Outputs QwenModel::run_rows(const RowRun& run) {
       trace.weights = h_route_weights_ + slot;
       trace.biased = nullptr;
       for_each_kernel_group([&](int row0, int count, bool decode, int) {
-        qwen_configure_gemm_rows(gemm_, count, decode);
+        configure_gemm_rows(count, decode);
         auto group_trace = trace;
         group_trace.ids += static_cast<size_t>(row0) * K;
         group_trace.weights += static_cast<size_t>(row0) * K;
@@ -1279,7 +1300,7 @@ QwenModel::Outputs QwenModel::run_rows(const RowRun& run) {
                                  ffn_out + static_cast<size_t>(row0) * H, count, stream_,
                                  traces ? &group_trace : nullptr);
       });
-      qwen_configure_gemm_rows(gemm_, T, run.decode);
+      configure_gemm_rows(T, run.decode);
       if (traces) {
         out.route_ids.emplace_back();  // filled after the sync
         out.route_weights.emplace_back();
@@ -1324,17 +1345,17 @@ QwenModel::Outputs QwenModel::run_rows(const RowRun& run) {
     project_head_rows(run, [&](int input, int output, int count) {
       if (mixed && input == 0) {
         // Project the decoder prefix together, preserving decode dispatch.
-        qwen_configure_gemm_rows(gemm_, count, true);
+        configure_gemm_rows(count, true);
         head_req_ = 0;
         lm_head_logits(h_, count, stream_, false);
-        qwen_configure_gemm_rows(gemm_, T, false);
+        configure_gemm_rows(T, false);
       } else {
         for_each_kernel_group([&](int row0, int rows, bool decode, int) {
           if (input < row0 || input >= row0 + rows) return;
-          qwen_configure_gemm_rows(gemm_, rows, decode);
+          configure_gemm_rows(rows, decode);
           lm_head_logits(h_ + static_cast<size_t>(row0) * H, rows, stream_, false, input - row0, output);
         });
-        qwen_configure_gemm_rows(gemm_, T, run.decode);
+        configure_gemm_rows(T, run.decode);
       }
     });
   } else if (!run.output_spans || run.output_spans[0]) {
@@ -1706,7 +1727,7 @@ void QwenModel::mtp_run_rows(int req, const int64_t* tokens, int64_t first_pos, 
   walk_rows_ = T;
   // The hidden projection has T * hc matrix rows: a shipped 6/8-token
   // walk must not enter the wide guard just because hc expands it to 24/32.
-  qwen_configure_gemm_rows(gemm_, T, decode_row);
+  configure_gemm_rows(T, decode_row);
   if (!mtp_) throw std::logic_error("mtp_run_rows: MTP is not enabled");
   if (T <= 0 || T > max_tokens_) throw std::invalid_argument("mtp_run_rows: rows");
   if (head_rows < 0 || head_rows > T) throw std::invalid_argument("mtp_run_rows: head_rows");

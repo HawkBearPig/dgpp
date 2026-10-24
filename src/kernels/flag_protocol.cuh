@@ -23,6 +23,7 @@
 #pragma once
 
 #include <cuda/atomic>
+#include "kernels/pdl.cuh"
 #include <cuda_runtime.h>
 
 #include <cstdint>
@@ -53,6 +54,7 @@ __device__ inline void flag_store_release(uint32_t* seq, uint32_t value) {
 __global__ inline void flag_heartbeat_kernel(uint32_t* start,
                                              FlagAck* ack,
                                              uint64_t deadline_cycles) {
+  dgpp_pdl_wait();
   uint64_t idle_since = clock64();
   uint32_t last_seen = 0;
   for (;;) {
@@ -78,6 +80,7 @@ __global__ inline void flag_payload_kernel(uint32_t* start,
                                            const uint32_t* payload,
                                            FlagAck* ack,
                                            uint64_t deadline_cycles) {
+  dgpp_pdl_wait();
   uint64_t idle_since = clock64();
   uint32_t last_seen = 0;
   for (;;) {

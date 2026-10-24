@@ -1,10 +1,10 @@
 # Image inputs
 
-GLM-5.3-Flash and Qwen3.8-Flash-Next accept images through
+GLM-5.3-Flash, Qwen3.8-Flash-Next and Qwen3.8-27B accept images through
 `POST /v1/chat/completions`. The engine loads the checkpoint's BF16 vision
 encoder and projects image features into the language model's prompt. It
 supports the FP8 and hybrid NVFP4/FP8 checkpoints, streaming, multiple choices
-and MTP. Other model frontends reject image inputs until they have their own
+and speculative drafting (MTP or the DFlash2 block drafter). Other model frontends reject image inputs until they have their own
 encoder integration.
 
 Check `GET /v1/models`: a capable model reports
@@ -63,20 +63,27 @@ The two served towers disagree about geometry, so the resize policy and the
 delimiters are per-family data (`serve/image_inputs.hpp`,
 `models/<family>/vision_config.hpp`), not constants in the shared path.
 
-| | GLM-5.3-Flash | Qwen3.8-Flash-Next |
-| --- | --- | --- |
-| Visual token | 28 pixels on a side (patch 14 × merge 2) | 32 pixels on a side (patch 16 × merge 2) |
-| Canvas | rounded **up** to the grid, the remainder painted black | rounded to the **nearest** multiple of the grid (ties to even), never padded |
-| Pixel budget | at least 16 tokens, at most 1,024 | at least 64 tokens, at most 1,024 (`min_pixels`/`max_pixels` growth and shrink, so a small image is scaled up rather than refused) |
-| Normalization | CLIP mean/std, temporal patch duplication | mean = std = 0.5, both temporal frames identical |
-| Delimiters | `image_start_token_id` 154830, `image_token_id` 154854, `image_end_token_id` 154831 | `vision_start_token_id`, `image_token_id`, `vision_end_token_id` (248053, 248056, 248054), rendered from the tokenizer's own vocabulary |
-| Tower | 24 blocks, RMSNorm, SwiGLU, windowed attention, deepstack injections | 27 blocks, LayerNorm ε 1e-6, GELU MLP, full attention, 2-D axial RoPE with θ 10000, a learned 48×48 position table resampled bilinearly, `deepstack_visual_indexes: []` |
-| Where the rows enter | the embedding and the deepstack layers | the embedding only (no deepstack) |
+| | GLM-5.3-Flash | Qwen3.8-Flash-Next | Qwen3.8-27B |
+| --- | --- | --- | --- |
+| Visual token | 28 pixels on a side (patch 14 × merge 2) | 32 pixels on a side (patch 16 × merge 2) | 32 pixels on a side (patch 16 × merge 2), same processor |
+| Canvas | rounded **up** to the grid, the remainder painted black | rounded to the **nearest** multiple of the grid (ties to even), never padded | as Flash-Next (shared frontend) |
+| Pixel budget | at least 16 tokens, at most 1,024 | at least 64 tokens, at most 1,024 (`min_pixels`/`max_pixels` growth and shrink, so a small image is scaled up rather than refused) | as Flash-Next |
+| Normalization | CLIP mean/std, temporal patch duplication | mean = std = 0.5, both temporal frames identical | as Flash-Next |
+| Delimiters | `image_start_token_id` 154830, `image_token_id` 154854, `image_end_token_id` 154831 | `vision_start_token_id`, `image_token_id`, `vision_end_token_id` (248053, 248056, 248054), rendered from the tokenizer's own vocabulary | same ids (248053, 248056, 248054) |
+| Tower | 24 blocks, RMSNorm, SwiGLU, windowed attention, deepstack injections | 27 blocks, LayerNorm ε 1e-6, GELU MLP, full attention, 2-D axial RoPE with θ 10000, a learned 48×48 position table resampled bilinearly, `deepstack_visual_indexes: []` | same 27-block tower, merger to 5120 (the dense model's width) |
+| Where the rows enter | the embedding and the deepstack layers | the embedding only (no deepstack) | the embedding only (no deepstack) |
 
 Qwen3.8-Flash-Next deviations, both recorded here rather than hidden in a
 comment: images are single frames (`video_token_id` is refused, never
 decoded), and the tower's rows are spliced into a prompt whose positions are
-still one-dimensional. The checkpoint's language model expects interleaved
+still one-dimensional. The same holds for Qwen3.8-27B (shared frontend and
+position design), with one of its own: the DFlash2 draft embeds the pad ids
+directly, so drafts at image rows are weaker while the verify stays exact;
+measured on image-heavy traffic the damage is negligible (p1 acceptance
+74.5%, inside the 70-89% text-only band; 36.4% of draft tokens accepted
+overall). Prefix reuse across image requests is measured too: a repeated
+image prompt attaches 1,722 of 1,727 cached tokens, first sight caches
+nothing, and a TTFT-hit request serves in ~133 ms against ~470 ms misses. The checkpoint's language model expects interleaved
 mRoPE, where an image span advances the height and width axes independently;
 DGPP's position array is also its cache-slot index, so the three-axis
 positions land with that split, not before it. Spatially demanding prompts
@@ -158,6 +165,11 @@ with serving stopped.
 cold image prefills, interleaved cursors with and without MTP, cancellation,
 slot reuse, and MTP catch-up at an attached prefix. It needs a GPU but no
 downloaded checkpoint.
+
+The 27B model has corresponding `qwen35_image_prefill_test` and
+`qwen35_mixed_image_prefill_test` gates for the FP8 and mixed NVFP4 formats.
+They also check grouped image requests and the shared prefill task's ownership
+of prompts, pixels and snapshot boundaries across yields.
 
 ```bash
 cmake --build build-ci -j 4 --target glm_vision_check

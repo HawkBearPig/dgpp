@@ -398,6 +398,55 @@ int main(int argc, char** argv) {
     cudaFree(dx); cudaFree(dwc); cudaFree(dws); cudaFree(dg); cudaFree(codes); cudaFree(scales); cudaFree(gs);
     cudaFree(o1); cudaFree(o2); cudaFree(seg); cudaFree(views);
   }
+  // The dense form's pipeline drain (2026-10-17): its last k-step's scale words
+  // must have landed before they are read. Forty launches at the Qwen3.8-27B
+  // MLP's gate shape, every output bitwise the grouped kernel's; before the
+  // drain wait, 4 of 49 launches differed (the NVFP4 27B's temperature-0
+  // transcripts moved run to run).
+  {
+    const int m = 100, n = 17408, k = 5120, iters = 40;
+    std::mt19937 rng(29);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    std::vector<uint16_t> x(size_t(m) * k);
+    for (auto& v : x) v = bf16(nd(rng));
+    std::vector<uint8_t> wc(size_t(n) * k / 2), ws(size_t(n) * k / 16);
+    for (auto& v : wc) v = static_cast<uint8_t>(rng() & 0xFF);
+    for (auto& v : ws) { uint8_t b = static_cast<uint8_t>(rng() & 0x7F); if ((b & 0x7F) == 0x7F) b = 0x7E; v = b; }
+    const float one = 1.f;
+    uint16_t* dx = dev(x);
+    uint8_t* dwc = dev(wc);
+    uint8_t* dws = dev(ws);
+    float* dg = dev(std::vector<float>{one});
+    const size_t ss = nvfp4_act_scale_stride(k);
+    uint8_t *codes = nullptr, *scales = nullptr;
+    float* gs = nullptr;
+    uint16_t *o1 = nullptr, *o2 = nullptr;
+    MoeSegment* seg = dev(std::vector<MoeSegment>{MoeSegment{0, m, 0}});
+    GlmFp4Matrix fm;
+    fm.payload = dwc; fm.scales = dws; fm.global_scale = dg; fm.rows = n; fm.cols = k; fm.scale_group = 16;
+    MoeExpertView* views = dev(std::vector<MoeExpertView>{MoeExpertView::of(fm), MoeExpertView::of(fm), MoeExpertView::of(fm)});
+    DGPP_CUDA_OK(cudaMalloc(&codes, size_t(m) * k / 2));
+    DGPP_CUDA_OK(cudaMalloc(&scales, size_t(m) * ss));
+    DGPP_CUDA_OK(cudaMalloc(&gs, size_t(m) * 4));
+    DGPP_CUDA_OK(cudaMalloc(&o1, size_t(m) * n * 2));
+    DGPP_CUDA_OK(cudaMalloc(&o2, size_t(m) * n * 2));
+    launch_quantize_rows_nvfp4(dx, k, m, k, codes, scales, gs, nullptr, 1.f);
+    launch_moe_grouped_w4a4_bf16(codes, scales, gs, nullptr, seg, 1, m, views, 0, o1, n, n, k, nullptr);
+    DGPP_CUDA_OK(cudaDeviceSynchronize());
+    const auto h1 = host(o1, size_t(m) * n);
+    const CUtensorMap am = nvfp4_code_tma_map(codes, m, k, 128), wm = nvfp4_code_tma_map(dwc, n, k, 256);
+    int bad = 0;
+    for (int it = 0; it < iters; ++it) {
+      DGPP_CUDA_OK(cudaMemset(o2, (it & 1) ? 0x00 : 0xFF, size_t(m) * n * 2));
+      launch_dense_w4a4_tma_bf16(am, wm, scales, ss, gs, dws, dg, o2, n, m, n, k, nullptr);
+      DGPP_CUDA_OK(cudaDeviceSynchronize());
+      if (host(o2, size_t(m) * n) != h1) ++bad;
+    }
+    std::printf("dense tma drain (m %d n %d k %d): %d of %d launches differ from the grouped form\n", m, n, k, bad, iters);
+    if (bad != 0) ++fails;
+    cudaFree(dx); cudaFree(dwc); cudaFree(dws); cudaFree(dg); cudaFree(codes); cudaFree(scales); cudaFree(gs);
+    cudaFree(o1); cudaFree(o2); cudaFree(seg); cudaFree(views);
+  }
   // Small shapes with ragged segments and k tails for the exact layout check.
   fails += run(64, 8, 2, 256, 256, true, "small");
   fails += run(200, 16, 4, 320, 320, true, "k320");

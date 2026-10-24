@@ -5,6 +5,953 @@ project procedures and design guidance live in `docs/`.
 
 ## Unreleased
 
+- **DeepSeek-V4.1-Flash-1017 EXL3: sixteen slots on a 96-row decode
+  batch, and the step's cost past a few rows** (2026-10-23 evening,
+  `docs/deepseek_v41_flash_exl3_plan.md` §3.3, §3.6, §7). The family's
+  decode batch widens from 64 to 96 rows (the engine's `kDecodeRowsMax`
+  and every bound that mirrored it — the pick tables, the GEMM lowering,
+  the CSA2 select and layer, the batch-map upload, the tensor-core GEMV's
+  one split chain, now to 128 rows) and the EXL3 template ships at sixteen
+  slots (queue 24): sixteen streams decode live where twelve had queued
+  four. The forms that pay for it, each bitwise its predecessor per row or
+  a fixed function of the request alone: the expert-run slot form's long
+  runs as 64-row groups from a launch list (the 64-row launch no longer
+  puts 1,400 idle blocks on the GPU a layer); the decode attention's
+  splits merged eight at a time by the group's last block in L2, the dead
+  partials discarded before they write back (the finish reads five
+  partials a row instead of forty; a one-time rounding-class change of
+  the decode attention, the two-level merge at 5e-8 relative to the flat
+  combine, batch-invariant by construction); the router's tiled dots and
+  the mHC dots' token tile from sixteen decode rows; the graph-variant
+  budget at 256 so sixteen slots keep all their scheduled depths, with the
+  new key `engine.mtp_schedule_options` to cap the depth options at the
+  budget's even spread (the template pins three: 1, 3, 4 — every depth as
+  an option let the schedule stop at depth 2 on code, 8 % of its tokens a
+  step) and the schedule's row and base costs measured on the pack (2.95
+  and 19.9 ms, from the mode boots). On the
+  twelve-slot template the campaign-method C8 legs read code 191.1 → 206.1
+  tok/s, JSON 227.9 → 240.7, prose level, C1 level at equal rows; on the
+  sixteen-slot template sixteen identical streams decode at 128 ms a
+  step. Two defects the gates caught on the way are in the plan's record
+  (the discard racing the merge's own reads; the 65–128-row tensor-core
+  form's unsplit chain past 64 rows). Later that evening the template's
+  block widened to five drafts (`engine.mtp_depth` 5, the schedule's
+  options 1, 3 and 5): the code, table, JSON and counting classes had
+  saturated the four-draft block (counting 4.96 tokens a step of a
+  possible 5) — now 5.95 / 5.17 / 5.20 / 3.60 tokens a step, C1 JSON
+  120.8 → 133.1 tok/s and code 91.1 → 92.0 on the campaign prompts, prose
+  level (plan §3.6). The campaign of record on the shipped template
+  (binary `9a179b15a6de02fa`, 2026-10-24 00:06–00:54 UTC, every gate
+  green): C1 70.7 / 92.0 / 134.2 / 111.4 / 70.1 tok/s (prose / code /
+  JSON / math / chat), C2 95.7–182.4, C4 127.8–206.6, C8 165.0–247.7;
+  cold prefill 1.188 / 3.446 / 13.331 s; HumanEval 160/164, GSM8K
+  295/300, extraction 100/100 — docs/benchmarks.md and the model card
+  carry the rows.
+
+- **DeepSeek-V4.1-Flash-1017 in its EXL3 3.5 bpw re-pack** (2026-10-23,
+  [LibertAIDAI/DeepSeek-V4.1-Flash-1017-EXL3-3.5bpw](https://huggingface.co/LibertAIDAI/DeepSeek-V4.1-Flash-1017-EXL3-3.5bpw)).
+  The engine serves the trellis-coded pack as published — every
+  projection of the model, the experts, the drafts and the head are EXL3
+  matrices (int16 trellis tiles under the `mul1` codebook with per-channel
+  input and output scales, 3 to 8 bits per weight by class from the
+  pack's `exl3_k_map.json`) — through its own decode core: the activation
+  row scaled and rotated in fp32 and rounded once to fp16, the tensor
+  cores against the codebook values decoded in registers from the bit
+  stream, fp32 accumulation, the output rotation and scale in fp32, one
+  rounding at the site. The dense form streams the weights once for 1 to
+  64 rows (split-K on the narrow attention projections), the MoE slot
+  kernels and the grouped prefill kernels take EXL3 expert views on the
+  shared MoE core, and a row's chain is the same whatever rows ride with
+  it. The `deepseek_v41` family gains the pack as a weight format
+  (`quant_method: exl3`): the binding table's EXL3 quadruples and checked
+  f16 / f32 natives, tensor-parallel slices on whole 128-blocks (the
+  experts' intermediate 640 / 640 / 512 / 512 at world 4, the head on
+  128-row blocks), the Engram tables from the base release through the new
+  key `engine.engram_source` (the pack ships none; required for an EXL3
+  pack, refused for other families), the attention, Engram and head
+  projections dispatched by format. The numpy reference decodes the
+  trellis independently and models the engine's one fp16 rounding; the
+  dsv41 suites run twice (`DGPP_DSV41_FIXTURE=exl3`, the `_exl3` ctest
+  variants) and the EXL3 fixture passes the release fixture's strict
+  teacher-forced budgets. The binding census on the published pack
+  matches 192,495 tensors with the four Engram tables the base supplies.
+  Template `deploy/cluster_deepseek-v4.1-flash-1017_exl3-3.5bpw_w4.example.json`;
+  plan and record in [docs/deepseek_v41_flash_exl3_plan.md](docs/deepseek_v41_flash_exl3_plan.md);
+  [card](docs/model_cards/DeepSeek-V4.1-Flash-1017-EXL3-3.5bpw.md). The
+  format follows exllamav3 ([docs/licenses/exllamav3.md](docs/licenses/exllamav3.md)).
+  The day's first campaign, on the six-slot template (source `a24e05b5`
+  plus the port, binary `c7efb833f88a06e3`): decode 65.0–105.0 /
+  90.9–141.8 / 115.5–156.4 / 91.1–137.9 tok/s at C1 / C2 / C4 / C8 against
+  the release template's 53.5–89.4 / 75.5–121.9 / 94.7–130.3 / 83.8–139.0,
+  the plain pass 20.0 ms against 23.9, the context matrix 36.21–51.39 ms a
+  pass from a short prompt to 512K against 43.12–60.35; cold prefill
+  1.225 / 3.489 / 13.607 s against 1.006 / 2.638 / 10.024 (the grouped
+  trellis kernels' first version — the plan's §3.4 names the second
+  round); HumanEval 159/164, GSM8K 294/300, extraction 100/100 against the
+  release's 157 / 295 / 100. The pack's first requests exposed a
+  decode-graph defect fixed before the run: `GlmMoeLayer::prepare_graph_table`
+  filled the graph's per-slot expert table with the routed EXL3 views but
+  had shared-expert branches for the NVFP4 and packed-int forms only, so
+  every graph step ran each MoE layer's shared expert on a stale view (the
+  first token right, the text degrading after it; the eager table had the
+  branch). The MoE test's EXL3 decode case now runs the graph table too.
+  The same day's decode and prefill program on this pack (the plan's §7
+  has every leg): the split form's reduce folded
+  into the EXL3 GEMV (the last split block of an output block folds the
+  splits; arrival counters in a fixed region at the head of each EXL3
+  workspace, zeroed by the owner, never cuBLASLt's); an eight-stage
+  cp.async ring for the slot kernels (the one-row gate-up from 72 % to
+  ~95 % of the DRAM rate; the dense GEMV keeps four); the experts'
+  intermediate slices alternating by parity (`exl3_expert_block_split`:
+  5/5/4/4 blocks on even experts, 4/4/5/5 on odd, the shared expert by its
+  layer's — a step's expert bytes even out across the ranks; the resident
+  image format is 2); a 128-row A tile for dense launches above 64 rows
+  (prefill −2.5 % at 8K and 32K); the family's decode batch 32 → 64 rows
+  (`decode_rows_cap`, the CSA2 layer's bound and the DSA select layout
+  rows) and the template at twelve slots with `queue_limit` 16 and a
+  4,096-token first prefill chunk for a lone prompt. Measured on one
+  binary: the plain one-row step 20.0 → 18.9 ms; C1 within ±2 % of six
+  slots; C8 code / JSON 127 / 135 → 154 / 175–180 decode tok/s, C12 167 /
+  181. Then the expert-run slot form: the per-slot kernels had streamed
+  and trellis-decoded an expert again for every slot that picked it (L2
+  served under half — eight identical streams cost them 4.9x one
+  stream's time, a C8 trace), so the expert-sorted order now emits each
+  position's equal-expert run length, the rotated rows are laid out by
+  position, and the run's first block computes all its rows as one A tile
+  (a 16-row tile, or a 64-row tile above 16 token rows) while the
+  duplicates' blocks return — bitwise the per-slot form per row (the MoE
+  test's decode case at 17 / 40 / 64 rows with few experts). C1 code /
+  JSON / prose 35.4 / 38.6 / 29.5 → 32.2 / 35.4 / 28.5 ms a pass (+10 / +9
+  / +4 % tok/s: the shared expert's run and the draft block's own
+  duplicates), C8 158 / 175 / 137 → 191 / 228 / 167 decode tok/s; eight
+  identical streams' step 166 → 92 ms. Measured and rejected: rotating the activation rows inside
+  the GEMV's stage (every rotating kernel 30–60 % slower: the rotating
+  warp also computes); closed with numbers: the prefetch window budget
+  and boundary rate (as shipped is best, the windows worth 2.5 ms a pass)
+  and the prefill chunk policy (a lone prompt already reaches 4,096-token
+  ticks). Per token the pack prefills at 1,760 / 2,270 / 2,420 tok/s at
+  2K / 8K / 32K. The campaign of record on the finished template (binary
+  `6f8bccfa5b70efef`, the rows in docs/benchmarks.md): decode 70.6–119.3
+  / 96.7–170.3 / 126.4–183.7 / 167.7–224.0 tok/s at C1 / C2 / C4 / C8
+  against the six-slot campaign's 65.0–105.0 / 90.9–141.8 / 115.5–156.4
+  / 91.1–137.9 (C1 prose / code / JSON / math / chat 70.6 / 96.2 / 119.3 /
+  111.3 / 70.9; the C8 cell eight live streams at 167.7 / 200.8 / 224.0 /
+  208.3 / 177.9), the plain one-row pass 18.9 ms, cold prefill 1.166 /
+  3.398 / 13.326 s, the context matrix 33.18 → 50.58 ms a pass from a
+  short prompt to 512K; HumanEval 159/164, GSM8K 293/300, extraction
+  100/100.
+- **The adaptive prefill controller charges a chunk only for what it adds**
+  (2026-10-22, issue #116 finding 2 and a second field report). The
+  controller timed the whole tick — the decoders' pass included — and
+  divided it by the chunk's tokens, so a small chunk looked dear per token
+  and the limit it produced made the next one dearer still: growth is
+  bounded at twice the last quantum, so a quantum grows only when its pass
+  is under half the allowance, and with decoders live every quantum whose
+  pass ran between 42.5 % and 85 % of the target was an absorbing state
+  that one slow pass could walk the limit down into for good. A one-Spark
+  Qwen3.8-Flash-Next NVFP4 deployment serving five opencode agents read
+  the limit at 128 tokens — one amount per pass shared by its four readers
+  — for whole runs, at twice the idle prompt cost per token, and only fixed
+  1,024/2,048 budgets with both targets off brought its first-token p90
+  from 58–60 s to 12–15 s. The scheduler now times decode-only ticks and
+  the controller learns the decoders' own pass per load range
+  (`PrefillLatencyController::observe_decode`), charges a chunk the pass
+  less that, and sizes the next from the target less that pass; a lone
+  reader is charged nothing and keeps its idle floor. The learned pass is
+  `scheduler.prefill_chunks.decode_pass_ms` / `dgpp_prefill_decode_pass_ms`,
+  and the startup line names the sizing policy (`adaptive: decode-gap
+  target … ms, first-token target … ms` or `fixed budgets (both latency
+  targets 0)`). The docs now say the busy budget and the adaptive limit are
+  one amount per pass shared by every reader on the mixed-prefill families,
+  how to size a prefix arena for agent clients (about three entries per
+  call), what full admission reserves for agent clients that ask for 32K
+  of output, and that the one-node Qwen arena rationale is to be measured
+  (idle prefill and major faults), not assumed. Measured on one Spark with
+  the one-node Qwen NVFP4 template at the field's shape (five slots, MTP
+  depth 3, FP8 K/V): four 39K prompts reading together beside a decoder
+  252–267 s → 158–159 s to their first tokens (limit 128–512 → 512–1024,
+  decode-gap misses 3 → 0); one beside four decoders 44.6 → 39.0–39.5 s;
+  the template as shipped unchanged within noise. Details in
+  [docs/continuous-batching.md](docs/continuous-batching.md).
+
+- **Flint** (`HawkBearPig/flint-FP8-NVFP4`, 2026-10-22): a new family on
+  the shared session core, served as shipped on one, two or four Sparks
+  (`deploy/cluster_flint_fp8-nvfp4_w{1,2,4}.example.json`). The MiMo
+  attention kernels became the sink-attention family (`kernels/sink_attn`)
+  instantiated per head geometry — MiMo's 192/64 unchanged, Flint's
+  128-wide heads with the per-head q / k RMSNorm, RoPE over the whole head
+  or none, and the 513 window. The MoE executor takes the export's
+  per-projection expert formats: a layer binds the fp8 and NVFP4 tables
+  together with a mask, the grouped chain picks the core per launch and
+  the decode slot path runs a mixed gate/up kernel whose fp8 and fp4 dots
+  are each bitwise their uniform kernel's. `QwenMoeLayer` serves the
+  ungated BF16 shared expert (a null gate is weight 1) behind a sigmoid
+  router; the fused add + norm gained its one-rounding form. The
+  tokenizer's three-stage scanner learned the o200k main pattern over the
+  case classes (Ll and Lu/Lt tables); the chat-template engine block
+  `set … endset` and the `\x` / `\u` string escapes; a positive
+  reasoning effort on a template without a control is a no-op. Whether
+  the model opens its own `<think>` became a family declaration
+  (`ServeFamily::model_opens_thinking`, carried by the frontend's markers
+  and the grammar vocabulary: MiMo-V2.6 and Flint) in place of the MiMo
+  dialect coupling, so the Flint parser splits and counts the model's
+  block and constrained decoding admits it before the answer; no other
+  family's prompts reach the rule (their templates open or close the
+  block themselves). The sink-attention prefill kernel stages each K/V
+  tile for 128 query vectors per block (64 before; both geometries): the
+  32K Flint prompt's attention 6.44 → 5.16 s (19.9 → 24.8 TF), MiMo's 8K
+  prompt's 0.820 → 0.621 s, bitwise. Every layer within 7 bf16 ulps of
+  the numpy reference teacher-forced, the final hidden bitwise; the
+  fixture ladder (loader at worlds 1/2/4, the session surface, loopback
+  TP and engines) and the real checkpoint's tokenizer / template goldens
+  pass. See [docs/flint_plan.md](docs/flint_plan.md)
+  and the [model card](docs/model_cards/Flint-FP8-NVFP4.md); the
+  campaign rows are in [docs/benchmarks.md](docs/benchmarks.md).
+
+- **Eval retry beyond the token cap** (2026-10-22): `scripts/serve_eval.py`
+  asks every response the server cut at the standard cap (2,048 tokens;
+  512 for extraction) once more at `--retry-max-tokens` (8,192), keeps the
+  retry's reply, tokens and verdict under `retry` in the item's record and
+  counts, per task, the retried items that completed and those that then
+  passed. The standard-cap score is unchanged by it; the quality table in
+  [docs/benchmarks.md](docs/benchmarks.md) gained the "Completed at the
+  8,192 retry (passed)" column (`serve_campaign.py rows`), so a model that
+  reaches the right answer only with more tokens is reported rather than
+  hidden among the failures.
+
+- **FP4-Local Qwen3.8-Flash-Next export** (`nvidia/Qwen3.8-Flash-Next-FP4-Local`).
+  Load CSF-wrapped NVFP4 expert scales losslessly, discover nested shards
+  through their index, and validate quantized vision matrices before widening
+  them to BF16. The model uses the shared Qwen engine, including the FP4
+  single-pass down projection, tile stealing, attention-combine staging,
+  PDL graphs, MTP copies, and sampling fast paths. MXFP8 attention and shared
+  experts can select the shared FP8 weight-tile prefill kernel through
+  `engine.prefill_dense`, with byte scales kept resident. Automatic dispatch
+  retains Qwen's faster existing bridge while DeepSeek-V4.1 keeps its tile.
+  Long QSA prefills reuse index-cache stripes across queries, preserving
+  score bits while avoiding repeated full-cache reads beyond L2 capacity.
+  Deployment preflight accepts indexed nested shards and rejects traversal. The one-Spark
+  template uses FP8 dense weights and KV, MTP3, a screened draft head,
+  a mapped n-gram table, four request slots, and a 1M-token pool and YaRN
+  positional ceiling. Fix premature source-scale page release for plain
+  NVFP4 column slices. Regression fixtures cover nested CSF checkpoints,
+  TP slicing, independent forward references, graph replay and mixed prefill.
+  See [docs/fp4local_plan.md](docs/fp4local_plan.md).
+
+- **The day's DeepSeek-V4.1 levers ported where they apply; the campaign's
+  C8 cell on a six-slot template read** (2026-10-20). Inventory of the
+  2026-10-20 commits: the lm head's bf12 tensor-core form lives in the GEMM
+  dispatch and every family packs its bf16 head already; the L2 window's
+  full form, the Markov bias and hidden-copy kernels and the bus
+  instrumentation are shared code — so those reach every family as
+  committed. Restricted to DeepSeek-V4.1 were the attention finish's staged
+  `l` (csa2's kernel, shared with DeepSeek-V4), the draft block's rows on
+  the listed flash form and the head companion. Ported, each bitwise the
+  kernel it replaces: the DSA decode combine (`attn_combine_kernel`;
+  GLM-5.3, GLM-5.3-Flash and Qwen's QSA layers) stages every split's `m`
+  and `l` one thread per split and thread 0 forms the maximum, the weights
+  and the denominator from shared memory (combine_bench, one block per
+  (row, head) at 128 threads: 10.24 → 8.20 µs at 32 splits, 6.15 level at
+  16, 4.23 → 4.10 at 8, rows 1–8); Qwen's full-attention combine
+  (`full_attn_combine_kernel`) stages the group's (head, split) `m` and
+  `l` and one thread per head forms the maximum, weights and denominator
+  (25.4 → 16.4 µs at a group of 8, 14.3 → 10.2 at 4, rows 1–16, 32
+  splits); the DFlash2 drafter's `block_attn_combine_kernel` holds split
+  `s` in lane `s`, the maximum by shuffle, each weight formed once and
+  broadcast in split order. DeepSeek-V4 gains the head's 12-bit companion
+  (`Bf12Companions`, the plan entry, the prefetch view through
+  `resident_view`; the loader grants no release, so the bf16 bytes stay for
+  the prefill forms) and its draft block's rows attend on the listed flash
+  form split like the decode rows; `dsv4_tp_test` gains
+  `dsv4_lm_head_bf12_companion_matches_the_bf16_head`, and the DSpark
+  exactness gates cover the draft block. Not ported: GLM-4.7's
+  `glm4_attn.cu` combine and MiMo's non-fused fallback combine (no
+  checkpoint on the box to measure the first; the second is not the served
+  path). Legs at C1 (code/prose/json ms per pass, three repeats, the
+  2026-10-19 binary `0d69d565` → the ported one): Qwen3.8-27B FP8 w4 with
+  DFlash2 46.55/45.88/46.66 → 45.31/44.67/45.48 (−2.7 %); Qwen3.8-Flash-Next
+  FP8 w4 23.23/22.97/23.19 → 22.91/22.82/22.96 (−1.4/−0.7/−1.0 %);
+  GLM-5.3-Flash NVFP4-FP8 w4 31.19/30.42/31.44 → 30.63/30.01/30.21
+  (−1.8/−1.3/−3.9 %); GLM-5.3 Mixed346 w4 62.29/61.13/61.78 → 62.47/61.30/61.99 and
+  62.78/61.20/61.97 on two boots of the narrow window form, 62.20/61.16/61.85
+  on the wide one. That last pair is the one shared change of the day that
+  did not pay everywhere: the full-rate window's 16 × 8 form (db097d49)
+  reaches every family's `WeightPrefetcher::open` (its default rate is
+  Full), and GLM-5.3's windows lose their bandwidth share beside its
+  streaming kernels at 512 KB in flight — the 48 × 4 form rebuilt for
+  attribution read 62.29/61.21/61.88, the 2026-10-19 figures. So the form
+  is a template key, `engine.l2_prefetch_full_form` (`16x8`, the default
+  that DeepSeek-V4.1, Qwen and GLM-5.3-Flash measured ahead on; `48x4`),
+  parsed, journaled (`l2ff`), on the CLI (`--l2-prefetch-full-form`), in
+  `docs/configuration.md` and `cluster_config_test`; the three GLM-5.3
+  templates ship `48x4`. DeepSeek-V4 could not be measured: the
+  DeepSeek-V4-Flash-0731 checkpoint is no longer in the box's cache (the
+  disk at 99 %), so its port stands on the gates and on the V4.1
+  measurement of the same kernels. `dgpp-serve --no-mtp-schedule` (a fixed
+  verify depth from a scheduled template) is the campaign's DSpark mode
+  knob (`--mode d3="--mtp-depth 3 --no-mtp-schedule"`; the server refuses
+  a fixed depth with the schedule on). The 1017 campaign's C8 code/json
+  cells read below the 2026-10-19 row's while every other cell rose: the
+  template serves six slots (the family's 32-row decode batch at depth 4),
+  so C8 is six live and two queued, 4.0 rows a step as at C4, and the
+  three-repeat json cell spans 123–157 ms/pass in either campaign; a
+  dedicated A/B (six repeats at C8, three at C6) has the day's binary
+  faster at every class — C8 json 152.5 → 138.4 ms/pass, code 127.4 →
+  119.0, math 123.5 → 104.7; C6 171.4 → 162.2, 125.2 → 117.0, 131.2 →
+  125.2 — and the head's tensor-core companion form ahead of the bf16 form
+  at m 12–32 (1120/1156/1274/1355 µs vs 1444/1442/1808/1460). The model
+  card carries both tables.
+
+- **The folds' arrival spread decomposed across ranks; the Engram staging
+  joins per table** (2026-10-20). `DGPP_BUS_TIMELINE_DUMP=<dir>` (a node
+  setting) makes every rank append its collectives' stamps (own clock:
+  start, staged, first and last peer gated, done, per peer landed and
+  claimed) to `<dir>/bus_gens_rank<r>.tsv`; aligned by generation, the
+  pairwise symmetric sums of the landing times give each path and their
+  differences each rank's lateness per collective with the clocks' offsets
+  cancelled. On the DeepSeek-V4.1 C1 pass the spread is the ranks' compute
+  imbalance between collectives (correlation 0.98–1.00): 15 µs at the
+  median on ordinary collectives (the GPUs' timing noise on identical work,
+  ~2 ms a pass summed) and a tail on the Engram collectives (layers 1 and
+  14), whose host gather of rows from the mapped tables page-faults on one
+  rank at 12 % of them (p90 363 µs, p99 1.2 ms). The decode walk's one
+  gather callback now publishes a pinned per-table count as it finishes
+  each table, and the first Engram layer's consumer spins on its own count
+  (the stage-wait kernel) instead of the whole staging's join — the second
+  layer's consumer still joins the side stream by event, so a capture stays
+  one host node and joined — and no longer waits for the second table's
+  rows: the Engram collectives' cross-rank imbalance p90 363 → 57 µs, p99
+  1.2 ms → 0.54, above 200 µs at 12 % → 3 %, ~0.3 ms a pass less summed.
+
+- **The full-rate window's partners, measured** (2026-10-20). Two
+  complementary changes for `l2_prefetch_boundary_rate: full` were
+  tried on the DeepSeek-V4.1 C1 pass with the per-layer instrument. The
+  decode slot kernels' expert loads as evict-first lines
+  (`DGPP_FP4_SLOT_STREAMING`, the 2026-09-22 form awaiting its A/B) is
+  level at the light rate (layer 885 → 885 µs, the pass within its
+  spread) and, under the full rate, leaves the gaps' stretch as it was
+  (B 107 → 94 µs with the projections L2-fed; A +11, E +12, F +12, H +7;
+  the layer +20, the pass +1 %): the expert stream is not what evicts the
+  gap kernels' lines. The gap kernels that stretch (the mHC dots and
+  stream update, the router dots) are L2-feed-bound, so the window's own
+  traffic through L2 at 232 GB/s is what slows them, whatever their data's
+  residency; the flag stays off. The `lines` form (one `prefetch.global.L2`
+  a line, no L2-to-SM transfer) was then measured as the other partner: on
+  the GB10 its prefetches do not land ahead of the consumer — a cold 18 MiB
+  window read right behind the lines kernel takes 67–76 µs against 22
+  L2-resident and 80 cold, at 8 to 96 blocks — so the load form is the
+  only fill, and its traffic through L2 is what the full rate costs the
+  gaps. The lever pays only once the gap kernels' own L2 bytes shrink (the
+  mHC dots' redundant stream and coefficient re-reads).
+
+- **The engine loop's iteration histogram** (2026-10-20). The collective
+  bus logs, per graph window, a histogram of its poll loop's iteration
+  times (<2 <5 <10 <20 <50 ≥50 µs) and the maximum: on the DeepSeek-V4.1
+  C1 pass 99.9 % of iterations take under 2 µs and the maxima are 11–16
+  µs, so the handshake's notice latency is not where the folds' 11–15 µs
+  of arrival spread comes from; the spread is the ranks' GPU-side timing
+  under L2 and DRAM contention.
+
+- **The collective timeline's minimums, and the attention finish's l
+  values staged in parallel** (2026-10-20). The graph window timeline
+  keeps each window's shortest handshake and, per peer, the shortest
+  staging → landed beside the averages (`min handshake`, `landed … min`):
+  on the DeepSeek-V4.1 C1 pass they are 1.6–2.0 µs and 0–4 µs against
+  averages of 15–21 and 13–19, so the averages are not a path floor; the
+  symmetric sums of the landing times between rank pairs put the path at
+  13–16 µs each way (the row's four PCIe crossings without GDR) and the
+  rest in the ranks' arrival spread. The attention finish kernel loaded
+  each live split's l inside thread 0's serial loop, a dependent L2 round
+  trip per split on the block's critical path; the l values are staged
+  beside the m values, one thread per split, the same arithmetic in the
+  same order (bitwise; `csa2_attn_finish_merges_sources_with_the_sink_and_unrotates`):
+  12.7–14.2 → 7.5–9.5 µs a launch in the C1 pass, the attention segment
+  36 → 32 µs a layer, the pass level within its spread (42.79 ms code).
+
+- **The decode pass's tail: the draft block's attention on the flash form,
+  the Markov bias and the hyper-state copies at the DRAM rate**
+  (2026-10-20). The C1 node trace puts 5.5 ms of a 42 ms DeepSeek-V4.1 pass
+  after the 40 main layers (the verify head, the draft block's three
+  layers, the draft head and the pick chain). Three of its kernels sat
+  far under their limits: (1) the draft block's rows attended on the
+  scalar partial kernel, one block per row, 131–170 µs a draft layer where
+  the decode rows' flash listed form takes ~20 — the block's rows now take
+  the decode form under `engine.decode_window` (split like the scalar
+  form; the lists are the builder's); (2) the Markov bias read its 16.5 MB
+  head slice at 134 GB/s cold (123 µs) — one thread a vocab row reading
+  512-byte rows in 16-byte vectors, so a warp's load touched 32 lines for
+  16 bytes each, whatever the depth in flight (the whole row in flight
+  measured the same) — and now loads each batch of rows warp-coalesced
+  (one row a warp instruction) into registers, stages it in shared memory
+  and lets each lane walk its own row with the same fmaf chain: 77 µs cold
+  (214 GB/s), 17 hot, bitwise (test `dsv41_dspark_test`: the host chain,
+  both forms, the padding group, the block maxima); (3) the hyper-state
+  window's store and gather copied one 2-byte element a thread an
+  iteration (29 + 12 µs a pass for 25,600-wide rows) and now copy 16-byte
+  units with eight in flight (test `qwen_mtp_test`). In the C1 pass: the
+  draft layers' attention kernel 174 → 17 µs, the copies 28 + 10 → 5 + 5;
+  on four nodes 43.15 → 42.81 ms (code), 36.89 → 36.49 (prose), 49.36 →
+  47.64 (JSON).
+
+- **The lm head read through its 12-bit companion under the tensor-core
+  chain, and the prefetch window's full form** (2026-10-20). The node
+  trace of a DeepSeek-V4.1 C1 pass showed the lm head as `mma_gemv_kernel`
+  at two bytes a weight (1.43 ms a launch, two launches a pass: 6 % of the
+  pass) although `engine.bf16_weights: bf12` had packed its companion
+  (0.23 GiB a rank, never read): the GEMM's tensor-core dispatch took every
+  width from the bf16 bytes, and the model's comment said otherwise. The
+  companion now feeds the decode forms through a bf12 form of the
+  tensor-core kernel (`launch_mma_gemv_bf12_f32/bf16`, m ≤ 32): a lane
+  loads its own 24 units of its row's packed super-block into registers
+  at the super-block's first window and decodes its fragments with the
+  expansion kernel's `expand_step` into the words the bf16 form loads, so
+  every row's chain is the bf16 launch's bit for bit at every width —
+  the scalar 12-bit kernel would have been 1.5 % faster still but gives a
+  row a chain that depends on the rows sharing its launch above eight.
+  On the head's slice ([32320 x 5120], cold): 1,425 → 1,096–1,136 µs
+  (226 GB/s on 248 MB; a staged form with a shared-memory ring ran at
+  109–183 GB/s, the SM's ~100 KB holding two to six warps); in the C1
+  pass 1,432 → 1,023 µs a launch (the head's prefetch window now streams
+  the packed bytes), and the pass on four nodes 44.50 → 43.15 ms (code),
+  37.73 → 36.89 (prose), JSON 48.03 → 49.36 by the median of three
+  repeats whose spread (46.7–49.5) covers both. The companion
+  takes precedence in `CublasLtGemm::matmul` ahead of the bf16 launch
+  (declining to the bf16 launch for a tail, raw rows or a shape the bf16
+  form would split), `resident_view` reports the packed bytes under the
+  tensor-core form so the head's prefetch window streams them, and
+  `bf12_lookup` no longer hides the companion from it. Test:
+  `mma_gemv_bf12_form_is_bitwise_the_bf16_form` (escapes, raw rows, a
+  partial block, k of one and five super-blocks, m 1–32, both outputs).
+  The L2 prefetcher's full form is 16 blocks with 8 loads in flight each
+  instead of 48 with 4: the same DRAM rate (232 GB/s cold) at the light
+  form's SM footprint — a gap-shaped latency chain beside it ran ×1.03
+  instead of ×1.21 — but `l2_prefetch_boundary_rate: full` still loses on
+  the fabric (C1 +1 % against light, +3 % with the old form): the
+  projections become L2-fed (B 107 → 92 µs a layer) while the gap kernels
+  that touch DRAM stretch (the mHC stream update ×1.7, the fold's write
+  kernel ×1.3–1.4, the router dots ×1.2–1.5). Light stays the default; the
+  full rate pays once the gap kernels stop touching DRAM.
+
+- **The one-sided collective transport for the decode step's folds
+  (`engine.collective_transport`), and what its numbers taught about the
+  step** (2026-10-19). The latency-class collectives — the decode graph's
+  recorded folds and the pick's stream collectives — travelled as payload
+  and doorbell SEND pairs that one block claimed through door cells, proved
+  by a hash pass, acked and credited: a chain of dependent system-memory
+  round trips on every rank. The write transport lays every row out as
+  512-byte self-describing chunks (31 lanes of bf16 and a trailer carrying
+  the chunk's hash and generation), RDMA-writes it into each peer's write
+  ring (a new slab region, exchange version 3; row (generation − 1) mod
+  kBusWriteRing, the ring's reuse guaranteed by the generations' order
+  rather than by credits), striped across both PCIe functions when the bus
+  has two lanes, and folds it with a grid whose warps each poll their own
+  chunks with every peer's copy in flight at once, prove each by its
+  trailer, fold in canonical rank order and write the result; each block
+  reports through its own pinned record and the engine posts on the full
+  set of ready records and completes on the full set of done records — no
+  door cells, claim rounds, acks, credits or atomics. The results are
+  bitwise the eager machine's (bus_test's graph, row and stream scenarios
+  run under both transports). The precondition probes that shaped it, on
+  this fabric: a GPU load of pinned memory costs 400 ns and 8+ blocks read
+  it near DRAM rate; DMA-BUF and peer-memory registration of device memory
+  are unsupported; the GPU cannot reach the NIC's PCIe BAR (a GPU-rung
+  doorbell is impossible here, and a GPU-built WQE rung by a CPU spinner is
+  2.5 µs slower than a plain post); NIC writes are atomic per 16-byte unit
+  but a 64-byte line's last unit can be visible before its first; the
+  fabric's one-way is 5.5 µs at 24 KiB, in situ as in isolation. The
+  mechanisms found while the kernel took five forms: GPU pollers slow a NIC
+  write's landing in proportion to their poll rate, not their bytes; beside
+  the L2 prefetch window a dependent global-memory round trip costs 1–8 µs,
+  so cross-block flags and per-chunk atomics straggle; one SM's in-flight
+  system loads cover a few GB/s at that latency, so one block is too few;
+  and the rows that land 18–23 µs after a rank's own row is staged are the
+  peers staging late — the ranks' arrival skew, not the wire. Per
+  collective at C1 (rank-0 medians, µs): send 64.2 = copy 5.1 + handshake
+  21.5 + skew 21.6 + fold 9.2; write 38.4 = 3.6 + 16.9 + 16.4 + 0.5. C1
+  code / prose / JSON (ms per pass at equal rows): 47.99 / 40.59 / 52.17 →
+  47.2 / 40.3 / 51.0 (decode 74.8 / 46.9 / 78.8 → 76.1 / 47.2 / 80.6
+  tok/s); C6 code (one repeat, 512 tokens): 170.96 → 165.32 ms/pass (121.2 → 125.3 tok/s), of which the lane striping is 1.1 ms; rank 0's collective there 267 → 198 µs, and 69 µs × 93 is the pass's gain — at six requests the collective is in the open. The pass gains less than the collective because the
+  boundary prefetch window drains under the fold by design and converts the
+  wait into DRAM time (window off: the collective 42 µs, the pass +1.9 ms),
+  so the step around the folds is bounded by DRAM bytes, and the
+  collective's remaining cost is the ranks' arrival skew (a quarter of the
+  generations wait under 20 µs, most 20–50, one in eight over 50). The bus
+  timeline now stamps each peer's row landing and first proof and the
+  engine's post mark from the kernel's clock (`scripts/bus_window_skew.py`
+  reads them); `DGPP_BUS_TIMELINE=1` as before.
+- **DeepSeek-V4.1 decode: the decode tail and the paired projection's
+  norms as one launch each** (2026-10-20). Behind the q projection the
+  walk ran five launches of 1–4 µs per layer (the q rope, the ring slot,
+  the window slot list, the entry position, the latent append into the
+  ring) and behind the paired q/kv projection three (the two norms, the kv
+  rope); `dsa_decode_tail_fp8block` and `csa2_norms_rope` run each set as
+  one block per row, element for element the kernels' own arithmetic in
+  the same order (the csa2 test holds both bitwise against the separate
+  launches; the append's body is the fp8-block kernel's, now a per-row
+  function). 1,753 → 1,524 kernels a pass; the projection segment 113 →
+  107 µs a layer. Four nodes, `timed_load` C1 (ms per pass / decode
+  tok/s): code 44.61 / 77.2 → 44.50 / 77.4, prose 37.86 / 50.3 → 37.73 /
+  50.4, JSON 48.35 / 86.5 → 48.03 / 87.0. The day's C1 at the lossless
+  formats, from the morning's 47.18 / 40.27 / 50.77: −5.7 / −6.3 / −5.4 %
+  per pass; a window-only layer 967 → 892 µs against a structural floor
+  near 800 (the MoE at the ceiling, the chain's gaps, the attention bytes
+  the L2 cannot hold ahead).
+- **DeepSeek-V4.1 decode: the per-layer instrument, programmatic launch
+  edges, the wo_b window and the paired projections** (2026-10-20). The
+  C1 pass is measured as a two-resource chain now — a per-layer
+  instrument over the node trace (segments A–H, each GEMV's achieved
+  GB/s cold or L2-fed, every window's overlap with every segment) decides
+  each change by where it moves the layer's time, not by the pass alone.
+  Three levers landed on it, every one exact: `engine.decode_pdl` (the
+  decode graph's kernel-to-kernel edges rewritten to programmatic
+  dependencies after capture for every kernel in our namespace; every
+  kernel in the tree waits first — `kernels/pdl.cuh`, held by the source
+  audit `tests/python/pdl_wait_audit.py`, after a first form that matched
+  kernels by name raced the Qwen and MiMo graphs through homonyms it had
+  not patched — 2,231 of 2,257 edges on the DeepSeek graph; 0.3–0.4 ms a
+  pass by an off/on/off/on A/B, kept on); a
+  wo_b-only prefetch window on the layers without an index source,
+  opened behind the q/kv projections at the light rate (wo_b 162 → 378
+  GB/s, the output projections 123 → 85 µs a layer; at the layer's start
+  it displaced wq_b from L2 and at the full rate its 48 blocks kept the
+  attention kernels off the SMs for 26 µs — both level passes, both
+  read off the instrument); and the two-segment form of the tensor-core
+  GEMV (`launch_mma_gemv_fp8_bf16_pair`: wq_a with wkv off the same
+  hidden, the two wo_a groups, one launch at the first segment's width
+  and split, each row's chain its single launch's — bitwise, the GEMV
+  test holds it against the two launches at 1–16 rows). Four nodes,
+  `timed_load` C1 (ms per pass / decode tok/s at equal rows): code 46.03
+  / 75.0 → 44.61 / 77.2, prose 39.05 / 48.7 → 37.86 / 50.3, JSON 49.68 /
+  83.5 → 48.35 / 86.5. A window-only layer: 932 → 887 µs. Measured and
+  not taken, on the same instrument: the attention-side window's budget
+  moved from wq_b to wo_a (wq_b cold +33 µs, wo_a's lines evicted before
+  the output projections), and the chunk GEMV core's loads double-buffered
+  (slower at every shape; the core's cost above four rows is its
+  activation staging, 80 KB a block at eight rows).
+- **DeepSeek-V4.1 sampled requests: greedy drafts and the block rule by
+  default; the screened draft head measured and declined** (2026-10-19).
+  `engine.mtp_draft auto` resolves to greedy for DeepSeek-V4.1-Flash as it
+  does for V4-Flash, and the family's templates set `engine.mtp_verify =
+  block`. Four nodes, C1 at temperature 1 (256 tokens × 3 per class, decode
+  tok/s code / prose / JSON): a draw from the DSpark block under the token
+  rule — the form `auto` had been resolving to — 60.1 / 39.2 / 78.4; the
+  draw under the block rule 57.9 / 37.4 / 79.8; the block's argmax under
+  the token rule 62.2 / 45.4 / 84.1; the argmax under the block rule 69.5 /
+  49.9 / 84.8; the template as shipped, re-measured, 66.3 / 49.7 / 81.7
+  (sampled runs vary a few percent). The draw loses twice: it accepts less (code 3.19 against the
+  argmax's 2.87 tokens per pass under the token rule looks better only
+  because its passes carry the whole block), and a sampled-draft slot
+  verifies the whole block every pass since the scheduled verify depth is
+  for greedy slots, so its passes cost 53 ms against 46 / 40 / 51; the
+  block rule on the argmax drafts then adds 10–12 % on code and prose
+  (the paper's 7–10 %), nothing on JSON. Both rules are exact for the
+  target distribution; greedy requests are untouched. Declined on the same
+  legs, at temperature 0: `engine.draft_head = screen` (the 2-bit rotated
+  head copy, 32 blocks of 128; 16 and 64 the same) — the pass is no cheaper
+  (46.4 ms against 46.0, the scan and the block scoring costing what the
+  1.42 ms full head did) and acceptance falls (code 3.45 → 3.23 tokens per
+  pass, prose 1.90 → 1.60, JSON 4.18 → 3.98), decode tok/s −6..−8 %; the
+  head stays exact. The acceptance per draft position at temperature 0, as
+  the retire lines log it: code 86 / 79 / 88 / 86 %, JSON 94 / 89 / 82 /
+  78 %, prose 63 / 46 / 24 / 67 %.
+- **DeepSeek-V4.1 decode: split-K on the narrow attention projections**
+  (2026-10-19). The decode walk's attention GEMVs ran unsplit (no
+  workspace passed), and the narrow ones under-fill the grid: in
+  isolation at four rows wkv (512 × 5120) streamed at 86 GB/s, a wo_a
+  group (1,024 × 4,096) at 136 and wq_a (1,280 × 5,120) at 161 against
+  the 233.6 GB/s ceiling (`micro_mma_gemv_shapes -d`, the new DeepSeek
+  shape set). With the layer's GEMM workspace the k range splits across
+  blocks: 157, 180 and 168 GB/s; wq_b, the indexer's wq_b and wo_b fill
+  the grid already and lose 2–15 % to the split's reduce, so they stay
+  unsplit. The C1 node trace placed the attention GEMVs at 244 µs a layer
+  against about 125 at the ceiling net of the prefetch windows' L2 hits
+  (the windows prefetch about 16 MB of a layer's 45 MB per rank — the L2's
+  capacity, not their rate — and are worth 2.1 ms a pass). Four nodes,
+  `timed_load` C1 (ms per pass / rows per pass / decode tok/s): code 47.18
+  / 3.59 / 76.1 → 45.97 / 3.45 / 75.0, prose 40.27 / 1.90 / 47.3 → 39.11 /
+  1.90 / 48.7, JSON 50.77 / 4.11 / 81.0 → 49.58 / 4.18 / 84.3. The split
+  chain is tolerance-equal to the unsplit one, not bitwise, so the greedy
+  transcripts on the fixed prompts shift: the code prompts lost a few
+  accepted draft rows and JSON gained some — the numeric path's effect on
+  near-ties, not a bias; the graph and eager engines agree as before.
+- **DeepSeek-V4.1 decode: the pipelined half-batches, tried and
+  discarded** (2026-10-19). A captured decode batch of two or more
+  requests walked as two request-aligned row halves on two streams a
+  half-layer apart — one half's MoE streaming the weights while the other
+  ran its attention, folds and small kernels — with the folds chained in
+  record order on every rank and, in its second form, a token that made
+  the halves' MoE phases alternate; the halves' MoE grids capped at 24
+  blocks (the overlap probe's threshold) and uncapped. Every batched gate
+  held against the eager transcripts; on four nodes the form lost at every
+  shape (`timed_load`, ms per pass): C2 code 72.2 → 81.4 free-running /
+  86.3 with the token, C6 code 166.0 → 176.5 / 182.8, C1 unchanged (one
+  request walks as one). The node traces give the mechanism: free-running,
+  the halves' MoE phases ran over each other (20 ms of an 88 ms pass) for
+  5 ms of the intended overlap; alternating, each half's attention chain —
+  every attention matrix read once per half, its latency kernels 1.25–1.4×
+  slower beside the other half's streaming (the probe: memory-latency
+  inflation, not SM starvation, so stream priorities change nothing) — is
+  longer than the half's MoE, and the pass becomes the sum of two stretched
+  chains; capping the MoE grids to leave SMs costs the chain 30 % of its
+  rate at 24 blocks (`moe_slot_bench`), which double-buffered strided
+  gate-up and down kernels did not recover; the collectives double. At C1 a
+  row split would fail by the same arithmetic with worse ratios. The code
+  is gone; two lessons it exposed stay in the bus test's harness note (a
+  CUDA event created in a rank worker beside a peer's spinning collective
+  kernel is a device-wide barrier, like a synchronous memcpy) and here
+  (halves staging different widths into one recorder buffer need regions
+  by the widest fold, not row × width).
+- **DeepSeek-V4.1 decode: the fused mHC site, the down kernel's tile
+  stealing, the flash window split beside the main source; the fold split
+  tried and discarded** (2026-10-19). The C1 pass's non-DRAM time, from the
+  node trace of `0d69d565` (three rows, about 850–920 µs a layer): two mHC
+  sites at three launches each (dots 8.5, finish 9.9, norm 7.3 µs), the
+  scalar window attention at eight splits (27–29 µs), the fp4 down
+  projection at 73 % of the read ceiling (840 tiles over the resident
+  blocks ran as whole rounds), and two collectives a layer (35 + 41 µs)
+  whose handshake and skew ran in the open. Shipped, each judged by the
+  trace: `Dsv41Model::mhc_site_fused` takes DeepSeek-V4's decode form (the
+  finish in the dots launch by tickets, the one-rounding norm, the comb on
+  a side stream joined at the stream update; a mixed decoder's rows keep
+  it) — a site is 12 µs on the critical path, 26 before;
+  `moe_slot_down_fp4_kernel` steals (slot, row tile) units from a counter
+  pair the last block resets, its grid the device's occupancy — 169 µs a
+  layer, 180 before; `engine.decode_window` (flash) runs the 128-key window
+  on `dsa_attn_listed`, split eight ways like the scalar form, on a side
+  stream beside the main source's kernel (the unsplit flash window walked
+  the eight tiles in one block at 36 µs; split, beside the 16 µs main
+  kernel). Tried and discarded with its numbers: the decode fold split
+  (each boundary's producer as two column halves, the first half's
+  all-reduce on a side stream under the second half, the bus walking up to
+  four generations in flight). Against the same build with it off, C1
+  ms/pass at equal rows: both sites +0.7 code / +1.6 prose / +1.1 JSON; the
+  MoE site alone +0.5 / +1.0 / +0.3. The bus timeline on four ranks says
+  why: the split adds 46 % more collectives (93 → 136 a window) and each
+  still pays its handshake and skew in full (23 + 21 µs; only the fold
+  shrinks, 9.0 → 5.8), while every collective's staging copy slows from
+  4.8 to 8.4 µs under the second half's DRAM traffic — the fixed cost of a
+  collective, not its fold, is what a split would have to hide, so the
+  lever is the handshake itself. The attention lever carried a
+  dependency of its own: the CSA2 layer's output window (wo_a + wo_b
+  prefetched under the attention) lost its cover when that phase shrank
+  to 12–20 µs, and the first output GEMV queued behind its own weights
+  (28.8 → 49.8 µs over 139 launches a pass, JSON +1.4 ms); a window-only
+  layer now opens no output window (the light rate spilled onto the GEMV,
+  the full rate slowed the attention's cache reads, the layer's start
+  slowed the projections — each measured), and
+  `engine.l2_prefetch_window_mib` governs this family's windows (18 MiB
+  pinned in the template, the best of 18/12/8/6). C1 (`timed_load`, three
+  repeats, ms per pass / decode tokens per pass / tok/s), the campaign's
+  `0d69d565` binary against this round's: code 46.80 / 3.11 / 66.5 →
+  47.93 / 3.59 / 74.9; prose 40.06 / 1.81 / 45.2 → 40.71 / 1.90 / 46.7;
+  JSON 51.95 / 4.11 / 79.2 → 51.75 / 4.11 / 79.5; C6 code 174.8 / 20.7 /
+  118.5 → 172.5 / 20.7 / 120.1; the quality set on the shipped binary
+  HumanEval 156/164, GSM8K 292/300 (three truncations), extraction
+  100/100 (the campaign binary: 157, 295, 100). The gates: every decode form bitwise run to run across request
+  slots (`dsv41_decode_forms_repeat_bitwise_across_slots`), dsv41 TP 19/19,
+  dsv41 model 6/6, the MoE kernels 101, the whole shared prefill binary
+  20/20 under its registered environment.
+- **Three defects the round's gates exposed, fixed** (2026-10-19). The flash
+  listed attention kernel bounded a list entry's block by the table's row
+  width; for the decode window's one-entry ring table that rejected every
+  request but slot 0, a zero-filled window per slot: `dsa_attn_listed(...,
+  blocks_total)` carries the pool's physical count and the CSA2 decode
+  window passes its ring regions. The fp8 streaming GEMM read a weight
+  scale past the ragged last column tile (its codes were guarded, the
+  scale row was not). And `WeightPrefetcher::add` bridged holes of up to
+  2 MiB between two allocations — that hole is unmapped, and the load-form
+  kernel faulted on it (the DeepSeek-V4 session gate's Xid 31, which a
+  kernel change elsewhere exposed by shifting the layout, and HEAD's draft
+  fault at the default dense GEMV threshold): a hole is bridged only inside
+  the pending range's allocation, the launcher clamps a range to its
+  allocation with one warning, DeepSeek-V4's fp8 draft head is an isolated
+  add. The benchmark rows of `0d69d565` are refreshed from the 2026-10-19
+  campaign (C1 44.8–78.1 tok/s, prefill 0.407 / 1.079 / 2.713 / 10.030 s,
+  quality 157/164, 295/300, 100/100).
+- **Decode: the fp4 MoE down projection in one pass per lane, and the
+  DeepSeek-V4.1 lm head's 12-bit companion** (2026-10-19). The 1017 decode
+  pass at C1 (46–47 ms wall, about three rows, a node trace): the expert
+  gate/up kernel at the DRAM read ceiling, the down kernel at 73 % of it
+  (its rows are K = 576 on four nodes, 18 chunks over two lanes, walked
+  in three passes of 4, 4 and 1), the dense GEMVs 12 ms, the 95
+  collectives 7.9 ms (copy 4.7 + handshake 17–22 + skew 19–22 + fold 9 µs
+  each), 1,013 kernels under 15 µs 5 ms. `fp4_gemv` now issues a short
+  row's chunks in one pass (K <= 1024, at most 9 chunks per lane — every
+  load in flight at once; the chain per row is the same: bitwise, the
+  fp4 and MoE pins green): the down kernel 188.6 → 178.8 µs per launch.
+  The lm head's bf12 companion, which `engine.bf16_weights: bf12` had
+  left inert for this family, is now packed after the load (one slot of
+  expansion scratch for the prefill head): the decode head GEMV reads 12
+  bits per weight, bitwise the bf16 head (the gate holds the prefill's
+  last row and four decode steps at rel l2 0 against the checkpoint
+  residency). Together the C1 pass 47.0 → 46.7 ms; the head's own A/B is
+  level within noise (its GEMVs 12.35 → 11.87 ms per pass, the read
+  already partly under the prefetch windows). Measured and excluded for
+  the collective's jitter, with the bus timeline on every rank: CPU idle
+  states capped at 100 µs (level: the bus spins), GPU clocks locked at
+  2500 and 3000 MHz (level: the step is DRAM-bound), the L2 prefetcher off
+  (skew unchanged; the prefetcher pays 50 µs per generation); inline
+  doorbells were already granted. What remains of the collective is
+  protocol latency — the propagation and claim rounds — a bus project.
+- **DeepSeek-V4.1 prefill: the Engram folds by row block** (2026-10-19).
+  The two Engram layers' folds of (hc + 1) x hidden per row — 210 MB per
+  4,096-row chunk, 31 ms each over the wire — were the overlap walk's last
+  synchronous folds. The projection now runs per row block, block A's
+  fold under block B's projection, block B's under A's gate and attention
+  (the previous layer's pending MoE fold lands under the projections, so
+  the reducer holds one fold at a time); A's gate reads A's streams, B's
+  gate follows its fold before B's attention site. The rows are the same
+  rows: bitwise the one-block form (the overlap gates now count 36
+  asynchronous folds per walk, 32 before). Measured on the 1017 template
+  on four nodes: cold prefill 0.413 / 1.066 / 2.717 / 10.033 s at 512 /
+  2K / 8K / 32K tokens against 0.421 / 1.097 / 2.771 / 10.174 (the same
+  prompts), 3,170 tok/s at 32K.
+- **DeepSeek-V4.1 prefill: the Engram rows staged a chunk ahead, and the
+  overlap's folds begun behind events** (2026-10-18; the staging under
+  `engine.ngram_prestage`, which now covers the Engram tables too). The
+  32K prefill's main stream had 2.2 s of gaps in a 10.9 s walk after the
+  attention kernels landed: 1.4 s were 110–160 ms stalls per 4,096-token
+  chunk at the first Engram layer — the mmap'ed tables' gather, forked at
+  the walk's start and joined at layer 1, storage-bound at 16 threads with
+  page hints already — and the rest were folds longer than the work under
+  them. `Dsv41EngramLayer::prestage` (Qwen's PLE form): the next chunk's
+  ids hashed on the device from its host ids behind the current chunk's
+  last `max_ngram - 1` tokens, one synthetic span on a private pad
+  context, and the rows gathered on the side stream into a second channel
+  while this chunk's layers run; the next `stage()` with the matching
+  (host ids, rows, first position, slot, first and last token) takes them,
+  and the last Engram table's embed issues the next prestage once its
+  conversion consumed the channel. `prefill_batch` names a lone prompt's
+  chunk by the prompt's own pointer and predicts its successor at the
+  tick's budget: the scheduler's only prefill path never set `next_ids`
+  before, so no family's chunk-ahead staging could claim under it (Qwen's
+  still requires a span-less run, a follow-up). `BoundaryReducer::
+  begin_async_after(event)` folds behind the rows' producers' event
+  instead of a stream drain; the overlap walk records an event after each
+  block's producers, enqueues the other block's work first, and defers
+  block B's MoE fold begin into the next layer behind its block-A site and
+  attention — bitwise, the overlap gates unchanged. `dsv41_tp_test` gains
+  the prestage gate (a 701-row prompt in 256-row chunks on the cursor
+  advance and on the scheduler's batch walk: two prestages claimed, logits
+  and decode steps bitwise the sequential staging). Measured on the 1017
+  template on four nodes: cold prefill 0.421 / 1.097 / 2.771 / 10.174 s at
+  512 / 2K / 8K / 32K tokens against 0.418 / 1.097 / 2.801 / 10.623 before
+  (the same prompts; −4 % at 32K), 3,130 tok/s at 32K; the profiled 32K
+  walk's main-stream gaps 2.2 → 1.4 s, the stalls over 10 ms 1.41 → 0.56 s
+  (one first-chunk gather of 90 ms, then the Engram folds at 31 ms each,
+  not yet overlapped). Left in the ledger: the Engram folds (0.5 s), the
+  MoE fold of block A under too little work (0.45 s), the attention fold
+  of block B (0.29 s).
+- **DSA/CSA2 flash attention: the listed kernel at the byte floor, and the
+  DeepSeek-V4.1 prefill window on it** (2026-10-18; `engine.prefill_window`,
+  default `flash`). `attn_flash_kernel` (`dsa.cu`: GLM-5.3's DSA and
+  DeepSeek-V4.1's CSA2, listed and dense) was the largest kernel of a 32K
+  DeepSeek-V4.1-Flash-1017 prefill, 5,406 launches at 646 µs at about
+  3 TFLOP/s and 50 GB/s. Nsight Compute on an isolated bench at the 1017
+  geometry showed 196 registers and 87 KB of shared memory holding one
+  block per SM, two warps per scheduler issuing once per 4.8 cycles and
+  22 of 32 lanes active. Three changes, each bitwise (the bench's
+  partial-output checksums identical at four shapes): the listed addresses
+  resolved once per 512-token round into shared memory instead of three
+  dependent loads per thread per row (750 → 630 µs on the bench); the
+  e2m1 decode as a nibble table instead of a switch that diverged a warp
+  eight ways per element, 64 elements per thread per tile (→ 300 µs; every
+  fp4 cache and the host reference decode through it); and two blocks per
+  SM with the Q~ fragments in registers, the exchange sized by the tile
+  and the fetch in four passes (→ 206 µs, 183 GB/s of the 234 GB/s read
+  ceiling) — for the listed rope-less widths, which fit the two-block
+  register budget without spilling; the 512 + 64 tail's kernel (GLM-5.3's
+  DSA, DeepSeek-V4) and the dense tile keep one block: compiled to two
+  they spilled, and that build faulted DeepSeek-V4's mixed walk in the
+  shared prefill test (the whole binary, never a filtered run) while every
+  one-block or spill-free build ran clean. The prefill's window
+  source then moved from the scalar partial kernel (287 µs per 128-row
+  tile, 12 % of the walk) onto the same listed kernel — the window scratch
+  is a one-block cache and the slot lists are per-row selections — under
+  `engine.prefill_window` (`flash` | `scalar`): its scores sum in the mma's
+  fragment order, so the model test's decode audit walks the scalar form
+  and a new gate holds the flash form within a flip's move of it; decode's
+  split window and the draft block keep the scalar kernel. Measured on the
+  1017 template on four nodes: cold prefill 0.418 / 1.097 / 2.801 / 10.623 s
+  at 512 / 2K / 8K / 32K tokens against 0.464 / 1.324 / 3.699 / 14.234
+  before (the same prompts; −10 / −17 / −24 / −25 %), 3,000 tok/s at 32K;
+  in the profiled 32K walk the listed kernel runs at 193 µs per launch
+  (was 646) and the window at 68 (was 287); decode level.
+- **DeepSeek-V4.1 prefill: the boundary folds under the other row block's
+  compute** (2026-10-18; `engine.prefill_fold_overlap`, default `true`).
+  The bulk folds were about 14 % of a 32K prefill, wire-bound at the port
+  and the GPU idle through each. A prefill walk of 512 rows or more on a
+  multi-rank world now runs each layer as two row blocks, the boundary a
+  row of the request's block grid nearest the middle (the DeepSeek-V4
+  walk's form): the attention per block, block A's fold under block B's
+  attention, block B's under A's stream update, mHC site and router, the
+  expert chain over every row, the accumulation per block under A's MoE
+  fold, and block B's MoE fold under the next layer's block A. An Engram
+  layer and a DSpark target layer land the pending fold first (their gate
+  and stream mean read every row); under the bounded prefill the encoder
+  layers overlap and the decoder's prologue lands the pending fold before
+  it publishes. Bitwise the one-block walk: the attention takes the second
+  block as it takes any chunk (its selection state at its own row base, as
+  a span's), and the MoE's phased form runs the same kernels per row.
+  `dsv41_tp_test` gates the exact and the bounded walk, a group of three
+  spans cut inside the second, and a loopback world of 2 through the bus's
+  asynchronous bulk folds against the one-block walk (the logits and the
+  decode steps behind the prefill bitwise). Measured on the 1017 template
+  on four nodes: cold prefill 0.464 / 1.324 / 3.699 / 14.234 s at 512 /
+  2K / 8K / 32K tokens against 0.480 / 1.415 / 4.045 / 15.328 before (the
+  same prompts; −3 / −6 / −9 / −7 %), 2,240 tok/s at 32K; a matched probe
+  of one prompt set five times, the key on against off on one binary:
+  −4.3 / −5.0 / −6.4 % per token at 512 / 2K / 8K, and decode level (code
+  48.0 against 47.6 ms per pass, prose 41.7 against 41.6).
+- **DeepSeek-V4.1 prefill: the dense projections on the fp8-weight tile
+  GEMM** (2026-10-18; `engine.prefill_dense`, default `tile`). The
+  family's dense projections took the streaming decode GEMM at every row
+  count — its rows are bitwise the row alone, which the batched decode
+  needs — so a prompt's 4096-row chunks re-read each fp8 weight once per
+  128 rows: 7,562 launches at 108 µs in one 32K prefill, 18 % of it, about
+  25 TFLOP/s. The prefill walk now runs every dense projection (the CSA2
+  layer's, the Engram projection, the draft's main projection) on the
+  fp8-weight tile GEMM (`fp8w_gemm.hpp`), which gains the family's 32 x 32
+  e8m0 scale grid (`rs` / `cs` per launch: the per-weight form reads each
+  weight's own block; the per-group form keeps the 128 grid). The tile
+  form places the same bf16(e4m3 x scale) weights and accumulates in fp32
+  in another order (within 3.4e-6 of the streaming form on the kernel
+  test, every reference-parity gate green), so a walk takes one form for
+  all its rows and a prefill row's value never depends on the chunk cut;
+  decode rows keep the streaming form. The model test gates the two forms
+  against each other and audits the decode path against the streaming
+  prefill. Measured on the 1017 template on four nodes, both lanes: cold
+  prefill 0.480 / 1.415 / 4.045 / 15.328 s at 512 / 2K / 8K / 32K tokens
+  against 0.514 / 1.572 / 4.715 / 17.916 (−7 / −10 / −14 / −14 %), 2,080
+  tok/s at 32K; decode untouched.
+- **Both ConnectX-7 port functions as bus lanes on the four-node fabric**
+  (2026-10-18; a site setting, `DGPP_ROCE_DEVICES="rocep1s0f0
+  roceP2p1s0f0"` with `DGPP_ROCE_GID_INDICES="3 3"` per node). The port
+  shows up as two verbs devices, one per PCIe x4 function, over the one
+  cable; the bus already stripes its bulk class across the configured
+  lanes and keeps the decode class on the first, and the site had named
+  one. On DeepSeek-V4.1-Flash-1017 with the same binary, cold prefill
+  0.514 / 1.572 / 4.715 / 17.916 s at 512 / 2K / 8K / 32K tokens against
+  0.523 / 1.619 / 5.152 / 19.591 on one lane (−8.5 % at 8K and 32K),
+  decode unchanged. `docs/networking.md` carries the setting.
+- **DeepSeek-V4.1 prefill: the indexer's scan fused on the fp8 tensor
+  cores** (2026-10-18). On every index-source layer a prefill chunk scores
+  each query against every visible compressed entry. The chain did it as
+  a cuBLASLt fp8 GEMM into a [rows × 32 heads, entries] fp32 dot buffer, a
+  fold kernel over that buffer and the selection kernels — and the buffer
+  (`kDotBudget`, 64 MB) held only four query rows at 128K entries, so a
+  4096-row chunk ran a thousand tiles, each re-reading the whole key set
+  and writing and re-reading 64 MB: a chunk's cost grew with the square of
+  its position and the prefill's per-token cost went 0.62 ms at 32K to 3.7
+  ms at 512K (1,947 s for a 512K prompt). `csa2_score_prefill` replaces
+  the GEMM and the fold: one query row's 32 heads against 128 entries per
+  CTA on mma.m16n8k32 e4m3 → fp32, the heads folded in the fragments (the
+  same (w_folded · k_scale) · relu(dot) terms, summed in the decode
+  scorer's tree order; the selection kernels unchanged over the per-row
+  logits), no dot buffer, the logits tile sized by the old budget so a row
+  tile reads the keys once for as many rows as fit (128 at 128K entries,
+  from L2). On the microbench the scorer runs 31 TFLOP/s — 35 µs per query
+  row at 128K entries, 2.5 µs at 8K — against the GEMM chain's byte-bound
+  tiles; it still sits a third of the way to the mma.sync rate (the key
+  staging is synchronous), the next pass. Checked against the host oracle
+  within the prefill logits kernel's tolerance with the plain, candidate
+  and restricted selections over its logits equal to the oracle's; every
+  dsv41 parity gate passes. The 1017 rows in `docs/benchmarks.md` predate
+  this change; the next campaign re-measures them.
+- **DeepSeek-V4.1 decode: the L2 prefetch windows, and the verify
+  schedule's measured cost model** (2026-10-18). The `deepseek_v41` walk
+  was the one decode family without the weight prefetcher's windows
+  (`kernels/l2_prefetch.hpp`; `engine.l2_prefetch*`): it now opens them
+  where every other family does — the MoE site's replicated bytes and the
+  shared expert before the attention fold, the next layer's attention
+  side (the Engram projection on an Engram layer, the head behind the
+  last layer) before the MoE fold, an Engram layer's own attention side
+  under its fold, and the output projections under the selection and the
+  attention inside the CSA2 layer (`Csa2Layer::set_prefetcher`) — nothing
+  the model reads is written, so the walk is bit-identical with it on or
+  off. On the 1017 template at one request, against the same binary with
+  the prefetcher off, the pass shortens 3.4–9.4 % by class (prose 45.1 →
+  40.9 ms, code 53.3 → 49.9, JSON 56.1 → 52.7, math 52.7 → 49.4, chat
+  47.2 → 43.5), every transcript identical. The template also carries the
+  verify schedule's measured cost model: fixed-depth sweeps put every class
+  on 31.1 ms + 5.17 ms per verify row (residual ≤ 0.25 ms; the draft
+  itself 5.1 ms), so `engine.mtp_schedule_row_ms` 5.2 and
+  `engine.mtp_schedule_base_ms` 31.1 replace the 8 / 28 defaults, which
+  priced a row 55 % too high; at one request the depth choice is level
+  with the old model (±2 % by class). The 1017 rows in `docs/benchmarks.md`
+  predate both levers; the next campaign re-measures them.
+- **DeepSeek-V4.1-Flash-1017, and the indexer budget as deployment keys**
+  (2026-10-18). The 1017 refinement (`deepseek-ai/DeepSeek-V4.1-Flash-1017`)
+  ships V4.1-Flash's config, tokenizer and tensor layout byte for byte with
+  every shard's weights re-trained; the `deepseek_v41` family serves it as
+  shipped from `deploy/cluster_deepseek-v4.1-flash-1017_mxfp4-fp8_w4.example.json`.
+  Three engine keys replace the checkpoint's indexer budget for a
+  deployment — `engine.index_topk` (the compressed entries a query attends
+  per layer; the release's 512, the select networks' 2048), `engine.candidate_topk_blocks`
+  and `engine.candidate_block_size` (the candidate pool's shape, 2048 × 8 as
+  shipped) — carried by the config digest and the settings record, refused
+  by every other family. Measured on the 1017 template on four nodes at
+  2048 against the checkpoint's 512 on the same binary: short-context
+  decode level, decode at 32K–512K of context 3–8 % slower per pass, cold
+  prefill 9 % (2K) to 48 % (32K) longer, quality unchanged — the template
+  ships 512 and carries the key; the 512 row set is in `docs/benchmarks.md`,
+  both budgets in the model card. The CSA2 selectors now serve 2048 (the prefill
+  rows select on a 4096-key tile; the decode radix select has no tile),
+  checked against the host oracles at the widened budget. The resident
+  image cache keeps a weight-identity note beside each image: its key reads
+  config.json and the shard headers, which 1017 re-ships byte for byte, so a
+  boot of 1017 beside a V4.1-Flash image would have restored the old
+  weights; an image without the note adopts the checkpoint it opens with, an
+  image whose note disagrees is discarded and rebuilt.
+- **The benchmark method of record, and one command per deployment**
+  (2026-10-18). `docs/benchmarks.md` now defines what a deployment's row
+  set contains, the validity checks and how results are reported: decode
+  and prefill as independent attributes, decode tokens/s by concurrency
+  (the engine's decode steps only) as the throughput figure, cold prefill
+  in seconds, the wall rate (prefill and queueing included) only as the
+  labelled service-level table — the C2/C4/C8 columns had reported wall
+  rates alone since the original campaign while every run recorded the
+  decode rate. The serving table's concurrency columns are now the decode
+  rate with cold prefill beside it, and the wall rates sit in a table of
+  their own; rows measured earlier read — at C2–C8 until re-measured (the
+  earlier raw records are gone). `scripts/serve_campaign.py run --config <template>` runs the
+  whole set for one template and `rows` prints the doc's cells.
+  `timed_load.py` prints the decode-only
+  per-class table before `serve_load.py`'s wall table. `AGENTS.md` carries
+  the rules.
+- **The fp8 K/V pool on every Qwen3.5 release, and the Qwen3.8-27B FP8
+  templates take it with the fp8 attention** (2026-10-18). `engine.kv_dtype:
+  "fp8"` needed a release that ships its `kv_cache_scheme` scales (the
+  mixed NVFP4 release); every Full layer now carries scale words in its
+  image — the shipped ones where the release has them, unit scales
+  otherwise (the FP8 release and the MTP draft layer: the codes are the
+  e4m3 rounding of K and V, the common scale-free fp8 cache), so the pool
+  and `engine.prefill_attention: "fp8"` are accepted on the FP8 release
+  and alongside `engine.mtp`. Gated on one Spark against the bf16 cache:
+  the teacher-forced probe at 127/128 top-1 with a mean KL of 0.005 nats
+  in both fp8 modes (the mixed release's calibrated scales read 0.015 and
+  0.039), needles 20/20 at 32K/128K and 5/5 at 258K, the 300-item evals
+  161/294/100 on the bf16 cache, the same on the pool, 159/295/100 with
+  the fp8 attention. Cold prefill 387 → 320 s at 258K and decode at 256K
+  216 → 181 ms a pass. The three FP8 templates set both keys with their
+  pools re-sized for the halved cache (one Spark 786,432 tokens with a
+  20 GiB arena, two and four Sparks one full context per slot under full
+  admission with 24 and 48 GiB; plans 100.2 / 101.9 / 92.2 GiB, 7.9 /
+  9.3 / 20.6 GiB left at listening, no swap). The forward test runs its
+  rows invariance under the fp8 pool on the FP8 fixture too.
+- **The dense W4A4 TMA GEMM's pipeline drain** (2026-10-17). The Qwen3.8-27B
+  NVFP4 MLP's TMA-staged form (2026-10-16) waited for its per-row scale
+  words with `cp.async.wait_group 1` at every k-step, which is right while a
+  newer group is still being committed and wrong at the last step, whose own
+  group is then the most recent: the final k-block could be scaled with
+  words that had not landed. Intermittent (4 of 49 launches at the gate
+  shape, 2 of 19 at 2,048 rows), and the reason the NVFP4 27B's
+  temperature-0 transcripts moved run to run under `prefill_activations:
+  "native"` while the FP8 release's reproduced exactly (bisected across the
+  fp8 pool, the fp8 attention and the native recipe, then kernel by kernel
+  at the model's shapes). The drain now waits for everything;
+  `moe_w4a4_test` launches the form forty times at the gate shape and
+  requires every output bitwise the grouped kernel's.
 - **Prepare generation requests outside the HTTP loop** ([#122](https://github.com/HawkBearPig/dgpp/issues/122)).
   One persistent worker per configured engine slot handles JSON validation,
   rendering, tokenization and image preparation. Ready requests proceed in
@@ -59,7 +1006,8 @@ project procedures and design guidance live in `docs/`.
   2,097,152 (one per slot, full admission) with 32 GiB on four; NVFP4
   1,048,576 (four) with 16 GiB on one, 2,097,152 with 32 GiB on two and
   four; the YaRN templates 1,130,496 (two full-length streams) with 16 GiB
-  and 1,048,576 with 20 GiB — plans of 73 to 104 GiB, each verified with
+  and 1,048,576 with 20 GiB — plans of 74 to 105 GiB including the
+  replicated BF16 image tower (1.17 GiB a rank), each verified with
   `--memory-plan` and a boot whose ledger leaves at least 5 GiB at
   listening: the boots end 6–8 GiB below the plan at world 1 (4.4 at two,
   2 at four; a 786,432-token FP8 pool planned at 109 GiB swapped), which
@@ -428,6 +1376,30 @@ project procedures and design guidance live in `docs/`.
   `benchmarks/results/` are no longer tracked. The measured
   latency/throughput tradeoffs are in
   [PR #112](https://github.com/HawkBearPig/dgpp/pull/112).
+
+- **Qwen3.5-122B-A10B-NVFP4: MoE support** (2026-10-07/08):
+  the `nvidia/Qwen3.5-122B-A10B-NVFP4` release serves on the `qwen3_5`
+  family (`qwen3_5_moe_text`): 48 layers (36 GDN + 12 Full, 3072 hidden),
+  256 experts top-8 + gated shared expert per layer. ModelOpt NVFP4 for
+  the routed experts only (U8 pairs + F8-E4M3 group-16 scales +
+  `weight_scale_2` stored reciprocal, kernels divide once), BF16 rest;
+  the declared FP8 `kv_cache_scheme` scales are absent and templates use BF16 KV.
+  `config35` reads the ModelOpt `config_groups` (`Linear` match-all +
+  glob `ignore`), `binding35`/`loader35` carry the MoE table (Router
+  replicates; experts/shared slice), the model rides `QwenMoeLayer`
+  (decode fast path + device prefill, per-layer graph route tables).
+  The MTP draft ships per-expert BF16:
+  `engine.mtp_expert_format=bf16` (qwen3_5-MoE-only) encodes it to block
+  FP8 at load (proposals-only loss, exact verify); without the key the
+  draft is refused by name. Templates
+  `cluster_qwen3.5-122b-a10b_nvfp4_w{1,2,4}` select MTP depth 2;
+  plain decode is `--no-mtp`. The separate DFlash v1 checkpoint supports
+  eager and captured block proposals, including multiple request slots
+  and tensor-parallel worlds. Its full 16-row block has independent KV
+  reservation from the capped verify depth. The model's existing FP8 KV,
+  image-input and shared-prefill interfaces are retained.
+  Serving throughput remains unmeasured under the current benchmark
+  protocol; no performance comparison is claimed for these templates.
 - **Qwen3.8-27B NVFP4: fp4w prefill GEMM** (2026-10-06):
   `launch_fp4w_gemm_*` (new): `fp8w_gemm`'s 128x128x64 tiles and
   three-stage pipeline with an e2m1 W-side (8 payload bytes + the
@@ -1288,10 +2260,7 @@ project procedures and design guidance live in `docs/`.
   them; bitwise (the long-prompt sha on every leg; an in-situ self-check,
   `DGPP_QWEN_PLE_PRESTAGE_CHECK=1`, gathers both channels and compares
   them; `DGPP_QWEN_PLE_PRESTAGE=0` keeps the one channel). The round also
-  served the author's vLLM stack on the same box for a kernel-level
-  comparison (their expert GEMM 1.8x ours per token, their fp8 dense GEMMs
-  and bf16 partials; our attention, indexer, hyper-connection glue and
-  n-gram path level or ahead) and left two opt-in forms: the expert GEMM
+  left two opt-in forms: the expert GEMM
   with its weight fragments decoded in registers and three pipeline stages
   (`DGPP_PACKQ_GEMM=wide3`, bitwise, level), the gate and up projections
   as one launch (`DGPP_MOE_PACKQ_PAIR=1`, bitwise, level) and the down

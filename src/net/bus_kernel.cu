@@ -1,4 +1,5 @@
 #include "net/bus_kernel.hpp"
+#include "kernels/pdl.cuh"
 
 #include <cooperative_groups.h>
 #include <cuda/atomic>
@@ -522,6 +523,7 @@ __device__ inline void block_fold_vectors_staged(
 // deadline converge on the shared stop flag first.
 __global__ __launch_bounds__(kConsumerThreads) void bus_consumer_kernel(
     BusRecvView v, uint64_t deadline_cycles) {
+  dgpp_pdl_wait();
   __shared__ uint32_t s_last_seen[kBusMaxConsumerCells];
   __shared__ uint64_t s_hash[kConsumerThreads / 32];  // per-warp fold partials
   __shared__ uint32_t s_seq;
@@ -624,6 +626,7 @@ __global__ __launch_bounds__(kConsumerThreads) void bus_allreduce_kernel(
     BusAllReduceView v, int my_rank, const __nv_bfloat16* src,
     __nv_bfloat16* dst, uint32_t elems, uint32_t ctl_seq,
     BusAllReduceCtl* ctl, uint64_t deadline_cycles) {
+  dgpp_pdl_wait();
   using BlockRef = cuda::atomic_ref<int, cuda::thread_scope_block>;
   using SysRef = cuda::atomic_ref<uint64_t, cuda::thread_scope_system>;
 
@@ -888,6 +891,7 @@ __global__ __launch_bounds__(Threads) void bus_allreduce_graph_kernel(
     BusAllReduceGraphView v, int my_rank, const __nv_bfloat16* src,
     __nv_bfloat16* dst, uint32_t elems, BusAllReduceCtl* ctl,
     uint64_t deadline_cycles, uint32_t stage_words) {
+  dgpp_pdl_wait();
   // stage_words: u64 words of dynamic shared memory per peer
   // (kBusMaxPeers slots) that a claimed payload is copied into by its
   // gate's hash pass; 0 = no staging (the fold reads the NIC-placed rows).
@@ -1333,6 +1337,272 @@ cudaError_t launch_bus_allreduce_graph(const BusAllReduceGraphView& v,
   return cudaGetLastError();
 }
 
+
+// ---- the one-sided latency transport (2026-10-19) ---------------------------
+// See bus_kernel.hpp (launch_bus_allreduce_write) and bus_types.hpp ("The
+// write ring"). The grid's warps own chunks; nothing on a warp's path
+// waits on another block or on a global word (beside the L2 prefetch
+// window a dependent round trip costs 1-8 us, measured 2026-10-19), and
+// no single SM is asked to carry the row's loads alone (at that latency
+// one SM's in-flight loads cover a few GB/s).
+
+namespace {
+
+constexpr int kWriteThreads = 32 * static_cast<int>(kBusWriteWarpsPerBlock);
+constexpr uint32_t kWritePollSleepNs = 400;  // between a warp's polls (the poll RATE is what slows the NIC's landing)
+
+// A data lane's two words mixed with their positions (the positional fold
+// of bus_fold64, per lane): XOR-combined over the warp, order-free.
+__device__ __forceinline__ uint64_t write_lane_mix(const uint4& v, uint32_t lane) {
+  const uint64_t w0 = static_cast<uint64_t>(v.x) | (static_cast<uint64_t>(v.y) << 32);
+  const uint64_t w1 = static_cast<uint64_t>(v.z) | (static_cast<uint64_t>(v.w) << 32);
+  return ((w0 + 2 * lane + 1) * kFoldMultiplier) ^ ((w1 + 2 * lane + 2) * kFoldMultiplier);
+}
+
+__device__ __forceinline__ uint64_t warp_xor_u64(uint64_t h) {
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1) h ^= __shfl_xor_sync(0xffffffffu, h, o);
+  return h;
+}
+
+__device__ __forceinline__ uint64_t write_chunk_hash_dev(uint64_t lanes_xor, uint32_t gen, uint32_t chunk) {
+  return lanes_xor ^ (((static_cast<uint64_t>(gen) << 32) | chunk) * kFoldMultiplier);
+}
+
+// A data lane's 16 bytes of chunk `chunk` from an `elems`-long bf16 vector
+// (zero past the end; lane 31 — the trailer lane — reads nothing).
+__device__ __forceinline__ uint4 write_load_lane(const uint16_t* src, uint32_t elems, uint32_t chunk,
+                                                 uint32_t lane, bool vec) {
+  const uint32_t e0 = chunk * kBusWriteChunkElems + lane * 8;
+  if (lane >= kBusWriteDataLanes || e0 >= elems) return make_uint4(0, 0, 0, 0);
+  if (vec && e0 + 8 <= elems) return reinterpret_cast<const uint4*>(src)[e0 / 8];
+  uint32_t w[4] = {0, 0, 0, 0};
+  for (uint32_t i = 0; i < 8 && e0 + i < elems; ++i)
+    w[i / 2] |= static_cast<uint32_t>(src[e0 + i]) << (16 * (i & 1));
+  return make_uint4(w[0], w[1], w[2], w[3]);
+}
+
+__device__ __forceinline__ void write_store_lane(uint16_t* dst, uint32_t elems, uint32_t chunk,
+                                                 uint32_t lane, bool vec, const uint4& v) {
+  const uint32_t e0 = chunk * kBusWriteChunkElems + lane * 8;
+  if (lane >= kBusWriteDataLanes || e0 >= elems) return;
+  if (vec && e0 + 8 <= elems) {
+    reinterpret_cast<uint4*>(dst)[e0 / 8] = v;
+    return;
+  }
+  const uint32_t w[4] = {v.x, v.y, v.z, v.w};
+  for (uint32_t i = 0; i < 8 && e0 + i < elems; ++i)
+    dst[e0 + i] = static_cast<uint16_t>(w[i / 2] >> (16 * (i & 1)));
+}
+
+// A chunk as read: 2 = proven (its trailer carries (gen, chunk) and the
+// data lanes fold to its hash), 1 = the trailer is here but the data is
+// not yet (a torn read: the timeline's "gate waits"), 0 = not landed.
+__device__ __forceinline__ int write_chunk_state(const uint4& val, uint32_t lane, uint32_t gen, uint32_t c) {
+  const uint64_t h = write_chunk_hash_dev(
+      warp_xor_u64(lane < kBusWriteDataLanes ? write_lane_mix(val, lane) : 0), gen, c);
+  const uint32_t t_lo = __shfl_sync(0xffffffffu, val.x, kBusWriteDataLanes);
+  const uint32_t t_hi = __shfl_sync(0xffffffffu, val.y, kBusWriteDataLanes);
+  const uint32_t t_gen = __shfl_sync(0xffffffffu, val.z, kBusWriteDataLanes);
+  const uint32_t t_chunk = __shfl_sync(0xffffffffu, val.w, kBusWriteDataLanes);
+  if (t_gen != gen || t_chunk != c) return 0;
+  return ((static_cast<uint64_t>(t_hi) << 32) | t_lo) == h ? 2 : 1;
+}
+
+template <int Threads>
+__global__ __launch_bounds__(Threads) void bus_allreduce_write_kernel(
+    BusAllReduceGraphView v, int my_rank, const __nv_bfloat16* src_bf, __nv_bfloat16* dst_bf,
+    uint32_t elems, BusAllReduceCtl* cell, BusWriteBlockRecord* recs, uint64_t deadline_cycles) {
+  dgpp_pdl_wait();
+  constexpr int kWarps = Threads / 32;
+  using SysRef = cuda::atomic_ref<uint64_t, cuda::thread_scope_system>;
+  __shared__ uint32_t s_gen;
+  __shared__ int s_peer_done[kBusMaxPeers];  // chunks of this block proved per peer
+  __shared__ int s_abort;
+  __shared__ unsigned s_gate_waits, s_gate_spins;
+  const int warp = threadIdx.x / 32;
+  const uint32_t lane = threadIdx.x & 31;
+  const uint32_t gwarp = blockIdx.x * kWarps + warp;
+  const uint32_t nwarps = gridDim.x * kWarps;
+  const uint16_t* src = reinterpret_cast<const uint16_t*>(src_bf);
+  uint16_t* dst = reinterpret_cast<uint16_t*>(dst_bf);
+  const uint32_t chunks = (elems + kBusWriteChunkElems - 1) / kBusWriteChunkElems;
+  const bool vec = aligned16(src) && aligned16(dst);
+  const int world = v.send_peers + 1;
+  const int lanes = v.lanes_per_peer;
+  // This block's chunks: c = gwarp + k * nwarps over its warps.
+  int block_chunks = 0;
+  for (int w = 0; w < kWarps; ++w) {
+    const uint32_t g = blockIdx.x * kWarps + w;
+    if (g < chunks) block_chunks += static_cast<int>((chunks - 1 - g) / nwarps) + 1;
+  }
+  if (threadIdx.x == 0) {
+    SysRef gen_ref(cell->gen_seq);
+    s_gen = static_cast<uint32_t>(gen_ref.load(cuda::memory_order_acquire));
+    for (int p = 0; p < static_cast<int>(kBusMaxPeers); ++p) s_peer_done[p] = 0;
+    s_abort = 0;
+    s_gate_waits = 0;
+    s_gate_spins = 0;
+    if (blockIdx.x == 0) cell->gt_start = globaltimer_ns();
+  }
+  __syncthreads();
+  const uint32_t gen = s_gen;
+  const uint32_t row = (gen - 1) % kBusWriteRing;
+  const uint64_t start = clock64();
+
+  // Phase 1 — my chunks into the generation's staging row; one fence per
+  // block, then the block's ready bit (the engine posts on the full mask).
+  uint8_t* stage = reinterpret_cast<uint8_t*>(v.stage_row_base) +
+                   static_cast<size_t>(row) * v.stage_row_bytes;
+  for (uint32_t c = gwarp; c < chunks; c += nwarps) {
+    uint4 val = write_load_lane(src, elems, c, lane, vec);
+    const uint64_t h = write_chunk_hash_dev(
+        warp_xor_u64(lane < kBusWriteDataLanes ? write_lane_mix(val, lane) : 0), gen, c);
+    if (lane == kBusWriteDataLanes)
+      val = make_uint4(static_cast<uint32_t>(h), static_cast<uint32_t>(h >> 32), gen, c);
+    reinterpret_cast<uint4*>(stage + static_cast<size_t>(c) * kBusWriteChunkBytes)[lane] = val;
+  }
+  __threadfence_system();
+  __syncthreads();
+  BusWriteBlockRecord& rec = recs[blockIdx.x];
+  if (threadIdx.x == 0) {
+    rec.gt_stage = globaltimer_ns();
+    cuda::atomic_ref<uint32_t, cuda::thread_scope_system> ready(rec.ready);
+    ready.store(gen, cuda::memory_order_release);
+  }
+
+  // Phase 2 — my chunks: every peer's copy polled in flight, proven by
+  // its trailer, folded in rank order, stored. The gentle cadence keeps the
+  // grid's poll rate off the NIC's landing.
+  auto abort_check = [&](uint32_t spin, uint32_t every_mask) -> bool {
+    if ((spin & every_mask) != every_mask) return false;
+    int abort = 0;
+    if (lane == 0) {
+      abort = *reinterpret_cast<volatile int*>(&s_abort);
+      if (abort == 0 && (clock64() - start > deadline_cycles ||
+                         sys_load_u64(&cell->done_seq) == gen)) {
+        abort = 1;
+        *reinterpret_cast<volatile int*>(&s_abort) = 1;
+      }
+    }
+    return __shfl_sync(0xffffffffu, abort, 0) != 0;
+  };
+  bool failed = false;
+  for (uint32_t c = gwarp; c < chunks && !failed; c += nwarps) {
+    const int cl = bus_write_lane_of(chunks, lanes, c);
+    uint4 in[kBusMaxPeers];
+    const uint4* ptrs[kBusMaxPeers];
+    bool proven[kBusMaxPeers];
+    for (int p = 0; p < static_cast<int>(kBusMaxPeers); ++p) {
+      ptrs[p] = nullptr;
+      proven[p] = p >= v.send_peers;
+      if (p >= v.send_peers) continue;
+      const BusRecvView& rv = v.recv[p * lanes + cl];
+      ptrs[p] = reinterpret_cast<const uint4*>(rv.write_ring + static_cast<size_t>(row) * rv.write_row_bytes +
+                                               static_cast<size_t>(c) * kBusWriteChunkBytes) +
+                lane;
+    }
+    const uint4 mine = write_load_lane(src, elems, c, lane, vec);
+    for (uint32_t spin = 0;; ++spin) {
+      for (int p = 0; p < static_cast<int>(kBusMaxPeers); ++p)
+        if (!proven[p]) in[p] = sys_load_u128(ptrs[p]);
+      bool all = true;
+      bool torn = false;
+      for (int p = 0; p < static_cast<int>(kBusMaxPeers); ++p) {
+        if (proven[p]) continue;
+        const int state = write_chunk_state(in[p], lane, gen, c);
+        if (state == 1) torn = true;
+        if (state == 2) {
+          proven[p] = true;
+          if (lane == 0) {
+            const int before = atomicAdd(&s_peer_done[p], 1);
+            if (before == 0 && blockIdx.x == 0 && spin > 0) {
+              // The row landed while this grid watched: the first proof of
+              // block 0 approximates the landing (instrumentation).
+              cell->gt_landed[p] = globaltimer_ns();
+            }
+            if (before == block_chunks - 1) rec.gt_peer[p] = globaltimer_ns();  // this block's last chunk of p
+          }
+        } else {
+          all = false;
+        }
+      }
+      if (all) break;
+      if (torn && lane == 0) {
+        atomicAdd(&s_gate_waits, 1u);
+        atomicAdd(&s_gate_spins, 1u);
+      }
+      if (abort_check(spin, 15u)) {
+        failed = true;
+        break;
+      }
+      __nanosleep(kWritePollSleepNs);
+    }
+    if (failed) break;
+    float acc[8];
+#pragma unroll
+    for (int e = 0; e < 8; ++e) acc[e] = 0.0f;
+    for (int r = 0; r < world; ++r) {
+      const uint4 val = r == my_rank ? mine : in[r < my_rank ? r : r - 1];
+      if (lane < kBusWriteDataLanes) {
+        const uint32_t w[4] = {val.x, val.y, val.z, val.w};
+#pragma unroll
+        for (int e = 0; e < 8; ++e)
+          acc[e] += bf16_to_f32(static_cast<uint16_t>((e & 1) ? (w[e >> 1] >> 16) : (w[e >> 1] & 0xFFFFu)));
+      }
+    }
+    uint4 out;
+    uint32_t o[4];
+#pragma unroll
+    for (int q = 0; q < 4; ++q) {
+      const __nv_bfloat16 lo = __float2bfloat16(acc[2 * q]);
+      const __nv_bfloat16 hi = __float2bfloat16(acc[2 * q + 1]);
+      o[q] = static_cast<uint32_t>(*reinterpret_cast<const uint16_t*>(&lo)) |
+             (static_cast<uint32_t>(*reinterpret_cast<const uint16_t*>(&hi)) << 16);
+    }
+    out.x = o[0]; out.y = o[1]; out.z = o[2]; out.w = o[3];
+    write_store_lane(dst, elems, c, lane, vec, out);
+  }
+  if (failed && lane == 0) *reinterpret_cast<volatile int*>(&s_abort) = 1;
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    if (s_gate_waits != 0) {
+      atomicAdd_system(&cell->dbg_gate_waits, s_gate_waits);
+      atomicAdd_system(&cell->dbg_gate_spins, s_gate_spins);
+    }
+    rec.status = s_abort != 0 ? 1u : 0u;
+    rec.gt_done = globaltimer_ns();
+    __threadfence_system();
+    cuda::atomic_ref<uint32_t, cuda::thread_scope_system> done(rec.done);
+    done.store(gen, cuda::memory_order_release);
+  }
+}
+
+}  // namespace
+
+cudaError_t launch_bus_allreduce_write(const BusAllReduceGraphView& v, int my_rank,
+                                       const __nv_bfloat16* src, __nv_bfloat16* dst,
+                                       uint32_t elems, BusAllReduceCtl* cell,
+                                       BusWriteBlockRecord* recs, uint64_t deadline_cycles,
+                                       cudaStream_t stream) {
+  const uint32_t blocks = bus_write_blocks(bus_write_chunks(elems));
+  bus_allreduce_write_kernel<kWriteThreads><<<blocks, kWriteThreads, 0, stream>>>(
+      v, my_rank, src, dst, elems, cell, recs, deadline_cycles);
+  return cudaGetLastError();
+}
+
+uint64_t bus_write_chunk_hash(uint32_t gen, uint32_t chunk, const void* lanes496) {
+  const uint8_t* b = static_cast<const uint8_t*>(lanes496);
+  uint64_t h = 0;
+  for (uint32_t lane = 0; lane < kBusWriteDataLanes; ++lane) {
+    uint64_t w0 = 0, w1 = 0;
+    std::memcpy(&w0, b + lane * 16, 8);
+    std::memcpy(&w1, b + lane * 16 + 8, 8);
+    h ^= ((w0 + 2 * lane + 1) * kFoldMultiplier) ^ ((w1 + 2 * lane + 2) * kFoldMultiplier);
+  }
+  return h ^ (((static_cast<uint64_t>(gen) << 32) | chunk) * kFoldMultiplier);
+}
+
 // ---- segment-quantized bulk collective (DESIGN §6.3, prefill class) ----
 
 namespace {
@@ -1514,6 +1784,7 @@ __global__ __launch_bounds__(kConsumerThreads) void bus_bulk_collective_kernel(
     const __nv_bfloat16* src_bf, __nv_bfloat16* dst_bf, BusBulkSegPlan plan,
     uint64_t* staged_counters, uint64_t* staged_hashes, uint32_t ctl_seq,
     BusAllReduceCtl* ctl, uint64_t deadline_cycles, BusBulkScratch* sc) {
+  dgpp_pdl_wait();
   using BlockRef = cuda::atomic_ref<int, cuda::thread_scope_block>;
   using SysRef = cuda::atomic_ref<uint64_t, cuda::thread_scope_system>;
   namespace cg = cooperative_groups;
@@ -2267,6 +2538,7 @@ namespace {
 
 __global__ __launch_bounds__(kConsumerThreads) void bus_warm_work_kernel(
     float* buf, int spins) {
+  dgpp_pdl_wait();
   float acc = static_cast<float>(threadIdx.x) * 1e-6f;
   for (int i = 0; i < spins; ++i) acc = acc * 1.0001f + 0.001f;
   buf[threadIdx.x] = acc;
@@ -2280,6 +2552,7 @@ cudaError_t launch_bus_warm_work(cudaStream_t stream, float* buf, int spins) {
 }
 
 __global__ void bus_globaltimer_stamp_kernel(uint64_t* out) {
+  dgpp_pdl_wait();
   *out = globaltimer_ns();
 }
 
@@ -2332,6 +2605,7 @@ cudaError_t bus_preload_kernels() {
       reinterpret_cast<const void*>(bus_allreduce_graph_kernel<256, false>),
       reinterpret_cast<const void*>(bus_allreduce_graph_kernel<512, false>),
       reinterpret_cast<const void*>(bus_allreduce_graph_kernel<1024, false>),
+      reinterpret_cast<const void*>(bus_allreduce_write_kernel<kWriteThreads>),
       reinterpret_cast<const void*>(bus_bulk_collective_kernel),
       reinterpret_cast<const void*>(bus_warm_work_kernel),
       reinterpret_cast<const void*>(bus_globaltimer_stamp_kernel),

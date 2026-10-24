@@ -22,6 +22,8 @@
 #include "models/qwen/binding.hpp"
 #include "models/qwen/config.hpp"
 
+#include "qwen_csf_fixture.hpp"
+
 namespace qwenfx {
 
 namespace fs = std::filesystem;
@@ -154,6 +156,27 @@ inline const char* tiny_qad_quant_json() {
     return q;
   }();
   return s.c_str();
+}
+
+inline const char* tiny_fp4local_quant_json() {
+  static const std::string json = [] {
+    std::string q = tiny_qad_quant_json();
+    const std::string from = ".mlp.experts\": {\"quant_algo\": \"NVFP4\", \"group_size\": 16}";
+    size_t pos = 0;
+    while ((pos = q.find(from, pos)) != std::string::npos) {
+      const std::string to = from.substr(0, from.size() - 1) + ", \"weight_scale_encoding\": \"csf\"}";
+      q.replace(pos, from.size(), to);
+      pos += to.size();
+    }
+    return q;
+  }();
+  return json.c_str();
+}
+
+inline QwenTextConfig tiny_fp4local_config() {
+  const auto t = dgpp::minijson::parse(tiny_qad_text_json());
+  const auto q = dgpp::minijson::parse(tiny_fp4local_quant_json());
+  return QwenTextConfig::parse(t.root, &q.root);
 }
 
 inline QwenTextConfig tiny_config() {
@@ -297,6 +320,7 @@ inline void write_fixture(const QwenTextConfig& cfg, const std::string& dir,
 // FP8 release's (the default), the NVFP4 release's, or the AutoRound hybrid's.
 inline void write_fixture_for(const QwenTextConfig& cfg, const std::string& dir) {
   if (cfg.experts_gptq_int4) write_fixture(cfg, dir, tiny_gptq_text_json(), tiny_gptq_quant_json(), {});
+  else if (cfg.experts_nvfp4_csf) write_fixture(cfg, dir, tiny_qad_text_json(), tiny_fp4local_quant_json(), {});
   else if (cfg.dense_mxfp8_shipped) write_fixture(cfg, dir, tiny_qad_text_json(), tiny_qad_quant_json(), {});
   else if (cfg.experts_nvfp4) write_fixture(cfg, dir, tiny_text_json(), tiny_nvfp4_quant_json(), {});
   else write_fixture(cfg, dir, tiny_text_json(), tiny_quant_json(), {});
@@ -311,6 +335,8 @@ inline void write_fixture_for(const QwenTextConfig& cfg, const std::string& dir)
 inline QwenTextConfig test_config() {
   const char* g = std::getenv("DGPP_TEST_QWEN_GPTQ");
   if (g != nullptr && g[0] == '1') return tiny_gptq_config();
+  const char* c = std::getenv("DGPP_TEST_QWEN_FP4LOCAL");
+  if (c != nullptr && c[0] == '1') return tiny_fp4local_config();
   const char* q = std::getenv("DGPP_TEST_QWEN_QAD");
   if (q != nullptr && q[0] == '1') return tiny_qad_config();
   const char* n = std::getenv("DGPP_TEST_QWEN_NVFP4");
@@ -336,28 +362,60 @@ inline void write_fixture(const QwenTextConfig& cfg, const std::string& dir,
     std::fwrite(json.data(), 1, json.size(), f);
     std::fclose(f);
   }
-  auto table = dgpp::qwen_expected_text_tensors(cfg);
+  auto plain_cfg = cfg;
+  plain_cfg.experts_nvfp4_csf = plain_cfg.mtp_experts_nvfp4_csf = false;
+  auto table = dgpp::qwen_expected_text_tensors(plain_cfg);
   table.insert(table.end(), extra_tensors.begin(), extra_tensors.end());
   std::string header = "{";
   std::vector<uint8_t> data;
   size_t off = 0;
-  for (const auto& e : table) {
-    const auto b = tensor_bytes(cfg, e);
+  std::string index = "{\"weight_map\":{";
+  const bool nested = cfg.experts_nvfp4_csf || cfg.mtp_experts_nvfp4_csf;
+  auto append = [&](const QwenExpectedTensor& e, const std::vector<uint8_t>& b) {
     std::string shape = "[";
     for (size_t i = 0; i < e.shape.size(); ++i) {
       if (i) shape += ",";
       shape += std::to_string(e.shape[i]);
     }
     shape += "]";
-    if (off) header += ",";
+    if (header.size() > 1) { header += ","; index += ","; }
+    index += "\"" + e.name + "\":\"tensors/model.safetensors\"";
     header += "\"" + e.name + "\":{\"dtype\":\"" + std::string(dgpp::dtype_name(e.dtype)) +
               "\",\"shape\":" + shape + ",\"data_offsets\":[" + std::to_string(off) + "," +
               std::to_string(off + b.size()) + "]}";
     data.insert(data.end(), b.begin(), b.end());
     off += b.size();
+  };
+  for (const auto& e : table) {
+    const auto b = tensor_bytes(plain_cfg, e);
+    if (e.role == QwenTensorRole::Fp4Scale &&
+        (e.layer == cfg.mtp_layer() ? cfg.mtp_experts_nvfp4_csf : cfg.experts_nvfp4_csf)) {
+      std::vector<uint8_t> fixed;
+      std::vector<uint32_t> exceptions;
+      encode_csf(b, e.shape[0], e.shape[1], fixed, exceptions);
+      auto side = e;
+      side.name += ".nvfp4_csf_fixed";
+      side.dtype = dgpp::DType::U8;
+      side.shape = {e.shape[0] / 16, 16 * (1 + e.shape[1] / 2)};
+      append(side, fixed);
+      side.name = e.name + ".nvfp4_csf_exceptions";
+      side.dtype = dgpp::DType::U32;
+      side.shape = {static_cast<int64_t>(exceptions.size())};
+      std::vector<uint8_t> bytes(exceptions.size() * 4);
+      if (!bytes.empty()) std::memcpy(bytes.data(), exceptions.data(), bytes.size());
+      append(side, bytes);
+    } else append(e, b);
   }
   header += "}";
-  const fs::path shard = root / "model.safetensors";
+  if (nested) {
+    fs::create_directories(root / "tensors");
+    index += "}}";
+    std::FILE* f = std::fopen((root / "model.safetensors.index.json").c_str(), "wb");
+    if (!f) throw std::runtime_error("cannot write index");
+    std::fwrite(index.data(), 1, index.size(), f);
+    std::fclose(f);
+  }
+  const fs::path shard = root / (nested ? "tensors/model.safetensors" : "model.safetensors");
   std::FILE* f = std::fopen(shard.c_str(), "wb");
   if (!f) throw std::runtime_error("cannot write shard");
   const uint64_t hlen = header.size();

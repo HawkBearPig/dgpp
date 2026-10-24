@@ -1,4 +1,5 @@
 #include "kernels/packq_a8_gemv.hpp"
+#include "kernels/pdl.cuh"
 
 #include <stdexcept>
 
@@ -13,6 +14,7 @@ __global__ void packq_a8_gemv_kernel(const int8_t* __restrict__ codes, size_t co
                                      const float* __restrict__ scales, size_t scale_stride,
                                      const uint8_t* __restrict__ w, const uint16_t* __restrict__ wscales,
                                      OutT* __restrict__ out, size_t out_stride, int n) {
+  dgpp_pdl_wait();
   extern __shared__ __align__(16) uint8_t smem[];
   packq_a8::stage_activations<kRows>(reinterpret_cast<const uint8_t*>(codes), code_stride, scales, scale_stride, K,
                                      smem);

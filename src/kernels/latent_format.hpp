@@ -132,19 +132,15 @@ DGPP_HD inline float e8m0_byte_to_float(uint8_t b) {
 // nibble of a byte is the even element. Encode is round-to-nearest-even on
 // that grid, saturating; NaN saturates too (no NaN code exists).
 DGPP_HD inline float fp4_e2m1_bits_to_float(uint8_t v) {
-  const uint32_t m = v & 7u;
-  float mag;
-  switch (m) {
-    case 0: mag = 0.0f; break;
-    case 1: mag = 0.5f; break;
-    case 2: mag = 1.0f; break;
-    case 3: mag = 1.5f; break;
-    case 4: mag = 2.0f; break;
-    case 5: mag = 3.0f; break;
-    case 6: mag = 4.0f; break;
-    default: mag = 6.0f; break;
-  }
-  return (v & 8u) ? -mag : mag;
+  // The eight magnitudes as twice their value, one nibble each (code 7
+  // first): a shift, a mask, an exact halving and the sign bit — no
+  // branch. The switch this replaces (2026-10-18) diverged a warp up to
+  // eight ways per element in the attention's row decode, 64 elements per
+  // thread per tile, and was the listed kernel's largest instruction
+  // stream; the values are bitwise the same.
+  const uint32_t mag2 = (0xC8643210u >> (4u * (v & 7u))) & 0xFu;
+  const float mag = static_cast<float>(mag2) * 0.5f;
+  return std::bit_cast<float>(std::bit_cast<uint32_t>(mag) | ((static_cast<uint32_t>(v) & 8u) << 28));
 }
 
 DGPP_HD inline uint8_t float_to_fp4_e2m1_bits(float f) {

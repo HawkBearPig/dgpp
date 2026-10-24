@@ -25,6 +25,8 @@ enum class DType : int {
   U8,
   I8,        // signed bytes (DeepSeek-V4.1's packed e2m1 expert nibbles)
   F8_E8M0,   // unsigned power-of-two scales, 2^(byte - 127) (MXFP4 / block-fp8 scales)
+  U32,       // index/value records (ModelOpt NVFP4 CSF exception tables)
+  I16,       // the EXL3 trellis words (exllamav3's int16 tiles)
 };
 
 constexpr size_t dtype_size(DType t) {
@@ -38,6 +40,8 @@ constexpr size_t dtype_size(DType t) {
     case DType::U8: return 1;
     case DType::I8: return 1;
     case DType::F8_E8M0: return 1;
+    case DType::U32: return 4;
+    case DType::I16: return 2;
   }
   return 0;
 }
@@ -53,6 +57,8 @@ constexpr std::string_view dtype_name(DType t) {
     case DType::U8: return "U8";
     case DType::I8: return "I8";
     case DType::F8_E8M0: return "F8_E8M0";
+    case DType::U32: return "U32";
+    case DType::I16: return "I16";
   }
   return "?";
 }
@@ -67,6 +73,8 @@ inline std::optional<DType> dtype_from_string(std::string_view s) {
   if (s == "U8" || s == "BOOL") return DType::U8;
   if (s == "I8") return DType::I8;
   if (s == "F8_E8M0") return DType::F8_E8M0;
+  if (s == "U32") return DType::U32;
+  if (s == "I16") return DType::I16;
   return std::nullopt;
 }
 

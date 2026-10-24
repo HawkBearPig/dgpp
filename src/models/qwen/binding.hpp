@@ -131,6 +131,7 @@ struct QwenBindReport {
   size_t unexpected = 0;  // present, not in the table, not vision
   size_t out_of_scope = 0;  // layers past a truncated config (the check apps' --layers)
   size_t vision = 0;      // model.visual.* (counted, not validated)
+  size_t csf_sidecars = 0;  // ModelOpt NVFP4 CSF scale sidecars (counted, expanded at load)
   size_t quantized_matrices = 0;
   size_t ngram_shards = 0;
   std::vector<std::string> errors;

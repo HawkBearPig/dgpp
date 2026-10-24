@@ -1,5 +1,12 @@
 # DGPP implementation status
 
+HTTP framing validates complete decimal request lengths and matching repeated
+fields before dispatch. Host regressions cover malformed/overflowing lengths,
+keep-alive compatibility, canonical handler-visible headers, connection closure
+and generic replies for exceptions escaping HTTP dispatch. Parser refusals and
+handler exceptions preserve earlier pipelined replies under backpressure; closure
+and disconnect notification wait for queued output to drain.
+
 JSON masking has a default-off `DGPP_JSON_FREE_STRING_MASK` build option for
 free value strings in mixed-constraint schemas. It reuses existing table masks
 and suffix simulation; active constraints remain on the vocabulary trie.
@@ -44,7 +51,26 @@ This page summarizes the implemented features and remaining work as of
 [serving measurements](docs/benchmarks.md) summarize performance. Performance figures apply to the configurations and
 revisions recorded with them.
 
+## Checkpoint reader
+
+Safetensors metadata is checked before exposing mapped tensor views, including
+header length, integer dimensions/offsets, range order and shape/dtype byte size.
+Native unit tests cover rejected metadata and scalar, empty, padded-header and
+dtype-alias compatibility. Global tensor overlap/coverage validation remains
+outside this reader change.
+Resident-image metadata validation rejects offsets inside the header/table,
+unaligned offsets, overflowing ranges and truncated blobs before restoration.
+Payload verification is enabled by default with an explicit environment opt-out.
+Rejected layers rebuild from their checkpoint, with native metadata/policy tests
+and GPU recovery coverage for both resident loader implementations.
+
 ## Serving support
+
+Host sampling automatically omits neutral penalty preparation using the
+effective request parameters. Deployment defaults and request overrides
+are covered by config, sampler, HTTP and journal regressions, including
+greedy penalties without logprobs. This is a host-work reduction; serving
+throughput gains require deployment measurements.
 
 The mixed `unsloth/Qwen3.8-27B-NVFP4` checkpoint runs at TP 1/2/4
 with the shipped DFlash2 recipes. Its dense FP4 prefill kernel reuses
@@ -98,6 +124,7 @@ operations to its peers. Every rank checks the operation-stream digest.
 | GLM-5.3 (full) | MLA with decoupled RoPE and per-token DSA selection shared across layers, int4/int8 pack-quantized experts and attention, draft-layer requantization, graph decode, prefix cache and MTP | Four nodes at 99.3 GiB of weights per rank (48K bf16 / 96K fp8 latent cache at four slots); served 2026-09-12: T=1 51 ms/step, MTP 68–76 ms/pass at 1.8–2.0 tokens/pass, gsm8k 59/60, HumanEval 40/40. Batched decode up to sixteen rows (eight request slots at MTP depth 1, five at depth 2; the select in row groups of eight); packed experts and attention use tensor-core prefill from 128 rows; shorter prompts retain GEMV to preserve measured C1/MTP behavior |
 | DeepSeek-V4.1-Flash | CED encoder/decoder, CSA2 sliding-window + compressed-KV attention with a two-level indexer, single-pass hyper-connections, Engram n-gram tables mapped from NVMe, the DSpark block draft (five drafts per pass), the MXFP4/FP8 checkpoint as shipped, graph decode, prefix cache and a bounded (SWA-replay) prefill | Four nodes at 72.94 GiB of weights per rank (128K context at two slots); served 2026-09-14: 76 ms/pass at 2.33 tokens/pass (32.5 ms/token), bounded prefill 1.6–2.4 ms/token, gsm8k 60/60, HumanEval 40/40, extract 30/30. `engine.prefill` chooses bounded (the default) or the exact 40-layer parity mode. Prefix caching is whole-block, so prompts shorter than 128 tokens are not cached yet |
 | MiMo-V2.6-Flash | Hybrid sliding-window (128, sink-biased) / global GQA attention over 192/128-wide heads with partial RoPE, the fused pre-sharded fp8 qkv projection read in the checkpoint's chunk layout, MXFP4 routed experts without a shared expert, BF16 o_proj / head / eh_proj as 12-bit companions, one MTP draft layer, a per-layer-width paged K/V pool in BF16 or the fp8 row form, graph decode and prefix cache | Served 2026-09-22 on four nodes (50.06 GiB per rank at 128K: C1 71.0–84.4 tok/s at 23 ms/pass, cold prefill 1.83 / 7.42 / 36.6 s at 2K / 8K / 32K, HumanEval 151/164, GSM8K 294/300, extraction 100/100) and two nodes (97.2 GiB per rank with a 256K fp8 pool: C1 42–48 tok/s). The vision and audio encoders are not served; the sliding-window layers keep their full history in the paged cache (a 128-token ring is the recorded memory lever); the one-split prefill attention is the recorded prefill lever past 8K |
+| Flint | Hybrid sliding-window (513, sink-biased, full-head RoPE) / full-attention (no RoPE) GQA over 128-wide heads with per-head q / k norms, BF16 projections and MLPs in their 12-bit decode form, the routed experts in the export's per-projection FP8 / NVFP4 formats (one decode kernel per pair form), the ungated BF16 shared expert, graph decode and the prefix cache | No draft head: the family serves at T=1 only. One, two or four nodes (the kv heads divide the world). See [the Flint plan](docs/flint_plan.md). |
 | DeepSeek-V4-Flash | 128-token sliding-window attention over one shared 512-wide latent with ratio-4 (64-head indexer, 512 entries per query) and ratio-128 compressed caches, two-pass hyper-connections over four streams, token-table routing on layers 0–2, MXFP4 routed experts with an FP8 shared expert, the DSpark block draft, graph decode, prefix cache, chunk-invariant prefill | Two or four nodes at the full 1M-token context (95.4 / 63.0 GiB per rank). The templates schedule the verify depth over the five-draft block; sampled requests draft greedily (`engine.mtp_draft`) and follow the schedule. Text only. |
 
 World size comes from the configuration's node list. A single-node graph
@@ -164,6 +191,10 @@ Their implementation and evaluation records are maintained separately:
   the hybrid SWA/GA attention with sinks, the pre-sharded fused projection,
   the MXFP4/fp8 checkpoint as shipped, the fp8 K/V form, the fixture
   ladder, the two defects met only on the real checkpoint.
+- [Flint architecture and port](docs/flint_plan.md): the sink-attention
+  kernels generalized to 128-wide heads with q / k norms and full-head RoPE,
+  the MoE executor's per-projection FP8 / NVFP4 form, the one-rounding norm,
+  the three-stage o200k tokenizer, the fixture ladder and the campaign.
 
 ## Qwen NVFP4 expert prefill
 

@@ -26,6 +26,7 @@
 #include "models/qwen/vision_config.hpp"
 
 namespace dgpp {
+struct TensorInfo;
 class QwenVisionEncoder {
  public:
   QwenVisionEncoder(const QwenVisionConfig& config, const std::string& checkpoint,
@@ -52,4 +53,19 @@ class QwenVisionEncoder {
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };
+
+// Load-time widening of a quantized vision linear to BF16 (vision.cpp):
+// MXFP8 e4m3 x 2^(scale-127) is exact; NVFP4 e2m1 x e4m3-group x global
+// rounds once (RNE). Both refuse malformed geometry and NaN codes by
+// tensor name (std::runtime_error).
+std::vector<uint16_t> qwen_vision_widen_mxfp8(const std::string& name, const uint8_t* weight,
+                                              size_t wbytes, const uint8_t* scale, size_t sbytes,
+                                              int64_t rows, int64_t cols);
+std::vector<uint16_t> qwen_vision_dequant_nvfp4(const std::string& name, const uint8_t* weight,
+                                               size_t wbytes, const uint8_t* scale, size_t sbytes,
+                                               float global, int64_t rows, int64_t cols);
+// Validate checkpoint layout before interpreting quantized bytes. The global
+// scale is required only for NVFP4; MXFP8 carries its scales in the grid.
+std::vector<uint16_t> qwen_vision_widen_linear(const TensorInfo& weight, const TensorInfo& scale,
+                                             const TensorInfo* global, int64_t rows, int64_t cols);
 }  // namespace dgpp

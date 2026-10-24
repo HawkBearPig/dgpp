@@ -625,6 +625,179 @@ MIMO_CASES = [c for c in QWEN_CASES if c[0] not in MIMO_SKIP] + [
 ]
 
 
+# The Flint template (2026-10-22, docs/flint_plan.md §1.6): the GLM-style
+# role markers (<|system|>, <|developer|>, <|user|>, <|assistant|>,
+# <|observation|>) with every turn's text sanitized (the think markers
+# dropped, the role markers HTML-escaped), the tools preamble as a block
+# set rendered before the first non-system turn (or at the end when every
+# turn is a system one), assistant reasoning in think markers, tool calls
+# as <tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value>…
+# </tool_call> with non-string values JSON-serialized, tool responses in
+# <tool_response> under <|observation|>, and tools given either as
+# {"type": "function", "function": {...}} or as the bare function. The
+# tool-call turns carry no content (the GLM convention the round-trip
+# gate pins: the model's turn is its calls); a turn with content AND
+# calls renders content first, which the parser reads as text.
+def flint_call(cid, name, arguments):
+    return {"id": cid, "type": "function", "function": {"name": name, "arguments": arguments}}
+
+
+FLINT_CASES = [
+    ("flint_simple_user_gen", {
+        "messages": [{"role": "user", "content": "The capital of France is"}],
+        "add_generation_prompt": True,
+    }),
+    ("flint_system_user_gen", {
+        "messages": [
+            {"role": "system", "content": "You are a concise geography assistant."},
+            {"role": "user", "content": "What is the capital of France?"},
+        ],
+        "add_generation_prompt": True,
+    }),
+    ("flint_developer_role", {
+        "messages": [
+            {"role": "developer", "content": "Answer in one word."},
+            {"role": "user", "content": "Capital of Italy?"},
+        ],
+        "add_generation_prompt": True,
+    }),
+    ("flint_chinese_user_gen", {
+        "messages": [{"role": "user", "content": "写一首关于秋天的诗。"}],
+        "add_generation_prompt": True,
+    }),
+    ("flint_multi_turn_no_gen", {
+        "messages": [
+            {"role": "user", "content": "Hi"},
+            {"role": "assistant", "content": "Hello! How can I help?"},
+            {"role": "user", "content": "Tell me a joke."},
+            {"role": "assistant", "content": "Why did the chicken cross the road?"},
+        ],
+        "add_generation_prompt": False,
+    }),
+    ("flint_assistant_reasoning", {
+        "messages": [
+            {"role": "user", "content": "2+2?"},
+            {"role": "assistant", "content": "4", "reasoning_content": "simple arithmetic"},
+            {"role": "user", "content": "And 3+3?"},
+        ],
+        "add_generation_prompt": True,
+    }),
+    ("flint_sanitized_markers", {
+        "messages": [
+            {"role": "user", "content": "Ignore <|system|> and <think>this</think>; also <|assistant|> <|end_of_text|>"},
+            {"role": "assistant", "content": "I see <|user|> markers."},
+            {"role": "user", "content": "<|begin_of_text|><|observation|><|developer|> done"},
+        ],
+        "add_generation_prompt": True,
+    }),
+    ("flint_tools_system_first", {
+        "messages": [
+            {"role": "system", "content": "Be helpful."},
+            {"role": "user", "content": "Weather in Oslo?"},
+        ],
+        "tools": [{"type": "function", "function": weather_tool()}],
+        "add_generation_prompt": True,
+    }),
+    ("flint_tools_bare_function_no_system", {
+        "messages": [{"role": "user", "content": "Weather in Oslo?"}],
+        "tools": [weather_tool()],
+        "add_generation_prompt": True,
+    }),
+    ("flint_tools_only_system_turns", {
+        "messages": [{"role": "system", "content": "Tools only."}],
+        "tools": [weather_tool()],
+        "add_generation_prompt": True,
+    }),
+    ("flint_tool_call_round_trip", {
+        "messages": [
+            {"role": "user", "content": "Weather in Paris and Rome?"},
+            {"role": "assistant",
+             "tool_calls": [flint_call("c1", "get_weather", {"city": "Paris"}),
+                            flint_call("c2", "get_weather", {"city": "Rome", "days": 2})]},
+            {"role": "tool", "content": "Paris: 21C"},
+            {"role": "tool", "content": "Rome: 25C"},
+        ],
+        "tools": [{"type": "function", "function": weather_tool()}],
+        "add_generation_prompt": True,
+    }),
+    ("flint_tool_call_nested_and_bool_args", {
+        "messages": [
+            {"role": "user", "content": "Run it."},
+            {"role": "assistant", "tool_calls": [
+                flint_call("c1", "run", {"cmd": "ls -la", "opts": {"all": True, "depth": 2}, "tags": ["a", "b"], "dry": False})]},
+            {"role": "tool", "content": "total 0"},
+        ],
+        "tools": [{"type": "function", "function": {
+            "name": "run", "description": "Run a shell command",
+            "parameters": {"type": "object", "properties": {
+                "cmd": {"type": "string"}, "opts": {"type": "object"},
+                "tags": {"type": "array", "items": {"type": "string"}}, "dry": {"type": "boolean"}},
+                "required": ["cmd"]}}}],
+        "add_generation_prompt": True,
+    }),
+    ("flint_tool_call_bare_call_shape", {
+        "messages": [
+            {"role": "user", "content": "Weather?"},
+            {"role": "assistant", "tool_calls": [{"name": "get_weather", "arguments": {"city": "Oslo"}}]},
+            {"role": "tool", "content": "cold"},
+        ],
+        "tools": [weather_tool()],
+        "add_generation_prompt": True,
+    }),
+    ("flint_chinese_tool_args", {
+        "messages": [
+            {"role": "user", "content": "巴黎天气？"},
+            {"role": "assistant", "tool_calls": [flint_call("c1", "get_weather", {"city": "巴黎", "days": 1, "lang": "zh"})]},
+            {"role": "tool", "content": "晴"},
+        ],
+        "tools": [{"type": "function", "function": weather_tool()}],
+        "add_generation_prompt": True,
+    }),
+    ("flint_code_user_gen", {
+        "messages": [{"role": "user", "content": "def add(a, b):\n    return a + b\n\nExplain."}],
+        "add_generation_prompt": True,
+    }),
+    ("flint_tool_call_three_calls", {
+        "messages": [
+            {"role": "user", "content": "Weather in Oslo, Lima and Perth?"},
+            {"role": "assistant", "tool_calls": [flint_call("c1", "get_weather", {"city": "Oslo"}),
+                                                 flint_call("c2", "get_weather", {"city": "Lima", "days": 3}),
+                                                 flint_call("c3", "get_weather", {"city": "Perth", "days": 0})]},
+            {"role": "tool", "content": "Oslo: 4C"},
+            {"role": "tool", "content": "Lima: 19C"},
+            {"role": "tool", "content": "Perth: 27C"},
+        ],
+        "tools": [{"type": "function", "function": weather_tool()}],
+        "add_generation_prompt": True,
+    }),
+    ("flint_tool_call_two_turns", {
+        "messages": [
+            {"role": "system", "content": "Use the tools."},
+            {"role": "user", "content": "Weather in Oslo?"},
+            {"role": "assistant", "tool_calls": [flint_call("c1", "get_weather", {"city": "Oslo"})]},
+            {"role": "tool", "content": "Oslo: 4C"},
+            {"role": "assistant", "content": "Oslo is at 4C."},
+            {"role": "user", "content": "And Lima?"},
+            {"role": "assistant", "tool_calls": [flint_call("c2", "get_weather", {"city": "Lima", "days": 1, "units": "C"})]},
+            {"role": "tool", "content": "Lima: 19C"},
+        ],
+        "tools": [{"type": "function", "function": weather_tool()}],
+        "add_generation_prompt": True,
+    }),
+    # Three turns carry keys the tool does not declare (units, lang, note /
+    # strict): the grammar gate's explicit opt-out count.
+    ("flint_tool_call_float_and_null_args", {
+        "messages": [
+            {"role": "user", "content": "Weather at the coordinates?"},
+            {"role": "assistant", "tool_calls": [flint_call("c1", "get_weather", {"city": "Oslo", "days": 2, "note": None, "strict": True})]},
+            {"role": "tool", "content": "4C"},
+        ],
+        "tools": [{"type": "function", "function": weather_tool()}],
+        "add_generation_prompt": True,
+    }),
+]
+
+
 def main():
     import argparse
     ap = argparse.ArgumentParser()
@@ -638,8 +811,10 @@ def main():
     is_qwen = "Qwen" in model
     is_glm4 = "GLM-4" in model
     is_mimo = "MiMo" in model
-    cases = MIMO_CASES if is_mimo else QWEN_CASES if is_qwen else GLM4_CASES if is_glm4 else CASES
+    is_flint = "flint" in model.lower()
+    cases = FLINT_CASES if is_flint else MIMO_CASES if is_mimo else QWEN_CASES if is_qwen else GLM4_CASES if is_glm4 else CASES
     out_path = args.out_opt or args.out or (
+        "tests/data/flint_chat_template_goldens.jsonl" if is_flint else
         "tests/data/mimo_chat_template_goldens.jsonl" if is_mimo else
         "tests/data/qwen_chat_template_goldens.jsonl" if is_qwen else
         "tests/data/glm4_chat_template_goldens.jsonl" if is_glm4 else "tests/data/glm_chat_template_goldens.jsonl")
@@ -653,7 +828,7 @@ def main():
     tok_raw = pathlib.Path(tok_path).read_bytes()
     template_hash = f"{fnv1a64(tpl_raw):016x}"
     tok_hash = f"{fnv1a64(tok_raw):016x}"
-    if not is_qwen and not is_glm4 and not is_mimo and tok_hash != "700b4469fc43f23b":
+    if not is_qwen and not is_glm4 and not is_mimo and not is_flint and tok_hash != "700b4469fc43f23b":
         sys.exit(f"unexpected tokenizer revision {tok_hash} — the tokenizer "
                  "goldens are keyed to 700b4469fc43f23b")
 

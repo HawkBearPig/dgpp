@@ -172,10 +172,11 @@ DGPP_TEST(glm_dsa_architecture_registry_dispatches) {
 DGPP_TEST(glm_dsa_config_reads_the_landed_checkpoint) {
   namespace fs = std::filesystem;
   const char* home = std::getenv("HOME");
-  if (!home) return;
+  if (!home) dgpp::test::skip("HOME is unset; checkpoint cache unavailable");
   const fs::path root =
       fs::path(home) / ".cache/huggingface/hub/models--HawkBearPig--GLM-5.3-Int4-Int8Mix-RTN-g64/snapshots";
-  if (!fs::is_directory(root)) return;
+  if (!fs::is_directory(root))
+    dgpp::test::skip("checkpoint snapshot directory absent: " + root.string());
   for (const auto& snap : fs::directory_iterator(root)) {
     const fs::path cfg = snap.path() / "config.json";
     if (!fs::exists(cfg)) continue;
@@ -186,6 +187,7 @@ DGPP_TEST(glm_dsa_config_reads_the_landed_checkpoint) {
     require(c.attention_bits == 8 && c.expert_bits == 4 && c.shared_bits == 8, "landed widths");
     return;
   }
+  dgpp::test::skip("no eligible checkpoint config under " + root.string());
 }
 
 // --- the NF4I8 contract (2026-10-08) -------------------------------------------
@@ -362,10 +364,11 @@ DGPP_TEST(glm_dsa_config_refuses_mixed346_contract_drift) {
 DGPP_TEST(glm_dsa_config_reads_the_landed_mixed346_checkpoint) {
   namespace fs = std::filesystem;
   const char* home = std::getenv("HOME");
-  if (!home) return;
+  if (!home) dgpp::test::skip("HOME is unset; checkpoint cache unavailable");
   const fs::path root =
       fs::path(home) / ".cache/huggingface/hub/models--HawkBearPig--GLM-5.3-Mixed346-GPTQ-H32-A8-g128/snapshots";
-  if (!fs::is_directory(root)) return;
+  if (!fs::is_directory(root))
+    dgpp::test::skip("checkpoint snapshot directory absent: " + root.string());
   for (const auto& snap : fs::directory_iterator(root)) {
     const fs::path cfg = snap.path() / "config.json";
     if (!fs::exists(cfg) || !fs::exists(snap.path() / "quantization-recipe.json") ||
@@ -389,15 +392,17 @@ DGPP_TEST(glm_dsa_config_reads_the_landed_mixed346_checkpoint) {
     require(existing == 116 && f444 == 15672 && f666 == 74, "the card's census");
     return;
   }
+  dgpp::test::skip("no eligible checkpoint config under " + root.string());
 }
 
 DGPP_TEST(glm_dsa_config_reads_the_landed_nf4i8_checkpoint) {
   namespace fs = std::filesystem;
   const char* home = std::getenv("HOME");
-  if (!home) return;
+  if (!home) dgpp::test::skip("HOME is unset; checkpoint cache unavailable");
   const fs::path root =
       fs::path(home) / ".cache/huggingface/hub/models--HawkBearPig--GLM-5.3-NF4I8-GPTQ-H32-g128/snapshots";
-  if (!fs::is_directory(root)) return;
+  if (!fs::is_directory(root))
+    dgpp::test::skip("checkpoint snapshot directory absent: " + root.string());
   for (const auto& snap : fs::directory_iterator(root)) {
     const fs::path cfg = snap.path() / "config.json";
     if (!fs::exists(cfg)) continue;
@@ -409,4 +414,5 @@ DGPP_TEST(glm_dsa_config_reads_the_landed_nf4i8_checkpoint) {
     require(c.expert_scale_fmt == dgpp::kPackedScaleBf16G128Nf4i8 && c.expert_input_hadamard32, "landed format");
     return;
   }
+  dgpp::test::skip("no eligible checkpoint config under " + root.string());
 }

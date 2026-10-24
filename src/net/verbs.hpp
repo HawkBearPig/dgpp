@@ -118,6 +118,15 @@ class RcLane {
                       uint32_t payload_lkey = 0, uint32_t ctl = 0,
                       uint64_t payload_hash = 0);
 
+  // RDMA WRITE of `len` bytes at `local` (any address in an MR of this
+  // lane's device, `lkey`) into the peer's `remote_addr` (`rkey`): the
+  // one-sided latency transport's row post (2026-10-19). Signaled when
+  // asked — the caller spaces signals so the SQ retires (see
+  // post_credit_write on the unsignaled SQ hazard).
+  bool post_write(BusPool pool, const void* local, uint32_t lkey, uint32_t len,
+                  uint64_t remote_addr, uint32_t rkey, bool signaled,
+                  std::string* error);
+
   // Unsignaled 64-byte RDMA WRITE of the staging cell into the peer's
   // completion cell for the same pool/slot. No CQE at either side — the
   // sender observes it as a pinned flag. `seq` is the generation credited.

@@ -35,6 +35,8 @@
 #include "common/log.hpp"
 #include "common/test.hpp"
 #include "engine/tp_bus.hpp"
+#include "engine/graph_engine.hpp"
+#include "qwen35_dflash_fixture.hpp"
 #include "models/qwen/config35.hpp"
 #include "models/qwen/model35.hpp"
 #include "net/collective_bus.hpp"
@@ -86,9 +88,13 @@ BusOptions loop_options(int rank, int world, uint16_t port) {
   return o;
 }
 
-std::vector<std::unique_ptr<CollectiveBus>> start_world(int world, uint16_t port) {
+std::vector<std::unique_ptr<CollectiveBus>> start_world(int world, uint16_t port, size_t slot_bytes = 0) {
   std::vector<std::unique_ptr<CollectiveBus>> out;
-  for (int r = 0; r < world; ++r) out.push_back(std::make_unique<CollectiveBus>(loop_options(r, world, port)));
+  for (int r = 0; r < world; ++r) {
+    auto options = loop_options(r, world, port);
+    if (slot_bytes) options.lat_slot_bytes = slot_bytes;
+    out.push_back(std::make_unique<CollectiveBus>(options));
+  }
   std::vector<std::string> errors(static_cast<size_t>(world));
   std::thread listener([&] {
     if (!out[0]->start(&errors[0])) DGPP_LOG_ERROR("qwen35 tp world rank 0: {}", errors[0]);
@@ -262,7 +268,11 @@ void check_world(int world, uint16_t port, const std::string& dir, const Qwen35T
         }
       }
     }
-    require(s.l2 < 0.02 && static_cast<double>(s.hard) <= 0.005 * static_cast<double>(s.total),
+    // MoE's router and experts compound BF16 partial-sum rounding. Use
+    // the existing forward e2e hard-element budget for its cross-world
+    // comparison, retaining the 2% L2 bound and certified top-1 check.
+    const double hard_budget = cfg.is_moe ? 0.02 : 0.005;
+    require(s.l2 < 0.02 && static_cast<double>(s.hard) <= hard_budget * static_cast<double>(s.total),
             "world " + std::to_string(world) + " " + what + " outside the numerics budget");
   };
   for (int l = 0; l < L; ++l) {
@@ -316,6 +326,168 @@ DGPP_TEST(qwen35_mixed_tp_loopback_worlds_2_and_4_match_world_1) {
 }
 DGPP_TEST(qwen35_mixed_prefill_tp_loopback_worlds_2_and_4_match_world_1) {
   check_quant_worlds(true, 2304);
+}
+
+DGPP_TEST(qwen35_moe_tp_loopback_worlds_2_and_4_match_world_1) {
+  const std::string dir = "qwen35_moe_tp_fixture";
+  qwen35fx::write_moe_fixture(dir);
+  const auto cfg = qwen35fx::tiny_moe_config();
+  const auto tokens = make_tokens(cfg, 72);
+  Qwen35Model::Outputs ref;
+  {
+    auto single = make_model(cfg, dir, 72, nullptr, 0, 1);
+    ref = single.forward(tokens, true);
+  }
+  check_world(2, 29950, dir, cfg, tokens, ref);
+  check_world(4, 29951, dir, cfg, tokens, ref);
+}
+
+DGPP_TEST(qwen35_dflash_request_tables_and_short_blocks) {
+  const std::string dir = "qwen35_dflash_target_fixture", draft = "qwen35_dflash_fixture";
+  qwen35fx::write_moe_fixture(dir);
+  const auto cfg = qwen35fx::tiny_moe_config();
+  for (int rows : {8, 16}) {
+    qwen35fx::write_dflash_fixture(draft, rows);
+    Qwen35Model::set_dflash_options(false, true, 2);
+    Qwen35Model model(cfg, dir, 128, 512, dgpp::LoaderResidency::Resident, nullptr, 0, 1, 2, 8, false, draft);
+    Qwen35Model reference(cfg, dir, 128, 512, dgpp::LoaderResidency::Resident, nullptr, 0, 1, 1, 8, false, draft);
+    for (int round = 0; round < 4; ++round) {
+      const auto prompt = make_tokens(cfg, 49 + round);
+      auto other = make_tokens(cfg, 33 + round);
+      for (auto& token : other) token = (token + 101) % cfg.vocab_size;
+      (void)model.session_prefill(0, other);  // physical page 0 belongs to another request
+      const auto out = model.session_prefill(1, prompt);
+      (void)reference.session_prefill(0, prompt);
+      const auto bonus = std::max_element(out.logits.begin(), out.logits.end()) - out.logits.begin();
+      std::vector<int32_t> got, want;
+      require(model.dflash2_draft(1, bonus, &got) && reference.dflash2_draft(0, bonus, &want), "draft succeeds");
+      require(got == want, "request 1 draft reads its own context, independent of request 0");
+      model.session_close(0);
+      model.session_close(1);
+      reference.session_close(0);
+    }
+  }
+  Qwen35Model::set_dflash_options(true, true, 0);
+}
+
+static void check_spec_graph(int world, int slots, int depth, bool native_mtp = false) {
+  const std::string dir = "qwen35_dflash_graph_target_fixture", draft = "qwen35_dflash_graph_fixture";
+  auto cfg = qwen35fx::tiny_moe_config();
+  if (native_mtp) {
+    // The FP4 decode core needs at least 32 routed columns per rank;
+    // four ranks therefore use I=128 instead of the prefill fixture's 64.
+    std::string json = qwen35fx::tiny_moe_config_text_json();
+    const std::string key = "\"moe_intermediate_size\": 64";
+    json.replace(json.find(key), key.size(), "\"moe_intermediate_size\": 128");
+    const auto parsed = dgpp::minijson::parse(json);
+    cfg = Qwen35TextConfig::parse(parsed.root.at("text_config"), parsed.root.find("quantization_config"));
+    qwen35fx::write_fixture(cfg, dir, json, qwen35fx::ignored_extras(), 1.f / 64);
+  } else {
+    qwen35fx::write_moe_fixture(dir);
+  }
+  qwen35fx::write_dflash_fixture(draft);
+  Qwen35Model::set_dflash_options(false, true, depth);
+  dgpp::Qwen35LayerStream::set_mtp_expert_format(native_mtp ? "bf16" : "fp8");
+  // Keep the native-MTP four-rank prefill on the latency path, like the
+  // existing TP fixture. Only DFlash's regression constrains the slot.
+  auto buses = start_world(world, 29950, native_mtp ? 0 : 8 * cfg.hidden_size * sizeof(uint16_t));
+  require(!buses.empty(), "DFlash bus world");
+  ConstructBarrier barrier(world);
+  std::vector<std::string> errors(world);
+  std::vector<std::vector<std::vector<int32_t>>> transcripts(world);
+  std::vector<std::thread> workers;
+  for (int rank = 0; rank < world; ++rank) workers.emplace_back([&, rank] {
+    uint16_t* scratch = nullptr;
+    bool arrived = false;
+    try {
+      BusBoundaryReducer reducer(*buses[rank], wait_timeout_ms());
+      Qwen35Model model(cfg, dir, 128, 512, dgpp::LoaderResidency::Resident, world > 1 ? &reducer : nullptr,
+                         rank, world, slots, 8, native_mtp, native_mtp ? "" : draft);
+      DGPP_CUDA_OK(cudaHostAlloc(reinterpret_cast<void**>(&scratch),
+          sizeof(uint16_t) * dgpp::kPickScratchElems(world), cudaHostAllocDefault));
+      {
+        dgpp::GraphEngineAdapter<Qwen35Model> engine(&model, buses[rank].get(), rank, world,
+            scratch, cfg.vocab_size, wait_timeout_ms(), 2, nullptr, nullptr, 1, nullptr, 0, depth);
+        arrived = true;
+        barrier.arrive_and_wait();
+        if (!native_mtp) {
+          require(engine.reservation_blocks(61) == 2, "reserve the full 16-row block past the verify cap");
+          bool refused = false;
+          try { engine.configure_verify_schedule(true, 1.f, 1.f); }
+          catch (const std::invalid_argument& e) { refused = std::string(e.what()).find("confidence") != std::string::npos; }
+          require(refused, "v1 scheduled depth must name the missing confidence scores");
+        }
+        engine.warm_captures(make_tokens(cfg, 4));  // includes every fixed-batch family
+        transcripts[rank].resize(slots);
+        std::vector<int> live;
+        for (int q = 0; q < slots; ++q) {
+          auto prompt = make_tokens(cfg, 49 - q * 4);
+          for (auto& token : prompt) token = (token + 17 * q) % cfg.vocab_size;
+          transcripts[rank][q].push_back(engine.prefill(q, prompt));
+          live.push_back(q);
+        }
+        for (int step = 0; step < 24; ++step) {
+          for (const int q : live) engine.reserve(q, model.session_position(q) + depth + 1);
+          const auto generated = engine.step_batch(live);
+          engine.drain();  // the eager oracle needs the replay window closed
+          for (size_t i = 0; i < live.size(); ++i) {
+            const int q = live[i];
+            auto& tokens = transcripts[rank][q];
+            tokens.insert(tokens.end(), generated[i].begin(), generated[i].end());
+            if (!native_mtp) {
+              std::vector<int32_t> eager_draft;
+              require(model.dflash2_draft(q, tokens.back(), &eager_draft), "eager draft after graph commit");
+              require(std::equal(eager_draft.begin(), eager_draft.end(), model.block_drafts_host(q)),
+                      "captured draft equals eager draft, including global vocab offsets");
+            }
+          }
+          // Retire an interior slot: the remaining slot must not write the
+          // inactive slot's freed pages during fixed-batch replay.
+          if (slots > 1 && step == 11) {
+            engine.close(0);
+            live.erase(live.begin());
+          }
+        }
+        for (const int q : live) engine.close(q);
+      }
+    } catch (const std::exception& e) {
+      errors[rank] = e.what();
+      if (!arrived) barrier.arrive_and_wait();
+    }
+    if (scratch) cudaFreeHost(scratch);
+  });
+  for (auto& worker : workers) worker.join();
+  for (int rank = 0; rank < world; ++rank) {
+    require(errors[rank].empty(), "rank " + std::to_string(rank) + ": " + errors[rank]);
+    require(transcripts[rank] == transcripts[0], "DFlash ranks publish identical transcripts");
+  }
+  for (auto& bus : buses) bus->stop();
+  // The same target without a drafter certifies the world-1 transcript.
+  // TP target numerics are checked by the MoE world-1/2/4 test above.
+  if (world == 1) {
+    Qwen35Model plain(cfg, dir, 128, 512, dgpp::LoaderResidency::Resident, nullptr, 0, 1, slots, 8);
+    for (int q = 0; q < slots; ++q) {
+      auto prompt = make_tokens(cfg, 49 - q * 4);
+      for (auto& token : prompt) token = (token + 17 * q) % cfg.vocab_size;
+      auto out = plain.session_prefill(q, prompt);
+      for (const auto token : transcripts[0][q]) {
+        const auto want = std::max_element(out.logits.begin(), out.logits.end()) - out.logits.begin();
+        require(token == want, "DFlash graph transcript matches the plain target");
+        out = plain.session_step(q, token);
+      }
+    }
+  }
+  Qwen35Model::set_dflash_options(true, true, 0);
+  dgpp::Qwen35LayerStream::set_mtp_expert_format("fp8");
+}
+
+DGPP_TEST(qwen35_dflash_graph_scalar_tp_small_buffer) { check_spec_graph(2, 1, 7); }
+DGPP_TEST(qwen35_dflash_graph_multi_slot_world1) { check_spec_graph(1, 2, 2); }
+DGPP_TEST(qwen35_dflash_graph_multi_slot_tp) { check_spec_graph(2, 2, 2); }
+
+DGPP_TEST(qwen35_moe_mtp_graph_multi_slot_tp) {
+  check_spec_graph(2, 2, 2, true);
+  check_spec_graph(4, 2, 2, true);
 }
 
 int main() {

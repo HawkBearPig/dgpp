@@ -86,7 +86,9 @@ prompt = [{"role": "user", "content": "Name three primary colors, one per line, 
 # Flash's ignores it and keeps its short low-effort block): a model that
 # spends the 160-token budget inside its think block leaves no words to
 # build a stop sequence from (GLM-4.7, 2026-09-10).
-no_think = {"chat_template_kwargs": {"enable_thinking": False}}
+# Explicit thinking controls must agree with reasoning_effort. Otherwise the
+# fallback below mistakes a conflicting request for an unsupported template knob.
+no_think = {"reasoning_effort": "none", "chat_template_kwargs": {"enable_thinking": False}}
 st, base = post("/v1/chat/completions", chat(prompt, **no_think))
 if st == 400:  # the template has no such knob (GLM-5.3-Flash): plain
     no_think = {}

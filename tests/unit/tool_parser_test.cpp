@@ -237,6 +237,74 @@ Run drive_dsml(const std::string& text, ToolCallParser::Options opts = {}, DsmlD
   return run;
 }
 
+// The prompt-tail rules (ChatMarkers::prompt_opens_thinking /
+// prompt_leaves_thinking_to_model) over every generation-prompt shape the
+// families render (2026-10-22, the Flint rule). Whether the model opens
+// its own <think> is the family's declaration (model_opens_thinking,
+// ServeFamily states it): without it no tail ever leaves the choice to
+// the model; with it only a tail the template left unsettled does — the
+// GLM shapes end inside <think> or with a closed block, Qwen's open the
+// block or close it, MiMo's "assistant\n" and Flint's "<|assistant|>\n"
+// carry neither. The tokens never select the family.
+DGPP_TEST(tool_parser_prompt_tail_leaves_thinking_to_the_model_by_the_family_declaration) {
+  constexpr int64_t kAssistant = 900, kImStart = 901, kNewline = 902, kWord = 903, kText = 904,
+                    kNewline2 = 905;  // the "\n\n" id (Qwen's 271)
+  auto glm = [&](bool declares) {
+    ChatMarkers m = fake_markers();
+    m.role_markers = {ChatMarker{kAssistant, "<|assistant|>"}};
+    m.newline = ChatMarker{kNewline, "\n"};
+    m.newline_ids = {kNewline, kNewline2};
+    m.model_opens_thinking = declares;
+    return m;
+  };
+  auto qwen = [&](bool declares) {
+    ChatMarkers m = qwen_markers();
+    m.role_markers = {ChatMarker{kImStart, "<|im_start|>"}};
+    m.newline = ChatMarker{kNewline, "\n"};
+    m.newline_ids = {kNewline, kNewline2};
+    m.model_opens_thinking = declares;
+    return m;
+  };
+  struct Case {
+    const char* what;
+    std::vector<int64_t> tail;
+    bool opens;     // prompt_opens_thinking
+    bool unsettled; // leaves_thinking_to_model under the declaration
+  };
+  const Case glm_cases[] = {
+      {"GLM-5.3-Flash thinking: <|assistant|><think>", {kText, kAssistant, kThinkOpen}, true, false},
+      {"GLM with a newline after <think>", {kText, kAssistant, kThinkOpen, kNewline}, true, false},
+      {"GLM-4.7 enable_thinking false: <think></think>", {kText, kAssistant, kThinkOpen, kThinkClose}, false, false},
+      {"GLM closed block then newlines", {kText, kAssistant, kThinkOpen, kThinkClose, kNewline, kNewline}, false, false},
+      {"Flint: the prompt ends at <|assistant|>", {kText, kAssistant}, false, true},
+      {"Flint: <|assistant|> then its newline", {kText, kAssistant, kNewline}, false, true},
+  };
+  const Case qwen_cases[] = {
+      {"Qwen thinking: assistant then <think>\n", {kImStart, kWord, kNewline, kThinkOpen, kNewline}, true, false},
+      {"Qwen enable_thinking false: closed block", {kImStart, kWord, kNewline, kThinkOpen, kThinkClose, kNewline, kNewline}, false, false},
+      {"Qwen3.8 enable_thinking false: <think>\n\n</think>\n\n with the pair as one id",
+       {kImStart, kWord, kNewline, kThinkOpen, kNewline2, kThinkClose, kNewline2}, false, false},
+      {"MiMo: the bare assistant header", {kImStart, kWord, kNewline}, false, true},
+      {"MiMo enable_thinking false: <think></think>", {kImStart, kWord, kNewline, kThinkOpen, kThinkClose}, false, false},
+  };
+  const auto check = [&](const ChatMarkers& declared, const ChatMarkers& silent, const Case& c) {
+    require(declared.prompt_opens_thinking(c.tail) == c.opens, std::string(c.what) + ": opens_thinking");
+    require(declared.prompt_leaves_thinking_to_model(c.tail) == c.unsettled,
+            std::string(c.what) + ": leaves_thinking_to_model under the family's declaration");
+    // No declaration (GLM, Qwen, DeepSeek): the same tail never leaves the choice.
+    require(!silent.prompt_leaves_thinking_to_model(c.tail), std::string(c.what) + ": never without the declaration");
+    require(silent.prompt_opens_thinking(c.tail) == c.opens, std::string(c.what) + ": opens_thinking is the template's");
+  };
+  for (const Case& c : glm_cases) check(glm(true), glm(false), c);
+  for (const Case& c : qwen_cases) check(qwen(true), qwen(false), c);
+  // The declaration without the reasoning markers: never.
+  ChatMarkers plain = glm(true);
+  plain.think_open = ChatMarker{};
+  plain.think_close = ChatMarker{};
+  require(!plain.prompt_leaves_thinking_to_model({kText, kAssistant}), "no think markers: never");
+  require(!ChatMarkers{}.prompt_leaves_thinking_to_model({kText, kAssistant}), "default markers: never");
+}
+
 DGPP_TEST(tool_parser_incremental_text_has_linear_decode_work) {
   const std::string reasoning = std::string(2048, 'r') + "é📭";
   for (const auto& markers : {fake_markers(), qwen_markers(), dsml_markers(),
@@ -923,6 +991,7 @@ DGPP_TEST(tool_parser_promptOpensThinkingSeesTheQwenNewline) {
 ChatMarkers mimo_markers() {
   ChatMarkers m = qwen_markers();
   m.xml_compact = true;
+  m.model_opens_thinking = true;  // the family's declaration (ServeFamily)
   return m;
 }
 Run drive_mimo(const std::string& text, ToolCallParser::Options opts = {}) {

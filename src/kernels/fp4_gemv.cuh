@@ -132,7 +132,14 @@ struct Geom {
   static constexpr int row_chunks = K / kCodesPerChunk;
   static constexpr int lanes_per_row = lanes_per_row_of(K);   // 1 .. 32
   static constexpr int chunks = row_chunks / lanes_per_row;   // per lane, over every pass
-  static constexpr int passes = (chunks + kMaxChunksPerLane - 1) / kMaxChunksPerLane;
+  // Chunks per pass: kMaxChunksPerLane, except a short row (K <= 1024: the
+  // MoE down projection's K = inter / world, 576 at DeepSeek-V4.1 on four
+  // nodes) whose lane holds at most 9 — issued in ONE pass, every load in
+  // flight at once (2026-10-19; three passes of 4, 4 and 1 ran the down
+  // kernel at 73 % of the read ceiling). The chain per row is the same
+  // whatever the pass split: bitwise.
+  static constexpr int cap = (K <= 1024 && chunks <= 9) ? chunks : kMaxChunksPerLane;
+  static constexpr int passes = (chunks + cap - 1) / cap;
   static constexpr int rows_per_step = 32 / lanes_per_row;
   static constexpr int rows_per_warp = kSteps * rows_per_step;
   static constexpr int rows_per_block = kWarps * rows_per_warp;
@@ -140,8 +147,8 @@ struct Geom {
   static constexpr int scale_cols = K / kGroup;
   // Chunks in pass p (at least 1 so a discarded instantiation stays legal).
   static constexpr int pass_chunks(int p) {
-    const int left = chunks - p * kMaxChunksPerLane;
-    return left < 1 ? 1 : (left < kMaxChunksPerLane ? left : kMaxChunksPerLane);
+    const int left = chunks - p * cap;
+    return left < 1 ? 1 : (left < cap ? left : cap);
   }
 };
 
@@ -482,11 +489,11 @@ __device__ __forceinline__ void warp_row_dots(const uint8_t* __restrict__ w,
     for (int a = 0; a < kRows; ++a) acc[st][a] = 0.f;
   pass_row_dots<K, kRows, 0, G::pass_chunks(0), kGroupT>(w, scales, sx, n0, n, acc);
   if constexpr (G::passes > 1)
-    pass_row_dots<K, kRows, kMaxChunksPerLane, G::pass_chunks(1), kGroupT>(w, scales, sx, n0, n, acc);
+    pass_row_dots<K, kRows, G::cap, G::pass_chunks(1), kGroupT>(w, scales, sx, n0, n, acc);
   if constexpr (G::passes > 2)
-    pass_row_dots<K, kRows, 2 * kMaxChunksPerLane, G::pass_chunks(2), kGroupT>(w, scales, sx, n0, n, acc);
+    pass_row_dots<K, kRows, 2 * G::cap, G::pass_chunks(2), kGroupT>(w, scales, sx, n0, n, acc);
   if constexpr (G::passes > 3)
-    pass_row_dots<K, kRows, 3 * kMaxChunksPerLane, G::pass_chunks(3), kGroupT>(w, scales, sx, n0, n, acc);
+    pass_row_dots<K, kRows, 3 * G::cap, G::pass_chunks(3), kGroupT>(w, scales, sx, n0, n, acc);
 #pragma unroll
   for (int st = 0; st < kSteps; ++st) group_reduce<kRows, G::lanes_per_row>(acc[st]);
 }
@@ -574,11 +581,11 @@ __device__ __forceinline__ void warp_row_dots_pair(
     for (int a = 0; a < kRows; ++a) acc0[st][a] = acc1[st][a] = 0.f;
   pass_row_dots_pair<K, kRows, 0, G::pass_chunks(0), kGroupT>(w0, scales0, w1, scales1, sx, n0, n, acc0, acc1);
   if constexpr (G::passes > 1)
-    pass_row_dots_pair<K, kRows, kMaxChunksPerLane, G::pass_chunks(1), kGroupT>(w0, scales0, w1, scales1, sx, n0, n, acc0, acc1);
+    pass_row_dots_pair<K, kRows, G::cap, G::pass_chunks(1), kGroupT>(w0, scales0, w1, scales1, sx, n0, n, acc0, acc1);
   if constexpr (G::passes > 2)
-    pass_row_dots_pair<K, kRows, 2 * kMaxChunksPerLane, G::pass_chunks(2), kGroupT>(w0, scales0, w1, scales1, sx, n0, n, acc0, acc1);
+    pass_row_dots_pair<K, kRows, 2 * G::cap, G::pass_chunks(2), kGroupT>(w0, scales0, w1, scales1, sx, n0, n, acc0, acc1);
   if constexpr (G::passes > 3)
-    pass_row_dots_pair<K, kRows, 3 * kMaxChunksPerLane, G::pass_chunks(3), kGroupT>(w0, scales0, w1, scales1, sx, n0, n, acc0, acc1);
+    pass_row_dots_pair<K, kRows, 3 * G::cap, G::pass_chunks(3), kGroupT>(w0, scales0, w1, scales1, sx, n0, n, acc0, acc1);
 #pragma unroll
   for (int st = 0; st < kSteps; ++st) {
     group_reduce<kRows, G::lanes_per_row>(acc0[st]);
@@ -623,11 +630,11 @@ __device__ __forceinline__ void warp_row_dots_issued(
     for (int a = 0; a < kRows; ++a) acc[st][a] = 0.f;
   consume_pass<K, kRows, 0, G::pass_chunks(0), kGroupT>(L0, sx, n0, n, acc);
   if constexpr (G::passes > 1)
-    pass_row_dots_s<K, kRows, kMaxChunksPerLane, G::pass_chunks(1), kGroupT, kStream>(w, scales, sx, n0, n, acc);
+    pass_row_dots_s<K, kRows, G::cap, G::pass_chunks(1), kGroupT, kStream>(w, scales, sx, n0, n, acc);
   if constexpr (G::passes > 2)
-    pass_row_dots_s<K, kRows, 2 * kMaxChunksPerLane, G::pass_chunks(2), kGroupT, kStream>(w, scales, sx, n0, n, acc);
+    pass_row_dots_s<K, kRows, 2 * G::cap, G::pass_chunks(2), kGroupT, kStream>(w, scales, sx, n0, n, acc);
   if constexpr (G::passes > 3)
-    pass_row_dots_s<K, kRows, 3 * kMaxChunksPerLane, G::pass_chunks(3), kGroupT, kStream>(w, scales, sx, n0, n, acc);
+    pass_row_dots_s<K, kRows, 3 * G::cap, G::pass_chunks(3), kGroupT, kStream>(w, scales, sx, n0, n, acc);
 #pragma unroll
   for (int st = 0; st < kSteps; ++st) group_reduce<kRows, G::lanes_per_row>(acc[st]);
 }
@@ -646,11 +653,11 @@ __device__ __forceinline__ void warp_row_dots_pair_issued(
     for (int a = 0; a < kRows; ++a) acc0[st][a] = acc1[st][a] = 0.f;
   consume_pass_pair<K, kRows, 0, G::pass_chunks(0), kGroupT>(L0, L1, sx, n0, n, acc0, acc1);
   if constexpr (G::passes > 1)
-    pass_row_dots_pair_s<K, kRows, kMaxChunksPerLane, G::pass_chunks(1), kGroupT, kStream>(w0, scales0, w1, scales1, sx, n0, n, acc0, acc1);
+    pass_row_dots_pair_s<K, kRows, G::cap, G::pass_chunks(1), kGroupT, kStream>(w0, scales0, w1, scales1, sx, n0, n, acc0, acc1);
   if constexpr (G::passes > 2)
-    pass_row_dots_pair_s<K, kRows, 2 * kMaxChunksPerLane, G::pass_chunks(2), kGroupT, kStream>(w0, scales0, w1, scales1, sx, n0, n, acc0, acc1);
+    pass_row_dots_pair_s<K, kRows, 2 * G::cap, G::pass_chunks(2), kGroupT, kStream>(w0, scales0, w1, scales1, sx, n0, n, acc0, acc1);
   if constexpr (G::passes > 3)
-    pass_row_dots_pair_s<K, kRows, 3 * kMaxChunksPerLane, G::pass_chunks(3), kGroupT, kStream>(w0, scales0, w1, scales1, sx, n0, n, acc0, acc1);
+    pass_row_dots_pair_s<K, kRows, 3 * G::cap, G::pass_chunks(3), kGroupT, kStream>(w0, scales0, w1, scales1, sx, n0, n, acc0, acc1);
 #pragma unroll
   for (int st = 0; st < kSteps; ++st) {
     group_reduce<kRows, G::lanes_per_row>(acc0[st]);

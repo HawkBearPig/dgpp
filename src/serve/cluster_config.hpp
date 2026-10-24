@@ -68,6 +68,16 @@ struct ClusterConfig {
     // distribution is unchanged; only the draft's proposals (acceptance)
     // can move. Other families ignore it.
     std::string mtp_head = "checkpoint";
+    // The DeepSeek-V4.1 indexer's budget (2026-10-18; the deepseek_v41
+    // family alone): how many compressed entries a query attends
+    // (index_topk; the release trained at 512, the select networks serve
+    // up to 2048) out of a candidate pool of candidate_topk_blocks blocks
+    // of candidate_block_size entries (2048 x 8 as shipped). 0 keeps the
+    // checkpoint's value. Widening the budget changes the model's output
+    // (more context visible to every query), not just its speed.
+    int index_topk = 0;
+    int candidate_topk_blocks = 0;
+    int candidate_block_size = 0;
     // The full GLM-5.3 attention projections' resident form (2026-10-09):
     // "checkpoint" as shipped (int8 g64); "int4" re-encoded to int4 g64 at
     // load (RTN) — −2.1 GB per MTP pass per rank, NOT lossless. Other
@@ -85,6 +95,13 @@ struct ClusterConfig {
     // shards hold the table) or the extracted table repo. Only the table's
     // tensors are taken from it. Empty: the checkpoint's own shards.
     std::string ngram_table_model;
+    // The DeepSeek-V4.1 Engram tables' source (2026-10-22, the EXL3 pack
+    // ships none): a Hugging Face repository id resolved through the model
+    // cache like `model` — the base release whose shards hold the tables
+    // (`deepseek-ai/DeepSeek-V4.1-Flash-1017`). Only the table tensors are
+    // taken from it; its Engram sidecar serves when the checkpoint has
+    // none. Empty: the checkpoint's own shards. Refused for any other family.
+    std::string engram_source;
     // The Qwen dense stack's form: "checkpoint" (the default:
     // the BF16 the checkpoint ships) or "fp8" (every dense projection
     // encoded to block FP8 at load — the same recipe as the FP8 releases;
@@ -166,13 +183,17 @@ struct ClusterConfig {
     //     prefill attention on the fp8 tensor cores — Q and the
     //     probabilities quantized to e4m3 per row, S and O on
     //     mma.e4m3 at twice the bf16 rate; decode rows keep the exact
-    //     widened walk). Needs kv_dtype fp8; other families refuse it.
+    //     widened walk). Also supported for Flash-Next QSA, with its
+    //     per-token/head cache scales. Both require kv_dtype fp8.
     bool prefill_bf16_partials = false;
     bool prefill_fold_scales = false;
     bool prefill_fp8_gemm = false;
     bool prefill_fp8_per_tensor = false;
     std::string prefill_activations = "bf16";
     std::string prefill_attention = "bf16";
+    // Flash-Next QSA decode arithmetic over its fp8 pool. Independent of
+    // prefill_attention so either phase can retain bf16 compute.
+    std::string decode_attention = "bf16";
     // The packed expert GEMM's form and companions (2026-09-30; every
     // serving switch is a config key — no environment variable selects a
     // kernel). All bitwise the default chain.
@@ -197,6 +218,20 @@ struct ClusterConfig {
     // recipe, half the prefill work) or "exact" (every layer over every
     // row, the parity mode).
     std::string prefill = "bounded";
+    std::string prefill_dense = "auto";  // family default | tile | streaming
+    std::string prefill_window = "flash";  // the DeepSeek-V4.1 prefill's window attention: flash | scalar
+    std::string decode_window = "flash";   // the DeepSeek-V4.1 decode's window attention: flash | scalar
+    // The fabric's latency-class collective transport for the decode
+    // step's folds and the pick (2026-10-19): "write" = rows RDMA-written
+    // into the peers' write rings as self-describing chunks, folded by a
+    // grid of warps as they prove; "send" = payload + doorbell SEND pairs
+    // claimed through door cells by one block, hash-gated, acked, credited.
+    std::string collective_transport = "write";
+    bool prefill_fold_overlap = true;
+    // The decode graph's kernel edges programmatic (2026-10-20): a kernel's
+    // blocks scheduled as its predecessor drains, each waiting for the
+    // predecessor's completion before its first read (engine/graph_pdl.hpp).
+    bool decode_pdl = true;    // the DeepSeek-V4.1 prefill's boundary folds under the other row block's compute
     // The opt-in YaRN rope ramp (2026-09-18, the Qwen3.8-Flash-Next 512K
     // recipe): absent is the default and leaves every table and every
     // kernel argument exactly as they were; present builds the Qwen QSA
@@ -251,6 +286,7 @@ struct ClusterConfig {
     // inside the attention layers, and whether adjacent ranges merge.
     bool l2_prefetch = true;
     std::string l2_prefetch_form = "load";
+    std::string l2_prefetch_full_form = "16x8";
     int l2_prefetch_window_mib = 12;
     int l2_prefetch_boundary_window_mib = 20;
     std::string l2_prefetch_boundary_rate = "light";
@@ -271,6 +307,7 @@ struct ClusterConfig {
     double mtp_schedule_base_ms = 28.0;
     double mtp_schedule_lambda = 0.0;
     int mtp_schedule_min_depth = 1;
+    int mtp_schedule_options = 0;  // at most this many scheduled depths (0: as many as the graph-variant budget holds)
     bool mtp_schedule_adapt = true;  // lambda follows the modeled throughput, floored at mtp_schedule_lambda
     // A sampled request's acceptance per position as a fraction of the
     // confidence head's, when its drafts are the draft's argmax
@@ -310,6 +347,11 @@ struct ClusterConfig {
     int dflash_batch_rows = 0;
     int graph_batch_min_live = 0;  // 0 = min(2, max_concurrency) (the batch family, 2026-09-07)
     int sampling_candidates = 128;
+    // Omitted fields inherit the checkpoint/neutral defaults. Process flags
+    // override these defaults; each request can override them again.
+    std::optional<float> repetition_penalty;
+    std::optional<float> frequency_penalty;
+    std::optional<float> presence_penalty;
     double prefix_cache_gib = 1.5;
     int prefix_min_tokens = 1024;       // no prefix snapshot below this position (0: every cut)
     bool prefix_head_snapshots = true;  // a cold prompt also keeps its first structural cut (the system prompt's end)

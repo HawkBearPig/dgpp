@@ -559,13 +559,15 @@ struct SelectFixture {
 };
 }  // namespace
 
-DGPP_TEST(csa2_long_decode_selection_replays) {
-  // Production block size and selection widths, a non-tile-aligned long pool,
-  // all partial-tail lengths, the all-candidates-fit transition, inactive rows,
-  // and the six-request/depth-four batch width. The unchanged DSA scorer supplies
-  // score keys; host sorting independently supplies candidate and selected IDs.
-  // The small fixture below also retains its fully independent host score oracle.
-  constexpr int rows = 30, entries = 131073, topk_blocks = 2048, select_k = 512, block_size = 8;
+namespace {
+// Production block size and selection widths (the release's 512 and the 2048
+// a deployment may widen engine.index_topk to), a non-tile-aligned long pool,
+// all partial-tail lengths, the all-candidates-fit transition, inactive rows,
+// and the six-request/depth-four batch width. The unchanged DSA scorer supplies
+// score keys; host sorting independently supplies candidate and selected IDs.
+// The small fixture below also retains its fully independent host score oracle.
+void long_decode_selection_replays(const int select_k) {
+  constexpr int rows = 30, entries = 131073, topk_blocks = 2048, block_size = 8;
   std::vector<int64_t> positions(rows);
   const std::vector<int64_t> lengths{0,      1,      511,    512,    513,    4095,   16383,
                                      16384,  16385,  32768,  131065, 131066, 131067, 131068,
@@ -667,6 +669,104 @@ DGPP_TEST(csa2_long_decode_selection_replays) {
   DGPP_CUDA_OK(cudaGraphExecDestroy(exec));
   DGPP_CUDA_OK(cudaGraphDestroy(graph));
   DGPP_CUDA_OK(cudaStreamDestroy(stream));
+}
+}  // namespace
+
+DGPP_TEST(csa2_long_decode_selection_replays) { long_decode_selection_replays(512); }
+DGPP_TEST(csa2_long_decode_selection_replays_at_2048) { long_decode_selection_replays(2048); }
+
+DGPP_TEST(csa2_selections_at_the_widened_budget) {
+  // engine.index_topk 2048 (2026-10-18): the restricted and plain decode
+  // selects (the radix path, no tile) and the prefill rows select (the
+  // 4096-key tile) at the select networks' bound, against the host oracles
+  // over a pool wider than the budget.
+  const int select_k = 2048, block_size = 8, topk_blocks = 256;
+  SelectFixture fx(5000, 8, {-1, 0, 2046, 2047, 2048, 2049, 4095, 4999}, 0x2048);
+  const int rows = fx.rows;
+  DevBuf dsel_ws(dgpp::csa2_select_workspace_bytes(rows, fx.n));
+  DevBuf dtop(size_t(rows) * select_k * 4), dcnt(rows * 4);
+  const auto check_plain = [&](const char* who) {
+    const auto top = download<int32_t>(dtop, size_t(rows) * select_k);
+    const auto cnt = download<int32_t>(dcnt, rows);
+    for (int r = 0; r < rows; ++r) {
+      const int64_t visible = fx.pos_sel[size_t(r)] + 1;
+      std::vector<int32_t> want(size_t(select_k), -1);
+      const int wn = dgpp::dsa_ref::select_pools(&fx.logits[size_t(r) * fx.n], visible, select_k, want.data());
+      require(cnt[size_t(r)] == wn, std::string(who) + " count row " + std::to_string(r));
+      for (int i = 0; i < select_k; ++i)
+        require(top[size_t(r) * select_k + i] == (i < wn ? want[size_t(i)] : -1), std::string(who) + " row " + std::to_string(r));
+    }
+  };
+  // 1) the plain decode select at 2048 (cand null: every visible entry).
+  dgpp::csa2_select_listed_decode(
+      fx.dq8.p, static_cast<const float*>(fx.dwf.p), fx.ri(), fx.ps(), rows, fx.tab(), fx.bpr(),
+      fx.dk.p, static_cast<const float*>(fx.dks.p), fx.epb, 32, nullptr, 0, nullptr, 0, select_k,
+      static_cast<uint64_t*>(dsel_ws.p), fx.n, static_cast<int32_t*>(dtop.p), static_cast<int32_t*>(dcnt.p), 0);
+  sync();
+  check_plain("plain decode at 2048");
+  // 2) the restricted decode select: 256 candidate blocks of 8 (2048 entries plus the partial
+  // newest block: a pool wider than the budget at every long row) from the host oracle.
+  std::vector<int32_t> cand(size_t(rows) * topk_blocks, -1), cand_counts(size_t(rows), 0);
+  for (int r = 0; r < rows; ++r) {
+    const int64_t visible = fx.pos_sel[size_t(r)] + 1;
+    if (visible <= 0) continue;
+    const auto blocks = ref_candidate_blocks(&fx.logits[size_t(r) * fx.n], visible, block_size, topk_blocks);
+    cand_counts[size_t(r)] = int(blocks.size());
+    std::copy(blocks.begin(), blocks.end(), cand.begin() + size_t(r) * topk_blocks);
+  }
+  DevBuf dcand = upload(cand), dcc = upload(cand_counts);
+  const auto check_restricted = [&](const char* who) {
+    const auto top = download<int32_t>(dtop, size_t(rows) * select_k);
+    const auto cnt = download<int32_t>(dcnt, rows);
+    for (int r = 0; r < rows; ++r) {
+      const int64_t visible = fx.pos_sel[size_t(r)] + 1;
+      std::vector<int32_t> blocks(cand.begin() + size_t(r) * topk_blocks,
+                                  cand.begin() + size_t(r) * topk_blocks + cand_counts[size_t(r)]);
+      const auto want = visible > 0 ? ref_topk_among(&fx.logits[size_t(r) * fx.n],
+                                                     ref_pool_entries(blocks, visible, block_size), visible, select_k)
+                                    : std::vector<int32_t>{};
+      require(cnt[size_t(r)] == int(want.size()), std::string(who) + " count row " + std::to_string(r));
+      for (int i = 0; i < select_k; ++i)
+        require(top[size_t(r) * select_k + i] == (i < int(want.size()) ? want[size_t(i)] : -1),
+                std::string(who) + " row " + std::to_string(r));
+    }
+  };
+  dgpp::csa2_select_listed_decode(
+      fx.dq8.p, static_cast<const float*>(fx.dwf.p), fx.ri(), fx.ps(), rows, fx.tab(), fx.bpr(),
+      fx.dk.p, static_cast<const float*>(fx.dks.p), fx.epb, 32, static_cast<const int32_t*>(dcand.p), topk_blocks,
+      static_cast<const int32_t*>(dcc.p), block_size, select_k, static_cast<uint64_t*>(dsel_ws.p), fx.n,
+      static_cast<int32_t*>(dtop.p), static_cast<int32_t*>(dcnt.p), 0);
+  sync();
+  check_restricted("restricted decode at 2048");
+  // 3) the prefill rows select over the oracle's logits rows (stride n): plain, then restricted.
+  DevBuf dlog = upload(fx.logits);
+  dgpp::csa2_select_rows_prefill(static_cast<const float*>(dlog.p), fx.n, fx.ps(), rows, select_k, nullptr, 0, nullptr, 0,
+                                 static_cast<int32_t*>(dtop.p), static_cast<int32_t*>(dcnt.p), 0);
+  sync();
+  check_plain("plain prefill at 2048");
+  dgpp::csa2_select_rows_prefill(static_cast<const float*>(dlog.p), fx.n, fx.ps(), rows, select_k,
+                                 static_cast<const int32_t*>(dcand.p), topk_blocks, static_cast<const int32_t*>(dcc.p),
+                                 block_size, static_cast<int32_t*>(dtop.p), static_cast<int32_t*>(dcnt.p), 0);
+  sync();
+  check_restricted("restricted prefill at 2048");
+  // 4) the candidate stage at the full 2048-block pool over these rows agrees with the oracle too.
+  {
+    const int full_blocks = 2048;
+    DevBuf dcp(size_t(rows) * full_blocks * 4), dcpc(rows * 4);
+    dgpp::csa2_select_candidates_prefill(static_cast<const float*>(dlog.p), fx.n, fx.ps(), rows, block_size, full_blocks,
+                                         static_cast<int32_t*>(dcp.p), static_cast<int32_t*>(dcpc.p), 0);
+    sync();
+    const auto cp = download<int32_t>(dcp, size_t(rows) * full_blocks);
+    const auto cpc = download<int32_t>(dcpc, rows);
+    for (int r = 0; r < rows; ++r) {
+      const int64_t visible = fx.pos_sel[size_t(r)] + 1;
+      auto c = visible > 0 ? ref_candidate_blocks(&fx.logits[size_t(r) * fx.n], visible, block_size, full_blocks)
+                           : std::vector<int32_t>{};
+      require(cpc[size_t(r)] == int(c.size()), "prefill candidate count at 2048 blocks");
+      c.resize(size_t(full_blocks), -1);
+      for (int i = 0; i < full_blocks; ++i) require(cp[size_t(r) * full_blocks + i] == c[size_t(i)], "prefill candidate list at 2048 blocks");
+    }
+  }
 }
 
 DGPP_TEST(csa2_selections_match_the_oracles) {
@@ -952,6 +1052,161 @@ DGPP_TEST(csa2_window_attention_end_to_end_matches_sparse_attn) {
   };
   run(3, {3, 0, 2}, "short ring");
   run(last, {283, 300, 315}, "wrapped ring");
+}
+
+// The fused prefill scorer (csa2_score_prefill) against the host oracle's
+// logits over a permuted index cache: every visible entry within the
+// prefill logits kernel's tolerance (a tensor-core fp32 dot against the
+// oracle's), -inf past the row's visible count, rows at -1 / 0 / a partial
+// tile / the pool's end (a row never sees past the gathered keys), a
+// tile-aligned and a ragged pool, and the plain,
+// candidate and restricted selections over those logits equal to the
+// oracle's over the kernel's own logits (the selection kernels unchanged).
+DGPP_TEST(csa2_fused_prefill_scores_match_the_oracle) {
+  for (const int n : {5000, 4096, 131}) {
+    const std::vector<int64_t> positions{-1, 0, 1, 127, 128, 129, int64_t(n) - 2, int64_t(n) - 1, int64_t(n) / 3, 2500 % n};
+    SelectFixture fx(n, 128, positions, 0x5C02Eull + uint64_t(n));
+    const int rows = fx.rows;
+    const int64_t stride = (n + 255) / 256 * 256;
+    // The gathered (logical-order) keys and scales, as the layer gathers them.
+    std::vector<uint8_t> kl(size_t(n) * 128);
+    std::vector<float> ksl(static_cast<size_t>(n), 0.0f);
+    for (int e = 0; e < n; ++e) {
+      const int slot = fx.table[size_t(e / fx.epb)] * fx.epb + e % fx.epb;
+      std::copy(fx.k.begin() + size_t(slot) * 128, fx.k.begin() + size_t(slot + 1) * 128, kl.begin() + size_t(e) * 128);
+      ksl[size_t(e)] = fx.ks[size_t(slot)];
+    }
+    DevBuf dkl = upload(kl), dksl = upload(ksl), dlog(size_t(rows) * stride * 4);
+    DGPP_CUDA_OK(cudaMemset(dlog.p, 0x7f, size_t(rows) * stride * 4));  // a NaN fill: every written cell shows
+    dgpp::csa2_score_prefill(fx.dq8.p, dkl.p, static_cast<const float*>(fx.dwf.p), static_cast<const float*>(dksl.p),
+                             fx.ps(), rows, n, 32, static_cast<float*>(dlog.p), stride, 0);
+    sync();
+    const auto lg = download<float>(dlog, size_t(rows) * stride);
+    std::vector<float> lg_ref(size_t(rows) * n);
+    int exact = 0, checked = 0;
+    for (int r = 0; r < rows; ++r) {
+      const int64_t visible = std::min<int64_t>(std::max<int64_t>(fx.pos_sel[size_t(r)] + 1, 0), n);
+      for (int e = 0; e < n; ++e) {
+        const float got = lg[size_t(r) * stride + e];
+        if (e >= visible) {
+          require(got == -INFINITY, "fused prefill: invisible entries are -inf");
+          lg_ref[size_t(r) * n + e] = -INFINITY;
+          continue;
+        }
+        const float want = fx.logits[size_t(r) * n + e];
+        require(std::isfinite(got), "fused prefill: finite logit");
+        require(std::fabs(got - want) <= 1e-5f * std::max(1.0f, std::fabs(want)),
+                "fused prefill logit row " + std::to_string(r) + " entry " + std::to_string(e) + ": got " +
+                    std::to_string(got) + " want " + std::to_string(want));
+        exact += got == want;
+        ++checked;
+        lg_ref[size_t(r) * n + e] = got;
+      }
+    }
+    // The oracle's fp32 dot is a sequential sum, the tensor cores' another
+    // order: near-equal, as the GEMM chain's was (the tolerance above).
+    (void)exact;
+    (void)checked;
+    // The selection kernels over the fused logits, against the oracle over the same logits.
+    constexpr int select_k = 32, block_size = 8, topk_blocks = 64, cand_stride = topk_blocks;
+    DevBuf dtop(size_t(rows) * select_k * 4), dcnt(rows * 4), dcp(size_t(rows) * cand_stride * 4), dcpc(rows * 4);
+    dgpp::csa2_select_candidates_prefill(static_cast<const float*>(dlog.p), stride, fx.ps(), rows, block_size, topk_blocks,
+                                         static_cast<int32_t*>(dcp.p), static_cast<int32_t*>(dcpc.p), 0);
+    dgpp::csa2_select_rows_prefill(static_cast<const float*>(dlog.p), stride, fx.ps(), rows, select_k,
+                                   static_cast<const int32_t*>(dcp.p), cand_stride, static_cast<const int32_t*>(dcpc.p),
+                                   block_size, static_cast<int32_t*>(dtop.p), static_cast<int32_t*>(dcnt.p), 0);
+    sync();
+    const auto top = download<int32_t>(dtop, size_t(rows) * select_k);
+    const auto cnt = download<int32_t>(dcnt, rows);
+    const auto cp = download<int32_t>(dcp, size_t(rows) * cand_stride);
+    const auto cpc = download<int32_t>(dcpc, rows);
+    for (int r = 0; r < rows; ++r) {
+      const int64_t visible = std::min<int64_t>(std::max<int64_t>(fx.pos_sel[size_t(r)] + 1, 0), n);
+      auto c = ref_candidate_blocks(&lg_ref[size_t(r) * n], visible, block_size, topk_blocks);
+      require(cpc[size_t(r)] == int(c.size()), "fused prefill: candidate count");
+      const auto want = ref_topk_among(&lg_ref[size_t(r) * n], ref_pool_entries(c, visible, block_size), visible, select_k);
+      require(cnt[size_t(r)] == int(want.size()), "fused prefill: restricted count row " + std::to_string(r));
+      for (int i = 0; i < select_k; ++i)
+        require(top[size_t(r) * select_k + i] == (i < int(want.size()) ? want[size_t(i)] : -1),
+                "fused prefill: restricted selection row " + std::to_string(r));
+    }
+  }
+}
+
+namespace {
+template <typename T>
+std::vector<T> fused_dl(const DevBuf& d, size_t n) {
+  std::vector<T> v(n);
+  d.download(v.data(), n * sizeof(T));
+  return v;
+}
+}  // namespace
+
+DGPP_TEST(csa2_norms_rope_is_bitwise_the_three_kernels) {
+  // The fused norms + kv rope launch against rmsnorm x2 and rope_apply on the same rows (2026-10-20).
+  const int rows = 5, q_dim = 1280, kv_dim = dgpp::kCsa2Latent, rope_dim = dgpp::kCsa2Rope, half = rope_dim / 2, off = kv_dim - rope_dim;
+  auto q = random_bf16_bits(0x51, int64_t(rows) * q_dim, -3, 3), kv = random_bf16_bits(0x52, int64_t(rows) * kv_dim, -3, 3);
+  auto qw = random_bf16_bits(0x53, q_dim, -1, 1), kw = random_bf16_bits(0x54, kv_dim, -1, 1);
+  std::vector<int64_t> pos = {0, 7, 1000, -1, 65535};
+  std::vector<float> inv_h(static_cast<size_t>(half), 0.0f);
+  for (int i = 0; i < half; ++i) inv_h[size_t(i)] = 1.0f / std::pow(10000.0f, float(2 * i) / float(2 * half));
+  DevBuf dqa = upload(q), dqb = upload(q), dka = upload(kv), dkb = upload(kv), dqw = upload(qw), dkw = upload(kw);
+  DevBuf dpos = upload(pos), dinv(inv_h.size() * 4);
+  dinv.upload(inv_h.data(), inv_h.size() * 4);
+  const float eps = 1e-6f;
+  dgpp::csa2_rmsnorm_bf16(dqa.p, q_dim, dqw.p, dqa.p, q_dim, rows, q_dim, eps, nullptr);
+  dgpp::csa2_rmsnorm_bf16(dka.p, kv_dim, dkw.p, dka.p, kv_dim, rows, kv_dim, eps, nullptr);
+  dgpp::csa2_rope_apply(static_cast<uint16_t*>(dka.p) + off, kv_dim, kv_dim, 1, rope_dim, static_cast<const int64_t*>(dpos.p),
+                        static_cast<const float*>(dinv.p), false, rows, nullptr);
+  dgpp::csa2_norms_rope(dqb.p, q_dim, dqw.p, q_dim, dkb.p, kv_dim, dkw.p, kv_dim, eps, off, rope_dim,
+                        static_cast<const int64_t*>(dpos.p), static_cast<const float*>(dinv.p), rows, nullptr);
+  sync();
+  const auto qa = fused_dl<uint16_t>(dqa, q.size()), qb = fused_dl<uint16_t>(dqb, q.size());
+  const auto ka = fused_dl<uint16_t>(dka, kv.size()), kb = fused_dl<uint16_t>(dkb, kv.size());
+  require(qa == qb, "the fused q norm is bitwise rmsnorm");
+  require(ka == kb, "the fused kv norm + rope is bitwise rmsnorm + rope_apply");
+}
+
+DGPP_TEST(dsa_decode_tail_is_bitwise_the_five_kernels) {
+  // The fused decode tail (q rope, ring slot, window slots, entry positions, the ring append) against the five
+  // launches it replaces (2026-10-20), fp8-block ring rows of 512 + 16 bytes.
+  const int rows = 5, lh = 16, rope_dim = dgpp::kCsa2Rope, half = rope_dim / 2, latent = dgpp::kCsa2Latent, off = latent - rope_dim;
+  const int ring_slots = 64, window = 16, ratio = 2, n_req = 2;
+  auto q = random_bf16_bits(0x61, int64_t(rows) * lh * latent, -3, 3), kv = random_bf16_bits(0x62, int64_t(rows) * latent, -3, 3);
+  std::vector<int64_t> pos = {5, 6, 0, 1, -1};
+  std::vector<int32_t> req = {0, 0, 1, 1, 0}, table = {0, 1};
+  std::vector<float> inv_h(static_cast<size_t>(half), 0.0f);
+  for (int i = 0; i < half; ++i) inv_h[size_t(i)] = 1.0f / std::pow(10000.0f, float(2 * i) / float(2 * half));
+  const size_t row_bytes = 528, ring_bytes = size_t(n_req) * ring_slots * row_bytes;
+  DevBuf dqa = upload(q), dqb = upload(q), dkv = upload(kv), dpos = upload(pos), dreq = upload(req), dtab = upload(table), dinv(inv_h.size() * 4);
+  dinv.upload(inv_h.data(), inv_h.size() * 4);
+  DevBuf dsa_(size_t(rows) * 8), dsb(size_t(rows) * 8), dla(size_t(rows) * window * 4), dlb(size_t(rows) * window * 4);
+  DevBuf dca(size_t(rows) * 4), dcb(size_t(rows) * 4), dea(size_t(rows) * 8), deb(size_t(rows) * 8), dra(ring_bytes), drb(ring_bytes);
+  DGPP_CUDA_OK(cudaMemset(dra.p, 0x5a, ring_bytes));
+  DGPP_CUDA_OK(cudaMemset(drb.p, 0x5a, ring_bytes));
+  // the five launches
+  dgpp::csa2_rope_apply(static_cast<uint16_t*>(dqa.p) + off, int64_t(lh) * latent, latent, lh, rope_dim,
+                        static_cast<const int64_t*>(dpos.p), static_cast<const float*>(dinv.p), false, rows, nullptr);
+  dgpp::csa2_ring_slot_positions(static_cast<const int64_t*>(dpos.p), static_cast<int64_t*>(dsa_.p), rows, ring_slots, nullptr);
+  dgpp::dsa_latent_append(dkv.p, static_cast<const int32_t*>(dreq.p), static_cast<const int64_t*>(dsa_.p), rows,
+                          static_cast<const int32_t*>(dtab.p), 1, ring_slots, dra.p, latent, nullptr, LatentFormat::kFp8Block);
+  dgpp::csa2_window_slots_decode(static_cast<const int64_t*>(dpos.p), rows, window, ring_slots, static_cast<int32_t*>(dla.p),
+                                 static_cast<int32_t*>(dca.p), nullptr);
+  dgpp::csa2_entry_positions(static_cast<const int64_t*>(dpos.p), static_cast<int64_t*>(dea.p), rows, ratio, nullptr);
+  // the fused tail
+  dgpp::dsa_decode_tail_fp8block(static_cast<uint16_t*>(dqb.p) + off, int64_t(lh) * latent, latent, lh, rope_dim,
+                                 static_cast<const int64_t*>(dpos.p), static_cast<const float*>(dinv.p),
+                                 static_cast<int64_t*>(dsb.p), ring_slots, window, static_cast<int32_t*>(dlb.p),
+                                 static_cast<int32_t*>(dcb.p), static_cast<int64_t*>(deb.p), ratio, dkv.p,
+                                 static_cast<const int32_t*>(dreq.p), static_cast<const int32_t*>(dtab.p), drb.p, latent, rows,
+                                 nullptr);
+  sync();
+  require(fused_dl<uint16_t>(dqa, q.size()) == fused_dl<uint16_t>(dqb, q.size()), "the tail's q rope is bitwise rope_apply");
+  require(fused_dl<int64_t>(dsa_, size_t(rows)) == fused_dl<int64_t>(dsb, size_t(rows)), "the tail's ring slots match");
+  require(fused_dl<int32_t>(dla, size_t(rows) * window) == fused_dl<int32_t>(dlb, size_t(rows) * window), "the tail's window lists match");
+  require(fused_dl<int32_t>(dca, size_t(rows)) == fused_dl<int32_t>(dcb, size_t(rows)), "the tail's window counts match");
+  require(fused_dl<int64_t>(dea, size_t(rows)) == fused_dl<int64_t>(deb, size_t(rows)), "the tail's entry positions match");
+  require(fused_dl<uint8_t>(dra, ring_bytes) == fused_dl<uint8_t>(drb, ring_bytes), "the tail's ring append is bitwise dsa_latent_append");
 }
 
 int main() { return dgpp::test::run_all(); }

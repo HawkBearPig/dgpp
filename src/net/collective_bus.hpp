@@ -26,6 +26,18 @@ namespace dgpp::net {
 
 enum class BusMessageClass { kLatency, kBulk };
 
+// The latency class's collective transport for the graph and stream
+// collectives (the decode step's folds and the pick's), 2026-10-19:
+//   kSend  — payload + doorbell SEND pairs into the peer's receive ring,
+//            claimed through door cells by a single-block kernel, hash-
+//            gated, acked and credited (the form until 2026-10-19);
+//   kWrite — the row laid out as self-describing chunks and RDMA-WRITTEN
+//            into the peer's write ring, folded by a grid of warps as the
+//            chunks prove themselves (bus_types.hpp, "The write ring").
+// The eager one-shot (allreduce/allreduce_staged) and the harness keep the
+// send machinery either way; the bulk class is separate.
+enum class BusLatencyTransport { kSend, kWrite };
+
 struct BusOptions {
   int world_size = 2;  // TP group size; ranks are 0..world_size-1
   int my_rank = 0;
@@ -74,6 +86,8 @@ struct BusOptions {
   // whose peers already posted can finish before its own engine has
   // posted. Production leaves it 0.
   int debug_pass_delay_us = 0;
+
+  BusLatencyTransport latency_transport = BusLatencyTransport::kSend;
 
   int qp_depth = 1024;
   int completion_timeout_ms = 5000;  // engine watchdog per request

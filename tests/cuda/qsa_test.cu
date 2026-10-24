@@ -9,6 +9,7 @@
 // within two ulps. Plus the frozen plain rope table and the YaRN cos/sin
 // scale itself.
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -762,6 +763,75 @@ DGPP_TEST(qsa_request_bounded_workspace_preserves_scores_selection_and_graphs) {
   }
 }
 
+DGPP_TEST(qsa_prefill_score_order_matches_single_rows_and_graphs_bitwise) {
+  // A row at a time retains the decode traversal and serves as an independent
+  // launch-order oracle. Cross the prefill threshold, a partial score stripe,
+  // and a cache larger than L2; requests use disjoint, shuffled physical pages.
+  constexpr int dim = 128, ppb = 16, kpool = 4, select_k = 512, guard = 16;
+  cudaStream_t stream = test_stream();
+  for (auto shape : {std::array<int, 3>{127, 2049, 1}, {128, 2049, 4},
+                     {129, 2049, 4}, {129, 131073, 4}}) {
+    const auto [rows, pools, heads] = shape;
+    const int blocks = (pools + ppb - 1) / ppb, stride = blocks * ppb;
+    const int qstride = heads * dim + 32;
+    std::vector<int32_t> table(2 * blocks);
+    std::iota(table.begin(), table.end(), 0);
+    std::mt19937 rng(133);
+    std::shuffle(table.begin(), table.end(), rng);
+    const auto cache = random_bf16_normal(133, int64_t(2) * stride * dim, 1.f);
+    const auto query = random_bf16_normal(134, int64_t(rows) * qstride, 1.f);
+    std::vector<int32_t> req(rows);
+    std::vector<int64_t> pos(rows);
+    for (int r = 0; r < rows; ++r) {
+      req[r] = r % 2;
+      pos[r] = r % 11 == 0 ? -1 : int64_t(pools) * kpool - rows + r;
+    }
+    DevBuf dc = up(cache), dq = up(query), dt = up(table), dr = up(req), dp = up(pos);
+    const size_t n = size_t(rows) * stride + 2 * guard;
+    DevBuf batched(n * sizeof(uint64_t)), serial(n * sizeof(uint64_t));
+    auto launch = [&](bool one_row) {
+      for (int r = 0; r < (one_row ? rows : 1); ++r)
+        dgpp::qsa_index_score(ptr<uint16_t>(dq) + size_t(r) * qstride, qstride,
+            ptr<int32_t>(dr) + r, ptr<int64_t>(dp) + r, one_row ? 1 : rows,
+            ptr<int32_t>(dt), blocks, ptr<uint16_t>(dc), ppb, heads, dim, kpool,
+            mptr<uint64_t>(one_row ? serial : batched) + guard + size_t(r) * stride,
+            stride, stream, pools, select_k);
+    };
+    DGPP_CUDA_OK(cudaMemsetAsync(batched.p, 0xff, batched.bytes, stream));
+    DGPP_CUDA_OK(cudaMemsetAsync(serial.p, 0xff, serial.bytes, stream));
+    launch(true);
+    launch(false);
+    DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+    auto expected = down<uint64_t>(serial, n);
+    require(down<uint64_t>(batched, n) == expected,
+            "prefill traversal changed scoring keys, padding or inactive rows");
+    for (int i = 0; i < guard; ++i)
+      require(expected[i] == UINT64_MAX && expected[n - 1 - i] == UINT64_MAX,
+              "score traversal overwrote a workspace guard");
+    cudaGraph_t graph;
+    cudaGraphExec_t exec;
+    DGPP_CUDA_OK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
+    launch(false);
+    DGPP_CUDA_OK(cudaStreamEndCapture(stream, &graph));
+    DGPP_CUDA_OK(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
+    // Replay with different row metadata, including newly active/inactive rows.
+    std::reverse(pos.begin(), pos.end());
+    DGPP_CUDA_OK(cudaMemcpyAsync(dp.p, pos.data(), pos.size() * sizeof(int64_t),
+                                cudaMemcpyHostToDevice, stream));
+    DGPP_CUDA_OK(cudaMemsetAsync(batched.p, 0xff, batched.bytes, stream));
+    DGPP_CUDA_OK(cudaMemsetAsync(serial.p, 0xff, serial.bytes, stream));
+    launch(true);
+    DGPP_CUDA_OK(cudaGraphLaunch(exec, stream));
+    DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+    require(down<uint64_t>(batched, n) == down<uint64_t>(serial, n),
+            "prefill scoring graph replay changed keys or padding");
+    DGPP_CUDA_OK(cudaGraphExecDestroy(exec));
+    DGPP_CUDA_OK(cudaGraphDestroy(graph));
+    std::printf("[ .. ] score traversal: %d rows, %d pools, %d heads, eager/graph exact\n",
+                rows, pools, heads);
+  }
+}
+
 DGPP_TEST(qsa_index_large_paged_pools_match_every_host_key_and_token) {
   // Preserve the reviewer's 65322-pool / position-261288 case as a normal
   // gate, then cross the 128K-pool boundary. Neither the score stripe nor
@@ -924,7 +994,7 @@ DGPP_TEST(qsa_listed_attention_and_gate_match_the_reference) {
     DevBuf dreq = up(req_ids), dpos = up(pos);
     dgpp::qsa_kv_append(ptr<uint16_t>(dk), width, ptr<uint16_t>(dv), width, ptr<int32_t>(dreq), ptr<int64_t>(dpos),
                         g.seq, ptr<int32_t>(sf.f.dtable), g.blocks_per_request, g.block_tokens, g.kv_heads, g.dim,
-                        mptr<uint16_t>(kc), mptr<uint16_t>(vc), st);
+                        mptr<uint16_t>(kc), mptr<uint16_t>(vc), nullptr, nullptr, st);
   }
   // Queries with the [q | gate] interleave; the reference lists.
   const int64_t q_head_stride = 2 * g.dim, q_row_stride = g.local_heads * q_head_stride;
@@ -971,7 +1041,7 @@ DGPP_TEST(qsa_listed_attention_and_gate_match_the_reference) {
                              ptr<uint16_t>(vc), ptr<int32_t>(sf.dreq), ptr<int32_t>(dtopk), g.max_selected(),
                              ptr<int32_t>(dcounts), rows, n_split, g.local_heads, g.kv_heads, g.dim, g.block_tokens,
                              ptr<int32_t>(sf.f.dtable), g.blocks_per_request, 1.0f / 16.0f, mptr<float>(m_ws),
-                             mptr<float>(l_ws), mptr<float>(c_ws), st);
+                             mptr<float>(l_ws), mptr<float>(c_ws), st, nullptr, nullptr);
       dgpp::dsa_attn_combine(ptr<float>(m_ws), ptr<float>(l_ws), ptr<float>(c_ws), rows, n_split, g.local_heads, g.dim,
                              mptr<float>(c_out), st);
       dgpp::qsa_gate_out(ptr<float>(c_out), ptr<uint16_t>(dqg) + g.dim, q_row_stride, q_head_stride, mptr<uint16_t>(out),
@@ -1079,7 +1149,7 @@ DGPP_TEST(qsa_prefill_partials_preserve_arithmetic_and_graph_replay) {
            ptr<int32_t>(dtopk), stride, ptr<int32_t>(dcounts), rows, splits, heads, kv_heads, dim,
            block_tokens, ptr<int32_t>(dtable), blocks, 1.0f / 16,
            mptr<float>(candidate ? m1 : m0), mptr<float>(candidate ? l1 : l0),
-           mptr<float>(candidate ? c1 : c0), stream);
+           mptr<float>(candidate ? c1 : c0), stream, nullptr, nullptr);
       };
       launch(false);
       launch(true);

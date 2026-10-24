@@ -1412,6 +1412,14 @@ bool Scheduler::tick(std::optional<int64_t> prefill_budget) {
   const auto started = prefill_budget ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
   const int64_t computed = prefill_chunk_computed_tokens_, offered = prefill_chunk_budget_tokens_;
   const int64_t context = prefill_budget ? prefill_context() : 0;  // where this chunk starts
+  // A tick that can only step: decoders, and nothing queued or reading.
+  // Its duration is the pass a mixed tick at this load pays before it
+  // reads a token (PrefillLatencyController::observe_decode).
+  const bool decode_only = prefill_budget && decoders > 0 &&
+      std::none_of(requests_.begin(), requests_.end(), [](const Request& r) {
+        return r.state == State::kQueued || r.state == State::kPrefilling;
+      });
+  const int64_t steps = decode_steps_;
   prefill_pass_budget_tokens_ = 0;
   const bool more = quantum(prefill_budget);
   // A completed group measures final projection/admission work as well as a
@@ -1423,6 +1431,11 @@ bool Scheduler::tick(std::optional<int64_t> prefill_budget) {
         std::max(prefill_pass_budget_tokens_, prefill_chunk_budget_tokens_ - offered),
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count(),
         policy_.prefill_latency);
+  else if (decode_only && decode_steps_ > steps && prefill_chunk_computed_tokens_ == computed)
+    prefill_latency_.observe_decode(decoders,
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count(),
+        policy_.prefill_latency);
+  if (prefill_budget) prefill_decode_pass_ms_ = prefill_latency_.decode_pass(decoders);
   compact_retired();
   return more;
 }
@@ -1851,6 +1864,7 @@ Scheduler::Meters Scheduler::meters() const {
   m.prefill_chunk_available_tokens = prefill_chunk_available_tokens_;
   m.prefill_chunk_computed_tokens = prefill_chunk_computed_tokens_;
   m.prefill_adaptive_limit_tokens = prefill_adaptive_limit_tokens_;
+  m.prefill_decode_pass_ms = prefill_decode_pass_ms_;
   m.mixed_steps = mixed_steps_;
   m.mixed_ms = mixed_ms_;
   m.prefill_ms = prefill_ms_;

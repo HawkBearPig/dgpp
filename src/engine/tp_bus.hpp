@@ -98,6 +98,14 @@ struct BusBoundaryReducer final : BoundaryReducer {
     if (async_id_ == 0) throw std::runtime_error("boundary reduce: bulk rejected: " + err);
     return true;
   }
+  bool begin_async_after(uint16_t* partial, int rows, int hidden, void* ready) override {
+    const size_t total = static_cast<size_t>(rows > 0 ? rows : 0) * static_cast<size_t>(hidden > 0 ? hidden : 0);
+    if (ready == nullptr || staged_ != nullptr || async_id_ != 0 || hidden <= 0 || hidden % 2 != 0 ||
+        static_cast<size_t>(hidden) > max_elems_ || total <= 2 * max_elems_)
+      return false;
+    DGPP_CUDA_OK(cudaEventSynchronize(static_cast<cudaEvent_t>(ready)));
+    return begin_async(partial, rows, hidden);
+  }
   void end_async() override {
     if (async_id_ == 0) return;
     step_timing::Scope tick(step_timing::kFold);
@@ -272,6 +280,20 @@ class BusStreamReducer final : public BoundaryReducer {
     if (stream_ == nullptr || async_id_ != 0 || hidden <= 0 || hidden % 2 != 0 || total <= max_elems_) return false;
     settle();
     DGPP_CUDA_OK(cudaStreamSynchronize(stream_));
+    std::string err;
+    async_id_ = bus_.allreduce_bulk(partial, partial, total, &err);
+    if (async_id_ == 0) throw std::runtime_error("boundary reduce: bulk rejected: " + err);
+    return true;
+  }
+  // The same fold behind the producers' event: the stream's folds settle
+  // and the host waits for the event alone, so the rows the caller
+  // enqueued after it keep the GPU while the bulk machine takes the buffer.
+  bool begin_async_after(uint16_t* partial, int rows, int hidden, void* ready) override {
+    const size_t total = static_cast<size_t>(rows > 0 ? rows : 0) * static_cast<size_t>(hidden > 0 ? hidden : 0);
+    if (ready == nullptr || stream_ == nullptr || async_id_ != 0 || hidden <= 0 || hidden % 2 != 0 || total <= max_elems_)
+      return false;
+    settle();
+    DGPP_CUDA_OK(cudaEventSynchronize(static_cast<cudaEvent_t>(ready)));
     std::string err;
     async_id_ = bus_.allreduce_bulk(partial, partial, total, &err);
     if (async_id_ == 0) throw std::runtime_error("boundary reduce: bulk rejected: " + err);
@@ -903,9 +925,7 @@ inline SamplingFold bus_sampling_fold(
         "sampling prefix: candidate table exceeds one latency slot");
 
   std::vector<float> adjusted(logits, logits + vocab_count);
-  sample::apply_penalties(adjusted.data(), vocab_count, vocab_begin,
-                              params,
-                              sample::count_context(context_ids));
+  sample::apply_context_penalties(adjusted.data(), vocab_count, vocab_begin, params, context_ids);
   sample::apply_bias(adjusted.data(), vocab_count, vocab_begin, bias);
   const bool constrained = mask != nullptr && mask->constrained();
   if (constrained)

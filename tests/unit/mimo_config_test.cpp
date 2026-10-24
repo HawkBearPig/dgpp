@@ -112,9 +112,10 @@ DGPP_TEST(mimo_config_refuses_unsupported_shapes) {
 DGPP_TEST(mimo_config_reads_the_landed_checkpoint) {
   namespace fs = std::filesystem;
   const char* home = std::getenv("HOME");
-  if (!home) return;
+  if (!home) dgpp::test::skip("HOME is unset; checkpoint cache unavailable");
   const fs::path root = fs::path(home) / ".cache/huggingface/hub/models--XiaomiMiMo--MiMo-V2.6-Flash-RL/snapshots";
-  if (!fs::is_directory(root)) return;
+  if (!fs::is_directory(root))
+    dgpp::test::skip("checkpoint snapshot directory absent: " + root.string());
   for (const auto& snap : fs::directory_iterator(root)) {
     const fs::path cfg = snap.path() / "config.json";
     if (!fs::exists(cfg)) continue;
@@ -123,6 +124,7 @@ DGPP_TEST(mimo_config_reads_the_landed_checkpoint) {
     require(c.num_swa_layers() == 39, "landed pattern");
     return;
   }
+  dgpp::test::skip("no eligible checkpoint config under " + root.string());
 }
 
 DGPP_TEST(mimo_native_mtp_config_preserves_no_draft_and_rejects_incomplete_heads) {

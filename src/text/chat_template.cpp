@@ -299,12 +299,48 @@ std::vector<ETok> lex_expr(std::string_view s, size_t line) {
       while (i < s.size() && s[i] != c) {
         if (s[i] == '\\' && i + 1 < s.size()) {
           const char e = s[i + 1];
+          auto hex_run = [&](size_t at, size_t n, uint32_t* v) {
+            if (at + n > s.size()) return false;
+            uint32_t acc = 0;
+            for (size_t k = 0; k < n; ++k) {
+              const char h = s[at + k];
+              const int d = h >= '0' && h <= '9' ? h - '0' : h >= 'a' && h <= 'f' ? h - 'a' + 10 : h >= 'A' && h <= 'F' ? h - 'A' + 10 : -1;
+              if (d < 0) return false;
+              acc = acc * 16 + static_cast<uint32_t>(d);
+            }
+            *v = acc;
+            return true;
+          };
+          auto push_utf8 = [&](uint32_t cp) {
+            if (cp < 0x80) str.push_back(static_cast<char>(cp));
+            else if (cp < 0x800) {
+              str.push_back(static_cast<char>(0xC0 | (cp >> 6)));
+              str.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+            } else {
+              str.push_back(static_cast<char>(0xE0 | (cp >> 12)));
+              str.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+              str.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+            }
+          };
+          uint32_t code = 0;
           switch (e) {
             case 'n': str.push_back('\n'); break;
             case 't': str.push_back('\t'); break;
             case 'r': str.push_back('\r'); break;
             case 'b': str.push_back('\b'); break;
             case 'f': str.push_back('\f'); break;
+            // Python's \xHH (one byte / codepoint < 0x100) and \uHHHH
+            // escapes (the Flint template's "\x00"), as UTF-8.
+            case 'x':
+              if (!hex_run(i + 2, 2, &code)) fail(line, "string: \\x needs two hex digits");
+              push_utf8(code);
+              i += 2;
+              break;
+            case 'u':
+              if (!hex_run(i + 2, 4, &code)) fail(line, "string: \\u needs four hex digits");
+              push_utf8(code);
+              i += 4;
+              break;
             default: str.push_back(e);
           }
           i += 2;
@@ -467,7 +503,7 @@ class ExprParser {
       const bool inv = accept_kw("not");
       if (peek().t != ETok::T::Ident) fail(line_, "'is' needs a test name");
       static const char* kTests[] = {"defined", "undefined", "none", "string",
-                                     "mapping", "iterable", "true", "false"};
+                                     "mapping", "sequence", "iterable", "true", "false"};
       ExprPtr e = make(Expr::Tag::Test);
       e->name = peek().s;
       e->inverted = inv;
@@ -775,7 +811,25 @@ class StmtParser {
       const std::string rest =
           sp == std::string::npos ? std::string() : body.substr(sp + 1);
       if (kw == "set") {
-        out.push_back(parse_set(rest, t.line));
+        // {% set name %} ... {% endset %}: the body's render is the value
+        // (the Flint template's tool preamble); {% set name = expr %}
+        // otherwise.
+        const size_t rb = rest.find_first_not_of(" \t");
+        const std::string target = rb == std::string::npos ? std::string() : rest.substr(rb, rest.find_last_not_of(" \t") - rb + 1);
+        if (!target.empty() && target.find('=') == std::string::npos) {
+          if (target.find_first_of(" \t.,") != std::string::npos) fail(t.line, "set: block set target must be one name");
+          auto s = std::make_unique<Stmt>();
+          s->tag = Stmt::Tag::Set;
+          s->line = t.line;
+          s->target = target;
+          ++pos_;
+          static const char* kSetTerm[] = {"endset"};
+          std::string ended;
+          s->body = parse_statements(kSetTerm, 1, &ended);
+          out.push_back(std::move(s));
+        } else {
+          out.push_back(parse_set(rest, t.line));
+        }
       } else if (kw == "if") {
         out.push_back(parse_if(t.line, rest));
       } else if (kw == "for") {
@@ -1692,6 +1746,8 @@ struct Renderer {
           r = v.kind() == Value::Kind::String;
         else if (e.name == "mapping")
           r = v.kind() == Value::Kind::Map;  // namespaces are not mappings
+        else if (e.name == "sequence")
+          r = v.kind() == Value::Kind::String || v.kind() == Value::Kind::List;  // Jinja: str counts
         else  // iterable (strings, lists and maps — Python truth)
           r = v.kind() == Value::Kind::String || v.kind() == Value::Kind::List ||
               v.kind() == Value::Kind::Map;
@@ -1733,7 +1789,11 @@ struct Renderer {
           *out += eval(*s->expr).to_output_string();
           break;
         case Stmt::Tag::Set:
-          if (s->target_attr.empty()) {
+          if (!s->expr) {  // the block form: the body's render is the value
+            std::string captured;
+            exec(s->body, &captured);
+            ctx_.set(s->target, Value::string_value(captured));
+          } else if (s->target_attr.empty()) {
             ctx_.set(s->target, eval(*s->expr));
           } else {
             const Value* base = ctx_.find(s->target);
@@ -1863,7 +1923,8 @@ void collect_global_reads(const std::vector<StmtPtr>& body,
         collect_name_reads(*s->expr, bound, out);
         break;
       case Stmt::Tag::Set:
-        collect_name_reads(*s->expr, bound, out);
+        if (s->expr) collect_name_reads(*s->expr, bound, out);
+        else collect_global_reads(s->body, bound, out);  // the block form
         // From here down the scope, this name is the template's own.
         // (A {% set ns.attr = value %} target binds no name.)
         if (s->target_attr.empty()) bound.push_back(s->target);

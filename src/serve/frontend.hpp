@@ -29,13 +29,17 @@ namespace dgpp::serve {
 
 class TextFrontend : public ModelFrontend {
  public:
+  // model_opens_thinking: the family's declaration that its template's
+  // generation prompt opens no reasoning block and the model opens its
+  // own <think> (ChatMarkers::model_opens_thinking; ServeFamily states it).
   TextFrontend(const dgpp::text::Tokenizer* tok,
-              const dgpp::text::ChatTemplate* tpl)
+              const dgpp::text::ChatTemplate* tpl, bool model_opens_thinking = false)
       : tok_(tok), tpl_(tpl) {
     if (tok_ == nullptr || tpl_ == nullptr)
       throw std::invalid_argument(
           "TextFrontend: tokenizer and chat template must both be loaded");
     markers_ = dgpp::text::ChatMarkers::from_tokenizer(*tok_);
+    markers_.model_opens_thinking = model_opens_thinking;
   }
 
   std::vector<int64_t> encode_text(std::string_view text) const override {

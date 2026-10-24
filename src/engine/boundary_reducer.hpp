@@ -42,6 +42,13 @@ struct BoundaryReducer {
   // (nothing was submitted; call reduce()).
   virtual bool begin_async(uint16_t* /*partial*/, int /*rows*/, int /*hidden*/) { return false; }
   virtual void end_async() {}
+  // begin_async behind an EVENT (2026-10-18): the rows' producing kernels
+  // are ordered before `ready` (a cudaEvent_t the caller recorded on its
+  // stream), and the caller has already enqueued other rows' work behind
+  // them — the implementation waits for the event, not the stream, so the
+  // GPU keeps that work while the host submits the fold. The default folds
+  // nothing (false): the caller drains and calls begin_async().
+  virtual bool begin_async_after(uint16_t* /*partial*/, int /*rows*/, int /*hidden*/, void* /*ready*/) { return false; }
 
   // Measurement interface (2026-09-09, the Qwen plan's Q0): one extra collective
   // of `rows x cols` bf16 over a scratch buffer nobody reads, issued right

@@ -3,7 +3,8 @@
 // acceptance at the deployment worlds, and — when the checkpoint is in the
 // hub cache — the full binding against every shard's header (152 089
 // tensors: every expected one present with its dtype and shape, nothing
-// unexpected but the vision tower).
+// unexpected but the vision tower; the FP4-Local export's 375 487 likewise,
+// its 147 456 CSF scale sidecars counted and its 499 vision tensors).
 #include <filesystem>
 #include <stdexcept>
 #include <string>
@@ -61,11 +62,27 @@ std::filesystem::path qad_snapshot() {
   return {};
 }
 
-// Every tensor of every shard under `snap` (names, dtypes, shapes).
+std::filesystem::path fp4local_snapshot() {
+  namespace fs = std::filesystem;
+  const char* home = std::getenv("HOME");
+  if (!home) return {};
+  const fs::path root =
+      fs::path(home) / ".cache/huggingface/hub/models--nvidia--Qwen3.8-Flash-Next-FP4-Local/snapshots";
+  if (!fs::is_directory(root)) return {};
+  for (const auto& snap : fs::directory_iterator(root))
+    if (fs::exists(snap.path() / "config.json") &&
+        fs::exists(snap.path() / "model.safetensors.index.json"))
+      return snap.path();
+  return {};
+}
+
+// Every tensor of every shard under `snap` (names, dtypes, shapes): a
+// recursive walk, so layouts that keep shards in a subdirectory (the
+// FP4-Local export's tensors/) bind the same way.
 std::unordered_map<std::string, dgpp::QwenTensorDesc> snapshot_tensors(const std::filesystem::path& snap) {
   std::unordered_map<std::string, dgpp::QwenTensorDesc> present;
-  for (const auto& e : std::filesystem::directory_iterator(snap)) {
-    if (e.path().extension() != ".safetensors") continue;
+  for (const auto& e : std::filesystem::recursive_directory_iterator(snap)) {
+    if (!e.is_regular_file() || e.path().extension() != ".safetensors") continue;
     auto f = dgpp::SafetensorsFile::open(e.path().string());
     f->for_each([&](const dgpp::TensorInfo& t) { present.emplace(t.name, dgpp::QwenTensorDesc{t.dtype, t.shape}); });
   }
@@ -82,7 +99,9 @@ std::unordered_map<std::string, dgpp::QwenTensorDesc> snapshot_tensors(const std
 // weight-only draft triples), and the TP geometry holds at worlds 1, 2, 4.
 DGPP_TEST(qwen_binding_binds_the_qad_export_when_present) {
   const auto snap = qad_snapshot();
-  if (snap.empty()) return;
+  if (snap.empty())
+    dgpp::test::skip(
+        "required checkpoint snapshot unavailable: local-inference-lab/Qwen3.8-Flash-Next-NVFP4");
   const dgpp::QwenTextConfig cfg = dgpp::QwenTextConfig::from_json_file((snap / "config.json").string());
   require(cfg.dense_mxfp8_shipped && cfg.ngram_table_nvfp4 && cfg.mtp_experts_nvfp4 && cfg.norms_f32,
           "the QAD export's forms");
@@ -98,9 +117,31 @@ DGPP_TEST(qwen_binding_binds_the_qad_export_when_present) {
     for (int r = 0; r < w; ++r) dgpp::qwen_tp_validate_geometry(cfg, r, w);
 }
 
+DGPP_TEST(qwen_binding_binds_the_fp4local_export_when_present) {
+  const auto snap = fp4local_snapshot();
+  if (snap.empty()) dgpp::test::skip("required FP4-Local checkpoint unavailable");
+  const dgpp::QwenTextConfig cfg = dgpp::QwenTextConfig::from_json_file((snap / "config.json").string());
+  require(cfg.experts_nvfp4 && cfg.dense_mxfp8_shipped && cfg.mtp_experts_nvfp4 &&
+              cfg.ngram_table_nvfp4 && cfg.norms_f32 && cfg.experts_nvfp4_csf,
+          "the FP4-Local export's forms");
+  const auto present = snapshot_tensors(snap);
+  require(present.size() == 375487, "tensor count " + std::to_string(present.size()));
+  const dgpp::QwenBindReport rep = dgpp::qwen_validate_text_binding(cfg, present, 8);
+  std::string errs;
+  for (const auto& e : rep.errors) errs += "\n  " + e;
+  require(rep.ok(), "FP4-Local binding failed:" + errs);
+  require(rep.vision == 499, "vision tensors " + std::to_string(rep.vision));
+  require(rep.csf_sidecars == 147456, "CSF sidecars " + std::to_string(rep.csf_sidecars));
+  require(rep.matched == present.size() - rep.vision - rep.csf_sidecars,
+          "every text tensor matched via the table or a CSF sidecar");
+  for (const int w : {1, 2, 4})
+    for (int r = 0; r < w; ++r) dgpp::qwen_tp_validate_geometry(cfg, r, w);
+}
+
 DGPP_TEST(qwen_binding_table_has_the_release_shape) {
   const auto snap = landed_snapshot();
-  if (snap.empty()) return;
+  if (snap.empty())
+    dgpp::test::skip("required checkpoint snapshot unavailable: Qwen/Qwen3.8-Flash-Next-FP8");
   const dgpp::QwenTextConfig cfg = dgpp::QwenTextConfig::from_json_file((snap / "config.json").string());
   const auto table = dgpp::qwen_expected_text_tensors(cfg);
   // 152 089 tensors in the file less the 333 of the vision tower.
@@ -118,7 +159,8 @@ DGPP_TEST(qwen_binding_table_has_the_release_shape) {
 
 DGPP_TEST(qwen_tp_geometry_accepts_the_deployment_worlds) {
   const auto snap = landed_snapshot();
-  if (snap.empty()) return;
+  if (snap.empty())
+    dgpp::test::skip("required checkpoint snapshot unavailable: Qwen/Qwen3.8-Flash-Next-FP8");
   const dgpp::QwenTextConfig cfg = dgpp::QwenTextConfig::from_json_file((snap / "config.json").string());
   for (const int w : {1, 2, 4, 8})
     for (int r = 0; r < w; ++r) dgpp::qwen_tp_validate_geometry(cfg, r, w);
@@ -134,7 +176,8 @@ DGPP_TEST(qwen_tp_geometry_accepts_the_deployment_worlds) {
 DGPP_TEST(qwen_binding_validates_the_landed_checkpoint_when_present) {
   namespace fs = std::filesystem;
   const auto snap = landed_snapshot();
-  if (snap.empty()) return;
+  if (snap.empty())
+    dgpp::test::skip("required checkpoint snapshot unavailable: Qwen/Qwen3.8-Flash-Next-FP8");
   const dgpp::QwenTextConfig cfg = dgpp::QwenTextConfig::from_json_file((snap / "config.json").string());
   std::unordered_map<std::string, dgpp::QwenTensorDesc> present;
   std::vector<fs::path> shards;
@@ -211,7 +254,8 @@ DGPP_TEST(qwen_binding_table_has_the_autoround_hybrid_shape) {
 
 DGPP_TEST(qwen_binding_table_has_the_radixark_fused_shape) {
   const auto snap = radixark_snapshot();
-  if (snap.empty()) return;
+  if (snap.empty())
+    dgpp::test::skip("required checkpoint snapshot unavailable: RadixArk/Qwen3.8-Flash-Next-NVFP4");
   const dgpp::QwenTextConfig cfg = dgpp::QwenTextConfig::from_json_file((snap / "config.json").string());
   // The RadixArk NVFP4 checkpoint stores the MTP layer's experts as fused BF16
   // tensors, not per-expert FP8 — the loader encodes the slices to FP8 at load.
@@ -243,4 +287,33 @@ DGPP_TEST(qwen_binding_table_has_the_radixark_fused_shape) {
               "down_proj shape {E, H, I}");
     }
   }
+}
+
+DGPP_TEST(qwen_binding_requires_csf_sidecars_for_each_compressed_matrix) {
+  const auto cfg = qwenfx::tiny_fp4local_config();
+  require(cfg.experts_nvfp4_csf && !cfg.mtp_experts_nvfp4_csf, "backbone-only CSF fixture");
+  std::unordered_map<std::string, dgpp::QwenTensorDesc> present;
+  std::string fixed, exceptions;
+  for (const auto& e : dgpp::qwen_expected_text_tensors(cfg)) {
+    present.emplace(e.name, dgpp::QwenTensorDesc{e.dtype, e.shape});
+    if (e.role == dgpp::QwenTensorRole::Fp4Payload && e.layer != cfg.mtp_layer()) {
+      fixed = e.name + "_scale.nvfp4_csf_fixed";
+      exceptions = e.name + "_scale.nvfp4_csf_exceptions";
+      present.emplace(fixed, dgpp::QwenTensorDesc{dgpp::DType::U8, {e.shape[0] / 16, 16 * (1 + e.shape[1] / 16)}});
+      present.emplace(exceptions, dgpp::QwenTensorDesc{dgpp::DType::U32, {0}});
+    }
+  }
+  require(dgpp::qwen_validate_text_binding(cfg, present).ok(), "complete sidecars bind");
+  const auto saved = present.at(fixed);
+  present.erase(fixed);
+  require(dgpp::qwen_validate_text_binding(cfg, present).missing == 1, "missing sidecar refused");
+  present[fixed] = saved;
+  present[fixed].shape[0]++;
+  require(dgpp::qwen_validate_text_binding(cfg, present).shape_mismatch == 1, "wrong fixed geometry refused");
+  present[fixed] = saved;
+  present[exceptions].dtype = dgpp::DType::U8;
+  require(dgpp::qwen_validate_text_binding(cfg, present).dtype_mismatch == 1, "wrong exception dtype refused");
+  present[exceptions].dtype = dgpp::DType::U32;
+  present["mtp.layers.0.unexpected.weight_scale.nvfp4_csf_fixed"] = saved;
+  require(!dgpp::qwen_validate_text_binding(cfg, present).ok(), "sidecars outside the selected matrix refused");
 }

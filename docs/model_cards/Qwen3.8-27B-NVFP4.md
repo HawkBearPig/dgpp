@@ -38,7 +38,11 @@ projections and late-layer MLPs from per-token e4m3 activations on the e4m3
 tensor cores; decode rows keep bf16 activations. The templates enable it: on one Spark a 262K cold prefill went
 451 -> 316 s and an 11.5K prompt 11.4 -> 5.7 s, with HumanEval 158/164 (159 on
 the bf16 chain), GSM8K 295/300 (296) and schema extraction 100/100 (100) at
-the same seed over 300 items.
+the same seed over 300 items. Its TMA-staged W4A4 form (2026-10-16) read the
+last k-step's scale words before they had landed in some launches until
+2026-10-17; with the drain fixed the template's temperature-0 transcripts
+reproduce exactly across repetitions, plain decode against the drafter and
+solo against seven co-tenants, as the FP8 release's always did.
 
 `engine.kv_dtype: "fp8"` (2026-10-16) serves the release's own FP8
 `kv_cache_scheme`: every Full layer ships a `k_scale` and a `v_scale`
@@ -54,9 +58,9 @@ planes. The NVFP4 templates set it (the release's own cache recipe; `bf16`
 restores the wider cache) together with `engine.prefill_attention: "fp8"`
 below. Since 2026-10-17 the templates size that pool to the node: on one
 Spark 1,048,576 tokens (four full contexts) with a 16 GiB prefix arena
-(98 GiB planned; a world-1 boot ends 6–8 GiB below its plan at listening,
+(99.6 GiB planned with the image tower; a world-1 boot ends 6–8 GiB below its plan at listening,
 so the recipe leaves that room), on two and four Sparks 2,097,152 tokens (one full
-context per slot, full admission) with 32 GiB arenas (104 and 73 GiB a
+context per slot, full admission) with 32 GiB arenas (105 and 74 GiB a
 rank), the YaRN templates 1,130,496 and 1,048,576 tokens with 16 and 20 GiB
 arenas; until then every template carried 262,144 tokens and 1.5 GiB.
 With the attention math kept in bf16 on one Spark the 262K cold prefill reads 352 s against

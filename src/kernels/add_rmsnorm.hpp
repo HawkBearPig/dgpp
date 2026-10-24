@@ -31,4 +31,10 @@ constexpr int kAddRmsnormMaxDim = 8192;
 void add_rmsnorm_bf16(uint16_t* resid, const uint16_t* add, const uint16_t* weight, uint16_t* out,
                       int rows, int dim, float eps, cudaStream_t stream);
 
+// The one-rounding form (2026-10-22, docs/flint_plan.md D4 — Flint's
+// norms, the released reference's rmsnorm): the same add and fp64 sum,
+// then out[r, :] = bf16((resid * rstd) * w) in fp32 with ONE rounding.
+void add_rmsnorm_bf16_one(uint16_t* resid, const uint16_t* add, const uint16_t* weight, uint16_t* out,
+                          int rows, int dim, float eps, cudaStream_t stream);
+
 }  // namespace dgpp

@@ -1,4 +1,5 @@
 #include "kernels/doll_attention.hpp"
+#include "kernels/pdl.cuh"
 
 #include <assert.h>
 
@@ -26,6 +27,7 @@ __global__ void __launch_bounds__(128) gqa_causal_attn_kernel(
     const int* __restrict__ dev_nq,
     const int* __restrict__ dev_abs_first, int num_heads, int num_kv_heads,
     int head_dim, float softmax_scale) {
+  dgpp_pdl_wait();
   constexpr int kDh = 128;  // fast-path specialization; launcher guards
   assert(head_dim == kDh);
   extern __shared__ float sc[];  // [kMaxSeqCap] scores -> probabilities

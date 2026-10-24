@@ -42,6 +42,7 @@
 #include "common/cuda_check.hpp"
 #include "common/dtypes.hpp"
 #include "common/log.hpp"
+#include "common/bf16_residency.hpp"
 #include "common/test.hpp"
 #include "dsv41_fixture.hpp"
 #include "engine/tp_bus.hpp"
@@ -194,7 +195,12 @@ Stats compare(const std::vector<uint16_t>& got, const std::vector<uint16_t>& wan
   for (size_t i = 0; i < got.size(); ++i) {
     const double g = bf16_bits_to_float(got[i]), w = bf16_bits_to_float(want[i]);
     int u = bf16_ulps(got[i], want[i]);
-    if (std::fabs(g - w) <= 0.02 * rms) u = 0;
+    // The floor under the ulp count: a world's fold sums the ranks' bf16
+    // partials, each rounded at its own magnitude, so an element near
+    // zero whose partials cancel carries the partials' rounding (four
+    // partials of a few times the rms: a few percent of it) — 5 % of the
+    // layer's rms, which a defect's whole-row error dwarfs.
+    if (std::fabs(g - w) <= 0.05 * rms) u = 0;
     s.max_ulps = std::max(s.max_ulps, static_cast<double>(u));
     if (u > 128) ++s.hard;
     d2 += (g - w) * (g - w);
@@ -375,6 +381,20 @@ void check_world(int world, uint16_t port, const std::string& dir, const Dsv41Te
       const Stats s = compare(kept_got, kept_want);
       std::printf("[ .. ] world %d layer-local, layer %d (%d of %d rows routed alike): l2 %.3g max %g ulps hard %ld of %ld; worst row t%d %.3g\n",
                   world, l, kept, T, s.l2, s.max_ulps, s.hard, s.total, worst_row, worst);
+      if (s.hard > 0) {
+        // The hard elements themselves (the evidence: a value against its twin and the layer's rms).
+        double rms = 0;
+        for (uint16_t v : kept_want) rms += std::pow(bf16_bits_to_float(v), 2);
+        rms = std::sqrt(rms / std::max<size_t>(kept_want.size(), 1));
+        int shown = 0;
+        for (size_t i = 0; i < kept_got.size() && shown < 6; ++i) {
+          const double g = bf16_bits_to_float(kept_got[i]), w = bf16_bits_to_float(kept_want[i]);
+          if (std::fabs(g - w) <= 0.02 * rms || bf16_ulps(kept_got[i], kept_want[i]) <= 128) continue;
+          std::printf("[ .. ]   hard element %zu (row %zu, stream %zu, channel %zu): got %.5g want %.5g (rms %.4g)\n", i, i / W,
+                      (i % W) / (W / 4), (i % W) % (W / 4), g, w, rms);
+          ++shown;
+        }
+      }
       budget(kept >= T - 2 && s.l2 < 0.01 && s.hard == 0,
              "world " + std::to_string(world) + " layer " + std::to_string(l) + " layer-local outside the numerics budget");
     }
@@ -602,6 +622,329 @@ DGPP_TEST(dsv41_tp_loopback_worlds_2_and_4_match_world_1_at_decode_rows) {
   }
   check_world(2, 29966, dir, cfg, tokens, ref);
   check_world(4, 29967, dir, cfg, tokens, ref);
+}
+
+namespace {
+// A reducer at world 1 for the fold-overlap gates: every fold an identity,
+// the asynchronous ones counted (dsv4_tp_test's).
+struct LocalAsyncReducer : dgpp::BoundaryReducer {
+  void reduce(uint16_t*, int, int) override { ++folds; }
+  bool begin_async(uint16_t*, int, int) override {
+    if (open) throw std::logic_error("local reducer: one fold outstanding at a time");
+    open = true;
+    ++folds;
+    return true;
+  }
+  void end_async() override { open = false; }
+  bool open = false;
+  int folds = 0;
+};
+}  // namespace
+
+// The prefill's fold overlap (engine.prefill_fold_overlap, 2026-10-18): a
+// 701-row prompt walks each layer as the row blocks 384 + 317 (the
+// boundary on the request's block grid nearest the middle); its logits and
+// the four decode steps behind it bitwise the one-block walk's, in the
+// exact prefill (every layer two blocks) and the bounded one (the encoder
+// layers two blocks; the decoder's prologue at its first layer lands the
+// pending fold before it reads the streams). Then three prompts of 141,
+// 701 and 300 rows as one group walk whose middle row stands inside the
+// second span: the boundary moves to that span's block grid, and each
+// prompt's logits and steps are bitwise its prefill alone.
+DGPP_TEST(dsv41_tp_prefill_fold_overlap_is_bitwise_the_one_block_walk) {
+  const std::string dir = (fs::current_path() / "dsv41_tp_fixture_overlap").string();
+  const Dsv41TextConfig cfg = dsv41fx::tiny_config();
+  dsv41fx::write_fixture(cfg, dir);
+  (void)dsv41fx::fixture_sidecar(cfg, dir);
+  std::vector<int64_t> prompt = make_tokens(cfg, 160);
+  while (prompt.size() < 701) prompt.push_back((prompt[prompt.size() - 160] * 31 + 11) % cfg.vocab_size);
+  for (const bool bounded : {false, true}) {
+    LocalAsyncReducer reducer;
+    Dsv41Model model(cfg, dir, 1280, 4096, Dsv41Residency::Streaming, nullptr, 0, 1, /*max_requests=*/3);
+    (void)model.set_boundary(&reducer);    // (the constructor takes a reducer at tp_world > 1 only)
+    model.set_decode_route_traces(false);  // as the engine serves it (a traced walk stays one block)
+    model.set_prefill_bounded(bounded);
+    const auto run = [&](int slot, const std::vector<int64_t>& p, bool overlap, std::vector<float>* logits,
+                         std::vector<std::vector<float>>* steps) {
+      model.set_prefill_fold_overlap(overlap);
+      Dsv41Model::Outputs o = model.session_prefill(slot, p);
+      *logits = o.logits;
+      for (int k = 0; k < 4; ++k) {
+        o = model.session_step(slot, (p[static_cast<size_t>(k)] + 7) % cfg.vocab_size);
+        steps->push_back(o.logits);
+      }
+      model.session_close(slot);
+    };
+    // 1) one prompt: 701 rows as blocks of 384 and 317.
+    std::vector<float> on_logits, off_logits;
+    std::vector<std::vector<float>> on_steps, off_steps;
+    run(0, prompt, true, &on_logits, &on_steps);
+    const uint64_t async_folds = model.debug_overlap_async_folds();
+    run(1, prompt, false, &off_logits, &off_steps);
+    require(model.debug_overlap_async_folds() == async_folds, "the one-block walk began an asynchronous fold");
+    require(async_folds > 0, "fold overlap: no fold ran asynchronously");
+    require(!on_logits.empty() && on_logits == off_logits,
+            "fold overlap: the prefill's logits differ from the one-block walk's");
+    require(on_steps == off_steps, "fold overlap: decode steps behind the prefill differ (the state)");
+    std::printf("[ OK ] %s prefill: 701 rows in two row blocks (%llu asynchronous folds): logits and 4 decode steps "
+                "bitwise the one-block walk\n", bounded ? "bounded" : "exact", static_cast<unsigned long long>(async_folds));
+    // 2) a group's spans.
+    const std::vector<std::vector<int64_t>> group = {
+        std::vector<int64_t>(prompt.begin(), prompt.begin() + 141), prompt,
+        std::vector<int64_t>(prompt.begin() + 200, prompt.begin() + 500)};
+    std::vector<std::vector<float>> alone_logits(3);
+    std::vector<std::vector<std::vector<float>>> alone_steps(3), group_steps(3);
+    for (int r = 0; r < 3; ++r)
+      run(r, group[static_cast<size_t>(r)], false, &alone_logits[static_cast<size_t>(r)], &alone_steps[static_cast<size_t>(r)]);
+    model.set_prefill_fold_overlap(true);
+    const std::vector<const std::vector<int64_t>*> pp = {&group[0], &group[1], &group[2]};
+    const std::vector<Dsv41Model::Outputs> g = model.session_prefill_group({0, 1, 2}, pp);
+    const uint64_t group_folds = model.debug_overlap_async_folds() - async_folds;
+    require(g.size() == 3, "three prompts prefilled as a group");
+    require(group_folds > 0, "fold overlap: the group walk ran no fold asynchronously");
+    for (int r = 0; r < 3; ++r) {
+      const std::vector<int64_t>& p = group[static_cast<size_t>(r)];
+      require(g[static_cast<size_t>(r)].logits == alone_logits[static_cast<size_t>(r)],
+              "fold overlap: a group walk's logits differ from the prompt's one-block prefill alone");
+      for (int k = 0; k < 4; ++k)
+        group_steps[static_cast<size_t>(r)].push_back(
+            model.session_step(r, (p[static_cast<size_t>(k)] + 7) % cfg.vocab_size).logits);
+      require(group_steps[static_cast<size_t>(r)] == alone_steps[static_cast<size_t>(r)],
+              "fold overlap: the steps behind a group walk differ (the state)");
+      model.session_close(r);
+    }
+    std::printf("[ OK ] %s prefill: 141 + 701 + 300 rows as one group walk in two row blocks (%llu asynchronous folds, "
+                "the boundary inside the second span on its block grid): logits and steps bitwise the prefills alone\n",
+                bounded ? "bounded" : "exact", static_cast<unsigned long long>(group_folds));
+  }
+}
+
+// Every decode form of the 2026-10-19 round repeats itself bitwise run to
+// run across request slots at world 1: the scalar and the flash window
+// (in line and beside the main source) and the fused mHC site. (The flash
+// window's first form read a zero-filled ring for every slot but 0 — the
+// listed kernel bounded a ring block by the table's row width — and this
+// gate's slot pair is what caught it.)
+DGPP_TEST(dsv41_decode_forms_repeat_bitwise_across_slots) {
+  const std::string dir = (fs::current_path() / "dsv41_tp_fixture_forms").string();
+  const Dsv41TextConfig cfg = dsv41fx::tiny_config();
+  dsv41fx::write_fixture(cfg, dir);
+  (void)dsv41fx::fixture_sidecar(cfg, dir);
+  const std::vector<int64_t> prompt = make_tokens(cfg, 96);
+  LocalAsyncReducer reducer;
+  Dsv41Model model(cfg, dir, 1280, 4096, Dsv41Residency::Streaming, nullptr, 0, 1, /*max_requests=*/2);
+  (void)model.set_boundary(&reducer);
+  model.set_decode_route_traces(false);
+  const auto run = [&](int slot, std::vector<std::vector<float>>* steps) {
+    Dsv41Model::Outputs o = model.session_prefill(slot, prompt);
+    steps->push_back(o.logits);
+    for (int k = 0; k < 6; ++k) {
+      o = model.session_step(slot, (prompt[static_cast<size_t>(k)] + 7) % cfg.vocab_size);
+      steps->push_back(o.logits);
+    }
+    model.session_close(slot);
+  };
+  struct Arm { bool fused, flash, beside; };
+  for (const Arm arm : {Arm{false, false, false}, Arm{false, true, false}, Arm{false, true, true}, Arm{true, true, true}}) {
+    std::vector<std::vector<float>> a, b;
+    model.set_decode_mhc_fused(arm.fused);
+    model.set_decode_window_flash(arm.flash);
+    model.set_decode_window_beside(arm.beside);
+    run(0, &a);
+    run(1, &b);
+    size_t first = a.size();
+    for (size_t i = 0; i < a.size() && i < b.size(); ++i)
+      if (a[i] != b[i]) { first = i; break; }
+    std::printf("  determinism: mhc %s, window %s %s: %s\n", arm.fused ? "fused" : "unfused", arm.flash ? "flash" : "scalar",
+                arm.beside ? "beside" : "in line", first == a.size() ? "bitwise run to run" : ("step " + std::to_string(first) + " differs").c_str());
+    require(first == a.size() && !a.empty(), std::string("the decode step is not bitwise across slots (mhc ") +
+                                                 (arm.fused ? "fused" : "unfused") + ", window " + (arm.flash ? "flash" : "scalar") +
+                                                 (arm.beside ? " beside" : " in line") + ")");
+  }
+  model.set_decode_mhc_fused(true);
+  model.set_decode_window_flash(true);
+  model.set_decode_window_beside(true);
+  std::printf("[ OK ] decode forms: the prefill and 6 decode steps bitwise across slots for every form\n");
+}
+
+// The overlap on a loopback world of 2: the bus's bulk all-reduce runs
+// asynchronously under the other block's compute (block A's fold exceeds
+// the reducer's asynchronous threshold of two latency slots at the
+// fixture's width); every rank's logits bitwise its one-block walk's.
+DGPP_TEST(dsv41_tp_prefill_fold_overlap_at_world_2_is_bitwise_the_one_block_walk) {
+  const std::string dir = (fs::current_path() / "dsv41_tp_fixture_overlap_w2").string();
+  const Dsv41TextConfig cfg = dsv41fx::tiny_config();
+  dsv41fx::write_fixture(cfg, dir);
+  (void)dsv41fx::fixture_sidecar(cfg, dir);
+  std::vector<std::unique_ptr<CollectiveBus>> buses = start_world(2, 29989);
+  require(!buses.empty(), "tp bus world failed to start");
+  const size_t slot = dgpp::bus_latency_slot_elems(*buses[0]);
+  int TA = 128;
+  while (static_cast<size_t>(TA) * static_cast<size_t>(cfg.hidden_size) <= 2 * slot) TA += 128;
+  const int T = 2 * TA;
+  require(T <= 4096, "the rows of an asynchronous fold exceed the fixture's positions");
+  const std::vector<int64_t> tokens = make_tokens(cfg, T);
+  struct Outcome {
+    std::vector<float> one, two;
+    uint64_t async_folds = 0;
+    std::string error;
+  };
+  std::vector<Outcome> ranks(2);
+  ConstructBarrier barrier(2);
+  std::vector<std::thread> workers;
+  for (int r = 0; r < 2; ++r)
+    workers.emplace_back([&, r] {
+      bool arrived = false;
+      auto arrive_once = [&] {
+        if (arrived) return;
+        arrived = true;
+        barrier.arrive_and_wait();
+      };
+      Outcome& o = ranks[static_cast<size_t>(r)];
+      try {
+        BusBoundaryReducer reducer(*buses[static_cast<size_t>(r)], wait_timeout_ms());
+        Dsv41Model model(cfg, dir, T, 4096, Dsv41Residency::Streaming, &reducer, r, 2);
+        arrive_once();
+        model.set_decode_route_traces(false);  // as the engine serves it (a traced walk stays one block)
+        model.set_prefill_fold_overlap(false);
+        o.one = model.forward(tokens).logits;
+        model.set_prefill_fold_overlap(true, /*min_rows=*/256);
+        o.two = model.forward(tokens).logits;
+        o.async_folds = model.debug_overlap_async_folds();
+      } catch (const std::exception& e) {
+        o.error = "rank " + std::to_string(r) + ": " + e.what();
+        arrive_once();
+      }
+    });
+  for (auto& t : workers) t.join();
+  for (int r = 0; r < 2; ++r) require(ranks[static_cast<size_t>(r)].error.empty(), ranks[static_cast<size_t>(r)].error);
+  for (int r = 0; r < 2; ++r) {
+    const Outcome& o = ranks[static_cast<size_t>(r)];
+    require(!o.one.empty() && o.one == o.two, "fold overlap at world 2: rank " + std::to_string(r) +
+                                                  "'s logits differ from its one-block walk's");
+    require(o.async_folds > 0, "fold overlap at world 2: rank " + std::to_string(r) + " ran no fold asynchronously");
+  }
+  std::printf("[ OK ] world 2: %d rows as blocks of %d (%llu asynchronous bulk folds per rank): logits bitwise the "
+              "one-block walk on both ranks\n", T, TA, static_cast<unsigned long long>(ranks[0].async_folds));
+}
+
+// The Engram chunk-ahead staging (engine.ngram_prestage, 2026-10-18): a
+// 701-row prompt prefilled in 256-row chunks on the cursor path (the base
+// names the next chunk at the same budget), every chunk after the first
+// taking the rows the previous chunk's prestage gathered on the side
+// stream; the logits and the steps behind it bitwise the same chunks
+// staged in turn (the rows gathered are the same rows).
+DGPP_TEST(dsv41_engram_prestage_is_bitwise_the_sequential_staging) {
+  const std::string dir = (fs::current_path() / "dsv41_tp_fixture_prestage").string();
+  const Dsv41TextConfig cfg = dsv41fx::tiny_config();
+  dsv41fx::write_fixture(cfg, dir);
+  (void)dsv41fx::fixture_sidecar(cfg, dir);
+  std::vector<int64_t> prompt = make_tokens(cfg, 160);
+  while (prompt.size() < 701) prompt.push_back((prompt[prompt.size() - 160] * 31 + 11) % cfg.vocab_size);
+  const auto run = [&](bool prestage, bool group_api, std::vector<float>* logits, std::vector<std::vector<float>>* steps,
+                       int* chunks, uint64_t* claims) {
+    dgpp::Dsv41EngramLayer::set_prestage(prestage);
+    Dsv41Model model(cfg, dir, 1280, 4096, Dsv41Residency::Streaming, nullptr, 0, 1, /*max_requests=*/2);
+    model.set_decode_route_traces(false);
+    Dsv41Model::PrefillCursor cursor = model.session_prefill_begin(0, prompt, static_cast<int64_t>(prompt.size()) + 8, 256);
+    *chunks = 0;
+    if (group_api) {  // the scheduler's path: one cursor through the batch walk
+      std::vector<Dsv41Model::PrefillCursor*> open = {&cursor};
+      while (!model.session_prefill_advance_group(open, {256})[0]) ++*chunks;
+    } else {
+      while (!model.session_prefill_advance(cursor)) ++*chunks;
+    }
+    ++*chunks;
+    *logits = cursor.output.logits;
+    for (int k = 0; k < 4; ++k) steps->push_back(model.session_step(0, (prompt[static_cast<size_t>(k)] + 7) % cfg.vocab_size).logits);
+    *claims = model.debug_engram_prestage_claims();
+    require(model.debug_engram_prestage_publishes() == (prestage ? uint64_t(*chunks - 1) : 0),
+            "the prestage publishes once per chunk that has a next (or never, off)");
+    model.session_close(0);
+  };
+  for (const bool group_api : {false, true}) {
+    std::vector<float> on_logits, off_logits;
+    std::vector<std::vector<float>> on_steps, off_steps;
+    int on_chunks = 0, off_chunks = 0;
+    uint64_t on_claims = 0, off_claims = 0;
+    run(true, group_api, &on_logits, &on_steps, &on_chunks, &on_claims);
+    run(false, group_api, &off_logits, &off_steps, &off_chunks, &off_claims);
+    dgpp::Dsv41EngramLayer::set_prestage(true);
+    require(on_chunks == 3 && off_chunks == 3, "701 rows at a 256-row budget walk as three chunks");
+    require(on_claims == 2 && off_claims == 0, "every chunk after the first takes the prestaged rows");
+    require(!on_logits.empty() && on_logits == off_logits, "prestage: the prefill's logits differ from the sequential staging's");
+    require(on_steps == off_steps, "prestage: the decode steps behind the prefill differ (the state)");
+    std::printf("[ OK ] 701 rows in three 256-row chunks (%s): 2 prestages claimed, logits and 4 decode steps bitwise "
+                "the sequential staging\n", group_api ? "the scheduler's batch walk" : "the cursor advance");
+  }
+}
+
+// The lm head's 12-bit companion (engine.bf16_weights, 2026-10-19): under
+// bf12 | bf12+bf16 the model packs its head slice after the load and the
+// decode head GEMV reads the companion. The packed values are the bf16
+// values; the companion GEMV sums each row in another fp32 order, so the
+// logits are the bf16 head's within rounding and the argmax is equal — the
+// prefill's last row and four decode steps behind it, against the
+// checkpoint residency; the companions-only residency packs the same.
+DGPP_TEST(dsv41_lm_head_bf12_companion_matches_the_bf16_head) {
+  const std::string dir = (fs::current_path() / "dsv41_tp_fixture_bf12").string();
+  const Dsv41TextConfig cfg = dsv41fx::tiny_config();
+  if (cfg.weights_exl3) {
+    std::printf("[ .. ] the EXL3 pack's head is a trellis matrix (no bf16 bytes, no bf12 companion): nothing to pack\n");
+    return;
+  }
+  dsv41fx::write_fixture(cfg, dir);
+  (void)dsv41fx::fixture_sidecar(cfg, dir);
+  const std::vector<int64_t> prompt = make_tokens(cfg, 160);
+  struct Run {
+    std::vector<float> logits;
+    std::vector<std::vector<float>> steps;
+    size_t matrices = 0, released = 0;
+  };
+  const auto run = [&](dgpp::Bf16Residency mode) {
+    dgpp::set_bf16_residency(mode);
+    Run r;
+    Dsv41Model model(cfg, dir, 512, 2048, Dsv41Residency::Streaming, nullptr, 0, 1, /*max_requests=*/2);
+    model.set_decode_route_traces(false);
+    r.logits = model.session_prefill(0, prompt).logits;
+    for (int k = 0; k < 4; ++k) r.steps.push_back(model.session_step(0, (prompt[static_cast<size_t>(k)] + 7) % cfg.vocab_size).logits);
+    model.session_close(0);
+    r.matrices = model.bf12_companions().matrices();
+    r.released = model.bf12_companions().released();
+    return r;
+  };
+  const Run plain = run(dgpp::Bf16Residency::Checkpoint);
+  const Run both = run(dgpp::Bf16Residency::Bf12AndBf16);
+  const Run only = run(dgpp::Bf16Residency::Bf12);
+  dgpp::set_bf16_residency(dgpp::Bf16Residency::Checkpoint);
+  require(plain.matrices == 0, "the checkpoint residency packs nothing");
+  require(both.matrices == 1 && only.matrices == 1, "both companion residencies pack the lm head");
+  const int V = cfg.vocab_size;
+  const auto compare = [&](const std::vector<float>& a, const std::vector<float>& b, const char* what) {
+    require(!a.empty() && a.size() == b.size(), std::string(what) + ": logits shape");
+    const size_t rows = a.size() / static_cast<size_t>(V);
+    const float* pa = a.data() + (rows - 1) * static_cast<size_t>(V);
+    const float* pb = b.data() + (rows - 1) * static_cast<size_t>(V);
+    int ia = 0, ib = 0;
+    double d = 0, m = 0;
+    for (int i = 0; i < V; ++i) {
+      if (pa[i] > pa[ia]) ia = i;
+      if (pb[i] > pb[ib]) ib = i;
+      d += double(pa[i] - pb[i]) * double(pa[i] - pb[i]);
+      m += double(pb[i]) * double(pb[i]);
+    }
+    const double l2 = std::sqrt(d) / std::max(std::sqrt(m), 1e-30);
+    require(ia == ib, std::string(what) + ": the argmax differs from the bf16 head's");
+    require(l2 < 0.02, std::string(what) + ": the logits beyond rounding of the bf16 head's");
+    return l2;
+  };
+  double worst = 0;
+  for (const Run* r : {&both, &only}) {
+    worst = std::max(worst, compare(r->logits, plain.logits, "prefill last row"));
+    for (int k = 0; k < 4; ++k) worst = std::max(worst, compare(r->steps[static_cast<size_t>(k)], plain.steps[static_cast<size_t>(k)], "decode step"));
+  }
+  std::printf("[ OK ] lm head bf12 companion: the prefill's last row and 4 decode steps within rel l2 %.2e of the bf16 head "
+              "(argmax equal), both residencies packed, %zu released under the companions-only one\n", worst, only.released);
 }
 
 int main() { return dgpp::test::run_all(); }

@@ -1,11 +1,13 @@
 // HF hub-cache resolution tests against synthetic cache trees — no
 // dependence on the machine's real cache or environment.
+#include "loaders/hf_cache.hpp"
+
 #include <cstdlib>
 #include <filesystem>
 #include <string>
 
+#include "../common/temp_dir.hpp"
 #include "common/test.hpp"
-#include "loaders/hf_cache.hpp"
 
 namespace fs = std::filesystem;
 
@@ -55,8 +57,8 @@ std::string resolve(const fs::path& root, const std::string& model_id,
 
 DGPP_TEST(hf_cache_resolves_ref_pinned_snapshot) {
   // GIVEN a cache with refs/main pinning commit abc123:
-  fs::path root = fs::temp_directory_path() / "dgpp_hf_cache_test_ref";
-  fs::remove_all(root);
+  const dgpp::test::TempDir fixture("dgpp_hf_cache_test_ref");
+  const fs::path& root = fixture.path();
   make_cache(root, "org/name", "abc123", /*with_ref=*/true);
 
   // WHEN resolving the model:
@@ -72,8 +74,8 @@ DGPP_TEST(hf_cache_resolves_ref_pinned_snapshot) {
 
 DGPP_TEST(hf_cache_resolves_single_snapshot_without_ref) {
   // GIVEN a cache with no refs (fresh manual download shape):
-  fs::path root = fs::temp_directory_path() / "dgpp_hf_cache_test_noref";
-  fs::remove_all(root);
+  const dgpp::test::TempDir fixture("dgpp_hf_cache_test_noref");
+  const fs::path& root = fixture.path();
   make_cache(root, "org/name", "abc123", /*with_ref=*/false);
 
   // WHEN resolving the model:
@@ -89,8 +91,8 @@ DGPP_TEST(hf_cache_resolves_single_snapshot_without_ref) {
 
 DGPP_TEST(hf_cache_refuses_ambiguous_snapshots_without_ref) {
   // GIVEN a cache with two snapshots and no refs/main:
-  fs::path root = fs::temp_directory_path() / "dgpp_hf_cache_test_ambig";
-  fs::remove_all(root);
+  const dgpp::test::TempDir fixture("dgpp_hf_cache_test_ambig");
+  const fs::path& root = fixture.path();
   make_cache(root, "org/name", "abc123", /*with_ref=*/false);
   make_cache(root, "org/name", "def456", /*with_ref=*/false);
 
@@ -107,9 +109,8 @@ DGPP_TEST(hf_cache_refuses_ambiguous_snapshots_without_ref) {
 
 DGPP_TEST(hf_cache_refuses_missing_model_loudly) {
   // GIVEN a cache without the requested model:
-  fs::path root = fs::temp_directory_path() / "dgpp_hf_cache_test_missing";
-  fs::remove_all(root);
-  fs::create_directories(root);
+  const dgpp::test::TempDir fixture("dgpp_hf_cache_test_missing");
+  const fs::path& root = fixture.path();
 
   // WHEN resolving a model that is not cached:
   std::string error;
@@ -125,8 +126,8 @@ DGPP_TEST(hf_cache_refuses_missing_model_loudly) {
 
 DGPP_TEST(hf_cache_refuses_snapshot_without_config) {
   // GIVEN a ref-pinned snapshot whose config.json never landed:
-  fs::path root = fs::temp_directory_path() / "dgpp_hf_cache_test_noconf";
-  fs::remove_all(root);
+  const dgpp::test::TempDir fixture("dgpp_hf_cache_test_noconf");
+  const fs::path& root = fixture.path();
   const fs::path model = make_cache(root, "org/name", "abc123", true);
   fs::remove(model / "snapshots" / "abc123" / "config.json");
 
@@ -143,8 +144,8 @@ DGPP_TEST(hf_cache_refuses_snapshot_without_config) {
 
 DGPP_TEST(hf_cache_refuses_ref_pointing_at_missing_snapshot) {
   // GIVEN refs/main pinning a commit whose snapshot directory is absent:
-  fs::path root = fs::temp_directory_path() / "dgpp_hf_cache_test_dangling";
-  fs::remove_all(root);
+  const dgpp::test::TempDir fixture("dgpp_hf_cache_test_dangling");
+  const fs::path& root = fixture.path();
   const fs::path model = make_cache(root, "org/name", "abc123", false);
   (void)model;
   fs::create_directories(root / "models--org--name" / "refs");
@@ -167,8 +168,8 @@ DGPP_TEST(hf_cache_refuses_ref_pointing_at_missing_snapshot) {
 DGPP_TEST(hf_cache_honors_hf_hub_cache_precedence) {
   // GIVEN HF_HUB_CACHE pointing at a synthetic root (huggingface_hub's
   // highest-precedence location) with a cached model:
-  fs::path root = fs::temp_directory_path() / "dgpp_hf_cache_test_env";
-  fs::remove_all(root);
+  const dgpp::test::TempDir fixture("dgpp_hf_cache_test_env");
+  const fs::path& root = fixture.path();
   make_cache(root, "org/name", "abc123", true);
   const char* saved = std::getenv("HF_HUB_CACHE");
   require(::setenv("HF_HUB_CACHE", root.string().c_str(), 1) == 0,

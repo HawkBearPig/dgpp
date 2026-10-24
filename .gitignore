@@ -36,6 +36,10 @@ venv/
 
 # --- Local benchmark artifacts --------------------------------------------------
 benchmarks/*
+!benchmarks/micro/
+benchmarks/micro/*
+!benchmarks/micro/qsa_fp8_bench.cu
+!benchmarks/micro/host_penalties_bench.cpp
 
 # --- Debug residue ---------------------------------------------------------------
 
@@ -95,3 +99,9 @@ mimo_window_fixture/
 # Serve runtime state (scripts/dgpp_serve.sh STATE_DIR): logs + pid, and the
 # tool-eval-bench .md reports it drops under runs/YYYY/MM/. Never tracked.
 runs/
+
+# The Flint tests write these fixtures into their working directory
+flint_tp_fixture/
+flint_engine_fixture/
+flint_engine_cap_fixture/
+flint_decode_fixture/

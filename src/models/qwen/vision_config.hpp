@@ -150,7 +150,8 @@ struct QwenVisionConfig {
     return 2 * (h * static_cast<size_t>(patch_in()) + h +
                 static_cast<size_t>(num_position_embeddings) * h +
                 static_cast<size_t>(depth) * (4 * h * h + 2 * h * i + 9 * h + i) +
-                2 * h + 2 * m + m * m + m + o * m + o);
+                // merger norm (2 x h), fc1 [m, m] + [m], fc2 [o, m] + [o]
+                2 * h + m * m + m + o * m + o);
   }
 
   size_t attention_score_bytes() const {

@@ -8,6 +8,8 @@
 //                      --ids 1,2,3,... [--topk K] [--layers N] [--dump-states FILE]
 //                      [--world W --rank R --peer HOST --port N] [--resident]
 //                      [--image-dir DIR|off] [--lat-slot-bytes N]
+//                      [--kv-dtype bf16|fp8] [--prefill-attention bf16|fp8]
+//                      [--dump-logits FILE] (row-major fp32, this rank's vocabulary)
 //
 // TP (plan D1): one process per node over the fabric bus; every fold of
 // the diagnostic forward rides the latency path, so the slot is sized for
@@ -41,7 +43,7 @@
 
 int main(int argc, char** argv) {
   std::string model_id, ckpt, ids_text, dump_states, peer, image_dir, ngram_table, dense_weights, mtp_expert_format;
-  std::string ngram_table_dir;
+  std::string ngram_table_dir, dump_logits, kv_dtype = "bf16", prefill_attention = "bf16";
   int topk = 5, layers = -1, world = 1, rank = 0, port = 29950;
   bool resident = false;
   size_t lat_slot_bytes = 0;
@@ -58,6 +60,9 @@ int main(int argc, char** argv) {
       else if (a == "--topk") topk = std::stoi(next(i));
       else if (a == "--layers") layers = std::stoi(next(i));
       else if (a == "--dump-states") dump_states = next(i);
+      else if (a == "--dump-logits") dump_logits = next(i);
+      else if (a == "--kv-dtype") kv_dtype = next(i);
+      else if (a == "--prefill-attention") prefill_attention = next(i);
       else if (a == "--world") world = std::stoi(next(i));
       else if (a == "--rank") rank = std::stoi(next(i));
       else if (a == "--peer") peer = next(i);
@@ -78,6 +83,12 @@ int main(int argc, char** argv) {
       if (ckpt.empty()) throw std::runtime_error("cannot resolve " + model_id + ": " + err);
     }
     if (ids_text.empty()) throw std::runtime_error("--ids is required");
+    if ((kv_dtype != "bf16" && kv_dtype != "fp8") ||
+        (prefill_attention != "bf16" && prefill_attention != "fp8"))
+      throw std::runtime_error("--kv-dtype and --prefill-attention must be bf16 or fp8");
+    if (prefill_attention == "fp8" && kv_dtype != "fp8")
+      throw std::runtime_error("--prefill-attention fp8 requires --kv-dtype fp8");
+    dgpp::QwenModel::set_native_attention(prefill_attention == "fp8", false);
     std::vector<int64_t> ids;
     {
       std::stringstream ss(ids_text);
@@ -117,10 +128,20 @@ int main(int argc, char** argv) {
       reducer = std::make_unique<dgpp::BusBoundaryReducer>(*bus, 600000);
     }
     const auto t0 = std::chrono::steady_clock::now();
-    dgpp::QwenModel model(cfg, ckpt, T, T + 64, residency, reducer.get(), rank, world);
+    dgpp::QwenModel model(cfg, ckpt, T, T + 64, residency, reducer.get(), rank, world,
+                         1, false, 0, false, false,
+                         kv_dtype == "fp8" ? dgpp::LatentFormat::kFp8 : dgpp::LatentFormat::kBf16);
     const auto t1 = std::chrono::steady_clock::now();
     const dgpp::QwenModel::Outputs out = model.forward(ids, true);
     const auto t2 = std::chrono::steady_clock::now();
+    if (!dump_logits.empty()) {
+      std::ofstream f(dump_logits, std::ios::binary);
+      f.write(reinterpret_cast<const char*>(out.logits.data()),
+              static_cast<std::streamsize>(out.logits.size() * sizeof(float)));
+      if (!f) throw std::runtime_error("cannot write logits to " + dump_logits);
+      std::printf("wrote %s: [%d, %d] fp32 logits (vocab begins at %d)\n",
+                  dump_logits.c_str(), T, out.lm_vocab_count, out.lm_vocab_begin);
+    }
     auto fnv = [](const std::vector<uint16_t>& v) {
       uint64_t h = 1469598103934665603ull;
       for (uint16_t x : v) { h ^= x; h *= 1099511628211ull; }

@@ -17,6 +17,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
 import cluster_doctor
 import cluster_process
+from humaneval_program import humaneval_program
 import prepare_data
 import site_env
 
@@ -120,6 +121,24 @@ class PortabilityTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "length"):
             cluster_doctor.checkpoint_size(snapshot)
 
+    def test_indexed_nested_shards_and_invalid_paths(self):
+        snapshot = self.checkpoint()
+        (snapshot / "tensors").mkdir()
+        shard = snapshot / "tensors/model.safetensors"
+        (snapshot / "model.safetensors").rename(shard)
+        index = snapshot / "model.safetensors.index.json"
+        index.write_text(json.dumps({"weight_map": {"weight": "tensors/model.safetensors"}}))
+        self.assertEqual(cluster_doctor.checkpoint_size(snapshot), shard.stat().st_size)
+        for name in ("../model.safetensors", "/tmp/model.safetensors", "tensors/../../model.safetensors",
+                     "tensors//model.safetensors", "tensors/./model.safetensors", "tensors\\model.safetensors"):
+            with self.subTest(name=name):
+                index.write_text(json.dumps({"weight_map": {"weight": name}}))
+                with self.assertRaisesRegex(ValueError, "invalid shard path"):
+                    cluster_doctor.checkpoint_size(snapshot)
+        index.write_text(json.dumps({"weight_map": {"weight": "tensors/missing.safetensors"}}))
+        with self.assertRaises(FileNotFoundError):
+            cluster_doctor.checkpoint_size(snapshot)
+
     def test_snapshot_ambiguity_and_missing_shard(self):
         snapshot = self.checkpoint()
         (snapshot.parent / "other").mkdir()
@@ -164,6 +183,22 @@ class PortabilityTest(unittest.TestCase):
         self.assertIn("--allow-code-execution", result.stderr)
         self.assertFalse(out.exists())
 
+    def test_humaneval_keeps_supplied_helpers_and_imports(self):
+        item = dict(entry_point="decode", prompt=(
+            "from math import factorial\n"
+            "def encode(n):\n    return factorial(n)\n"
+            "def decode(n):\n    \"\"\"Return n's factorial.\"\"\"\n"),
+            test="def check(candidate):\n    assert candidate(4) == encode(4)\n")
+        for code in ("def decode(n):\n    return factorial(n)\n",
+                     "    return factorial(n)\n",
+                     "    return 1 if n <= 1 else n * decode(n - 1)\n",
+                     "from __future__ import annotations\n"
+                     "def decode(n: MissingType):\n    return factorial(n)\n"):
+            with self.subTest(code=code):
+                exec(humaneval_program(item, code), {})
+        with self.assertRaises(AssertionError):
+            exec(humaneval_program(item, "def decode(n):\n    return 0\n"), {})
+
     def test_peer_procedures_reject_single_node_before_launch(self):
         for name in ("serve_stop_check.sh", "serve_failure_drill.sh", "serve_soak_run.sh"):
             result = subprocess.run(["bash", str(ROOT / "scripts" / name)], env=self.env,
@@ -196,6 +231,7 @@ class PortabilityTest(unittest.TestCase):
 
     def test_deployment_filenames_describe_their_settings(self):
         models = {
+            "nvidia/Qwen3.8-Flash-Next-FP4-Local": "qwen-3.8-flash-next-fp4local",
             "HawkBearPig/GLM-5.3-Flash-NVFP4-FP8": "glm-5.3-flash_nvfp4-fp8",
             "HawkBearPig/GLM-5.3-Int4-Int8Mix-RTN-g64": "glm-5.3_int4-int8",
             "HawkBearPig/GLM-5.3-NF4I8-GPTQ-H32-g128": "glm-5.3_nf4i8",
@@ -205,14 +241,21 @@ class PortabilityTest(unittest.TestCase):
             "nvidia/Qwen3.8-Flash-Next-NVFP4": "qwen-3.8-flash-next_nvfp4",
             "RadixArk/Qwen3.8-Flash-Next-NVFP4": "qwen-3.8-flash-next_nvfp4-radixark",
             "deepseek-ai/DeepSeek-V4.1-Flash": "deepseek-v4.1-flash_mxfp4-fp8",
+            "deepseek-ai/DeepSeek-V4.1-Flash-1017": "deepseek-v4.1-flash-1017_mxfp4-fp8",
+            "LibertAIDAI/DeepSeek-V4.1-Flash-1017-EXL3-3.5bpw": "deepseek-v4.1-flash-1017_exl3-3.5bpw",
             "XiaomiMiMo/MiMo-V2.6-Flash-RL": "mimo-v2.6-flash_mxfp4-fp8",
             "deepseek-ai/DeepSeek-V4-Flash-0731": "deepseek-v4-flash_mxfp4-fp8",
             "Saren/Qwen3.8-Flash-Next-W4A16-AutoRound-hybrid-MTP_int4RTN": "qwen-3.8-flash-next_autoround-int4",
             "Qwen/Qwen3.8-27B-FP8": "qwen3.8-27b_fp8",
             "unsloth/Qwen3.8-27B-NVFP4": "qwen3.8-27b_nvfp4",
+            "nvidia/Qwen3.5-122B-A10B-NVFP4": "qwen3.5-122b-a10b_nvfp4",
             "local-inference-lab/Qwen3.8-Flash-Next-NVFP4": "qwen-3.8-flash-next_nvfp4-qad",
             "kaushikvira/Qwen3.8-Flash-Next-swift15-nvfp4-dgpp": "qwen-3.8-flash-next_nvfp4-swift15",
+            "HawkBearPig/flint-FP8-NVFP4": "flint_fp8-nvfp4",
         }
+        # The families without a draft head (2026-10-22): their templates
+        # keep MTP off — the plain world is the only one.
+        no_draft = {"HawkBearPig/flint-FP8-NVFP4"}
         values = {**site_env.DEFAULTS, "DGPP_NODES": "head peer1 peer2 peer3", "DGPP_SSH_USER": "ops"}
         templates = list((ROOT / "deploy").glob("*.example.json"))
         self.assertTrue(templates)
@@ -233,6 +276,9 @@ class PortabilityTest(unittest.TestCase):
                 if drafter:
                     self.assertFalse(engine["mtp"], "a drafter template replaces MTP, not both")
                     self.assertTrue(engine["decode_graph"], "the drafter's block proposal is recorded in the graph step")
+                elif cfg["model"] in no_draft:
+                    self.assertFalse(engine["mtp"], "a family without a draft head keeps MTP off")
+                    self.assertTrue(engine["decode_graph"])
                 else:
                     self.assertTrue(engine["mtp"], "every template enables MTP (the plain world is --no-mtp)")
                     self.assertTrue(engine["decode_graph"])

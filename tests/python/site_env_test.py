@@ -392,6 +392,31 @@ class SiteEnvTest(unittest.TestCase):
                     self.assertEqual((assignments["DGPP_LOG_LEVEL"], assignments["DGPP_MLOCK"]),
                                      expected[1])
 
+    def test_resident_cache_verification_opt_out_reaches_every_rank(self):
+        self.env_file.write_text(self.env_file.read_text() + 'DGPP_RESIDENT_CACHE_VERIFY=0\n')
+        module = runpy.run_path(str(ROOT / "scripts/dgpp-cluster"))
+        args = argparse.Namespace(config=str(self.config), log_dir=str(self.root / "logs"), knobs="")
+        for exported, expected in [({}, "0"), ({"DGPP_RESIDENT_CACHE_VERIFY": "1"}, "1")]:
+            with self.subTest(expected=expected), patch.dict(
+                    os.environ, {**self.environ, **exported}, clear=True):
+                cluster = module["Cluster"](args)
+                self.assertTrue(all(env["DGPP_RESIDENT_CACHE_VERIFY"] == expected
+                                    for env in cluster.cfg["node_env"]))
+                # Keep environment policy compatible with existing server JSON schemas.
+                staged = site_env.server_config(cluster.cfg)
+                self.assertTrue(all("DGPP_RESIDENT_CACHE_VERIFY" not in env
+                                    for env in staged["node_env"]))
+                Path(cluster.log_dir).mkdir(parents=True, exist_ok=True)
+                with patch.object(module["cluster_process"], "launch") as launch:
+                    launch.return_value.pid = 12345
+                    cluster.boot_head()
+                    self.assertEqual(launch.call_args.args[4]["DGPP_RESIDENT_CACHE_VERIFY"], expected)
+                with patch.object(module["subprocess"], "run") as remote:
+                    remote.return_value.returncode = 0
+                    cluster.spawn_peer(1, "peer1")
+                    words = shlex.split(remote.call_args.args[0][-1])
+                    self.assertIn("DGPP_RESIDENT_CACHE_VERIFY=" + expected, words[:words.index("python3")])
+
     def test_persistent_swap_policy_reaches_every_serving_rank(self):
         self.env_file.write_text(self.env_file.read_text() + 'DGPP_NO_SWAP=1\n')
         module = runpy.run_path(str(ROOT / "scripts/dgpp-cluster"))
@@ -425,9 +450,12 @@ class SiteEnvTest(unittest.TestCase):
                 self.assertTrue(all("DGPP_NO_SWAP" not in env for env in json.loads(result.stdout)["node_env"]))
 
     def test_operational_wrappers_stop_on_invalid_env_before_running(self):
-        scripts = [p for p in (ROOT / "scripts").glob("*.sh")
-                   if p.name != "cluster_env.sh" and 'cluster_env.sh" || exit 1' in p.read_text()]
-        self.assertGreater(len(scripts), 20)
+        # Select by role, so removing a wrapper's site guard cannot remove it
+        # from coverage. The shared library, configuration wizard and local
+        # memory sampler do not require an existing site configuration.
+        excluded = {"cluster_env.sh", "setup.sh", "node_probe.sh"}
+        scripts = sorted(p for p in (ROOT / "scripts").glob("*.sh") if p.name not in excluded)
+        self.assertTrue(scripts, "no operational wrappers found")
         for path in scripts:
             with self.subTest(script=path.name):
                 result = subprocess.run(["bash", str(path)], env={**self.environ, "DGPP_ENV_FILE": str(self.root / "missing")},

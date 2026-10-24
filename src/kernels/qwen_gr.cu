@@ -1,4 +1,5 @@
 #include "kernels/qwen_gr.hpp"
+#include "kernels/pdl.cuh"
 
 #include <stdexcept>
 #include <string>
@@ -22,6 +23,7 @@ __device__ __forceinline__ float round_bf16(float v) {
 __device__ __forceinline__ float sigmoid_f(float v) { return 1.0f / (1.0f + expf(-v)); }
 
 __global__ void gate_act_kernel(uint16_t* __restrict__ t, int64_t n, float inv_hc) {
+  dgpp_pdl_wait();
   const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (i >= n) return;
   // t / hc is exact in bf16 (hc a power of two); silu in fp32, one rounding.
@@ -33,6 +35,7 @@ __global__ void mix_finish_kernel(const uint16_t* __restrict__ logits,
                                   const uint16_t* __restrict__ rn,
                                   uint16_t* __restrict__ x, int hc, int hidden,
                                   float inv_hc) {
+  dgpp_pdl_wait();
   const int64_t row = blockIdx.y;
   const int j = blockIdx.x * blockDim.x + threadIdx.x;
   if (j >= hidden) return;
@@ -89,6 +92,7 @@ __global__ void combine_dots_kernel(const uint16_t* __restrict__ rn,
                                     const uint16_t* __restrict__ w_inject,
                                     float* __restrict__ gates, int hc, int width,
                                     float inv_hc) {
+  dgpp_pdl_wait();
   const int64_t row = blockIdx.x;
   const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
   if (warp >= hc) return;
@@ -107,6 +111,7 @@ __global__ void combine_apply_kernel(uint16_t* __restrict__ r_state,
                                      const float* __restrict__ gates,
                                      const uint16_t* __restrict__ y, int hc, int hidden,
                                      int width) {
+  dgpp_pdl_wait();
   const int64_t row = blockIdx.y;
   const int idx = static_cast<int>(blockIdx.x) * blockDim.x + static_cast<int>(threadIdx.x);
   if (idx >= width) return;
@@ -127,6 +132,7 @@ template <typename NormW>
 __global__ void combine_norm_kernel(uint16_t* __restrict__ r_state, const float* __restrict__ gates,
                                     const uint16_t* __restrict__ y, const NormW* __restrict__ norm_w,
                                     uint16_t* __restrict__ rn, int hc, int hidden, float eps) {
+  dgpp_pdl_wait();
   extern __shared__ float staged[];
   __shared__ float warp_sums[32];
   const int64_t row = blockIdx.x;
@@ -204,6 +210,7 @@ __global__ void __launch_bounds__(kGrGemvThreads)
                         uint16_t* __restrict__ t, int lowrank,
                         const uint16_t* __restrict__ w_inject, float* __restrict__ gates,
                         float inv_hc) {
+  dgpp_pdl_wait();
   extern __shared__ __align__(16) uint16_t smem_u16[];
   const int W = hc * hidden;
   uint16_t* sx = smem_u16;  // [kRows, W] the normalized rows
@@ -277,6 +284,7 @@ __global__ void __launch_bounds__(kGrGemvThreads)
                           uint16_t* __restrict__ t,
                           int lowrank, const uint16_t* __restrict__ w_inject,
                           float* __restrict__ gates, int hc, float inv_hc) {
+  dgpp_pdl_wait();
   extern __shared__ __align__(16) uint16_t sx_di[];
   gemv::stage_activations<kRows>(rn, static_cast<size_t>(W), W, sx_di);
   __syncthreads();
@@ -324,6 +332,7 @@ __global__ void __launch_bounds__(kGrGemvThreads)
                                const float* __restrict__ down_s, uint16_t* __restrict__ t, int lowrank,
                                const uint16_t* __restrict__ w_inject, float* __restrict__ gates,
                                float inv_hc) {
+  dgpp_pdl_wait();
   extern __shared__ __align__(16) uint16_t sx_nd[];  // [kRows][W]: the raw rows, then the normalized
   constexpr int kWarpsPerBlock = kGrGemvThreads / 32;
   constexpr int kMaxPairs = kRows * 8;  // hc <= 8
@@ -429,6 +438,7 @@ __global__ void __launch_bounds__(kGrGemvThreads)
     gr_down_inject_bf12_kernel(const uint16_t* __restrict__ rn, int W, Bf12Matrix down, size_t row_bytes,
                                uint16_t* __restrict__ t, int lowrank, const uint16_t* __restrict__ w_inject,
                                float* __restrict__ gates, int hc, float inv_hc) {
+  dgpp_pdl_wait();
   extern __shared__ __align__(16) uint16_t sx_di[];
   gemv::stage_activations<kRows>(rn, static_cast<size_t>(W), W, sx_di);
   __syncthreads();
@@ -506,6 +516,7 @@ __global__ void __launch_bounds__(kGrGemvThreads)
     gr_act_up_kernel(const uint16_t* __restrict__ t, int lowrank, float inv_hc,
                      const void* __restrict__ up_w, const float* __restrict__ up_s,
                      uint16_t* __restrict__ logits, int W) {
+  dgpp_pdl_wait();
   extern __shared__ __align__(16) uint16_t sx[];
   for (int i = threadIdx.x; i < kRows * lowrank; i += blockDim.x) {
     // gate_act_kernel, op for op: t / hc is exact in bf16, silu in fp32.
@@ -624,6 +635,7 @@ __global__ void __launch_bounds__(kGrGemvThreads)
     gr_act_up_mix_kernel(const uint16_t* __restrict__ t, int lowrank, float inv_hc,
                          const void* __restrict__ up_w, const float* __restrict__ up_s,
                          const uint16_t* __restrict__ rn, uint16_t* __restrict__ x, int hidden) {
+  dgpp_pdl_wait();
   extern __shared__ __align__(16) uint16_t sx[];
   for (int i = threadIdx.x; i < kRows * lowrank; i += blockDim.x) {
     const float v = bf16_bits_to_float(t[i]) * inv_hc;

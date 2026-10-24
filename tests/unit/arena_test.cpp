@@ -41,8 +41,7 @@ void arena_body(dgpp::Arena& a, bool warm) {
 
 DGPP_TEST(arena_slab_accounting_stable_across_reset_cycle) {
   if (!cuda_available()) {
-    std::printf("[SKIP] no CUDA device\n");
-    return;
+    dgpp::test::skip("no CUDA device");
   }
   dgpp::Arena a;
   a.init({.persistent_hot = 0,
@@ -77,8 +76,7 @@ DGPP_TEST(arena_slab_accounting_stable_across_reset_cycle) {
 
 DGPP_TEST(arena_alignment_guarantees) {
   if (!cuda_available()) {
-    std::printf("[SKIP] no CUDA device\n");
-    return;
+    dgpp::test::skip("no CUDA device");
   }
   dgpp::Arena a;
   a.init({.persistent_hot = 0,
@@ -102,8 +100,7 @@ DGPP_TEST(arena_alignment_guarantees) {
 
 DGPP_TEST(arena_rejects_invalid_geometry_and_double_init) {
   if (!cuda_available()) {
-    std::printf("[SKIP] no CUDA device\n");
-    return;
+    dgpp::test::skip("no CUDA device");
   }
   dgpp::Arena a;
   a.init({.scratch_hot = 1 << 20});

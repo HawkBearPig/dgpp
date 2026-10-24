@@ -519,18 +519,15 @@ memory floor plus ~4 ms of collectives that is a ~1.6x ratio, the
 optimization gate's starting point (§5 of the plan; the confidence-
 scheduled rows are its first item now that acceptance is measured).
 
-**The like-for-like vLLM bench (2026-09-14, later; the recipe's own
-client, prompt set v1, temperature 0, thinking off; the dated
-the 2026-09-14 DeepSeek V4.1 measurements).** The
-recipe (TP4, DSpark k = 5, CUDA graphs) reports C1 37.95, C2 64.30, C6
-131.86 tok/s aggregate and C1 code 73.8 per stream. dgpp's depth-5
+**The cell-method bench (2026-09-14, later; one prompt per class, a
+cell at concurrency C sends C copies of it, temperature 0, thinking off;
+the dated 2026-09-14 DeepSeek V4.1 measurements).** dgpp's depth-5
 scheduled two-slot world: C1 47.5 / C2 64.3 aggregate, code 74.1, math
-73.1 (the recipe 47), reasoning 58.1 (38–42), prose 37.8 (23) — every
-category at or above the recipe at one and two streams. The six-slot
-world (depth 4, scheduled) after the day's three kernel changes: C1 48.6,
-C2 66.2, C6 82.7 aggregate (43.2 / 53.0 / 58.9 in the morning), TTFT 0.31
-/ 0.48 / 1.26 s (0.55 / 0.85 / 2.15), cold prefill 1,286 / 1,315 tok/s at
-2,950 / 11,592 tokens (568 / 595; the recipe 902–1,539). The changes: the
+73.1, reasoning 58.1, prose 37.8 per stream. The six-slot world (depth 4,
+scheduled) after the day's three kernel changes: C1 48.6, C2 66.2, C6
+82.7 aggregate (43.2 / 53.0 / 58.9 in the morning), TTFT 0.31 / 0.48 /
+1.26 s (0.55 / 0.85 / 2.15), cold prefill 1,286 / 1,315 tok/s at 2,950 /
+11,592 tokens (568 / 595). The changes: the
 streaming tensor-core decode GEMM (`kernels/mma_gemv`: the dense fp8
 projections, the engram wkv, the draft's main_proj and the bf16 head read
 their weights once per launch at 1–32 rows — the 30-row step 252 → 215
@@ -818,8 +815,9 @@ Flash) and +22–29 % (GLM-4.7: its step was the BF16 attention re-reads).
 ## DeepSeek-V4.1-Flash: the GPU-driven eager fold (plan D9, 2026-09-14 late)
 
 The six-slot config (`cluster_deepseek-v4.1-flash_mxfp4-fp8_w4_mtp4_c6`),
-the recipe's bench (`fabric_v41bench.sh`, prompt set v1, levels 1 and 6,
-the 2K prefill target), two boots the same evening: the host-driven eager
+a cell-method bench (prompt set v1: one prompt per class, C copies of it
+at concurrency C; levels 1 and 6, the 2K prefill target), two boots the
+same evening: the host-driven eager
 fold (`DGPP_DSV41_EAGER_FOLD=1`) against the stream-ordered one (the
 default since D9). Same binary, the bus timeline on for both.
 

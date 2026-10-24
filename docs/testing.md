@@ -1,5 +1,12 @@
 # Tests
 
+`resident_image_*` unit tests cover malformed offsets and lengths, truncated
+blobs, default payload verification, its explicit opt-out and recoverable
+read/size failures. `glm_loader_rebuilds_rejected_resident_images` and
+`qwen_loader_rebuilds_rejected_resident_images` corrupt an image's table and
+verify that the affected layer rebuilds, its neighbor restores and the repaired
+cache is reusable. Run the GPU loader suites on idle hardware.
+
 `serve_preparation_*` checks the fixed preparation pool at configured engine
 concurrencies of 1, 2, 4 and 16, completion ordering, responsive health/SSE
 traffic during blocked preparation, count/payload bounds, disconnects, worker
@@ -44,10 +51,29 @@ use the existing session numerical tier and certify changed argmax near ties;
 same-shape isolation and graph token comparisons remain exact. Qwen4Exp retains
 its two-rank `qwen_engine_test` coverage. Run GPU checks serially with production
 stopped, then restore and verify the original deployment.
+`qwen35_moe_*` adds the ModelOpt MoE fixture, row/group invariance and
+independent reference/teacher comparisons. `qwen35_tp_test` covers MoE
+worlds 1/2/4, native MTP graphs at worlds 2/4, and DFlash v1 graph
+proposals at worlds 1/2, with multiple
+request slots, page-boundary reserves and a small reduction buffer.
+`shared_prefill_qwen35_moe` in `shared_prefill_test` exercises the current
+shared-prefill protocol and native MTP. Run the focused set with:
+
+```bash
+python3 scripts/site_env.py run-rank --rank 0 -- ctest --test-dir build-ci --output-on-failure -j 1 -R '^(unit_tests|dflash2_kernels_test|qwen35_moe_.*|qwen35_tp_test)$'
+python3 scripts/site_env.py run-rank --rank 0 -- env DGPP_TEST_FILTER=shared_prefill_qwen35 ctest --test-dir build-ci --output-on-failure -j 1 -R '^shared_prefill_test$'
+```
+
 `qwen_image_prefill_test` also destroys the caller's prompt, image and boundary
 buffers after starting a shared `PrefillTask`. Its yielded execution must retain
 the target and MTP results, snapshot chain and KV cleanup behavior. Run it with
 `glm_vision_stream_test` and `glm_vision_frontend_test` when changing that lifetime.
+`qwen35_image_prefill_test` and `qwen35_mixed_image_prefill_test` cover the same
+lifetime for the 27B model with synthetic FP8 and mixed NVFP4 checkpoints. They
+also compare grouped and interleaved image requests against isolated execution,
+check cancellation followed by text slot reuse, and resume an attached prefix
+whose MTP catch-up token is the first image row. Build `qwen35_image_prefill_test`
+and run `ctest --test-dir build-ci --output-on-failure -R '^qwen35_(mixed_)?image_prefill_test$'`.
 
 For serving comparisons, use the same deployment, checkpoint revisions, prompts
 and output lengths for the previous and candidate executable. Warm long prompts
@@ -183,6 +209,28 @@ ctest --test-dir build-ci -L host -LE checkpoint --output-on-failure
 ctest --test-dir build-ci -L python --output-on-failure
 ```
 
+These selections include `cluster_process_swap_test`'s four cheap policy and
+mocked propagation checks. Run the four systemd integration checks explicitly
+on a Linux host with systemd user scopes:
+
+```bash
+ctest --test-dir build-ci -L systemd --output-on-failure -V
+```
+
+To run the remaining CTest groups while explicitly excluding real systemd
+scopes, use `ctest --test-dir build-ci -LE systemd --output-on-failure` after
+building their targets and satisfying their hardware/checkpoint requirements.
+
+`cluster_process_swap_systemd_test` is excluded from the `host` and `python`
+labels so those selections do not start real scopes. Positive checks report
+skips when systemd tools, a user manager or cgroup v2 memory/swap controls are
+unavailable. The missing-bus failure checks still run without a working user
+manager; they verify that scope failure never falls back to an unprotected
+command. Once a scope is launched, a behavioral failure remains a failure.
+Run this group when changing process launch, swap policy or version probes;
+directly running `tests/python/cluster_process_swap_test.py -v` retains all
+eight checks and reports individual skips.
+
 `serve_startup_test` uses the built server for two- and four-process settings
 handshakes over loopback. It deliberately fails a local HTTP capacity check
 after settings adoption, before model loading, CUDA initialization or RDMA
@@ -192,11 +240,23 @@ setup. It is registered when the server target is enabled (libibverbs required).
 loopback tests use fixed ports in the 299xx range. Run GPU/RDMA tests only
 on idle test hardware, serially; do not run them alongside production serving.
 
+The common native harness reports each completed case as `[ OK ]`, `[FAIL]`
+or `[SKIP] name: reason`. Its summary includes separate counts, for example
+`12 tests, 0 failed, 10 passed, 2 skipped`; the total includes skipped cases.
+Missing optional devices, checkpoints or an applicable corpus are skips,
+not passing checks. Assertion failures remain failures. A mixed or all-skipped
+harness run retains exit zero when no case fails; failure or an unmatched
+filter returns nonzero. CTest reports the aggregate binary result, not
+individual case skips. Standalone suites that already return skip code 2
+when their prerequisites are absent retain that behavior. Read the case
+counts before treating a passing aggregate result as hardware/model coverage.
+
 The [Chat API extension validation record](openai-api-validation.md) lists
 focused file/custom-tool/reasoning/schema checks, sanitizer commands and
 the distinction between host conformance tests and live model validation.
 
-CTest labels are `host`, `python`, `checkpoint`, `gpu`, `rdma` and `fixture`.
+CTest labels are `host`, `python`, `checkpoint`, `gpu`, `rdma`, `fixture` and
+`systemd`.
 Use `ctest --test-dir build-ci -N -L LABEL` to inspect a group before running
 it. Fixture producers are added automatically when a selected test requires
 them. Build all targets before a full CTest run. The `checkpoint` label marks

@@ -432,7 +432,7 @@ void CublasLtGemm::register_bf12(const void* weight, const Bf12Matrix& packed) {
 size_t CublasLtGemm::bf12_registered() const { return impl_->bf12.size(); }
 
 const Bf12Matrix* CublasLtGemm::bf12_lookup(const void* weight) const {
-  if (impl_->bf12.empty() || impl_->decode_mma) return nullptr;
+  if (impl_->bf12.empty()) return nullptr;
   const auto it = impl_->bf12.find(weight);
   return it == impl_->bf12.end() ? nullptr : &it->second.m;
 }
@@ -475,11 +475,15 @@ void CublasLtGemm::resident_view(const void* weight, size_t bytes, int m, const 
   if (it == impl_->bf12.end()) return;
   const Bf12Matrix& p = it->second.m;
   // The dispatch rule of matmul: the GEMV lowering's rows — every call of a
-  // released weight (its own bytes are gone; an Lt call expands these).
-  if (!it->second.released &&
-      (m < 1 || m > impl_->gemv_rows(&it->second) || impl_->decode_mma ||
-       !bf16_gemv_accepts(weight, 1, p.k) || !bf12_gemv_accepts(p, 1)))
+  // released weight (its own bytes are gone; an Lt call expands these) —
+  // or, under the tensor-core form, the decode widths its bf12 form takes.
+  if (impl_->decode_mma) {
+    if (it->second.released || m < 1 || m > kMmaGemvMaxRows || !mma_gemv_bf12_accepts(p, m)) return;
+  } else if (!it->second.released &&
+             (m < 1 || m > impl_->gemv_rows(&it->second) ||
+              !bf16_gemv_accepts(weight, 1, p.k) || !bf12_gemv_accepts(p, 1))) {
     return;
+  }
   *ptr = p.packed;
   *view_bytes = bf12_packed_bytes(p.n, p.k);
 }
@@ -521,6 +525,19 @@ void CublasLtGemm::matmul(const void* act, const void* weight, void* out,
     const bool split = impl_->mma_split_k && m <= kMmaGemvMaxRows;
     void* split_ws = split ? workspace : nullptr;
     const size_t split_bytes = split ? ws_bytes : 0;
+    // A registered companion feeds the decode forms (mma_gemv.hpp's bf12
+    // form, 2026-10-20: the chain of the bf16 launch at three quarters of
+    // its bytes — the lm head, read twice a pass); a shape or width the
+    // form declines runs the bf16 launch below.
+    if (const Impl::Bf12Entry* packed12 = m <= kMmaGemvMaxRows ? impl_->bf12_for(weight, n, k) : nullptr;
+        packed12 != nullptr) {
+      const bool took = out_dtype == GemmOut::F32
+                            ? launch_mma_gemv_bf12_f32(x, act_row_stride, packed12->m, reinterpret_cast<float*>(y), m, n, k,
+                                                       static_cast<size_t>(n), stream, split_ws, split_bytes)
+                            : launch_mma_gemv_bf12_bf16(x, act_row_stride, packed12->m, reinterpret_cast<uint16_t*>(y), m, n,
+                                                        k, static_cast<size_t>(n), stream, split_ws, split_bytes);
+      if (took) return;
+    }
     if (out_dtype == GemmOut::F32)
       launch_mma_gemv_bf16_f32(x, act_row_stride, w, reinterpret_cast<float*>(y), m, n, k,
                                static_cast<size_t>(n), stream, split_ws, split_bytes);

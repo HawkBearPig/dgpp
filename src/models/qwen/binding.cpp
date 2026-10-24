@@ -26,15 +26,20 @@ void add_bf16(TensorList& out, const std::string& name, std::vector<int64_t> sha
 // convention) by `f32_scale`.
 void add_quantized(TensorList& out, const std::string& name, int64_t rows, int64_t cols,
                    QwenWeightClass cls, int layer, int expert, bool nvfp4 = false,
-                   bool f32_scale = false, bool input_scale = true) {
+                   bool f32_scale = false, bool input_scale = true, bool csf_scales = false) {
   if (nvfp4) {
     // The modelopt NVFP4 triple (plus its activation scale, which the
     // weight-only W4A16_NVFP4 form of the QAD export's draft experts does
-    // not carry): `name` is "...proj.weight".
+    // not carry): `name` is "...proj.weight". The FP4-Local export wraps
+    // the backbone experts' per-group scales as CSF sidecars instead of
+    // the plain E4M3 weight_scale (config experts_nvfp4_csf): the sidecars
+    // are counted, not tabled (their shapes are data-dependent), and the
+    // loader expands them once.
     const std::string base = name.substr(0, name.size() - std::string(".weight").size());
     add(out, name, DType::U8, {rows, cols / 2}, cls, layer, expert, QwenTensorRole::Fp4Payload);
-    add(out, base + ".weight_scale", DType::F8_E4M3, {rows, cols / 16}, cls, layer, expert,
-        QwenTensorRole::Fp4Scale);
+    if (!csf_scales)
+      add(out, base + ".weight_scale", DType::F8_E4M3, {rows, cols / 16}, cls, layer, expert,
+          QwenTensorRole::Fp4Scale);
     add(out, base + ".weight_scale_2", DType::F32, {}, cls, layer, expert, QwenTensorRole::Fp4Global);
     if (input_scale)
       add(out, base + ".input_scale", DType::F32, {}, cls, layer, expert, QwenTensorRole::InputScale);
@@ -178,9 +183,12 @@ void expect_moe(TensorList& out, const std::string& p, const QwenTextConfig& cfg
   if (cfg.mtp_experts_nvfp4 && is_mtp) {
     for (int e = 0; e < E; ++e) {
       const std::string ep = p + "experts." + std::to_string(e) + ".";
-      add_quantized(out, ep + "gate_proj.weight", I, H, QwenWeightClass::RoutedExpert, layer, e, true, false, false);
-      add_quantized(out, ep + "up_proj.weight", I, H, QwenWeightClass::RoutedExpert, layer, e, true, false, false);
-      add_quantized(out, ep + "down_proj.weight", H, I, QwenWeightClass::RoutedExpert, layer, e, true, false, false);
+      add_quantized(out, ep + "gate_proj.weight", I, H, QwenWeightClass::RoutedExpert, layer, e, true, false, false,
+                    cfg.mtp_experts_nvfp4_csf);
+      add_quantized(out, ep + "up_proj.weight", I, H, QwenWeightClass::RoutedExpert, layer, e, true, false, false,
+                    cfg.mtp_experts_nvfp4_csf);
+      add_quantized(out, ep + "down_proj.weight", H, I, QwenWeightClass::RoutedExpert, layer, e, true, false, false,
+                    cfg.mtp_experts_nvfp4_csf);
     }
     return;
   }
@@ -196,9 +204,16 @@ void expect_moe(TensorList& out, const std::string& p, const QwenTextConfig& cfg
   }
   for (int e = 0; e < E; ++e) {
     const std::string ep = p + "experts." + std::to_string(e) + ".";
-    add_quantized(out, ep + "gate_proj.weight", I, H, QwenWeightClass::RoutedExpert, layer, e, nvfp4);
-    add_quantized(out, ep + "up_proj.weight", I, H, QwenWeightClass::RoutedExpert, layer, e, nvfp4);
-    add_quantized(out, ep + "down_proj.weight", H, I, QwenWeightClass::RoutedExpert, layer, e, nvfp4);
+    // The FP4-Local export's CSF-wrapped scales (config experts_nvfp4_csf):
+    // no plain weight_scale; the sidecars are counted at validation and
+    // expanded once at load.
+    const bool csf = nvfp4 && cfg.experts_nvfp4_csf;
+    add_quantized(out, ep + "gate_proj.weight", I, H, QwenWeightClass::RoutedExpert, layer, e, nvfp4,
+                  false, true, csf);
+    add_quantized(out, ep + "up_proj.weight", I, H, QwenWeightClass::RoutedExpert, layer, e, nvfp4,
+                  false, true, csf);
+    add_quantized(out, ep + "down_proj.weight", H, I, QwenWeightClass::RoutedExpert, layer, e, nvfp4,
+                  false, true, csf);
   }
 }
 
@@ -364,6 +379,35 @@ QwenBindReport qwen_validate_text_binding(
     ++rep.matched;
     if (e.quantized()) ++rep.quantized_matrices;
     if (e.role == QwenTensorRole::NgramShard) ++rep.ngram_shards;
+  }
+  // Sidecars belong to a specific routed matrix, not to an allowlisted
+  // suffix. Validate both before allocating the resident model; only the
+  // exception count is data-dependent.
+  for (const auto& e : expected) {
+    if (e.role != QwenTensorRole::Fp4Payload || e.cls != QwenWeightClass::RoutedExpert) continue;
+    if (!(e.layer == cfg.mtp_layer() ? cfg.mtp_experts_nvfp4_csf : cfg.experts_nvfp4_csf)) continue;
+    const int64_t rows = e.shape[0], cols = e.shape[1] / 8;  // K/16 scales
+    for (const bool fixed : {true, false}) {
+      const std::string name = e.name + "_scale.nvfp4_csf_" + (fixed ? "fixed" : "exceptions");
+      const auto it = present.find(name);
+      if (it == present.end()) {
+        ++rep.missing;
+        push_error(std::format("missing tensor '{}'", name));
+        continue;
+      }
+      consumed.emplace(name, 1);
+      const auto& d = it->second;
+      if (d.dtype != (fixed ? DType::U8 : DType::U32)) {
+        ++rep.dtype_mismatch;
+        push_error(std::format("'{}' has the wrong CSF sidecar dtype", name));
+      } else if (fixed ? d.shape != std::vector<int64_t>{rows / 16, 16 * (1 + cols / 2)}
+                       : d.shape.size() != 1 || d.shape[0] < 0 || d.shape[0] > rows * cols) {
+        ++rep.shape_mismatch;
+        push_error(std::format("'{}' has an invalid CSF sidecar shape {}", name, shape_str(d.shape)));
+      } else {
+        ++rep.csf_sidecars;
+      }
+    }
   }
   for (const auto& [name, desc] : present) {
     if (consumed.count(name)) continue;

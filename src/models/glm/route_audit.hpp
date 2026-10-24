@@ -92,7 +92,9 @@ inline void audit_route_flips(const int32_t* eng_ids,
   for (int64_t t = 0; t < tokens; ++t) {
     const int32_t* ei = eng_ids + t * top_k;
     const int32_t* ri = ref_ids + t * top_k;
-    std::vector<int32_t> eng(ei, ei + top_k), ref(ri, ri + top_k);
+    std::vector<int32_t> eng(K), ref(K);
+    std::copy_n(ei, K, eng.begin());
+    std::copy_n(ri, K, ref.begin());
     std::sort(eng.begin(), eng.end());
     std::sort(ref.begin(), ref.end());
     if (eng == ref) continue;  // kept token: nothing to prove

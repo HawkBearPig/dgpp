@@ -1,4 +1,5 @@
 #include "kernels/bf16_gemv.hpp"
+#include "kernels/pdl.cuh"
 
 #include <algorithm>
 #include <stdexcept>
@@ -16,6 +17,7 @@ __global__ void bf16_gemv_kernel(const uint16_t* __restrict__ act,
                                  size_t act_stride,
                                  const uint16_t* __restrict__ w,
                                  void* __restrict__ out, int n, int k) {
+  dgpp_pdl_wait();
   extern __shared__ __align__(16) uint16_t sx[];
   gemv::stage_activations<kRows>(act, act_stride, k, sx);
   __syncthreads();
@@ -41,6 +43,7 @@ __global__ void bf16_gemv_kernel(const uint16_t* __restrict__ act,
 template <int kRows, bool kOutF32>
 __global__ void bf16_gemv_dual_kernel(Bf16GemvProblem p0, Bf16GemvProblem p1,
                                       int blocks0, int k) {
+  dgpp_pdl_wait();
   extern __shared__ __align__(16) uint16_t sx[];
   const bool second = static_cast<int>(blockIdx.x) >= blocks0;
   // Field-wise selects, not a reference into the parameter space: a
@@ -84,6 +87,7 @@ struct Bf16GemvMulti {
 
 template <int kRows, bool kOutF32>
 __global__ void bf16_gemv_multi_kernel(Bf16GemvMulti mp, int k) {
+  dgpp_pdl_wait();
   extern __shared__ __align__(16) uint16_t sx[];
   const int bid = static_cast<int>(blockIdx.x);
   int which = 0;

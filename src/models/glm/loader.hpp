@@ -356,8 +356,7 @@ class GlmLayerStream {
   GlmReplicatedDigest compute_replicated_digest() const;
   // The image paths of load_layer (resident): lay out the views without a
   // source byte, then stream the blob in; or dump a freshly built bump.
-  void restore_layer_from_image(int layer, GlmLayerBump& bump,
-                                GlmLayerResident& out);
+  bool restore_layer_from_image(int layer, GlmLayerBump& bump, GlmLayerResident& out);
   void capture_layer_to_image(int layer, const GlmLayerBump& bump,
                               size_t bytes);
   std::vector<std::unique_ptr<SafetensorsFile>> shards_;

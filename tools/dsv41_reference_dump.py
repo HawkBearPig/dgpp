@@ -121,9 +121,177 @@ def load_np(entries, name):
         return w.view(np.float32).astype(np.float64).reshape(shape)
     if dtype == "F32":
         return np.frombuffer(buf, dtype=np.float32).astype(np.float64).reshape(shape)
+    if dtype == "F16":
+        return np.frombuffer(buf, dtype=np.float16).astype(np.float64).reshape(shape)
+    if dtype == "I16":
+        return np.frombuffer(buf, dtype=np.int16).reshape(shape)
     if dtype in ("F8_E4M3", "F8_E8M0", "I8"):
         return np.frombuffer(buf, dtype=np.uint8).reshape(shape)
     raise ValueError("unsupported dtype %s for %s" % (dtype, name))
+
+
+# ---- the EXL3 trellis (docs/deepseek_v41_flash_exl3_plan.md §2; models/exl3_matrix.hpp) ----
+# A matrix is `trellis` I16 [K/16, N/16, 16 * bits] (a 16 x 16 tile per
+# (k tile, n tile), its 256 values in the mma B-fragment order packed
+# MSB-first into little-endian uint32 words), `suh` F16 [K], `svh` F16 [N].
+# State p of a tile is the stream's bits [(p + 1) bits - 16, (p + 1) bits)
+# modulo 256 bits; its value under the mul1 codebook is one fp16 fma of
+# 1024 + bytesum(state * 0x83DCD12D) by 0x1eee, 0xc931. The weight in the
+# HF layout ([N, K]) is svh o H_N (w_inner) H_K o suh with the 128-point
+# Sylvester-order rotations over sqrt(128) per block, in doubles here.
+_MUL1_TABLE = None
+
+
+def mul1_table():
+    global _MUL1_TABLE
+    if _MUL1_TABLE is None:
+        st = np.arange(65536, dtype=np.uint64)
+        x = (st * np.uint64(0x83DCD12D)) & np.uint64(0xFFFFFFFF)
+        bs = (x & 0xFF) + ((x >> 8) & 0xFF) + ((x >> 16) & 0xFF) + ((x >> 24) & 0xFF)
+        h = (0x6400 + bs).astype(np.uint16).view(np.float16).astype(np.float64)
+        kinv = np.array([0x1eee], dtype=np.uint16).view(np.float16).astype(np.float64)[0]
+        kbias = np.array([0xc931], dtype=np.uint16).view(np.float16).astype(np.float64)[0]
+        _MUL1_TABLE = (h * kinv + kbias).astype(np.float16).astype(np.float64)  # one rounding, as the fma
+    return _MUL1_TABLE
+
+
+def _tile_positions():
+    p = np.arange(256)
+    t, j = p // 8, p % 8
+    rows = (t % 4) * 2 + np.array([0, 1, 8, 9])[j % 4]
+    cols = t // 4 + 8 * (j // 4)
+    return rows, cols
+
+
+def exl3_inner(trellis):
+    """The trellis [K/16, N/16, 16 * bits] int16 -> w_inner [K, N] (the codebook values)."""
+    kt, nt, words16 = trellis.shape
+    bits = words16 // 16
+    length = 256 * bits
+    # Every tile's bit stream: words LE uint32, MSB-first inside each word.
+    u32 = np.ascontiguousarray(trellis).view(np.uint8).reshape(kt, nt, length // 32, 4)
+    u32 = (u32[..., 0].astype(np.uint32) | (u32[..., 1].astype(np.uint32) << 8) |
+           (u32[..., 2].astype(np.uint32) << 16) | (u32[..., 3].astype(np.uint32) << 24))
+    bitpos = np.arange(length)
+    stream = ((u32[:, :, bitpos // 32] >> (31 - (bitpos % 32)).astype(np.uint32)) & 1).astype(np.uint32)  # [kt, nt, length]
+    p = np.arange(256)
+    end = ((p + 1) * bits) % length
+    idx = (end[:, None] - 16 + np.arange(16)[None, :]) % length                        # [256, 16]
+    bits16 = stream[:, :, idx]                                                           # [kt, nt, 256, 16]
+    weights = (np.uint32(1) << np.arange(15, -1, -1, dtype=np.uint32))
+    states = (bits16 * weights).sum(axis=-1).astype(np.int64)                            # [kt, nt, 256]
+    vals = mul1_table()[states]
+    rows, cols = _tile_positions()
+    tile = np.zeros((kt, nt, 16, 16), dtype=np.float64)
+    tile[:, :, rows, cols] = vals
+    return tile.transpose(0, 2, 1, 3).reshape(kt * 16, nt * 16)
+
+
+def hadamard128_blocks(x, axis):
+    """The 128-point rotation (butterflies at strides 1..64, element j: v_j + v_{j^s} when
+    bit s is clear, v_{j^s} - v_j when set) over sqrt(128), per 128-block along `axis`."""
+    x = np.moveaxis(x, axis, -1)
+    shape = x.shape
+    v = x.reshape(shape[:-1] + (shape[-1] // 128, 128)).copy()
+    j = np.arange(128)
+    for s in (1, 2, 4, 8, 16, 32, 64):
+        other = v[..., j ^ s]
+        v = np.where((j & s) != 0, other - v, v + other)
+    v = v * (1.0 / np.sqrt(128.0))
+    return np.moveaxis(v.reshape(shape), -1, axis)
+
+
+def hadamard128_blocks_f32(x):
+    """The input rotation as the engine's rotate kernel computes it: fp32
+    butterflies in the stage order 1..64 over each 128-block of the last
+    axis, then one multiply by the fp32 scale 0.088388347648."""
+    x = np.asarray(x, dtype=np.float32)
+    shape = x.shape
+    v = x.reshape(shape[:-1] + (shape[-1] // 128, 128)).copy()
+    j = np.arange(128)
+    for s_ in (1, 2, 4, 8, 16, 32, 64):
+        other = v[..., j ^ s_]
+        v = np.where((j & s_) != 0, other - v, v + other).astype(np.float32)
+    v = (v * np.float32(0.088388347648)).astype(np.float32)
+    return v.reshape(shape)
+
+
+class Exl3Mat:
+    """An EXL3 matrix in its inner form, so a product models the engine's
+    chain (docs/deepseek_v41_flash_exl3_plan.md §2.2): the row is scaled
+    by suh and rotated in fp32 and rounded to fp16 — the one rounding the
+    engine adds, bitwise its rotate kernel's — then multiplied by the
+    codebook values (exact products, fp32 accumulation in the engine),
+    rotated on the output axis and scaled by svh in doubles. `x @ m.T`
+    and `linear_bf16(x, m)` take it like a dense [N, K] array; a row slice
+    on 128-blocks (`m[a:b]`) is the output block range."""
+    __array_ufunc__ = None  # `ndarray @ Exl3T` defers to our __rmatmul__
+
+    def __init__(self, inner, suh, svh):
+        self.inner, self.suh, self.svh = inner, suh, svh  # inner [K, N], suh [K], svh [N]
+
+    @property
+    def shape(self):
+        return (self.svh.shape[0], self.suh.shape[0])
+
+    def __getitem__(self, rows):
+        start, stop, step = rows.indices(self.shape[0])
+        assert step == 1 and start % 128 == 0 and stop % 128 == 0, "an EXL3 row slice is whole 128-blocks"
+        return Exl3Mat(self.inner[:, start:stop], self.suh, self.svh[start:stop])
+
+    @property
+    def T(self):
+        return _Exl3T(self)
+
+    def apply(self, x):
+        """x [..., K] -> the unrounded product [..., N] (doubles)."""
+        x = np.asarray(x, dtype=np.float64)
+        xh = hadamard128_blocks_f32(x.astype(np.float32) * self.suh.astype(np.float32)).astype(np.float16).astype(np.float64)
+        y = xh @ self.inner
+        return hadamard128_blocks(y, axis=-1) * self.svh
+
+    def dense(self):
+        """The exact dequantized W^T ([N, K] doubles) for an oracle that wants the matrix."""
+        w = hadamard128_blocks(self.inner, axis=0) * self.suh[:, None]
+        return (hadamard128_blocks(w, axis=1) * self.svh[None, :]).T
+
+
+class _Exl3T:
+    __array_ufunc__ = None
+
+    def __init__(self, m):
+        self.m = m
+
+    def __rmatmul__(self, x):
+        return self.m.apply(x)
+
+
+def load_exl3(entries, base):
+    """An EXL3 matrix -> its Exl3Mat (the engine's chain modelled on a product)."""
+    trellis = load_np(entries, base + ".trellis")
+    suh = load_np(entries, base + ".suh")
+    svh = load_np(entries, base + ".svh")
+    return Exl3Mat(exl3_inner(trellis), suh, svh)
+
+
+def head_weight(entries):
+    """The lm head [V, H]: the EXL3 pack's matrix or the release's bf16 rows."""
+    if "head.trellis" in entries:
+        return load_exl3(entries, "head")
+    return load_np(entries, "head.weight")
+
+
+def load_w(entries, base):
+    """A projection in whichever format the checkpoint packs: EXL3, else the fp8 pair."""
+    if base + ".trellis" in entries:
+        return load_exl3(entries, base)
+    return load_fp8(entries, base)
+
+
+def load_expert(entries, base):
+    if base + ".trellis" in entries:
+        return load_exl3(entries, base)
+    return load_mxfp4(entries, base)
 
 
 def load_fp8(entries, base):
@@ -179,6 +347,8 @@ def rmsnorm1(x, w, eps):
 
 def linear_bf16(x, w):
     """bf16(x @ w^T): a projection with a bf16 output (the engine's GEMV / tile kernels)."""
+    if isinstance(w, Exl3Mat):
+        return bf16(w.apply(x))
     return bf16(np.asarray(x, dtype=np.float64) @ np.asarray(w, dtype=np.float64).T)
 
 
@@ -310,6 +480,11 @@ def hc_post(y, x, post, comb):
 # ---------------------------------------------------------------------------
 # the layers
 # ---------------------------------------------------------------------------
+def wo_a_group(w, g, o_lora):
+    """Group g's wo_a rows: the release's row block, or the pack's per-group matrix."""
+    return w.wo_a[g] if isinstance(w.wo_a, list) else w.wo_a[g * o_lora:(g + 1) * o_lora]
+
+
 def layer_prefix(cfg, layer):
     L = cfg["num_hidden_layers"]
     return ("mtp.%d." % (layer - L)) if layer >= L else ("layers.%d." % layer)
@@ -330,44 +505,53 @@ class Weights:
         self.q_norm = load_np(entries, a + "q_norm.weight")
         self.kv_norm = load_np(entries, a + "kv_norm.weight")
         self.sink = load_np(entries, a + "attn_sink")
-        self.wq_a = load_fp8(entries, a + "wq_a")
-        self.wq_b = load_fp8(entries, a + "wq_b")
-        self.wkv = load_fp8(entries, a + "wkv")
-        self.wo_a = load_fp8(entries, a + "wo_a")
-        self.wo_b = load_fp8(entries, a + "wo_b")
+        self.wq_a = load_w(entries, a + "wq_a")
+        self.wq_b = load_w(entries, a + "wq_b")
+        self.wkv = load_w(entries, a + "wkv")
+        # wo_a is block-diagonal over the output groups; the EXL3 pack ships
+        # one matrix per group (wo_a.slice.g, [o_lora, hpg * 512]), stacked
+        # here into the release's [o_groups * o_lora, hpg * 512] rows.
+        if a + "wo_a.slice.0.trellis" in entries:
+            self.wo_a = [load_exl3(entries, a + "wo_a.slice.%d" % g) for g in range(cfg["o_groups"])]
+        else:
+            self.wo_a = load_w(entries, a + "wo_a")
+        self.wo_b = load_w(entries, a + "wo_b")
         self.ratio = cfg["compress_ratios"][layer]
         self.kv_source = layer in cfg["kv_source_layer_ids"]
         self.index_source = layer in cfg["index_source_layer_ids"]
         if self.index_source:
-            self.idx_wq_b = load_fp8(entries, a + "indexer.wq_b")
+            self.idx_wq_b = load_w(entries, a + "indexer.wq_b")
             self.idx_wp = load_np(entries, a + "indexer.weights_proj.weight")
         if self.kv_source:
-            self.idx_wk = load_np(entries, a + "indexer.wk.weight")
+            self.idx_wk = (load_exl3(entries, a + "indexer.wk") if a + "indexer.wk.trellis" in entries
+                           else load_np(entries, a + "indexer.wk.weight"))
             self.idx_k_norm = load_np(entries, a + "indexer.k_norm.weight")
-            self.comp_wkv = load_np(entries, a + "compressor.wkv.weight")
+            self.comp_wkv = (load_exl3(entries, a + "compressor.wkv") if a + "compressor.wkv.trellis" in entries
+                             else load_np(entries, a + "compressor.wkv.weight"))
             self.comp_norm = load_np(entries, a + "compressor.norm.weight")
             if self.ratio == 2:
-                self.comp_wgate = load_np(entries, a + "compressor.wgate.weight")
+                self.comp_wgate = (load_exl3(entries, a + "compressor.wgate") if a + "compressor.wgate.trellis" in entries
+                                   else load_np(entries, a + "compressor.wgate.weight"))
         m = p + "ffn."
         self.router = load_np(entries, m + "gate.weight")
         self.router_bias = load_np(entries, m + "gate.bias")
         E = cfg["dspark_n_routed_experts"] if self.draft else cfg["n_routed_experts"]
         self.top_k = cfg["dspark_num_experts_per_tok"] if self.draft else cfg["num_experts_per_tok"]
-        self.experts = [(load_mxfp4(entries, m + "experts.%d.w1" % e), load_mxfp4(entries, m + "experts.%d.w3" % e),
-                         load_mxfp4(entries, m + "experts.%d.w2" % e)) for e in range(E)]
-        self.shared = (load_fp8(entries, m + "shared_experts.w1"), load_fp8(entries, m + "shared_experts.w3"),
-                       load_fp8(entries, m + "shared_experts.w2"))
+        self.experts = [(load_expert(entries, m + "experts.%d.w1" % e), load_expert(entries, m + "experts.%d.w3" % e),
+                         load_expert(entries, m + "experts.%d.w2" % e)) for e in range(E)]
+        self.shared = (load_w(entries, m + "shared_experts.w1"), load_w(entries, m + "shared_experts.w3"),
+                       load_w(entries, m + "shared_experts.w2"))
         self.engram = (not self.draft) and layer in cfg["engram_layer_ids"]
         if self.engram:
             g = p + "engram."
-            self.eng_wkv = load_fp8(entries, g + "wkv")
+            self.eng_wkv = load_w(entries, g + "wkv")
             self.eng_q = load_np(entries, g + "q_weight")
             self.eng_k = load_np(entries, g + "k_weight")
             self.eng_table = g + "embed"
         if self.draft:
             stage = layer - L
             if stage == 0:
-                self.main_proj = load_fp8(entries, p + "main_proj")
+                self.main_proj = load_w(entries, p + "main_proj")
                 self.main_norm = load_np(entries, p + "main_norm.weight")
             if stage == cfg["num_nextn_predict_layers"] - 1:
                 self.draft_norm = load_np(entries, p + "norm.weight")
@@ -548,7 +732,7 @@ def csa2_forward(cfg, w, u, layer, state, freq, T, seg=0, pos0=None):
     oa = []
     for g in range(cfg["o_groups"]):
         og = o[:, g * hpg:(g + 1) * hpg, :].reshape(T, hpg * 512)
-        wg = w.wo_a[g * cfg["o_lora_rank"]:(g + 1) * cfg["o_lora_rank"]]
+        wg = wo_a_group(w, g, cfg["o_lora_rank"])
         oa.append(linear_bf16(og, wg))
     oa = np.concatenate(oa, axis=1)
     y = linear_bf16(oa, w.wo_b)
@@ -672,7 +856,7 @@ def reference_forward(cfg, entries, sc, tokens, teacher=None, bounded=False):
         layer_states.append(x.copy())
         print("layer %d done" % layer, file=sys.stderr)
     h = rmsnorm1(hc_pre(x, pre_mix), load_np(entries, "norm.weight"), cfg["rms_norm_eps"])
-    logits = f32(h @ load_np(entries, "head.weight").T)
+    logits = f32(h @ head_weight(entries).T)
     main_hidden = np.concatenate(main_hiddens, axis=1) if main_hiddens else None
     return (layer_states, h, logits, routes, route_margins, selections, sel_margins, index_logits, candidates,
             block_margins, main_hidden, seg0)
@@ -733,7 +917,7 @@ def dspark_forward(cfg, entries, main_hidden, logits, T, seg0=0):
         oa = []
         for g in range(cfg["o_groups"]):
             og = o[:, g * hpg:(g + 1) * hpg, :].reshape(B, hpg * 512)
-            wg = w.wo_a[g * cfg["o_lora_rank"]:(g + 1) * cfg["o_lora_rank"]]
+            wg = wo_a_group(w, g, cfg["o_lora_rank"])
             oa.append(linear_bf16(og, wg))
         y = linear_bf16(np.concatenate(oa, axis=1), w.wo_b)
         site = {"x_attn": u.copy(), "attn_out": y.copy()}
@@ -749,7 +933,7 @@ def dspark_forward(cfg, entries, main_hidden, logits, T, seg0=0):
         pre_mix = pre_f
     xh = hc_pre(x, pre_mix)  # [B, H] bf16: the confidence head's hidden
     h = rmsnorm1(xh, wl.draft_norm, eps)
-    blogits = f32(h @ load_np(entries, "head.weight").T)  # [B, V]
+    blogits = f32(h @ head_weight(entries).T)  # [B, V]
     margins = np.zeros(B)
     conf = np.zeros(B)
     for i in range(B):

@@ -38,9 +38,10 @@ GlmMoeConfig QwenMoeLayer::routed_config(int hidden, int inter, int n_experts,
 GlmMoeWeights QwenMoeLayer::routed_view(const QwenMoeWeights& w) {
   GlmMoeWeights g;
   g.router_gate = w.router;
-  g.router_bias = nullptr;
+  g.router_bias = w.router_bias;
   g.experts = w.experts;
   g.experts_fp4 = w.experts_fp4;
+  g.routed_fp4_mask = w.routed_fp4_mask;
   g.experts_packed = w.experts_packed;
   g.act_scale_w13 = w.act_scale_w13;
   g.act_scales_dev = w.act_scales_dev;
@@ -79,10 +80,14 @@ QwenMoeLayer::QwenMoeLayer(const QwenMoeWeights& weights, const GlmMoeConfig& cf
     DGPP_CUDA_OK(cudaEventCreateWithFlags(&shared_fork_, cudaEventDisableTiming));
     DGPP_CUDA_OK(cudaEventCreateWithFlags(&shared_join_, cudaEventDisableTiming));
   }
-  if (cfg_.n_shared_experts != 0 || cfg_.router_mode != MoeRouterMode::SoftmaxTopk)
+  // The routed config: routed_config()'s (the softmax router) or Flint's
+  // (the sigmoid router with its zero bias, FlintTextConfig::moe_config);
+  // the shared expert never in the chain.
+  if (cfg_.n_shared_experts != 0 ||
+      (cfg_.router_mode != MoeRouterMode::SoftmaxTopk && cfg_.router_mode != MoeRouterMode::SigmoidBias))
     throw std::invalid_argument(
         "QwenMoeLayer: the routed config must be routed_config()'s (softmax "
-        "router, no shared expert in the chain)");
+        "router, no shared expert in the chain) or a sigmoid router's");
   check_weights();
   const size_t M = static_cast<size_t>(max_tokens_);
   const size_t H = static_cast<size_t>(cfg_.hidden);
@@ -126,10 +131,14 @@ void QwenMoeLayer::check_weights() const {
   const bool shared_ok = w_.shared_fp8 ? (w_.shared_fp8[0].payload && w_.shared_fp8[1].payload && w_.shared_fp8[2].payload)
                                        : (w_.shared_gate_proj && w_.shared_up_proj && w_.shared_down_proj);
   const int forms = (w_.experts != nullptr) + (w_.experts_fp4 != nullptr) + (w_.experts_packed != nullptr);
-  if (!w_.router || !w_.shared_gate || !shared_ok || forms == 0)
+  // shared_gate null: the ungated shared expert at weight 1 (Flint).
+  if (!w_.router || !shared_ok || forms == 0)
     throw std::invalid_argument("QwenMoeLayer: null weight pointer");
-  if (forms != 1)
-    throw std::invalid_argument("QwenMoeLayer: exactly one routed expert form (fp8, nvfp4, packed) may be bound");
+  const bool mixed = forms == 2 && w_.experts && w_.experts_fp4 && w_.routed_fp4_mask != 0;
+  if (forms != 1 && !mixed)
+    throw std::invalid_argument(
+        "QwenMoeLayer: exactly one routed expert form (fp8, nvfp4, packed) may be bound, or the fp8 and NVFP4 "
+        "tables with a per-projection mask");
   if (w_.shared_inter <= 0 || w_.shared_inter % 8 != 0)
     throw std::invalid_argument("QwenMoeLayer: shared_inter must be a positive multiple of 8");
   if (cfg_.hidden % 8 != 0)
@@ -236,11 +245,11 @@ void QwenMoeLayer::enqueue_prefill(const uint16_t* hidden, uint16_t* out, int to
   routed_.enqueue_prefill_f32(hidden, d_acc_, tokens, trace, stream,
                               routed_.mma_takes_grid() ? MoeExpertKernel::kMma
                                                        : MoeExpertKernel::kGemv);
-  shared_tail(hidden, out, tokens, stream);
+  shared_tail(hidden, out, tokens, stream, true);
 }
 
 void QwenMoeLayer::shared_tail(const uint16_t* hidden, uint16_t* out, int tokens,
-                               cudaStream_t stream) {
+                               cudaStream_t stream, bool prefill) {
   const int H = cfg_.hidden;
   const int S = static_cast<int>(w_.shared_inter);
   // 2. The BF16 shared expert: gate/up (bf16 out), silu * up with the
@@ -248,7 +257,8 @@ void QwenMoeLayer::shared_tail(const uint16_t* hidden, uint16_t* out, int tokens
   int rs = 7, cs = 7;
   shared_grid(rs, cs);
   const bool block128 = shared_block128();
-  if (w_.shared_fp8 && tokens > 128) {
+  const bool tile = prefill && prefill_dense_tile_ && !block128 && H % 64 == 0 && S % 64 == 0;
+  if (w_.shared_fp8 && tokens > 128 && !tile) {
     // Prefill-shaped: each FP8 matrix dequantized into the bridge (the
     // GEMV core's values) and run through the BF16 interface.
     launch_fp8_dequant_blocks(w_.shared_fp8[0].payload, w_.shared_fp8[0].scales, d_shared_bridge_, S, H, stream, rs, cs);
@@ -273,10 +283,10 @@ void QwenMoeLayer::shared_tail(const uint16_t* hidden, uint16_t* out, int tokens
     const bool mma = mma_from_rows_ > 0 && tokens >= mma_from_rows_;
     launch_scale_gemm_grid_bf16(hidden, static_cast<size_t>(H), w_.shared_fp8[0].payload, w_.shared_fp8[0].scales,
                                 d_sgate_, tokens, S, H, stream, static_cast<size_t>(S), rs, cs, mma, gemm_ws_,
-                                gemm_ws_bytes_);
+                                gemm_ws_bytes_, tile);
     launch_scale_gemm_grid_bf16(hidden, static_cast<size_t>(H), w_.shared_fp8[1].payload, w_.shared_fp8[1].scales,
                                 d_sup_, tokens, S, H, stream, static_cast<size_t>(S), rs, cs, mma, gemm_ws_,
-                                gemm_ws_bytes_);
+                                gemm_ws_bytes_, tile);
   } else {
     gemm_.matmul(hidden, w_.shared_gate_proj, d_sgate_, tokens, S, H, DType::BF16,
                  GemmOut::BF16, static_cast<size_t>(H), gemm_ws_, gemm_ws_bytes_, stream);
@@ -286,7 +296,7 @@ void QwenMoeLayer::shared_tail(const uint16_t* hidden, uint16_t* out, int tokens
   launch_moe_swiglu_clamp(d_sgate_, d_sup_, d_sact_,
                           static_cast<int64_t>(tokens) * S,
                           std::numeric_limits<float>::infinity(), stream);
-  if (w_.shared_fp8 && tokens > 128) {
+  if (w_.shared_fp8 && tokens > 128 && !tile) {
     launch_fp8_dequant_blocks(w_.shared_fp8[2].payload, w_.shared_fp8[2].scales, d_shared_bridge_, H, S, stream, rs, cs);
     gemm_.matmul(d_sact_, d_shared_bridge_, d_sdown_, tokens, H, S, DType::BF16,
                  GemmOut::F32, static_cast<size_t>(S), gemm_ws_, gemm_ws_bytes_, stream);
@@ -297,7 +307,7 @@ void QwenMoeLayer::shared_tail(const uint16_t* hidden, uint16_t* out, int tokens
   else if (w_.shared_fp8)
     launch_scale_gemm_grid_f32(d_sact_, static_cast<size_t>(S), w_.shared_fp8[2].payload, w_.shared_fp8[2].scales,
                                d_sdown_, tokens, H, S, stream, static_cast<size_t>(H), rs, cs,
-                               mma_from_rows_ > 0 && tokens >= mma_from_rows_, gemm_ws_, gemm_ws_bytes_);
+                               mma_from_rows_ > 0 && tokens >= mma_from_rows_, gemm_ws_, gemm_ws_bytes_, tile);
   else
     gemm_.matmul(d_sact_, w_.shared_down_proj, d_sdown_, tokens, H, S, DType::BF16,
                  GemmOut::F32, static_cast<size_t>(S), gemm_ws_, gemm_ws_bytes_, stream);

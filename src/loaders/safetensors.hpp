@@ -1,14 +1,15 @@
 #pragma once
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <unistd.h>
-
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <fcntl.h>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <unordered_map>
 #include <vector>
 
@@ -30,10 +31,20 @@ struct TensorInfo {
 
   size_t numel() const {
     size_t n = 1;
-    for (auto d : shape) n *= static_cast<size_t>(d);
+    for (const auto d : shape) {
+      if (d < 0) throw std::runtime_error("safetensors: negative tensor shape dimension");
+      if (static_cast<uint64_t>(d) > std::numeric_limits<size_t>::max() ||
+          (n != 0 && static_cast<uint64_t>(d) > std::numeric_limits<size_t>::max() / n))
+        throw std::runtime_error("safetensors: tensor shape element count overflows");
+      n *= static_cast<size_t>(d);
+    }
     return n;
   }
-  size_t nbytes() const { return data_end - data_begin; }
+  size_t nbytes() const {
+    if (data_end < data_begin || data_end - data_begin > std::numeric_limits<size_t>::max())
+      throw std::runtime_error("safetensors: invalid tensor byte range");
+    return static_cast<size_t>(data_end - data_begin);
+  }
 };
 
 class SafetensorsFile {
@@ -143,6 +154,28 @@ class SafetensorsFile {
   // FNV-1a of the raw header JSON: the shard's identity for cache keys
   // (names, dtypes, shapes, offsets — a swapped checkpoint changes it).
   uint64_t header_fold() const { return header_fold_; }
+  // FNV-1a over three 64 KiB windows of the payload (its start, middle and
+  // end): the shard's WEIGHT identity, for the resident image's payload
+  // note. A refined release that re-ships the same tensors in the same
+  // shards with other values keeps header_fold() and changes this
+  // (DeepSeek-V4.1-Flash-1017 against DeepSeek-V4.1-Flash, 2026-10-18:
+  // byte-identical config and headers, every shard's payload different).
+  // Three page-ins per shard; nothing else is read.
+  uint64_t payload_sample_fold() const {
+    uint64_t hlen = 0;
+    std::memcpy(&hlen, map_, 8);
+    const size_t begin = 8 + static_cast<size_t>(hlen);
+    const size_t len = map_len_ > begin ? map_len_ - begin : 0;
+    constexpr size_t kWindow = 64 * 1024;
+    const size_t starts[3] = {0, len / 2, len > kWindow ? len - kWindow : 0};
+    uint64_t h = 1469598103934665603ull;
+    for (const size_t s0 : starts) {
+      const size_t n = std::min(kWindow, len - std::min(len, s0));
+      const uint8_t* w = map_ + begin + s0;
+      for (size_t i = 0; i < n; ++i) h = (h ^ w[i]) * 1099511628211ull;
+    }
+    return h;
+  }
 
   // Header-truth iteration (bind-check tooling): visits every tensor of this
   // shard. Fn takes const TensorInfo&.
@@ -159,8 +192,7 @@ class SafetensorsFile {
       throw std::runtime_error(path_ + ": too small for safetensors");
     uint64_t hlen;
     std::memcpy(&hlen, map_, 8);
-    if (8 + hlen > map_len_)
-      throw std::runtime_error(path_ + ": header length overruns file");
+    if (hlen > map_len_ - 8) throw std::runtime_error(path_ + ": header length overruns file");
     std::string_view json(reinterpret_cast<const char*>(map_ + 8), hlen);
     header_fold_ = 1469598103934665603ull;
     for (const char c : json)
@@ -183,13 +215,34 @@ class SafetensorsFile {
       if (!dt)
         throw std::runtime_error(path_ + ": unknown dtype " + std::string(ds));
       t->dtype = *dt;
-      for (const auto& d : desc.at("shape").items())
-        t->shape.push_back(d.as_int());
+      const auto nonnegative_integer = [&](const minijson::Value& value,
+                                           const char* field) -> uint64_t {
+        if (value.kind() != minijson::Value::Kind::Int || value.as_int() < 0)
+          throw std::runtime_error(path_ + ": tensor " + m.key + " " + field +
+                                   " must contain nonnegative integers");
+        return static_cast<uint64_t>(value.as_int());
+      };
+      const minijson::Value& shape = desc.at("shape");
+      if (!shape.is_array())
+        throw std::runtime_error(path_ + ": tensor " + m.key + " shape is not an array");
+      for (const auto& d : shape.items())
+        t->shape.push_back(static_cast<int64_t>(nonnegative_integer(d, "shape")));
       const minijson::Value& offs = desc.at("data_offsets");
-      t->data_begin = offs.items().at(0).as_int() + data_start;
-      t->data_end = offs.items().at(1).as_int() + data_start;
-      if (t->data_end > map_len_)
-        throw std::runtime_error(path_ + ": tensor " + m.key + " overruns file");
+      if (!offs.is_array() || offs.items().size() != 2)
+        throw std::runtime_error(path_ + ": tensor " + m.key +
+                                 " data_offsets must contain two integers");
+      const uint64_t begin = nonnegative_integer(offs.items()[0], "data_offsets");
+      const uint64_t end = nonnegative_integer(offs.items()[1], "data_offsets");
+      // Validate payload-relative integers before adding the header offset.
+      // Subtraction is safe because the header length was checked above.
+      if (begin > end || end > map_len_ - data_start)
+        throw std::runtime_error(path_ + ": tensor " + m.key + " has invalid data_offsets");
+      const size_t elements = t->numel();
+      const size_t width = dtype_size(t->dtype);
+      if (elements > std::numeric_limits<size_t>::max() / width || elements * width != end - begin)
+        throw std::runtime_error(path_ + ": tensor " + m.key + " shape/dtype byte count mismatch");
+      t->data_begin = data_start + begin;
+      t->data_end = data_start + end;
       t->data = map_ + t->data_begin;
       t->owner = this;
       tensors_[t->name] = std::move(t);
