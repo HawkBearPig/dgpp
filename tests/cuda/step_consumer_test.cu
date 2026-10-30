@@ -440,7 +440,7 @@ __global__ void init_fp8_experts(uint8_t* arena, int experts) {
   unsigned h = static_cast<unsigned>(i * 2654435761ull) ^ static_cast<unsigned>(i >> 17) ^ 0x7f4a7c15u;
   h ^= h >> 13; h *= 0x85ebca6bu; h ^= h >> 16;
   if (!scale) {
-    arena[i] = static_cast<uint8_t>((h & 0x80) | ((1 + (h >> 8) % 13) << 3) | ((h >> 16) & 7));
+    arena[i] = static_cast<uint8_t>((h & 0x80) | (((h >> 8) % 15) << 3) | ((h >> 16) & 7));  // exponents 0..14: subnormals and zeros in, the NaN codes out
     return;
   }
   if ((off & 3) == 0) {
@@ -751,6 +751,32 @@ constexpr int kPK = 5120, kPN = 1280;
 constexpr size_t kPBytes = static_cast<size_t>(kPN) * kPK, kPScales = static_cast<size_t>(kPN / 32) * (kPK / 32) * 4;
 constexpr size_t kPStride = align_up(kPBytes) + align_up(kPScales);
 
+// A projection matrix of kPN rows by kPK codes (exponents 0..14, the NaN codes out) with F32 scales in [0.5, 2).
+__global__ void init_fp8_matrix(uint8_t* w) {
+  const size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= kPStride) return;
+  unsigned h = static_cast<unsigned>(i * 2654435761ull) ^ static_cast<unsigned>(i >> 17) ^ 0x51ed270bu;
+  h ^= h >> 13; h *= 0x85ebca6bu; h ^= h >> 16;
+  if (i < kPBytes) { w[i] = static_cast<uint8_t>((h & 0x80) | (((h >> 8) % 15) << 3) | ((h >> 16) & 7)); return; }
+  const size_t so = i - align_up(kPBytes);
+  if (so < kPScales && (so & 3) == 0) {
+    const float sc = 0.5f + static_cast<float>((h >> 8) & 0xFFFF) / 65536.0f * 1.5f;
+    *reinterpret_cast<float*>(w + i) = sc;
+  }
+}
+
+// The windowed (shuffled) form of the same unit, for the bitwise comparison.
+__global__ void __launch_bounds__(kMxfp4Threads) proj_windowed_kernel(const uint8_t* w, const float* sc, const int32_t* tokens, int count,
+                                                                      const uint16_t* x, uint16_t* y) {
+  extern __shared__ __align__(128) uint8_t smem[];
+  Mxfp4Group g;
+  g.slots = tokens;
+  g.tokens = tokens;
+  g.count = count;
+  g.x_stride = kPK;
+  fp8_matrix_unit<kPK, kPN, 32, 1>(w, sc, g, blockIdx.x, x, y, nullptr, smem, 0, kPK / kMxfp4WindowCodes, kMxfp4UnitRows);
+}
+
 __global__ void __launch_bounds__(kMxfp4Threads) proj_kernel(const uint8_t* arena, int matrices, const int32_t* tokens, int count, const uint16_t* x,
                                                              uint16_t* y, int slabs) {
   extern __shared__ __align__(128) uint8_t smem[];
@@ -784,11 +810,12 @@ DGPP_TEST(fp8_projection_unit_rate) {
   DGPP_CUDA_OK(cudaMemcpy(tokens, h_tok.data(), 20, cudaMemcpyHostToDevice));
   uint16_t* y = nullptr;
   DGPP_CUDA_OK(cudaMalloc(&y, static_cast<size_t>(matrices) * 32 * kPN * 2));
-  DGPP_CUDA_OK(cudaFuncSetAttribute(proj_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem));
+  constexpr int kProjSmem = kFp8StagedSmemCap;
+  DGPP_CUDA_OK(cudaFuncSetAttribute(proj_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kProjSmem));
   cudaEvent_t e0, e1;
   DGPP_CUDA_OK(cudaEventCreate(&e0));
   DGPP_CUDA_OK(cudaEventCreate(&e1));
-  proj_kernel<<<dim3(kPN / 128, 1), kMxfp4Threads, kSmem>>>(arena, matrices, tokens, 5, x, y, 1);  // the first launch's costs
+  proj_kernel<<<dim3(kPN / 128, 1), kMxfp4Threads, kProjSmem>>>(arena, matrices, tokens, 5, x, y, 1);  // the first launch's costs
   DGPP_CUDA_OK(cudaDeviceSynchronize());
   for (int slabs : {1, 4}) {
     for (int mats : {1, 8, 47}) {
@@ -796,7 +823,7 @@ DGPP_TEST(fp8_projection_unit_rate) {
       std::vector<float> ms(3);
       for (float& m : ms) {
         DGPP_CUDA_OK(cudaEventRecord(e0));
-        proj_kernel<<<grid, kMxfp4Threads, kSmem>>>(arena, matrices, tokens, 5, x, y, slabs);
+        proj_kernel<<<grid, kMxfp4Threads, kProjSmem>>>(arena, matrices, tokens, 5, x, y, slabs);
         DGPP_CUDA_OK(cudaEventRecord(e1));
         DGPP_CUDA_OK(cudaDeviceSynchronize());
         DGPP_CUDA_OK(cudaEventElapsedTime(&m, e0, e1));
@@ -808,6 +835,26 @@ DGPP_TEST(fp8_projection_unit_rate) {
       std::printf("   fp8 [1280 x 5120] x %2d matrices, %d slab(s), %4d blocks: %6.0f us (median of 3) = %5.1f GB/s aggregate, %5.1f GB/s an SM\n",
                   mats, slabs, blocks, ms[1] * 1e3, mb / ms[1], per_block);
     }
+  }
+  // The same matrix eight times, L2-hot: the unit's compute rate, at one block an SM with the one-slab slice
+  // staged and at the blocks the smaller four-slab slice lets the registers and shared memory co-reside.
+  for (int slabs : {1, 4}) {
+    const int smem = slabs == 1 ? kProjSmem : fp8_staged_smem_bytes<kPK, 32>(kPK / slabs);
+    const dim3 grid((kPN / 128) * slabs, 8);
+    std::vector<float> ms(3);
+    for (float& m : ms) {
+      DGPP_CUDA_OK(cudaEventRecord(e0));
+      proj_kernel<<<grid, kMxfp4Threads, smem>>>(arena, 1, tokens, 5, x, y, slabs);
+      DGPP_CUDA_OK(cudaEventRecord(e1));
+      DGPP_CUDA_OK(cudaDeviceSynchronize());
+      DGPP_CUDA_OK(cudaEventElapsedTime(&m, e0, e1));
+    }
+    std::sort(ms.begin(), ms.end());
+    const double mb = 8.0 * (kPBytes + kPScales) / 1e6;
+    int per_sm = 0;
+    DGPP_CUDA_OK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, proj_kernel, kMxfp4Threads, smem));
+    std::printf("   fp8 [1280 x 5120] hot x 8, %d slab(s), %4d blocks, %d a SM by occupancy, %d KB smem: %6.0f us = %5.1f GB/s aggregate\n",
+                slabs, static_cast<int>(grid.x * grid.y), per_sm, smem / 1024, ms[1] * 1e3, mb / ms[1]);
   }
   cudaFree(arena); cudaFree(x); cudaFree(tokens); cudaFree(y);
 }
@@ -832,7 +879,7 @@ __global__ void __launch_bounds__(kMxfp4Threads) split_kernel(const uint8_t* w, 
 DGPP_TEST(fp8_split_form_matches_the_reference) {
   uint8_t* arena = nullptr;
   DGPP_CUDA_OK(cudaMalloc(&arena, kPStride));
-  init_fp8_experts<<<static_cast<unsigned>((kPStride + 255) / 256), 256>>>(arena, 1);  // the pair layout's first two regions suffice as one matrix
+  init_fp8_matrix<<<static_cast<unsigned>((kPStride + 255) / 256), 256>>>(arena);
   uint16_t* x = nullptr;
   DGPP_CUDA_OK(cudaMalloc(&x, 32 * kPK * 2));
   init_x<<<(32 * kPK + 255) / 256, 256>>>(x, 32 * kPK);
@@ -878,6 +925,76 @@ DGPP_TEST(fp8_split_form_matches_the_reference) {
   std::printf("   fp8 split form [1280 x 5120], 5 tokens: %zu ok, %zu beyond of %zu\n", ok, bad, elems);
   cudaFree(arena); cudaFree(x); cudaFree(tokens); cudaFree(y); cudaFree(y_ref); cudaFree(yf); cudaFree(mag);
   require(bad == 0, "the split form disagrees with the reference");
+}
+
+// ---- the one-token-group (staged) form of one fp8 matrix against the reference, and bitwise across launches
+
+DGPP_TEST(fp8_staged_form_matches_the_reference) {
+  uint8_t* arena = nullptr;
+  DGPP_CUDA_OK(cudaMalloc(&arena, kPStride));
+  init_fp8_matrix<<<static_cast<unsigned>((kPStride + 255) / 256), 256>>>(arena);
+  uint16_t* x = nullptr;
+  DGPP_CUDA_OK(cudaMalloc(&x, 32 * kPK * 2));
+  init_x<<<(32 * kPK + 255) / 256, 256>>>(x, 32 * kPK);
+  int32_t* tokens = nullptr;
+  std::vector<int32_t> h_tok = {3, 0, 4, 1, 2};
+  DGPP_CUDA_OK(cudaMalloc(&tokens, 5 * 4));
+  DGPP_CUDA_OK(cudaMemcpy(tokens, h_tok.data(), 20, cudaMemcpyHostToDevice));
+  const size_t elems = 5 * static_cast<size_t>(kPN);
+  uint16_t *y = nullptr, *y2 = nullptr, *y_ref = nullptr;
+  float *yf = nullptr, *mag = nullptr;
+  DGPP_CUDA_OK(cudaMalloc(&y, elems * 2));
+  DGPP_CUDA_OK(cudaMalloc(&y2, elems * 2));
+  DGPP_CUDA_OK(cudaMalloc(&y_ref, elems * 2));
+  DGPP_CUDA_OK(cudaMalloc(&yf, elems * 4));
+  DGPP_CUDA_OK(cudaMalloc(&mag, elems * 4));
+  DGPP_CUDA_OK(cudaMemset(y, 0, elems * 2));
+  DGPP_CUDA_OK(cudaMemset(y2, 0xff, elems * 2));
+  const uint8_t* w = arena;
+  const float* sc = reinterpret_cast<const float*>(arena + align_up(kPBytes));
+  constexpr int smem = kFp8StagedSmemCap;
+  static_assert(fp8_staged_smem_bytes<kPK, 32>(kPK) <= kFp8StagedSmemCap, "the [1280 x 5120] unit takes the staged form at one slab");
+  DGPP_CUDA_OK(cudaFuncSetAttribute(proj_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+  proj_kernel<<<dim3(kPN / 128, 1), kMxfp4Threads, smem>>>(arena, 1, tokens, 5, x, y, 1);
+  proj_kernel<<<dim3(kPN / 128, 1), kMxfp4Threads, smem>>>(arena, 1, tokens, 5, x, y2, 1);
+  uint16_t* y_win = nullptr;
+  DGPP_CUDA_OK(cudaMalloc(&y_win, elems * 2));
+  DGPP_CUDA_OK(cudaMemset(y_win, 0, elems * 2));
+  DGPP_CUDA_OK(cudaFuncSetAttribute(proj_windowed_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem));
+  proj_windowed_kernel<<<kPN / 128, kMxfp4Threads, kSmem>>>(w, sc, tokens, 5, x, y_win);
+  DGPP_CUDA_OK(cudaDeviceSynchronize());
+  Mxfp4Group g;
+  g.slots = tokens;
+  g.tokens = tokens;
+  g.count = 5;
+  step_ref::fp8_matrix<<<(kPN + 127) / 128, 128>>>(w, sc, g, x, kPK, kPK, kPN, 32, y_ref, yf, mag);
+  DGPP_CUDA_OK(cudaDeviceSynchronize());
+  std::vector<uint16_t> got(elems), again(elems), ref(elems);
+  std::vector<float> exact(elems), m(elems);
+  DGPP_CUDA_OK(cudaMemcpy(got.data(), y, elems * 2, cudaMemcpyDeviceToHost));
+  DGPP_CUDA_OK(cudaMemcpy(again.data(), y2, elems * 2, cudaMemcpyDeviceToHost));
+  DGPP_CUDA_OK(cudaMemcpy(ref.data(), y_ref, elems * 2, cudaMemcpyDeviceToHost));
+  DGPP_CUDA_OK(cudaMemcpy(exact.data(), yf, elems * 4, cudaMemcpyDeviceToHost));
+  DGPP_CUDA_OK(cudaMemcpy(m.data(), mag, elems * 4, cudaMemcpyDeviceToHost));
+  std::vector<uint16_t> win(elems);
+  DGPP_CUDA_OK(cudaMemcpy(win.data(), y_win, elems * 2, cudaMemcpyDeviceToHost));
+  size_t ok = 0, bad = 0, shown = 0, differ = 0, differ_win = 0;
+  for (size_t i = 0; i < elems; ++i) {
+    if (got[i] != again[i]) ++differ;
+    if (got[i] != win[i]) ++differ_win;
+    if (got[i] == ref[i] || step_ref::value_ok(got[i], exact[i], m[i])) ++ok;
+    else {
+      ++bad;
+      if (shown++ < 6)
+        std::printf("      y[slot %zu][row %zu]: got %g ref %g (magnitude %g)\n", i / kPN, i % kPN, bf16_bits_to_float(got[i]), exact[i], m[i]);
+    }
+  }
+  std::printf("   fp8 staged form [1280 x 5120], 5 tokens in slot order 3 0 4 1 2: %zu ok, %zu beyond of %zu, %zu differ between launches, %zu from the windowed form\n",
+              ok, bad, elems, differ, differ_win);
+  cudaFree(arena); cudaFree(x); cudaFree(tokens); cudaFree(y); cudaFree(y2); cudaFree(y_win); cudaFree(y_ref); cudaFree(yf); cudaFree(mag);
+  require(bad == 0, "the staged form disagrees with the reference");
+  require(differ == 0, "the staged form is not bitwise across launches");
+  require(differ_win == 0, "the staged form is not bitwise the windowed form");
 }
 
 int main() { return dgpp::test::run_all(); }

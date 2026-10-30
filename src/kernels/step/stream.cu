@@ -780,7 +780,8 @@ unsigned step_stream_mxfp4_smem(int inter) {
   if (inter != kConsumerI) return 0u;
   const unsigned experts = static_cast<unsigned>(mxfp4_unit_smem_bytes<kConsumerI>());
   const unsigned split = static_cast<unsigned>(fp8_split_smem_bytes<kSplitMaxK, kSplitRowTiles>());
-  return experts > split ? experts : split;
+  const unsigned staged = static_cast<unsigned>(kFp8StagedSmemCap);  // the one-token-group projection form stages its slice
+  return experts > split ? (experts > staged ? experts : staged) : (split > staged ? split : staged);
 }
 
 cudaError_t launch_step_stream(const StepStreamParams& p, int workers, cudaStream_t stream) {

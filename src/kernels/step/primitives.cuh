@@ -69,6 +69,15 @@ __device__ __forceinline__ void mma_bf16_16x8x16(float (&c)[4], const uint32_t (
       : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
 }
 
+// The same with a zero C operand: the first mma of an accumulation block,
+// so the block's partial needs no reset. Bitwise the mma over a zeroed c.
+__device__ __forceinline__ void mma_bf16_16x8x16_zero(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
+  asm volatile(
+      "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%10,%10,%10};"
+      : "=f"(d[0]), "=f"(d[1]), "=f"(d[2]), "=f"(d[3])
+      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "f"(0.f));
+}
+
 __device__ __forceinline__ void cp_async_16(void* smem, const void* gmem) {
   const unsigned s = static_cast<unsigned>(__cvta_generic_to_shared(smem));
   asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(s), "l"(gmem));

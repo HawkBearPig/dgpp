@@ -40,16 +40,35 @@ __device__ __forceinline__ void prefetch_l2_bulk(const void* gmem, unsigned byte
 }
 
 // Four e4m3 bytes (codes k..k+3 of one row) as two bf16x2 words {(k, k+1),
-// (k+2, k+3)}: exponent rebias 7 to 127, the mantissa into bf16's top three
-// bits, zero kept zero; e4m3 weights have no NaN and the scale grid holds
-// their subnormals out.
+// (k+2, k+3)}, through the conversion unit: two e4m3 to f16x2 (exact, every
+// e4m3 value is an f16), each half to f32 (exact) and the pair packed to
+// bf16x2 with round-to-nearest, exact because an e4m3 value has four
+// significant bits and bf16 eight. Subnormal codes decode to their values
+// and zero keeps its sign, as production's fp8 GEMV (`fp8_gemv.cuh`) and
+// the test reference decode them; the two NaN codes come back NaN and do
+// not occur in weights. An integer form that rebiased the exponent served
+// here until 2026-10-30, exact on normal codes and wrong on the fourteen
+// subnormal ones, which the synthetic test data had never held. About
+// nine instructions a word.
 __device__ __forceinline__ void e4m3x4_bf16x2(uint32_t w, uint32_t& lo, uint32_t& hi) {
-  const uint32_t b0 = prmt(w, 0u, 0x4140u), b1 = prmt(w, 0u, 0x4342u);
-  const uint32_t m0 = (b0 & 0x007F007Fu) << 4, m1 = (b1 & 0x007F007Fu) << 4;
-  const uint32_t s0 = (b0 & 0x00800080u) << 8, s1 = (b1 & 0x00800080u) << 8;
-  const uint32_t nz0 = ((b0 & 0x007F007Fu) + 0x007F007Fu) & 0x00800080u, nz1 = ((b1 & 0x007F007Fu) + 0x007F007Fu) & 0x00800080u;
-  lo = (m0 + ((nz0 >> 7) * 0x3C00u)) | s0;
-  hi = (m1 + ((nz1 >> 7) * 0x3C00u)) | s1;
+  asm("{\n"
+      ".reg .b16 c0, c1, c2, c3;\n"
+      ".reg .b32 f01, f23;\n"
+      ".reg .f32 x0, x1, x2, x3;\n"
+      "mov.b32 {c0, c1}, %2;\n"
+      "cvt.rn.f16x2.e4m3x2 f01, c0;\n"
+      "cvt.rn.f16x2.e4m3x2 f23, c1;\n"
+      "mov.b32 {c0, c1}, f01;\n"
+      "mov.b32 {c2, c3}, f23;\n"
+      "cvt.f32.f16 x0, c0;\n"
+      "cvt.f32.f16 x1, c1;\n"
+      "cvt.f32.f16 x2, c2;\n"
+      "cvt.f32.f16 x3, c3;\n"
+      "cvt.rn.bf16x2.f32 %0, x1, x0;\n"
+      "cvt.rn.bf16x2.f32 %1, x3, x2;\n"
+      "}"
+      : "=r"(lo), "=r"(hi)
+      : "r"(w));
 }
 
 // Lane l of a warp holds 16 bytes of row l / 2, half l & 1 of a 32-code
@@ -415,11 +434,126 @@ __device__ void fp8_matrix_split_unit(const uint8_t* __restrict__ w, const float
   }
 }
 
+// The one-token-group form of a projection unit (groups of at most eight
+// slots, the C1 shape). The windowed form above pays a block barrier every
+// eight chunks and a dependent L2 load of the next scale every chunk, which
+// with two warps a scheduler held it at 16 GB/s an SM L2-hot and 5 cold
+// (MOONSHOT-1.md section 1.4, H2). Here the warp's scale row and the group's
+// activation slice over the unit's windows are staged once, so the chunk
+// loop has no barrier and no load but the ring's and the bridge's. Shared
+// memory: eight warps' scale rows, then eight token rows of the slice with a
+// 32-code pad so the row stride lands 64 bytes off the bank period and a
+// fragment load's eight rows hit distinct banks.
+constexpr int kFp8StagedRows = 8;
+constexpr int kFp8StagedPad = 32;
+constexpr int kFp8StagedSmemCap = 92160;  // the dynamic shared memory the step kernel launches with when any projection takes this form
+template <int kK, int kBlock>
+__host__ __device__ constexpr int fp8_staged_smem_bytes(int codes) {  // codes: the unit's inner codes, kK over its slabs
+  return kFp8StagedRows * (kK / kBlock) * 4 + kFp8StagedRows * (codes + kFp8StagedPad) * 2;
+}
+template <int kK, int kN, int kBlock>
+__device__ void fp8_matrix_staged_unit(const uint8_t* __restrict__ w, const float* __restrict__ scales, const Mxfp4Group& g, int rb,
+                                       const uint16_t* __restrict__ x, uint16_t* __restrict__ y, float* __restrict__ partial, uint8_t* smem,
+                                       int w0, int w1, int unit_rows) {
+  static_assert(kK % kMxfp4WindowCodes == 0 && kBlock % 32 == 0 && kN % kTileRows == 0, "the matrix's shape");
+  constexpr int kSlab = fp8_slab_bytes(kK);
+  constexpr int kD = kMxfp4WindowCodes / 32;  // chunks in flight a lane, a window's worth, the ring indexed by the unrolled chunk
+  constexpr int kAhead = 4;
+  constexpr int kChunksPerBlock = kBlock / 32;
+  constexpr int kSC = kK / kBlock;
+  constexpr int kChunksPerSlab = kSlab / 32;
+  const int c_begin = w0 * kD, c_end = w1 * kD;
+  const int codes = (c_end - c_begin) * 32, stride = codes + kFp8StagedPad;  // bf16 a staged row
+  const int slab_end = (c_end * 32 + kSlab - 1) / kSlab;
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, gid = lane >> 2, tid = lane & 3;
+  const int n0 = rb * unit_rows + warp * kTileRows, r0 = n0 + gid, r1 = r0 + 8;
+  const bool live = n0 < kN && warp * kTileRows < unit_rows;
+  // The fragment owner loads its own bytes: of a 32-code chunk, lane (gid,
+  // tid) takes codes [8 tid, 8 tid + 8) of rows gid and gid + 8, the codes
+  // the shuffled form handed it, so the mma sees the same values in the
+  // same slots and the result is bitwise the shuffled form's with no
+  // shuffle. A warp-load is eight rows by 32 bytes, as before.
+  const uint8_t* wp0 = w + static_cast<size_t>((live ? n0 : 0) + gid) * kK + 8 * tid;
+  const uint8_t* wp1 = wp0 + static_cast<size_t>(8) * kK;
+  const float* sw = scales + static_cast<size_t>((live ? n0 : 0) / kBlock) * kSC;
+  float* s_sc = reinterpret_cast<float*>(smem) + warp * kSC;
+  uint16_t* s_x = reinterpret_cast<uint16_t*>(smem + kFp8StagedRows * kSC * 4);
+  auto bridge = [&](int slab) {
+    if (!live || slab >= slab_end || lane >= 16) return;
+    const int r = n0 + lane;
+    prefetch_l2_bulk(w + static_cast<size_t>(r) * kK + static_cast<size_t>(slab) * kSlab, kSlab);
+  };
+  // The weights first, so the memory is busy while the staging lands.
+  const int slab0 = c_begin * 32 / kSlab;
+#pragma unroll
+  for (int a = 0; a <= kAhead; ++a) bridge(slab0 + a);
+  uint2 ring[kD][2];
+#pragma unroll
+  for (int i = 0; i < kD; ++i) {
+    ring[i][0] = __ldcs(reinterpret_cast<const uint2*>(wp0 + (c_begin + i) * 32));
+    ring[i][1] = __ldcs(reinterpret_cast<const uint2*>(wp1 + (c_begin + i) * 32));
+  }
+  for (int i = lane; i < kSC; i += 32) s_sc[i] = __ldg(sw + i);
+  {
+    const size_t xs = g.x_stride ? static_cast<size_t>(g.x_stride) : static_cast<size_t>(kK);
+    const int chunks16 = codes / 8;  // 16-byte pieces a row
+    for (int q = threadIdx.x; q < kFp8StagedRows * chunks16; q += kMxfp4Threads) {
+      const int t = q / chunks16, c16 = q % chunks16;
+      const int tok = t < g.count ? g.tokens[t] : g.tokens[0];
+      cp_async_16(s_x + t * stride + c16 * 8, x + static_cast<size_t>(tok) * xs + static_cast<size_t>(c_begin) * 32 + c16 * 8);
+    }
+    cp_async_commit();
+  }
+  cp_async_wait<0>();
+  __syncthreads();  // the unit's one barrier: the scales and the slice are staged
+  float acc[4] = {0.f, 0.f, 0.f, 0.f}, blk[4] = {0.f, 0.f, 0.f, 0.f};
+  const uint16_t* xb = s_x + gid * stride + 8 * tid;
+#pragma unroll 1
+  for (int c0 = c_begin; c0 < c_end; c0 += kD) {
+#pragma unroll
+    for (int i = 0; i < kD; ++i) {
+      const int c = c0 + i;
+      if (c % kChunksPerSlab == 0 && c > c_begin) bridge(c / kChunksPerSlab + kAhead);
+      const uint2 v0 = ring[i][0], v1 = ring[i][1];
+      if (c + kD < c_end) {
+        ring[i][0] = __ldcs(reinterpret_cast<const uint2*>(wp0 + (c + kD) * 32));
+        ring[i][1] = __ldcs(reinterpret_cast<const uint2*>(wp1 + (c + kD) * 32));
+      }
+      uint32_t a0[4], a1[4];  // the chunk's two k-steps: codes 8 tid .. +3 and 8 tid + 4 .. +7 of rows gid and gid + 8
+      e4m3x4_bf16x2(v0.x, a0[0], a0[2]);
+      e4m3x4_bf16x2(v1.x, a0[1], a0[3]);
+      e4m3x4_bf16x2(v0.y, a1[0], a1[2]);
+      e4m3x4_bf16x2(v1.y, a1[1], a1[3]);
+      const uint4 bv = *reinterpret_cast<const uint4*>(xb + (c - c_begin) * 32);
+      if (c % kChunksPerBlock == 0) mma_bf16_16x8x16_zero(blk, a0, bv.x, bv.y); else mma_bf16_16x8x16(blk, a0, bv.x, bv.y);
+      mma_bf16_16x8x16(blk, a1, bv.z, bv.w);
+      if ((c + 1) % kChunksPerBlock == 0) {
+        const float scale = s_sc[c / kChunksPerBlock];
+#pragma unroll
+        for (int k = 0; k < 4; ++k) acc[k] = fmaf(scale, blk[k], acc[k]);
+      }
+    }
+  }
+  if (!live) return;
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const int r = 2 * tid + (i & 1), row = (i < 2) ? r0 : r1;
+    if (r >= g.count) continue;
+    const size_t at = static_cast<size_t>(g.slots[r]) * kN + row;
+    if (partial) partial[at] = acc[i]; else y[at] = f32_to_bf16(acc[i]);
+  }
+}
+
 template <int kK, int kN, int kBlock>
 __device__ __forceinline__ void fp8_matrix(const uint8_t* w, const float* scales, const Mxfp4Group& g, int rb, const uint16_t* x, uint16_t* y,
                                            float* partial, uint8_t* smem, int w0, int w1, int unit_rows = kMxfp4UnitRows) {
   switch ((g.count + 7) / 8) {
-    case 1: fp8_matrix_unit<kK, kN, kBlock, 1>(w, scales, g, rb, x, y, partial, smem, w0, w1, unit_rows); break;
+    case 1:
+      if (fp8_staged_smem_bytes<kK, kBlock>((w1 - w0) * kMxfp4WindowCodes) <= kFp8StagedSmemCap)
+        fp8_matrix_staged_unit<kK, kN, kBlock>(w, scales, g, rb, x, y, partial, smem, w0, w1, unit_rows);
+      else
+        fp8_matrix_unit<kK, kN, kBlock, 1>(w, scales, g, rb, x, y, partial, smem, w0, w1, unit_rows);
+      break;
     case 2: fp8_matrix_unit<kK, kN, kBlock, 2>(w, scales, g, rb, x, y, partial, smem, w0, w1, unit_rows); break;
     case 3: fp8_matrix_unit<kK, kN, kBlock, 3>(w, scales, g, rb, x, y, partial, smem, w0, w1, unit_rows); break;
     default: fp8_matrix_unit<kK, kN, kBlock, 4>(w, scales, g, rb, x, y, partial, smem, w0, w1, unit_rows); break;
