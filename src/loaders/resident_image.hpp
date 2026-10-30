@@ -41,6 +41,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -83,6 +84,14 @@ class ResidentImage {
   // `verify` re-folds the bytes against the entry. Throws on mismatch.
   // `dst` should be 4 KiB-aligned to take the direct path (pinned
   // allocations are); anything else reads buffered, correctly but slower.
+  // Thread safety: concurrent read_layer / try_read_layer / write_layer calls
+  // for DIFFERENT layers are safe (pread is thread-safe; the entry snapshot is
+  // taken under the mutex and the blob moves outside it). Concurrent write_layer
+  // calls are safe: each reserves its file range under the mutex (ftruncate),
+  // writes outside it, then publishes its entry under the mutex — the file order
+  // across layers is nondeterministic, the entries are exact. A write racing a
+  // read of the SAME layer is not supported; callers give each layer to one
+  // worker.
   void read_layer(int layer, void* dst, size_t bytes, bool verify = verification_enabled()) const;
 
   // Recoverable cache read for loaders: absent, stale, unreadable or corrupt
@@ -129,6 +138,7 @@ class ResidentImage {
   int fd_ = -1;         // buffered: header, table, blob tails
   int direct_fd_ = -1;  // O_DIRECT: blob bodies; -1 when unsupported
   std::vector<Entry> entries_;
+  mutable std::mutex mutex_;  // the entry table + write offset allocation
 };
 
 }  // namespace dgpp

@@ -68,6 +68,7 @@
 #include "kernels/bf12_companions.hpp"
 #include "kernels/latent_format.hpp"
 #include "loaders/hf_cache.hpp"
+#include "loaders/resident_stream.hpp"
 #include "serve/cluster_config.hpp"
 #include "serve/rank_metrics.hpp"
 #include "serve/nvme_cache_check.hpp"
@@ -562,6 +563,12 @@ struct QwenFamily final : ServeFamily {
         reducer,
         fabric ? rank : 0, fabric ? world_ : 1, slots, fabric && mtp, decode_rows, fp8_head_mma,
         /*serving_logits=*/true, kv_format, dflash);
+    // Opt-in eager parallel layer load (DGPP_PRELOAD_THREADS): no-op unless
+    // resident (fabric resident, or dflash data-parallel resident). Each
+    // worker holds one pinned staging mirror (~2.4 GiB transient) beside
+    // the weights.
+    if (const int preload_threads = dgpp::loader_preload_threads(); preload_threads > 1)
+      model->preload_resident_layers(preload_threads);
   }
   // The drafter (2026-10-20 port of the Qwen35 DFlash2 walk): its recorded
   // block draft (session_graph_capture_block_draft/_batch, mirrors and the
@@ -637,6 +644,9 @@ struct Glm4Family final : ServeFamily {
         fabric ? dgpp::Glm4Residency::Resident : dgpp::Glm4Residency::Streaming, reducer,
         fabric ? rank : 0, fabric ? world_ : 1, slots, fabric && mtp, decode_rows,
         /*serving_logits=*/true);
+    // Opt-in eager load (DGPP_PRELOAD_THREADS): no-op unless resident.
+    if (const int preload_threads = dgpp::loader_preload_threads(); preload_threads > 1)
+      model->preload_resident_layers(preload_threads);
   }
   void destroy_model() override { model.reset(); }
   size_t model_snapshot_bytes() const override { return model ? model->session_snapshot_bytes() : 0; }
@@ -712,6 +722,9 @@ struct GlmDsaFamily final : ServeFamily {
         fabric ? dgpp::GlmDsaResidency::Resident : dgpp::GlmDsaResidency::Streaming, reducer,
         fabric ? rank : 0, fabric ? world_ : 1, slots, fabric && mtp, decode_rows, kv_format,
         /*serving_logits=*/true);
+    // Opt-in eager load (DGPP_PRELOAD_THREADS): no-op unless resident.
+    if (const int preload_threads = dgpp::loader_preload_threads(); preload_threads > 1)
+      model->preload_resident_layers(preload_threads);
   }
   void destroy_model() override { model.reset(); }
   size_t model_snapshot_bytes() const override { return model ? model->session_snapshot_bytes() : 0; }
@@ -978,6 +991,9 @@ struct MimoFamily final : ServeFamily {
         fabric ? dgpp::MimoResidency::Resident : dgpp::MimoResidency::Streaming, reducer,
         fabric ? rank : 0, fabric ? world_ : 1, slots, fabric && mtp, decode_rows, kv_format,
         /*serving_logits=*/true);
+    // Opt-in eager load (DGPP_PRELOAD_THREADS): no-op unless resident.
+    if (const int preload_threads = dgpp::loader_preload_threads(); preload_threads > 1)
+      model->preload_resident_layers(preload_threads);
   }
   void destroy_model() override { model.reset(); }
   size_t model_snapshot_bytes() const override { return model ? model->session_snapshot_bytes() : 0; }
@@ -1240,6 +1256,10 @@ struct Qwen35Family final : ServeFamily {
         fabric || !dflash.empty() ? dgpp::LoaderResidency::Resident : dgpp::LoaderResidency::Streaming,
         reducer, fabric ? rank : 0,
         fabric ? world_ : 1, slots, decode_rows, fabric && mtp, dflash, kv_format);
+    // Opt-in eager load (DGPP_PRELOAD_THREADS): no-op unless resident
+    // (fabric resident, or dflash data-parallel resident).
+    if (const int preload_threads = dgpp::loader_preload_threads(); preload_threads > 1)
+      model->preload_resident_layers(preload_threads);
   }
   void set_draft_model(const std::string& dir) override { dflash = dir; }
   // The block draft records in this family's capture (the
