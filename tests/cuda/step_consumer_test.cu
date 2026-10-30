@@ -812,4 +812,72 @@ DGPP_TEST(fp8_projection_unit_rate) {
   cudaFree(arena); cudaFree(x); cudaFree(tokens); cudaFree(y);
 }
 
+// ---- the split form of one fp8 matrix against the reference
+
+namespace {
+
+__global__ void __launch_bounds__(kMxfp4Threads) split_kernel(const uint8_t* w, const float* sc, const int32_t* tokens, int count, const uint16_t* x,
+                                                              uint16_t* y) {
+  extern __shared__ __align__(128) uint8_t smem[];
+  Mxfp4Group g;
+  g.slots = tokens;
+  g.tokens = tokens;
+  g.count = count;
+  g.x_stride = kPK;
+  fp8_matrix_split_unit<kPK, kPN, 32, 2>(w, sc, g, blockIdx.x, x, y, smem);
+}
+
+}  // namespace
+
+DGPP_TEST(fp8_split_form_matches_the_reference) {
+  uint8_t* arena = nullptr;
+  DGPP_CUDA_OK(cudaMalloc(&arena, kPStride));
+  init_fp8_experts<<<static_cast<unsigned>((kPStride + 255) / 256), 256>>>(arena, 1);  // the pair layout's first two regions suffice as one matrix
+  uint16_t* x = nullptr;
+  DGPP_CUDA_OK(cudaMalloc(&x, 32 * kPK * 2));
+  init_x<<<(32 * kPK + 255) / 256, 256>>>(x, 32 * kPK);
+  int32_t* tokens = nullptr;
+  std::vector<int32_t> h_tok = {0, 1, 2, 3, 4};
+  DGPP_CUDA_OK(cudaMalloc(&tokens, 5 * 4));
+  DGPP_CUDA_OK(cudaMemcpy(tokens, h_tok.data(), 20, cudaMemcpyHostToDevice));
+  const size_t elems = 5 * static_cast<size_t>(kPN);
+  uint16_t *y = nullptr, *y_ref = nullptr;
+  float *yf = nullptr, *mag = nullptr;
+  DGPP_CUDA_OK(cudaMalloc(&y, elems * 2));
+  DGPP_CUDA_OK(cudaMalloc(&y_ref, elems * 2));
+  DGPP_CUDA_OK(cudaMalloc(&yf, elems * 4));
+  DGPP_CUDA_OK(cudaMalloc(&mag, elems * 4));
+  DGPP_CUDA_OK(cudaMemset(y, 0, elems * 2));
+  const uint8_t* w = arena;
+  const float* sc = reinterpret_cast<const float*>(arena + align_up(kPBytes));
+  constexpr int smem = fp8_split_smem_bytes<kPK, 2>();
+  DGPP_CUDA_OK(cudaFuncSetAttribute(split_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+  split_kernel<<<kPN / 32, kMxfp4Threads, smem>>>(w, sc, tokens, 5, x, y);
+  DGPP_CUDA_OK(cudaDeviceSynchronize());
+  Mxfp4Group g;
+  g.slots = tokens;
+  g.tokens = tokens;
+  g.count = 5;
+  step_ref::fp8_matrix<<<(kPN + 127) / 128, 128>>>(w, sc, g, x, kPK, kPK, kPN, 32, y_ref, yf, mag);
+  DGPP_CUDA_OK(cudaDeviceSynchronize());
+  std::vector<uint16_t> got(elems), ref(elems);
+  std::vector<float> exact(elems), m(elems);
+  DGPP_CUDA_OK(cudaMemcpy(got.data(), y, elems * 2, cudaMemcpyDeviceToHost));
+  DGPP_CUDA_OK(cudaMemcpy(ref.data(), y_ref, elems * 2, cudaMemcpyDeviceToHost));
+  DGPP_CUDA_OK(cudaMemcpy(exact.data(), yf, elems * 4, cudaMemcpyDeviceToHost));
+  DGPP_CUDA_OK(cudaMemcpy(m.data(), mag, elems * 4, cudaMemcpyDeviceToHost));
+  size_t ok = 0, bad = 0, shown = 0;
+  for (size_t i = 0; i < elems; ++i) {
+    if (got[i] == ref[i] || step_ref::value_ok(got[i], exact[i], m[i])) ++ok;
+    else {
+      ++bad;
+      if (shown++ < 6)
+        std::printf("      y[slot %zu][row %zu]: got %g ref %g (magnitude %g)\n", i / kPN, i % kPN, bf16_bits_to_float(got[i]), exact[i], m[i]);
+    }
+  }
+  std::printf("   fp8 split form [1280 x 5120], 5 tokens: %zu ok, %zu beyond of %zu\n", ok, bad, elems);
+  cudaFree(arena); cudaFree(x); cudaFree(tokens); cudaFree(y); cudaFree(y_ref); cudaFree(yf); cudaFree(mag);
+  require(bad == 0, "the split form disagrees with the reference");
+}
+
 int main() { return dgpp::test::run_all(); }

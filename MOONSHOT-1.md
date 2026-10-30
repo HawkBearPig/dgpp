@@ -687,10 +687,28 @@ each unit's staging and its halved loads in flight outweighing the finer
 tail; and the lead's cap, re-swept with every consumer real, moved from 8
 MB to 12 to 16, since the projections now read L2-hot what the lead
 staged. With the lead at 16 MB the layers run at 86 to 91 percent of
-their floor with every weight of the layer computed. The rest is the
-fixed phases' quantization, which the fused chain changes anyway: in a
-real layer the fixed matrices stream under the attention's and the folds'
-latency rather than in phases of their own.
+their floor with every weight of the layer computed.
+
+The work-distribution remedies were then tried in turn and measured. The
+fixed byte units are handed out last so they fill a phase's tail. A split
+form of the projection unit, 32 rows with the eight warps on four parts of
+the inner width, the group's activations staged once and reused across a
+grab of four units that shrinks to one as the phase drains, and a
+deterministic reduce across the parts, is exact and cut the drain to a
+third, but its units cost more per byte (the staging of the whole slice,
+the cross-warp reduce, four times the prologues) and the phases came out
+20 percent longer, so it is kept as an option and the slabbed 128-row form
+stays the default. A bridge four slabs ahead instead of two changed
+nothing. The plateau is 88 to 90 percent of the floor with every weight
+computed, and its mechanism is now clear: during any stretch where fewer
+than about forty SMs stream, the memory is not saturated, because one SM's
+rate is bound by its bytes in flight against the loaded memory's latency,
+and a phase of a few dependent matrices has such stretches at both ends.
+The remedy is structural rather than a unit form: no phase of a few
+matrices on its own. In the fused chain the fixed matrices stream under the
+attention's and the folds' latency with the lead, and the expert phase,
+which has no such stretches, already runs at the ceiling. That is where
+the gap closes or does not, and it is measured when the chain is real.
 
 The fp8 result raised the question whether the routed experts need the
 tile-major layout at all, so the MXFP4 form was built over the row-major

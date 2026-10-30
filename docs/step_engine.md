@@ -271,7 +271,11 @@ projections for every token, eight DeepSeek-V4.1 shapes compiled in, as
 sums in slab order. Inside the streamer every projection output of a layer
 is exact or inside the envelope against the reference. With every weight
 of the layer computed and the lead at 16 MB, the layers run at 86 to 91
-percent of their byte floor; the fixed phases' unit quantization is the
-residue, since a unit streams at the ceiling's share of one SM and a phase
-of a few matrices is one unit's time long.
+percent of their byte floor; the fixed phases are the residue. During any
+stretch where fewer than about forty SMs stream, the memory is not
+saturated, since one SM's rate is bound by its bytes in flight against the
+loaded memory's latency, and a phase of a few dependent matrices has such
+stretches at both ends. A split form of the projection unit (32 rows, the
+width in four parts across the warps, a deterministic reduce) is kept as
+an option; it shortened the drain but cost more per byte.
 

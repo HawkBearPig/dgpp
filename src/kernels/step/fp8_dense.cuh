@@ -235,7 +235,7 @@ __device__ void fp8_matrix_unit(const uint8_t* __restrict__ w, const float* __re
   static_assert(kK % kMxfp4WindowCodes == 0 && kBlock % 32 == 0 && kN % kTileRows == 0, "the matrix's shape");
   constexpr int kSlab = fp8_slab_bytes(kK);
   constexpr int kD = kMxfp4WindowCodes / 32;  // chunks in flight a lane: a window's worth, so the ring index is the unrolled chunk index
-  constexpr int kAhead = 2;    // slabs the bridge runs ahead of the loads
+  constexpr int kAhead = 4;    // slabs the bridge runs ahead of the loads: 32 KB a warp in L2 prefetch against the loaded DRAM's latency
   constexpr int kChunksPerBlock = kBlock / 32;
   constexpr int kSC = kK / kBlock;
   constexpr int kChunksPerSlab = kSlab / 32;
@@ -306,6 +306,115 @@ __device__ void fp8_matrix_unit(const uint8_t* __restrict__ w, const float* __re
       if (partial) partial[at] = acc[t][i]; else y[at] = f32_to_bf16(acc[t][i]);
     }
 }
+// The small-group form of one fp8 matrix (groups of at most eight slots):
+// a unit is 16 kRowTiles rows, and the eight warps split the inner width
+// kSplit ways, warp w on row tile w % kRowTiles and part w / kRowTiles.
+// The group's activations are staged once for the unit, every part's slice
+// in shared memory, and each warp's fp32 partial is summed across the parts
+// in part order, so the unit is a quarter the length of the 128-row form
+// at the same loads in flight and a phase of a few matrices has units
+// enough for every worker. Shared memory: kSplit x 8 x (kK / kSplit + 8)
+// bf16 plus the reduce's 8 x 16 x 8 fp32.
+constexpr int kFp8SplitRows = 8;  // slots the form takes
+template <int kK, int kRowTiles>
+__host__ __device__ constexpr int fp8_split_smem_bytes() {
+  constexpr int split = 8 / kRowTiles;
+  return split * kFp8SplitRows * (kK / split + 8) * 2 + 8 * 16 * 8 * 4;
+}
+template <int kK, int kN, int kBlock, int kRowTiles>
+__device__ void fp8_matrix_split_unit(const uint8_t* __restrict__ w, const float* __restrict__ scales, const Mxfp4Group& g, int rb,
+                                      const uint16_t* __restrict__ x, uint16_t* __restrict__ y, uint8_t* smem, bool stage = true) {
+  constexpr int kSplit = 8 / kRowTiles;
+  constexpr int kPartK = kK / kSplit;  // codes a part
+  static_assert(kK % (kSplit * 32) == 0 && kN % kTileRows == 0 && kBlock % 32 == 0 && (kPartK % kBlock) == 0, "the split shape");
+  constexpr int kSlab = fp8_slab_bytes(kPartK);
+  constexpr int kD = 8;
+  constexpr int kChunks = kPartK / 32;
+  constexpr int kChunksPerBlock = kBlock / 32;
+  constexpr int kSC = kK / kBlock;
+  constexpr int kChunksPerSlab = kSlab / 32;
+  constexpr int kStride = kPartK + 8;  // bf16 elements a staged row
+  constexpr int kUnitRows = kTileRows * kRowTiles;
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, gid = lane >> 2, tid = lane & 3;
+  const int tile = warp % kRowTiles, part = warp / kRowTiles;
+  const int n0 = rb * kUnitRows + tile * kTileRows, r0 = n0 + gid, r1 = r0 + 8;
+  const bool live = n0 < kN;
+  const int k0 = part * kPartK;  // this warp's codes
+  // Stage the group's rows of every part: part p's slice at smem + p * 8 * kStride * 2.
+  uint16_t* act = reinterpret_cast<uint16_t*>(smem);
+  float* red = reinterpret_cast<float*>(smem + kSplit * kFp8SplitRows * kStride * 2);
+  if (stage) {  // consecutive units of one matrix reuse the group's staged rows
+    const size_t xs = g.x_stride ? static_cast<size_t>(g.x_stride) : static_cast<size_t>(kK);
+    constexpr int per_row16 = kK / 8;  // 16-byte pieces a row over the whole width
+    for (int q = threadIdx.x; q < kFp8SplitRows * per_row16; q += kMxfp4Threads) {
+      const int t = q / per_row16, c16 = q % per_row16;
+      const int tok = t < g.count ? g.tokens[t] : g.tokens[0];
+      const int code = c16 * 8, pp = code / kPartK, kk = code - pp * kPartK;
+      cp_async_16(act + (static_cast<size_t>(pp) * kFp8SplitRows + t) * kStride + kk, x + static_cast<size_t>(tok) * xs + code);
+    }
+    cp_async_commit();
+  }
+  const int row_l = (live ? n0 : 0) + (lane >> 1), half = lane & 1;
+  const uint8_t* wp = w + static_cast<size_t>(row_l) * kK + k0 + half * 16;
+  const float* sw = scales + static_cast<size_t>((live ? n0 : 0) / kBlock) * kSC + k0 / kBlock;
+  auto bridge = [&](int slab) {
+    if (!live || slab >= kPartK / kSlab || lane >= 16) return;
+    prefetch_l2_bulk(w + static_cast<size_t>(n0 + lane) * kK + k0 + static_cast<size_t>(slab) * kSlab, kSlab);
+  };
+  bridge(0);
+  bridge(1);
+  bridge(2);
+  uint4 ring[kD];
+#pragma unroll
+  for (int i = 0; i < kD; ++i) ring[i] = __ldcs(reinterpret_cast<const uint4*>(wp + i * 32));
+  const uint16_t* xb = act + static_cast<size_t>(part) * kFp8SplitRows * kStride;
+  float acc[4] = {0.f, 0.f, 0.f, 0.f}, blk[4] = {0.f, 0.f, 0.f, 0.f};
+  float scale = __ldg(sw);
+  cp_async_wait<0>();
+  __syncthreads();
+#pragma unroll 1
+  for (int c8 = 0; c8 < kChunks; c8 += kD) {
+#pragma unroll
+    for (int cc = 0; cc < kD; ++cc) {
+      const int c = c8 + cc;
+      if (c >= kChunks) break;  // a part whose chunks are not a multiple of the ring
+      if (c % kChunksPerSlab == 0 && c > 0) bridge(c / kChunksPerSlab + 2);
+      const uint4 v = ring[cc];
+      if (c + kD < kChunks) ring[cc] = __ldcs(reinterpret_cast<const uint4*>(wp + (c + kD) * 32));
+      uint32_t a0[4], a1[4];
+      fp8_fragments(v, gid, tid, a0, a1);
+      const uint4 bv = *reinterpret_cast<const uint4*>(xb + gid * kStride + c * 32 + 8 * tid);
+      mma_bf16_16x8x16(blk, a0, bv.x, bv.y);
+      mma_bf16_16x8x16(blk, a1, bv.z, bv.w);
+      if ((c + 1) % kChunksPerBlock == 0) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) { acc[i] = fmaf(scale, blk[i], acc[i]); blk[i] = 0.f; }
+        const int nb = (c + 1) / kChunksPerBlock;
+        if (nb < kPartK / kBlock) scale = __ldg(sw + nb);
+      }
+    }
+  }
+  // The parts' partials in part order: warp (tile, part) -> red[part][tile][lane][4].
+  float* mine = red + ((static_cast<size_t>(part) * kRowTiles + tile) * 32 + lane) * 4;
+#pragma unroll
+  for (int i = 0; i < 4; ++i) mine[i] = acc[i];
+  __syncthreads();
+  if (part != 0 || !live) return;
+  float sum[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+  for (int pp = 0; pp < kSplit; ++pp) {
+    const float* other = red + ((static_cast<size_t>(pp) * kRowTiles + tile) * 32 + lane) * 4;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) sum[i] += other[i];
+  }
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const int r = 2 * tid + (i & 1), row = (i < 2) ? r0 : r1;
+    if (r >= g.count) continue;
+    y[static_cast<size_t>(g.slots[r]) * kN + row] = f32_to_bf16(sum[i]);
+  }
+}
+
 template <int kK, int kN, int kBlock>
 __device__ __forceinline__ void fp8_matrix(const uint8_t* w, const float* scales, const Mxfp4Group& g, int rb, const uint16_t* x, uint16_t* y,
                                            float* partial, uint8_t* smem, int w0, int w1, int unit_rows = kMxfp4UnitRows) {

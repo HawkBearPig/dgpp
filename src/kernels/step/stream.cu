@@ -14,6 +14,20 @@ constexpr unsigned kStateIdle = 0, kStateStream = 1, kStateEnd = 2;
 // world 4. Other shapes come with their family ports.
 constexpr int kConsumerH = 5120, kConsumerI = 576;
 constexpr int kConsumerFp8Block = 32;  // DeepSeek-V4.1's fp8 scale grid
+// Projections for groups of at most kFp8SplitRows slots take the split form:
+// 32-row units, the width in four parts, when the width fits its staging.
+// Measured 2026-10-30 against the 128-row slabbed form: the split form's
+// drain is a third as long but its units cost more per byte (the staging
+// of the whole slice a unit, the cross-warp reduce, four times the unit
+// prologues), and the phases came out 20 percent longer, so it stays an
+// option until a phase shape wants it.
+constexpr bool kUseSplitForm = false;
+constexpr int kSplitRowTiles = 2;
+constexpr int kSplitUnitRows = kTileRows * kSplitRowTiles;
+constexpr int kSplitMaxK = 5120;
+__device__ __forceinline__ bool projection_split(const StepStreamParams& p, const DevPool& pool) {
+  return kUseSplitForm && pool.kind == kPoolFp8Matrix && p.ctl->rows <= kFp8SplitRows && pool.k <= kSplitMaxK;
+}
 
 struct OutIndex {
   int hidden, spt;
@@ -59,13 +73,18 @@ __device__ __forceinline__ void spin_us(float us) {
 
 // The units of phase P of `layer` at the current run list.
 // A pool's units this step: the run list's groups for the routed pool, one group otherwise.
+// A pool's compute units a group this step: the plan's, or the split form's for a small group.
+__device__ __forceinline__ unsigned compute_units_per_group(const StepStreamParams& p, const DevPool& pool) {
+  if (projection_split(p, pool)) return (static_cast<unsigned>(pool.rows) + kSplitUnitRows - 1) / kSplitUnitRows;
+  return static_cast<unsigned>(pool.units_per_group);
+}
 __device__ __forceinline__ unsigned reduce_units(const StepStreamParams& p, const DevPool& pool) {
-  if (pool.kind != kPoolFp8Matrix || pool.slabs <= 1) return 0;
+  if (pool.kind != kPoolFp8Matrix || pool.slabs <= 1 || projection_split(p, pool)) return 0;
   return (static_cast<unsigned>(pool.rows) * static_cast<unsigned>(p.ctl->rows) + kStepAccChunk - 1) / kStepAccChunk;
 }
 __device__ __forceinline__ unsigned pool_units(const StepStreamParams& p, int layer, const DevPool& pool) {
   const unsigned groups = pool.group_kind == kGroupRouted ? static_cast<unsigned>(p.ctl->run_count[layer]) : 1u;
-  return groups * static_cast<unsigned>(pool.units_per_group) + reduce_units(p, pool);
+  return groups * compute_units_per_group(p, pool) + reduce_units(p, pool);
 }
 __device__ __forceinline__ unsigned own_units(const StepStreamParams& p, int layer, int P) {
   const DevPhase& ph = p.phases[P];
@@ -80,16 +99,19 @@ __device__ __forceinline__ unsigned own_units(const StepStreamParams& p, int lay
 // last. `v` is the unit's index inside.
 __device__ __forceinline__ int unit_slot(const StepStreamParams& p, int layer, int P, unsigned u, unsigned* v) {
   const DevPhase& ph = p.phases[P];
-  if (u < ph.fixed_units) { *v = u; return -1; }
-  u -= ph.fixed_units;
   for (int i = 0; i < ph.n_pools; ++i) {
     if (i == ph.routed) continue;
     const unsigned n = pool_units(p, layer, p.pools[ph.pools[i]]);
     if (u < n) { *v = u; return i; }
     u -= n;
   }
-  *v = u;
-  return ph.routed;
+  if (ph.routed >= 0) {
+    const unsigned n = pool_units(p, layer, p.pools[ph.pools[ph.routed]]);
+    if (u < n) { *v = u; return ph.routed; }
+    u -= n;
+  }
+  *v = u;  // the fixed byte units last: the shortest, they fill the tail
+  return -1;
 }
 // The units a published phase hands out: its own, and the merged next phase's after them.
 __device__ __forceinline__ unsigned phase_units(const StepStreamParams& p, int layer, int P) {
@@ -117,18 +139,18 @@ __device__ bool locate_lead(const StepStreamParams& p, int layer, int P, unsigne
     if (locate_segment(p, base, p.segments[ph.lead_seg_begin + i], u, ptr, bytes)) return true;
   return false;
 }
-// Unit u of phase P in `layer`: its bytes in the layer's span.
-__device__ bool locate(const StepStreamParams& p, int layer, int P, unsigned u, const uint8_t** ptr, unsigned* bytes) {
+// Fixed byte unit v of phase P in `layer`: its bytes in the layer's span.
+__device__ bool locate_fixed(const StepStreamParams& p, int layer, int P, unsigned v, const uint8_t** ptr, unsigned* bytes) {
   const DevPhase& ph = p.phases[P];
   const uint8_t* base = p.bases[layer];
-  if (u < ph.fixed_units) {
-    for (int i = 0; i < ph.seg_count; ++i)
-      if (locate_segment(p, base, p.segments[ph.seg_begin + i], u, ptr, bytes)) return true;
-    return false;
-  }
-  if (ph.routed < 0) return false;
-  const DevPool& pool = p.pools[ph.pools[ph.routed]];
-  const unsigned v = u - ph.fixed_units;
+  if (v >= ph.fixed_units) return false;
+  for (int i = 0; i < ph.seg_count; ++i)
+    if (locate_segment(p, base, p.segments[ph.seg_begin + i], v, ptr, bytes)) return true;
+  return false;
+}
+// Byte unit v of a byte pool (the synthetic routed pool): group v / units_per_group of the run list.
+__device__ bool locate_pool_bytes(const StepStreamParams& p, int layer, const DevPool& pool, unsigned v, const uint8_t** ptr, unsigned* bytes) {
+  const uint8_t* base = p.bases[layer];
   const int g = static_cast<int>(v / static_cast<unsigned>(pool.units_per_group));
   const unsigned t = v % static_cast<unsigned>(pool.units_per_group);
   if (g >= p.ctl->run_count[layer]) return false;
@@ -270,11 +292,14 @@ __device__ void reduce_unit(const StepStreamParams& p, const DevPool& pool, unsi
 // The shared expert's pools have one group, every token's shared slot.
 // The fp8 projection form at the shapes compiled in (DeepSeek-V4.1 at world 4).
 __device__ bool fp8_matrix_dispatch(int k, int n, const uint8_t* w, const float* scales, const Mxfp4Group& g, int rb, const uint16_t* x,
-                                    uint16_t* y, float* partial, uint8_t* smem, int w0, int w1, int unit_rows) {
-#define DGPP_STEP_FP8_SHAPE(K, N)                                                                        \
-  if (k == (K) && n == (N)) {                                                                            \
-    fp8_matrix<(K), (N), kConsumerFp8Block>(w, scales, g, rb, x, y, partial, smem, w0, w1, unit_rows);  \
-    return true;                                                                                         \
+                                    uint16_t* y, float* partial, uint8_t* smem, int w0, int w1, int unit_rows, bool split, bool stage) {
+#define DGPP_STEP_FP8_SHAPE(K, N)                                                                               \
+  if (k == (K) && n == (N)) {                                                                                   \
+    if (split && (K) <= kSplitMaxK)                                                                             \
+      fp8_matrix_split_unit<(K), (N), kConsumerFp8Block, kSplitRowTiles>(w, scales, g, rb, x, y, smem, stage);  \
+    else                                                                                                        \
+      fp8_matrix<(K), (N), kConsumerFp8Block>(w, scales, g, rb, x, y, partial, smem, w0, w1, unit_rows);       \
+    return true;                                                                                                \
   }
   DGPP_STEP_FP8_SHAPE(5120, 1280)   // wq_a
   DGPP_STEP_FP8_SHAPE(5120, 512)    // wkv
@@ -308,13 +333,14 @@ __device__ void consumer_unit(const StepStreamParams& p, int layer, const DevPoo
     grp.count = static_cast<int>(p.ctl->rows);
   }
   if (pool.kind == kPoolFp8Matrix) {
-    // Unit v: rb * slabs + slab for the compute units, then the reduce units.
+    const bool split = projection_split(p, pool);
+    // Unit v: a 32-row block in the split form; else rb * slabs + slab for the compute units, then the reduce units.
     const int windows = pool.k / kMxfp4WindowCodes, per_slab = windows / pool.slabs;
-    const int slab = rb % pool.slabs, block = rb / pool.slabs;
+    const int slab = split ? 0 : rb % pool.slabs, block = split ? rb : rb / pool.slabs;
     const int w0 = slab * per_slab, w1 = w0 + per_slab;
-    float* partial = pool.slabs > 1 ? p.proj_part + pool.part_offset + static_cast<size_t>(slab) * kStepMaxRows * pool.rows : nullptr;
+    float* partial = (!split && pool.slabs > 1) ? p.proj_part + pool.part_offset + static_cast<size_t>(slab) * kStepMaxRows * pool.rows : nullptr;
     if (!fp8_matrix_dispatch(pool.k, pool.rows, base + pool.offsets[0], reinterpret_cast<const float*>(base + pool.offsets[1]), grp, block,
-                             p.x, p.proj + pool.out_offset, partial, smem, w0, w1, pool.unit_rows) &&
+                             p.x, p.proj + pool.out_offset, partial, smem, w0, w1, pool.unit_rows, split, stage) &&
         threadIdx.x == 0)
       atomicCAS(&p.ctl->status, kStepOk, kStepBadUnit);
     return;
@@ -551,7 +577,13 @@ __global__ void __launch_bounds__(kStepThreads, 1) step_stream_kernel(StepStream
             unsigned v = 0;
             const int slot = unit_slot(p, cur_layer, ip, iu, &v);
             const DevPhase& iph = p.phases[ip];
-            if (slot >= 0 && p.pools[iph.pools[slot]].kind != kPoolBytes) grab = static_cast<unsigned>(p.pools[iph.pools[slot]].grab);
+            if (slot >= 0 && p.pools[iph.pools[slot]].kind != kPoolBytes) {
+              const DevPool& gp = p.pools[iph.pools[slot]];
+              grab = projection_split(p, gp) ? 4u : static_cast<unsigned>(gp.grab);
+              // Consecutive units share their staging while the phase has units for every worker; the tail takes them singly.
+              const unsigned remaining = need > at ? need - at : 0u;
+              if (remaining < grab * (gridDim.x - 1)) grab = 1u;
+            }
           }
           const unsigned u = atomicAdd(&ctl->next[P], grab);
           if (u < need) {
@@ -617,7 +649,7 @@ __global__ void __launch_bounds__(kStepThreads, 1) step_stream_kernel(StepStream
       if (upool && upool->kind != kPoolBytes) {
         const bool shared = upool->group_kind == kGroupShared;
         const unsigned compute_units = (upool->group_kind == kGroupRouted ? static_cast<unsigned>(p.ctl->run_count[sm_layer]) : 1u) *
-                                       static_cast<unsigned>(upool->units_per_group);
+                                       compute_units_per_group(p, *upool);
         if (xv >= compute_units) {
           // A reduce unit: after the pool's compute units, which were handed out before it.
           if (threadIdx.x == 0) {
@@ -634,8 +666,9 @@ __global__ void __launch_bounds__(kStepThreads, 1) step_stream_kernel(StepStream
           last_pool = -1;
           continue;
         }
-        const int g = static_cast<int>(xv / static_cast<unsigned>(upool->units_per_group));
-        const int rb = static_cast<int>(xv % static_cast<unsigned>(upool->units_per_group));
+        const unsigned upg = compute_units_per_group(p, *upool);
+        const int g = static_cast<int>(xv / upg);
+        const int rb = static_cast<int>(xv % upg);
         if (pool_is_down(upool->kind) && upool->partner >= 0) {
           // The group's gate and up units must be complete: they were handed out earlier, so the wait is short.
           if (threadIdx.x == 0) {
@@ -653,7 +686,7 @@ __global__ void __launch_bounds__(kStepThreads, 1) step_stream_kernel(StepStream
         consumer_unit(p, sm_layer, *upool, g, rb, smem, pool_id != last_pool || g != last_group);
         last_group = g;
         last_pool = pool_id;
-        if (upool->kind == kPoolFp8Matrix && upool->slabs > 1) {
+        if (upool->kind == kPoolFp8Matrix && upool->slabs > 1 && !projection_split(p, *upool)) {
           __syncthreads();
           if (threadIdx.x == 0) { __threadfence(); atomicAdd(&ctl->pool_done[pool_id], 1u); }
         }
@@ -670,8 +703,9 @@ __global__ void __launch_bounds__(kStepThreads, 1) step_stream_kernel(StepStream
         const uint8_t* ptr = nullptr;
         unsigned bytes = 0;
         unsigned acc = 0;
-        const bool found = kind == 2 ? locate_lead(p, sm_layer, static_cast<int>(xphase), xunit, &ptr, &bytes)
-                                     : locate(p, sm_layer, static_cast<int>(xphase), xunit, &ptr, &bytes);
+        const bool found = kind == 2  ? locate_lead(p, sm_layer, static_cast<int>(xphase), xunit, &ptr, &bytes)
+                           : upool    ? locate_pool_bytes(p, sm_layer, *upool, xv, &ptr, &bytes)
+                                      : locate_fixed(p, sm_layer, static_cast<int>(xphase), xv, &ptr, &bytes);
         if (found) {
           acc = kind == 2 ? stream_unit<false>(ptr, bytes) : stream_unit<true>(ptr, bytes);
         } else if (threadIdx.x == 0) {
@@ -742,7 +776,12 @@ bool step_stream_has_fp8_matrix(int k, int rows) {
     if (s[0] == k && s[1] == rows) return true;
   return false;
 }
-unsigned step_stream_mxfp4_smem(int inter) { return inter == kConsumerI ? static_cast<unsigned>(mxfp4_unit_smem_bytes<kConsumerI>()) : 0u; }
+unsigned step_stream_mxfp4_smem(int inter) {
+  if (inter != kConsumerI) return 0u;
+  const unsigned experts = static_cast<unsigned>(mxfp4_unit_smem_bytes<kConsumerI>());
+  const unsigned split = static_cast<unsigned>(fp8_split_smem_bytes<kSplitMaxK, kSplitRowTiles>());
+  return experts > split ? experts : split;
+}
 
 cudaError_t launch_step_stream(const StepStreamParams& p, int workers, cudaStream_t stream) {
   if (workers < 1 || workers + 1 > step_stream_capacity(p.consumer_smem)) return cudaErrorInvalidConfiguration;
