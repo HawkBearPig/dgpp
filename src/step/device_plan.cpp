@@ -168,8 +168,11 @@ DevicePlan lower_plan(const std::vector<LayerPlan>& layers, uint32_t unit_bytes,
           const bool gate_up = payload[0] && scales[0] && payload[1] && scales[1] && !payload[2];
           const bool down = payload[2] && scales[2] && !payload[0];
           if (gate_up || down) {
-            pool.kind = gate_up ? kPoolMxfp4GateUp : kPoolMxfp4Down;
             const Range* m0 = gate_up ? payload[0] : payload[2];
+            // The layout the plan records picks the form: the tile-major form
+            // where the arena wrote tiles, the bridged row-major form otherwise.
+            const bool tiled = m0->layout == Layout::Tile16;
+            pool.kind = gate_up ? (tiled ? kPoolMxfp4GateUp : kPoolMxfp4RowGateUp) : (tiled ? kPoolMxfp4Down : kPoolMxfp4RowDown);
             pool.rows = static_cast<int32_t>(m0->rows);
             pool.k = static_cast<int32_t>(m0->cols);
             if (gate_up) {
@@ -198,8 +201,8 @@ DevicePlan lower_plan(const std::vector<LayerPlan>& layers, uint32_t unit_bytes,
     for (size_t i = 0; i + 1 < dp.phases.size(); ++i) {
       DevPhase& a = dp.phases[i];
       const DevPhase& b = dp.phases[i + 1];
-      if (a.pool >= 0 && b.pool >= 0 && a.layer == b.layer && dp.pools[static_cast<size_t>(a.pool)].kind == kPoolMxfp4GateUp &&
-          dp.pools[static_cast<size_t>(b.pool)].kind == kPoolMxfp4Down)
+      if (a.pool >= 0 && b.pool >= 0 && a.layer == b.layer && pool_is_gate_up(dp.pools[static_cast<size_t>(a.pool)].kind) &&
+          pool_is_down(dp.pools[static_cast<size_t>(b.pool)].kind))
         a.merged_next = 1;
     }
   return dp;

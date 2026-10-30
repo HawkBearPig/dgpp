@@ -28,7 +28,18 @@ enum DevPoolKind : uint8_t {
   kPoolMxfp4Down = 2,    // MXFP4 down: units of 128 output rows a group
   kPoolFp8GateUp = 3,    // the shared expert's fp8 pair, row-major with F32 32 x 32 scales: one group of every token
   kPoolFp8Down = 4,      // the shared expert's fp8 down
+  kPoolMxfp4RowGateUp = 5,  // MXFP4 gate and up over the checkpoint's row-major layout, through the L2 bridge
+  kPoolMxfp4RowDown = 6,    // MXFP4 down, row-major
 };
+#if defined(__CUDACC__)
+#define DGPP_STEP_PLAN_HD __host__ __device__
+#else
+#define DGPP_STEP_PLAN_HD
+#endif
+DGPP_STEP_PLAN_HD inline bool pool_is_gate_up(uint8_t kind) {
+  return kind == kPoolMxfp4GateUp || kind == kPoolFp8GateUp || kind == kPoolMxfp4RowGateUp;
+}
+DGPP_STEP_PLAN_HD inline bool pool_is_down(uint8_t kind) { return kind == kPoolMxfp4Down || kind == kPoolFp8Down || kind == kPoolMxfp4RowDown; }
 
 struct DevPool {
   uint64_t base = 0;    // group 0's first byte

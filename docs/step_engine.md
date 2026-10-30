@@ -213,6 +213,15 @@ with a changing sentinel agree bitwise, and a slot computed in a group of
 one equals the same slot computed in its group. As plain grids over 132
 cold experts the pair streams at 235 GB/s and the down at 248.
 
+The same form also exists over the checkpoint's row-major layout
+(`src/kernels/step/mxfp4_row.cuh`), reading through the L2 bridge the fp8
+consumer uses. It is exact and bitwise like the tile-major form and
+streams the pair at 215 GB/s and the down at 223 as plain grids over cold
+experts, against 233 and 247 for the tile-major form. The plan's layout
+field picks the form when the plan is lowered, so the streamer serves the
+layout the loader writes today and takes the tile-major form when the
+arena's second layout version arrives.
+
 Inside the streamer the plan's expert pools take the consumer kinds, the
 chain's router writes each expert's slot group beside the run list, and
 the workers run consumer units: a gate and up unit, or four down units of
@@ -227,7 +236,8 @@ reference as the plain grids do, the accumulated rows are bitwise the
 ordered sum, and the first eight DeepSeek-V4.1 layers run at 97 to 98
 percent of their byte floor at the median with the design chain
 interleaved and every expert computed, on an idle device, 93 to 95 beside
-a serving production world.
+a serving production world; with the routed experts in the checkpoint's
+row-major layout the layers run at 92 to 93 percent.
 
 ## The fp8 consumer
 

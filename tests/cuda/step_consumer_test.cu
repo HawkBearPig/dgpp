@@ -23,6 +23,7 @@
 #include "common/test.hpp"
 #include "kernels/step/fp8_dense.cuh"
 #include "kernels/step/mxfp4_expert.cuh"
+#include "kernels/step/mxfp4_row.cuh"
 #include "step_reference.cuh"
 
 namespace {
@@ -604,6 +605,141 @@ DGPP_TEST(fp8_consumer_plain_grid_rate) {
     DGPP_CUDA_OK(cudaEventElapsedTime(&m2, e1, e2));
     std::printf("   fp8 plain grids, %s, %zu distinct pairs in %d groups: gate and up %.0f us = %.0f GB/s (%.0f MB) | down %.0f us = %.0f GB/s (%.0f MB)\n",
                 rep ? "L2-warm where it fits" : "cold", distinct.size(), rig.groups, m1 * 1e3, pair_mb / m1, pair_mb, m2 * 1e3, down_mb / m2, down_mb);
+  }
+}
+
+// ---- the MXFP4 pair and down over the checkpoint's row-major layout, through the L2 bridge
+
+namespace {
+
+__global__ void __launch_bounds__(kMxfp4Threads) row_gate_up_kernel(const uint8_t* arena, GroupTable t, const uint16_t* x, uint16_t* act) {
+  extern __shared__ __align__(128) uint8_t smem[];
+  const Mxfp4Group g = group_of(t, blockIdx.y);
+  mxfp4_row_gate_up<kH, kI>(expert_at(arena, t.expert[blockIdx.y]), g, blockIdx.x, x, act, smem);
+}
+__global__ void __launch_bounds__(kMxfp4Threads) row_down_kernel(const uint8_t* arena, GroupTable t, const uint16_t* act, float* out) {
+  extern __shared__ __align__(128) uint8_t smem[];
+  const Mxfp4Group g = group_of(t, blockIdx.y);
+  mxfp4_stage_down_act<kI>(act, g, smem);
+  __syncthreads();
+  mxfp4_row_down<kH, kI>(expert_at(arena, t.expert[blockIdx.y]), g, blockIdx.x, smem, out, OutIndex{});
+}
+void run_row_consumer(const Rig& r) {
+  row_gate_up_kernel<<<dim3((kI + kMxfp4UnitRows - 1) / kMxfp4UnitRows, static_cast<unsigned>(r.groups)), kMxfp4Threads, kSmem>>>(
+      r.arena, r.table(), r.x, r.act);
+  row_down_kernel<<<dim3(kH / kMxfp4UnitRows, static_cast<unsigned>(r.groups)), kMxfp4Threads, kSmem>>>(r.arena, r.table(), r.act, r.out);
+}
+
+}  // namespace
+
+DGPP_TEST(mxfp4_row_major_consumer_matches_the_reference) {
+  auto rig = make_rig(48, 8, 32, 29);  // the same bytes read as row-major [rows, K / 2] payloads
+  DGPP_CUDA_OK(cudaFuncSetAttribute(row_gate_up_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem));
+  DGPP_CUDA_OK(cudaFuncSetAttribute(row_down_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem));
+  DGPP_CUDA_OK(cudaMemset(rig->act, 0, rig->act_elems * 2));
+  DGPP_CUDA_OK(cudaMemset(rig->out, 0, rig->out_elems * 4));
+  run_row_consumer(*rig);
+  DGPP_CUDA_OK(cudaDeviceSynchronize());
+  const std::vector<uint16_t> act = download(rig->act, rig->act_elems);
+  const std::vector<float> out = download(rig->out, rig->out_elems);
+  float *gu = nullptr, *gu_mag = nullptr, *abs_sum = nullptr;
+  DGPP_CUDA_OK(cudaMalloc(&gu, rig->act_elems * 8));
+  DGPP_CUDA_OK(cudaMalloc(&gu_mag, rig->act_elems * 8));
+  DGPP_CUDA_OK(cudaMalloc(&abs_sum, rig->out_elems * 4));
+  for (int g = 0; g < rig->groups; ++g) {
+    Mxfp4Group grp;
+    grp.slots = rig->slots + g * kMxfp4GroupRows;
+    grp.tokens = rig->tokens + g * kMxfp4GroupRows;
+    grp.count = rig->h_count[static_cast<size_t>(g)];
+    step_ref::mxfp4_row_gate_up<<<(kI + 127) / 128, 128>>>(expert_at(rig->arena, rig->h_expert[static_cast<size_t>(g)]), grp, rig->x, kH, kI, rig->act, gu, gu_mag);
+  }
+  DGPP_CUDA_OK(cudaDeviceSynchronize());
+  const std::vector<uint16_t> act_r = download(rig->act, rig->act_elems);
+  const std::vector<float> gu_h = download(gu, rig->act_elems * 2), gu_m = download(gu_mag, rig->act_elems * 2);
+  DGPP_CUDA_OK(cudaMemcpy(rig->act, act.data(), rig->act_elems * 2, cudaMemcpyHostToDevice));
+  for (int g = 0; g < rig->groups; ++g) {
+    Mxfp4Group grp;
+    grp.slots = rig->slots + g * kMxfp4GroupRows;
+    grp.tokens = rig->tokens + g * kMxfp4GroupRows;
+    grp.count = rig->h_count[static_cast<size_t>(g)];
+    step_ref::mxfp4_row_down<<<kH / 128, 128>>>(expert_at(rig->arena, rig->h_expert[static_cast<size_t>(g)]), grp, rig->act, kH, kI, kSlotsPerToken, rig->out, abs_sum);
+  }
+  DGPP_CUDA_OK(cudaDeviceSynchronize());
+  const std::vector<float> out_r = download(rig->out, rig->out_elems), mag = download(abs_sum, rig->out_elems);
+  cudaFree(gu); cudaFree(gu_mag); cudaFree(abs_sum);
+  const std::vector<bool> live = live_slots(*rig);
+  size_t exact = 0, ok = 0, bad = 0, n = 0, out_bad = 0, out_n = 0;
+  for (size_t i = 0; i < act.size(); ++i) {
+    if (!live[i / kI]) continue;
+    ++n;
+    if (act[i] == act_r[i]) ++exact;
+    else if (step_ref::act_ok(act[i], act_r[i], gu_h[2 * i], gu_h[2 * i + 1], gu_m[2 * i], gu_m[2 * i + 1])) ++ok;
+    else ++bad;
+  }
+  for (size_t i = 0; i < out.size(); ++i) {
+    const int slot = static_cast<int>((i / kSlotsPerToken) / kH) * kSlotsPerToken + static_cast<int>(i % kSlotsPerToken);
+    if (!live[static_cast<size_t>(slot)]) continue;
+    ++out_n;
+    if (!step_ref::partial_ok(out[i], out_r[i], mag[i])) ++out_bad;
+  }
+  std::printf("   MXFP4 row-major, %d groups of %d rows: act %zu exact, %zu within the envelope, %zu beyond of %zu; partials %zu beyond the bound of %zu\n",
+              rig->groups, rig->rows, exact, ok, bad, n, out_bad, out_n);
+  require(bad == 0, "row-major MXFP4 gate and up outputs beyond the reference's envelope");
+  require(out_bad == 0, "row-major MXFP4 down partials beyond the fp32 bound");
+}
+
+DGPP_TEST(mxfp4_row_major_consumer_is_bitwise_across_launches_and_group_sizes) {
+  auto grouped = make_rig(48, 8, 32, 31);
+  auto alone = make_rig(48, 8, 1, 31);
+  DGPP_CUDA_OK(cudaFuncSetAttribute(row_gate_up_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem));
+  DGPP_CUDA_OK(cudaFuncSetAttribute(row_down_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem));
+  auto run = [&](Rig& r, uint8_t sentinel) {
+    DGPP_CUDA_OK(cudaMemset(r.act, sentinel, r.act_elems * 2));
+    DGPP_CUDA_OK(cudaMemset(r.out, sentinel, r.out_elems * 4));
+    run_row_consumer(r);
+    DGPP_CUDA_OK(cudaDeviceSynchronize());
+    return std::make_pair(download(r.act, r.act_elems), download(r.out, r.out_elems));
+  };
+  const auto first = run(*grouped, 0x00), second = run(*grouped, 0x7f), solo = run(*alone, 0x00);
+  const std::vector<bool> live = live_slots(*grouped);
+  auto same_live = [&](const std::vector<uint16_t>& a, const std::vector<uint16_t>& b, const std::vector<float>& oa, const std::vector<float>& ob) {
+    for (size_t i = 0; i < a.size(); ++i)
+      if (live[i / kI] && a[i] != b[i]) return false;
+    for (size_t i = 0; i < oa.size(); ++i) {
+      const int slot = static_cast<int>((i / kSlotsPerToken) / kH) * kSlotsPerToken + static_cast<int>(i % kSlotsPerToken);
+      if (live[static_cast<size_t>(slot)] && std::memcmp(&oa[i], &ob[i], 4) != 0) return false;
+    }
+    return true;
+  };
+  require(same_live(first.first, second.first, first.second, second.second), "row-major MXFP4: repeat launches differ");
+  require(same_live(first.first, solo.first, first.second, solo.second), "row-major MXFP4: a lone slot differs from the grouped one");
+  std::printf("   MXFP4 row-major: %d grouped and %d single-slot units agree bitwise\n", grouped->groups, alone->groups);
+}
+
+DGPP_TEST(mxfp4_row_major_consumer_plain_grid_rate) {
+  auto rig = make_rig(192, 32, 32, 37);
+  DGPP_CUDA_OK(cudaFuncSetAttribute(row_gate_up_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem));
+  DGPP_CUDA_OK(cudaFuncSetAttribute(row_down_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem));
+  cudaEvent_t e0, e1, e2;
+  DGPP_CUDA_OK(cudaEventCreate(&e0));
+  DGPP_CUDA_OK(cudaEventCreate(&e1));
+  DGPP_CUDA_OK(cudaEventCreate(&e2));
+  std::vector<int> distinct;
+  for (int e : rig->h_expert) if (std::find(distinct.begin(), distinct.end(), e) == distinct.end()) distinct.push_back(e);
+  const double pair_mb = distinct.size() * 2.0 * (kPair + kPairScales) / 1e6, down_mb = distinct.size() * (kDown + kDownScales) / 1e6;
+  for (int rep = 0; rep < 2; ++rep) {
+    DGPP_CUDA_OK(cudaEventRecord(e0));
+    row_gate_up_kernel<<<dim3((kI + kMxfp4UnitRows - 1) / kMxfp4UnitRows, static_cast<unsigned>(rig->groups)), kMxfp4Threads, kSmem>>>(
+        rig->arena, rig->table(), rig->x, rig->act);
+    DGPP_CUDA_OK(cudaEventRecord(e1));
+    row_down_kernel<<<dim3(kH / kMxfp4UnitRows, static_cast<unsigned>(rig->groups)), kMxfp4Threads, kSmem>>>(rig->arena, rig->table(), rig->act, rig->out);
+    DGPP_CUDA_OK(cudaEventRecord(e2));
+    DGPP_CUDA_OK(cudaDeviceSynchronize());
+    float m1 = 0, m2 = 0;
+    DGPP_CUDA_OK(cudaEventElapsedTime(&m1, e0, e1));
+    DGPP_CUDA_OK(cudaEventElapsedTime(&m2, e1, e2));
+    std::printf("   MXFP4 row-major plain grids, %s, %zu distinct experts in %d groups: gate and up %.0f us = %.0f GB/s (%.0f MB) | down %.0f us = %.0f GB/s (%.0f MB)\n",
+                rep ? "L2-warm where it fits" : "cold", distinct.size(), rig->groups, m1 * 1e3, pair_mb / m1, pair_mb, m2 * 1e3, down_mb / m2, down_mb);
   }
 }
 

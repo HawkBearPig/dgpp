@@ -639,6 +639,7 @@ GPU at the time, so the figures below carry its noise.
 | MXFP4 tensor-core consumers on the routed experts, gate and up then down as two phases | 89 to 94 |
 | the same with the expert phases merged, a down unit released by its group's gate and up | 96 to 98 |
 | the merged phase with the shared expert computed too, by the row-major fp8 form through the L2 bridge, its units handed out first and its bytes in the lead | 97 to 98 idle, 93 to 95 beside production |
+| the same with the routed experts read in the checkpoint's row-major layout through the bridge, no second layout | 92 to 93 |
 
 The merged phase is the work distribution the phase-1 prototype owed: the
 gate and up phase alone drained 68 µs a layer with 150 units of 110 µs
@@ -668,6 +669,21 @@ at 247 GB/s. Two placement lessons came with it: the shared units are the
 longest of the phase and go out first, and the shared expert's bytes stay
 in the lead's sequence as lead-only segments although no worker streams
 them as bytes.
+
+The fp8 result raised the question whether the routed experts need the
+tile-major layout at all, so the MXFP4 form was built over the row-major
+layout with the same bridge (`src/kernels/step/mxfp4_row.cuh`). It is
+exact and bitwise like the tile-major form. Under the same conditions, as
+plain grids over cold experts, the tile-major pair streams at 233 GB/s and
+the row-major pair at 215, the downs at 247 and 223; inside the streamer
+the layers run at 95 to 98 percent of their floor with tile-major experts
+and 92 to 93 with row-major ones. The eight points on the pair are the
+probes' finding of section 1.3 again, so the tile-major layout stays the
+arena's second version. What the row-major form buys is independence: the
+plan's layout field picks the form at lowering, the streamer serves the
+checkpoint's layout today at 92 percent, and the layout version lands when
+the loader's transform and the prefill readers' address map are ready
+rather than before any family can be ported.
 
 ### 1.1 A second engine behind a flag
 
@@ -1848,7 +1864,11 @@ area, untracked.
       shared slot through the fp8 form, its five gate and up units handed
       out before the routed ones and its bytes in the lead's sequence; the
       first eight layers then run at 97 to 98 percent of their byte floor
-      with every expert computed, on an idle device.
+      with every expert computed, on an idle device. The routed experts
+      take the tile-major form where the plan records tiles and the
+      bridged row-major form (`mxfp4_row.cuh`) where it records the
+      checkpoint's layout, at 92 to 93 percent; both are checked inside
+      the kernel against the reference.
 - [ ] Dense and attention projections from stationary tiles, the thin TP
       shards as adjacent ranges; the fp8 block-scaled form above is the
       candidate for the fp8 projections, the bf12 form is unbuilt.

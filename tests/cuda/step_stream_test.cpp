@@ -60,7 +60,7 @@ struct Rig {
 
 // Builds the plan of the first kLayers main layers under the arena and the
 // device arena they stream from.
-std::unique_ptr<Rig> make_rig(int layers = kLayers, bool consumers = false) {
+std::unique_ptr<Rig> make_rig(int layers = kLayers, bool consumers = false, bool tile_major = false) {
   auto rig = std::make_unique<Rig>();
   const auto doc = minijson::parse(dsv41_test::config_json());
   rig->cfg = Dsv41TextConfig::parse(doc.root);
@@ -75,6 +75,9 @@ std::unique_ptr<Rig> make_rig(int layers = kLayers, bool consumers = false) {
     Dsv41LayerResident r;
     const size_t span = Dsv41LayerStream::layout_layer(rig->cfg, l, 0, kWorld, base, r, &placement);
     rig->plans.push_back(dsv41_layer_plan(rig->cfg, geo, r, base, span, rig->shape));
+    if (tile_major)  // the arena's second layout version, as the loader will write it
+      for (Range& rg : rig->plans.back().ranges)
+        if (rg.dep == Dependency::Router && rg.format == Format::Fp4E2m1) rg.layout = Layout::Tile16;
     max_span = std::max<uint64_t>(max_span, span);
   }
   rig->dp = lower_plan(rig->plans, 65536, consumers);
@@ -341,8 +344,8 @@ DGPP_TEST(step_protocol_gather_phase_waits_for_the_host_sequence) {
 
 // ---- the consumers inside the stream (phase 3 items 1 and 2)
 
-DGPP_TEST(step_consumers_in_the_stream_match_the_reference) {
-  auto rig = make_rig(2, /*consumers=*/true);
+void consumers_match_the_reference(bool tile_major) {
+  auto rig = make_rig(2, /*consumers=*/true, tile_major);
   Streamer s(rig->dp, rig->bases, rig->plans);
   require(s.consumers(), "the plan's expert pools took the MXFP4 consumer");
   StreamerConfig cfg = design_config();
@@ -364,8 +367,8 @@ DGPP_TEST(step_consumers_in_the_stream_match_the_reference) {
   const DevLayer& dl = rig->dp.layers[static_cast<size_t>(L)];
   for (int P = dl.phase_begin; P < dl.phase_begin + dl.phase_count; ++P) {
     const DevPhase& ph = rig->dp.phases[static_cast<size_t>(P)];
-    if (ph.pool >= 0 && rig->dp.pools[static_cast<size_t>(ph.pool)].kind == kPoolMxfp4GateUp) gate_up = &rig->dp.pools[static_cast<size_t>(ph.pool)];
-    if (ph.pool >= 0 && rig->dp.pools[static_cast<size_t>(ph.pool)].kind == kPoolMxfp4Down) down = &rig->dp.pools[static_cast<size_t>(ph.pool)];
+    if (ph.pool >= 0 && pool_is_gate_up(rig->dp.pools[static_cast<size_t>(ph.pool)].kind)) gate_up = &rig->dp.pools[static_cast<size_t>(ph.pool)];
+    if (ph.pool >= 0 && pool_is_down(rig->dp.pools[static_cast<size_t>(ph.pool)].kind)) down = &rig->dp.pools[static_cast<size_t>(ph.pool)];
     if (ph.pool2 >= 0 && rig->dp.pools[static_cast<size_t>(ph.pool2)].kind == kPoolFp8GateUp) sh_gate_up = &rig->dp.pools[static_cast<size_t>(ph.pool2)];
     if (ph.pool2 >= 0 && rig->dp.pools[static_cast<size_t>(ph.pool2)].kind == kPoolFp8Down) sh_down = &rig->dp.pools[static_cast<size_t>(ph.pool2)];
   }
@@ -409,8 +412,13 @@ DGPP_TEST(step_consumers_in_the_stream_match_the_reference) {
     const uint8_t* db = rig->bases[static_cast<size_t>(L)] + down->base + static_cast<uint64_t>(expert) * down->stride;
     e.down = db + down->offsets[0];
     e.down_scales = db + down->offsets[1];
-    step_ref::launch_gate_up(e, grp, s.x(), H, I, act_ref, gu, gu_mag, nullptr);
-    step_ref::launch_down(e, grp, act_dev, H, I, spt, out_ref, out_mag, nullptr);
+    if (gate_up->kind == kPoolMxfp4GateUp) {
+      step_ref::launch_gate_up(e, grp, s.x(), H, I, act_ref, gu, gu_mag, nullptr);
+      step_ref::launch_down(e, grp, act_dev, H, I, spt, out_ref, out_mag, nullptr);
+    } else {
+      step_ref::launch_mxfp4_row_gate_up(e, grp, s.x(), H, I, act_ref, gu, gu_mag, nullptr);
+      step_ref::launch_mxfp4_row_down(e, grp, act_dev, H, I, spt, out_ref, out_mag, nullptr);
+    }
   }
   {
     // The shared expert: every token's shared slot through the fp8 pools.
@@ -464,22 +472,27 @@ DGPP_TEST(step_consumers_in_the_stream_match_the_reference) {
       a = std::fma(1.0f, out[step_out_index(t * spt + cfg.top_k, c, H, spt)], a);
       if (float_to_bf16_bits(a) != y[static_cast<size_t>(t) * H + c]) ++y_bad;
     }
-  std::printf("   layer %d, %d routed experts and the shared expert over %d rows: act %zu exact, %zu within the envelope, %zu beyond of %zu; partials %zu beyond the bound of %zu; y %zu of %zu differ from the ordered sum\n",
-              L, groups, cfg.rows, exact, ok, bad, n, out_bad, out_n_live, y_bad, y.size());
+  std::printf("   %s experts, layer %d, %d routed and the shared over %d rows: act %zu exact, %zu within the envelope, %zu beyond of %zu; partials %zu beyond the bound of %zu; y %zu of %zu differ from the ordered sum\n",
+              tile_major ? "tile-major" : "row-major", L, groups, cfg.rows, exact, ok, bad, n, out_bad, out_n_live, y_bad, y.size());
   require(bad == 0, "gate and up outputs beyond the reference's envelope inside the stream");
   require(out_bad == 0, "down partials beyond the fp32 bound inside the stream");
   require(y_bad == 0, "the accumulated output is not the ordered sum of the partials");
 }
 
-DGPP_TEST(step_consumers_rate_at_the_design_chain) {
-  auto rig = make_rig(kLayers, /*consumers=*/true);
+DGPP_TEST(step_consumers_in_the_stream_match_the_reference) {
+  consumers_match_the_reference(/*tile_major=*/false);  // the checkpoint's layout, as the loader writes it today
+  consumers_match_the_reference(/*tile_major=*/true);   // the arena's tile-major experts
+}
+
+double consumers_rate(bool tile_major) {
+  auto rig = make_rig(kLayers, /*consumers=*/true, tile_major);
   Streamer s(rig->dp, rig->bases, rig->plans);
   StreamerConfig cfg = design_config();
   cfg.steps = 3;
   cfg.rows = 5;
   cfg.top_k = 6;
   const StreamReport r = s.run(cfg);
-  print_report("consumers, design chain, lead 8 MB", r, 3);
+  print_report(tile_major ? "tile-major experts, design chain, lead 8 MB" : "row-major experts, design chain, lead 8 MB", r, 3);
   require(r.status == kStepOk, "the kernel ended on " + r.status_text);
   std::vector<double> pct;
   for (size_t l = 0; l < r.layer_us.size(); ++l) {
@@ -489,8 +502,16 @@ DGPP_TEST(step_consumers_rate_at_the_design_chain) {
                 r.run_counts[l], r.layer_us[l], floor_us, pct.back());
   }
   std::sort(pct.begin(), pct.end());
-  std::printf("   with the MXFP4 consumers computing the routed experts: median layer at %.1f %% of the ceiling\n", pct[pct.size() / 2]);
-  require(pct[pct.size() / 2] >= 85.0, "the consumers' layers stream under 85 percent of the ceiling");
+  std::printf("   %s experts computed by the consumers: median layer at %.1f %% of the ceiling\n", tile_major ? "tile-major" : "row-major",
+              pct[pct.size() / 2]);
+  return pct[pct.size() / 2];
+}
+
+DGPP_TEST(step_consumers_rate_at_the_design_chain) {
+  const double row = consumers_rate(/*tile_major=*/false);
+  const double tile = consumers_rate(/*tile_major=*/true);
+  require(tile >= 85.0, "the tile-major consumers' layers stream under 85 percent of the ceiling");
+  require(row >= 80.0, "the row-major consumers' layers stream under 80 percent of the ceiling");
 }
 
 int main() { return dgpp::test::run_all(); }

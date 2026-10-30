@@ -3,6 +3,7 @@
 
 #include "kernels/step/fp8_dense.cuh"
 #include "kernels/step/mxfp4_expert.cuh"
+#include "kernels/step/mxfp4_row.cuh"
 
 namespace dgpp::step {
 
@@ -266,18 +267,21 @@ __device__ void consumer_unit(const StepStreamParams& p, int layer, const DevPoo
     return;
   }
   Mxfp4Expert e;
-  if (pool.kind == kPoolMxfp4GateUp) {
+  if (pool.kind == kPoolMxfp4GateUp || pool.kind == kPoolMxfp4RowGateUp) {
     e.gate = base + pool.offsets[0];
     e.gate_scales = base + pool.offsets[1];
     e.up = base + pool.offsets[2];
     e.up_scales = base + pool.offsets[3];
-    mxfp4_gate_up<kConsumerH, kConsumerI>(e, grp, rb, p.x, p.act, smem);
+    if (pool.kind == kPoolMxfp4GateUp) mxfp4_gate_up<kConsumerH, kConsumerI>(e, grp, rb, p.x, p.act, smem);
+    else mxfp4_row_gate_up<kConsumerH, kConsumerI>(e, grp, rb, p.x, p.act, smem);
   } else {
     e.down = base + pool.offsets[0];
     e.down_scales = base + pool.offsets[1];
     if (stage) mxfp4_stage_down_act<kConsumerI>(p.act, grp, smem);
     __syncthreads();
-    mxfp4_down<kConsumerH, kConsumerI>(e, grp, rb, smem, p.out, OutIndex{p.hidden, static_cast<int>(p.ctl->top_k) + 1});
+    const OutIndex oi{p.hidden, static_cast<int>(p.ctl->top_k) + 1};
+    if (pool.kind == kPoolMxfp4Down) mxfp4_down<kConsumerH, kConsumerI>(e, grp, rb, smem, p.out, oi);
+    else mxfp4_row_down<kConsumerH, kConsumerI>(e, grp, rb, smem, p.out, oi);
   }
 }
 
@@ -543,7 +547,7 @@ __global__ void __launch_bounds__(kStepThreads, 1) step_stream_kernel(StepStream
         const int pool_id = shared ? uph.pool2 : uph.pool;
         const int g = static_cast<int>(xv / static_cast<unsigned>(upool->units_per_group));
         const int rb = static_cast<int>(xv % static_cast<unsigned>(upool->units_per_group));
-        if ((upool->kind == kPoolMxfp4Down || upool->kind == kPoolFp8Down) && xphase != sm_phase) {
+        if (pool_is_down(upool->kind) && xphase != sm_phase) {
           // The group's gate and up units must be complete: they were handed out earlier, so the wait is short.
           if (threadIdx.x == 0) {
             const DevPhase& gph = p.phases[sm_phase];
@@ -561,7 +565,7 @@ __global__ void __launch_bounds__(kStepThreads, 1) step_stream_kernel(StepStream
         consumer_unit(p, sm_layer, *upool, g, rb, smem, pool_id != last_pool || g != last_group);
         last_group = g;
         last_pool = pool_id;
-        if (upool->kind == kPoolMxfp4GateUp || upool->kind == kPoolFp8GateUp) {
+        if (pool_is_gate_up(upool->kind)) {
           __syncthreads();
           if (threadIdx.x == 0) {
             __threadfence();

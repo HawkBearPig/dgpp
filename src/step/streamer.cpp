@@ -63,7 +63,7 @@ Streamer::Streamer(const DevicePlan& dp, const std::vector<const uint8_t*>& base
   DGPP_CUDA_OK(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking));
   // The consumers' operands, when the plan has consumer pools.
   for (const DevPool& pool : dp.pools) {
-    if (pool.kind == kPoolMxfp4GateUp) { hidden_ = pool.k; inter_ = pool.rows; consumers_ = true; }
+    if (pool.kind == kPoolMxfp4GateUp || pool.kind == kPoolMxfp4RowGateUp) { hidden_ = pool.k; inter_ = pool.rows; consumers_ = true; }
   }
   if (consumers_) {
     if (!step_stream_has_mxfp4_consumer(hidden_, inter_))
