@@ -283,6 +283,9 @@ StreamReport Streamer::run(const StreamerConfig& cfg) {
         t.drained_us = static_cast<double>(ctl_->stamp_end[P] - ctl_->idle_first[P]) / 1e3;
       t.busy_us = static_cast<double>(ctl_->busy_ns[P]) / 1e3;
       t.handout_us = static_cast<double>(ctl_->handout_ns[P]) / 1e3;
+      t.lead_in_mb = static_cast<double>(ctl_->lead_in_bytes[P]) / 1e6;
+      t.staged_mb = static_cast<double>(ctl_->pf_staged[P]) / 1e6;
+      t.wait_us = static_cast<double>(ctl_->wait_ns[P]) / 1e3;
       t.grabs = ctl_->grabs[P];
       first = std::min(first, ctl_->stamp_begin[P]);
       last = std::max(last, ctl_->stamp_end[P]);

@@ -148,7 +148,28 @@ lead's cap grows by an idle budget while the current phase is a latency
 phase or drained, the modeled time until the next stream phase at the
 ceiling's rate, since the memory would otherwise idle for it. The trace a
 run reads back reports each phase's worker utilization, the mean time of a
-grab and the mean hand-out time.
+grab, the mean hand-out time, the lead bytes streamed in the phase's
+window, the bytes staged for the phase's own units and the time workers
+spent on dependency waits.
+
+The lead's accounting follows consumption. A latency phase is published
+too, idle, so the workers see the phase the chain is in. The bytes staged
+for a phase leave the lead's account as the phase's units consume them,
+unit by unit, rather than at the phase's end, so the lead's room opens
+while a phase runs and the staged set in L2 stays within the cap in
+consumption order. A yielded lead unit counts only what it read, and it
+yields only to a published stream phase, not to a latency publish. The
+lead stays within the next layer (`lookahead_layers` 1), so its cursor is
+at the bytes a latency window can stage. Reduce units of slabbed
+projections are handed out after every pool's compute units, so the pool
+they wait on has only its stragglers left. Measured together, the lead
+stages about 22 MB a layer in windows that total about 23 MB at the
+ceiling: the idle windows are nearly spent, and what remains of the layer
+is the expert phase's forms, at 93 to 94 percent of the ceiling inside the
+stream, and the tails and hand-outs of the fixed phases. Staging into L2
+with the evict-last priority rather than evict-normal changed nothing; a
+probe showed evict-normal lines surviving a 150 MB evict-first stream at
+92 to 95 percent.
 
 The plan reaches the kernel through `lower_plan` (`src/step/device_plan.hpp`):
 each phase's fixed ranges under the arena coalesce into a few contiguous

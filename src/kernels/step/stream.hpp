@@ -71,6 +71,10 @@ struct alignas(128) StepCtl {
   unsigned long long busy_ns[kStepMaxPhases];      // the last pass: worker time inside the phase's grabs, summed
   unsigned grabs[kStepMaxPhases];                  // the last pass: grabs of the phase's units
   unsigned long long handout_ns[kStepMaxPhases];   // the last pass: thread 0's time from the loop top to the grab, summed
+  unsigned long long lead_in_bytes[kStepMaxPhases]; // the last pass: lead bytes streamed while this phase was the published one
+  unsigned long long pf_credit[kStepMaxPhases];     // of the phase's staged bytes, those credited as consumed so far
+  unsigned long long pf_staged[kStepMaxPhases];     // bytes the lead actually streamed for the phase's lead units (a yielded unit counts what it read)
+  unsigned long long wait_ns[kStepMaxPhases];       // the last pass: workers' time spinning on a group's gate and up units before its down units
   unsigned steps_run;                              // steps this launch completed
   unsigned rows;                                   // the running step's rows (the synthetic router's)
   unsigned top_k;

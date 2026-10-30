@@ -881,6 +881,34 @@ to 248 GB/s against the floor's 240), the latency segments the fused chain
 shortens (the accumulation's 21 µs first), and the lead's use of the cap
 around them.
 
+*The lead's accounting, later that night.* The trace gained the lead's
+bytes per window and the bytes actually staged for each phase, and the
+first thing they showed was that the earlier counts were wrong: a lead
+unit cut short by a yield had counted as staged in full, and the yield
+fired on every phase-word change, so the lead looked twice as effective
+as it was. With latency phases published to the workers, staged bytes
+credited as units consume them, yields only to a stream publish and the
+lead held within the next layer, the lead stages about 22 MB a layer
+(qkv 7, the shared expert 7, the router 4, attn_out 3) in idle windows
+worth about 23 MB at the ceiling. The idle windows are therefore nearly
+spent, and the lead cannot buy much more: the fixed phases' remaining
+time is their cold bytes at the ceiling plus tails and hand-outs, and the
+accumulation's 21 µs is the design's own accumulate and fold latency, not
+its units. Two experiments closed side questions: staging with the
+evict-last priority changed nothing (a probe showed evict-normal lines
+surviving a 150 MB evict-first stream at 92 to 95 percent), and reducing
+a slabbed projection in the pool's last arriving worker made the largest
+pool's reduce the phase's tail, so reduce units stay units, handed out
+after every pool's compute units. The layer stands at 89 percent of its
+floor, plus or minus two between runs, and the residue is now mostly the
+expert phase: 642 µs for bytes the forms read in 596 as plain grids and
+the floor counts at 604, so the pair's request granularity (233 GB/s
+against the down's 247) and the grabs' prologues are the next levers,
+with the fixed phases' tails after them. The fused chain's value for the
+C1 target is accordingly smaller than the plan assumed, since the lead
+already covers the design's latency, and its value is the latency it
+removes from the pass itself.
+
 **H3. The owned lead.** The lead table of section 2.1 counts 23 MB and the
 L2 part, 16 MB, is built. The other 7 MB is register and shared-memory
 staging owned by the CTA that will consume it, which needs the stationary
@@ -2184,13 +2212,27 @@ area, untracked.
       hand-out time. Hand-out 3.5 to 4.5 µs a grab to 1.0 to 1.6, workers
       busy 83, 78 and 96 percent of the qkv, attn_out and expert phases,
       the median layer 87 to 88 percent of its floor at any lead cap.
-- [ ] The latency residue: about 70 µs a layer of latency segments the
-      lead cannot cover because its cap is full when they begin. The
-      accumulation's 21 µs first (finer units, the lead let into it),
-      then the fused chain's shortening of the rest, then the lead's cap
-      used around the expert phase rather than parked across it. Gate:
-      the layers with every weight computed at or above 95 percent of
-      their floor with the design chain's latencies.
+- [x] The lead's accounting (2026-10-30 night): latency phases published
+      to the workers, staged bytes credited as units consume them, a
+      yielded unit counting what it read and yielding only to a stream
+      publish, the lead within the next layer, reduce units after every
+      pool's compute units, and the trace's lead-in-window, staged and
+      wait columns. The lead now stages about 22 MB a layer in windows
+      worth about 23 MB, so the idle windows are nearly spent; the
+      accumulation's 21 µs is the design's own accumulate and fold
+      latency (8 and 12), not its units, which take 2 µs each. The median
+      layer with every weight computed stands at 89 percent of its floor,
+      plus or minus two between runs.
+- [ ] The residue after the lead: the expert forms inside the stream at
+      93 to 94 percent of the ceiling (the tile-major pair reads 233 GB/s
+      as a plain grid against the down's 247, request granularity, and
+      the stream adds the grabs' prologues), about 6 percent; the fixed
+      phases' tails and hand-outs, about 3 percent. Levers: the pair's
+      runs lengthened or its gate and up tiles adjacent (the arena's
+      second layout version, the loader transform owed), fewer and
+      larger down grabs, finer tails. Gate: the layers with every weight
+      computed at or above 95 percent of their floor with the design
+      chain's latencies.
 - [x] The ceiling per form (hypothesis H6), measured 2026-10-30: the
       tile-major forms miss exactly their bytes at L2 (415.2 MB of
       misses for a 414 MB sweep) at 2.9 to 3.9 sectors a request, the

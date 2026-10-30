@@ -51,6 +51,9 @@ struct PhaseTiming {
   double drained_us = 0;  // the first worker's idle wait from the phase's drain to its end (0: none seen)
   double busy_us = 0;     // worker time inside the phase's grabs, summed over workers
   double handout_us = 0;  // thread 0's time from the loop top to the grab, summed over grabs
+  double lead_in_mb = 0;  // lead bytes streamed while this phase was the published one
+  double staged_mb = 0;   // lead bytes streamed for this phase's own units
+  double wait_us = 0;     // workers' time spinning on dependencies inside the phase, summed
   unsigned grabs = 0;
 };
 

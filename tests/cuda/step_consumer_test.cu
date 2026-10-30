@@ -751,6 +751,23 @@ constexpr int kPK = 5120, kPN = 1280;
 constexpr size_t kPBytes = static_cast<size_t>(kPN) * kPK, kPScales = static_cast<size_t>(kPN / 32) * (kPK / 32) * 4;
 constexpr size_t kPStride = align_up(kPBytes) + align_up(kPScales);
 
+__global__ void stream_cs_kernel(const uint4* __restrict__ p, size_t n, unsigned* sink) {
+  unsigned acc = 0;
+  for (size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < n; i += static_cast<size_t>(gridDim.x) * blockDim.x) {
+    const uint4 v = __ldcs(p + i);
+    acc ^= v.x ^ v.y ^ v.z ^ v.w;
+  }
+  if (acc == 0x9e3779b9u) *sink = acc;
+}
+__global__ void stage_cg_kernel(const uint4* __restrict__ p, size_t n, unsigned* sink) {
+  unsigned acc = 0;
+  for (size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < n; i += static_cast<size_t>(gridDim.x) * blockDim.x) {
+    const uint4 v = __ldcg(p + i);
+    acc ^= v.x ^ v.y ^ v.z ^ v.w;
+  }
+  if (acc == 0x9e3779b9u) *sink = acc;
+}
+
 // A projection matrix of kPN rows by kPK codes (exponents 0..14, the NaN codes out) with F32 scales in [0.5, 2).
 __global__ void init_fp8_matrix(uint8_t* w) {
   const size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -835,6 +852,33 @@ DGPP_TEST(fp8_projection_unit_rate) {
       std::printf("   fp8 [1280 x 5120] x %2d matrices, %d slab(s), %4d blocks: %6.0f us (median of 3) = %5.1f GB/s aggregate, %5.1f GB/s an SM\n",
                   mats, slabs, blocks, ms[1] * 1e3, mb / ms[1], per_block);
     }
+  }
+  // The lead's staging as the streamer does it: the matrix read into L2 with cache-global loads by 47 blocks after a
+  // 150 MB evict-first stream, then the unit over it once. Hot means the staged lines serve the consumer.
+  {
+    uint4* flushbuf = nullptr;
+    const size_t flush_n = (150u << 20) / 16;
+    DGPP_CUDA_OK(cudaMalloc(&flushbuf, flush_n * 16));
+    DGPP_CUDA_OK(cudaMemset(flushbuf, 3, flush_n * 16));
+    unsigned* sink = nullptr;
+    DGPP_CUDA_OK(cudaMalloc(&sink, 4));
+    for (int staged = 0; staged < 3; ++staged) {
+      stream_cs_kernel<<<47, 256>>>(flushbuf, flush_n, sink);
+      DGPP_CUDA_OK(cudaDeviceSynchronize());
+      if (staged == 1) stage_cg_kernel<<<47, 256>>>(reinterpret_cast<const uint4*>(arena), kPStride / 16, sink);
+      if (staged == 2) stream_cs_kernel<<<47, 256>>>(reinterpret_cast<const uint4*>(arena), kPStride / 16, sink);
+      DGPP_CUDA_OK(cudaDeviceSynchronize());
+      DGPP_CUDA_OK(cudaEventRecord(e0));
+      proj_kernel<<<dim3(kPN / 128, 1), kMxfp4Threads, kProjSmem>>>(arena, 1, tokens, 5, x, y, 1);
+      DGPP_CUDA_OK(cudaEventRecord(e1));
+      DGPP_CUDA_OK(cudaDeviceSynchronize());
+      float ms = 0;
+      DGPP_CUDA_OK(cudaEventElapsedTime(&ms, e0, e1));
+      std::printf("   fp8 [1280 x 5120] x 1, 1 slab, 10 blocks, %s: %6.0f us = %5.1f GB/s aggregate\n",
+                  staged == 0 ? "cold after a 150 MB stream" : staged == 1 ? "staged by cache-global loads (the lead's)" : "staged by evict-first loads", ms * 1e3,
+                  (kPBytes + kPScales) / (ms * 1e6));
+    }
+    cudaFree(flushbuf); cudaFree(sink);
   }
   // The same matrix eight times, L2-hot: the unit's compute rate, at one block an SM with the one-slab slice
   // staged and at the blocks the smaller four-slab slice lets the registers and shared memory co-reside.

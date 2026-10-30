@@ -139,7 +139,7 @@ DevicePlan lower_plan(const std::vector<LayerPlan>& layers, uint32_t unit_bytes,
           pool.rows = static_cast<int32_t>(parts[0]->rows);
           pool.k = static_cast<int32_t>(parts[0]->cols);
           pool.units_per_group = (pool.rows + 127) / 128;
-          pool.grab = down ? 4 : 1;
+          pool.grab = down ? 8 : 1;
           pool.group_kind = kGroupShared;
           for (const Range* r : parts)
             if (r) dp.fixed_bytes += static_cast<double>(r->bytes_per_read()) * r->reads;
@@ -254,7 +254,7 @@ DevicePlan lower_plan(const std::vector<LayerPlan>& layers, uint32_t unit_bytes,
               pool.offsets[1] = scales[2]->offset - pool.base;
             }
             pool.units_per_group = (pool.rows + 127) / 128;
-            pool.grab = down ? 4 : 1;  // the down units are small (phase 1 measured four a grab)
+            pool.grab = down ? 8 : 1;  // the down units are small (phase 1 measured four a grab)
           }
         }
         pool.group_kind = kGroupRouted;
