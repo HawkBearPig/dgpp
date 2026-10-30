@@ -206,6 +206,10 @@ struct WorldSettings {
   int lookup_nmin = 6, lookup_nstrong = 8, lookup_agree = 2;
   int lookup_tail = 0;  // engine.lookup_tail: every rank verifies the same rows
   std::string mtp_verify = "token";  // engine.mtp_verify: every rank decides the chain by the same rule
+  std::string decode_engine = "graph";  // engine.decode_engine: every rank runs the same engine (graph | step)
+  int step_sms = 0;          // engine.step_sms: the step engine's worker SMs, the same on every rank
+  int l2_staging_mib = 8;    // engine.l2_staging_mib: the lead's L2 cap
+  int stream_governor = 0;   // engine.stream_governor: the leaders bound
   int dflash_batch_rows = 0;  // engine.dflash_batch_rows: every rank batches the same rows
   int graph_batch_min_live = 0;
   int sampling_candidates = 0;

@@ -1912,6 +1912,10 @@ int main(int argc, char** argv) {
   std::string mtp_draft = "auto";  // engine.mtp_draft: auto | sampled | greedy
   double mtp_draft_temperature = 1.0;  // engine.mtp_draft_temperature: the drawn drafts' temperature / the request's
   std::string mtp_verify = "token";  // engine.mtp_verify: token | block
+  std::string decode_engine = "graph";  // engine.decode_engine: graph | step (MOONSHOT-1.md §1.1)
+  int step_sms = 0;         // engine.step_sms: the step engine's worker SMs (0: every SM but the chain's)
+  int l2_staging_mib = 8;   // engine.l2_staging_mib: the step engine's lead cap
+  int stream_governor = 0;  // engine.stream_governor: the step engine's leaders bound (0: unbounded)
   int dflash_batch_rows = 0;  // engine.dflash_batch_rows: the drafter's batched verify rows budget (0: whole blocks)
   bool lookup_draft = false;  // engine.lookup_draft: fuse strong prompt-history matches into MTP drafts
   int lookup_nmin = 6, lookup_nstrong = 8, lookup_agree = 2;
@@ -2057,6 +2061,10 @@ int main(int argc, char** argv) {
     mtp_draft = e.mtp_draft;
     mtp_draft_temperature = e.mtp_draft_temperature;
     mtp_verify = e.mtp_verify;
+    decode_engine = e.decode_engine;
+    step_sms = e.step_sms;
+    l2_staging_mib = e.l2_staging_mib;
+    stream_governor = e.stream_governor;
     dflash_batch_rows = e.dflash_batch_rows;
     lookup_draft = e.lookup_draft;
     lookup_nmin = e.lookup_nmin;
@@ -2238,6 +2246,10 @@ int main(int argc, char** argv) {
     else if (a == "--mtp-draft") mtp_draft = next();
     else if (a == "--mtp-draft-temperature") mtp_draft_temperature = std::stod(next());
     else if (a == "--mtp-verify") mtp_verify = next();
+    else if (a == "--decode-engine") decode_engine = next();
+    else if (a == "--step-sms") step_sms = std::stoi(next());
+    else if (a == "--l2-staging-mib") l2_staging_mib = std::stoi(next());
+    else if (a == "--stream-governor") stream_governor = std::stoi(next());
     else if (a == "--dflash-batch-rows") dflash_batch_rows = std::stoi(next());
     else if (a == "--lookup-draft") {
       lookup_draft = true;
@@ -2451,7 +2463,7 @@ int main(int argc, char** argv) {
         "fp8head={} dh={} dhb={} mtph={} attw={} itopk={} ctb={} cbs={} pf={} pfd={} pfo={} pfw={} dcw={} ctr={} pdl={} dlp={} dkv={} "
         "emsh={} maxtok={} queue={} "
         "eos={} graph={} compact={} mtp={} mtpd={} mss={} msrow={} msbase={} mslam={} msmin={} msopt={} "
-        "msad={} msss={} mdr={} mdt={} mvf={} dbr={} "
+        "msad={} msss={} mdr={} mdt={} mvf={} deng={} ssm={} l2s={} sgov={} dbr={} "
         "batchmin={} cand={} "
         "pcgib={} adm={} win={} pfbudget={} pfidle={} gapms={} ttftms={} pfhr={} pfgrow={} pfrec={} pfstart={} pfifloor={} pfearly={} pmin={} phead={} pace={} inflight={} "
         "reasoning_in_content={} "
@@ -2467,7 +2479,7 @@ int main(int argc, char** argv) {
         compact_batches ? 1 : 0, mtp ? 1 : 0, mtp_depth, mtp_schedule ? 1 : 0, mtp_schedule_row_ms,
         mtp_schedule_base_ms, mtp_schedule_lambda, mtp_schedule_min_depth, mtp_schedule_options,
         mtp_schedule_adapt ? 1 : 0, mtp_schedule_sampled_scale, mtp_draft, mtp_draft_temperature,
-        mtp_verify, dflash_batch_rows, effective_batch_min_live,
+        mtp_verify, decode_engine, step_sms, l2_staging_mib, stream_governor, dflash_batch_rows, effective_batch_min_live,
         sampling_candidates, prefix_cache_gib,
         admission_mode, admission_window, prefill_budget_tokens, prefill_idle_budget_tokens,
         decode_gap_target_ms, first_token_target_ms,
@@ -2603,6 +2615,10 @@ int main(int argc, char** argv) {
         ws.mtp_draft = mtp_draft;
         ws.mtp_draft_temperature = mtp_draft_temperature;
         ws.mtp_verify = mtp_verify;
+        ws.decode_engine = decode_engine;
+        ws.step_sms = step_sms;
+        ws.l2_staging_mib = l2_staging_mib;
+        ws.stream_governor = stream_governor;
         ws.dflash_batch_rows = dflash_batch_rows;
         ws.lookup_draft = lookup_draft;
         ws.lookup_nmin = lookup_nmin;
@@ -2725,6 +2741,10 @@ int main(int argc, char** argv) {
         mtp_draft = ws.mtp_draft;
         mtp_draft_temperature = ws.mtp_draft_temperature;
         mtp_verify = ws.mtp_verify;
+        decode_engine = ws.decode_engine;
+        step_sms = ws.step_sms;
+        l2_staging_mib = ws.l2_staging_mib;
+        stream_governor = ws.stream_governor;
         dflash_batch_rows = ws.dflash_batch_rows;
         lookup_draft = ws.lookup_draft;
         lookup_nmin = ws.lookup_nmin;
@@ -2867,6 +2887,23 @@ int main(int argc, char** argv) {
   }
   if (mtp_verify != "token" && mtp_verify != "block") {
     DGPP_LOG_ERROR("--mtp-verify must be token or block, got '{}'", mtp_verify);
+    return 2;
+  }
+  if (decode_engine != "graph" && decode_engine != "step") {
+    DGPP_LOG_ERROR("--decode-engine must be graph or step, got '{}'", decode_engine);
+    return 2;
+  }
+  if (step_sms < 0 || step_sms > 256 || l2_staging_mib < 0 || l2_staging_mib > 24 || stream_governor < 0 ||
+      stream_governor > 256) {
+    DGPP_LOG_ERROR("--step-sms must be in [0, 256], --l2-staging-mib in [0, 24] and --stream-governor in [0, 256], got {} {} {}",
+                   step_sms, l2_staging_mib, stream_governor);
+    return 2;
+  }
+  if (decode_engine == "step") {
+    // The persistent-step engine (MOONSHOT-1.md) ships behind this key; no
+    // family port exists yet, so the key is refused here rather than
+    // falling back to the graph engines silently.
+    DGPP_LOG_ERROR("engine.decode_engine step: the step engine has no family port yet; set graph");
     return 2;
   }
   if (!(mtp_draft_temperature > 0.0 && mtp_draft_temperature <= 4.0)) {

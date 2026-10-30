@@ -49,6 +49,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <cuda_runtime.h>
@@ -164,6 +165,12 @@ class Dsv41Model : public SessionModel<Dsv41Model> {
   // form without a reducer. Every model built from here on takes the default.
   static constexpr int kFoldOverlapMinRows = 512;
   static void set_default_prefill_fold_overlap(bool on) { s_default_prefill_fold_overlap = on; }
+  // The resident layout the next models build their stream with (the step
+  // engine's arena, loaders/resident_stream.hpp ResidentLayout; MOONSHOT-1.md
+  // 2.4): the engine selects it by engine.decode_engine before the model is
+  // built. An empty layout is the loader's grant order, today's behaviour.
+  static void set_default_resident_layout(ResidentLayout layout) { s_default_resident_layout = std::move(layout); }
+  static const ResidentLayout& default_resident_layout() { return s_default_resident_layout; }
   void set_prefill_fold_overlap(bool on, int min_rows = kFoldOverlapMinRows, bool without_reducer = false);
   bool prefill_fold_overlap() const { return fold_overlap_; }
   uint64_t debug_overlap_async_folds() const { return overlap_async_folds_; }
@@ -354,6 +361,7 @@ class Dsv41Model : public SessionModel<Dsv41Model> {
   static constexpr int kBf12ExpandSlots = 1;
   Bf12Companions bf12_;
   static inline bool s_default_prefill_fold_overlap = true;
+  static inline ResidentLayout s_default_resident_layout{};
   bool fold_overlap_ = s_default_prefill_fold_overlap;
   int fold_overlap_min_rows_ = kFoldOverlapMinRows;
   bool fold_overlap_without_reducer_ = false;

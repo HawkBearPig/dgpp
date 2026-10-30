@@ -165,7 +165,7 @@ DGPP_TEST(cluster_config_parses_fills_defaults_and_derives_the_world) {
                "prefill_budget_tokens": 256, "prefill_idle_budget_tokens": 2048,
                "prefill_early_admission": true,
                "prefix_min_tokens": 512, "prefix_head_snapshots": false, "mtp_draft": "greedy",
-               "mtp_schedule_sampled_scale": 0.5, "mtp_draft_temperature": 0.7, "mtp_verify": "block",
+               "mtp_schedule_sampled_scale": 0.5, "mtp_draft_temperature": 0.7, "mtp_verify": "block", "decode_engine": "step", "step_sms": 47, "l2_staging_mib": 12, "stream_governor": 8,
                "prefill_dense": "streaming", "prefill_fold_overlap": false, "decode_pdl": false, "prefill_window": "scalar", "decode_window": "scalar", "collective_transport": "send",
                "dflash_batch_rows": 32, "dflash_weights": "fp8", "prefill_group": false,
                "l2_prefetch": false, "l2_prefetch_form": "touch", "l2_prefetch_full_form": "48x4", "l2_prefetch_window_mib": 8,
@@ -191,7 +191,8 @@ DGPP_TEST(cluster_config_parses_fills_defaults_and_derives_the_world) {
               c.engine.prefill_dense == "streaming" && !c.engine.prefill_fold_overlap && !c.engine.decode_pdl && c.engine.prefill_window == "scalar" &&
               c.engine.decode_window == "scalar" &&
               c.engine.collective_transport == "send" &&
-              c.engine.mtp_draft_temperature == 0.7 && c.engine.mtp_verify == "block" &&
+              c.engine.mtp_draft_temperature == 0.7 && c.engine.mtp_verify == "block" && c.engine.decode_engine == "step" && c.engine.step_sms == 47 &&
+              c.engine.l2_staging_mib == 12 && c.engine.stream_governor == 8 &&
               c.engine.dflash_batch_rows == 32 && c.engine.dflash_weights == "fp8" && !c.engine.prefill_group &&
               !c.engine.l2_prefetch && c.engine.l2_prefetch_form == "touch" && c.engine.l2_prefetch_full_form == "48x4" &&
               c.engine.l2_prefetch_window_mib == 8 &&
@@ -214,6 +215,13 @@ DGPP_TEST(cluster_config_parses_fills_defaults_and_derives_the_world) {
           "the drafter's batches verify whole blocks by default");
   require(dgpp::serve::parse_cluster_config(R"({"model":"m","nodes":["h"]})", "t").engine.mtp_verify == "token",
           "the sampled chain's rule defaults to the token test");
+  require(dgpp::serve::parse_cluster_config(R"({"model":"m","nodes":["h"]})", "t").engine.decode_engine == "graph",
+          "a template without engine.decode_engine runs the graph engines");
+  {
+    const auto d = dgpp::serve::parse_cluster_config(R"({"model":"m","nodes":["h"]})", "t");
+    require(d.engine.step_sms == 0 && d.engine.l2_staging_mib == 8 && d.engine.stream_governor == 0,
+            "the step engine's streamer keys default to every SM, an 8 MiB lead and no governor");
+  }
   require(dgpp::serve::parse_cluster_config(R"({"model":"m","nodes":["h"]})", "t").engine.mtp_draft_temperature == 1.0,
           "the drawn drafts' temperature defaults to the request's");
   require(dgpp::serve::parse_cluster_config(R"({"model":"m","nodes":["h"]})", "t").engine.mtp_schedule_sampled_scale == 0.93,
@@ -509,6 +517,14 @@ DGPP_TEST(cluster_config_refusesUnknownKeysAndBadValuesByName) {
        "unknown key 'engine.max_concurency'"},
       {R"({"model":"m","nodes":["h"],"engine":{"max_concurrency":"2"}})",
        "'engine.max_concurrency' must be an integer"},
+      {R"({"model":"m","nodes":["h"],"engine":{"decode_engine":"fast"}})",
+       "'engine.decode_engine' must be graph or step"},
+      {R"({"model":"m","nodes":["h"],"engine":{"decode_engine":1}})",
+       "'engine.decode_engine' must be a string"},
+      {R"({"model":"m","nodes":["h"],"engine":{"l2_staging_mib":25}})",
+       "'engine.l2_staging_mib' must be in [0, 24]"},
+      {R"({"model":"m","nodes":["h"],"engine":{"step_sms":-1}})",
+       "'engine.step_sms' must be in [0, 256]"},
       {R"({"model":"m","nodes":["h"],"engine":{"max_concurrency":1.5}})",
        "'engine.max_concurrency' must be an integer"},
       {R"({"model":"m","nodes":["h"],"engine":{"max_concurrency":0}})",

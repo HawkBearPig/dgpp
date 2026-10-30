@@ -392,6 +392,14 @@ ClusterConfig parse_cluster_config(const std::string& json, const std::string& w
         else if (p.key == "max_connections") e.max_connections = static_cast<int>(integer(x, ek, what, 1, 1 << 20));
         else if (p.key == "no_eos") e.no_eos = boolean(x, ek, what);
         else if (p.key == "decode_graph") e.decode_graph = boolean(x, ek, what);
+        else if (p.key == "decode_engine") {
+          e.decode_engine = text(x, ek, what);
+          if (e.decode_engine != "graph" && e.decode_engine != "step")
+            fail(what, "'" + ek + "' must be graph or step");
+        }
+        else if (p.key == "step_sms") e.step_sms = static_cast<int>(integer(x, ek, what, 0, 256));
+        else if (p.key == "l2_staging_mib") e.l2_staging_mib = static_cast<int>(integer(x, ek, what, 0, 24));
+        else if (p.key == "stream_governor") e.stream_governor = static_cast<int>(integer(x, ek, what, 0, 256));
         else if (p.key == "mtp") e.mtp = boolean(x, ek, what);
         else if (p.key == "dflash_model") e.dflash_model = text(x, ek, what);
         else if (p.key == "dflash_weights") {

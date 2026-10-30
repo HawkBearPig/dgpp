@@ -470,6 +470,31 @@ target_include_directories(dgpp_models_dsv41_layers PUBLIC ${CMAKE_CURRENT_SOURC
 target_link_libraries(dgpp_models_dsv41_layers PUBLIC dgpp_models_dsv41_loader dgpp_models_csa2 dgpp_models_moe dgpp_models_glm dgpp_kernels CUDA::cudart)
 dgpp_set_common(dgpp_models_dsv41_layers)
 
+# The step engine (MOONSHOT-1.md, engine.decode_engine = step): the stream
+# plan with its totals and checks (src/step), and each family's plan
+# generator over its loader's layout pass. Host code, no device.
+add_library(dgpp_step STATIC
+  src/step/plan.cpp)
+target_include_directories(dgpp_step PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+dgpp_set_common(dgpp_step)
+
+add_library(dgpp_step_dsv41 STATIC
+  src/step/dsv41/plan.cpp
+  src/step/dsv41/arena.cpp)
+target_include_directories(dgpp_step_dsv41 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(dgpp_step_dsv41 PUBLIC dgpp_step dgpp_models_dsv41_loader dgpp_models_csa2)
+dgpp_set_common(dgpp_step_dsv41)
+
+# The streamer: the plan lowered to device tables, the persistent kernel
+# (chain block, workers, lead, governor, deadlines) and its host side.
+add_library(dgpp_step_stream STATIC
+  src/step/device_plan.cpp
+  src/step/streamer.cpp
+  src/kernels/step/stream.cu)
+target_include_directories(dgpp_step_stream PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(dgpp_step_stream PUBLIC dgpp_step CUDA::cudart)
+dgpp_set_common(dgpp_step_stream)
+
 # DeepSeek-V4-Flash (the 0731 release, 2026-10-01): the host-side model
 # description (config, binding).
 add_library(dgpp_models_dsv4 STATIC
@@ -1225,6 +1250,35 @@ add_test(NAME fabric_serve_test COMMAND fabric_serve_test)
 add_test(NAME fabric_serve_test_wake COMMAND fabric_serve_test)
 set_tests_properties(fabric_serve_test_wake PROPERTIES ENVIRONMENT "DGPP_TEST_STREAM_WAKE=1")
 
+# The step engine's plan gate (MOONSHOT-1.md section 5, phase 2): the
+# DeepSeek-V4.1 plan from the config alone tiles every layer's resident
+# span and matches the hand count from the checkpoint's own headers
+# (host-only, no model, always runs).
+# The streamer's rate gate (section 5, phase 2): the DeepSeek-V4.1 plan
+# under the arena, streamed from a device arena of its layers' sizes with
+# the design chain's latencies interleaved, at 95 percent of the ceiling;
+# the deadline and poison exits. Needs the GPU and about 4 GB free.
+add_executable(step_stream_test tests/cuda/step_stream_test.cpp tests/cuda/step_reference_kernels.cu)
+target_include_directories(step_stream_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
+target_link_libraries(step_stream_test PRIVATE dgpp_step_stream dgpp_step_dsv41 CUDA::cudart Threads::Threads)
+dgpp_set_common(step_stream_test)
+add_test(NAME step_stream_test COMMAND step_stream_test)
+
+# The MXFP4 expert consumer's gate (phase 3): exact to two bf16 ulps
+# against an fp32 reference over tile-major bytes, bitwise across launches
+# and group sizes, the plain grids' rate reported. GPU, about 1 GB free.
+add_executable(step_consumer_test tests/cuda/step_consumer_test.cu)
+target_include_directories(step_consumer_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(step_consumer_test PRIVATE CUDA::cudart)
+dgpp_set_common(step_consumer_test)
+add_test(NAME step_consumer_test COMMAND step_consumer_test)
+
+add_executable(step_plan_test tests/host/step_plan_test.cpp)
+target_include_directories(step_plan_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit)
+target_link_libraries(step_plan_test PRIVATE dgpp_step_dsv41)
+dgpp_set_common(step_plan_test)
+add_test(NAME step_plan_test COMMAND step_plan_test)
+
 # M6 Stage 2b: the scheduler policy gate (host, no model, no skip path —
 # the FakeEngine replaces the engine, so the policy is pinned everywhere
 # CI runs).
@@ -1417,7 +1471,7 @@ add_test(NAME dsv41_engram_layer_test_exl3 COMMAND ${DSV41_EXL3_ENV} $<TARGET_FI
 
 add_executable(dsv41_model_test tests/cuda/dsv41_model_test.cpp)
 target_include_directories(dsv41_model_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
-target_link_libraries(dsv41_model_test PRIVATE dgpp_models_dsv41_layers dgpp_bus dgpp_loaders dgpp_sched dgpp_text CUDA::cudart Threads::Threads)
+target_link_libraries(dsv41_model_test PRIVATE dgpp_models_dsv41_layers dgpp_step_dsv41 dgpp_bus dgpp_loaders dgpp_sched dgpp_text CUDA::cudart Threads::Threads)
 dgpp_set_common(dsv41_model_test)
 add_test(NAME dsv41_model_test COMMAND dsv41_model_test)
 add_test(NAME dsv41_model_test_exl3 COMMAND ${DSV41_EXL3_ENV} $<TARGET_FILE:dsv41_model_test>
@@ -2116,7 +2170,7 @@ dgpp_set_common(glm_dsa_load_check)
 # byte-exact, the globals, the Engram table mappings, the image round trip).
 add_executable(dsv41_loader_test tests/cuda/dsv41_loader_test.cpp)
 target_include_directories(dsv41_loader_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
-target_link_libraries(dsv41_loader_test PRIVATE dgpp_models_dsv41_loader CUDA::cudart Threads::Threads)
+target_link_libraries(dsv41_loader_test PRIVATE dgpp_models_dsv41_loader dgpp_step_dsv41 CUDA::cudart Threads::Threads)
 dgpp_set_common(dsv41_loader_test)
 add_test(NAME dsv41_loader_test COMMAND dsv41_loader_test)
 
