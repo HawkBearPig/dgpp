@@ -10,7 +10,33 @@ namespace dgpp::step {
 namespace {
 
 constexpr uint64_t kGrantAlign = 256;
+constexpr int kStepRows = 32;  // kernels/step/stream.hpp kStepMaxRows: the projection buffer's rows
 uint64_t align_grant(uint64_t b) { return (b + kGrantAlign - 1) / kGrantAlign * kGrantAlign; }
+
+// A projection's units: 128 output rows each (eight warps on 16-row tiles;
+// 64-row units measured slower, each unit's staging and its halved loads in
+// flight costing more than the finer tail saved) over the inner width in as
+// many slabs as leave a slab of at least 1280 codes dividing the windows
+// evenly, so a unit is about 160 KB and the phase's tail a fraction of its
+// time. Slabbed pools reduce their fp32 partials in slab order afterwards.
+constexpr int32_t kProjectionUnitRows = 128;
+int32_t projection_slabs(int k) {
+  int32_t best = 1;
+  for (int d = 2; d <= 8; ++d)
+    if ((k / 256) % d == 0 && k / d >= 1280) best = d;
+  return best;
+}
+
+int add_pool(DevicePlan& dp, DevPhase& d, const DevPool& pool) {
+  if (d.n_pools >= kMaxPhasePools) throw std::logic_error("lower_plan: a phase has more pools than the kernel holds");
+  const int index = static_cast<int>(dp.pools.size());
+  dp.pools.push_back(pool);
+  d.pools[d.n_pools] = index;
+  if (pool.group_kind == kGroupRouted) d.routed = static_cast<int8_t>(d.n_pools);
+  ++d.n_pools;
+  dp.max_k = std::max(dp.max_k, pool.k);
+  return index;
+}
 
 }  // namespace
 
@@ -42,10 +68,46 @@ DevicePlan lower_plan(const std::vector<LayerPlan>& layers, uint32_t unit_bytes,
       for (const Range& r : lp.ranges)
         if (r.phase == static_cast<int>(ph) && r.source == Source::Host && r.reads > 0) d.waits_host = 1;
       if (consumers && phase.name == "accumulate") { d.accumulate = 1; d.kind = 1; }
-      // The shared expert's fp8 pair or down as a consumer pool of one group:
-      // its ranges leave the fixed segments.
+      // The shared expert's fp8 pair or down and the fp8 projections as
+      // consumer pools of one group: their ranges leave the fixed segments
+      // and become lead-only segments.
       std::vector<const Range*> shared_pool;
+      uint32_t phase_part_elems = 0;
       if (consumers) {
+        for (size_t ri = 0; ri < lp.ranges.size(); ++ri) {
+          const Range& r = lp.ranges[ri];
+          if (r.phase != static_cast<int>(ph) || r.dep != Dependency::Fixed || r.source != Source::Resident || r.reads == 0) continue;
+          if (r.format != Format::Fp8E4m3 || (r.consumer != Consumer::Projection && r.consumer != Consumer::Indexer)) continue;
+          const Range* scales = nullptr;
+          for (const Range& c : lp.ranges)
+            if (c.scale_of == static_cast<int>(ri)) scales = &c;
+          if (!scales) continue;
+          DevPool pool;
+          pool.kind = kPoolFp8Matrix;
+          pool.group_kind = kGroupTokens;
+          pool.groups = 1;
+          pool.stride = 0;
+          pool.base = std::min(r.offset, scales->offset);
+          pool.bytes = std::max(align_grant(r.offset + r.bytes), align_grant(scales->offset + scales->bytes)) - pool.base;
+          pool.offsets[0] = r.offset - pool.base;
+          pool.offsets[1] = scales->offset - pool.base;
+          pool.rows = static_cast<int32_t>(r.rows);
+          pool.k = static_cast<int32_t>(r.cols);
+          pool.slabs = projection_slabs(pool.k);
+          pool.unit_rows = kProjectionUnitRows;
+          pool.units_per_group = ((pool.rows + pool.unit_rows - 1) / pool.unit_rows) * pool.slabs;  // the reduce units follow at run time
+          pool.grab = 1;
+          pool.out_offset = dp.proj_elems;
+          dp.proj_elems += static_cast<uint32_t>(pool.rows) * kStepRows;
+          if (pool.slabs > 1) {
+            pool.part_offset = phase_part_elems;
+            phase_part_elems += static_cast<uint32_t>(pool.slabs) * static_cast<uint32_t>(pool.rows) * kStepRows;
+          }
+          dp.fixed_bytes += static_cast<double>(r.bytes_per_read()) * r.reads + static_cast<double>(scales->bytes_per_read()) * scales->reads;
+          add_pool(dp, d, pool);
+          shared_pool.push_back(&r);
+          shared_pool.push_back(scales);
+        }
         const Range* payload[3] = {nullptr, nullptr, nullptr};
         const Range* scales[3] = {nullptr, nullptr, nullptr};
         for (const Range* r : by_offset) {
@@ -73,9 +135,10 @@ DevicePlan lower_plan(const std::vector<LayerPlan>& layers, uint32_t unit_bytes,
           pool.k = static_cast<int32_t>(parts[0]->cols);
           pool.units_per_group = (pool.rows + 127) / 128;
           pool.grab = down ? 4 : 1;
-          for (const Range* r : shared_pool) dp.fixed_bytes += static_cast<double>(r->bytes_per_read()) * r->reads;
-          d.pool2 = static_cast<int32_t>(dp.pools.size());
-          dp.pools.push_back(pool);
+          pool.group_kind = kGroupShared;
+          for (const Range* r : parts)
+            if (r) dp.fixed_bytes += static_cast<double>(r->bytes_per_read()) * r->reads;
+          add_pool(dp, d, pool);
         }
       }
       // Fixed-class ranges of this phase, coalesced where adjacent.
@@ -131,6 +194,7 @@ DevicePlan lower_plan(const std::vector<LayerPlan>& layers, uint32_t unit_bytes,
       d.lead_seg_count = static_cast<int32_t>(dp.segments.size()) - d.lead_seg_begin;
       d.lead_units = lead_units;
       lead += lead_units;
+      dp.part_elems = std::max(dp.part_elems, phase_part_elems);
       // The router-bound pool: every group's ranges at one stride.
       std::vector<const Range*> routed;
       for (const Range* r : by_offset)
@@ -188,22 +252,34 @@ DevicePlan lower_plan(const std::vector<LayerPlan>& layers, uint32_t unit_bytes,
             pool.grab = down ? 4 : 1;  // the down units are small (phase 1 measured four a grab)
           }
         }
-        d.pool = static_cast<int32_t>(dp.pools.size());
-        dp.pools.push_back(pool);
+        pool.group_kind = kGroupRouted;
+        add_pool(dp, d, pool);
       }
       dp.phases.push_back(d);
     }
     dp.layers.push_back(dl);
   }
   dp.lead_units = lead;
-  // The expert phases: a gate and up pool followed by a down pool merge.
+  // The expert phases: a gate and up pool followed by a down pool merge, and
+  // each down pool names the gate and up pool of its group kind as partner.
   if (consumers)
     for (size_t i = 0; i + 1 < dp.phases.size(); ++i) {
       DevPhase& a = dp.phases[i];
-      const DevPhase& b = dp.phases[i + 1];
-      if (a.pool >= 0 && b.pool >= 0 && a.layer == b.layer && pool_is_gate_up(dp.pools[static_cast<size_t>(a.pool)].kind) &&
-          pool_is_down(dp.pools[static_cast<size_t>(b.pool)].kind))
-        a.merged_next = 1;
+      DevPhase& b = dp.phases[i + 1];
+      if (a.routed < 0 || b.routed < 0 || a.layer != b.layer) continue;
+      if (!pool_is_gate_up(dp.pools[static_cast<size_t>(a.pools[a.routed])].kind) ||
+          !pool_is_down(dp.pools[static_cast<size_t>(b.pools[b.routed])].kind))
+        continue;
+      a.merged_next = 1;
+      for (int bi = 0; bi < b.n_pools; ++bi) {
+        DevPool& down = dp.pools[static_cast<size_t>(b.pools[bi])];
+        if (!pool_is_down(down.kind)) continue;
+        for (int ai = 0; ai < a.n_pools; ++ai) {
+          const DevPool& gate = dp.pools[static_cast<size_t>(a.pools[ai])];
+          if (pool_is_gate_up(gate.kind) && gate.group_kind == down.group_kind) down.partner = a.pools[ai];
+        }
+        if (down.partner < 0) throw std::logic_error("lower_plan: a down pool without its gate and up pool");
+      }
     }
   return dp;
 }

@@ -149,7 +149,9 @@ Every spin in the kernel has a deadline and leaves through one path that
 writes a status word naming the phase, and the host's poison word ends a
 running kernel from outside. The step engine adapter will read
 `engine.step_sms` as the worker count, `engine.l2_staging_mib` as the lead's
-cap and `engine.stream_governor` as the leaders bound.
+cap and `engine.stream_governor` as the leaders bound. With synthetic
+consumers the lead's cap measured best at 8 MB; with every consumer real,
+whose units read what the lead staged, 12 to 16 MB.
 
 `step_stream_test` is the gate, on the GPU with about 4 GB free. The first
 eight main layers of DeepSeek-V4.1 at world 4, five rows and a 64 KB unit,
@@ -262,4 +264,14 @@ partials take the shared slot of the accumulation. `step_consumer_test`
 checks the form against the reference as plain grids, where it streams
 the pair at 229 GB/s and the down at 216 over 60 cold pairs, and
 `step_stream_test` checks the shared expert's outputs inside the kernel.
+
+The same form with one matrix (`fp8_matrix_unit`) computes the layer's fp8
+projections for every token, eight DeepSeek-V4.1 shapes compiled in, as
+128-row units over slabs of the inner width whose fp32 partials a reduce
+sums in slab order. Inside the streamer every projection output of a layer
+is exact or inside the envelope against the reference. With every weight
+of the layer computed and the lead at 16 MB, the layers run at 86 to 91
+percent of their byte floor; the fixed phases' unit quantization is the
+residue, since a unit streams at the ceiling's share of one SM and a phase
+of a few matrices is one unit's time long.
 

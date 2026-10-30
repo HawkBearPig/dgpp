@@ -139,7 +139,7 @@ StreamerConfig design_config() {
   cfg.workers = std::min(47, step_stream_capacity() - 1);
   cfg.steps = 3;
   cfg.lookahead_layers = 2;
-  cfg.lead_cap_bytes = uint64_t{8} << 20;
+  cfg.lead_cap_bytes = uint64_t{16} << 20;  // the sweep's optimum with every consumer real (8 MB with synthetic ones)
   cfg.max_leaders = 0;
   cfg.deadline_s = 5.0;
   cfg.rows = 5;
@@ -165,7 +165,7 @@ DGPP_TEST(step_stream_rate_at_the_design_chain) {
   const StreamerConfig cfg = design_config();
   require(cfg.workers >= 16, "fewer than 16 worker blocks can be co-resident");
   const StreamReport r = s.run(cfg);
-  print_report("design chain, lead 8 MB", r, 3);
+  print_report("design chain, lead 16 MB", r, 3);
   require(r.status == kStepOk, "the kernel ended on " + r.status_text);
   // Every stream phase of the last pass completed its units.
   for (const PhaseTiming& t : r.phases)
@@ -364,16 +364,23 @@ void consumers_match_the_reference(bool tile_major) {
   const DevPool* down = nullptr;
   const DevPool* sh_gate_up = nullptr;
   const DevPool* sh_down = nullptr;
+  std::vector<const DevPool*> projections;
   const DevLayer& dl = rig->dp.layers[static_cast<size_t>(L)];
   for (int P = dl.phase_begin; P < dl.phase_begin + dl.phase_count; ++P) {
     const DevPhase& ph = rig->dp.phases[static_cast<size_t>(P)];
-    if (ph.pool >= 0 && pool_is_gate_up(rig->dp.pools[static_cast<size_t>(ph.pool)].kind)) gate_up = &rig->dp.pools[static_cast<size_t>(ph.pool)];
-    if (ph.pool >= 0 && pool_is_down(rig->dp.pools[static_cast<size_t>(ph.pool)].kind)) down = &rig->dp.pools[static_cast<size_t>(ph.pool)];
-    if (ph.pool2 >= 0 && rig->dp.pools[static_cast<size_t>(ph.pool2)].kind == kPoolFp8GateUp) sh_gate_up = &rig->dp.pools[static_cast<size_t>(ph.pool2)];
-    if (ph.pool2 >= 0 && rig->dp.pools[static_cast<size_t>(ph.pool2)].kind == kPoolFp8Down) sh_down = &rig->dp.pools[static_cast<size_t>(ph.pool2)];
+    for (int i = 0; i < ph.n_pools; ++i) {
+      const DevPool& pool = rig->dp.pools[static_cast<size_t>(ph.pools[i])];
+      if (pool.group_kind == kGroupRouted && pool_is_gate_up(pool.kind)) gate_up = &pool;
+      if (pool.group_kind == kGroupRouted && pool_is_down(pool.kind)) down = &pool;
+      if (pool.kind == kPoolFp8GateUp) sh_gate_up = &pool;
+      if (pool.kind == kPoolFp8Down) sh_down = &pool;
+      if (pool.kind == kPoolFp8Matrix) projections.push_back(&pool);
+    }
   }
   require(gate_up && down, "the layer has a gate_up and a down consumer pool");
   require(sh_gate_up && sh_down, "the layer has the shared expert's fp8 pools");
+  require(!projections.empty(), "the layer has fp8 projection pools");
+  require(s.x_stride() == H, "the expert references read x at the hidden width, which this rig's buffer uses");
   const size_t slots = static_cast<size_t>(cfg.rows) * spt;
   const size_t act_n = slots * I, out_n = slots * H;
   std::vector<uint16_t> act(act_n);
@@ -477,6 +484,42 @@ void consumers_match_the_reference(bool tile_major) {
   require(bad == 0, "gate and up outputs beyond the reference's envelope inside the stream");
   require(out_bad == 0, "down partials beyond the fp32 bound inside the stream");
   require(y_bad == 0, "the accumulated output is not the ordered sum of the partials");
+  // The projections: every token through each fp8 matrix of the layer.
+  size_t proj_exact = 0, proj_ok = 0, proj_bad = 0, proj_n = 0;
+  for (const DevPool* pool : projections) {
+    const size_t elems = static_cast<size_t>(cfg.rows) * pool->rows;
+    std::vector<uint16_t> got(elems);
+    DGPP_CUDA_OK(cudaMemcpy(got.data(), s.proj() + pool->out_offset, elems * 2, cudaMemcpyDeviceToHost));
+    uint16_t* y_ref = nullptr;
+    float *yf = nullptr, *ymag = nullptr;
+    DGPP_CUDA_OK(cudaMalloc(&y_ref, elems * 2));
+    DGPP_CUDA_OK(cudaMalloc(&yf, elems * 4));
+    DGPP_CUDA_OK(cudaMalloc(&ymag, elems * 4));
+    Mxfp4Group grp;
+    grp.slots = ctl->token_slots;
+    grp.tokens = ctl->token_slots;
+    grp.count = cfg.rows;
+    const uint8_t* b = rig->bases[static_cast<size_t>(L)] + pool->base;
+    step_ref::launch_fp8_matrix(b + pool->offsets[0], reinterpret_cast<const float*>(b + pool->offsets[1]), grp, s.x(), s.x_stride(), pool->k,
+                                pool->rows, 32, y_ref, yf, ymag, nullptr);
+    DGPP_CUDA_OK(cudaDeviceSynchronize());
+    std::vector<uint16_t> ref(elems);
+    std::vector<float> exact_f(elems), mag_f(elems);
+    DGPP_CUDA_OK(cudaMemcpy(ref.data(), y_ref, elems * 2, cudaMemcpyDeviceToHost));
+    DGPP_CUDA_OK(cudaMemcpy(exact_f.data(), yf, elems * 4, cudaMemcpyDeviceToHost));
+    DGPP_CUDA_OK(cudaMemcpy(mag_f.data(), ymag, elems * 4, cudaMemcpyDeviceToHost));
+    cudaFree(y_ref); cudaFree(yf); cudaFree(ymag);
+    size_t pb = 0;
+    for (size_t i = 0; i < elems; ++i) {
+      ++proj_n;
+      if (got[i] == ref[i]) ++proj_exact;
+      else if (step_ref::value_ok(got[i], exact_f[i], mag_f[i])) ++proj_ok;
+      else { ++proj_bad; ++pb; }
+    }
+    std::printf("      projection [%d, %d]: %zu outputs, %zu beyond\n", pool->rows, pool->k, elems, pb);
+  }
+  std::printf("   projections of layer %d: %zu exact, %zu within the envelope, %zu beyond of %zu\n", L, proj_exact, proj_ok, proj_bad, proj_n);
+  require(proj_bad == 0, "projection outputs beyond the reference's envelope inside the stream");
 }
 
 DGPP_TEST(step_consumers_in_the_stream_match_the_reference) {
@@ -492,7 +535,7 @@ double consumers_rate(bool tile_major) {
   cfg.rows = 5;
   cfg.top_k = 6;
   const StreamReport r = s.run(cfg);
-  print_report(tile_major ? "tile-major experts, design chain, lead 8 MB" : "row-major experts, design chain, lead 8 MB", r, 3);
+  print_report(tile_major ? "tile-major experts, design chain, lead 16 MB" : "row-major experts, design chain, lead 16 MB", r, 3);
   require(r.status == kStepOk, "the kernel ended on " + r.status_text);
   std::vector<double> pct;
   for (size_t l = 0; l < r.layer_us.size(); ++l) {
@@ -512,6 +555,33 @@ DGPP_TEST(step_consumers_rate_at_the_design_chain) {
   const double tile = consumers_rate(/*tile_major=*/true);
   require(tile >= 85.0, "the tile-major consumers' layers stream under 85 percent of the ceiling");
   require(row >= 80.0, "the row-major consumers' layers stream under 80 percent of the ceiling");
+}
+
+DGPP_TEST(step_consumers_lead_sweep) {
+  // The lead's cap against the consumers' own L2 use, with every consumer real (report only).
+  auto rig = make_rig(kLayers, /*consumers=*/true, /*tile_major=*/true);
+  Streamer s(rig->dp, rig->bases, rig->plans);
+  for (const int mib : {4, 8, 12, 16, 20}) {
+    StreamerConfig cfg = design_config();
+    cfg.steps = 3;
+    cfg.rows = 5;
+    cfg.top_k = 6;
+    cfg.lead_cap_bytes = static_cast<uint64_t>(mib) << 20;
+    const StreamReport r = s.run(cfg);
+    require(r.status == kStepOk, "the kernel ended on " + r.status_text);
+    std::vector<double> pct;
+    for (size_t l = 0; l < r.layer_us.size(); ++l) pct.push_back(100.0 * (r.layer_bytes[l] / kCeilingGBs * 1e-3) / r.layer_us[l]);
+    std::sort(pct.begin(), pct.end());
+    double qkv = 0, attn_out = 0, experts = 0;
+    for (const PhaseTiming& t : r.phases)
+      if (t.layer == 3) {
+        if (t.name == "qkv") qkv = t.end_us - t.begin_us;
+        if (t.name == "attn_out") attn_out = t.end_us - t.begin_us;
+        if (t.name == "gate_up") experts = t.end_us - t.begin_us;
+      }
+    std::printf("   lead %2d MB: median layer %.1f %% of the ceiling; layer 3 qkv %.0f us, attn_out %.0f us, experts %.0f us; lead read %.0f MB\n", mib,
+                pct[pct.size() / 2], qkv, attn_out, experts, r.lead_bytes / 1e6);
+  }
 }
 
 int main() { return dgpp::test::run_all(); }

@@ -30,7 +30,15 @@ enum DevPoolKind : uint8_t {
   kPoolFp8Down = 4,      // the shared expert's fp8 down
   kPoolMxfp4RowGateUp = 5,  // MXFP4 gate and up over the checkpoint's row-major layout, through the L2 bridge
   kPoolMxfp4RowDown = 6,    // MXFP4 down, row-major
+  kPoolFp8Matrix = 7,       // one fp8 projection, row-major with F32 block scales: y = W x for every token
 };
+// Whose slots a pool's group holds.
+enum DevGroupKind : uint8_t {
+  kGroupRouted = 0,  // the run list's experts, each with its slots
+  kGroupShared = 1,  // every token's shared slot
+  kGroupTokens = 2,  // every token, slot i = token i
+};
+constexpr int kMaxPhasePools = 8;
 #if defined(__CUDACC__)
 #define DGPP_STEP_PLAN_HD __host__ __device__
 #else
@@ -48,12 +56,23 @@ struct DevPool {
   int32_t groups = 0;
   int32_t units_per_group = 0;
   uint8_t kind = kPoolBytes;
-  uint8_t pad[3] = {0, 0, 0};
+  uint8_t group_kind = kGroupRouted;
+  uint8_t pad[2] = {0, 0};
   int32_t rows = 0;     // a consumer pool: the matrix's output rows (gate and up: I; down: H)
   int32_t k = 0;        // and its inner width (gate and up: H; down: I)
   int32_t grab = 1;     // units a worker takes at once: consecutive units of one group share their staged activations
+  int32_t partner = -1; // a down pool: the pool whose gate and up units its group waits for
+  uint32_t out_offset = 0;  // kPoolFp8Matrix: where its y [slots, rows] begins in the step's projection buffer (elements)
+  // kPoolFp8Matrix: the inner width is cut into `slabs` so a unit is a
+  // 128-row block over one slab; with more than one, units write fp32
+  // partials at part_offset [slab][slot][rows] and reduce units, after the
+  // pool's compute units, sum them in slab order into y.
+  int32_t slabs = 1;
+  uint32_t part_offset = 0;
+  int32_t unit_rows = 128;  // output rows a unit covers (a multiple of 16; warps past them idle): finer for the fixed matrices
   // A consumer pool's matrices inside a group: gate payload, gate scales,
-  // up payload, up scales (gate_up), or down payload, down scales (down).
+  // up payload, up scales (gate_up), or down payload, down scales (down),
+  // or the matrix's payload and scales (kPoolFp8Matrix).
   uint64_t offsets[4] = {0, 0, 0, 0};
 };
 
@@ -76,8 +95,13 @@ struct DevPhase {
   int32_t lead_seg_begin = 0;
   int32_t lead_seg_count = 0;
   uint32_t lead_units = 0;  // fixed_units plus the lead-only units: the phase's share of the lead sequence
-  int32_t pool = -1;       // index into pools, or -1: the routed experts
-  int32_t pool2 = -1;      // a second pool: the shared expert, fixed-class, one group of every token
+  // The phase's pools: units are handed out fixed segments first, then the
+  // pools in order with the routed pool (`routed`, a slot in `pools`) last,
+  // since its units depend on the router and the others' are the longest.
+  int32_t pools[kMaxPhasePools] = {-1, -1, -1, -1, -1, -1, -1, -1};
+  uint8_t n_pools = 0;
+  int8_t routed = -1;
+  uint8_t pad2[2] = {0, 0};
   uint32_t lead_begin = 0; // this phase's first unit in the global lead sequence
   int32_t layer = 0;       // the layer (index into DevicePlan::layers) the phase belongs to
 };
@@ -95,6 +119,9 @@ struct DevicePlan {
   std::vector<DevSegment> segments;
   std::vector<DevPool> pools;
   uint32_t lead_units = 0;  // fixed units over the whole plan
+  uint32_t proj_elems = 0;  // the projection buffer: every kPoolFp8Matrix pool's y [kStepMaxRows, rows], bf16
+  uint32_t part_elems = 0;  // the partials scratch: the widest phase's slabs x [kStepMaxRows, rows] fp32, reused by every phase
+  int32_t max_k = 0;        // the widest inner width a consumer reads its activations at
   // Bytes a step reads at the plan's shape, by class, for the rate.
   double fixed_bytes = 0;
   double router_bytes = 0;

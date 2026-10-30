@@ -58,28 +58,38 @@ __device__ __forceinline__ void spin_us(float us) {
 }
 
 // The units of phase P of `layer` at the current run list.
+// A pool's units this step: the run list's groups for the routed pool, one group otherwise.
+__device__ __forceinline__ unsigned reduce_units(const StepStreamParams& p, const DevPool& pool) {
+  if (pool.kind != kPoolFp8Matrix || pool.slabs <= 1) return 0;
+  return (static_cast<unsigned>(pool.rows) * static_cast<unsigned>(p.ctl->rows) + kStepAccChunk - 1) / kStepAccChunk;
+}
+__device__ __forceinline__ unsigned pool_units(const StepStreamParams& p, int layer, const DevPool& pool) {
+  const unsigned groups = pool.group_kind == kGroupRouted ? static_cast<unsigned>(p.ctl->run_count[layer]) : 1u;
+  return groups * static_cast<unsigned>(pool.units_per_group) + reduce_units(p, pool);
+}
 __device__ __forceinline__ unsigned own_units(const StepStreamParams& p, int layer, int P) {
   const DevPhase& ph = p.phases[P];
   if (ph.accumulate) return (static_cast<unsigned>(p.ctl->rows) * static_cast<unsigned>(p.hidden) + kStepAccChunk - 1) / kStepAccChunk;
   unsigned n = ph.fixed_units;
-  if (ph.pool >= 0) n += static_cast<unsigned>(p.ctl->run_count[layer]) * static_cast<unsigned>(p.pools[ph.pool].units_per_group);
-  if (ph.pool2 >= 0) n += static_cast<unsigned>(p.pools[ph.pool2].units_per_group);
+  for (int i = 0; i < ph.n_pools; ++i) n += pool_units(p, layer, p.pools[ph.pools[i]]);
   return n;
 }
-// Where unit u of phase P sits: 0 fixed, 2 the shared pool, 1 the routed
-// pool, in that hand-out order (the shared expert's units are the longest
-// and have no dependency, so they go first); `v` is the index inside.
-__device__ __forceinline__ int unit_class(const StepStreamParams& p, int layer, int P, unsigned u, unsigned* v) {
+// Where unit u of phase P sits: the fixed segments (-1), or a pool's slot
+// in the phase's list, in the hand-out order: fixed, the pools that do not
+// depend on the router in order (the longest units first), the routed pool
+// last. `v` is the unit's index inside.
+__device__ __forceinline__ int unit_slot(const StepStreamParams& p, int layer, int P, unsigned u, unsigned* v) {
   const DevPhase& ph = p.phases[P];
-  if (u < ph.fixed_units) { *v = u; return 0; }
+  if (u < ph.fixed_units) { *v = u; return -1; }
   u -= ph.fixed_units;
-  if (ph.pool2 >= 0) {
-    const unsigned shared = static_cast<unsigned>(p.pools[ph.pool2].units_per_group);
-    if (u < shared) { *v = u; return 2; }
-    u -= shared;
+  for (int i = 0; i < ph.n_pools; ++i) {
+    if (i == ph.routed) continue;
+    const unsigned n = pool_units(p, layer, p.pools[ph.pools[i]]);
+    if (u < n) { *v = u; return i; }
+    u -= n;
   }
   *v = u;
-  return 1;
+  return ph.routed;
 }
 // The units a published phase hands out: its own, and the merged next phase's after them.
 __device__ __forceinline__ unsigned phase_units(const StepStreamParams& p, int layer, int P) {
@@ -116,8 +126,8 @@ __device__ bool locate(const StepStreamParams& p, int layer, int P, unsigned u, 
       if (locate_segment(p, base, p.segments[ph.seg_begin + i], u, ptr, bytes)) return true;
     return false;
   }
-  if (ph.pool < 0) return false;
-  const DevPool& pool = p.pools[ph.pool];
+  if (ph.routed < 0) return false;
+  const DevPool& pool = p.pools[ph.pools[ph.routed]];
   const unsigned v = u - ph.fixed_units;
   const int g = static_cast<int>(v / static_cast<unsigned>(pool.units_per_group));
   const unsigned t = v % static_cast<unsigned>(pool.units_per_group);
@@ -215,6 +225,7 @@ __device__ void route(const StepStreamParams& p, int layer, const DevPool& pool,
   if (threadIdx.x < static_cast<unsigned>(rows)) {
     p.ctl->shared_slots[layer][threadIdx.x] = static_cast<int>(threadIdx.x) * (top_k + 1) + top_k;
     p.ctl->shared_tokens[layer][threadIdx.x] = static_cast<int>(threadIdx.x);
+    p.ctl->token_slots[threadIdx.x] = static_cast<int>(threadIdx.x);
   }
   if (threadIdx.x == 0) p.ctl->shared_gate_done[layer] = 0;
   __syncthreads();
@@ -237,17 +248,77 @@ __device__ void accumulate_chunk(const StepStreamParams& p, unsigned unit) {
   }
 }
 
+// A slabbed projection's reduce unit: chunk `unit` of its [slots, rows]
+// outputs as the sum of the slab partials in slab order, rounded once.
+__device__ void reduce_unit(const StepStreamParams& p, const DevPool& pool, unsigned unit) {
+  const int rows = static_cast<int>(p.ctl->rows), N = pool.rows;
+  const int i0 = static_cast<int>(unit) * kStepAccChunk, i1 = min(i0 + kStepAccChunk, rows * N);
+  const float* part = p.proj_part + pool.part_offset;
+  uint16_t* y = p.proj + pool.out_offset;
+  const size_t slab_stride = static_cast<size_t>(kStepMaxRows) * N;
+  for (int i = i0 + static_cast<int>(threadIdx.x); i < i1; i += kStepThreads) {
+    const int t = i / N, c = i - t * N;  // slot t is token t for a projection
+    const size_t at = static_cast<size_t>(t) * N + c;
+    float a = 0.f;
+    for (int s = 0; s < pool.slabs; ++s) a += part[static_cast<size_t>(s) * slab_stride + at];
+    y[at] = f32_to_bf16(a);
+  }
+}
+
 // A consumer pool's unit: group g's 128-row block rb of the expert's pair or
 // down matrix. `stage`: the group's activations are not yet in shared memory.
 // The shared expert's pools have one group, every token's shared slot.
+// The fp8 projection form at the shapes compiled in (DeepSeek-V4.1 at world 4).
+__device__ bool fp8_matrix_dispatch(int k, int n, const uint8_t* w, const float* scales, const Mxfp4Group& g, int rb, const uint16_t* x,
+                                    uint16_t* y, float* partial, uint8_t* smem, int w0, int w1, int unit_rows) {
+#define DGPP_STEP_FP8_SHAPE(K, N)                                                                        \
+  if (k == (K) && n == (N)) {                                                                            \
+    fp8_matrix<(K), (N), kConsumerFp8Block>(w, scales, g, rb, x, y, partial, smem, w0, w1, unit_rows);  \
+    return true;                                                                                         \
+  }
+  DGPP_STEP_FP8_SHAPE(5120, 1280)   // wq_a
+  DGPP_STEP_FP8_SHAPE(5120, 512)    // wkv
+  DGPP_STEP_FP8_SHAPE(1280, 8192)   // wq_b
+  DGPP_STEP_FP8_SHAPE(4096, 2048)   // wo_a
+  DGPP_STEP_FP8_SHAPE(2048, 5120)   // wo_b
+  DGPP_STEP_FP8_SHAPE(1280, 4096)   // the indexer's wq_b
+  DGPP_STEP_FP8_SHAPE(1536, 25600)  // the Engram projection
+  DGPP_STEP_FP8_SHAPE(15360, 5120)  // the draft's main_proj
+#undef DGPP_STEP_FP8_SHAPE
+  return false;
+}
+
 __device__ void consumer_unit(const StepStreamParams& p, int layer, const DevPool& pool, int g, int rb, uint8_t* smem, bool stage) {
-  const bool shared = pool.kind == kPoolFp8GateUp || pool.kind == kPoolFp8Down;
-  const int expert = shared ? 0 : p.ctl->run_list[layer][g];
+  const bool routed = pool.group_kind == kGroupRouted;
+  const int expert = routed ? p.ctl->run_list[layer][g] : 0;
   const uint8_t* base = p.bases[layer] + pool.base + static_cast<unsigned long long>(expert) * pool.stride;
   Mxfp4Group grp;
-  grp.slots = shared ? p.ctl->shared_slots[layer] : p.ctl->group_slots[layer][g];
-  grp.tokens = shared ? p.ctl->shared_tokens[layer] : p.ctl->group_tokens[layer][g];
-  grp.count = shared ? static_cast<int>(p.ctl->rows) : p.ctl->group_count[layer][g];
+  grp.x_stride = p.x_stride;
+  if (routed) {
+    grp.slots = p.ctl->group_slots[layer][g];
+    grp.tokens = p.ctl->group_tokens[layer][g];
+    grp.count = p.ctl->group_count[layer][g];
+  } else if (pool.group_kind == kGroupShared) {
+    grp.slots = p.ctl->shared_slots[layer];
+    grp.tokens = p.ctl->shared_tokens[layer];
+    grp.count = static_cast<int>(p.ctl->rows);
+  } else {
+    grp.slots = p.ctl->token_slots;
+    grp.tokens = p.ctl->token_slots;
+    grp.count = static_cast<int>(p.ctl->rows);
+  }
+  if (pool.kind == kPoolFp8Matrix) {
+    // Unit v: rb * slabs + slab for the compute units, then the reduce units.
+    const int windows = pool.k / kMxfp4WindowCodes, per_slab = windows / pool.slabs;
+    const int slab = rb % pool.slabs, block = rb / pool.slabs;
+    const int w0 = slab * per_slab, w1 = w0 + per_slab;
+    float* partial = pool.slabs > 1 ? p.proj_part + pool.part_offset + static_cast<size_t>(slab) * kStepMaxRows * pool.rows : nullptr;
+    if (!fp8_matrix_dispatch(pool.k, pool.rows, base + pool.offsets[0], reinterpret_cast<const float*>(base + pool.offsets[1]), grp, block,
+                             p.x, p.proj + pool.out_offset, partial, smem, w0, w1, pool.unit_rows) &&
+        threadIdx.x == 0)
+      atomicCAS(&p.ctl->status, kStepOk, kStepBadUnit);
+    return;
+  }
   if (pool.kind == kPoolFp8GateUp) {
     Fp8Expert f;
     f.gate = base + pool.offsets[0];
@@ -321,7 +392,7 @@ __global__ void __launch_bounds__(kStepThreads, 1) step_stream_kernel(StepStream
           ctl->rows = d->rows;
           ctl->top_k = d->top_k;
           ctl->seed = d->seed + static_cast<unsigned>(d->seq);
-          for (int P = 0; P < n_phases; ++P) { ctl->next[P] = 0; ctl->done[P] = 0; ctl->pf_units[P] = 0; ctl->idle_first[P] = 0; }
+          for (int P = 0; P < n_phases; ++P) { ctl->next[P] = 0; ctl->done[P] = 0; ctl->pf_units[P] = 0; ctl->idle_first[P] = 0; ctl->pool_done[P] = 0; }
           ctl->pf_next = 0;
           ctl->pf_bytes = 0;
           ctl->consumed_pf_bytes = 0;
@@ -408,7 +479,8 @@ __global__ void __launch_bounds__(kStepThreads, 1) step_stream_kernel(StepStream
           if (ph.resolves == static_cast<uint8_t>(Dependency::Router)) {
             // The first pool of the layer's later phases says how many groups there are.
             int pool_index = -1;
-            for (int Q = P + 1; Q < dl.phase_begin + dl.phase_count && pool_index < 0; ++Q) pool_index = p.phases[Q].pool;
+            for (int Q = P + 1; Q < dl.phase_begin + dl.phase_count && pool_index < 0; ++Q)
+              if (p.phases[Q].routed >= 0) pool_index = p.phases[Q].pools[p.phases[Q].routed];
             if (pool_index >= 0) route(p, l, p.pools[pool_index], keys, sorted);
             if (t0) __threadfence();
           }
@@ -477,10 +549,9 @@ __global__ void __launch_bounds__(kStepThreads, 1) step_stream_kernel(StepStream
             unsigned iu = at;
             if (gph.merged_next && at >= own) { ip = P + 1; iu = at - own; }
             unsigned v = 0;
-            const int cls = unit_class(p, cur_layer, ip, iu, &v);
+            const int slot = unit_slot(p, cur_layer, ip, iu, &v);
             const DevPhase& iph = p.phases[ip];
-            if (cls == 1 && p.pools[iph.pool].kind != kPoolBytes) grab = static_cast<unsigned>(p.pools[iph.pool].grab);
-            else if (cls == 2 && iph.pool2 >= 0) grab = static_cast<unsigned>(p.pools[iph.pool2].grab);
+            if (slot >= 0 && p.pools[iph.pools[slot]].kind != kPoolBytes) grab = static_cast<unsigned>(p.pools[iph.pools[slot]].grab);
           }
           const unsigned u = atomicAdd(&ctl->next[P], grab);
           if (u < need) {
@@ -540,18 +611,35 @@ __global__ void __launch_bounds__(kStepThreads, 1) step_stream_kernel(StepStream
         continue;
       }
       unsigned xv = 0;
-      const int xcls = kind == 1 ? unit_class(p, sm_layer, static_cast<int>(xphase), xunit, &xv) : 0;
-      const DevPool* upool = (kind == 1 && xcls == 1) ? &p.pools[uph.pool] : (kind == 1 && xcls == 2 && uph.pool2 >= 0) ? &p.pools[uph.pool2] : nullptr;
+      const int xslot = kind == 1 ? unit_slot(p, sm_layer, static_cast<int>(xphase), xunit, &xv) : -1;
+      const int pool_id = xslot >= 0 ? uph.pools[xslot] : -1;
+      const DevPool* upool = pool_id >= 0 ? &p.pools[pool_id] : nullptr;
       if (upool && upool->kind != kPoolBytes) {
-        const bool shared = xcls == 2;
-        const int pool_id = shared ? uph.pool2 : uph.pool;
+        const bool shared = upool->group_kind == kGroupShared;
+        const unsigned compute_units = (upool->group_kind == kGroupRouted ? static_cast<unsigned>(p.ctl->run_count[sm_layer]) : 1u) *
+                                       static_cast<unsigned>(upool->units_per_group);
+        if (xv >= compute_units) {
+          // A reduce unit: after the pool's compute units, which were handed out before it.
+          if (threadIdx.x == 0) {
+            const unsigned long long t_wait = gtimer();
+            while (ld_acq(&ctl->pool_done[pool_id]) < compute_units) {
+              if (p.deadline_ns && gtimer() - t_wait > p.deadline_ns) { atomicCAS(&ctl->status, kStepOk, kStepDeadline | (xphase << 8)); break; }
+              if (ld_acq(&ctl->poison)) break;
+              __nanosleep(100);
+            }
+          }
+          __syncthreads();
+          reduce_unit(p, *upool, xv - compute_units);
+          last_group = -1;
+          last_pool = -1;
+          continue;
+        }
         const int g = static_cast<int>(xv / static_cast<unsigned>(upool->units_per_group));
         const int rb = static_cast<int>(xv % static_cast<unsigned>(upool->units_per_group));
-        if (pool_is_down(upool->kind) && xphase != sm_phase) {
+        if (pool_is_down(upool->kind) && upool->partner >= 0) {
           // The group's gate and up units must be complete: they were handed out earlier, so the wait is short.
           if (threadIdx.x == 0) {
-            const DevPhase& gph = p.phases[sm_phase];
-            const unsigned gate_units = static_cast<unsigned>(p.pools[shared ? gph.pool2 : gph.pool].units_per_group);
+            const unsigned gate_units = static_cast<unsigned>(p.pools[upool->partner].units_per_group);
             const unsigned* done = shared ? &ctl->shared_gate_done[sm_layer] : &ctl->gate_done[sm_layer][g];
             const unsigned long long t_wait = gtimer();
             while (ld_acq(done) < gate_units) {
@@ -565,6 +653,10 @@ __global__ void __launch_bounds__(kStepThreads, 1) step_stream_kernel(StepStream
         consumer_unit(p, sm_layer, *upool, g, rb, smem, pool_id != last_pool || g != last_group);
         last_group = g;
         last_pool = pool_id;
+        if (upool->kind == kPoolFp8Matrix && upool->slabs > 1) {
+          __syncthreads();
+          if (threadIdx.x == 0) { __threadfence(); atomicAdd(&ctl->pool_done[pool_id], 1u); }
+        }
         if (pool_is_gate_up(upool->kind)) {
           __syncthreads();
           if (threadIdx.x == 0) {
@@ -644,6 +736,12 @@ int step_stream_capacity(unsigned smem_bytes) {
 }
 
 bool step_stream_has_mxfp4_consumer(int hidden, int inter) { return hidden == kConsumerH && inter == kConsumerI; }
+bool step_stream_has_fp8_matrix(int k, int rows) {
+  const int shapes[8][2] = {{5120, 1280}, {5120, 512}, {1280, 8192}, {4096, 2048}, {2048, 5120}, {1280, 4096}, {1536, 25600}, {15360, 5120}};
+  for (const auto& s : shapes)
+    if (s[0] == k && s[1] == rows) return true;
+  return false;
+}
 unsigned step_stream_mxfp4_smem(int inter) { return inter == kConsumerI ? static_cast<unsigned>(mxfp4_unit_smem_bytes<kConsumerI>()) : 0u; }
 
 cudaError_t launch_step_stream(const StepStreamParams& p, int workers, cudaStream_t stream) {

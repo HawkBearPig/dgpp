@@ -640,6 +640,7 @@ GPU at the time, so the figures below carry its noise.
 | the same with the expert phases merged, a down unit released by its group's gate and up | 96 to 98 |
 | the merged phase with the shared expert computed too, by the row-major fp8 form through the L2 bridge, its units handed out first and its bytes in the lead | 97 to 98 idle, 93 to 95 beside production |
 | the same with the routed experts read in the checkpoint's row-major layout through the bridge, no second layout | 92 to 93 |
+| every fp8 projection of the layer computed too, by the single-matrix fp8 form, 128-row units over inner-width slabs with a reduce, lead 16 MB | 86 to 91 |
 
 The merged phase is the work distribution the phase-1 prototype owed: the
 gate and up phase alone drained 68 µs a layer with 150 units of 110 µs
@@ -669,6 +670,27 @@ at 247 GB/s. Two placement lessons came with it: the shared units are the
 longest of the phase and go out first, and the shared expert's bytes stay
 in the lead's sequence as lead-only segments although no worker streams
 them as bytes.
+
+The fp8 projections followed as consumers of the same form with one matrix
+(`fp8_matrix_unit`), every token through each of the layer's fp8
+matrices: wq_a, wkv, wq_b, wo_a, wo_b, the indexer's wq_b, the Engram
+projection and the draft's main_proj, eight shapes compiled in. All
+213,760 outputs of a layer are exact or inside the envelope. Their cost
+is the phase structure, not the form: a 128-row unit over a full 5120-wide
+row streams at 15 GB/s alone and L2-hot but at the ceiling's share, 5
+GB/s, when every SM streams, so a phase of a few matrices is one unit's
+time long whatever the worker count, and the fixed phases lost 20 to 50
+µs a layer against the byte-streaming form's 64 KB units. Splitting the
+inner width into slabs with a deterministic reduce in slab order gave the
+tail back on the long matrices; 64-row units cost more than they saved,
+each unit's staging and its halved loads in flight outweighing the finer
+tail; and the lead's cap, re-swept with every consumer real, moved from 8
+MB to 12 to 16, since the projections now read L2-hot what the lead
+staged. With the lead at 16 MB the layers run at 86 to 91 percent of
+their floor with every weight of the layer computed. The rest is the
+fixed phases' quantization, which the fused chain changes anyway: in a
+real layer the fixed matrices stream under the attention's and the folds'
+latency rather than in phases of their own.
 
 The fp8 result raised the question whether the routed experts need the
 tile-major layout at all, so the MXFP4 form was built over the row-major
@@ -1871,7 +1893,14 @@ area, untracked.
       the kernel against the reference.
 - [ ] Dense and attention projections from stationary tiles, the thin TP
       shards as adjacent ranges; the fp8 block-scaled form above is the
-      candidate for the fp8 projections, the bf12 form is unbuilt.
+      candidate for the fp8 projections, the bf12 form is unbuilt. The fp8
+      projections are consumers in the streamer since 2026-10-30
+      (`fp8_matrix_unit`, eight DeepSeek-V4.1 shapes, 128-row units over
+      inner-width slabs with a reduce in slab order), exact on every output
+      of a layer; the layer runs at 86 to 91 percent of its floor with
+      every weight computed, the fixed phases' unit quantization being the
+      residue (section 1.3). Their inputs are synthetic until the fused
+      chain feeds them; the bf12 head form stays unbuilt.
 - [ ] The vocabulary head and the 2-bit screen as consumers, the pick's
       digit table as a fold payload, the pick ABI with instances, request
       slots and verify rows as three numbers.

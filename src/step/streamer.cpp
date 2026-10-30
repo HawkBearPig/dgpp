@@ -69,16 +69,31 @@ Streamer::Streamer(const DevicePlan& dp, const std::vector<const uint8_t*>& base
     if (!step_stream_has_mxfp4_consumer(hidden_, inter_))
       throw std::invalid_argument("Streamer: the kernel has no MXFP4 consumer for hidden " + std::to_string(hidden_) + ", inter " +
                                   std::to_string(inter_));
+    for (const DevPool& pool : dp.pools)
+      if (pool.kind == kPoolFp8Matrix && !step_stream_has_fp8_matrix(pool.k, pool.rows))
+        throw std::invalid_argument("Streamer: the kernel has no fp8 projection form for [" + std::to_string(pool.rows) + ", " +
+                                    std::to_string(pool.k) + "]");
     consumer_smem_ = step_stream_mxfp4_smem(inter_);
     const size_t slots = static_cast<size_t>(kStepMaxRows) * 9;  // top_k up to 8, plus the shared slot
-    DGPP_CUDA_OK(cudaMalloc(&x_, static_cast<size_t>(kStepMaxRows) * hidden_ * 2));
+    // The activations: every consumer reads a token's row at its own inner
+    // width from the same buffer, so it holds the widest.
+    x_stride_ = std::max(hidden_, dp.max_k);
+    DGPP_CUDA_OK(cudaMalloc(&x_, static_cast<size_t>(kStepMaxRows) * x_stride_ * 2));
+    if (dp.proj_elems) {
+      DGPP_CUDA_OK(cudaMalloc(&proj_, static_cast<size_t>(dp.proj_elems) * 2));
+      DGPP_CUDA_OK(cudaMemset(proj_, 0, static_cast<size_t>(dp.proj_elems) * 2));
+    }
+    if (dp.part_elems) {
+      DGPP_CUDA_OK(cudaMalloc(&proj_part_, static_cast<size_t>(dp.part_elems) * 4));
+      DGPP_CUDA_OK(cudaMemset(proj_part_, 0, static_cast<size_t>(dp.part_elems) * 4));
+    }
     DGPP_CUDA_OK(cudaMalloc(&act_, slots * inter_ * 2));
     DGPP_CUDA_OK(cudaMalloc(&out_, slots * hidden_ * 4));
     DGPP_CUDA_OK(cudaMalloc(&y_, static_cast<size_t>(kStepMaxRows) * hidden_ * 2));
     DGPP_CUDA_OK(cudaMemset(act_, 0, slots * inter_ * 2));
     DGPP_CUDA_OK(cudaMemset(out_, 0, slots * hidden_ * 4));
     DGPP_CUDA_OK(cudaMemset(y_, 0, static_cast<size_t>(kStepMaxRows) * hidden_ * 2));
-    step_stream_init_x(x_, kStepMaxRows * hidden_, 0x51e5u, nullptr);
+    step_stream_init_x(x_, kStepMaxRows * x_stride_, 0x51e5u, nullptr);
     DGPP_CUDA_OK(cudaDeviceSynchronize());
   }
 }
@@ -100,6 +115,8 @@ Streamer::~Streamer() {
   cudaFree(act_);
   cudaFree(out_);
   cudaFree(y_);
+  cudaFree(proj_);
+  cudaFree(proj_part_);
 }
 
 void Streamer::poison() { std::atomic_ref<unsigned>(ctl_->poison).store(1u, std::memory_order_release); }
@@ -142,6 +159,9 @@ StreamReport Streamer::run(const StreamerConfig& cfg) {
   p.act = act_;
   p.out = out_;
   p.y = y_;
+  p.proj = proj_;
+  p.proj_part = proj_part_;
+  p.x_stride = x_stride_;
   p.hidden = hidden_;
   p.inter = inter_;
   p.consumer_smem = consumer_smem_;
@@ -263,8 +283,10 @@ StreamReport Streamer::run(const StreamerConfig& cfg) {
       first = std::min(first, ctl_->stamp_begin[P]);
       last = std::max(last, ctl_->stamp_end[P]);
       for (int i = 0; i < ph.seg_count; ++i) bytes += static_cast<double>(dp_.segments[static_cast<size_t>(ph.seg_begin + i)].bytes);
-      if (ph.pool >= 0) bytes += static_cast<double>(dp_.pools[static_cast<size_t>(ph.pool)].bytes) * ctl_->run_count[l];
-      if (ph.pool2 >= 0) bytes += static_cast<double>(dp_.pools[static_cast<size_t>(ph.pool2)].bytes);  // the shared expert, once
+      for (int i = 0; i < ph.n_pools; ++i) {
+        const DevPool& pool = dp_.pools[static_cast<size_t>(ph.pools[i])];
+        bytes += static_cast<double>(pool.bytes) * (pool.group_kind == kGroupRouted ? ctl_->run_count[l] : 1);
+      }
       r.phases.push_back(std::move(t));
     }
     r.layer_us.push_back(static_cast<double>(last - first) / 1e3);

@@ -743,4 +743,73 @@ DGPP_TEST(mxfp4_row_major_consumer_plain_grid_rate) {
   }
 }
 
+// ---- one fp8 projection unit's own rate: a [1280, 5120] matrix for five tokens
+
+namespace {
+
+constexpr int kPK = 5120, kPN = 1280;
+constexpr size_t kPBytes = static_cast<size_t>(kPN) * kPK, kPScales = static_cast<size_t>(kPN / 32) * (kPK / 32) * 4;
+constexpr size_t kPStride = align_up(kPBytes) + align_up(kPScales);
+
+__global__ void __launch_bounds__(kMxfp4Threads) proj_kernel(const uint8_t* arena, int matrices, const int32_t* tokens, int count, const uint16_t* x,
+                                                             uint16_t* y, int slabs) {
+  extern __shared__ __align__(128) uint8_t smem[];
+  const int m = blockIdx.y % matrices;
+  const uint8_t* w = arena + static_cast<size_t>(m) * kPStride;
+  const float* sc = reinterpret_cast<const float*>(w + align_up(kPBytes));
+  Mxfp4Group g;
+  g.slots = tokens;
+  g.tokens = tokens;
+  g.count = count;
+  g.x_stride = kPK;
+  const int windows = kPK / kMxfp4WindowCodes, per = windows / slabs;
+  const int rb = blockIdx.x / slabs, slab = blockIdx.x % slabs;
+  fp8_matrix<kPK, kPN, 32>(w, sc, g, rb, x, y + static_cast<size_t>(blockIdx.y) * 32 * kPN, slabs > 1 ? nullptr : nullptr, smem, slab * per, (slab + 1) * per);
+}
+
+}  // namespace
+
+DGPP_TEST(fp8_projection_unit_rate) {
+  const int matrices = 47;
+  uint8_t* arena = nullptr;
+  DGPP_CUDA_OK(cudaMalloc(&arena, kPStride * matrices));
+  // e4m3 normals and unit scales are enough for a rate.
+  DGPP_CUDA_OK(cudaMemset(arena, 0x38, kPStride * matrices));
+  uint16_t* x = nullptr;
+  DGPP_CUDA_OK(cudaMalloc(&x, 32 * kPK * 2));
+  init_x<<<(32 * kPK + 255) / 256, 256>>>(x, 32 * kPK);
+  int32_t* tokens = nullptr;
+  std::vector<int32_t> h_tok = {0, 1, 2, 3, 4};
+  DGPP_CUDA_OK(cudaMalloc(&tokens, 5 * 4));
+  DGPP_CUDA_OK(cudaMemcpy(tokens, h_tok.data(), 20, cudaMemcpyHostToDevice));
+  uint16_t* y = nullptr;
+  DGPP_CUDA_OK(cudaMalloc(&y, static_cast<size_t>(matrices) * 32 * kPN * 2));
+  DGPP_CUDA_OK(cudaFuncSetAttribute(proj_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem));
+  cudaEvent_t e0, e1;
+  DGPP_CUDA_OK(cudaEventCreate(&e0));
+  DGPP_CUDA_OK(cudaEventCreate(&e1));
+  proj_kernel<<<dim3(kPN / 128, 1), kMxfp4Threads, kSmem>>>(arena, matrices, tokens, 5, x, y, 1);  // the first launch's costs
+  DGPP_CUDA_OK(cudaDeviceSynchronize());
+  for (int slabs : {1, 4}) {
+    for (int mats : {1, 8, 47}) {
+      const dim3 grid((kPN / 128) * slabs, mats);
+      std::vector<float> ms(3);
+      for (float& m : ms) {
+        DGPP_CUDA_OK(cudaEventRecord(e0));
+        proj_kernel<<<grid, kMxfp4Threads, kSmem>>>(arena, matrices, tokens, 5, x, y, slabs);
+        DGPP_CUDA_OK(cudaEventRecord(e1));
+        DGPP_CUDA_OK(cudaDeviceSynchronize());
+        DGPP_CUDA_OK(cudaEventElapsedTime(&m, e0, e1));
+      }
+      std::sort(ms.begin(), ms.end());
+      const double mb = static_cast<double>(mats) * (kPBytes + kPScales) / 1e6;
+      const int blocks = static_cast<int>(grid.x * grid.y);
+      const double per_block = mb / ms[1] / std::min(blocks, 48);
+      std::printf("   fp8 [1280 x 5120] x %2d matrices, %d slab(s), %4d blocks: %6.0f us (median of 3) = %5.1f GB/s aggregate, %5.1f GB/s an SM\n",
+                  mats, slabs, blocks, ms[1] * 1e3, mb / ms[1], per_block);
+    }
+  }
+  cudaFree(arena); cudaFree(x); cudaFree(tokens); cudaFree(y);
+}
+
 int main() { return dgpp::test::run_all(); }

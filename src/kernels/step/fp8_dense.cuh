@@ -30,6 +30,8 @@ struct Fp8Expert {
 };
 
 constexpr int kFp8SlabBytes = 512;  // the bridge's prefetch granule a row
+// The slab a row of K bytes takes: 512 where K divides into it, else 256.
+__host__ __device__ constexpr int fp8_slab_bytes(int k_bytes) { return k_bytes % kFp8SlabBytes == 0 ? kFp8SlabBytes : kFp8SlabBytes / 2; }
 
 #if defined(__CUDACC__)
 
@@ -219,6 +221,100 @@ __device__ void fp8_down_unit(const Fp8Expert& e, const Mxfp4Group& g, int rb, c
       if (r >= g.count) continue;
       out[out_index(g.slots[r], (i < 2) ? r0 : r1)] = acc[t][i];
     }
+}
+
+// One row-major fp8 matrix W [kN, kK] with F32 kBlock scales over 128-row
+// block `rb` for group `g` (its activations x, bf16 [tokens, kK]), over the
+// windows [w0, w1) of 256 codes: writes y[slot * kN + row] as bf16 when
+// `partial` is null, else the fp32 slab partial partial[slot * kN + row]. A
+// projection's form: the pair's with one matrix.
+template <int kK, int kN, int kBlock, int kTG>
+__device__ void fp8_matrix_unit(const uint8_t* __restrict__ w, const float* __restrict__ scales, const Mxfp4Group& g, int rb,
+                                const uint16_t* __restrict__ x, uint16_t* __restrict__ y, float* __restrict__ partial, uint8_t* smem,
+                                int w0, int w1, int unit_rows) {
+  static_assert(kK % kMxfp4WindowCodes == 0 && kBlock % 32 == 0 && kN % kTileRows == 0, "the matrix's shape");
+  constexpr int kSlab = fp8_slab_bytes(kK);
+  constexpr int kD = kMxfp4WindowCodes / 32;  // chunks in flight a lane: a window's worth, so the ring index is the unrolled chunk index
+  constexpr int kAhead = 2;    // slabs the bridge runs ahead of the loads
+  constexpr int kChunksPerBlock = kBlock / 32;
+  constexpr int kSC = kK / kBlock;
+  constexpr int kChunksPerSlab = kSlab / 32;
+  const int c_begin = w0 * (kMxfp4WindowCodes / 32), c_end = w1 * (kMxfp4WindowCodes / 32);
+  const int slab_end = (c_end * 32 + kSlab - 1) / kSlab;
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, gid = lane >> 2, tid = lane & 3;
+  const int n0 = rb * unit_rows + warp * kTileRows, r0 = n0 + gid, r1 = r0 + 8;
+  const bool live = n0 < kN && warp * kTileRows < unit_rows;  // warps past the unit's rows only help stage the windows
+  const int row_l = (live ? n0 : 0) + (lane >> 1), half = lane & 1;
+  const uint8_t* wp = w + static_cast<size_t>(row_l) * kK + half * 16;
+  const float* sw = scales + static_cast<size_t>((live ? n0 : 0) / kBlock) * kSC;
+  auto bridge = [&](int slab) {
+    if (!live || slab >= slab_end || lane >= 16) return;
+    const int r = (live ? n0 : 0) + lane;
+    prefetch_l2_bulk(w + static_cast<size_t>(r) * kK + static_cast<size_t>(slab) * kSlab, kSlab);
+  };
+  const int slab0 = c_begin * 32 / kSlab;
+#pragma unroll
+  for (int a = 0; a <= kAhead; ++a) bridge(slab0 + a);
+  uint4 ring[kD];
+#pragma unroll
+  for (int i = 0; i < kD; ++i) ring[i] = __ldcs(reinterpret_cast<const uint4*>(wp + (c_begin + i) * 32));
+  mxfp4_fill_window<kK>(x, g, w0, 0, smem);
+  mxfp4_fill_window<kK>(x, g, w0 + 1, 1, smem);
+  float acc[kTG][4], blk[kTG][4];
+#pragma unroll
+  for (int t = 0; t < kTG; ++t)
+    for (int i = 0; i < 4; ++i) { acc[t][i] = 0.f; blk[t][i] = 0.f; }
+  float scale = __ldg(sw + c_begin / kChunksPerBlock);
+#pragma unroll 1
+  for (int wdw = w0; wdw < w1; ++wdw) {
+    cp_async_wait<1>();
+    __syncthreads();
+    if (wdw + 2 < w1) mxfp4_fill_window<kK>(x, g, wdw + 2, (wdw - w0 + 2) % kMxfp4Windows, smem); else cp_async_commit();
+    const uint8_t* xb = smem + ((wdw - w0) % kMxfp4Windows) * kMxfp4WindowBytes;
+#pragma unroll
+    for (int cc = 0; cc < kMxfp4WindowCodes / 32; ++cc) {
+      const int c = wdw * (kMxfp4WindowCodes / 32) + cc;
+      if (c % kChunksPerSlab == 0 && c > c_begin) bridge(c / kChunksPerSlab + kAhead);
+      const uint4 v = ring[cc];  // kD chunks a window: slot cc holds chunk c
+      if (c + kD < c_end) ring[cc] = __ldcs(reinterpret_cast<const uint4*>(wp + (c + kD) * 32));
+      uint32_t a0[4], a1[4];
+      fp8_fragments(v, gid, tid, a0, a1);
+#pragma unroll
+      for (int t = 0; t < kTG; ++t) {
+        const uint4 bv = *reinterpret_cast<const uint4*>(xb + (t * 8 + gid) * kMxfp4WindowStride * 2 + (cc * 32 + 8 * tid) * 2);
+        mma_bf16_16x8x16(blk[t], a0, bv.x, bv.y);
+        mma_bf16_16x8x16(blk[t], a1, bv.z, bv.w);
+      }
+      if ((c + 1) % kChunksPerBlock == 0) {
+#pragma unroll
+        for (int t = 0; t < kTG; ++t)
+          for (int i = 0; i < 4; ++i) { acc[t][i] = fmaf(scale, blk[t][i], acc[t][i]); blk[t][i] = 0.f; }
+        const int nb = (c + 1) / kChunksPerBlock;
+        if (nb < kSC) scale = __ldg(sw + nb);
+      }
+    }
+  }
+  cp_async_wait<0>();
+  if (!live) return;
+#pragma unroll
+  for (int t = 0; t < kTG; ++t)
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const int r = t * 8 + 2 * tid + (i & 1), row = (i < 2) ? r0 : r1;
+      if (r >= g.count) continue;
+      const size_t at = static_cast<size_t>(g.slots[r]) * kN + row;
+      if (partial) partial[at] = acc[t][i]; else y[at] = f32_to_bf16(acc[t][i]);
+    }
+}
+template <int kK, int kN, int kBlock>
+__device__ __forceinline__ void fp8_matrix(const uint8_t* w, const float* scales, const Mxfp4Group& g, int rb, const uint16_t* x, uint16_t* y,
+                                           float* partial, uint8_t* smem, int w0, int w1, int unit_rows = kMxfp4UnitRows) {
+  switch ((g.count + 7) / 8) {
+    case 1: fp8_matrix_unit<kK, kN, kBlock, 1>(w, scales, g, rb, x, y, partial, smem, w0, w1, unit_rows); break;
+    case 2: fp8_matrix_unit<kK, kN, kBlock, 2>(w, scales, g, rb, x, y, partial, smem, w0, w1, unit_rows); break;
+    case 3: fp8_matrix_unit<kK, kN, kBlock, 3>(w, scales, g, rb, x, y, partial, smem, w0, w1, unit_rows); break;
+    default: fp8_matrix_unit<kK, kN, kBlock, 4>(w, scales, g, rb, x, y, partial, smem, w0, w1, unit_rows); break;
+  }
 }
 
 template <int kH, int kI, int kBlock>

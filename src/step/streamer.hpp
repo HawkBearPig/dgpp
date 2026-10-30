@@ -91,6 +91,8 @@ class Streamer {
   const uint16_t* act() const { return act_; }
   const float* out() const { return out_; }
   const uint16_t* y() const { return y_; }
+  const uint16_t* proj() const { return proj_; }  // the projections' outputs, bf16, at each pool's out_offset
+  int x_stride() const { return x_stride_; }       // elements a row of x
   int hidden() const { return hidden_; }
   int inter() const { return inter_; }
   bool consumers() const { return consumers_; }
@@ -119,6 +121,9 @@ class Streamer {
   uint16_t* act_ = nullptr;
   float* out_ = nullptr;
   uint16_t* y_ = nullptr;
+  uint16_t* proj_ = nullptr;
+  float* proj_part_ = nullptr;
+  int x_stride_ = 0;
   unsigned consumer_smem_ = 0;
 };
 

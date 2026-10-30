@@ -34,6 +34,7 @@ struct Mxfp4Group {
   const int32_t* slots = nullptr;  // the slot ids, for the act and out rows
   const int32_t* tokens = nullptr; // slot i's token row of x
   int count = 0;
+  int x_stride = 0;                // elements a row of x (0: the consumer's inner width)
 };
 
 constexpr int kMxfp4GroupRows = 32;   // slots a group computes at once (four m16n8 tiles of eight)
@@ -72,11 +73,13 @@ __device__ __forceinline__ uint16_t swiglu_bf16(float gate, float up) {
 template <int kH>
 __device__ __forceinline__ void mxfp4_fill_window(const uint16_t* __restrict__ x, const Mxfp4Group& g, int w, int buf, uint8_t* smem) {
   uint8_t* dst = smem + buf * kMxfp4WindowBytes;
-  constexpr int chunks16 = kMxfp4GroupRows * (kMxfp4WindowCodes / 8);
+  const int rows_staged = ((g.count + 7) / 8) * 8;  // the tiles the group's slots fill
+  const int chunks16 = rows_staged * (kMxfp4WindowCodes / 8);
+  const size_t stride = g.x_stride ? static_cast<size_t>(g.x_stride) : static_cast<size_t>(kH);
   for (int q = threadIdx.x; q < chunks16; q += kMxfp4Threads) {
     const int t = q / (kMxfp4WindowCodes / 8), c16 = q % (kMxfp4WindowCodes / 8);
     const int tok = t < g.count ? g.tokens[t] : g.tokens[0];
-    cp_async_16(dst + t * kMxfp4WindowStride * 2 + c16 * 16, x + static_cast<size_t>(tok) * kH + static_cast<size_t>(w) * kMxfp4WindowCodes + c16 * 8);
+    cp_async_16(dst + t * kMxfp4WindowStride * 2 + c16 * 16, x + static_cast<size_t>(tok) * stride + static_cast<size_t>(w) * kMxfp4WindowCodes + c16 * 8);
   }
   cp_async_commit();
 }

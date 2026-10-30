@@ -15,6 +15,8 @@
 
 namespace step_ref {
 
+inline float bf16_ulp(float v);
+
 // One group's gate and up over every row of the expert into act, with the
 // exact gate and up (gu, interleaved) and the terms' magnitudes (mag).
 void launch_gate_up(const dgpp::step::Mxfp4Expert& e, const dgpp::step::Mxfp4Group& g, const uint16_t* x, int H, int I, uint16_t* act,
@@ -27,6 +29,17 @@ void launch_mxfp4_row_gate_up(const dgpp::step::Mxfp4Expert& e, const dgpp::step
                               float* gu, float* mag, cudaStream_t stream);
 void launch_mxfp4_row_down(const dgpp::step::Mxfp4Expert& e, const dgpp::step::Mxfp4Group& g, const uint16_t* act, int H, int I, int spt,
                            float* out, float* mag, cudaStream_t stream);
+// One row-major fp8 matrix for a token group, y as bf16 with the exact fp32 and the magnitudes beside it.
+void launch_fp8_matrix(const uint8_t* w, const float* scales, const dgpp::step::Mxfp4Group& g, const uint16_t* x, int x_stride, int K, int N,
+                       int block, uint16_t* y, float* yf, float* mag, cudaStream_t stream);
+// A bf16 result against the exact value: within two ulps, or inside the accumulation envelope widened by two ulps.
+inline bool value_ok(uint16_t got_bits, float exact, float magnitude) {
+  const float got = dgpp::bf16_bits_to_float(got_bits);
+  const float ref = dgpp::bf16_bits_to_float(dgpp::float_to_bf16_bits(exact));
+  if (got_bits == dgpp::float_to_bf16_bits(exact)) return true;
+  const float slack = 2.0f * bf16_ulp(std::fabs(ref) > std::fabs(got) ? std::fabs(ref) : std::fabs(got)) + magnitude * 4e-6f + 1e-7f;
+  return std::fabs(got - exact) <= slack;
+}
 // The row-major fp8 pair and down with F32 scales on block x block blocks.
 void launch_fp8_gate_up(const dgpp::step::Fp8Expert& e, const dgpp::step::Mxfp4Group& g, const uint16_t* x, int H, int I, int block,
                         uint16_t* act, float* gu, float* mag, cudaStream_t stream);

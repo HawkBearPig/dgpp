@@ -63,6 +63,8 @@ struct alignas(128) StepCtl {
   int32_t shared_slots[kStepMaxLayers][32];
   int32_t shared_tokens[kStepMaxLayers][32];
   unsigned shared_gate_done[kStepMaxLayers];
+  int32_t token_slots[32];  // the token group: slot i = token i
+  unsigned pool_done[kStepMaxPhases];  // kPoolFp8Matrix with slabs: compute units of the pool completed this step, by pool index
   unsigned long long stamp_begin[kStepMaxPhases];  // the last pass: the phase's publish or latency start
   unsigned long long stamp_end[kStepMaxPhases];    // the last pass: its units done, the fold after it included
   unsigned long long idle_first[kStepMaxPhases];   // the last pass: the first worker to find the phase drained
@@ -93,10 +95,13 @@ struct StepStreamParams {
   // The MXFP4 expert consumers' operands when the plan has consumer pools:
   // x [kStepMaxRows][hidden] bf16, act [slots][inter] bf16, out partials
   // [tokens][hidden][slots_per_token] fp32, y [kStepMaxRows][hidden] bf16.
-  const uint16_t* x = nullptr;
+  const uint16_t* x = nullptr;  // [kStepMaxRows][x_stride]: the consumers read a row at their own inner width
   uint16_t* act = nullptr;
   float* out = nullptr;
   uint16_t* y = nullptr;
+  uint16_t* proj = nullptr;     // the projections' outputs, bf16, at each pool's out_offset
+  float* proj_part = nullptr;   // the projections' slab partials, fp32, at each pool's part_offset
+  int x_stride = 0;             // elements a row of x
   int hidden = 0;
   int inter = 0;
   unsigned consumer_smem = 0;  // dynamic shared memory the consumer units need
@@ -114,6 +119,8 @@ int step_stream_capacity(unsigned smem_bytes = 0);
 cudaError_t launch_step_stream(const StepStreamParams& p, int workers, cudaStream_t stream);
 // Whether the kernel holds the MXFP4 consumer for this hidden and intermediate width.
 bool step_stream_has_mxfp4_consumer(int hidden, int inter);
+// Whether the kernel holds the fp8 projection form for a [rows, k] matrix.
+bool step_stream_has_fp8_matrix(int k, int rows);
 // The shared memory the MXFP4 consumer needs at this intermediate width.
 unsigned step_stream_mxfp4_smem(int inter);
 // The partials' index: token-major, the slots of one output element in one sector.

@@ -175,4 +175,29 @@ __global__ void mxfp4_row_down(dgpp::step::Mxfp4Expert e, dgpp::step::Mxfp4Group
   }
 }
 
+// One row-major fp8 matrix for a token group: y[slot * N + row] as bf16,
+// the exact value as fp32 beside it (yf) and the terms' magnitudes (mag).
+__global__ void fp8_matrix(const uint8_t* w, const float* scales, dgpp::step::Mxfp4Group g, const uint16_t* x, int x_stride, int K, int N,
+                           int block, uint16_t* y, float* yf, float* mag) {
+  const int row = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row >= N) return;
+  const int sc_cols = K / block;
+  const uint8_t* pay = w + static_cast<size_t>(row) * K;
+  const float* sc = scales + static_cast<size_t>(row / block) * sc_cols;
+  for (int r = 0; r < g.count; ++r) {
+    const int slot = g.slots[r], tok = g.tokens[r];
+    double a = 0.0, m = 0.0;
+    for (int k = 0; k < K; ++k) {
+      const double term = static_cast<double>(e4m3_value(pay[k])) * static_cast<double>(sc[k / block]) *
+                          static_cast<double>(dgpp::bf16_bits_to_float(x[static_cast<size_t>(tok) * x_stride + k]));
+      a += term;
+      m += fabs(term);
+    }
+    const size_t idx = static_cast<size_t>(slot) * N + row;
+    y[idx] = dgpp::float_to_bf16_bits(static_cast<float>(a));
+    yf[idx] = static_cast<float>(a);
+    mag[idx] = static_cast<float>(m);
+  }
+}
+
 }  // namespace step_ref
