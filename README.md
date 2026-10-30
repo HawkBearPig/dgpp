@@ -220,6 +220,9 @@ or TLS. Bind to `127.0.0.1` and put a reverse proxy in front for
 anything beyond a trusted network. The
 [nginx example](deploy/nginx.example.conf) is a starting point.
 
+Manual builds can opt into [table masks for free JSON strings](docs/json-mask-performance.md).
+The build option is off by default; normal setup retains the existing behavior.
+
 ### Send a request
 
 Reasoning tokens count toward `max_tokens`, so this short example

@@ -157,6 +157,10 @@ and troubleshooting.
    For an offline build, prefetch PCRE2 10.45 and set
    `-DFETCHCONTENT_SOURCE_DIR_PCRE2=/path/to/pcre2-10.45` during configuration.
 
+   JSON masking has an optional build-time fast path, default off. See
+   [JSON mask CPU replay](json-mask-performance.md) for enabling
+   `DGPP_JSON_FREE_STRING_MASK`, checking both builds and measuring its scope.
+
    Check the CUDA 13 compiler with `nvcc --version`. If that command is missing,
    try `/usr/local/cuda/bin/nvcc --version`: the toolkit may already be installed
    outside your shell's `PATH`. See [build setup](#5-build-the-server-on-rank-0)

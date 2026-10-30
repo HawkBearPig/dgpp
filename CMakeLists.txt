@@ -36,6 +36,7 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 option(DGPP_WERROR "Treat compiler warnings as errors" OFF)
 option(DGPP_BUILD_BENCHMARKS "Build platform, kernel and transport microbenchmarks" ON)
+option(DGPP_JSON_FREE_STRING_MASK "Use table masks inside unconstrained JSON value strings" OFF)
 set(DGPP_SANITIZE "" CACHE STRING "Host sanitizer (address or undefined)")
 set_property(CACHE DGPP_SANITIZE PROPERTY STRINGS "" address undefined)
 
@@ -269,6 +270,9 @@ add_library(dgpp_text STATIC
   src/text/string_constraint.cpp
   src/text/json_grammar.cpp)
 target_link_libraries(dgpp_text PUBLIC dgpp_loaders dgpp_pcre2)
+if(DGPP_JSON_FREE_STRING_MASK)
+  target_compile_definitions(dgpp_text PRIVATE DGPP_JSON_FREE_STRING_MASK=1)
+endif()
 dgpp_set_common(dgpp_text)
 
 add_library(dgpp_sched STATIC
@@ -2642,6 +2646,10 @@ if(DGPP_BUILD_BENCHMARKS)
 
   dgpp_add_benchmark(host_penalties_bench
     SOURCES benchmarks/micro/host_penalties_bench.cpp)
+
+  dgpp_add_benchmark(json_mask_bench
+    SOURCES tools/json_mask_bench.cpp
+    LIBRARIES dgpp_text Threads::Threads)
 
   dgpp_add_benchmark(micro_mem_bw
     SOURCES benchmarks/micro/mem_bw.cu src/common/log.cpp
