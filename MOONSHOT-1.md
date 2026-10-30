@@ -725,6 +725,111 @@ checkpoint's layout today at 92 percent, and the layout version lands when
 the loader's transform and the prefill readers' address map are ready
 rather than before any family can be ported.
 
+### 1.4 Beyond the pass: the hypotheses of 2026-10-30
+
+Pillar 1 as built makes the memory busy at a fixed byte count. With every
+weight computed the layers run at 88 to 90 percent of the byte floor, the
+fused chain is owed, and the C1 code target of 39 ms is the pass at 107
+percent of the 36.3 ms floor. Even a perfect pass caps the pillar near
+1.30x on C1 code (47.1 ms today over 36.3). Everything past that is fewer
+bytes a pass or more tokens a pass. The hypotheses below widen the search
+in that order, each with the experiment that decides it and the decision
+rule, and each has its checklist item in section 5. None touches the graph
+engine's paths, and every one keeps the lossless rule: a wrong guess costs
+bandwidth or lines, never a bit of a result.
+
+**H1. A speculative lead over predicted experts.** The lead can only run
+ahead on fixed-class bytes, about 55 MB of a 731 MB layer at C8 and the
+reason the C8 experiment found it worth 3 to 6 points, and the fixed
+phases idle at their edges because no byte of the next phase may be
+touched before its router. A guess at the next layer's routed experts
+gives the lead unbounded material: idle workers stream predicted expert
+units during any sub-40-SM stretch, and the chain's run list supersedes
+the guess when it lands. The economics are better than a recall figure
+suggests. The lead streams only when workers are idle, when the memory
+would otherwise be idle, so a wrong guess costs L2 lines rather than time,
+and the governor and the L2 cap bound it. Experiment: `dsv41_forward_check`
+already dumps every walked layer's routed expert ids per token over a
+prompt on the real checkpoint at world 1 through the streaming loader, so
+three texts of about two thousand tokens each (prose, code, JSON) give the
+routing of the model as served, and an analysis script measures, per
+layer, how many of the six true experts fall inside predicted sets of 6,
+12 and 18 from three predictors the streamer could hold: the same token's
+experts at the previous layer (a co-occurrence table), the token's
+identity (a per-layer table, scored leave-one-out), and the previous
+token's experts at the same layer (temporal locality, known a whole step
+early). Decision: recall of 60 percent or more at a set of 12 from any
+predictor available in time builds the speculative lead as a pool of
+predicted units in the lead's sequence, below 40 drops it, between the two
+it goes through the replay model first.
+
+**H2. A streaming unit with more bytes in flight.** The plateau's
+mechanism is one SM at 5 to 6 GB/s under load because its bytes in flight,
+16 KB a block at four 16-byte loads a lane, sit against the loaded
+memory's latency. Bulk copies into shared memory behind an mbarrier
+pipeline put most of the 99 KB a block in flight from one issuing thread.
+If sixteen SMs could then saturate the memory, a sub-40-SM stretch would
+no longer leave it idle and the other SMs would be free for the chain. The
+probes set TMA aside because deep rings interfered with the fold's host
+polling, a finding from a different structure that this one has to
+re-measure. Experiment: a scratch microbenchmark streaming disjoint
+regions from 1 to 48 blocks in four forms, the plain four-deep ring of
+today, plain rings eight and sixteen deep, and bulk copies two and three
+stages of 32 KB deep, each cold, with the device's utilization recorded.
+Decision: a form that reaches 200 GB/s from sixteen SMs where the plain
+form does not becomes a staged variant of the projection unit (the
+consumer reading its fragments from shared memory) and the fixed phases
+are re-measured with it, a plain ring that reaches it merely deepens the
+ring where registers allow, and neither reaching it closes the question
+in favour of the fused chain alone.
+
+**H3. The owned lead.** The lead table of section 2.1 counts 23 MB and the
+L2 part, 16 MB, is built. The other 7 MB is register and shared-memory
+staging owned by the CTA that will consume it, which needs the stationary
+tile assignment of the fixed matrices that phase 3 lists. It hides about
+30 µs more latency a layer and lets the fixed phases run from on-chip
+bytes. No experiment decides it, the fused chain's measurement does.
+
+**H4. Fewer bytes a pass, losslessly.** Each is a few percent of the floor
+and they compound.
+
+| Cut | Bytes a pass per rank | At the ceiling | Condition |
+|---|---|---|---|
+| the ranges every rank reads whole (wq_a, wkv, the indexer, the compressor, the router, the mHC coefficients) sharded, their outputs gathered by the fold | about 685 MB read today, about 510 MB saved | about 2.1 ms saved, one more fold a layer at phase 4's 15 µs costs 0.65 ms | the in-kernel fold of phase 4 |
+| bf12 companions for the remaining bf16 fixed ranges (the Engram projections, the hyper-connection coefficients, the indexer, the compressor, the router) | about 70 MB | about 0.3 ms | the bf12 form as a consumer, exact by construction |
+| the 2-bit screen on the head's two reads | about 180 MB a read | about 0.75 ms a read | the bound that makes the screen exact has to be proven, not assumed, and the second read's inputs depend on the first's argmax, so the reads stay two |
+
+Together they move the floor from 36.3 ms toward about 33 ms, and the same
+107 percent pass becomes about 1.35x. The first brainstorm of the day
+listed reading the head once for the verify and draft rows as a fourth
+cut. It is not one: the draft block's rows take the tokens the verify
+read's argmax picks, so the second read cannot start before the first
+ends, and the screen is the lever on it.
+
+**H5. Tokens a pass.** A C1 pass reads 8.7 GB whether it yields three
+accepted tokens or five, so every accepted token above today's average is
+worth more than the whole of this pillar. Rows cost experts: each verify
+row adds about five distinct experts a layer, about 1 GB a pass, about 4
+ms, so wider trees pay only where acceptance is high. This is pillar 2's
+depth schedule, and what the step engine owes it is the number the
+schedule needs, the measured distinct-byte cost of a row by class from the
+floor meter.
+
+**H6. Smaller items.** The ceiling has about 5 percent of play by access
+pattern, 233 GB/s for the 32-byte runs and 248 for the tile-major down, so
+a DRAM sector-efficiency measurement under `ncu` per consumer form tells
+how much of each form's traffic is partial sectors, and the floor should
+carry the measured ceiling of the form it uses. Locked clocks cut the fold
+skew's tail by a quarter in the phase-0 decomposition and are an
+operational setting. The fused chain's own latency budget is 72 µs a
+layer, so every 10 µs saved there is 1 percent of the pass, the mHC site
+being the largest piece.
+
+The order of work: a measurement sprint of the three experiments that
+decide a direction (H1's routing predictability, H2's per-SM rate by form,
+H6's sector efficiency), none touching production and each about a day,
+while the fused chain continues, since H1 and H3 land inside it.
+
 ### 1.1 A second engine behind a flag
 
 The step engine is new code beside the engines that exist, selected per
@@ -1796,6 +1901,14 @@ area, untracked.
       64 KB runs), `cp.async` activation windows and the tile-major
       fragment path, and the replay model comparison once the replay model
       is repo code rather than the scratch script.
+- [ ] The speculative lead (hypothesis H1 of section 1.4): predicted
+      expert units of the next layer in the lead's sequence behind the
+      fixed units, streamed by idle workers within the L2 cap, superseded
+      by the chain's run list. Experiment first: the routing of the three
+      texts from `dsv41_forward_check` and the per-layer recall of the
+      three predictors at sets of 6, 12 and 18. Gate: the layers with
+      every weight computed at or above the synthetic 100 to 103 percent
+      of their floor, and the step bitwise its own with the lead off.
 - [x] Hand-off primitives with cycle deadlines and the common exit path,
       the status word, the engine watchdog's poison. Gate: a withheld flag
       ends the kernel inside the deadline with a legible status on every
@@ -1919,6 +2032,24 @@ area, untracked.
       every weight computed, the fixed phases' unit quantization being the
       residue (section 1.3). Their inputs are synthetic until the fused
       chain feeds them; the bf12 head form stays unbuilt.
+- [ ] The streaming unit's bytes in flight (hypothesis H2 of section
+      1.4): the per-SM rate by form from one to 48 blocks, the plain
+      four-deep ring against eight- and sixteen-deep rings and against
+      bulk copies two and three 32 KB stages deep into shared memory, cold.
+      Decision rule in section 1.4. If a form wins, the projection unit
+      gains a shared-memory staged variant and the fixed phases are
+      re-measured.
+- [ ] The ceiling per form (hypothesis H6): DRAM bytes and sectors read
+      under `ncu` for each consumer's plain grid against the bytes the
+      plan says it reads, the floor carrying the measured ceiling of the
+      form it uses.
+- [ ] Fewer bytes a pass (hypothesis H4): bf12 companions for the
+      remaining bf16 fixed ranges through the bf12 consumer, the ranges
+      every rank reads whole sharded with their outputs gathered by the
+      fold once phase 4 lands, the 2-bit screen on the head's reads once
+      its bound is proven. Gates: every cut bitwise against the unsharded,
+      unscreened step, and the plan's step bytes falling by the table's
+      figures.
 - [ ] The vocabulary head and the 2-bit screen as consumers, the pick's
       digit table as a fold payload, the pick ABI with instances, request
       slots and verify rows as three numbers.
