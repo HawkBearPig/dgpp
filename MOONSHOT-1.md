@@ -907,7 +907,12 @@ against the down's 247) and the grabs' prologues are the next levers,
 with the fixed phases' tails after them. The fused chain's value for the
 C1 target is accordingly smaller than the plan assumed, since the lead
 already covers the design's latency, and its value is the latency it
-removes from the pass itself.
+removes from the pass itself. A last probe cleared the pair's request
+pattern: two streams a warp 4 MB apart read 238 GB/s at 48 blocks, as do
+one stream of 512-byte runs and one of 1 KB runs, so a pure stream's
+ceiling on this device is 237 to 238 and the pair's 233 is 98 percent of
+it. The expert phase's remaining 4 percent of the layer is the stream's
+structure around the units, not the bytes.
 
 **H3. The owned lead.** The lead table of section 2.1 counts 23 MB and the
 L2 part, 16 MB, is built. The other 7 MB is register and shared-memory
@@ -2223,16 +2228,20 @@ area, untracked.
       latency (8 and 12), not its units, which take 2 µs each. The median
       layer with every weight computed stands at 89 percent of its floor,
       plus or minus two between runs.
-- [ ] The residue after the lead: the expert forms inside the stream at
-      93 to 94 percent of the ceiling (the tile-major pair reads 233 GB/s
-      as a plain grid against the down's 247, request granularity, and
-      the stream adds the grabs' prologues), about 6 percent; the fixed
-      phases' tails and hand-outs, about 3 percent. Levers: the pair's
-      runs lengthened or its gate and up tiles adjacent (the arena's
-      second layout version, the loader transform owed), fewer and
-      larger down grabs, finer tails. Gate: the layers with every weight
-      computed at or above 95 percent of their floor with the design
-      chain's latencies.
+- [ ] The residue after the lead: the expert phase inside the stream at
+      93 to 94 percent of the ceiling, about 4 percent of the layer, and
+      the fixed phases' tails and hand-outs, about 3. A probe of the
+      pair's request pattern cleared it: a warp streaming a gate and an
+      up tile 4 MB apart reads 238 GB/s at 48 blocks, the same as one
+      stream of 512-byte or 1 KB runs (237 to 238.5), so the pair's 233
+      as a plain grid is 98 percent of what a pure stream reads and the
+      layout's second version would not buy the expert phase its gap.
+      What is left there is the stream's own structure: the hand-out
+      (about 9 µs a layer), the drain (8 to 12), the down grabs'
+      prologues and the forms' 2 percent. Levers: larger down units,
+      the drain's tail, and the fixed phases' tails. Gate: the layers
+      with every weight computed at or above 95 percent of their floor
+      with the design chain's latencies.
 - [x] The ceiling per form (hypothesis H6), measured 2026-10-30: the
       tile-major forms miss exactly their bytes at L2 (415.2 MB of
       misses for a 414 MB sweep) at 2.9 to 3.9 sectors a request, the
