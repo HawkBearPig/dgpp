@@ -21,7 +21,9 @@
 #include "common/cuda_check.hpp"
 #include "common/dtypes.hpp"
 #include "common/test.hpp"
+#include "kernels/step/fp8_dense.cuh"
 #include "kernels/step/mxfp4_expert.cuh"
+#include "step_reference.cuh"
 
 namespace {
 
@@ -403,6 +405,205 @@ DGPP_TEST(mxfp4_consumer_plain_grid_rate) {
     DGPP_CUDA_OK(cudaEventElapsedTime(&m2, e1, e2));
     std::printf("   plain grids, %s, %zu distinct experts in %d groups: gate and up %.0f us = %.0f GB/s (%.0f MB) | down %.0f us = %.0f GB/s (%.0f MB)\n",
                 rep ? "L2-warm where it fits" : "cold", distinct_experts.size(), rig->groups, m1 * 1e3, pair_mb / m1, pair_mb, m2 * 1e3, down_mb / m2, down_mb);
+  }
+}
+
+// ---- the row-major fp8 pair and down with F32 scales on 32 x 32 blocks (the shared expert's form)
+
+namespace {
+
+constexpr int kFp8Block = 32;
+constexpr size_t kFp8Pair = static_cast<size_t>(kI) * kH, kFp8PairSc = static_cast<size_t>(kI / kFp8Block) * (kH / kFp8Block) * 4;
+constexpr size_t kFp8Down = static_cast<size_t>(kH) * kI, kFp8DownSc = static_cast<size_t>(kH / kFp8Block) * (kI / kFp8Block) * 4;
+constexpr size_t kF8OffGateSc = align_up(kFp8Pair), kF8OffUp = kF8OffGateSc + align_up(kFp8PairSc), kF8OffUpSc = kF8OffUp + align_up(kFp8Pair),
+                 kF8OffDown = kF8OffUpSc + align_up(kFp8PairSc), kF8OffDownSc = kF8OffDown + align_up(kFp8Down),
+                 kFp8ExpertBytes = kF8OffDownSc + align_up(kFp8DownSc);
+
+__host__ __device__ Fp8Expert fp8_expert_at(const uint8_t* arena, int e) {
+  const uint8_t* b = arena + static_cast<size_t>(e) * kFp8ExpertBytes;
+  Fp8Expert x;
+  x.gate = b;
+  x.gate_scales = reinterpret_cast<const float*>(b + kF8OffGateSc);
+  x.up = b + kF8OffUp;
+  x.up_scales = reinterpret_cast<const float*>(b + kF8OffUpSc);
+  x.down = b + kF8OffDown;
+  x.down_scales = reinterpret_cast<const float*>(b + kF8OffDownSc);
+  return x;
+}
+// e4m3 normals (exponent 1..13, no NaN, no subnormals) and F32 scales in [0.5, 2).
+__global__ void init_fp8_experts(uint8_t* arena, int experts) {
+  const size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= static_cast<size_t>(experts) * kFp8ExpertBytes) return;
+  const size_t off = i % kFp8ExpertBytes;
+  const bool scale = (off >= kF8OffGateSc && off < kF8OffUp) || (off >= kF8OffUpSc && off < kF8OffDown) || off >= kF8OffDownSc;
+  unsigned h = static_cast<unsigned>(i * 2654435761ull) ^ static_cast<unsigned>(i >> 17) ^ 0x7f4a7c15u;
+  h ^= h >> 13; h *= 0x85ebca6bu; h ^= h >> 16;
+  if (!scale) {
+    arena[i] = static_cast<uint8_t>((h & 0x80) | ((1 + (h >> 8) % 13) << 3) | ((h >> 16) & 7));
+    return;
+  }
+  if ((off & 3) == 0) {
+    const size_t w = i & ~size_t{3};
+    unsigned hw = static_cast<unsigned>(w * 2654435761ull) ^ 0x1234567u;
+    hw ^= hw >> 13; hw *= 0x85ebca6bu; hw ^= hw >> 16;
+    const float sv = 0.5f + (hw % 1536) / 1024.0f;
+    uint32_t u;
+    memcpy(&u, &sv, 4);
+    arena[i] = u & 0xff; arena[i + 1] = (u >> 8) & 0xff; arena[i + 2] = (u >> 16) & 0xff; arena[i + 3] = (u >> 24) & 0xff;
+  }
+}
+__global__ void __launch_bounds__(kMxfp4Threads) fp8_gate_up_kernel(const uint8_t* arena, GroupTable t, const uint16_t* x, uint16_t* act) {
+  extern __shared__ __align__(128) uint8_t smem[];
+  const Mxfp4Group g = group_of(t, blockIdx.y);
+  fp8_gate_up<kH, kI, kFp8Block>(fp8_expert_at(arena, t.expert[blockIdx.y]), g, blockIdx.x, x, act, smem);
+}
+__global__ void __launch_bounds__(kMxfp4Threads) fp8_down_kernel(const uint8_t* arena, GroupTable t, const uint16_t* act, float* out) {
+  extern __shared__ __align__(128) uint8_t smem[];
+  const Mxfp4Group g = group_of(t, blockIdx.y);
+  mxfp4_stage_down_act<kI>(act, g, smem);
+  __syncthreads();
+  fp8_down<kH, kI, kFp8Block>(fp8_expert_at(arena, t.expert[blockIdx.y]), g, blockIdx.x, smem, out, OutIndex{});
+}
+
+struct Fp8Rig {
+  std::unique_ptr<Rig> base;  // the slots, groups, x, act and out buffers
+  uint8_t* arena = nullptr;
+  ~Fp8Rig() { cudaFree(arena); }
+};
+std::unique_ptr<Fp8Rig> make_fp8_rig(int experts, int rows, int max_group, unsigned seed) {
+  auto r = std::make_unique<Fp8Rig>();
+  r->base = make_rig(experts, rows, max_group, seed);
+  size_t free_b = 0, total = 0;
+  DGPP_CUDA_OK(cudaMemGetInfo(&free_b, &total));
+  const size_t need = static_cast<size_t>(experts) * kFp8ExpertBytes + (size_t{64} << 20);
+  if (free_b < need) dgpp::test::skip("needs " + std::to_string(need >> 20) + " MB free, " + std::to_string(free_b >> 20));
+  DGPP_CUDA_OK(cudaMalloc(&r->arena, static_cast<size_t>(experts) * kFp8ExpertBytes));
+  init_fp8_experts<<<static_cast<unsigned>((static_cast<size_t>(experts) * kFp8ExpertBytes + 255) / 256), 256>>>(r->arena, experts);
+  DGPP_CUDA_OK(cudaDeviceSynchronize());
+  return r;
+}
+void run_fp8_consumer(const Fp8Rig& f) {
+  const Rig& r = *f.base;
+  fp8_gate_up_kernel<<<dim3((kI + kMxfp4UnitRows - 1) / kMxfp4UnitRows, static_cast<unsigned>(r.groups)), kMxfp4Threads, kSmem>>>(f.arena, r.table(), r.x, r.act);
+  fp8_down_kernel<<<dim3(kH / kMxfp4UnitRows, static_cast<unsigned>(r.groups)), kMxfp4Threads, kSmem>>>(f.arena, r.table(), r.act, r.out);
+}
+
+}  // namespace
+
+DGPP_TEST(fp8_consumer_matches_the_reference) {
+  auto f = make_fp8_rig(48, 8, 32, 17);
+  const Rig& rig = *f->base;
+  DGPP_CUDA_OK(cudaFuncSetAttribute(fp8_gate_up_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem));
+  DGPP_CUDA_OK(cudaFuncSetAttribute(fp8_down_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem));
+  DGPP_CUDA_OK(cudaMemset(rig.act, 0, rig.act_elems * 2));
+  DGPP_CUDA_OK(cudaMemset(rig.out, 0, rig.out_elems * 4));
+  run_fp8_consumer(*f);
+  DGPP_CUDA_OK(cudaDeviceSynchronize());
+  const std::vector<uint16_t> act = download(rig.act, rig.act_elems);
+  const std::vector<float> out = download(rig.out, rig.out_elems);
+  float *gu = nullptr, *gu_mag = nullptr, *abs_sum = nullptr;
+  DGPP_CUDA_OK(cudaMalloc(&gu, rig.act_elems * 8));
+  DGPP_CUDA_OK(cudaMalloc(&gu_mag, rig.act_elems * 8));
+  DGPP_CUDA_OK(cudaMalloc(&abs_sum, rig.out_elems * 4));
+  for (int g = 0; g < rig.groups; ++g) {
+    Mxfp4Group grp;
+    grp.slots = rig.slots + g * kMxfp4GroupRows;
+    grp.tokens = rig.tokens + g * kMxfp4GroupRows;
+    grp.count = rig.h_count[static_cast<size_t>(g)];
+    step_ref::fp8_gate_up<<<(kI + 127) / 128, 128>>>(fp8_expert_at(f->arena, rig.h_expert[static_cast<size_t>(g)]), grp, rig.x, kH, kI, kFp8Block, rig.act, gu, gu_mag);
+  }
+  DGPP_CUDA_OK(cudaDeviceSynchronize());
+  const std::vector<uint16_t> act_r = download(rig.act, rig.act_elems);
+  const std::vector<float> gu_h = download(gu, rig.act_elems * 2), gu_m = download(gu_mag, rig.act_elems * 2);
+  DGPP_CUDA_OK(cudaMemcpy(rig.act, act.data(), rig.act_elems * 2, cudaMemcpyHostToDevice));  // the down judged on the consumer's act
+  for (int g = 0; g < rig.groups; ++g) {
+    Mxfp4Group grp;
+    grp.slots = rig.slots + g * kMxfp4GroupRows;
+    grp.tokens = rig.tokens + g * kMxfp4GroupRows;
+    grp.count = rig.h_count[static_cast<size_t>(g)];
+    step_ref::fp8_down<<<kH / 128, 128>>>(fp8_expert_at(f->arena, rig.h_expert[static_cast<size_t>(g)]), grp, rig.act, kH, kI, kFp8Block, kSlotsPerToken, rig.out, abs_sum);
+  }
+  DGPP_CUDA_OK(cudaDeviceSynchronize());
+  const std::vector<float> out_r = download(rig.out, rig.out_elems), mag = download(abs_sum, rig.out_elems);
+  cudaFree(gu); cudaFree(gu_mag); cudaFree(abs_sum);
+  const std::vector<bool> live = live_slots(rig);
+  size_t exact = 0, ok = 0, bad = 0, n = 0, out_bad = 0, out_n = 0;
+  for (size_t i = 0; i < act.size(); ++i) {
+    if (!live[i / kI]) continue;
+    ++n;
+    if (act[i] == act_r[i]) ++exact;
+    else if (step_ref::act_ok(act[i], act_r[i], gu_h[2 * i], gu_h[2 * i + 1], gu_m[2 * i], gu_m[2 * i + 1])) ++ok;
+    else ++bad;
+  }
+  for (size_t i = 0; i < out.size(); ++i) {
+    const int slot = static_cast<int>((i / kSlotsPerToken) / kH) * kSlotsPerToken + static_cast<int>(i % kSlotsPerToken);
+    if (!live[static_cast<size_t>(slot)]) continue;
+    ++out_n;
+    if (!step_ref::partial_ok(out[i], out_r[i], mag[i])) ++out_bad;
+  }
+  std::printf("   fp8 row-major, %d groups of %d rows: act %zu exact, %zu within the envelope, %zu beyond of %zu; partials %zu beyond the bound of %zu\n",
+              rig.groups, rig.rows, exact, ok, bad, n, out_bad, out_n);
+  require(bad == 0, "fp8 gate and up outputs beyond the reference's envelope");
+  require(out_bad == 0, "fp8 down partials beyond the fp32 bound");
+}
+
+DGPP_TEST(fp8_consumer_is_bitwise_across_launches_and_group_sizes) {
+  auto grouped = make_fp8_rig(48, 8, 32, 19);
+  auto alone = make_fp8_rig(48, 8, 1, 19);
+  DGPP_CUDA_OK(cudaFuncSetAttribute(fp8_gate_up_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem));
+  DGPP_CUDA_OK(cudaFuncSetAttribute(fp8_down_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem));
+  auto run = [&](Fp8Rig& f, uint8_t sentinel) {
+    DGPP_CUDA_OK(cudaMemset(f.base->act, sentinel, f.base->act_elems * 2));
+    DGPP_CUDA_OK(cudaMemset(f.base->out, sentinel, f.base->out_elems * 4));
+    run_fp8_consumer(f);
+    DGPP_CUDA_OK(cudaDeviceSynchronize());
+    return std::make_pair(download(f.base->act, f.base->act_elems), download(f.base->out, f.base->out_elems));
+  };
+  const auto first = run(*grouped, 0x00), second = run(*grouped, 0x7f);
+  // The two rigs hold the same bytes (the same seed and shape): the lone-slot run reads the grouped arena.
+  cudaFree(alone->arena);
+  alone->arena = grouped->arena;
+  const auto solo = run(*alone, 0x00);
+  alone->arena = nullptr;
+  const std::vector<bool> live = live_slots(*grouped->base);
+  auto same_live = [&](const std::vector<uint16_t>& a, const std::vector<uint16_t>& b, const std::vector<float>& oa, const std::vector<float>& ob) {
+    for (size_t i = 0; i < a.size(); ++i)
+      if (live[i / kI] && a[i] != b[i]) return false;
+    for (size_t i = 0; i < oa.size(); ++i) {
+      const int slot = static_cast<int>((i / kSlotsPerToken) / kH) * kSlotsPerToken + static_cast<int>(i % kSlotsPerToken);
+      if (live[static_cast<size_t>(slot)] && std::memcmp(&oa[i], &ob[i], 4) != 0) return false;
+    }
+    return true;
+  };
+  require(same_live(first.first, second.first, first.second, second.second), "fp8: repeat launches with a changing sentinel differ");
+  require(same_live(first.first, solo.first, first.second, solo.second), "fp8: a slot in a group of one differs from the same slot grouped");
+  std::printf("   fp8: %d grouped and %d single-slot units agree bitwise\n", grouped->base->groups, alone->base->groups);
+}
+
+DGPP_TEST(fp8_consumer_plain_grid_rate) {
+  auto f = make_fp8_rig(64, 32, 32, 23);  // 64 pairs of 8.85 MB: cold
+  const Rig& rig = *f->base;
+  DGPP_CUDA_OK(cudaFuncSetAttribute(fp8_gate_up_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem));
+  DGPP_CUDA_OK(cudaFuncSetAttribute(fp8_down_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem));
+  cudaEvent_t e0, e1, e2;
+  DGPP_CUDA_OK(cudaEventCreate(&e0));
+  DGPP_CUDA_OK(cudaEventCreate(&e1));
+  DGPP_CUDA_OK(cudaEventCreate(&e2));
+  std::vector<int> distinct;
+  for (int e : rig.h_expert) if (std::find(distinct.begin(), distinct.end(), e) == distinct.end()) distinct.push_back(e);
+  const double pair_mb = distinct.size() * 2.0 * (kFp8Pair + kFp8PairSc) / 1e6, down_mb = distinct.size() * (kFp8Down + kFp8DownSc) / 1e6;
+  for (int rep = 0; rep < 2; ++rep) {
+    DGPP_CUDA_OK(cudaEventRecord(e0));
+    fp8_gate_up_kernel<<<dim3((kI + kMxfp4UnitRows - 1) / kMxfp4UnitRows, static_cast<unsigned>(rig.groups)), kMxfp4Threads, kSmem>>>(f->arena, rig.table(), rig.x, rig.act);
+    DGPP_CUDA_OK(cudaEventRecord(e1));
+    fp8_down_kernel<<<dim3(kH / kMxfp4UnitRows, static_cast<unsigned>(rig.groups)), kMxfp4Threads, kSmem>>>(f->arena, rig.table(), rig.act, rig.out);
+    DGPP_CUDA_OK(cudaEventRecord(e2));
+    DGPP_CUDA_OK(cudaDeviceSynchronize());
+    float m1 = 0, m2 = 0;
+    DGPP_CUDA_OK(cudaEventElapsedTime(&m1, e0, e1));
+    DGPP_CUDA_OK(cudaEventElapsedTime(&m2, e1, e2));
+    std::printf("   fp8 plain grids, %s, %zu distinct pairs in %d groups: gate and up %.0f us = %.0f GB/s (%.0f MB) | down %.0f us = %.0f GB/s (%.0f MB)\n",
+                rep ? "L2-warm where it fits" : "cold", distinct.size(), rig.groups, m1 * 1e3, pair_mb / m1, pair_mb, m2 * 1e3, down_mb / m2, down_mb);
   }
 }
 

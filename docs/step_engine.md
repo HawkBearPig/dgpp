@@ -224,7 +224,32 @@ work. The accumulation is a worker phase of 512-output chunks that folds
 the routed partials in slot order with the shared slot last. In
 `step_stream_test` the consumers' outputs inside the kernel match the
 reference as the plain grids do, the accumulated rows are bitwise the
-ordered sum, and the first eight DeepSeek-V4.1 layers run at 96 to 98
+ordered sum, and the first eight DeepSeek-V4.1 layers run at 97 to 98
 percent of their byte floor at the median with the design chain
-interleaved, beside a serving production world.
+interleaved and every expert computed, on an idle device, 93 to 95 beside
+a serving production world.
+
+## The fp8 consumer
+
+The shared expert, and later the fp8 projections, keep the checkpoint's
+row-major layout and are read by the fp8 block-scaled consumer
+(`src/kernels/step/fp8_dense.cuh`). A unit is the same group and 128-row
+block as the MXFP4 form, eight warps on 16-row tiles, but a lane's sixteen
+bytes are half a 32-code chunk of one row, which alone would show the
+memory 32-byte runs. Before a warp starts a 512-byte slab of its sixteen
+rows it prefetches the next slab of every row into L2 with one bulk
+prefetch a row, so the fragment loads hit L2. Each chunk's e4m3 codes
+become bf16 exactly, the chunk's tensor-core partial is multiplied by the
+F32 scale of its 32 by 32 block (128 by 128 on GLM, by template) and
+accumulated, the slot kernels' structure, and the epilogue is the same
+SwiGLU.
+
+Inside the streamer the shared expert is the expert phase's second pool,
+one group of every token's shared slot. Its gate and up units are the
+longest of the phase and are handed out first, its bytes stay in the
+lead's sequence as lead-only segments so the lead prefetches them, and its
+partials take the shared slot of the accumulation. `step_consumer_test`
+checks the form against the reference as plain grids, where it streams
+the pair at 229 GB/s and the down at 216 over 60 cold pairs, and
+`step_stream_test` checks the shared expert's outputs inside the kernel.
 

@@ -10,6 +10,7 @@
 #include <cuda_runtime.h>
 
 #include "common/dtypes.hpp"
+#include "kernels/step/fp8_dense.cuh"
 #include "kernels/step/mxfp4_expert.cuh"
 
 namespace step_ref {
@@ -21,6 +22,11 @@ void launch_gate_up(const dgpp::step::Mxfp4Expert& e, const dgpp::step::Mxfp4Gro
 // One group's down over every row from `act` into the token-major partials and their magnitudes.
 void launch_down(const dgpp::step::Mxfp4Expert& e, const dgpp::step::Mxfp4Group& g, const uint16_t* act, int H, int I, int spt, float* out,
                  float* mag, cudaStream_t stream);
+// The row-major fp8 pair and down with F32 scales on block x block blocks.
+void launch_fp8_gate_up(const dgpp::step::Fp8Expert& e, const dgpp::step::Mxfp4Group& g, const uint16_t* x, int H, int I, int block,
+                        uint16_t* act, float* gu, float* mag, cudaStream_t stream);
+void launch_fp8_down(const dgpp::step::Fp8Expert& e, const dgpp::step::Mxfp4Group& g, const uint16_t* act, int H, int I, int block, int spt,
+                     float* out, float* mag, cudaStream_t stream);
 
 // The host's copy of the epilogue, for the error envelope.
 inline uint16_t host_swiglu(float gate, float up) {

@@ -104,19 +104,28 @@ std::unique_ptr<Rig> make_rig(int layers = kLayers, bool consumers = false) {
       DGPP_CUDA_OK(cudaDeviceSynchronize());
       cudaFree(offsets);
       cudaFree(bytes);
-      h_off.clear();
-      h_bytes.clear();
-      for (int l = c; l < layers; l += kCopies)
-        for (const Range& r : rig->plans[static_cast<size_t>(l)].ranges)
-          if (r.source == Source::Resident && r.format == Format::ScaleE8m0) { h_off.push_back(r.offset); h_bytes.push_back(r.bytes); }
-      DGPP_CUDA_OK(cudaMalloc(&offsets, h_off.size() * 8));
-      DGPP_CUDA_OK(cudaMalloc(&bytes, h_bytes.size() * 8));
-      DGPP_CUDA_OK(cudaMemcpy(offsets, h_off.data(), h_off.size() * 8, cudaMemcpyHostToDevice));
-      DGPP_CUDA_OK(cudaMemcpy(bytes, h_bytes.data(), h_bytes.size() * 8, cudaMemcpyHostToDevice));
-      step_stream_fill_ranges(rig->copies[static_cast<size_t>(c)], offsets, bytes, static_cast<int>(h_off.size()), 0x7f4au + c, 112, 24, nullptr);
-      DGPP_CUDA_OK(cudaDeviceSynchronize());
-      cudaFree(offsets);
-      cudaFree(bytes);
+      // Then the formats whose bytes must decode finitely: e8m0 scales in
+      // [112, 136), e4m3 payloads as normals, F32 scale grids in [0.5, 2).
+      struct Pass { Format format; StepFillMode mode; unsigned lo, span, seed; };
+      const Pass passes[3] = {{Format::ScaleE8m0, kFillBytes, 112, 24, 0x7f4au}, {Format::Fp8E4m3, kFillE4m3, 0, 0, 0x1357u},
+                              {Format::ScaleF32, kFillF32Scales, 0, 0, 0x2468u}};
+      for (const Pass& pass : passes) {
+        h_off.clear();
+        h_bytes.clear();
+        for (int l = c; l < layers; l += kCopies)
+          for (const Range& r : rig->plans[static_cast<size_t>(l)].ranges)
+            if (r.source == Source::Resident && r.format == pass.format) { h_off.push_back(r.offset); h_bytes.push_back(r.bytes); }
+        if (h_off.empty()) continue;
+        DGPP_CUDA_OK(cudaMalloc(&offsets, h_off.size() * 8));
+        DGPP_CUDA_OK(cudaMalloc(&bytes, h_bytes.size() * 8));
+        DGPP_CUDA_OK(cudaMemcpy(offsets, h_off.data(), h_off.size() * 8, cudaMemcpyHostToDevice));
+        DGPP_CUDA_OK(cudaMemcpy(bytes, h_bytes.data(), h_bytes.size() * 8, cudaMemcpyHostToDevice));
+        step_stream_fill_ranges(rig->copies[static_cast<size_t>(c)], offsets, bytes, static_cast<int>(h_off.size()), pass.seed + c, pass.lo,
+                                pass.span, nullptr, pass.mode);
+        DGPP_CUDA_OK(cudaDeviceSynchronize());
+        cudaFree(offsets);
+        cudaFree(bytes);
+      }
     }
   }
   return rig;
@@ -350,13 +359,18 @@ DGPP_TEST(step_consumers_in_the_stream_match_the_reference) {
   // The pools the layer's gate_up and down phases use.
   const DevPool* gate_up = nullptr;
   const DevPool* down = nullptr;
+  const DevPool* sh_gate_up = nullptr;
+  const DevPool* sh_down = nullptr;
   const DevLayer& dl = rig->dp.layers[static_cast<size_t>(L)];
   for (int P = dl.phase_begin; P < dl.phase_begin + dl.phase_count; ++P) {
     const DevPhase& ph = rig->dp.phases[static_cast<size_t>(P)];
     if (ph.pool >= 0 && rig->dp.pools[static_cast<size_t>(ph.pool)].kind == kPoolMxfp4GateUp) gate_up = &rig->dp.pools[static_cast<size_t>(ph.pool)];
     if (ph.pool >= 0 && rig->dp.pools[static_cast<size_t>(ph.pool)].kind == kPoolMxfp4Down) down = &rig->dp.pools[static_cast<size_t>(ph.pool)];
+    if (ph.pool2 >= 0 && rig->dp.pools[static_cast<size_t>(ph.pool2)].kind == kPoolFp8GateUp) sh_gate_up = &rig->dp.pools[static_cast<size_t>(ph.pool2)];
+    if (ph.pool2 >= 0 && rig->dp.pools[static_cast<size_t>(ph.pool2)].kind == kPoolFp8Down) sh_down = &rig->dp.pools[static_cast<size_t>(ph.pool2)];
   }
   require(gate_up && down, "the layer has a gate_up and a down consumer pool");
+  require(sh_gate_up && sh_down, "the layer has the shared expert's fp8 pools");
   const size_t slots = static_cast<size_t>(cfg.rows) * spt;
   const size_t act_n = slots * I, out_n = slots * H;
   std::vector<uint16_t> act(act_n);
@@ -398,6 +412,25 @@ DGPP_TEST(step_consumers_in_the_stream_match_the_reference) {
     step_ref::launch_gate_up(e, grp, s.x(), H, I, act_ref, gu, gu_mag, nullptr);
     step_ref::launch_down(e, grp, act_dev, H, I, spt, out_ref, out_mag, nullptr);
   }
+  {
+    // The shared expert: every token's shared slot through the fp8 pools.
+    Mxfp4Group grp;
+    grp.slots = ctl->shared_slots[L];
+    grp.tokens = ctl->shared_tokens[L];
+    grp.count = cfg.rows;
+    for (int i = 0; i < grp.count; ++i) live[static_cast<size_t>(grp.slots[i])] = true;
+    Fp8Expert f;
+    const uint8_t* gb = rig->bases[static_cast<size_t>(L)] + sh_gate_up->base;
+    f.gate = gb + sh_gate_up->offsets[0];
+    f.gate_scales = reinterpret_cast<const float*>(gb + sh_gate_up->offsets[1]);
+    f.up = gb + sh_gate_up->offsets[2];
+    f.up_scales = reinterpret_cast<const float*>(gb + sh_gate_up->offsets[3]);
+    const uint8_t* db = rig->bases[static_cast<size_t>(L)] + sh_down->base;
+    f.down = db + sh_down->offsets[0];
+    f.down_scales = reinterpret_cast<const float*>(db + sh_down->offsets[1]);
+    step_ref::launch_fp8_gate_up(f, grp, s.x(), H, I, 32, act_ref, gu, gu_mag, nullptr);
+    step_ref::launch_fp8_down(f, grp, act_dev, H, I, 32, spt, out_ref, out_mag, nullptr);
+  }
   DGPP_CUDA_OK(cudaDeviceSynchronize());
   std::vector<uint16_t> act_r(act_n);
   std::vector<float> gu_h(act_n * 2), gu_m(act_n * 2), out_r(out_n), out_m(out_n);
@@ -431,8 +464,8 @@ DGPP_TEST(step_consumers_in_the_stream_match_the_reference) {
       a = std::fma(1.0f, out[step_out_index(t * spt + cfg.top_k, c, H, spt)], a);
       if (float_to_bf16_bits(a) != y[static_cast<size_t>(t) * H + c]) ++y_bad;
     }
-  std::printf("   layer %d, %d experts in %d groups: act %zu exact, %zu within the envelope, %zu beyond of %zu; partials %zu beyond the bound of %zu; y %zu of %zu differ from the ordered sum\n",
-              L, groups, groups, exact, ok, bad, n, out_bad, out_n_live, y_bad, y.size());
+  std::printf("   layer %d, %d routed experts and the shared expert over %d rows: act %zu exact, %zu within the envelope, %zu beyond of %zu; partials %zu beyond the bound of %zu; y %zu of %zu differ from the ordered sum\n",
+              L, groups, cfg.rows, exact, ok, bad, n, out_bad, out_n_live, y_bad, y.size());
   require(bad == 0, "gate and up outputs beyond the reference's envelope inside the stream");
   require(out_bad == 0, "down partials beyond the fp32 bound inside the stream");
   require(y_bad == 0, "the accumulated output is not the ordered sum of the partials");

@@ -59,6 +59,10 @@ struct alignas(128) StepCtl {
   int32_t group_tokens[kStepMaxLayers][kStepMaxGroups][32];
   int32_t group_count[kStepMaxLayers][kStepMaxGroups];
   unsigned gate_done[kStepMaxLayers][kStepMaxGroups];  // gate and up units of the group completed this step
+  // The shared expert's group: every token's shared slot (slot = t * (top_k + 1) + top_k).
+  int32_t shared_slots[kStepMaxLayers][32];
+  int32_t shared_tokens[kStepMaxLayers][32];
+  unsigned shared_gate_done[kStepMaxLayers];
   unsigned long long stamp_begin[kStepMaxPhases];  // the last pass: the phase's publish or latency start
   unsigned long long stamp_end[kStepMaxPhases];    // the last pass: its units done, the fold after it included
   unsigned long long idle_first[kStepMaxPhases];   // the last pass: the first worker to find the phase drained
@@ -119,9 +123,11 @@ __host__ __device__ inline size_t step_out_index(int slot, int row, int hidden, 
 }
 constexpr int kStepAccChunk = 512;  // outputs an accumulation unit folds
 // Test fixtures' fills: every listed range [offsets[i], +bytes[i]) of `base`
-// with hashed bytes in [lo, lo + span), and the activations x as small bf16.
+// with hashed bytes in [lo, lo + span) (kFillBytes), e4m3 normals (kFillE4m3)
+// or F32 in [0.5, 2) (kFillF32Scales); and the activations x as small bf16.
+enum StepFillMode : unsigned { kFillBytes = 0, kFillE4m3 = 1, kFillF32Scales = 2 };
 void step_stream_fill_ranges(uint8_t* base, const unsigned long long* offsets, const unsigned long long* bytes, int n, unsigned seed,
-                             unsigned lo, unsigned span, cudaStream_t stream);
+                             unsigned lo, unsigned span, cudaStream_t stream, StepFillMode mode = kFillBytes);
 void step_stream_init_x(uint16_t* x, int n, unsigned seed, cudaStream_t stream);
 
 }  // namespace dgpp::step

@@ -20,10 +20,11 @@ reaches 95 percent of the ceiling, the deadline and poison exits end the
 kernel with their status, and the step protocol runs a thousand-step soak
 from the device token feed, host work beside a pending kernel, a skip, the
 sequence boundaries and a late gather. GPU, about 4 GB free, skips
-otherwise. `step_consumer_test` is the MXFP4 expert consumer's gate: within
-two bf16 ulps or the accumulation envelope of a double-precision reference
-over tile-major bytes, bitwise across launches and group sizes, the plain
-grids' rate reported. GPU, about 1 GB free.
+otherwise. `step_consumer_test` is the gate of the MXFP4 expert consumer
+and of the row-major fp8 consumer: within two bf16 ulps or the
+accumulation envelope of a double-precision reference, bitwise across
+launches and group sizes, the plain grids' rate reported. GPU, about 1 GB
+free.
 
 `chat_template_generator_test` exercises the Python golden generator's Jinja
 sandbox without a checkpoint or GPU. It checks private-attribute restrictions,

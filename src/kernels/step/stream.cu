@@ -1,6 +1,7 @@
 // The step engine's streamer (kernels/step/stream.hpp).
 #include "kernels/step/stream.hpp"
 
+#include "kernels/step/fp8_dense.cuh"
 #include "kernels/step/mxfp4_expert.cuh"
 
 namespace dgpp::step {
@@ -11,6 +12,7 @@ constexpr unsigned kStateIdle = 0, kStateStream = 1, kStateEnd = 2;
 // The MXFP4 consumer's shape compiled into this kernel: DeepSeek-V4.1 at
 // world 4. Other shapes come with their family ports.
 constexpr int kConsumerH = 5120, kConsumerI = 576;
+constexpr int kConsumerFp8Block = 32;  // DeepSeek-V4.1's fp8 scale grid
 
 struct OutIndex {
   int hidden, spt;
@@ -60,7 +62,23 @@ __device__ __forceinline__ unsigned own_units(const StepStreamParams& p, int lay
   if (ph.accumulate) return (static_cast<unsigned>(p.ctl->rows) * static_cast<unsigned>(p.hidden) + kStepAccChunk - 1) / kStepAccChunk;
   unsigned n = ph.fixed_units;
   if (ph.pool >= 0) n += static_cast<unsigned>(p.ctl->run_count[layer]) * static_cast<unsigned>(p.pools[ph.pool].units_per_group);
+  if (ph.pool2 >= 0) n += static_cast<unsigned>(p.pools[ph.pool2].units_per_group);
   return n;
+}
+// Where unit u of phase P sits: 0 fixed, 2 the shared pool, 1 the routed
+// pool, in that hand-out order (the shared expert's units are the longest
+// and have no dependency, so they go first); `v` is the index inside.
+__device__ __forceinline__ int unit_class(const StepStreamParams& p, int layer, int P, unsigned u, unsigned* v) {
+  const DevPhase& ph = p.phases[P];
+  if (u < ph.fixed_units) { *v = u; return 0; }
+  u -= ph.fixed_units;
+  if (ph.pool2 >= 0) {
+    const unsigned shared = static_cast<unsigned>(p.pools[ph.pool2].units_per_group);
+    if (u < shared) { *v = u; return 2; }
+    u -= shared;
+  }
+  *v = u;
+  return 1;
 }
 // The units a published phase hands out: its own, and the merged next phase's after them.
 __device__ __forceinline__ unsigned phase_units(const StepStreamParams& p, int layer, int P) {
@@ -69,21 +87,32 @@ __device__ __forceinline__ unsigned phase_units(const StepStreamParams& p, int l
   return n;
 }
 
+__device__ __forceinline__ bool locate_segment(const StepStreamParams& p, const uint8_t* base, const DevSegment& s, unsigned u,
+                                               const uint8_t** ptr, unsigned* bytes) {
+  if (u < s.unit_begin || u >= s.unit_begin + s.units) return false;
+  const unsigned long long off = s.offset + static_cast<unsigned long long>(u - s.unit_begin) * p.unit_bytes;
+  const unsigned long long left = s.offset + s.bytes - off;
+  *ptr = base + off;
+  *bytes = static_cast<unsigned>(left < p.unit_bytes ? left : p.unit_bytes);
+  return true;
+}
+// Lead unit u of phase P: the fixed segments, then the lead-only ones.
+__device__ bool locate_lead(const StepStreamParams& p, int layer, int P, unsigned u, const uint8_t** ptr, unsigned* bytes) {
+  const DevPhase& ph = p.phases[P];
+  const uint8_t* base = p.bases[layer];
+  for (int i = 0; i < ph.seg_count; ++i)
+    if (locate_segment(p, base, p.segments[ph.seg_begin + i], u, ptr, bytes)) return true;
+  for (int i = 0; i < ph.lead_seg_count; ++i)
+    if (locate_segment(p, base, p.segments[ph.lead_seg_begin + i], u, ptr, bytes)) return true;
+  return false;
+}
 // Unit u of phase P in `layer`: its bytes in the layer's span.
 __device__ bool locate(const StepStreamParams& p, int layer, int P, unsigned u, const uint8_t** ptr, unsigned* bytes) {
   const DevPhase& ph = p.phases[P];
   const uint8_t* base = p.bases[layer];
   if (u < ph.fixed_units) {
-    for (int i = 0; i < ph.seg_count; ++i) {
-      const DevSegment& s = p.segments[ph.seg_begin + i];
-      if (u < s.unit_begin + s.units) {
-        const unsigned long long off = s.offset + static_cast<unsigned long long>(u - s.unit_begin) * p.unit_bytes;
-        const unsigned long long left = s.offset + s.bytes - off;
-        *ptr = base + off;
-        *bytes = static_cast<unsigned>(left < p.unit_bytes ? left : p.unit_bytes);
-        return true;
-      }
-    }
+    for (int i = 0; i < ph.seg_count; ++i)
+      if (locate_segment(p, base, p.segments[ph.seg_begin + i], u, ptr, bytes)) return true;
     return false;
   }
   if (ph.pool < 0) return false;
@@ -182,6 +211,11 @@ __device__ void route(const StepStreamParams& p, int layer, const DevPool& pool,
     p.ctl->group_count[layer][g] = n;
     p.ctl->gate_done[layer][g] = 0;
   }
+  if (threadIdx.x < static_cast<unsigned>(rows)) {
+    p.ctl->shared_slots[layer][threadIdx.x] = static_cast<int>(threadIdx.x) * (top_k + 1) + top_k;
+    p.ctl->shared_tokens[layer][threadIdx.x] = static_cast<int>(threadIdx.x);
+  }
+  if (threadIdx.x == 0) p.ctl->shared_gate_done[layer] = 0;
   __syncthreads();
 }
 
@@ -204,13 +238,33 @@ __device__ void accumulate_chunk(const StepStreamParams& p, unsigned unit) {
 
 // A consumer pool's unit: group g's 128-row block rb of the expert's pair or
 // down matrix. `stage`: the group's activations are not yet in shared memory.
+// The shared expert's pools have one group, every token's shared slot.
 __device__ void consumer_unit(const StepStreamParams& p, int layer, const DevPool& pool, int g, int rb, uint8_t* smem, bool stage) {
-  const int expert = p.ctl->run_list[layer][g];
+  const bool shared = pool.kind == kPoolFp8GateUp || pool.kind == kPoolFp8Down;
+  const int expert = shared ? 0 : p.ctl->run_list[layer][g];
   const uint8_t* base = p.bases[layer] + pool.base + static_cast<unsigned long long>(expert) * pool.stride;
   Mxfp4Group grp;
-  grp.slots = p.ctl->group_slots[layer][g];
-  grp.tokens = p.ctl->group_tokens[layer][g];
-  grp.count = p.ctl->group_count[layer][g];
+  grp.slots = shared ? p.ctl->shared_slots[layer] : p.ctl->group_slots[layer][g];
+  grp.tokens = shared ? p.ctl->shared_tokens[layer] : p.ctl->group_tokens[layer][g];
+  grp.count = shared ? static_cast<int>(p.ctl->rows) : p.ctl->group_count[layer][g];
+  if (pool.kind == kPoolFp8GateUp) {
+    Fp8Expert f;
+    f.gate = base + pool.offsets[0];
+    f.gate_scales = reinterpret_cast<const float*>(base + pool.offsets[1]);
+    f.up = base + pool.offsets[2];
+    f.up_scales = reinterpret_cast<const float*>(base + pool.offsets[3]);
+    fp8_gate_up<kConsumerH, kConsumerI, kConsumerFp8Block>(f, grp, rb, p.x, p.act, smem);
+    return;
+  }
+  if (pool.kind == kPoolFp8Down) {
+    Fp8Expert f;
+    f.down = base + pool.offsets[0];
+    f.down_scales = reinterpret_cast<const float*>(base + pool.offsets[1]);
+    if (stage) mxfp4_stage_down_act<kConsumerI>(p.act, grp, smem);
+    __syncthreads();
+    fp8_down<kConsumerH, kConsumerI, kConsumerFp8Block>(f, grp, rb, smem, p.out, OutIndex{p.hidden, static_cast<int>(p.ctl->top_k) + 1});
+    return;
+  }
   Mxfp4Expert e;
   if (pool.kind == kPoolMxfp4GateUp) {
     e.gate = base + pool.offsets[0];
@@ -319,8 +373,8 @@ __global__ void __launch_bounds__(kStepThreads, 1) step_stream_kernel(StepStream
             }
             // The lead never takes the units of the phase that is running: a
             // stream phase's workers read them now, a latency phase's chain does.
-            atomicMax(&ctl->pf_next, ph.lead_begin + ph.fixed_units);
-            if (ph.merged_next) atomicMax(&ctl->pf_next, p.phases[P + 1].lead_begin + p.phases[P + 1].fixed_units);
+            atomicMax(&ctl->pf_next, ph.lead_begin + ph.lead_units);
+            if (ph.merged_next) atomicMax(&ctl->pf_next, p.phases[P + 1].lead_begin + p.phases[P + 1].lead_units);
             if (!sm_fail && ph.kind == 1) {
               st_rel(&ctl->phase_word, word(step, P, kStateStream));
               const unsigned need = phase_units(p, l, P);
@@ -408,28 +462,26 @@ __global__ void __launch_bounds__(kStepThreads, 1) step_stream_kernel(StepStream
         if (state == kStateStream) {
           const unsigned need = phase_units(p, cur_layer, P);
           const DevPhase& gph = p.phases[P];
-          // The grab size of the units at the counter: a consumer pool's, else one.
+          // The grab size: a consumer pool's at the counter's position, else one.
+          // Every unit of the grab is classified on its own below, so a grab
+          // that crosses a class boundary is still executed right.
           unsigned grab = 1;
           {
             const unsigned at = ld_acq(&ctl->next[P]);
             const unsigned own = own_units(p, cur_layer, P);
-            const DevPhase* ip = &gph;
+            int ip = P;
             unsigned iu = at;
-            if (gph.merged_next && at >= own) { ip = &p.phases[P + 1]; iu = at - own; }
-            if (ip->pool >= 0 && p.pools[ip->pool].kind != kPoolBytes && iu >= ip->fixed_units) grab = static_cast<unsigned>(p.pools[ip->pool].grab);
+            if (gph.merged_next && at >= own) { ip = P + 1; iu = at - own; }
+            unsigned v = 0;
+            const int cls = unit_class(p, cur_layer, ip, iu, &v);
+            const DevPhase& iph = p.phases[ip];
+            if (cls == 1 && p.pools[iph.pool].kind != kPoolBytes) grab = static_cast<unsigned>(p.pools[iph.pool].grab);
+            else if (cls == 2 && iph.pool2 >= 0) grab = static_cast<unsigned>(p.pools[iph.pool2].grab);
           }
           const unsigned u = atomicAdd(&ctl->next[P], grab);
           if (u < need) {
             sm_kind = 1; sm_unit = u; sm_phase = static_cast<unsigned>(P); sm_layer = cur_layer;
             sm_count = min(grab, need - u);
-            // A grab never straddles the fixed units, a pool's end or the merged boundary.
-            const unsigned own = own_units(p, cur_layer, P);
-            if (u < own) {
-              if (u < gph.fixed_units) sm_count = 1;
-              else sm_count = min(sm_count, own - u);
-            } else if (u - own < p.phases[P + 1].fixed_units) {
-              sm_count = 1;
-            }
           } else if (ctl->idle_first[P] == 0) {
             ctl->idle_first[P] = gtimer();
           }
@@ -466,29 +518,39 @@ __global__ void __launch_bounds__(kStepThreads, 1) step_stream_kernel(StepStream
     const unsigned kind = sm_kind;
     if (kind == 3) return;
     if (kind == 0) { __nanosleep(200); continue; }
-    // A unit past a merged phase's own units belongs to the next phase.
-    unsigned xphase = sm_phase, xunit = sm_unit;
-    if (kind == 1 && p.phases[sm_phase].merged_next) {
-      const unsigned own = own_units(p, sm_layer, static_cast<int>(sm_phase));
-      if (sm_unit >= own) { xphase = sm_phase + 1; xunit = sm_unit - own; }
-    }
-    const DevPhase& uph = p.phases[xphase];
-    const DevPool* upool = (kind == 1 && uph.pool >= 0 && xunit >= uph.fixed_units) ? &p.pools[uph.pool] : nullptr;
-    if (kind == 1 && uph.accumulate) {
-      accumulate_chunk(p, xunit);
-    } else if (upool && upool->kind != kPoolBytes) {
-      int last_group = -1;
-      for (unsigned q = 0; q < sm_count; ++q) {
-        const unsigned v = xunit + q - uph.fixed_units;
-        const int g = static_cast<int>(v / static_cast<unsigned>(upool->units_per_group));
-        const int rb = static_cast<int>(v % static_cast<unsigned>(upool->units_per_group));
-        if (q) __syncthreads();  // the previous unit's readers of the shared memory are done
-        if (upool->kind == kPoolMxfp4Down && xphase != sm_phase) {
+    // Each unit of the grab on its own: a unit past a merged phase's own
+    // units belongs to the next phase, and inside a phase it is a fixed byte
+    // unit, a routed consumer unit or a shared-expert unit.
+    int last_group = -1, last_pool = -1;
+    for (unsigned q = 0; q < sm_count; ++q) {
+      const unsigned gu = sm_unit + q;
+      unsigned xphase = sm_phase, xunit = gu;
+      if (kind == 1 && p.phases[sm_phase].merged_next) {
+        const unsigned own = own_units(p, sm_layer, static_cast<int>(sm_phase));
+        if (gu >= own) { xphase = sm_phase + 1; xunit = gu - own; }
+      }
+      const DevPhase& uph = p.phases[xphase];
+      if (q) __syncthreads();  // the previous unit's readers of the shared memory are done
+      if (kind == 1 && uph.accumulate) {
+        accumulate_chunk(p, xunit);
+        continue;
+      }
+      unsigned xv = 0;
+      const int xcls = kind == 1 ? unit_class(p, sm_layer, static_cast<int>(xphase), xunit, &xv) : 0;
+      const DevPool* upool = (kind == 1 && xcls == 1) ? &p.pools[uph.pool] : (kind == 1 && xcls == 2 && uph.pool2 >= 0) ? &p.pools[uph.pool2] : nullptr;
+      if (upool && upool->kind != kPoolBytes) {
+        const bool shared = xcls == 2;
+        const int pool_id = shared ? uph.pool2 : uph.pool;
+        const int g = static_cast<int>(xv / static_cast<unsigned>(upool->units_per_group));
+        const int rb = static_cast<int>(xv % static_cast<unsigned>(upool->units_per_group));
+        if ((upool->kind == kPoolMxfp4Down || upool->kind == kPoolFp8Down) && xphase != sm_phase) {
           // The group's gate and up units must be complete: they were handed out earlier, so the wait is short.
           if (threadIdx.x == 0) {
-            const unsigned gate_units = static_cast<unsigned>(p.pools[p.phases[sm_phase].pool].units_per_group);
+            const DevPhase& gph = p.phases[sm_phase];
+            const unsigned gate_units = static_cast<unsigned>(p.pools[shared ? gph.pool2 : gph.pool].units_per_group);
+            const unsigned* done = shared ? &ctl->shared_gate_done[sm_layer] : &ctl->gate_done[sm_layer][g];
             const unsigned long long t_wait = gtimer();
-            while (ld_acq(&ctl->gate_done[sm_layer][g]) < gate_units) {
+            while (ld_acq(done) < gate_units) {
               if (p.deadline_ns && gtimer() - t_wait > p.deadline_ns) { atomicCAS(&ctl->status, kStepOk, kStepDeadline | (xphase << 8)); break; }
               if (ld_acq(&ctl->poison)) break;
               __nanosleep(100);
@@ -496,24 +558,32 @@ __global__ void __launch_bounds__(kStepThreads, 1) step_stream_kernel(StepStream
           }
           __syncthreads();
         }
-        consumer_unit(p, sm_layer, *upool, g, rb, smem, g != last_group);
+        consumer_unit(p, sm_layer, *upool, g, rb, smem, pool_id != last_pool || g != last_group);
         last_group = g;
-        if (upool->kind == kPoolMxfp4GateUp) {
+        last_pool = pool_id;
+        if (upool->kind == kPoolMxfp4GateUp || upool->kind == kPoolFp8GateUp) {
           __syncthreads();
-          if (threadIdx.x == 0) { __threadfence(); atomicAdd(&ctl->gate_done[sm_layer][g], 1u); }
+          if (threadIdx.x == 0) {
+            __threadfence();
+            atomicAdd(shared ? &ctl->shared_gate_done[sm_layer] : &ctl->gate_done[sm_layer][g], 1u);
+          }
         }
+      } else {
+        last_group = -1;
+        last_pool = -1;
+        const uint8_t* ptr = nullptr;
+        unsigned bytes = 0;
+        unsigned acc = 0;
+        const bool found = kind == 2 ? locate_lead(p, sm_layer, static_cast<int>(xphase), xunit, &ptr, &bytes)
+                                     : locate(p, sm_layer, static_cast<int>(xphase), xunit, &ptr, &bytes);
+        if (found) {
+          acc = kind == 2 ? stream_unit<false>(ptr, bytes) : stream_unit<true>(ptr, bytes);
+        } else if (threadIdx.x == 0) {
+          atomicCAS(&ctl->status, kStepOk, kStepBadUnit);
+        }
+        for (int o = 16; o; o >>= 1) acc ^= __shfl_xor_sync(0xffffffffu, acc, o);
+        if ((threadIdx.x & 31) == 0) p.sink[(blockIdx.x % kStepMaxWorkers) * 8 + (threadIdx.x >> 5)] ^= acc;
       }
-    } else {
-      const uint8_t* ptr = nullptr;
-      unsigned bytes = 0;
-      unsigned acc = 0;
-      if (locate(p, sm_layer, static_cast<int>(xphase), xunit, &ptr, &bytes)) {
-        acc = kind == 2 ? stream_unit<false>(ptr, bytes) : stream_unit<true>(ptr, bytes);
-      } else if (threadIdx.x == 0) {
-        atomicCAS(&ctl->status, kStepOk, kStepBadUnit);
-      }
-      for (int o = 16; o; o >>= 1) acc ^= __shfl_xor_sync(0xffffffffu, acc, o);
-      if ((threadIdx.x & 31) == 0) p.sink[(blockIdx.x % kStepMaxWorkers) * 8 + (threadIdx.x >> 5)] ^= acc;
     }
     __syncthreads();
     if (threadIdx.x == 0) {
@@ -524,15 +594,27 @@ __global__ void __launch_bounds__(kStepThreads, 1) step_stream_kernel(StepStream
 }
 
 __global__ void fill_ranges_kernel(uint8_t* base, const unsigned long long* offsets, const unsigned long long* bytes, int n,
-                                   unsigned seed, unsigned lo, unsigned span) {
+                                   unsigned seed, unsigned lo, unsigned span, unsigned mode) {
   const int r = blockIdx.y;
   if (r >= n) return;
   for (unsigned long long i = static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x; i < bytes[r];
        i += static_cast<unsigned long long>(gridDim.x) * blockDim.x) {
     const unsigned long long a = offsets[r] + i;
+    if (mode == kFillF32Scales) {
+      if (a & 3) continue;  // one word a float
+      const unsigned long long w = a >> 2;
+      unsigned h = static_cast<unsigned>(w * 2654435761ull) ^ static_cast<unsigned>(w >> 17) ^ seed;
+      h ^= h >> 13; h *= 0x85ebca6bu; h ^= h >> 16;
+      const float sv = 0.5f + (h % 1536) / 1024.0f;
+      *reinterpret_cast<float*>(base + a) = sv;
+      continue;
+    }
     unsigned h = static_cast<unsigned>(a * 2654435761ull) ^ static_cast<unsigned>(a >> 17) ^ seed;
     h ^= h >> 13; h *= 0x85ebca6bu; h ^= h >> 16;
-    base[a] = static_cast<uint8_t>(lo + (h % span));
+    if (mode == kFillE4m3)
+      base[a] = static_cast<uint8_t>((h & 0x80) | ((1 + (h >> 8) % 13) << 3) | ((h >> 16) & 7));
+    else
+      base[a] = static_cast<uint8_t>(lo + (h % span));
   }
 }
 __global__ void init_x_kernel(uint16_t* x, int n, unsigned seed) {
@@ -567,9 +649,9 @@ cudaError_t launch_step_stream(const StepStreamParams& p, int workers, cudaStrea
 }
 
 void step_stream_fill_ranges(uint8_t* base, const unsigned long long* offsets, const unsigned long long* bytes, int n, unsigned seed,
-                             unsigned lo, unsigned span, cudaStream_t stream) {
+                             unsigned lo, unsigned span, cudaStream_t stream, StepFillMode mode) {
   if (n <= 0) return;
-  fill_ranges_kernel<<<dim3(64, static_cast<unsigned>(n)), 256, 0, stream>>>(base, offsets, bytes, n, seed, lo, span);
+  fill_ranges_kernel<<<dim3(64, static_cast<unsigned>(n)), 256, 0, stream>>>(base, offsets, bytes, n, seed, lo, span, static_cast<unsigned>(mode));
 }
 void step_stream_init_x(uint16_t* x, int n, unsigned seed, cudaStream_t stream) {
   init_x_kernel<<<(n + 255) / 256, 256, 0, stream>>>(x, n, seed);

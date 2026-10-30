@@ -638,6 +638,7 @@ GPU at the time, so the figures below carry its noise.
 | the same without the lead | 96 to 100 |
 | MXFP4 tensor-core consumers on the routed experts, gate and up then down as two phases | 89 to 94 |
 | the same with the expert phases merged, a down unit released by its group's gate and up | 96 to 98 |
+| the merged phase with the shared expert computed too, by the row-major fp8 form through the L2 bridge, its units handed out first and its bytes in the lead | 97 to 98 idle, 93 to 95 beside production |
 
 The merged phase is the work distribution the phase-1 prototype owed: the
 gate and up phase alone drained 68 µs a layer with 150 units of 110 µs
@@ -649,9 +650,24 @@ and is the next item of the chain work. The consumers inside the kernel
 are exact: every gate and up output of a layer equals the double-precision
 reference or sits inside the envelope its own fp32 accumulation allows,
 every down partial sits inside the fp32 bound, and the accumulated rows
-are bitwise the ordered sum of the partials. The protocol around them runs
-a thousand steps from the device token feed with the next step's execute
-seen 1.8 µs after the verdict at the median.
+are bitwise the ordered sum of the partials, with the shared expert's
+partials among them. The protocol around them runs a thousand steps from
+the device token feed with the next step's execute seen 1.8 µs after the
+verdict at the median.
+
+The shared expert keeps the checkpoint's row-major fp8 layout, as section
+2.4 asks of every tensor but the routed experts, and its consumer
+(`src/kernels/step/fp8_dense.cuh`) reads it through the bridge the probes
+measured: before a warp starts a 512-byte slab of its sixteen rows it
+prefetches the next slab of every row into L2 with one bulk prefetch a
+row, so the 32-byte fragment loads hit L2. The F32 scale of each 32 by 32
+block multiplies the chunk's tensor-core partial, the slot kernels'
+structure. As plain grids over 60 cold pairs it streams the pair at 229
+GB/s and the down at 216, and inside the merged phase the expert bytes run
+at 247 GB/s. Two placement lessons came with it: the shared units are the
+longest of the phase and go out first, and the shared expert's bytes stay
+in the lead's sequence as lead-only segments although no worker streams
+them as bytes.
 
 ### 1.1 A second engine behind a flag
 
@@ -1806,23 +1822,33 @@ area, untracked.
       its terms' magnitude (worst 0.2 of the bound); bitwise across three
       launches with a changing sentinel and between a slot computed alone
       and the same slot in a group; as plain grids over 132 cold experts
-      the pair streams at 235 GB/s and the down at 248.
-- [ ] The expert consumer over run lists with canonical accumulation and
+      the pair streams at 235 GB/s and the down at 248. The fp8
+      block-scaled form over the checkpoint's row-major layout followed
+      (`fp8_dense.cuh`, the L2 bridge of a bulk prefetch a row a slab, the
+      F32 scale per 32 by 32 block on the chunk's partial, 128 on GLM by
+      template): 27,638 of 27,648 exact and the rest inside the envelope,
+      bitwise across launches and group sizes, 229 GB/s for the pair and
+      216 for the down as plain grids over 60 cold pairs.
+- [x] The expert consumer over run lists with canonical accumulation and
       the shared expert last: a group is every slot of one expert, exact
       against the slot form (measured 2026-10-30), and the shared expert
       is a tensor-core consumer of its own fp8 form, read once for every
-      token rather than once per group of four. The routed half is in the
-      streamer since 2026-10-30: the lowering marks the MXFP4 pools with
+      token rather than once per group of four. In the streamer since
+      2026-10-30: the lowering marks the MXFP4 pools with
       their consumer kind, matrices and 128-row units, the chain's router
       writes the run list and each expert's slot group, workers run the
       consumer units (down units four a grab, the group's staged
       activations reused), and the accumulation is a worker phase of
-      1024-output chunks folding the routed partials in slot order with
+      512-output chunks folding the routed partials in slot order with
       the shared slot last. `step_stream_test` holds the gate inside the
       kernel: every gate and up output of a layer exact or inside the
       reference's envelope, every down partial inside the fp32 bound, and
       the accumulated rows bitwise the ordered sum of the partials. The
-      shared expert still streams as bytes; its fp8 form comes next.
+      shared expert is the phase's second pool, one group of every token's
+      shared slot through the fp8 form, its five gate and up units handed
+      out before the routed ones and its bytes in the lead's sequence; the
+      first eight layers then run at 97 to 98 percent of their byte floor
+      with every expert computed, on an idle device.
 - [ ] Dense and attention projections from stationary tiles, the thin TP
       shards as adjacent ranges; the fp8 block-scaled form above is the
       candidate for the fp8 projections, the bf12 form is unbuilt.

@@ -264,6 +264,7 @@ StreamReport Streamer::run(const StreamerConfig& cfg) {
       last = std::max(last, ctl_->stamp_end[P]);
       for (int i = 0; i < ph.seg_count; ++i) bytes += static_cast<double>(dp_.segments[static_cast<size_t>(ph.seg_begin + i)].bytes);
       if (ph.pool >= 0) bytes += static_cast<double>(dp_.pools[static_cast<size_t>(ph.pool)].bytes) * ctl_->run_count[l];
+      if (ph.pool2 >= 0) bytes += static_cast<double>(dp_.pools[static_cast<size_t>(ph.pool2)].bytes);  // the shared expert, once
       r.phases.push_back(std::move(t));
     }
     r.layer_us.push_back(static_cast<double>(last - first) / 1e3);

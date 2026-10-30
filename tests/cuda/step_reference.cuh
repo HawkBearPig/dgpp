@@ -7,6 +7,7 @@
 #include <cstdint>
 
 #include "common/dtypes.hpp"
+#include "kernels/step/fp8_dense.cuh"
 #include "kernels/step/mxfp4_expert.cuh"
 #include "step_reference_host.hpp"
 
@@ -60,6 +61,61 @@ __global__ void down(dgpp::step::Mxfp4Expert e, dgpp::step::Mxfp4Group g, const 
     for (int k = 0; k < I; ++k) {
       const uint32_t code = (e.down[dgpp::step::tile_major_offset(row, k, I)] >> (4 * (k & 1))) & 0xF;
       const double term = static_cast<double>(ldexpf(e2m1_value(code), static_cast<int>(sc[k >> 5]) - 127)) *
+                          static_cast<double>(dgpp::bf16_bits_to_float(act[static_cast<size_t>(slot) * I + k]));
+      a += term;
+      m += fabs(term);
+    }
+    const size_t idx = (static_cast<size_t>(slot / spt) * H + row) * spt + (slot % spt);
+    out[idx] = static_cast<float>(a);
+    mag[idx] = static_cast<float>(m);
+  }
+}
+
+// e4m3 as the exact value (no NaN in weights).
+__device__ inline float e4m3_value(uint32_t b) {
+  const int e = (b >> 3) & 0xF, m = b & 7;
+  float v = e == 0 ? ldexpf(static_cast<float>(m) / 8.0f, -6) : ldexpf(1.0f + m / 8.0f, e - 7);
+  return (b & 0x80) ? -v : v;
+}
+
+// The row-major fp8 pair with F32 block scales (block x block), one group.
+__global__ void fp8_gate_up(dgpp::step::Fp8Expert e, dgpp::step::Mxfp4Group g, const uint16_t* x, int H, int I, int block, uint16_t* act,
+                            float* gu, float* mag) {
+  const int row = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row >= I) return;
+  const int sc_cols = H / block;
+  for (int r = 0; r < g.count; ++r) {
+    const int slot = g.slots[r], tok = g.tokens[r];
+    float d[2];
+    for (int m = 0; m < 2; ++m) {
+      const uint8_t* pay = (m ? e.up : e.gate) + static_cast<size_t>(row) * H;
+      const float* sc = (m ? e.up_scales : e.gate_scales) + static_cast<size_t>(row / block) * sc_cols;
+      double a = 0.0, mg = 0.0;
+      for (int k = 0; k < H; ++k) {
+        const double term = static_cast<double>(e4m3_value(pay[k])) * static_cast<double>(sc[k / block]) *
+                            static_cast<double>(dgpp::bf16_bits_to_float(x[static_cast<size_t>(tok) * H + k]));
+        a += term;
+        mg += fabs(term);
+      }
+      d[m] = static_cast<float>(a);
+      gu[(static_cast<size_t>(slot) * I + row) * 2 + m] = d[m];
+      mag[(static_cast<size_t>(slot) * I + row) * 2 + m] = static_cast<float>(mg);
+    }
+    act[static_cast<size_t>(slot) * I + row] = dgpp::step::swiglu_bf16(d[0], d[1]);
+  }
+}
+__global__ void fp8_down(dgpp::step::Fp8Expert e, dgpp::step::Mxfp4Group g, const uint16_t* act, int H, int I, int block, int spt,
+                         float* out, float* mag) {
+  const int row = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row >= H) return;
+  const int sc_cols = (I + block - 1) / block;
+  const uint8_t* pay = e.down + static_cast<size_t>(row) * I;
+  const float* sc = e.down_scales + static_cast<size_t>(row / block) * sc_cols;
+  for (int r = 0; r < g.count; ++r) {
+    const int slot = g.slots[r];
+    double a = 0.0, m = 0.0;
+    for (int k = 0; k < I; ++k) {
+      const double term = static_cast<double>(e4m3_value(pay[k])) * static_cast<double>(sc[k / block]) *
                           static_cast<double>(dgpp::bf16_bits_to_float(act[static_cast<size_t>(slot) * I + k]));
       a += term;
       m += fabs(term);

@@ -23,9 +23,11 @@ struct DevSegment {
 
 // A pool's consumer: how its units are cut and computed.
 enum DevPoolKind : uint8_t {
-  kPoolBytes = 0,      // synthetic: units of unit_bytes, streamed and folded
+  kPoolBytes = 0,        // synthetic: units of unit_bytes, streamed and folded
   kPoolMxfp4GateUp = 1,  // MXFP4 gate and up pair: units of 128 output rows a group
   kPoolMxfp4Down = 2,    // MXFP4 down: units of 128 output rows a group
+  kPoolFp8GateUp = 3,    // the shared expert's fp8 pair, row-major with F32 32 x 32 scales: one group of every token
+  kPoolFp8Down = 4,      // the shared expert's fp8 down
 };
 
 struct DevPool {
@@ -58,7 +60,13 @@ struct DevPhase {
   int32_t seg_begin = 0;   // fixed segments
   int32_t seg_count = 0;
   uint32_t fixed_units = 0;
-  int32_t pool = -1;       // index into pools, or -1
+  // Lead-only segments: fixed-class bytes a consumer pool reads (the shared
+  // expert's), which the lead prefetches into L2 but no worker streams.
+  int32_t lead_seg_begin = 0;
+  int32_t lead_seg_count = 0;
+  uint32_t lead_units = 0;  // fixed_units plus the lead-only units: the phase's share of the lead sequence
+  int32_t pool = -1;       // index into pools, or -1: the routed experts
+  int32_t pool2 = -1;      // a second pool: the shared expert, fixed-class, one group of every token
   uint32_t lead_begin = 0; // this phase's first unit in the global lead sequence
   int32_t layer = 0;       // the layer (index into DevicePlan::layers) the phase belongs to
 };
