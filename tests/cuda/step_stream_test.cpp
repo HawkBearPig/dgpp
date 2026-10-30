@@ -146,6 +146,7 @@ StreamerConfig design_config() {
   cfg.rows = 5;
   cfg.top_k = 6;
   cfg.seed = 7;
+  cfg.route_pool = 32;  // the measured overlap: about 20 distinct experts a layer for five rows, not 29
   return cfg;
 }
 
@@ -542,6 +543,26 @@ double consumers_rate(bool tile_major) {
   cfg.top_k = 6;
   const StreamReport r = s.run(cfg);
   print_report(tile_major ? "tile-major experts, design chain, lead 16 MB" : "row-major experts, design chain, lead 16 MB", r, 3);
+  {  // the slowest layer's phases too, when it is not layer 3
+    int slowest = 0;
+    for (size_t l = 1; l < r.layer_us.size(); ++l)
+      if (r.layer_us[l] / std::max(1.0, r.layer_bytes[l]) > r.layer_us[static_cast<size_t>(slowest)] / std::max(1.0, r.layer_bytes[static_cast<size_t>(slowest)])) slowest = static_cast<int>(l);
+    if (slowest != 3) print_report("the slowest layer", r, slowest);
+  }
+  // Every layer's phases in one line: the fixed stream phases, the expert phase, the rest (latency and gaps), the lead's bytes.
+  for (size_t l = 0; l < r.layer_us.size(); ++l) {
+    double fixed = 0, experts = 0, lead = 0, begin = 1e30, end = 0;
+    for (const PhaseTiming& t : r.phases) {
+      if (t.layer != static_cast<int>(l)) continue;
+      begin = std::min(begin, t.begin_us);
+      end = std::max(end, t.end_us);
+      lead += t.lead_in_mb;
+      if (t.name == "gate_up" || t.name == "down") experts = std::max(experts, t.end_us) - std::min(experts > 0 ? t.begin_us : t.begin_us, t.begin_us), experts = t.end_us - t.begin_us > experts ? t.end_us - t.begin_us : experts;
+      else if (t.stream && t.units > 0 && t.name != "accumulate") fixed += t.end_us - t.begin_us;
+    }
+    std::printf("      layer %zu: fixed %5.1f us, experts %5.1f us, other %5.1f us of %6.1f, lead %5.1f MB\n", l, fixed, experts,
+                (end - begin) - fixed - experts, end - begin, lead);
+  }
   require(r.status == kStepOk, "the kernel ended on " + r.status_text);
   std::vector<double> pct;
   for (size_t l = 0; l < r.layer_us.size(); ++l) {

@@ -64,7 +64,7 @@ struct alignas(128) StepCtl {
   int32_t shared_tokens[kStepMaxLayers][32];
   unsigned shared_gate_done[kStepMaxLayers];
   int32_t token_slots[32];  // the token group: slot i = token i
-  unsigned pool_done[kStepMaxPhases];  // kPoolFp8Matrix with slabs: compute units of the pool completed this step, by pool index
+  unsigned pool_done[kStepMaxLayers][kStepMaxPhases];  // kPoolFp8Matrix with slabs: compute units of the pool completed this step, by layer and pool index
   unsigned long long stamp_begin[kStepMaxPhases];  // the last pass: the phase's publish or latency start
   unsigned long long stamp_end[kStepMaxPhases];    // the last pass: its units done, the fold after it included
   unsigned long long idle_first[kStepMaxPhases];   // the last pass: the first worker to find the phase drained
@@ -79,6 +79,7 @@ struct alignas(128) StepCtl {
   unsigned rows;                                   // the running step's rows (the synthetic router's)
   unsigned top_k;
   unsigned seed;
+  unsigned route_pool;  // the synthetic router picks from this many experts of a layer (0: all), 32 reproduces the measured overlap
 };
 
 struct StepStreamParams {
@@ -120,6 +121,7 @@ struct StepStreamParams {
   // rate (bytes a microsecond; 0: the cap alone). The extra is consumed by
   // the very next stream phases, so the parked set stays the cap's.
   float lead_bytes_per_us = 0.f;
+  unsigned route_pool = 0;  // the synthetic router's window of experts a layer (0: all)
   unsigned max_leaders = 0;               // 0: unbounded
   unsigned long long deadline_ns = 0;          // every in-step spin's deadline (0: none)
   unsigned long long pending_deadline_ns = 0;  // how long the chain waits for the host's next descriptor (0: forever)

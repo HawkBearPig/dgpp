@@ -144,6 +144,20 @@ int main() {
     const ByteTotals p = step_bytes(dsv41_step_plan(cfg, 0, kWorld, prose));
     check_near(p.total(), 5.653e9, 0.01, "the two-row step reads the hand count's bytes");
     check_near(p.router, 2.424e9, 0.01, "the two-row routed experts match the hand count");
+    // The measured overlap of consecutive rows (2026-10-30, four texts through the real checkpoint): five rows read
+    // 19.8 distinct experts a layer and two rows 10.1, where rows picking independently would read 28.9 and 11.8.
+    Dsv41StepShape code_measured = code;
+    code_measured.distinct_main = 19.8;
+    code_measured.bf12_head = true;
+    const ByteTotals cm = step_bytes(dsv41_step_plan(cfg, 0, kWorld, code_measured));
+    check_near(cm.router, 5.633e9 + (19.8 - 28.9) * 4700160.0 * 40, 0.002, "five rows at the measured overlap read 3.92 GB of experts");
+    Dsv41StepShape prose_measured = prose;
+    prose_measured.distinct_main = 10.1;
+    prose_measured.bf12_head = true;
+    const ByteTotals pm = step_bytes(dsv41_step_plan(cfg, 0, kWorld, prose_measured));
+    check_near(pm.router, 2.424e9 + (10.1 - 11.83) * 4700160.0 * 40, 0.002, "two rows at the measured overlap read 2.10 GB of experts");
+    std::printf("   floors at the measured overlap, bf12 head: five rows %.3f GB = %.1f ms, two rows %.3f GB = %.1f ms at 240 GB/s\n",
+                cm.total() / 1e9, cm.total() / 240e6, pm.total() / 1e9, pm.total() / 240e6);
     // A measured run list replaces the expectation.
     Dsv41StepShape counted = code;
     counted.distinct_main = 143;

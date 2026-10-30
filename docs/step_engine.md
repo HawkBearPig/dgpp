@@ -80,6 +80,18 @@ whole on every rank, the KV rows as the pool's 528-byte window rows and
 | the same with the bf12 head the production template serves | 3.046 GB | 5.633 GB | 43 MB | 8.721 GB | 36.3 ms |
 | two verify rows, the same draft block, the bf16 head | 3.211 GB | 2.424 GB | 18 MB | 5.653 GB | 23.6 ms |
 | the same with the bf12 head | 3.046 GB | 2.424 GB | 18 MB | 5.488 GB | 22.9 ms |
+| five verify rows at the measured overlap, 19.8 experts a layer, the bf12 head | 3.046 GB | 3.922 GB | 43 MB | 7.011 GB | 29.2 ms |
+| two verify rows at the measured overlap, 10.1 experts a layer, the bf12 head | 3.046 GB | 2.099 GB | 18 MB | 5.162 GB | 21.5 ms |
+
+The routed rows of the first four shapes take the uniform expectation of
+the picks (28.9 distinct experts a layer at five rows, 11.8 at two). Four
+texts through the real checkpoint on 2026-10-30 showed consecutive rows
+sharing experts, 19.8 distinct at five rows and 10.1 at two, about 3.3
+more a row past the first, and the shape's `distinct_main` carries the
+measured count; the last two rows are the floors the step engine is
+measured against. The stream test's synthetic router routes through a
+window of 32 experts a layer (`route_pool`), which reproduces the measured
+overlap.
 
 One rank's slice of one routed expert is 4,700,160 bytes: gate and up at
 576 rows by 5120 columns and down at 5120 by 576, each with its e8m0

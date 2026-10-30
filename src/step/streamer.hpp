@@ -31,6 +31,7 @@ struct StreamerConfig {
   int rows = 1;                  // the step's rows and the synthetic router's picks a row
   int top_k = 1;
   unsigned seed = 1;
+  unsigned route_pool = 0;       // the synthetic router's window of experts a layer (0: all 384; 32 gives the measured overlap)
   uint64_t first_seq = 0;        // the first step's sequence number; steps count up from it
   uint64_t epoch = 0;            // echoed by every verdict
   int skip_at_step = -1;         // publish skip instead of this step (-1: never)

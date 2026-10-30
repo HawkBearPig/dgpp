@@ -58,8 +58,8 @@ so.
 
 | Family at C1 | Pass today | Logical bytes | Floor at 240 GB/s | Target pass | Gain |
 |---|---|---|---|---|---|
-| DeepSeek-V4.1-Flash-1017 MXFP4, four Sparks, five rows, code | 47.1 ms | 8.7 GB | 36.3 ms | 39 ms | 1.21x |
-| DeepSeek-V4.1-Flash-1017 MXFP4, four Sparks, two rows, prose | 32.3 ms | 5.5 GB | 22.9 ms | 25.5 ms | 1.27x |
+| DeepSeek-V4.1-Flash-1017 MXFP4, four Sparks, five rows, code | 47.1 ms | 7.0 GB | 29.2 ms | 31.3 ms | 1.50x |
+| DeepSeek-V4.1-Flash-1017 MXFP4, four Sparks, two rows, prose | 32.3 ms | 5.2 GB | 21.5 ms | 23.0 ms | 1.40x |
 | Qwen3.8-27B NVFP4 with DFlash2, one Spark, eight rows | 108 ms | 20.1 GB | 83.8 ms | 86 ms | 1.25x |
 | GLM-5.3-Flash NVFP4/FP8, four Sparks, two rows | 30.6 ms | 5.9 GB | 24.5 ms | 27.5 ms | 1.11x |
 | GLM-5.3 Mixed346, four Sparks, two rows | 62.7 ms | 12.8 GB | 53.3 ms | 57.5 ms | 1.09x |
@@ -146,12 +146,43 @@ rerun under the same corrections agreeing to 0.1 percent:
 | two verify rows, the same draft block, the bf16 head twice | 3.211 GB | 2.424 GB | 18 MB | 5.653 GB | 23.6 ms |
 | the same with the bf12 head | 3.046 GB | 2.424 GB | 18 MB | 5.488 GB | 22.9 ms |
 
-The as-served rows, with the bf12 head, are the floors the rest of this
-document uses for DeepSeek-V4.1: 36.3 ms at five rows and 22.9 at two,
-where the phase-0 figures were 35.1 and 20.7. The layer-level floors of
-section 1.3 are unchanged, since the omissions sit in the pass's tail and
-in a few megabytes a layer of fixed bytes. The other families' floors are
-re-counted the same way when their generators land in phase 6.
+The as-served rows, with the bf12 head, were the floors this document
+used for DeepSeek-V4.1 until the night of 2026-10-30: 36.3 ms at five rows
+and 22.9 at two, where the phase-0 figures were 35.1 and 20.7. The other
+families' floors are re-counted the same way when their generators land in
+phase 6.
+
+**Corrected again 2026-10-30 night by the measured routing.** The routed
+bytes above take the uniform expectation of the picks, rows choosing
+independently: 28.9 distinct experts a layer at five rows, 11.8 at two.
+Four texts through the real checkpoint (section 1.4, H1) show consecutive
+rows sharing experts far more than that: 6.0, 10.1, 13.7, 16.9, 19.8, 22.6,
+27.7, 36.4 and 43.8 distinct experts a layer for 1, 2, 3, 4, 5, 6, 8, 12
+and 16 consecutive rows, about 3.3 more a row past the first, against the
+uniform model's 11.8 at two and 28.9 at five. The verify rows of a C1 pass
+are consecutive positions, so the measured figures are the pass's. The
+plan's shape takes the measured count (`distinct_main`), and the floors it
+yields with the bf12 head are:
+
+| Shape at the measured overlap | Step bytes | Floor at 240 GB/s | Pass today | Today at |
+|---|---|---|---|---|
+| five verify rows, 19.8 experts a layer | 7.011 GB | 29.2 ms | 47.1 ms | 62 percent |
+| two verify rows, 10.1 experts a layer | 5.162 GB | 21.5 ms | 32.3 ms | 67 percent |
+
+These are the floors the rest of this document uses for DeepSeek-V4.1,
+and the targets of section 1 are re-derived from them at the same 107
+percent of the floor: 31.3 ms at five rows and 23.0 at two, 1.50x and
+1.40x over today. Two consequences follow. Today's engine is further from
+its floor than the 77 and 71 percent below say, 62 and 67, since it too
+reads only the distinct experts, so the pillar's cap at a perfect pass is
+1.61x on C1 code rather than 1.30x. And the routed share of a layer falls
+from 69 to 59 percent at five rows, so the fixed phases, the latency and
+the tails weigh more in the pass: the eight-layer gate of section 1.3 now
+routes through a window of 32 experts a layer, which reproduces the
+measured overlap (19.7 distinct at five rows, 10.1 at two), and with every
+weight computed the median layer stands at 85 to 86 percent of its floor
+there, against 89 at the uniform count. The draft stages keep the uniform
+expectation (14.2 of 128 at top-3) until their routing is measured.
 
 **Today's engine is far closer to its floor than the plan assumed.** The
 two-term instrument at the real shapes, per rank, with the existing
@@ -164,8 +195,8 @@ points of each pass:
 
 | Family, C1 shape | Pass | Byte floor at 240 GB/s | Pass at | Layer latency, folds, gaps |
 |---|---|---|---|---|
-| DeepSeek-V4.1 MXFP4 w4, five rows, code | 47.1 ms | 36.3 ms | 77 percent | 122 + 81 + 13 µs |
-| DeepSeek-V4.1 MXFP4 w4, two rows, prose | 32.3 ms | 22.9 ms | 71 percent | 89 + 49 + 14 µs |
+| DeepSeek-V4.1 MXFP4 w4, five rows, code | 47.1 ms | 36.3 ms (29.2 at the measured overlap) | 77 percent (62) | 122 + 81 + 13 µs |
+| DeepSeek-V4.1 MXFP4 w4, two rows, prose | 32.3 ms | 22.9 ms (21.5 at the measured overlap) | 71 percent (67) | 89 + 49 + 14 µs |
 | Qwen3.8-27B NVFP4 w1, eight rows | 108.0 ms | 83.8 ms | 78 percent | 77 + 0 + 0 µs, GEMVs at 205 GB/s |
 | GLM-5.3-Flash NVFP4/FP8 w4, two rows | 30.6 ms | 24.5 ms | 80 percent | 50 + 47 + 9 µs |
 | GLM-5.3 Mixed346 w4, two rows | 62.7 ms | 53.3 ms | 85 percent | 100 + 53 + 11 µs |
@@ -730,8 +761,10 @@ rather than before any family can be ported.
 Pillar 1 as built makes the memory busy at a fixed byte count. With every
 weight computed the layers run at 88 to 90 percent of the byte floor, the
 fused chain is owed, and the C1 code target of 39 ms is the pass at 107
-percent of the 36.3 ms floor. Even a perfect pass caps the pillar near
-1.30x on C1 code (47.1 ms today over 36.3). Everything past that is fewer
+percent of the 36.3 ms floor (29.2 at the measured overlap, found later
+that night, which makes the cap 1.61x; the figures of this section keep
+the floor they were written against). Even a perfect pass caps the pillar
+near 1.30x on C1 code (47.1 ms today over 36.3). Everything past that is fewer
 bytes a pass or more tokens a pass. The hypotheses below widen the search
 in that order, each with the experiment that decides it and the decision
 rule, and each has its checklist item in section 5. None touches the graph
@@ -2228,6 +2261,15 @@ area, untracked.
       latency (8 and 12), not its units, which take 2 µs each. The median
       layer with every weight computed stands at 89 percent of its floor,
       plus or minus two between runs.
+- [x] The measured routing overlap in the plan and the gate (2026-10-30
+      night): `distinct_main` at the measured 19.8 and 10.1 gives floors
+      of 29.2 and 21.5 ms with the bf12 head, the synthetic router routes
+      through a window of 32 experts a layer (`route_pool`), which
+      reproduces the overlap, and the slab reduce's completion counter is
+      per layer (it was per pool across layers, so a later layer's reduce
+      units did not wait on their own layer's compute units, masked by
+      their late hand-out). The median layer at the measured overlap: 85
+      to 86 percent of its floor.
 - [ ] The residue after the lead: the expert phase inside the stream at
       93 to 94 percent of the ceiling, about 4 percent of the layer, and
       the fixed phases' tails and hand-outs, about 3. A probe of the

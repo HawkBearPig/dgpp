@@ -227,18 +227,28 @@ __device__ unsigned stream_unit(const uint8_t* ptr, unsigned bytes) {
 
 // The synthetic router: `rows` rows pick `top_k` distinct groups each (a
 // counter-based hash per pass, layer and row), the distinct picks sorted
-// ascending into the layer's run list. Block-wide, the chain block's.
+// ascending into the layer's run list. Block-wide, the chain block's. With
+// `route_pool` set, every row of a layer picks from the same window of that
+// many experts, which gives the rows the overlap real routing has: a window
+// of 32 yields 19.7 distinct experts for five rows and 10.1 for two, as
+// measured on DeepSeek-V4.1 (2026-10-30), where rows picking from all 384
+// yield 28.9 and 11.8.
 __device__ void route(const StepStreamParams& p, int layer, const DevPool& pool, int* keys, int* sorted) {
   const int rows = static_cast<int>(p.ctl->rows), top_k = static_cast<int>(p.ctl->top_k);
   const int picks = rows * top_k;
   if (threadIdx.x < static_cast<unsigned>(rows)) {
     unsigned h = p.ctl->seed * 2654435761u + 7919u * static_cast<unsigned>(layer) + 104729u * threadIdx.x;
+    const unsigned window = (p.ctl->route_pool > 0 && p.ctl->route_pool < static_cast<unsigned>(pool.groups)) ? p.ctl->route_pool
+                                                                                                             : static_cast<unsigned>(pool.groups);
+    const unsigned start = window < static_cast<unsigned>(pool.groups)
+                               ? ((p.ctl->seed * 40503u + 7919u * static_cast<unsigned>(layer)) % (static_cast<unsigned>(pool.groups) - window + 1u))
+                               : 0u;
     for (int i = 0; i < top_k; ++i) {
       int e;
       bool dup;
       do {
         h = h * 1664525u + 1013904223u;
-        e = static_cast<int>((h >> 8) % static_cast<unsigned>(pool.groups));
+        e = static_cast<int>(start + (h >> 8) % window);
         dup = false;
         for (int j = 0; j < i; ++j) dup = dup || keys[threadIdx.x * top_k + j] == e;
       } while (dup);
@@ -447,8 +457,10 @@ __global__ void __launch_bounds__(kStepThreads, 1) step_stream_kernel(StepStream
           ctl->rows = d->rows;
           ctl->top_k = d->top_k;
           ctl->seed = d->seed + static_cast<unsigned>(d->seq);
+          ctl->route_pool = p.route_pool;
           for (int P = 0; P < n_phases; ++P) {
-            ctl->next[P] = 0; ctl->done[P] = 0; ctl->pf_units[P] = 0; ctl->idle_first[P] = 0; ctl->pool_done[P] = 0;
+            ctl->next[P] = 0; ctl->done[P] = 0; ctl->pf_units[P] = 0; ctl->idle_first[P] = 0;
+            for (int L = 0; L < kStepMaxLayers; ++L) ctl->pool_done[L][P] = 0;
             ctl->busy_ns[P] = 0; ctl->grabs[P] = 0; ctl->handout_ns[P] = 0; ctl->lead_in_bytes[P] = 0; ctl->pf_credit[P] = 0; ctl->pf_staged[P] = 0;
             ctl->wait_ns[P] = 0;
           }
@@ -749,7 +761,7 @@ __global__ void __launch_bounds__(kStepThreads, 1) step_stream_kernel(StepStream
           // A reduce unit: after the pool's compute units, which were handed out before it.
           if (threadIdx.x == 0) {
             const unsigned long long t_wait = gtimer();
-            while (ld_acq(&ctl->pool_done[pool_id]) < compute_units) {
+            while (ld_acq(&ctl->pool_done[sm_layer][pool_id]) < compute_units) {
               if (p.deadline_ns && gtimer() - t_wait > p.deadline_ns) { atomicCAS(&ctl->status, kStepOk, kStepDeadline | (xphase << 8)); break; }
               if (ld_acq(&ctl->poison)) break;
               __nanosleep(100);
@@ -785,7 +797,7 @@ __global__ void __launch_bounds__(kStepThreads, 1) step_stream_kernel(StepStream
         if (threadIdx.x == 0) sm_grab_bytes += upool->bytes / upg;
         if (upool->kind == kPoolFp8Matrix && upool->slabs > 1 && !projection_split(p, *upool)) {
           __syncthreads();
-          if (threadIdx.x == 0) { __threadfence(); atomicAdd(&ctl->pool_done[pool_id], 1u); }
+          if (threadIdx.x == 0) { __threadfence(); atomicAdd(&ctl->pool_done[sm_layer][pool_id], 1u); }
         }
         if (pool_is_gate_up(upool->kind)) {
           __syncthreads();

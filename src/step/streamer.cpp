@@ -152,6 +152,7 @@ StreamReport Streamer::run(const StreamerConfig& cfg) {
   p.sink = sink_;
   p.lookahead_layers = cfg.lookahead_layers;
   p.lead_bytes_per_us = cfg.lead_bytes_per_us;
+  p.route_pool = cfg.route_pool;
   p.lead_cap_bytes = cfg.lead_cap_bytes;
   p.max_leaders = cfg.max_leaders;
   p.deadline_ns = static_cast<unsigned long long>(cfg.deadline_s * 1e9);
