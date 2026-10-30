@@ -763,6 +763,29 @@ predictor available in time builds the speculative lead as a pool of
 predicted units in the lead's sequence, below 40 drops it, between the two
 it goes through the replay model first.
 
+*Measured 2026-10-30 evening*, three texts of 1,637, 2,032 and 2,430
+tokens (prose, code, JSON) through `dsv41_forward_check` on three idle
+nodes, 40 routed layers, six experts a token. Recall of the true six inside
+a set of 12, mean over layers and texts: the layer's most popular experts
+11 percent (the load is balanced, no hot set), the same token's experts at
+the previous layer 25, the previous tokens' experts at the same layer 40,
+the token's identity 56 (leave-one-out inside the text, 46 to 72 by
+layer). Restricted to tokens the text had already seen, identity reaches 58
+on prose, 64 on code and 67 on JSON at a set of 12 and 63 to 75 at 18, and
+such tokens are 66, 91 and 95 percent of the three texts, so a table kept
+over the deployment's life approaches those figures. Identity is also the
+predictor available earliest: every row's token is known when the step
+begins, so the guess for every layer is ready before the layer. The
+verdict is the band between the rules, and the bound on the gain is the
+lead's L2 cap rather than the recall: 16 MB holds about three experts of
+the twenty a five-row layer reads, so with the measured recall a staged
+set yields about 9 MB of useful bytes a layer, about 37 µs of memory time,
+about 1.6 ms a pass or 4 percent of the floor. The data also gave pillar 2
+its number: five consecutive rows read 19 to 22 distinct experts a layer,
+so a row past the first costs about 3.3 experts a layer, about 0.6 GB a
+pass, about 2.7 ms at the ceiling. H1 waits behind H2's finding below,
+which removes most of the stretches it would fill.
+
 **H2. A streaming unit with more bytes in flight.** The plateau's
 mechanism is one SM at 5 to 6 GB/s under load because its bytes in flight,
 16 KB a block at four 16-byte loads a lane, sit against the loaded
@@ -782,6 +805,43 @@ consumer reading its fragments from shared memory) and the fixed phases
 are re-measured with it, a plain ring that reaches it merely deepens the
 ring where registers allow, and neither reaching it closes the question
 in favour of the fused chain alone.
+
+*Measured 2026-10-30 evening on the idle device.* The premise was wrong
+in a useful way. A plain streaming block, 256 threads with the streamer's
+`__ldcs` 16-byte loads four deep a lane, reads 52 GB/s from one SM cold,
+the same with rings eight and sixteen deep, and eight such blocks saturate
+the memory at 236 GB/s. Multi-stage `cp.async` into shared memory reaches
+75 to 81 GB/s from one SM and bulk copies of 32 KB stages 61 to 76. So
+bytes in flight do not bound an SM near 5 GB/s, and sixteen SMs were never
+needed: eight suffice for any form, and the plan's SM budget can give the
+chain and the attention forty. The projection unit's own access pattern
+without its compute, sixteen rows by 32 bytes a warp-load, streams 31 GB/s
+from one SM and caps the whole device at 160 GB/s, because every request
+is one sector of one line; the bridge's 512-byte L2 prefetch a row lifts
+it to 54 GB/s from one SM and 236 from eight, which is why the bridge was
+found necessary, and runs of 64 bytes or more a row saturate without it.
+Bulk copies of 256-byte row pieces are the one bad form, 5 GB/s a block,
+each small copy paying the async proxy's overhead. So the unit's 16 GB/s
+an SM L2-hot and 5 cold are its instruction stream, and `ncu` on the hot
+unit says where: 124 warp instructions a 512-byte chunk, so even perfect
+issue caps an SM at 35 GB/s, and 7.0 cycles an issued instruction with
+only two warps a scheduler, of which 1.9 are long-scoreboard stalls, 1.65
+the block barrier and 1.2 fixed-latency waits. The long-scoreboard stall
+is the per-block scale: with 32-row blocks every chunk loads the next
+scale from L2 and the next chunk's accumulate depends on it. The barrier
+is the activation window's, every eight chunks. The conversion of e4m3 to
+bf16 is about half the instructions. Decision: rebuild the unit rather
+than its loads, in this order, each step measured by the hot and cold
+per-SM rate in `step_consumer_test` and the layer's share of its floor in
+`step_stream_test`: the scales of a warp's rows staged in shared memory
+once a unit, the activation slice staged once a unit when the group has
+one token group so the chunk loop has no barrier, the ring deepened where
+registers allow, then the conversion's instruction count. The target is
+40 GB/s an SM so that six units saturate the memory, which makes a phase
+of a few matrices stream at the ceiling without the fused chain, and the
+chain's job becomes latency alone. Bulk and multi-stage `cp.async` forms
+stay for the attention arena, where the per-SM rate from a single issuing
+thread is the point.
 
 **H3. The owned lead.** The lead table of section 2.1 counts 23 MB and the
 L2 part, 16 MB, is built. The other 7 MB is register and shared-memory
@@ -825,10 +885,26 @@ operational setting. The fused chain's own latency budget is 72 µs a
 layer, so every 10 µs saved there is 1 percent of the pass, the mHC site
 being the largest piece.
 
-The order of work: a measurement sprint of the three experiments that
+*H6 measured 2026-10-30 evening* over the consumers' plain grids, cold:
+the tile-major MXFP4 forms miss exactly their bytes at L2, 415.2 MB of L2
+read misses for a 414 MB pair sweep and 207.2 for a 207 MB down sweep,
+with 2.9 and 3.9 sectors a request, so nothing is over-fetched and the 233
+to 248 GB/s spread between forms is request granularity, not partial
+sectors. The fp8 and row-major forms issue 1.05 to 1.09 sectors a request,
+one line each, 2.5 times the requests a byte of the tile-major form, and
+their memory reads hide behind the bridge's prefetches where read misses
+cannot count them. The GB10 exposes no DRAM-side counters to `ncu`, so the
+L2 miss count is the deepest observable, and the floor keeps the ceiling
+it has.
+
+The order of work was a measurement sprint of the three experiments that
 decide a direction (H1's routing predictability, H2's per-SM rate by form,
-H6's sector efficiency), none touching production and each about a day,
-while the fused chain continues, since H1 and H3 land inside it.
+H6's sector efficiency), run the same evening with production down at the
+user's word and the three routing dumps on the other nodes. Its outcome
+reorders the program: the projection unit's rebuild (H2) comes first,
+since it attacks the plateau directly and cheaply, the fused chain keeps
+its place as the latency work, and the speculative lead (H1) and the
+remaining byte cuts follow.
 
 ### 1.1 A second engine behind a flag
 
@@ -1904,11 +1980,15 @@ area, untracked.
 - [ ] The speculative lead (hypothesis H1 of section 1.4): predicted
       expert units of the next layer in the lead's sequence behind the
       fixed units, streamed by idle workers within the L2 cap, superseded
-      by the chain's run list. Experiment first: the routing of the three
-      texts from `dsv41_forward_check` and the per-layer recall of the
-      three predictors at sets of 6, 12 and 18. Gate: the layers with
-      every weight computed at or above the synthetic 100 to 103 percent
-      of their floor, and the step bitwise its own with the lead off.
+      by the chain's run list. The experiment ran 2026-10-30: token
+      identity predicts 56 percent of a layer's six experts inside a set
+      of 12 (58 to 67 on tokens seen before, which are 66 to 95 percent
+      of a text), the previous layer 25, the previous tokens 40, so the
+      predictor is the token table and the gain is bounded by the L2 cap
+      at about 4 percent of the floor. Parked behind the projection
+      unit's rebuild. Gate when built: the layers with every weight
+      computed at or above the synthetic 100 to 103 percent of their
+      floor, and the step bitwise its own with the lead off.
 - [x] Hand-off primitives with cycle deadlines and the common exit path,
       the status word, the engine watchdog's poison. Gate: a withheld flag
       ends the kernel inside the deadline with a legible status on every
@@ -2032,17 +2112,30 @@ area, untracked.
       every weight computed, the fixed phases' unit quantization being the
       residue (section 1.3). Their inputs are synthetic until the fused
       chain feeds them; the bf12 head form stays unbuilt.
-- [ ] The streaming unit's bytes in flight (hypothesis H2 of section
-      1.4): the per-SM rate by form from one to 48 blocks, the plain
-      four-deep ring against eight- and sixteen-deep rings and against
-      bulk copies two and three 32 KB stages deep into shared memory, cold.
-      Decision rule in section 1.4. If a form wins, the projection unit
-      gains a shared-memory staged variant and the fixed phases are
-      re-measured.
-- [ ] The ceiling per form (hypothesis H6): DRAM bytes and sectors read
-      under `ncu` for each consumer's plain grid against the bytes the
-      plan says it reads, the floor carrying the measured ceiling of the
-      form it uses.
+- [x] The streaming unit's bytes in flight (hypothesis H2 of section
+      1.4), measured 2026-10-30: one SM streams 52 GB/s with the plain
+      four-deep ring and eight SMs saturate the memory, the unit's access
+      pattern with the bridge streams 54 from one SM, so the unit's 16
+      GB/s hot and 5 cold are its instruction stream (124 instructions a
+      512-byte chunk, a dependent per-chunk scale load, a barrier every
+      eight chunks). The staged variant is not the remedy; the rebuild
+      below is.
+- [ ] The projection unit's rebuild to 40 GB/s an SM, so six units
+      saturate the memory and a phase of a few matrices streams at the
+      ceiling: the scales of a warp's rows staged once a unit, the
+      activation slice staged once a unit at one token group with no
+      barrier in the chunk loop, the ring deepened where registers allow,
+      the conversion's instruction count cut. Gates: exact on every
+      output of a layer as today, the hot and cold per-SM rates in
+      `step_consumer_test` at or above 40 and 30 GB/s, and the layers
+      with every weight computed back at the synthetic 100 to 103
+      percent of their floor in `step_stream_test`.
+- [x] The ceiling per form (hypothesis H6), measured 2026-10-30: the
+      tile-major forms miss exactly their bytes at L2 (415.2 MB of
+      misses for a 414 MB sweep) at 2.9 to 3.9 sectors a request, the
+      fp8 and row-major forms at 1.05 to 1.09 behind the bridge, the
+      GB10 exposes no DRAM-side counters, so the floor keeps its 240
+      GB/s ceiling and the spread between forms is request granularity.
 - [ ] Fewer bytes a pass (hypothesis H4): bf12 companions for the
       remaining bf16 fixed ranges through the bf12 consumer, the ranges
       every rank reads whole sharded with their outputs gathered by the
