@@ -385,12 +385,12 @@ void test_settings_handshake() {
   sent.rendezvous_timeout_ms = 120000;
   sent.stats_interval_s = 10.0;
   {
-    dgpp::serve::JournalWriter writer(29938);
+    dgpp::serve::JournalWriter writer(0);
     std::atomic<bool> stop{false};
     dgpp::serve::WorldSettings got;
     bool ok = false;
     std::thread peer([&] {
-      dgpp::serve::JournalReader reader("127.0.0.1", 29938, 5000, 1);
+      dgpp::serve::JournalReader reader("127.0.0.1", writer.port(), 5000, 1);
       ok = dgpp::serve::wait_journal_settings(&reader, [&] { return stop.load(); }, &got,
                                               "0.1.0+gtest");
     });
@@ -415,11 +415,11 @@ void test_settings_handshake() {
   }
   {
     // A peer of another version refuses: a mixed-version world cannot form.
-    dgpp::serve::JournalWriter writer(29941);
+    dgpp::serve::JournalWriter writer(0);
     std::atomic<bool> stop{false};
     std::string violation;
     std::thread peer([&] {
-      dgpp::serve::JournalReader reader("127.0.0.1", 29941, 5000, 1);
+      dgpp::serve::JournalReader reader("127.0.0.1", writer.port(), 5000, 1);
       dgpp::serve::WorldSettings got;
       try {
         (void)dgpp::serve::wait_journal_settings(&reader, [&] { return stop.load(); }, &got,
@@ -437,12 +437,12 @@ void test_settings_handshake() {
             "a different version refuses naming both: " + violation);
   }
   {
-    dgpp::serve::JournalWriter writer(29939);
+    dgpp::serve::JournalWriter writer(0);
     std::atomic<bool> stop{false};
     bool ended = true;
     std::string violation;
     std::thread peer([&] {
-      dgpp::serve::JournalReader reader("127.0.0.1", 29939, 5000, 1);
+      dgpp::serve::JournalReader reader("127.0.0.1", writer.port(), 5000, 1);
       dgpp::serve::WorldSettings got;
       try {
         ended = !dgpp::serve::wait_journal_settings(&reader, [&] { return stop.load(); }, &got);
@@ -457,11 +457,11 @@ void test_settings_handshake() {
             "a first record that is not the settings is a protocol violation: " + violation);
   }
   {
-    dgpp::serve::JournalWriter writer(29940);
+    dgpp::serve::JournalWriter writer(0);
     std::atomic<bool> stop{false};
     bool ended = false;
     std::thread peer([&] {
-      dgpp::serve::JournalReader reader("127.0.0.1", 29940, 5000, 1);
+      dgpp::serve::JournalReader reader("127.0.0.1", writer.port(), 5000, 1);
       dgpp::serve::WorldSettings got;
       ended = !dgpp::serve::wait_journal_settings(&reader, [&] { return stop.load(); }, &got);
     });
