@@ -174,6 +174,7 @@ __device__ int phase_of_lead_unit(const StepStreamParams& p, int n_phases, unsig
 
 // Streams `bytes` from `ptr` through the block: lane-contiguous 16-byte
 // loads, four in flight a thread, folded into one word so the loads live.
+constexpr unsigned kLeadPiece = 16u << 10;  // a lead unit streams in pieces of this size and may stop between them
 template <bool kEvictFirst>
 __device__ unsigned stream_unit(const uint8_t* ptr, unsigned bytes) {
   const uint4* q = reinterpret_cast<const uint4*>(ptr);
@@ -418,7 +419,10 @@ __global__ void __launch_bounds__(kStepThreads, 1) step_stream_kernel(StepStream
           ctl->rows = d->rows;
           ctl->top_k = d->top_k;
           ctl->seed = d->seed + static_cast<unsigned>(d->seq);
-          for (int P = 0; P < n_phases; ++P) { ctl->next[P] = 0; ctl->done[P] = 0; ctl->pf_units[P] = 0; ctl->idle_first[P] = 0; ctl->pool_done[P] = 0; }
+          for (int P = 0; P < n_phases; ++P) {
+            ctl->next[P] = 0; ctl->done[P] = 0; ctl->pf_units[P] = 0; ctl->idle_first[P] = 0; ctl->pool_done[P] = 0;
+            ctl->busy_ns[P] = 0; ctl->grabs[P] = 0; ctl->handout_ns[P] = 0;
+          }
           ctl->pf_next = 0;
           ctl->pf_bytes = 0;
           ctl->consumed_pf_bytes = 0;
@@ -548,13 +552,18 @@ __global__ void __launch_bounds__(kStepThreads, 1) step_stream_kernel(StepStream
   }
   // ---- a worker
   extern __shared__ __align__(128) uint8_t smem[];
-  __shared__ unsigned sm_kind, sm_unit, sm_phase, sm_count;
+  __shared__ unsigned sm_kind, sm_unit, sm_phase, sm_count, sm_word, sm_stop;
+  __shared__ unsigned sm_cache_word, sm_need, sm_nslots;
+  __shared__ unsigned sm_slot_end[2 * (kMaxPhasePools + 1)], sm_slot_grab[2 * (kMaxPhasePools + 1)];
   __shared__ int sm_layer;
+  if (threadIdx.x == 0) sm_cache_word = ~0u;
   for (;;) {
     if (threadIdx.x == 0) {
       sm_kind = 0;
       sm_count = 1;
+      const unsigned long long t_top = gtimer();
       const unsigned w = ld_acq(&ctl->phase_word);
+      sm_word = w;
       const unsigned state = w & 3u;
       const int P = static_cast<int>((w >> 2) & 0xfffffu);
       if (state == kStateEnd || ld_acq(&ctl->poison)) {
@@ -562,33 +571,58 @@ __global__ void __launch_bounds__(kStepThreads, 1) step_stream_kernel(StepStream
       } else {
         const int cur_layer = p.phases[P].layer;
         if (state == kStateStream) {
-          const unsigned need = phase_units(p, cur_layer, P);
-          const DevPhase& gph = p.phases[P];
-          // The grab size: a consumer pool's at the counter's position, else one.
-          // Every unit of the grab is classified on its own below, so a grab
-          // that crosses a class boundary is still executed right.
-          unsigned grab = 1;
-          {
-            const unsigned at = ld_acq(&ctl->next[P]);
-            const unsigned own = own_units(p, cur_layer, P);
-            int ip = P;
-            unsigned iu = at;
-            if (gph.merged_next && at >= own) { ip = P + 1; iu = at - own; }
-            unsigned v = 0;
-            const int slot = unit_slot(p, cur_layer, ip, iu, &v);
-            const DevPhase& iph = p.phases[ip];
-            if (slot >= 0 && p.pools[iph.pools[slot]].kind != kPoolBytes) {
-              const DevPool& gp = p.pools[iph.pools[slot]];
-              grab = projection_split(p, gp) ? 4u : static_cast<unsigned>(gp.grab);
-              // Consecutive units share their staging while the phase has units for every worker; the tail takes them singly.
-              const unsigned remaining = need > at ? need - at : 0u;
-              if (remaining < grab * (gridDim.x - 1)) grab = 1u;
+          // The phase's hand-out table, built once a phase a worker: the unit count and, in the
+          // hand-out order (the pools that do not depend on the router, the routed pool, the fixed
+          // units, then the merged next phase's the same way), each class's end and grab size. A
+          // grab then costs the counter's load and the atomic, where recomputing the table's
+          // dependent loads under a saturated memory cost 3.5 to 4.5 us a grab (2026-10-30).
+          const unsigned at = ld_acq(&ctl->next[P]);
+          if (w != sm_cache_word) {
+            unsigned n = 0, end = 0;
+            for (int ip = P; ip <= (p.phases[P].merged_next ? P + 1 : P); ++ip) {
+              const DevPhase& iph = p.phases[ip];
+              if (iph.accumulate) {  // the ordered accumulation's chunks are the phase's only units
+                end += own_units(p, cur_layer, ip);
+                sm_slot_end[n] = end;
+                sm_slot_grab[n] = 1u;
+                ++n;
+                continue;
+              }
+              for (int pass = 0; pass < 2; ++pass)
+                for (int i = 0; i < iph.n_pools; ++i) {
+                  if ((pass == 0) == (i == iph.routed)) continue;  // the routed pool in the second pass
+                  const DevPool& gp = p.pools[iph.pools[i]];
+                  end += pool_units(p, cur_layer, gp);
+                  sm_slot_end[n] = end;
+                  sm_slot_grab[n] = gp.kind == kPoolBytes ? 1u : (projection_split(p, gp) ? 4u : static_cast<unsigned>(gp.grab));
+                  ++n;
+                }
+              end += iph.fixed_units;
+              sm_slot_end[n] = end;
+              sm_slot_grab[n] = 1u;
+              ++n;
             }
+            sm_need = end;
+            sm_nslots = n;
+            sm_cache_word = w;
+          }
+          const unsigned need = sm_need;
+          // The grab size: the class's at the counter's position. Every unit of the grab is
+          // classified on its own below, so a grab that crosses a class boundary is still
+          // executed right. Consecutive units share their staging while the phase has units for
+          // every worker; the tail takes them singly.
+          unsigned grab = 1;
+          for (unsigned i = 0; i < sm_nslots; ++i)
+            if (at < sm_slot_end[i]) { grab = sm_slot_grab[i]; break; }
+          if (grab > 1) {
+            const unsigned remaining = need > at ? need - at : 0u;
+            if (remaining < grab * (gridDim.x - 1)) grab = 1u;
           }
           const unsigned u = atomicAdd(&ctl->next[P], grab);
           if (u < need) {
             sm_kind = 1; sm_unit = u; sm_phase = static_cast<unsigned>(P); sm_layer = cur_layer;
             sm_count = min(grab, need - u);
+            atomicAdd(&ctl->handout_ns[P], gtimer() - t_top);
           } else if (ctl->idle_first[P] == 0) {
             ctl->idle_first[P] = gtimer();
           }
@@ -596,7 +630,22 @@ __global__ void __launch_bounds__(kStepThreads, 1) step_stream_kernel(StepStream
         if (sm_kind == 0 && p.lead_cap_bytes) {
           long long ahead = static_cast<long long>(ctl->pf_bytes) - static_cast<long long>(ctl->consumed_pf_bytes);
           if (ahead < 0) ahead = 0;
-          if (static_cast<unsigned long long>(ahead) + p.unit_bytes <= p.lead_cap_bytes) {
+          // The idle budget: the modeled time until the next stream phase has units, a latency
+          // phase's own time and the folds between, when this phase is a latency phase or drained.
+          unsigned long long cap = p.lead_cap_bytes;
+          if (p.lead_bytes_per_us > 0.f) {
+            float idle_us = 0.f;
+            for (int q = P; q < n_phases; ++q) {
+              const DevPhase& qh = p.phases[q];
+              if (qh.kind == 1 && !(q == P && state == kStateStream) ) break;  // a later stream phase: the memory is busy again
+              if (qh.kind == 0) idle_us += qh.latency_us;
+              const bool merged = qh.merged_next != 0;
+              idle_us += merged ? p.phases[q + 1].fold_after_us : qh.fold_after_us;
+              if (merged) ++q;
+            }
+            cap += static_cast<unsigned long long>(idle_us * p.lead_bytes_per_us);
+          }
+          if (static_cast<unsigned long long>(ahead) + p.unit_bytes <= cap) {
             bool slot = true;
             if (p.max_leaders) {
               if (atomicAdd(&ctl->leaders, 1u) >= p.max_leaders) { atomicSub(&ctl->leaders, 1u); slot = false; }
@@ -625,6 +674,7 @@ __global__ void __launch_bounds__(kStepThreads, 1) step_stream_kernel(StepStream
     const unsigned kind = sm_kind;
     if (kind == 3) return;
     if (kind == 0) { __nanosleep(200); continue; }
+    const unsigned long long t_grab = gtimer();
     // Each unit of the grab on its own: a unit past a merged phase's own
     // units belongs to the next phase, and inside a phase it is a fixed byte
     // unit, a routed consumer unit or a shared-expert unit.
@@ -706,8 +756,25 @@ __global__ void __launch_bounds__(kStepThreads, 1) step_stream_kernel(StepStream
         const bool found = kind == 2  ? locate_lead(p, sm_layer, static_cast<int>(xphase), xunit, &ptr, &bytes)
                            : upool    ? locate_pool_bytes(p, sm_layer, *upool, xv, &ptr, &bytes)
                                       : locate_fixed(p, sm_layer, static_cast<int>(xphase), xv, &ptr, &bytes);
-        if (found) {
-          acc = kind == 2 ? stream_unit<false>(ptr, bytes) : stream_unit<true>(ptr, bytes);
+        if (found && kind == 2) {
+          // A lead unit yields: it streams in pieces and stops when the chain publishes a new
+          // phase, so a worker is back at the hand-out within a piece's time rather than a
+          // unit's at the memory's share, which held phase starts behind lead work.
+          unsigned off = 0;
+          while (off < bytes) {
+            const unsigned piece = min(kLeadPiece, bytes - off);
+            acc ^= stream_unit<false>(ptr + off, piece);
+            off += piece;
+            if (off < bytes) {
+              if (threadIdx.x == 0) sm_stop = ld_acq(&ctl->phase_word) != sm_word ? 1u : 0u;
+              __syncthreads();
+              if (sm_stop) break;
+            }
+          }
+          if (threadIdx.x == 0 && off < bytes)  // the unstreamed remainder leaves the lead's account (a wrapping add)
+            atomicAdd(&ctl->pf_bytes, static_cast<unsigned long long>(-static_cast<long long>(bytes - off)));
+        } else if (found) {
+          acc = stream_unit<true>(ptr, bytes);
         } else if (threadIdx.x == 0) {
           atomicCAS(&ctl->status, kStepOk, kStepBadUnit);
         }
@@ -717,7 +784,12 @@ __global__ void __launch_bounds__(kStepThreads, 1) step_stream_kernel(StepStream
     }
     __syncthreads();
     if (threadIdx.x == 0) {
-      if (kind == 1) { __threadfence(); atomicAdd(&ctl->done[sm_phase], sm_count); }
+      if (kind == 1) {
+        __threadfence();
+        atomicAdd(&ctl->done[sm_phase], sm_count);
+        atomicAdd(&ctl->busy_ns[sm_phase], gtimer() - t_grab);
+        atomicAdd(&ctl->grabs[sm_phase], 1u);
+      }
       if (kind == 2 && p.max_leaders) atomicSub(&ctl->leaders, 1u);
     }
   }

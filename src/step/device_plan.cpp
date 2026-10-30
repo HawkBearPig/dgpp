@@ -20,10 +20,15 @@ uint64_t align_grant(uint64_t b) { return (b + kGrantAlign - 1) / kGrantAlign * 
 // evenly, so a unit is about 160 KB and the phase's tail a fraction of its
 // time. Slabbed pools reduce their fp32 partials in slab order afterwards.
 constexpr int32_t kProjectionUnitRows = 128;
+// The slabs of a projection's inner width: the most that leave a slab of at
+// least 640 codes (two and a half windows). Units of 80 to 130 KB give a
+// phase of a few matrices four or more waves over the workers, so its tail
+// is a fraction of a unit rather than most of one (2026-10-30: at 1280-code
+// slabs the attn_out phase drained for half its length).
 int32_t projection_slabs(int k) {
   int32_t best = 1;
   for (int d = 2; d <= 8; ++d)
-    if ((k / 256) % d == 0 && k / d >= 1280) best = d;
+    if ((k / 256) % d == 0 && k / d >= 640) best = d;
   return best;
 }
 

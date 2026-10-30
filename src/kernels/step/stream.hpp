@@ -68,6 +68,9 @@ struct alignas(128) StepCtl {
   unsigned long long stamp_begin[kStepMaxPhases];  // the last pass: the phase's publish or latency start
   unsigned long long stamp_end[kStepMaxPhases];    // the last pass: its units done, the fold after it included
   unsigned long long idle_first[kStepMaxPhases];   // the last pass: the first worker to find the phase drained
+  unsigned long long busy_ns[kStepMaxPhases];      // the last pass: worker time inside the phase's grabs, summed
+  unsigned grabs[kStepMaxPhases];                  // the last pass: grabs of the phase's units
+  unsigned long long handout_ns[kStepMaxPhases];   // the last pass: thread 0's time from the loop top to the grab, summed
   unsigned steps_run;                              // steps this launch completed
   unsigned rows;                                   // the running step's rows (the synthetic router's)
   unsigned top_k;
@@ -107,6 +110,12 @@ struct StepStreamParams {
   unsigned consumer_smem = 0;  // dynamic shared memory the consumer units need
   int lookahead_layers = 2;
   unsigned long long lead_cap_bytes = 0;  // 0: no lead
+  // The lead's idle budget: when the current phase is a latency phase or a
+  // drained stream phase, the memory would otherwise idle until the next
+  // stream phase, so the cap grows by that time's worth of bytes at this
+  // rate (bytes a microsecond; 0: the cap alone). The extra is consumed by
+  // the very next stream phases, so the parked set stays the cap's.
+  float lead_bytes_per_us = 0.f;
   unsigned max_leaders = 0;               // 0: unbounded
   unsigned long long deadline_ns = 0;          // every in-step spin's deadline (0: none)
   unsigned long long pending_deadline_ns = 0;  // how long the chain waits for the host's next descriptor (0: forever)

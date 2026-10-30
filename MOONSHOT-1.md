@@ -783,8 +783,10 @@ set yields about 9 MB of useful bytes a layer, about 37 µs of memory time,
 about 1.6 ms a pass or 4 percent of the floor. The data also gave pillar 2
 its number: five consecutive rows read 19 to 22 distinct experts a layer,
 so a row past the first costs about 3.3 experts a layer, about 0.6 GB a
-pass, about 2.7 ms at the ceiling. H1 waits behind H2's finding below,
-which removes most of the stretches it would fill.
+pass, about 2.7 ms at the ceiling. A fourth text (1,533 tokens of prose)
+left identity at 56 and lifted the previous layer to 31 and the previous
+tokens to 42 at a set of 12. H1 waits behind H2's finding below, which
+removes most of the stretches it would fill.
 
 **H2. A streaming unit with more bytes in flight.** The plateau's
 mechanism is one SM at 5 to 6 GB/s under load because its bytes in flight,
@@ -842,6 +844,42 @@ of a few matrices stream at the ceiling without the fused chain, and the
 chain's job becomes latency alone. Bulk and multi-stage `cp.async` forms
 stay for the attention arena, where the per-SM rate from a single issuing
 thread is the point.
+
+*Built the same evening.* The staged projection form (the scale row and
+the activation slice staged once, no barrier in the chunk loop, each lane
+loading its own fragment's bytes so the shuffle network is gone, the
+block's first mma with a zero C operand, the e4m3 decode through the
+conversion unit) runs the hot unit at 25 GB/s an SM from 16, bitwise the
+windowed form. The decode step exposed a defect: the integer rebias every
+fp8 form used was wrong on the fourteen subnormal e4m3 codes, which real
+DeepSeek-V4.1 shards hold at about one code in ten thousand and the
+synthetic test data had never held; every form now decodes as production's
+fp8 GEMV does, the test data holds exponents 0 to 14, and the stream's
+exactness gates held. The layer did not move with the unit alone, and the
+per-phase utilization the trace now reports said why: workers were busy
+60 to 70 percent of the fixed phases and 91 of the expert phase, and the
+hand-out itself cost 3.5 to 4.5 µs a grab under a saturated memory (1.3
+in a quiet phase), its dependent loads of the phase and pool tables.
+Three changes followed, each measured: the phase's hand-out table built
+once a worker in shared memory (a grab is the counter's load and the
+atomic, 1.0 to 1.6 µs), lead units that stream in 16 KB pieces and yield
+when a phase is published (phase starts had waited behind lead units at
+the memory's share), and slabs of at least 640 codes for the projections
+(the attn_out drain fell from 56 to 15 µs). Workers are now busy 83, 78
+and 96 percent of the qkv, attn_out and expert phases, the expert phase
+streams at 92 percent of the ceiling, the fixed phases at the ceiling in
+aggregate, and the median layer at 87 to 88 percent of its floor at any
+lead cap from 4 to 20 MB. The residue is the layer's latency: attn_in 9,
+attend 2, ffn_in 12, the router 18, the gap to the experts 8 and the
+accumulation 21 µs, about 70 µs a layer, of which the lead covers a few
+microseconds, because its cap is full when the latency begins. The bound
+is structural: the L2 cap of about 16 MB that survives the expert phase
+is 67 µs of bytes, the layer's idle time (latency plus drains) about 100,
+and bytes parked across the expert phase hold the cap for its 650 µs. So
+the remaining 12 percent comes from three places: the forms' own rate (233
+to 248 GB/s against the floor's 240), the latency segments the fused chain
+shortens (the accumulation's 21 µs first), and the lead's use of the cap
+around them.
 
 **H3. The owned lead.** The lead table of section 2.1 counts 23 MB and the
 L2 part, 16 MB, is built. The other 7 MB is register and shared-memory
@@ -2129,7 +2167,30 @@ area, untracked.
       output of a layer as today, the hot and cold per-SM rates in
       `step_consumer_test` at or above 40 and 30 GB/s, and the layers
       with every weight computed back at the synthetic 100 to 103
-      percent of their floor in `step_stream_test`.
+      percent of their floor in `step_stream_test`. Landed 2026-10-30
+      evening as `fp8_matrix_staged_unit`: the staging, the direct
+      fragment loads in place of the shuffles, the zero-C first mma and
+      the conversion-unit decode, 25 GB/s an SM hot from 16, bitwise the
+      windowed form, with the e4m3 decode defect fixed in every fp8 form
+      (section 1.4). Owed: the rate target, the decode still half the
+      instructions; since the fixed phases now stream at the ceiling in
+      aggregate with the lead's staged bytes, the per-SM rate matters at
+      their tails only.
+- [x] The hand-out table and the lead's yield (2026-10-30 evening): the
+      phase's table built once a worker in shared memory, lead units in
+      16 KB pieces that stop at a published phase, the lead's idle budget
+      during latency phases and drains, projection slabs of at least 640
+      codes, and the trace's per-phase worker utilization, grab time and
+      hand-out time. Hand-out 3.5 to 4.5 µs a grab to 1.0 to 1.6, workers
+      busy 83, 78 and 96 percent of the qkv, attn_out and expert phases,
+      the median layer 87 to 88 percent of its floor at any lead cap.
+- [ ] The latency residue: about 70 µs a layer of latency segments the
+      lead cannot cover because its cap is full when they begin. The
+      accumulation's 21 µs first (finer units, the lead let into it),
+      then the fused chain's shortening of the rest, then the lead's cap
+      used around the expert phase rather than parked across it. Gate:
+      the layers with every weight computed at or above 95 percent of
+      their floor with the design chain's latencies.
 - [x] The ceiling per form (hypothesis H6), measured 2026-10-30: the
       tile-major forms miss exactly their bytes at L2 (415.2 MB of
       misses for a 414 MB sweep) at 2.9 to 3.9 sectors a request, the

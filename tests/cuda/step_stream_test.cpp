@@ -140,6 +140,7 @@ StreamerConfig design_config() {
   cfg.steps = 3;
   cfg.lookahead_layers = 2;
   cfg.lead_cap_bytes = uint64_t{16} << 20;  // the sweep's optimum with every consumer real (8 MB with synthetic ones)
+  cfg.lead_bytes_per_us = 240e3f;           // the idle budget at the ceiling
   cfg.max_leaders = 0;
   cfg.deadline_s = 5.0;
   cfg.rows = 5;
@@ -150,10 +151,14 @@ StreamerConfig design_config() {
 
 void print_report(const char* title, const StreamReport& r, int layer) {
   std::printf("   %s: status %s, kernel %.1f ms, lead %.1f MB\n", title, r.status_text.c_str(), r.kernel_ms, r.lead_bytes / 1e6);
-  for (const PhaseTiming& t : r.phases)
-    if (t.layer == layer)
-      std::printf("      layer %d %-10s %s %8.1f .. %8.1f us  units %5u  lead %4u  drained %6.1f us\n", t.layer, t.name.c_str(),
-                  t.stream ? "stream " : "latency", t.begin_us, t.end_us, t.units, t.pf_units, t.drained_us);
+  for (const PhaseTiming& t : r.phases) {
+    if (t.layer != layer) continue;
+    const double window = t.end_us - t.begin_us;
+    const double util = (t.stream && window > 0 && r.workers > 0) ? t.busy_us / (window * r.workers) : 0.0;
+    std::printf("      layer %d %-10s %s %8.1f .. %8.1f us  units %5u  lead %4u  drained %6.1f us  busy %5.1f %%  %5.1f us a grab (%u), hand-out %4.1f us\n",
+                t.layer, t.name.c_str(), t.stream ? "stream " : "latency", t.begin_us, t.end_us, t.units, t.pf_units, t.drained_us,
+                util * 100.0, t.grabs ? t.busy_us / t.grabs : 0.0, t.grabs, t.grabs ? t.handout_us / t.grabs : 0.0);
+  }
 }
 
 }  // namespace

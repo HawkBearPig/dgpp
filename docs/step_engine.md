@@ -135,6 +135,21 @@ the phases ahead, within a lookahead of layers and an L2 cap, read with
 normal loads so the lines stay for the phase that consumes them. The
 governor bounds how many workers lead at once.
 
+Three details of the hand-out came from measurement with every consumer
+real. A worker builds the published phase's hand-out table once in shared
+memory (the unit count and, in hand-out order, each class's end and grab
+size), so a grab costs the counter's load and the atomic; recomputing the
+table's dependent loads under a saturated memory cost 3.5 to 4.5 µs a grab
+and was most of the idle worker time in the expert phase. A lead unit
+streams in 16 KB pieces and stops when the chain publishes a new phase, so
+a worker is back at the hand-out within a piece rather than a unit at the
+memory's share; before that, phase starts waited behind lead work. And the
+lead's cap grows by an idle budget while the current phase is a latency
+phase or drained, the modeled time until the next stream phase at the
+ceiling's rate, since the memory would otherwise idle for it. The trace a
+run reads back reports each phase's worker utilization, the mean time of a
+grab and the mean hand-out time.
+
 The plan reaches the kernel through `lower_plan` (`src/step/device_plan.hpp`):
 each phase's fixed ranges under the arena coalesce into a few contiguous
 segments, its routed experts into one pool of groups at one stride, and
@@ -267,15 +282,37 @@ the pair at 229 GB/s and the down at 216 over 60 cold pairs, and
 
 The same form with one matrix (`fp8_matrix_unit`) computes the layer's fp8
 projections for every token, eight DeepSeek-V4.1 shapes compiled in, as
-128-row units over slabs of the inner width whose fp32 partials a reduce
-sums in slab order. Inside the streamer every projection output of a layer
-is exact or inside the envelope against the reference. With every weight
-of the layer computed and the lead at 16 MB, the layers run at 86 to 91
-percent of their byte floor; the fixed phases are the residue. During any
-stretch where fewer than about forty SMs stream, the memory is not
-saturated, since one SM's rate is bound by its bytes in flight against the
-loaded memory's latency, and a phase of a few dependent matrices has such
-stretches at both ends. A split form of the projection unit (32 rows, the
-width in four parts across the warps, a deterministic reduce) is kept as
-an option; it shortened the drain but cost more per byte.
+128-row units over slabs of at least 640 codes of the inner width whose
+fp32 partials a reduce sums in slab order. Groups of at most eight slots,
+the C1 shape, take the staged form (`fp8_matrix_staged_unit`): the warp's
+scale row and the group's activation slice over the unit's slabs are
+staged once, so the chunk loop has no block barrier and no dependent
+load, and each lane loads the bytes of its own mma fragment (codes 8 tid
+to 8 tid + 7 of rows gid and gid + 8) rather than taking them from a
+shuffle, bitwise the windowed form's result. The e4m3 codes of every fp8
+form decode through the conversion unit (two codes to f16x2, each to f32,
+the pair to bf16x2), exact on every finite code and the decode
+production's fp8 GEMV uses; the integer rebias it replaced was wrong on
+the fourteen subnormal codes, which are about one code in ten thousand of
+the checkpoint's fp8 tensors and which the synthetic test data had never
+held. Inside the streamer every projection output of a layer is exact or
+inside the envelope against the reference, and `step_consumer_test` holds
+the staged form bitwise against the windowed form and against the
+reference over data with subnormal codes.
+
+The per-SM rate is the unit's instruction stream, not the memory's
+latency: a plain streaming block reads 52 GB/s from one SM and eight
+saturate the memory, while the hot projection unit went from 16 to 25
+GB/s an SM through the staging, the direct fragment loads and the
+conversion unit, with the e4m3 decode still about half its instructions.
+With every weight of the layer computed the layers run at 87 to 88
+percent of their byte floor at any lead cap from 4 to 20 MB; the fixed
+phases stream at the ceiling in aggregate with the lead's staged bytes,
+the expert phase at 92 percent with its workers busy 96 percent of the
+time, and the residue is the layer's latency segments (about 70 µs a
+layer with the accumulation's 20) that the lead can cover only as far as
+the L2 cap lets it park bytes across the expert phase. A split form of the
+projection unit (32 rows, the width in four parts across the warps, a
+deterministic reduce) is kept as an option; it shortened the drain but
+cost more per byte.
 

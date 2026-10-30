@@ -25,6 +25,7 @@ struct StreamerConfig {
   int lookahead_layers = 2;      // how far ahead the lead may run
   uint64_t lead_cap_bytes = uint64_t{8} << 20;  // engine.l2_staging_mib
   unsigned max_leaders = 0;      // engine.stream_governor: 0 unbounded
+  float lead_bytes_per_us = 0.f; // the lead's idle budget rate (bytes a microsecond; 0: the cap alone)
   double deadline_s = 5.0;       // every in-step spin's deadline
   double pending_deadline_s = 30.0;  // the kernel's wait for the next descriptor
   int rows = 1;                  // the step's rows and the synthetic router's picks a row
@@ -48,6 +49,9 @@ struct PhaseTiming {
   unsigned units = 0;
   unsigned pf_units = 0;
   double drained_us = 0;  // the first worker's idle wait from the phase's drain to its end (0: none seen)
+  double busy_us = 0;     // worker time inside the phase's grabs, summed over workers
+  double handout_us = 0;  // thread 0's time from the loop top to the grab, summed over grabs
+  unsigned grabs = 0;
 };
 
 struct StreamReport {
@@ -65,6 +69,7 @@ struct StreamReport {
   std::vector<double> layer_bytes;  // what the layer streamed at its run list
   std::vector<int> run_counts;
   double lead_bytes = 0;            // the last step's lead reads
+  int workers = 0;                  // the run's workers, for the phases' utilization
 };
 
 class Streamer {

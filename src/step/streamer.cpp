@@ -151,6 +151,7 @@ StreamReport Streamer::run(const StreamerConfig& cfg) {
   p.ctl = ctl_;
   p.sink = sink_;
   p.lookahead_layers = cfg.lookahead_layers;
+  p.lead_bytes_per_us = cfg.lead_bytes_per_us;
   p.lead_cap_bytes = cfg.lead_cap_bytes;
   p.max_leaders = cfg.max_leaders;
   p.deadline_ns = static_cast<unsigned long long>(cfg.deadline_s * 1e9);
@@ -280,6 +281,9 @@ StreamReport Streamer::run(const StreamerConfig& cfg) {
       t.pf_units = ctl_->pf_units[P];
       if (ctl_->idle_first[P] && ctl_->idle_first[P] < ctl_->stamp_end[P])
         t.drained_us = static_cast<double>(ctl_->stamp_end[P] - ctl_->idle_first[P]) / 1e3;
+      t.busy_us = static_cast<double>(ctl_->busy_ns[P]) / 1e3;
+      t.handout_us = static_cast<double>(ctl_->handout_ns[P]) / 1e3;
+      t.grabs = ctl_->grabs[P];
       first = std::min(first, ctl_->stamp_begin[P]);
       last = std::max(last, ctl_->stamp_end[P]);
       for (int i = 0; i < ph.seg_count; ++i) bytes += static_cast<double>(dp_.segments[static_cast<size_t>(ph.seg_begin + i)].bytes);
@@ -293,6 +297,7 @@ StreamReport Streamer::run(const StreamerConfig& cfg) {
     r.layer_bytes.push_back(bytes);
   }
   r.lead_bytes = static_cast<double>(ctl_->pf_bytes);
+  r.workers = cfg.workers;
   return r;
 }
 
