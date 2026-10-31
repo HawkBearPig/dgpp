@@ -2887,6 +2887,86 @@ DGPP_TEST(scheduler_prefixCache_twoInterleavedConversationsKeepHittingUnderATigh
   require(m.prefix_evictions > 0, "the arena turned over: " + std::to_string(m.prefix_evictions));
 }
 
+DGPP_TEST(scheduler_prefixCache_cancelledHistoryReusesOnlyMatchingCommittedPrefixes) {
+  const char* scenarios[] = {"full history",  "one undelivered token", "truncated before cut",
+                             "edited answer", "edited prompt",         "changed boundary"};
+  // A normal completion is the control: cancellation after the same nine
+  // tokens should preserve the same eligible prefix, not force a rewind.
+  for (bool cancel : {false, true}) {
+    for (int scenario = 0; scenario < 6; ++scenario) {
+      FakeEngine engine(1, 100, 4);
+      engine.set_prefix_arena(8, 4);
+      std::vector<int32_t> script;
+      for (int i = 0; i < 40; ++i) script.push_back(31 + i);
+      engine.arm(0, script, 40);
+      engine.arm(0, {90}, 1);
+      Scheduler sched(&engine, {kEos});
+      const auto prompt = counted_prompt(21);
+      sched.submit(make_cached_request("first", prompt, {5, 13}, cancel ? 40 : 9));
+      if (cancel) {
+        for (int i = 0; i < 50 && sched.meters().tokens_generated < 9; ++i) sched.tick();
+        require(sched.meters().tokens_generated == 9, "generated exactly nine tokens");
+        require(sched.cancel("first"), "cancel the live request");
+      }
+      sched.run_to_completion();
+      require(sched.results()[0].generated.size() == 9, "matching response lengths");
+      require(sched.results()[0].reason == (cancel ? Scheduler::Result::Reason::kCancelled
+                                                   : Scheduler::Result::Reason::kSteps),
+              "the control completes and the interrupted request cancels");
+      auto delivered = sched.results()[0].generated;
+      if (scenario == 1) delivered.resize(8);
+      if (scenario == 2) delivered.resize(5);
+      auto next = prompt;
+      next.insert(next.end(), delivered.begin(), delivered.end());
+      const int64_t boundary = static_cast<int64_t>(next.size());
+      next.insert(next.end(), {9000, 9001, 9002});
+      if (scenario == 3) next[21] = 7000;
+      if (scenario == 4) next[0] = 7000;
+      const auto before = sched.meters();
+      sched.submit(make_cached_request("next", next, {5, 13, scenario == 5 ? 24 : boundary}, 1));
+      sched.run_to_completion();
+      const auto saved = sched.meters().prefix_tokens_saved - before.prefix_tokens_saved;
+      const int expected = scenario == 4 ? 0 : scenario < 2 ? 28 : 12;
+      require(saved == expected, std::string(cancel ? "cancel: " : "complete: ") +
+                                     scenarios[scenario] + " saved=" + std::to_string(saved));
+    }
+  }
+}
+
+DGPP_TEST(scheduler_prefixCache_cancelledSpeculativeBatchRetainsOnlyEligibleCuts) {
+  // A scripted cancel can cut a two-token batch short. Only a snapshot at
+  // a committed position that is also a cut in the new history may attach.
+  const int expected[] = {12, 12, 24, 24, 24, 12, 28};
+  for (int stop = 2; stop <= 8; ++stop) {
+    FakeEngine engine(1, 100, 4);
+    engine.set_prefix_arena(8, 4);
+    engine.set_step_tokens_max(2);
+    engine.arm_batches(0, 31, {{32, 33}, {34, 35}, {36, 37}, {38, 39}}, 20);
+    engine.arm(0, {90}, 1);
+    Scheduler sched(&engine, {kEos});
+    const auto prompt = counted_prompt(21);
+    auto request = make_cached_request("first", prompt, {5, 13}, 20);
+    request.cancel_after = stop;
+    sched.submit(request);
+    sched.run_to_completion();
+    const auto generated = sched.results()[0].generated;
+    require(generated.size() == static_cast<size_t>(stop),
+            "scripted cancellation truncates the batch");
+    auto next = prompt;
+    next.insert(next.end(), generated.begin(), generated.end());
+    const int64_t boundary = static_cast<int64_t>(next.size());
+    next.push_back(9000);
+    const auto before = sched.meters();
+    sched.submit(make_cached_request("next", next, {5, 13, boundary}, 1));
+    sched.run_to_completion();
+    const auto saved = sched.meters().prefix_tokens_saved - before.prefix_tokens_saved;
+    require(saved <= 21 + stop - 1, "never attach beyond the committed response prefix");
+    require(saved == expected[stop - 2], "eligible cut after cancellation at token " +
+                                             std::to_string(stop) +
+                                             ": saved=" + std::to_string(saved));
+  }
+}
+
 DGPP_TEST(scheduler_prefixCache_rollingSnapshotBecomesTheCloseEntryTheNextTurnAttachesTo) {
   // GIVEN a 21-token prompt whose answer runs six tokens and ends in EOS:
   // committed positions 21 (after the prefill pick), 22, 23, 24 <- aligned,
