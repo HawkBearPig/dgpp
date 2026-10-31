@@ -64,7 +64,8 @@ void check_near(double a, double b, double rel, const std::string& what) {
 int main() {
   using namespace dgpp;
   using namespace dgpp::step;
-  const auto doc = minijson::parse(dsv41_test::config_json());
+  const std::string config_text = dsv41_test::config_json();  // outlives the parse: the document's strings view it
+  const auto doc = minijson::parse(config_text);
   const Dsv41TextConfig cfg = Dsv41TextConfig::parse(doc.root);
   constexpr int kWorld = 4;
 

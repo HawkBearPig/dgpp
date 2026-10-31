@@ -2435,19 +2435,23 @@ area, untracked.
       synthetic router and no sites had read. The band of one clean run
       is about 1.5 points on the median and 6 µs on a class window, so a
       lever is judged on two samples at least and together with the
-      stages that would have to adapt with it. Three levers measured
-      alone against a saturated stream and set aside are to be
-      re-evaluated as a set, since each is right in the design: gated
-      classes first (needs the lead to back off while critical classes
-      run, and site and router units insensitive to memory contention:
-      staged operands, few round trips); the 2048-output row chunk (needs
-      the accumulate and reduce units' loads pipelined, which they now
-      are); the pipelined router batches (needs the kernel's register
-      budget, 255 with spills). The select's loads are batched, the finish
-      works in shared memory, each site unit collapses its slice of the
-      row so the finish only norms, and the class table resolves the
-      routed counts at load so no rebuild follows the select; each within
-      the band on its own.
+      stages that would have to adapt with it. The levers set aside on
+      single runs were re-measured as a set by
+      `step_consumers_lever_matrix` (2026-10-31 night, after finding that
+      two background patch scripts had failed silently, so the per-group
+      fold gate and the lead's yield on gates had never run): the yield
+      is worth three to four points and is on; gated classes first loses
+      about three even with it, the group's end bounded by the stream the
+      critical units now share workers and memory with; bounding the
+      leaders to eight while critical units run trades 15 µs of tail for
+      about five points of the lead's staging; the 2048-output chunk and
+      the pipelined router batches sit inside the band alone and in
+      combination. The select's loads are batched, the finish works in
+      shared memory, each site unit collapses its slice of the row so the
+      finish only norms, and the class table resolves the routed counts at
+      load so no rebuild follows the select. What the remaining tail now
+      needs is units that run at their standalone speed under the stream
+      (staged operands, few round trips) rather than a different order.
       Owed here: the attention consumer, the folds and the select as
       consumers, and the chain's critical path after the attention-output
       fold, about 70 µs against the budget's 34: the MoE site's class 24

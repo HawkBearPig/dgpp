@@ -100,7 +100,7 @@ __device__ __forceinline__ unsigned compute_units_per_group(const StepStreamPara
 // reduce became the phase's tail.
 __device__ __forceinline__ unsigned reduce_units(const StepStreamParams& p, const DevPool& pool) {
   if (pool.kind != kPoolFp8Matrix || pool.slabs <= 1 || projection_split(p, pool)) return 0;
-  return (static_cast<unsigned>(pool.rows) * static_cast<unsigned>(p.ctl->rows) + kStepAccChunk - 1) / kStepAccChunk;
+  return (static_cast<unsigned>(pool.rows) * static_cast<unsigned>(p.ctl->rows) + p.acc_chunk - 1) / p.acc_chunk;
 }
 __device__ __forceinline__ unsigned pool_units(const StepStreamParams& p, int layer, const DevPool& pool) {
   const unsigned groups = pool.group_kind == kGroupRouted ? static_cast<unsigned>(p.ctl->run_count[layer]) : 1u;
@@ -108,7 +108,7 @@ __device__ __forceinline__ unsigned pool_units(const StepStreamParams& p, int la
 }
 __device__ __forceinline__ unsigned own_units(const StepStreamParams& p, int layer, int P) {
   const DevPhase& ph = p.phases[P];
-  if (ph.accumulate) return (static_cast<unsigned>(p.ctl->rows) * static_cast<unsigned>(p.hidden) + kStepAccChunk - 1) / kStepAccChunk;
+  if (ph.accumulate) return (static_cast<unsigned>(p.ctl->rows) * static_cast<unsigned>(p.hidden) + p.acc_chunk - 1) / p.acc_chunk;
   unsigned n = ph.fixed_units;
   for (int i = 0; i < ph.n_pools; ++i) n += pool_units(p, layer, p.pools[ph.pools[i]]);
   return n;
@@ -144,29 +144,35 @@ __device__ void build_class_table(const StepStreamParams& p, int P) {
     e.w = per_run;
     ctl->cls_table[P][n++] = e;
   };
-  for (int ip = P; ip <= P + static_cast<int>(p.phases[P].merged); ++ip) {
-    const DevPhase& iph = p.phases[ip];
-    const int il = iph.layer;
-    if (iph.accumulate) {  // the ordered accumulation's chunks are the phase's only units
-      put(own_units(p, il, ip), 1u, kClassAccumulate, ip, -1, kGateNone, 0, 0u);
-      continue;
-    }
-    for (int rp = 0; rp < 2; ++rp)
-      for (int i = 0; i < iph.n_pools; ++i) {
-        if ((rp == 0) == (i == iph.routed)) continue;  // the routed pool after the others
-        const DevPool& gp = p.pools[iph.pools[i]];
-        const bool routed = gp.group_kind == kGroupRouted;
-        const unsigned per_group = compute_units_per_group(p, gp);
-        if (per_group)
-          put(per_group, gp.kind == kPoolBytes ? 1u : (projection_split(p, gp) ? 4u : static_cast<unsigned>(gp.grab)), kClassCompute, ip, iph.pools[i],
-              gp.gate_kind, gp.gate_arg, routed ? 1u : 0u);
-        // Its reduce units, gated on its compute units: the update-carrying projection's y (and
-        // the attention update) completes early in the group.
-        const unsigned reduce = reduce_units(p, gp);
-        if (reduce) put(reduce, 1u, kClassReduce, ip, iph.pools[i], kGateOwnPool, 0, 0u);
+  // Phase order; with p.gated_first the gated classes first (in phase order), then the rest.
+  const int passes = p.gated_first ? 2 : 1;
+  for (int pass = 0; pass < passes; ++pass)
+    for (int ip = P; ip <= P + static_cast<int>(p.phases[P].merged); ++ip) {
+      const DevPhase& iph = p.phases[ip];
+      const int il = iph.layer;
+      const bool want_gated = passes == 2 && pass == 0;
+      const bool want_ungated = passes == 1 || pass == 1;
+      if (iph.accumulate) {  // the ordered accumulation's chunks are the phase's only units
+        if (want_ungated) put(own_units(p, il, ip), 1u, kClassAccumulate, ip, -1, kGateNone, 0, 0u);
+        continue;
       }
-    if (iph.fixed_units) put(iph.fixed_units, 1u, kClassFixed, ip, -1, kGateNone, 0, 0u);  // the shortest units, they fill the tail
-  }
+      for (int rp = 0; rp < 2; ++rp)
+        for (int i = 0; i < iph.n_pools; ++i) {
+          if ((rp == 0) == (i == iph.routed)) continue;  // the routed pool after the others
+          const DevPool& gp = p.pools[iph.pools[i]];
+          const bool routed = gp.group_kind == kGroupRouted;
+          const unsigned per_group = compute_units_per_group(p, gp);
+          const bool gated = gp.gate_kind != kGateNone;
+          if (per_group && (passes == 1 || gated == want_gated))
+            put(per_group, gp.kind == kPoolBytes ? 1u : (projection_split(p, gp) ? 4u : static_cast<unsigned>(gp.grab)), kClassCompute, ip, iph.pools[i],
+                gp.gate_kind, gp.gate_arg, routed ? 1u : 0u);
+          // Its reduce units, gated on its compute units: the update-carrying projection's y (and
+          // the attention update) completes early in the group.
+          const unsigned reduce = reduce_units(p, gp);
+          if (reduce && (passes == 1 || want_gated)) put(reduce, 1u, kClassReduce, ip, iph.pools[i], kGateOwnPool, 0, 0u);
+        }
+      if (iph.fixed_units && want_ungated) put(iph.fixed_units, 1u, kClassFixed, ip, -1, kGateNone, 0, 0u);  // the shortest units, they fill the tail
+    }
   (void)rows;
   ctl->cls_n[P] = n;
 }
@@ -373,7 +379,7 @@ __device__ void route_finish(const StepStreamParams& p, int layer, int* keys, in
 constexpr int kStepMaxSlotsPerToken = 9;
 __device__ void accumulate_chunk(const StepStreamParams& p, int layer, unsigned unit, bool fused) {
   const int rows = static_cast<int>(p.ctl->rows), top_k = static_cast<int>(p.ctl->top_k), spt = top_k + 1, H = p.hidden;
-  const int i0 = static_cast<int>(unit) * kStepAccChunk, i1 = min(i0 + kStepAccChunk, rows * H);
+  const int i0 = static_cast<int>(unit) * p.acc_chunk, i1 = min(i0 + p.acc_chunk, rows * H);
   const float* __restrict__ sw = p.ctl->slot_weight[layer];
   const float* __restrict__ out = p.out;
   uint16_t* __restrict__ y = p.y;
@@ -446,7 +452,7 @@ __device__ void mhc_unit(const StepStreamParams& p, int layer, const DevPool& po
   site.ln_eps = p.mhc_norm_eps;
   mhc_finish_normed(row, f + 32, site, H, p.pre[s ^ 1] + t * kMhcN, p.post + t * kMhcN, p.comb + t * kMhcN * kMhcN, f + 64);
   __syncthreads();
-  if (threadIdx.x == 0) red_release(&p.ctl->site_done[layer][s], 1u);  // the router's gate
+  if (threadIdx.x == 0) { red_release(&p.ctl->site_done[layer][s], 1u); red_release(&p.ctl->open_gen, 1u); }  // the router's gate; lead units yield
 }
 
 // A slabbed projection's reduce unit: chunk `unit` of its [slots, rows]
@@ -456,7 +462,7 @@ __device__ void mhc_unit(const StepStreamParams& p, int layer, const DevPool& po
 // streams[0] mix into streams[1] under the site's post and comb.
 __device__ void reduce_unit(const StepStreamParams& p, const DevPool& pool, unsigned unit) {
   const int rows = static_cast<int>(p.ctl->rows), N = pool.rows;
-  const int i0 = static_cast<int>(unit) * kStepAccChunk, i1 = min(i0 + kStepAccChunk, rows * N);
+  const int i0 = static_cast<int>(unit) * p.acc_chunk, i1 = min(i0 + p.acc_chunk, rows * N);
   const float* __restrict__ part = p.proj_part + pool.part_offset;
   uint16_t* __restrict__ y = p.proj + pool.out_offset;
   const size_t slab_stride = static_cast<size_t>(kStepMaxRows) * N;
@@ -611,7 +617,10 @@ __device__ void consumer_unit(const StepStreamParams& p, int layer, const DevPoo
     return;
   }
   if (pool.kind == kPoolRouter) {
-    if (pool.k == 5120) router_unit<5120, kRouterBatch, kRouterSpecialize, kRouterPipeline>(base, pool, rb, grp, p.x, p.scores, p.biased, p.n_experts, p.router_mode, smem);
+    if (pool.k == 5120) {
+      if (p.router_pipeline) router_unit<5120, kRouterBatch, kRouterSpecialize, true>(base, pool, rb, grp, p.x, p.scores, p.biased, p.n_experts, p.router_mode, smem);
+      else router_unit<5120, kRouterBatch, kRouterSpecialize, false>(base, pool, rb, grp, p.x, p.scores, p.biased, p.n_experts, p.router_mode, smem);
+    }
     else if (threadIdx.x == 0) atomicCAS(&p.ctl->status, kStepOk, kStepBadUnit);
     return;
   }
@@ -710,13 +719,14 @@ __global__ void __launch_bounds__(kStepThreads, 1) step_stream_kernel(StepStream
           ctl->pf_next = 0;
           ctl->pf_bytes = 0;
           ctl->consumed_pf_bytes = 0;
+          ctl->open_gen = 0;
         }
       }
       __syncthreads();
       if (!sm_skip && !sm_fail) {
         // The step's counters and trace, reset by the whole block (one thread took tens of microseconds).
         for (int i = static_cast<int>(threadIdx.x); i < n_phases; i += kStepThreads) {
-          ctl->done[i] = 0; ctl->pf_units[i] = 0; ctl->idle_first[i] = 0;
+          ctl->done[i] = 0; ctl->pf_units[i] = 0; ctl->idle_first[i] = 0; ctl->fold_done[i] = 0;
           ctl->busy_ns[i] = 0; ctl->grabs[i] = 0; ctl->handout_ns[i] = 0; ctl->lead_in_bytes[i] = 0; ctl->pf_credit[i] = 0; ctl->pf_staged[i] = 0;
           ctl->wait_ns[i] = 0;
           for (int c = 0; c < kStepMaxClasses; ++c) { ctl->cls_next[i][c] = 0; ctl->cls_first[i][c] = ~0ull; ctl->cls_last[i][c] = 0; }
@@ -726,7 +736,7 @@ __global__ void __launch_bounds__(kStepThreads, 1) step_stream_kernel(StepStream
           ctl->reduce_done[i / n_phases][i % n_phases] = 0;
         }
         for (int i = static_cast<int>(threadIdx.x); i < kStepMaxLayers; i += kStepThreads) {
-          ctl->acc_done[i] = 0; ctl->fold_done[i] = 0; ctl->site_done[i][0] = 0; ctl->site_done[i][1] = 0;
+          ctl->acc_done[i] = 0; ctl->site_done[i][0] = 0; ctl->site_done[i][1] = 0;
         }
         __syncthreads();
         if (t0) {
@@ -842,7 +852,8 @@ __global__ void __launch_bounds__(kStepThreads, 1) step_stream_kernel(StepStream
               while (ld_acq(&ctl->done[P]) < need) {
                 if (sm_fold_pending && fold_trigger_holds(p, l, P)) {
                   spin_us(fold_us);
-                  st_rel(&ctl->fold_done[l], 1u);
+                  st_rel(&ctl->fold_done[P], 1u);  // this group's gate (per group, not per layer: a layer has two groups with folds)
+                  red_release(&ctl->open_gen, 1u);  // lead units yield: the classes behind the fold want the workers
                   ctl->stamp_end[P] = gtimer();  // the first phase's trace: its own units and the fold
                   for (int Q = P + 1; Q <= P_last; ++Q) ctl->stamp_begin[Q] = ctl->stamp_end[P];
                   sm_first_stamped = 1;
@@ -859,7 +870,8 @@ __global__ void __launch_bounds__(kStepThreads, 1) step_stream_kernel(StepStream
               if (!sm_fail && sm_event == 0) {
                 if (sm_fold_pending) {  // no gated class waited on it: the fold after the group
                   spin_us(fold_us);
-                  st_rel(&ctl->fold_done[l], 1u);
+                  st_rel(&ctl->fold_done[P], 1u);  // this group's gate (per group, not per layer: a layer has two groups with folds)
+                  red_release(&ctl->open_gen, 1u);  // lead units yield: the classes behind the fold want the workers
                   sm_fold_pending = 0;
                 }
                 st_rel(&ctl->phase_word, word(step, P, kStateIdle));
@@ -943,7 +955,7 @@ __global__ void __launch_bounds__(kStepThreads, 1) step_stream_kernel(StepStream
   }
   // ---- a worker
   extern __shared__ __align__(128) uint8_t smem[];
-  __shared__ unsigned sm_kind, sm_unit, sm_phase, sm_count, sm_word, sm_stop, sm_published, sm_look_blocked, sm_class;
+  __shared__ unsigned sm_kind, sm_unit, sm_phase, sm_count, sm_word, sm_stop, sm_published, sm_look_blocked, sm_class, sm_critical, sm_gen;
   __shared__ unsigned sm_lead_begin[kStepMaxPhases];  // the lead sequence's phase boundaries, for the lead's hand-out
   __shared__ unsigned long long sm_grab_bytes;
   // The published group's unit classes, built once a group a worker: in hand-out order, each
@@ -998,20 +1010,21 @@ __global__ void __launch_bounds__(kStepThreads, 1) step_stream_kernel(StepStream
           // The grab: the first open class with units left. Consecutive units share their
           // staging while the class has units for every worker; the tail takes them singly.
           bool any_pending = false;  // a closed gate: units will come
+          sm_critical = 0;           // an open gated class with its units all out: they run now, the lead gives way
           for (unsigned c = 0; c < sm_nclasses && sm_kind == 0; ++c) {
-            if (sm_cls_exhausted & (1u << c)) continue;
+            if (sm_cls_exhausted & (1u << c)) { if (sm_cls_gate[c] != kGateNone && sm_cls_gate[c] != kGateOwnPool) sm_critical = 1; continue; }
             const uint8_t gk = sm_cls_gate[c];
             if (gk != kGateNone) {
               const int il = p.phases[sm_cls_phase[c]].layer;
               bool open;
-              if (gk == kGateFold) open = ld_acq(&ctl->fold_done[cur_layer]) != 0u;
+              if (gk == kGateFold) open = ld_acq(&ctl->fold_done[P]) != 0u;  // this group's fold
               else if (gk == kGateSite) open = ld_acq(&ctl->site_done[il][sm_cls_gate_arg[c] & 1u]) >= sm_rows;
               else open = ld_acq(&ctl->pool_done[il][sm_cls_pool[c]]) >= pool_compute_units(p, il, p.pools[sm_cls_pool[c]]);
               if (!open) { any_pending = true; continue; }
             }
             const unsigned count = sm_cls_count[c];
             const unsigned at = ld_acq(&ctl->cls_next[P][c]);
-            if (at >= count) { sm_cls_exhausted |= 1u << c; continue; }
+            if (at >= count) { sm_cls_exhausted |= 1u << c; if (gk != kGateNone && gk != kGateOwnPool) sm_critical = 1; continue; }
             unsigned grab = sm_cls_grab[c];
             if (grab > 1) {  // the tail shrinks the grab gradually: at most a worker's share of what remains
               const unsigned share = (count - at) / (gridDim.x - 1);
@@ -1050,8 +1063,12 @@ __global__ void __launch_bounds__(kStepThreads, 1) step_stream_kernel(StepStream
           }
           if (static_cast<unsigned long long>(ahead) + p.unit_bytes <= cap) {
             bool slot = true;
-            if (p.max_leaders) {
-              if (atomicAdd(&ctl->leaders, 1u) >= p.max_leaders) { atomicSub(&ctl->leaders, 1u); slot = false; }
+            // The leaders bound: the governor's, or critical_leaders while a site's or the
+            // router's units are out running (their reads then share the memory with fewer leaders).
+            const unsigned limit = (sm_critical && p.critical_leaders) ? p.critical_leaders : p.max_leaders;
+            if (p.max_leaders || p.critical_leaders) {
+              if (limit && atomicAdd(&ctl->leaders, 1u) >= limit) { atomicSub(&ctl->leaders, 1u); slot = false; }
+              else if (!limit) atomicAdd(&ctl->leaders, 1u);
             }
             if (slot) {
               const unsigned pf = ld_acq(&ctl->pf_next);
@@ -1064,12 +1081,13 @@ __global__ void __launch_bounds__(kStepThreads, 1) step_stream_kernel(StepStream
                   if (got < p.lead_units) {
                     const int P3 = phase_of_lead_unit_sm(sm_lead_begin, n_phases, got);
                     sm_kind = 2; sm_unit = got - p.phases[P3].lead_begin; sm_phase = static_cast<unsigned>(P3);
+                    sm_gen = ld_acq(&ctl->open_gen);
                     atomicAdd(&ctl->pf_bytes, static_cast<unsigned long long>(p.unit_bytes));
                     atomicAdd(&ctl->pf_units[P3], 1u);
                   }
                 }
               }
-              if (sm_kind != 2 && p.max_leaders) atomicSub(&ctl->leaders, 1u);
+              if (sm_kind != 2 && (p.max_leaders || p.critical_leaders)) atomicSub(&ctl->leaders, 1u);
             }
           }
         }
@@ -1146,7 +1164,10 @@ __global__ void __launch_bounds__(kStepThreads, 1) step_stream_kernel(StepStream
         if (threadIdx.x == 0) sm_grab_bytes += upool->bytes / upg;
         if ((upool->kind == kPoolFp8Matrix && upool->slabs > 1 && !projection_split(p, *upool)) || upool->kind == kPoolRouter) {
           __syncthreads();  // the pool's compute units complete: its reduce units' gate, or the chain's select
-          if (threadIdx.x == 0) red_release(&ctl->pool_done[xlayer][pool_id], 1u);
+          if (threadIdx.x == 0) {
+            const unsigned before = atom_add_acq_rel(&ctl->pool_done[xlayer][pool_id], 1u);
+            if (before + 1 == pool_compute_units(p, xlayer, *upool)) red_release(&ctl->open_gen, 1u);  // the last: a gate opens, lead units yield
+          }
         }
         if (pool_is_gate_up(upool->kind)) {
           __syncthreads();
@@ -1173,7 +1194,9 @@ __global__ void __launch_bounds__(kStepThreads, 1) step_stream_kernel(StepStream
             if (off < bytes) {
               if (threadIdx.x == 0) {
                 const unsigned now = ld_acq(&ctl->phase_word);
-                sm_stop = (now != sm_word && (now & 3u) == kStateStream) ? 1u : 0u;  // a stream phase with units wants the worker
+                // A stream phase with units, or an opened gate, wants the worker (a 64 KB lead unit at a
+                // 47-way share of the memory is about 13 µs; the merged classes' units waited that long).
+                sm_stop = ((now != sm_word && (now & 3u) == kStateStream) || (p.yield_on_gate && ld_acq(&ctl->open_gen) != sm_gen)) ? 1u : 0u;
               }
               __syncthreads();
               if (sm_stop) break;
@@ -1214,7 +1237,7 @@ __global__ void __launch_bounds__(kStepThreads, 1) step_stream_kernel(StepStream
         atomicAdd(&ctl->busy_ns[sm_phase], gtimer() - t_grab);
         atomicAdd(&ctl->grabs[sm_phase], 1u);
       }
-      if (kind == 2 && p.max_leaders) atomicSub(&ctl->leaders, 1u);
+      if (kind == 2 && (p.max_leaders || p.critical_leaders)) atomicSub(&ctl->leaders, 1u);
     }
   }
 }

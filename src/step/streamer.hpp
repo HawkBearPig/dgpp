@@ -40,6 +40,12 @@ struct StreamerConfig {
   float hc_eps = 1e-6f;
   int sinkhorn_iters = 20;
   float mhc_norm_eps = 1e-6f;
+  // The levers measured as a set (see kernels/step/stream.hpp): off by default.
+  bool gated_first = false;
+  unsigned critical_leaders = 0;
+  int acc_chunk = 512;
+  bool router_pipeline = false;
+  bool lead_yield_on_gate = true;
   uint64_t first_seq = 0;        // the first step's sequence number; steps count up from it
   uint64_t epoch = 0;            // echoed by every verdict
   int skip_at_step = -1;         // publish skip instead of this step (-1: never)
@@ -177,6 +183,8 @@ class Streamer {
   float* biased_ = nullptr;
   int n_experts_ = 0;
   unsigned consumer_smem_ = 0;
+  int acc_chunk_ = 512;  // the last run's accumulation chunk, for the report's class table
+  bool gated_first_ = false;  // and its class order
   bool mhc_ = false;
   uint16_t* streams_[2] = {nullptr, nullptr};
   float* pre_[2] = {nullptr, nullptr};

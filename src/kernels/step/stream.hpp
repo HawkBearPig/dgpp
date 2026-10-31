@@ -169,6 +169,14 @@ struct StepStreamParams {
   float lead_bytes_per_us = 0.f;
   unsigned route_pool = 0;  // the synthetic router's window of experts a layer (0: all)
   unsigned max_leaders = 0;               // 0: unbounded
+  // The levers under evaluation as a set (MOONSHOT-1.md phase 3, the fused chain): gated classes
+  // first in the hand-out; leaders bounded to critical_leaders while an open gated class has its
+  // units out running; the accumulation and reduce chunk; the router's pipelined row batches.
+  unsigned gated_first = 0;
+  unsigned critical_leaders = 0;
+  int acc_chunk = 512;
+  unsigned router_pipeline = 0;
+  unsigned yield_on_gate = 1;  // lead units yield when a gate opens, not only when a phase is published
   unsigned long long deadline_ns = 0;          // every in-step spin's deadline (0: none)
   unsigned long long pending_deadline_ns = 0;  // how long the chain waits for the host's next descriptor (0: forever)
 };

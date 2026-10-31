@@ -390,11 +390,32 @@ start, moved to the host: it cost the chain several microseconds a group.
 Measured clean with all of that, the sites cost the layer nothing the
 attribution can see (81.2 percent of the floor without them, 83.3 with,
 inside the run-to-run band), the median layer 83.1 tile-major and 78.1
-row-major in that run; two back-to-back samples later that night read 81.9
-and 80.5 tile-major, 75.8 and 76.7 row-major, so the band of one clean run
-is about 1.5 points on the median and 6 µs on a class window, and no lever
-is judged on one sample or in isolation from the stages that would have to
-adapt with it (the plan's fused-phases item keeps the list). The class windows of `attn_out` (tile-major, layer 3, from the
+row-major in that run; later samples read 80.5 to 81.9 tile-major and 74.5
+to 76.7 row-major (the earliest of them with the attention site racing the
+accumulate, since the per-group fold gate had not landed), so the band of
+one clean run is about 1.5 points on the median and 6 µs on a class window,
+and no lever is judged on one sample or in isolation from the stages that
+would have to adapt with it.
+
+`step_consumers_lever_matrix` measures the scheduling levers as a set, two
+samples each, on the tile-major rig, with the median and the
+attention-output group's site and router windows and tail. Its first full
+run (2026-10-31 night, the kernel's gates and the lead's yield verified in
+the source after two background patch scripts had failed silently): the
+lead's yield on an opened gate is worth three to four points (82.7 and 83.0
+with it, 78.3 and 79.7 without; the group's end 15 to 25 µs earlier), since
+a 64 KB lead unit at a 47-way share of the memory is about 13 µs and the
+merged classes' units waited that long for workers. Gated classes first
+loses about three points even with the yield: the site and the router start
+at the fold but the group ends no earlier, bounded by the stream they now
+share workers and memory with, and the expert phase starts later. Bounding
+the leaders to eight while a site's or the router's units run shortens the
+group by about 15 µs and costs the layer about five points: the lead's
+staging of the expert phase during that tail is worth more than the tail.
+The 2048-output chunk and the pipelined router batches sit inside the band
+alone and on top of the others. The kernel keeps phase order, the yield,
+the 512-output chunk and the plain batches; the knobs stay on the streamer
+for the next set. The class windows of `attn_out` (tile-major, layer 3, from the
 group's publish): the output projection's compute units 2 to 64 µs, its
 reduce units 62 to 74, the other projection 40 to 85 with its reduce to 89,
 the fold, the MoE site 88 to 111, the router 109 to 132, the select and
