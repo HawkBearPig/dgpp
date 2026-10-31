@@ -134,8 +134,14 @@ struct DevicePlan {
 // span (KV rows, gathered tables) are not streamed from the arena and are
 // left out. `unit_bytes` is the grab size, a multiple of 512. With
 // `consumers`, the MXFP4 expert pools take the consumer kinds and the
-// accumulate phase becomes worker units; without, every pool is bytes.
-DevicePlan lower_plan(const std::vector<LayerPlan>& layers, uint32_t unit_bytes, bool consumers = false);
+// accumulate phase becomes worker units; without, every pool is bytes. The
+// mask form picks the consumer classes one by one, for attribution: the
+// routed experts, the shared expert and the fp8 projections.
+constexpr unsigned kConsumeExperts = 1u, kConsumeShared = 2u, kConsumeProjections = 4u, kConsumeAll = 7u;
+DevicePlan lower_plan(const std::vector<LayerPlan>& layers, uint32_t unit_bytes, unsigned consumer_mask);
+inline DevicePlan lower_plan(const std::vector<LayerPlan>& layers, uint32_t unit_bytes, bool consumers = false) {
+  return lower_plan(layers, unit_bytes, consumers ? kConsumeAll : 0u);
+}
 
 std::string device_plan_summary(const DevicePlan& dp);
 

@@ -141,6 +141,9 @@ bool step_stream_has_mxfp4_consumer(int hidden, int inter);
 bool step_stream_has_fp8_matrix(int k, int rows);
 // The shared memory the MXFP4 consumer needs at this intermediate width.
 unsigned step_stream_mxfp4_smem(int inter);
+// The dynamic shared memory the consumer pools present need: the MXFP4 forms
+// when a routed pool at `inter` exists (0: none), the fp8 forms when `fp8`.
+unsigned step_stream_consumer_smem(int inter, bool fp8);
 // The partials' index: token-major, the slots of one output element in one sector.
 __host__ __device__ inline size_t step_out_index(int slot, int row, int hidden, int slots_per_token) {
   return (static_cast<size_t>(slot / slots_per_token) * hidden + static_cast<size_t>(row)) * slots_per_token +

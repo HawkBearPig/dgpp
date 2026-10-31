@@ -107,6 +107,9 @@ __device__ __forceinline__ unsigned pool_compute_units(const StepStreamParams& p
   const unsigned groups = pool.group_kind == kGroupRouted ? static_cast<unsigned>(p.ctl->run_count[layer]) : 1u;
   return groups * compute_units_per_group(p, pool);
 }
+// (Handing out each class's units from the last to the first, so the staged
+// units land in the tail where the lead fills the memory, measured within
+// the noise on 2026-10-31: the order is the consumers'.)
 __device__ __forceinline__ int unit_slot(const StepStreamParams& p, int layer, int P, unsigned u, unsigned* v) {
   const DevPhase& ph = p.phases[P];
   // The compute units: the pools that do not depend on the router, then the routed pool.
@@ -701,6 +704,9 @@ __global__ void __launch_bounds__(kStepThreads, 1) step_stream_kernel(StepStream
             const unsigned share = remaining / (gridDim.x - 1);
             grab = share < 1u ? 1u : (share < grab ? share : grab);
           }
+          // (Workers leading inside the routed expert phase in place of taking its units were
+          // measured 2026-10-31 and lost four to five points: that phase is memory-saturated,
+          // so the staging added to it one to one and bought back a quarter of itself in qkv.)
           const unsigned u = atomicAdd(&ctl->next[P], grab);
           if (u < need) {
             sm_kind = 1; sm_unit = u; sm_phase = static_cast<unsigned>(P); sm_layer = cur_layer;
@@ -955,12 +961,16 @@ bool step_stream_has_fp8_matrix(int k, int rows) {
     if (s[0] == k && s[1] == rows) return true;
   return false;
 }
-unsigned step_stream_mxfp4_smem(int inter) {
-  if (inter != kConsumerI) return 0u;
-  const unsigned experts = static_cast<unsigned>(mxfp4_unit_smem_bytes<kConsumerI>());
-  const unsigned split = static_cast<unsigned>(fp8_split_smem_bytes<kSplitMaxK, kSplitRowTiles>());
-  const unsigned staged = static_cast<unsigned>(kFp8StagedSmemCap);  // the one-token-group projection form stages its slice
-  return experts > split ? (experts > staged ? experts : staged) : (split > staged ? split : staged);
+unsigned step_stream_mxfp4_smem(int inter) { return step_stream_consumer_smem(inter, true); }
+unsigned step_stream_consumer_smem(int inter, bool fp8) {
+  unsigned need = 0u;
+  if (inter == kConsumerI) need = static_cast<unsigned>(mxfp4_unit_smem_bytes<kConsumerI>());
+  if (fp8) {
+    const unsigned split = static_cast<unsigned>(fp8_split_smem_bytes<kSplitMaxK, kSplitRowTiles>());
+    const unsigned staged = static_cast<unsigned>(kFp8StagedSmemCap);  // the one-token-group projection form stages its slice
+    need = std::max(need, std::max(split, staged));
+  }
+  return need;
 }
 
 cudaError_t launch_step_stream(const StepStreamParams& p, int workers, cudaStream_t stream) {

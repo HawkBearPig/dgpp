@@ -60,7 +60,7 @@ struct Rig {
 
 // Builds the plan of the first kLayers main layers under the arena and the
 // device arena they stream from.
-std::unique_ptr<Rig> make_rig(int layers = kLayers, bool consumers = false, bool tile_major = false) {
+std::unique_ptr<Rig> make_rig_mask(int layers, unsigned consumer_mask, bool tile_major) {
   auto rig = std::make_unique<Rig>();
   const auto doc = minijson::parse(dsv41_test::config_json());
   rig->cfg = Dsv41TextConfig::parse(doc.root);
@@ -80,7 +80,7 @@ std::unique_ptr<Rig> make_rig(int layers = kLayers, bool consumers = false, bool
         if (rg.dep == Dependency::Router && rg.format == Format::Fp4E2m1) rg.layout = Layout::Tile16;
     max_span = std::max<uint64_t>(max_span, span);
   }
-  rig->dp = lower_plan(rig->plans, 65536, consumers);
+  rig->dp = lower_plan(rig->plans, 65536, consumer_mask);
   size_t free_bytes = 0, total = 0;
   DGPP_CUDA_OK(cudaMemGetInfo(&free_bytes, &total));
   const size_t need = static_cast<size_t>(max_span) * kCopies + (size_t{256} << 20);
@@ -93,7 +93,7 @@ std::unique_ptr<Rig> make_rig(int layers = kLayers, bool consumers = false, bool
     rig->copies.push_back(d);
   }
   for (int l = 0; l < layers; ++l) rig->bases.push_back(rig->copies[static_cast<size_t>(l % kCopies)]);
-  if (consumers) {
+  if (consumer_mask != 0u) {
     // Payloads hashed over the whole copy, then every layer's e8m0 scale
     // ranges in [112, 136) so no dot product overflows.
     for (int c = 0; c < kCopies; ++c) {
@@ -132,6 +132,9 @@ std::unique_ptr<Rig> make_rig(int layers = kLayers, bool consumers = false, bool
     }
   }
   return rig;
+}
+std::unique_ptr<Rig> make_rig(int layers = kLayers, bool consumers = false, bool tile_major = false) {
+  return make_rig_mask(layers, consumers ? kConsumeAll : 0u, tile_major);
 }
 
 StreamerConfig design_config() {
@@ -534,6 +537,27 @@ DGPP_TEST(step_consumers_in_the_stream_match_the_reference) {
   consumers_match_the_reference(/*tile_major=*/true);   // the arena's tile-major experts
 }
 
+// Every layer's phases in one line: the fixed stream phases, the expert phase, the rest (latency and gaps), the lead's bytes.
+void print_layers(const StreamReport& r) {
+  for (size_t l = 0; l < r.layer_us.size(); ++l) {
+    double fixed = 0, experts = 0, lead = 0, begin = 1e30, end = 0, exp_busy = 0, exp_wait = 0, exp_drain = 0;
+    for (const PhaseTiming& t : r.phases) {
+      if (t.layer != static_cast<int>(l)) continue;
+      begin = std::min(begin, t.begin_us);
+      end = std::max(end, t.end_us);
+      lead += t.lead_in_mb;
+      if (t.name == "gate_up") {
+        experts = t.end_us - t.begin_us;
+        exp_busy = (experts > 0 && r.workers > 0) ? t.busy_us / (experts * r.workers) * 100.0 : 0.0;
+        exp_wait = (experts > 0 && r.workers > 0) ? t.wait_us / (experts * r.workers) * 100.0 : 0.0;
+        exp_drain = t.drained_us;
+      } else if (t.stream && t.units > 0 && t.name != "accumulate" && t.name != "down") fixed += t.end_us - t.begin_us;
+    }
+    std::printf("      layer %zu: fixed %5.1f us, experts %5.1f us (busy %4.1f %%, waits %4.1f %%, drain %5.1f us), other %5.1f us of %6.1f, lead %5.1f MB\n",
+                l, fixed, experts, exp_busy, exp_wait, exp_drain, (end - begin) - fixed - experts, end - begin, lead);
+  }
+}
+
 double consumers_rate(bool tile_major) {
   auto rig = make_rig(kLayers, /*consumers=*/true, tile_major);
   Streamer s(rig->dp, rig->bases, rig->plans);
@@ -552,24 +576,7 @@ double consumers_rate(bool tile_major) {
       if (r.layer_us[l] / std::max(1.0, r.layer_bytes[l]) > r.layer_us[static_cast<size_t>(slowest)] / std::max(1.0, r.layer_bytes[static_cast<size_t>(slowest)])) slowest = static_cast<int>(l);
     if (slowest != 3) print_report("the slowest layer", r, slowest);
   }
-  // Every layer's phases in one line: the fixed stream phases, the expert phase, the rest (latency and gaps), the lead's bytes.
-  for (size_t l = 0; l < r.layer_us.size(); ++l) {
-    double fixed = 0, experts = 0, lead = 0, begin = 1e30, end = 0, exp_busy = 0, exp_wait = 0, exp_drain = 0;
-    for (const PhaseTiming& t : r.phases) {
-      if (t.layer != static_cast<int>(l)) continue;
-      begin = std::min(begin, t.begin_us);
-      end = std::max(end, t.end_us);
-      lead += t.lead_in_mb;
-      if (t.name == "gate_up") {
-        experts = t.end_us - t.begin_us;
-        exp_busy = (experts > 0 && r.workers > 0) ? t.busy_us / (experts * r.workers) * 100.0 : 0.0;
-        exp_wait = (experts > 0 && r.workers > 0) ? t.wait_us / (experts * r.workers) * 100.0 : 0.0;
-        exp_drain = t.drained_us;
-      } else if (t.stream && t.units > 0 && t.name != "accumulate" && t.name != "down") fixed += t.end_us - t.begin_us;
-    }
-    std::printf("      layer %zu: fixed %5.1f us, experts %5.1f us (busy %4.1f %%, waits %4.1f %%, drain %5.1f us), other %5.1f us of %6.1f, lead %5.1f MB\n",
-                l, fixed, experts, exp_busy, exp_wait, exp_drain, (end - begin) - fixed - experts, end - begin, lead);
-  }
+  print_layers(r);
   require(r.status == kStepOk, "the kernel ended on " + r.status_text);
   std::vector<double> pct;
   for (size_t l = 0; l < r.layer_us.size(); ++l) {
@@ -593,6 +600,37 @@ DGPP_TEST(step_consumers_rate_at_the_design_chain) {
   // fused chain's structure is where the rest comes back, section 1.3).
   require(tile >= 82.0, "the tile-major consumers' layers stream under 82 percent of the ceiling");
   require(row >= 74.0, "the row-major consumers' layers stream under 74 percent of the ceiling");
+}
+
+// Which consumers cost the layer its share of the floor: the step with the
+// routed experts, the shared expert and the fp8 projections as consumers one
+// class at a time (the rest as byte units), tile-major experts, clean method.
+double consumers_rate_mask(unsigned mask, const char* title) {
+  auto rig = make_rig_mask(kLayers, mask, /*tile_major=*/true);
+  Streamer s(rig->dp, rig->bases, rig->plans);
+  StreamerConfig cfg = design_config();
+  cfg.steps = 3;
+  cfg.rows = 5;
+  cfg.top_k = 6;
+  (void)s.run(cfg);
+  const StreamReport r = s.run(cfg);
+  require(r.status == kStepOk, std::string("the kernel ended on ") + r.status_text);
+  print_report(title, r, 3);
+  print_layers(r);
+  std::vector<double> pct;
+  for (size_t l = 0; l < r.layer_us.size(); ++l) pct.push_back(r.layer_bytes[l] / 240e3 / r.layer_us[l] * 100.0);
+  std::sort(pct.begin(), pct.end());
+  const double median = pct[pct.size() / 2];
+  std::printf("   %-44s median layer at %.1f %% of the ceiling\n", title, median);
+  return median;
+}
+
+DGPP_TEST(step_consumers_attribution) {
+  consumers_rate_mask(0u, "every pool as byte units:");
+  consumers_rate_mask(kConsumeExperts, "the routed experts as consumers:");
+  consumers_rate_mask(kConsumeShared | kConsumeProjections, "the shared expert and projections as consumers:");
+  consumers_rate_mask(kConsumeProjections, "the projections as consumers:");
+  consumers_rate_mask(kConsumeAll, "every consumer:");
 }
 
 DGPP_TEST(step_consumers_lead_sweep) {

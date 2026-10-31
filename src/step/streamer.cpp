@@ -61,19 +61,30 @@ Streamer::Streamer(const DevicePlan& dp, const std::vector<const uint8_t*>& base
   pinned(&verdict_, &verdict_dev_, static_cast<size_t>(kStepRingSlots));
   pinned(&host_seq_, &host_seq_dev_, 1);
   DGPP_CUDA_OK(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking));
-  // The consumers' operands, when the plan has consumer pools.
+  // The consumers' operands, when the plan has consumer pools of any class:
+  // the routed experts (the MXFP4 forms), the shared expert and the fp8
+  // projections (the fp8 forms). A plan with fp8 pools and no routed pool
+  // launched with no dynamic shared memory and no activations once, and
+  // faulted (2026-10-31).
+  bool mxfp4 = false, fp8 = false;
   for (const DevPool& pool : dp.pools) {
-    if (pool.kind == kPoolMxfp4GateUp || pool.kind == kPoolMxfp4RowGateUp) { hidden_ = pool.k; inter_ = pool.rows; consumers_ = true; }
+    if (pool.kind == kPoolBytes) continue;
+    consumers_ = true;
+    if (pool_is_gate_up(pool.kind) && pool.kind != kPoolFp8GateUp) { hidden_ = pool.k; inter_ = pool.rows; mxfp4 = true; }
+    else if (pool.kind == kPoolFp8GateUp) { if (!hidden_) hidden_ = pool.k; if (!inter_) inter_ = pool.rows; fp8 = true; }
+    else if (pool.kind == kPoolFp8Matrix || pool.kind == kPoolFp8Down) fp8 = true;
   }
   if (consumers_) {
-    if (!step_stream_has_mxfp4_consumer(hidden_, inter_))
+    if (mxfp4 && !step_stream_has_mxfp4_consumer(hidden_, inter_))
       throw std::invalid_argument("Streamer: the kernel has no MXFP4 consumer for hidden " + std::to_string(hidden_) + ", inter " +
                                   std::to_string(inter_));
     for (const DevPool& pool : dp.pools)
       if (pool.kind == kPoolFp8Matrix && !step_stream_has_fp8_matrix(pool.k, pool.rows))
         throw std::invalid_argument("Streamer: the kernel has no fp8 projection form for [" + std::to_string(pool.rows) + ", " +
                                     std::to_string(pool.k) + "]");
-    consumer_smem_ = step_stream_mxfp4_smem(inter_);
+    consumer_smem_ = step_stream_consumer_smem(mxfp4 ? inter_ : 0, fp8);
+    if (!hidden_) hidden_ = dp.max_k;  // projections only: the activations' width is the widest inner width
+    if (!inter_) inter_ = 1;
     const size_t slots = static_cast<size_t>(kStepMaxRows) * 9;  // top_k up to 8, plus the shared slot
     // The activations: every consumer reads a token's row at its own inner
     // width from the same buffer, so it holds the widest.

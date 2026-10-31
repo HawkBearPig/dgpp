@@ -202,6 +202,20 @@ or minus 0.3 over three runs and the row-major 77.3, and the lead cap sweep
 is flat from 12 MB to 128: the lead is bounded by the workers' idle time,
 not by the cap.
 
+`step_consumers_attribution` runs the same phases with each consumer class
+alone and the rest as byte units, clean. Over three runs: every pool as
+bytes 96.6 to 97.9 percent of the floor, the routed experts as consumers
+86.1 to 90.8, the shared expert and projections 88.2 to 89.7, the
+projections alone 83.6 to 89.9, every consumer 82.5 to 83.9. The expert
+consumers' phase costs five points against the byte units' (hand-outs, the
+drain, the forms at 233 GB/s against 240) and another five indirectly: its
+units keep every worker busy, so the lead stages 9.4 MB of the next qkv
+instead of 15.3. Workers leading inside that phase instead lost four to
+five points, since the phase is memory-saturated and their staging added to
+it one to one. The streamer sizes its shared memory and buffers from every
+consumer class present; a plan with fp8 pools and no routed pool once
+launched with neither and faulted.
+
 The plan reaches the kernel through `lower_plan` (`src/step/device_plan.hpp`):
 each phase's fixed ranges under the arena coalesce into a few contiguous
 segments, its routed experts into one pool of groups at one stride, and

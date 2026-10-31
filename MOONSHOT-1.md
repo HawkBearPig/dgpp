@@ -2265,6 +2265,12 @@ area, untracked.
       latency (8 and 12), not its units, which take 2 µs each. The median
       layer with every weight computed stands at 89 percent of its floor,
       plus or minus two between runs.
+- [x] A fault in the streamer's setup (2026-10-31): a plan whose consumer
+      pools were fp8 only, with no routed MXFP4 pool, launched with no
+      dynamic shared memory and no activation buffers, since the setup
+      keyed everything on the routed pool, and the fp8 units faulted (Xid
+      13). The setup now sizes the shared memory and the buffers from
+      every consumer class present; the attribution case exercises it.
 - [x] The measured routing overlap in the plan and the gate (2026-10-30
       night): `distinct_main` at the measured 19.8 and 10.1 gives floors
       of 29.2 and 21.5 ms with the bf12 head, the synthetic router routes
@@ -2318,7 +2324,26 @@ area, untracked.
       tails, 13 in the lead's own rate, and about 30 not yet attributed.
       Two remedies for the hot stretches were measured clean and lost: a
       minimum of leaders during hot phases (minus 2) and the lead's units
-      interleaved (minus 1.3), both removed. A probe of the
+      interleaved (minus 1.3), both removed, as were leaders inside the
+      expert phase (minus 4 to 5: that phase is memory-saturated, so their
+      9 MB of staging added one to one and bought back a quarter in qkv)
+      and handing each class's units out last to first (within noise).
+      The attribution case (`step_consumers_attribution`, 2026-10-31,
+      clean, three runs) runs the same phases with each consumer class
+      alone and the rest as byte units: every pool as bytes 96.6 to 97.9
+      percent, the routed experts as consumers 86.1 to 90.8, the shared
+      expert and projections 88.2 to 89.7, the projections alone 83.6 to
+      89.9, every consumer 82.5 to 83.9. The expert consumers cost about
+      ten points, of which their own phase explains five (450 µs against
+      the byte units' 413 for the same bytes: hand-outs, the drain, the
+      forms at 233 against 240) and the rest is indirect: their units
+      keep every worker busy, so the lead stages 9.4 MB of the next qkv
+      instead of the 15.3 the byte units' idle slack allowed, and qkv runs
+      63 µs instead of 45. The projections cost about seven, their units'
+      prologues, hand-outs and reduce tails. These costs are the stream's
+      structure around the consumers, and the one mechanical lever left is
+      to hide the hand-out behind the running unit (a grab ahead), worth
+      about three points; the rest is the fused chain's. A probe of the
       pair's request pattern cleared it: a warp streaming a gate and an
       up tile 4 MB apart reads 238 GB/s at 48 blocks, the same as one
       stream of 512-byte or 1 KB runs (237 to 238.5), so the pair's 233

@@ -45,8 +45,11 @@ int add_pool(DevicePlan& dp, DevPhase& d, const DevPool& pool) {
 
 }  // namespace
 
-DevicePlan lower_plan(const std::vector<LayerPlan>& layers, uint32_t unit_bytes, bool consumers) {
+DevicePlan lower_plan(const std::vector<LayerPlan>& layers, uint32_t unit_bytes, unsigned consumer_mask) {
   if (unit_bytes == 0 || unit_bytes % 512 != 0) throw std::invalid_argument("lower_plan: unit_bytes must be a multiple of 512");
+  const bool experts = (consumer_mask & kConsumeExperts) != 0, shared = (consumer_mask & kConsumeShared) != 0,
+             projections = (consumer_mask & kConsumeProjections) != 0;
+  const bool consumers = consumer_mask != 0;
   DevicePlan dp;
   dp.unit_bytes = unit_bytes;
   uint32_t lead = 0;
@@ -72,14 +75,14 @@ DevicePlan lower_plan(const std::vector<LayerPlan>& layers, uint32_t unit_bytes,
       d.layer = static_cast<int32_t>(dp.layers.size());
       for (const Range& r : lp.ranges)
         if (r.phase == static_cast<int>(ph) && r.source == Source::Host && r.reads > 0) d.waits_host = 1;
-      if (consumers && phase.name == "accumulate") { d.accumulate = 1; d.kind = 1; }
+      if (experts && phase.name == "accumulate") { d.accumulate = 1; d.kind = 1; }
       // The shared expert's fp8 pair or down and the fp8 projections as
       // consumer pools of one group: their ranges leave the fixed segments
       // and become lead-only segments.
       std::vector<const Range*> shared_pool;
       uint32_t phase_part_elems = 0;
       if (consumers) {
-        for (size_t ri = 0; ri < lp.ranges.size(); ++ri) {
+        for (size_t ri = 0; projections && ri < lp.ranges.size(); ++ri) {
           const Range& r = lp.ranges[ri];
           if (r.phase != static_cast<int>(ph) || r.dep != Dependency::Fixed || r.source != Source::Resident || r.reads == 0) continue;
           if (r.format != Format::Fp8E4m3 || (r.consumer != Consumer::Projection && r.consumer != Consumer::Indexer)) continue;
@@ -123,7 +126,7 @@ DevicePlan lower_plan(const std::vector<LayerPlan>& layers, uint32_t unit_bytes,
         }
         const bool gate_up = payload[0] && scales[0] && payload[1] && scales[1] && !payload[2];
         const bool down = payload[2] && scales[2] && !payload[0];
-        if (gate_up || down) {
+        if (shared && (gate_up || down)) {
           DevPool pool;
           pool.kind = gate_up ? kPoolFp8GateUp : kPoolFp8Down;
           pool.groups = 1;
@@ -228,7 +231,7 @@ DevicePlan lower_plan(const std::vector<LayerPlan>& layers, uint32_t unit_bytes,
         pool.units_per_group = static_cast<int32_t>((pool.bytes + unit_bytes - 1) / unit_bytes);
         // The MXFP4 expert consumers: group 0's matrices in the arena's order
         // (payload then scales per matrix), units of 128 output rows.
-        if (consumers) {
+        if (experts) {
           const Range* payload[3] = {nullptr, nullptr, nullptr};
           const Range* scales[3] = {nullptr, nullptr, nullptr};
           for (const Range* r : routed)
@@ -267,7 +270,7 @@ DevicePlan lower_plan(const std::vector<LayerPlan>& layers, uint32_t unit_bytes,
   dp.lead_units = lead;
   // The expert phases: a gate and up pool followed by a down pool merge, and
   // each down pool names the gate and up pool of its group kind as partner.
-  if (consumers)
+  if (experts || shared)
     for (size_t i = 0; i + 1 < dp.phases.size(); ++i) {
       DevPhase& a = dp.phases[i];
       DevPhase& b = dp.phases[i + 1];
