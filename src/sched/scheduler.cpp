@@ -1358,15 +1358,20 @@ void Scheduler::retire(int arrival, Result::Status status,
   }
   // The prefix cache (M7): the rolling snapshot — the state at the aligned
   // image of the last token's position, where the next turn's cold prefill
-  // cuts — becomes an entry when the answer completed (EOS or the cap); a
-  // cancelled or shed request's partial answer is not worth a slot.
+  // cuts — becomes an entry when the answer completed (EOS or the cap).
+  // Cancellation can retain an existing snapshot within the committed
+  // response prefix; it must not publish speculative state beyond it.
   if (r.rolling_slot >= 0) {
     const int slot = r.rolling_slot;
     const int64_t position = r.rolling_position;
     r.rolling_slot = -1;
     r.rolling_position = -1;
     bool kept = false;
-    if (reason == Result::Reason::kEos || reason == Result::Reason::kSteps) {
+    const bool cancelled_snapshot_is_committed =
+        reason == Result::Reason::kCancelled && position > 0 &&
+        position <= static_cast<int64_t>(r.spec.prompt.size()) + r.steps_done - 1;
+    if (reason == Result::Reason::kEos || reason == Result::Reason::kSteps ||
+        cancelled_snapshot_is_committed) {
       std::vector<int64_t> ids(r.spec.prompt.begin(), r.spec.prompt.end());
       const int64_t gen = position - static_cast<int64_t>(r.spec.prompt.size());
       if (gen > 0)

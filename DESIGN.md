@@ -1835,6 +1835,13 @@ the next conversation turn. Reuse requires the next prompt to contain
 the same token prefix, including the rendered answer and relevant
 reasoning/template content.
 
+Cancellation may retain an existing rolling snapshot only when its position
+is within the committed response prefix (prompt plus generated tokens,
+excluding the pending last token). It does not take a fresh retirement
+snapshot. A client that received fewer tokens or changed the rendered
+history still has to match the stored prefix and a valid cut. Retained
+entries use the ordinary arena, block accounting and eviction policy.
+
 MTP can commit past an aligned position in one step. The scheduler can
 arm a post-row snapshot for that position; the engine reconstructs it
 from speculative state snapshots and the corresponding cache references.
