@@ -181,7 +181,19 @@ is the expert phase's forms, at 93 to 94 percent of the ceiling inside the
 stream, and the tails and hand-outs of the fixed phases. Staging into L2
 with the evict-last priority rather than evict-normal changed nothing; a
 probe showed evict-normal lines surviving a 150 MB evict-first stream at
-92 to 95 percent.
+92 to 95 percent. The lead's own hand-out searches the phase table in a
+shared-memory copy of the phases' lead boundaries, since the two binary
+searches a unit over global memory held the lead to half the ceiling in a
+ten-microsecond window. Two policies were measured and left out: a minimum
+of leaders during hot phases (their traffic competes with the fixed
+phases' cold units) and the lead walking a phase's units even first then
+odd (`lead_interleave`, within the noise). The trace reports, per phase,
+the lead's bytes ahead when the chain entered it, the layer its cursor
+stood in and how many workers found the cursor past the lookahead.
+
+The rate case runs in about two seconds, and production's requests on the
+shared GPU contaminate it: a run counts only when the serve log shows no
+decode in its window.
 
 The plan reaches the kernel through `lower_plan` (`src/step/device_plan.hpp`):
 each phase's fixed ranges under the arena coalesce into a few contiguous

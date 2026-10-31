@@ -153,6 +153,7 @@ StreamReport Streamer::run(const StreamerConfig& cfg) {
   p.lookahead_layers = cfg.lookahead_layers;
   p.lead_bytes_per_us = cfg.lead_bytes_per_us;
   p.route_pool = cfg.route_pool;
+  p.lead_interleave = cfg.lead_interleave;
   p.lead_cap_bytes = cfg.lead_cap_bytes;
   p.max_leaders = cfg.max_leaders;
   p.deadline_ns = static_cast<unsigned long long>(cfg.deadline_s * 1e9);
@@ -287,6 +288,9 @@ StreamReport Streamer::run(const StreamerConfig& cfg) {
       t.lead_in_mb = static_cast<double>(ctl_->lead_in_bytes[P]) / 1e6;
       t.staged_mb = static_cast<double>(ctl_->pf_staged[P]) / 1e6;
       t.wait_us = static_cast<double>(ctl_->wait_ns[P]) / 1e3;
+      t.ahead_mb = static_cast<double>(ctl_->ahead_begin[P]) / 1e6;
+      t.cursor_layer = ctl_->cursor_begin[P] < dp_.phases.size() ? dp_.phases[ctl_->cursor_begin[P]].layer : -1;
+      t.look_blocked = ctl_->look_blocked[P];
       t.grabs = ctl_->grabs[P];
       first = std::min(first, ctl_->stamp_begin[P]);
       last = std::max(last, ctl_->stamp_end[P]);

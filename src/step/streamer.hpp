@@ -32,6 +32,7 @@ struct StreamerConfig {
   int top_k = 1;
   unsigned seed = 1;
   unsigned route_pool = 0;       // the synthetic router's window of experts a layer (0: all 384; 32 gives the measured overlap)
+  unsigned lead_interleave = 0;  // 1: the lead walks a phase's units even first, then odd (an A/B switch)
   uint64_t first_seq = 0;        // the first step's sequence number; steps count up from it
   uint64_t epoch = 0;            // echoed by every verdict
   int skip_at_step = -1;         // publish skip instead of this step (-1: never)
@@ -55,6 +56,9 @@ struct PhaseTiming {
   double lead_in_mb = 0;  // lead bytes streamed while this phase was the published one
   double staged_mb = 0;   // lead bytes streamed for this phase's own units
   double wait_us = 0;     // workers' time spinning on dependencies inside the phase, summed
+  double ahead_mb = 0;    // the lead's staged bytes not yet consumed when the chain entered the phase
+  int cursor_layer = -1;  // the layer the lead's cursor stood in when the chain entered the phase (-1: the sequence's end)
+  unsigned look_blocked = 0;  // workers that found the cursor past the lookahead while this phase was published
   unsigned grabs = 0;
 };
 

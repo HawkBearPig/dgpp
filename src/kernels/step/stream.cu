@@ -148,9 +148,18 @@ __device__ __forceinline__ bool locate_segment(const StepStreamParams& p, const 
   return true;
 }
 // Lead unit u of phase P: the fixed segments, then the lead-only ones.
+// Lead unit u of phase P: the fixed segments, then the lead-only ones, in
+// the consumers' order; or, with `lead_interleave`, a phase's even units
+// first and then its odd ones, so a partly staged phase runs hot and cold
+// units side by side (an A/B switch for the stream test).
+__device__ __forceinline__ unsigned lead_interleave(unsigned u, unsigned n) {
+  const unsigned half = (n + 1) / 2;
+  return u < half ? 2 * u : 2 * (u - half) + 1;
+}
 __device__ bool locate_lead(const StepStreamParams& p, int layer, int P, unsigned u, const uint8_t** ptr, unsigned* bytes) {
   const DevPhase& ph = p.phases[P];
   const uint8_t* base = p.bases[layer];
+  if (p.lead_interleave) u = lead_interleave(u, ph.lead_units);
   for (int i = 0; i < ph.seg_count; ++i)
     if (locate_segment(p, base, p.segments[ph.seg_begin + i], u, ptr, bytes)) return true;
   for (int i = 0; i < ph.lead_seg_count; ++i)
@@ -186,6 +195,18 @@ __device__ int phase_of_lead_unit(const StepStreamParams& p, int n_phases, unsig
   while (lo < hi) {
     const int mid = (lo + hi + 1) >> 1;
     if (p.phases[mid].lead_begin <= g) lo = mid; else hi = mid - 1;
+  }
+  return lo;
+}
+// The same over a shared-memory copy of the phases' lead_begin: the workers'
+// lead hand-out ran two of these searches over global memory a unit, about
+// fourteen dependent loads, which held the lead to half the ceiling in a
+// ten-microsecond latency window (2026-10-31).
+__device__ __forceinline__ int phase_of_lead_unit_sm(const unsigned* lead_begin, int n_phases, unsigned g) {
+  int lo = 0, hi = n_phases - 1;
+  while (lo < hi) {
+    const int mid = (lo + hi + 1) >> 1;
+    if (lead_begin[mid] <= g) lo = mid; else hi = mid - 1;
   }
   return lo;
 }
@@ -521,6 +542,13 @@ __global__ void __launch_bounds__(kStepThreads, 1) step_stream_kernel(StepStream
             // stream phase's workers read them now, a latency phase's chain does.
             atomicMax(&ctl->pf_next, ph.lead_begin + ph.lead_units);
             if (ph.merged_next) atomicMax(&ctl->pf_next, p.phases[P + 1].lead_begin + p.phases[P + 1].lead_units);
+            if (t0) {
+              const long long ahead = static_cast<long long>(ctl->pf_bytes) - static_cast<long long>(ctl->consumed_pf_bytes);
+              ctl->ahead_begin[P] = ahead > 0 ? static_cast<unsigned long long>(ahead) : 0ull;
+              const unsigned pf = ld_acq(&ctl->pf_next);
+              ctl->cursor_begin[P] = pf < p.lead_units ? static_cast<unsigned>(phase_of_lead_unit(p, n_phases, pf)) : static_cast<unsigned>(n_phases);
+              ctl->look_blocked[P] = 0;
+            }
             if (!sm_fail && ph.kind == 1) {
               st_rel(&ctl->phase_word, word(step, P, kStateStream));
               const unsigned need = phase_units(p, l, P);
@@ -597,18 +625,22 @@ __global__ void __launch_bounds__(kStepThreads, 1) step_stream_kernel(StepStream
   }
   // ---- a worker
   extern __shared__ __align__(128) uint8_t smem[];
-  __shared__ unsigned sm_kind, sm_unit, sm_phase, sm_count, sm_word, sm_stop, sm_published;
+  __shared__ unsigned sm_kind, sm_unit, sm_phase, sm_count, sm_word, sm_stop, sm_published, sm_look_blocked;
+  __shared__ unsigned sm_lead_begin[kStepMaxPhases];  // the lead sequence's phase boundaries, for the lead's hand-out
   __shared__ unsigned long long sm_grab_bytes;
   __shared__ unsigned sm_cache_word, sm_need, sm_nslots;
   __shared__ unsigned sm_slot_end[2 * (kMaxPhasePools + 2)], sm_slot_grab[2 * (kMaxPhasePools + 2)];
   __shared__ int sm_layer;
-  if (threadIdx.x == 0) sm_cache_word = ~0u;
+  if (threadIdx.x == 0) { sm_cache_word = ~0u; sm_word = ~0u; sm_look_blocked = 0; }
+  for (int i = static_cast<int>(threadIdx.x); i < n_phases; i += kStepThreads) sm_lead_begin[i] = p.phases[i].lead_begin;
+  __syncthreads();
   for (;;) {
     if (threadIdx.x == 0) {
       sm_kind = 0;
       sm_count = 1;
       const unsigned long long t_top = gtimer();
       const unsigned w = ld_acq(&ctl->phase_word);
+      if (w != sm_word) sm_look_blocked = 0;  // a new published phase: the lookahead block is counted once a worker a phase
       sm_word = w;
       sm_published = (w >> 2) & 0xfffffu;
       const unsigned state = w & 3u;
@@ -709,11 +741,13 @@ __global__ void __launch_bounds__(kStepThreads, 1) step_stream_kernel(StepStream
             if (slot) {
               const unsigned pf = ld_acq(&ctl->pf_next);
               if (pf < p.lead_units) {
-                const int P2 = phase_of_lead_unit(p, n_phases, pf);
-                if (p.phases[P2].layer <= cur_layer + p.lookahead_layers) {
+                const int P2 = phase_of_lead_unit_sm(sm_lead_begin, n_phases, pf);
+                if (p.phases[P2].layer > cur_layer + p.lookahead_layers) {
+                  if (!sm_look_blocked) { sm_look_blocked = 1u; atomicAdd(&ctl->look_blocked[P], 1u); }
+                } else {
                   const unsigned got = atomicAdd(&ctl->pf_next, 1u);
                   if (got < p.lead_units) {
-                    const int P3 = phase_of_lead_unit(p, n_phases, got);
+                    const int P3 = phase_of_lead_unit_sm(sm_lead_begin, n_phases, got);
                     sm_kind = 2; sm_unit = got - p.phases[P3].lead_begin; sm_phase = static_cast<unsigned>(P3); sm_layer = p.phases[P3].layer;
                     atomicAdd(&ctl->pf_bytes, static_cast<unsigned long long>(p.unit_bytes));
                     atomicAdd(&ctl->pf_units[P3], 1u);

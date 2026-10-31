@@ -2270,9 +2270,34 @@ area, untracked.
       units did not wait on their own layer's compute units, masked by
       their late hand-out). The median layer at the measured overlap: 85
       to 86 percent of its floor.
+- [x] The lead's hand-out and two policy experiments (2026-10-31): the
+      lead's two binary searches over the phase table ran in global
+      memory, about fourteen dependent loads a unit, and held the lead to
+      half the ceiling in a ten-microsecond window; a shared-memory copy
+      of the phases' lead boundaries fixed it (ffn_in now fully covered,
+      the lead 28 to 38 MB a layer). The trace gained the lead's bytes
+      ahead at each phase start, the cursor's layer and lookahead blocks.
+      Two policies measured and rejected: a minimum of six leaders during
+      hot phases cost two points (their traffic competes with the fixed
+      phases' cold units and the staged set outgrows L2), and the lead
+      walking a phase's units even first then odd, so hot and cold units
+      run side by side, measured plus one point within the run-to-run
+      noise of plus or minus one and a half over three clean A/B pairs
+      (kept as the `lead_interleave` switch, off). Measurement hygiene
+      learned the hard way: the rate case runs in about two seconds and
+      production's requests on the shared GPU contaminate it, so a run
+      counts only when the serve log shows no decode in its window.
 - [ ] The residue after the lead: the expert phase inside the stream at
       93 to 94 percent of the ceiling, about 4 percent of the layer, and
-      the fixed phases' tails and hand-outs, about 3. A probe of the
+      the fixed phases' tails and hand-outs, about 3. At the measured
+      expert count the accounting is: a layer of 147 MB takes about 710
+      µs against 615 at the ceiling, the expert phase 440 of 417, the
+      fixed phases 190 (40 MB cold at the ceiling plus 20 MB hot from L2
+      plus tails), the latency windows 70 filled by the lead at the
+      ceiling, so the memory idles about 85 µs a layer: 25 in the expert
+      phase's structure, 25 in the fixed phases' hot stretches, 35 in
+      tails, drains and hand-outs. The lead is saturated and more of it
+      does not pay. A probe of the
       pair's request pattern cleared it: a warp streaming a gate and an
       up tile 4 MB apart reads 238 GB/s at 48 blocks, the same as one
       stream of 512-byte or 1 KB runs (237 to 238.5), so the pair's 233

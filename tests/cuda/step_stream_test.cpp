@@ -156,10 +156,10 @@ void print_report(const char* title, const StreamReport& r, int layer) {
     if (t.layer != layer) continue;
     const double window = t.end_us - t.begin_us;
     const double util = (t.stream && window > 0 && r.workers > 0) ? t.busy_us / (window * r.workers) : 0.0;
-    std::printf("      layer %d %-10s %s %8.1f .. %8.1f us  units %5u  staged %5.1f MB  drained %6.1f us  busy %5.1f %%  %5.1f us a grab (%u), hand-out %4.1f us, lead in window %5.1f MB, waits %4.1f %%\n",
+    std::printf("      layer %d %-10s %s %8.1f .. %8.1f us  units %5u  staged %5.1f MB  drained %6.1f us  busy %5.1f %%  %5.1f us a grab (%u), hand-out %4.1f us, lead in window %5.1f MB, waits %4.1f %%, ahead at start %5.1f MB, cursor in layer %d, %u blocked by lookahead\n",
                 t.layer, t.name.c_str(), t.stream ? "stream " : "latency", t.begin_us, t.end_us, t.units, t.staged_mb, t.drained_us,
                 util * 100.0, t.grabs ? t.busy_us / t.grabs : 0.0, t.grabs, t.grabs ? t.handout_us / t.grabs : 0.0, t.lead_in_mb,
-                (t.stream && window > 0 && r.workers > 0) ? t.wait_us / (window * r.workers) * 100.0 : 0.0);
+                (t.stream && window > 0 && r.workers > 0) ? t.wait_us / (window * r.workers) * 100.0 : 0.0, t.ahead_mb, t.cursor_layer, t.look_blocked);
   }
 }
 
@@ -534,15 +534,17 @@ DGPP_TEST(step_consumers_in_the_stream_match_the_reference) {
   consumers_match_the_reference(/*tile_major=*/true);   // the arena's tile-major experts
 }
 
-double consumers_rate(bool tile_major) {
+double consumers_rate(bool tile_major, bool interleave = false) {
   auto rig = make_rig(kLayers, /*consumers=*/true, tile_major);
   Streamer s(rig->dp, rig->bases, rig->plans);
   StreamerConfig cfg = design_config();
+  cfg.lead_interleave = interleave ? 1u : 0u;
   cfg.steps = 3;
   cfg.rows = 5;
   cfg.top_k = 6;
   const StreamReport r = s.run(cfg);
-  print_report(tile_major ? "tile-major experts, design chain, lead 16 MB" : "row-major experts, design chain, lead 16 MB", r, 3);
+  print_report(tile_major ? (interleave ? "tile-major experts, design chain, lead 16 MB, interleaved lead" : "tile-major experts, design chain, lead 16 MB")
+                          : "row-major experts, design chain, lead 16 MB", r, 3);
   {  // the slowest layer's phases too, when it is not layer 3
     int slowest = 0;
     for (size_t l = 1; l < r.layer_us.size(); ++l)
@@ -580,6 +582,8 @@ double consumers_rate(bool tile_major) {
 DGPP_TEST(step_consumers_rate_at_the_design_chain) {
   const double row = consumers_rate(/*tile_major=*/false);
   const double tile = consumers_rate(/*tile_major=*/true);
+  const double tile_il = consumers_rate(/*tile_major=*/true, /*interleave=*/true);
+  std::printf("   interleaved lead against the consumers' order: %.1f against %.1f percent\n", tile_il, tile);
   // Interim gates at the measured plateau less the run-to-run noise (tile-major
   // 86 to 90 percent, row-major 78 to 88 with every weight computed; the
   // fused chain's structure is where the rest comes back, section 1.3).
