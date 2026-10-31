@@ -905,8 +905,9 @@ streams at 92 percent of the ceiling, the fixed phases at the ceiling in
 aggregate, and the median layer at 87 to 88 percent of its floor at any
 lead cap from 4 to 20 MB (beside production, at the uniform expert count;
 the clean figure at the measured count, 2026-10-31, is 83 with the
-synthetic router, 80.6 with the real one, 79.4 with the mHC sites computed
-as well as gated classes of the stream phases). The residue is the layer's latency: attn_in 9,
+synthetic router, 80.6 with the real one, 83.1 with the real router and
+the mHC sites computed as well as gated classes of the stream phases, that
+night). The residue is the layer's latency: attn_in 9,
 attend 2, ffn_in 12, the router 18, the gap to the experts 8 and the
 accumulation 21 µs, about 70 µs a layer, of which the lead covers a few
 microseconds, because its cap is full when the latency begins. The bound
@@ -2424,23 +2425,30 @@ area, untracked.
       projection's reduce), the attention site inside the previous layer's
       accumulate behind the layer's fold, the select inside the group as
       soon as the router's units are done, the class table built by the
-      chain while the previous group runs. Clean at the measured count the
-      sites cost 0.7 points (80.1 percent of the floor without them, 79.4
-      with), the median layer 79 tile-major, 74 row-major, the synthetic
-      chain 95.4. Owed here: the attention consumer, the folds and the
-      select as consumers, and the chain's critical path after the
-      attention-output fold, about 100 µs against the budget's 34: the
-      router's 24 units take 41 µs for 160 KB of rows and 50 KB of staged
-      activations each (a standalone probe next, as the site unit had),
-      the site 24, the select and finish about 15. Lessons kept in
+      chain while the previous group runs, the merged phases' rows kept on
+      the lead's path so they are in L2 when their classes open, lead
+      units yielding when a gate opens. Clean at the measured count the
+      median layer reads 83.1 percent of its floor tile-major and 78.1
+      row-major with every weight, both sites and the real router computed
+      (83.3 and 81.2 with and without the sites in the attribution, inside
+      the band), above the 83.2 the synthetic router and no sites had read.
+      Owed here: the attention consumer, the folds and the select as
+      consumers, and the chain's critical path after the attention-output
+      fold, about 70 µs against the budget's 34: the MoE site's class 24
+      (hand-out stagger, units of 9, the finish of 10), the router's 23
+      (its unit 9 standalone, `router_unit_rate`), the select and finish
+      about 25 under the saturated memory. Lessons kept in
       `docs/step_engine.md`: gated classes first lost 3.6 points, merged
       phases first deadlocked, the fold gate must be per group, a
       dependent token-id load per staged 16-byte piece cost the projection
-      units a tenth, and workers building the class table cost up to 17 µs
-      a phase. Two defects fixed on the way: the test rig's overlaid arena
-      copies (one per distinct layer layout now) and the host's wait on a
-      faulted kernel. A 2048-output row chunk was tried and reverted (unit
-      time scaled with the chunk, three points).
+      units a tenth, workers building the class table cost up to 17 µs a
+      phase, exempting the merged phases' rows from the lead left the
+      router's units reading DRAM under the lead's stream (42 µs for 9),
+      and a phase-table search at every group's start cost the chain
+      microseconds. Two defects fixed on the way: the test rig's overlaid
+      arena copies (one per distinct layer layout now) and the host's wait
+      on a faulted kernel. A 2048-output row chunk was tried and reverted
+      (unit time scaled with the chunk, three points).
 - [ ] No library kernel on the step engine's path, the existing walks
       untouched. Gate: no library kernel in a step's trace on any family.
 

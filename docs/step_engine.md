@@ -204,14 +204,14 @@ percent of their floor plus or minus 0.3 over three runs and the row-major
 77.3, and the lead cap sweep is flat from 12 MB to 128: the lead is bounded
 by the workers' idle time, not by the cap. With the real router and the
 hyper-connection sites computed as well, as gated classes of the stream
-phases (2026-10-31 evening), the same layers read 79 and 74 (the eight
-tile-major layers 76 to 86).
+phases (2026-10-31 night), the same layers read 83.1 and 78.1 (the eight
+tile-major layers 78 to 85).
 
 `step_consumers_attribution` runs the same phases with each consumer class
-alone and the rest as byte units, clean. Every pool as bytes 96.8 percent
-of the floor, the routed experts as consumers 88.1, the shared expert and
-projections 85.9, the projections alone 87.3, every consumer but the
-hyper-connection sites 80.1, every consumer 79.4 (an earlier day's three
+alone and the rest as byte units, clean. Every pool as bytes 96.9 percent
+of the floor, the routed experts as consumers 91.0, the shared expert and
+projections 85.4, the projections alone 83.4, every consumer but the
+hyper-connection sites 81.2, every consumer 83.3 (an earlier day's three
 runs, before the sites: bytes 96.6 to 97.9, experts 86.1 to 90.8, shared
 and projections 88.2 to 89.7, projections 83.6 to 89.9, all 82.5 to 83.9
 with the synthetic router). The expert
@@ -372,19 +372,34 @@ gives the first phase of a group its own units and the fold, the merged
 phases the rest, and each class its window from first hand-out to last
 completion.
 
-Measured clean with the sites as classes, the sites cost the layer 0.7
-points (80.1 percent of the floor without them, 79.4 with), the median
-layer 79 tile-major and 74 row-major. The class windows of `attn_out`
-(tile-major, layer 3, from the group's publish): the output projection's
-compute units 3 to 63 µs, its reduce units 62 to 74, the other projection
-32 to 86 with its reduce to 93, the fold, the MoE site 90 to 113, the
-router 113 to 155, the select, the group's end at 188 and the expert phase
-published at 193. The accumulate group: the accumulation 4 to 14, the fold
-to 28, the attention site to 36. So the chain's critical path after the
-attention-output fold is about 100 µs against the budget's 34: the router's
-24 units take 41 µs for 160 KB of rows and 50 KB of staged activations each
-(the next item, with a standalone probe), the site 24 and the select and
-finish about 15.
+Three more things the class trace taught the same night. The merged
+phases' lead-only bytes (a site's coefficient rows, the router's rows) stay
+on the lead's path when the group begins, where the first phase's own bytes
+leave it: their classes open behind the fold and read them from L2 then.
+Exempted with the first phase's they came from DRAM under the lead's full
+stream, and the router's 24 units took 42 µs for 3.9 MB where the
+standalone probe `router_unit_rate` gives 9 with the rows in L2 (in every
+form of the unit: rows loaded one, five or ten ahead, tokens specialized or
+not; five ahead is the kernel's). A lead unit yields when a gate opens as
+well as when a phase is published, since a 64 KB lead unit at a 47-way
+share of the memory is about 13 µs. And the chain's stamp of where the
+lead's cursor stood, a binary search over the phase table at every group's
+start, moved to the host: it cost the chain several microseconds a group.
+
+Measured clean with all of that, the sites cost the layer nothing the
+attribution can see (81.2 percent of the floor without them, 83.3 with,
+inside the run-to-run band), the median layer 83.1 tile-major and 78.1
+row-major. The class windows of `attn_out` (tile-major, layer 3, from the
+group's publish): the output projection's compute units 2 to 64 µs, its
+reduce units 62 to 74, the other projection 40 to 85 with its reduce to 89,
+the fold, the MoE site 88 to 111, the router 109 to 132, the select and
+finish to the group's end at 157, the expert phase published at 161. The
+accumulate group: the accumulation 2 to 13, the fold to 25, the attention
+site to 32. The chain's critical path after the attention-output fold is
+now about 70 µs against the budget's 34: the site's class 24 (a hand-out
+stagger, units of about 9 and the finish of about 10), the router's 23, the
+select and finish about 25 under the saturated memory where they take 12
+quiet. Those three are the next items.
 
 ## The step protocol
 

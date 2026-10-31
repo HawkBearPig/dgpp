@@ -81,6 +81,7 @@ struct alignas(128) StepCtl {
   unsigned acc_done[kStepMaxLayers];      // the accumulate units completed, by layer (the fold trigger of its group)
   unsigned site_done[kStepMaxLayers][2];  // a hyper-connection site's tokens finished, by layer and site (the router's gate)
   unsigned fold_done[kStepMaxPhases];     // the chain spun the group's fold, by the group's published phase (the gate of the units behind it; a layer has two groups with folds, so not by layer: 2026-10-31)
+  unsigned open_gen;                      // bumped when a gate opens (a fold spun, a site's token finished, a pool's compute units complete): lead units yield to it
   unsigned long long stamp_begin[kStepMaxPhases];  // the last pass: the phase's publish or latency start
   unsigned long long stamp_end[kStepMaxPhases];    // the last pass: its units done, the fold after it included
   unsigned long long idle_first[kStepMaxPhases];   // the last pass: the first worker to find the phase drained

@@ -23,6 +23,7 @@
 #include "common/test.hpp"
 #include "kernels/step/fp8_dense.cuh"
 #include "kernels/step/mhc.cuh"
+#include "kernels/step/router.cuh"
 #include "kernels/glm_mhc_launch.hpp"
 #include "models/glm/mhc.hpp"
 #include "kernels/step/mxfp4_expert.cuh"
@@ -1170,6 +1171,91 @@ DGPP_TEST(mhc_unit_rate) {
     cudaFree(pre_in); cudaFree(pre_out); cudaFree(post); cudaFree(comb); cudaFree(base); cudaFree(scale); cudaFree(ln); cudaFree(normed);
   }
   cudaFree(streams); cudaFree(fn); cudaFree(lg); cudaFree(flushbuf); cudaFree(sink);
+}
+
+// The router unit on its own: 24 blocks of 16 expert rows (384 experts, 5120
+// wide) over five tokens, the rows staged in L2 as the lead leaves them, in
+// the forms the unit can take: row vectors loaded one, five or ten ahead,
+// the token count specialized or eight always.
+namespace {
+template <int kBatch, bool kSpecialize>
+__global__ void router_unit_rate_kernel(const uint8_t* w_base, DevPool pool, Mxfp4Group g, const uint16_t* x, float* scores, float* biased, int n_experts) {
+  extern __shared__ __align__(128) uint8_t smem[];
+  router_unit<5120, kBatch, kSpecialize>(w_base, pool, blockIdx.x, g, x, scores, biased, n_experts, 2, smem);
+}
+}  // namespace
+
+DGPP_TEST(router_unit_rate) {
+  const int K = 5120, E = 384, T = 5, units = E / kRouterUnitRows;
+  const size_t wbytes = static_cast<size_t>(E) * K * 2, bbytes = static_cast<size_t>(E) * 4;
+  uint8_t* arena = nullptr;
+  DGPP_CUDA_OK(cudaMalloc(&arena, wbytes + 256 + bbytes));
+  init_x<<<static_cast<unsigned>((static_cast<size_t>(E) * K + 255) / 256), 256>>>(reinterpret_cast<uint16_t*>(arena), E * K);
+  init_f32<<<(E + 31) / 32, 32>>>(reinterpret_cast<float*>(arena + wbytes + 256), E, -0.5f, 1.f, 17u);
+  uint16_t* x = nullptr;
+  DGPP_CUDA_OK(cudaMalloc(&x, static_cast<size_t>(T) * K * 2));
+  init_x<<<(T * K + 255) / 256, 256>>>(x, T * K);
+  int32_t* tokens = nullptr;
+  DGPP_CUDA_OK(cudaMalloc(&tokens, T * 4));
+  {
+    std::vector<int32_t> tk(T);
+    for (int t = 0; t < T; ++t) tk[static_cast<size_t>(t)] = t;
+    DGPP_CUDA_OK(cudaMemcpy(tokens, tk.data(), T * 4, cudaMemcpyHostToDevice));
+  }
+  float *scores = nullptr, *biased = nullptr, *scores_ref = nullptr;
+  DGPP_CUDA_OK(cudaMalloc(&scores, static_cast<size_t>(T) * E * 4));
+  DGPP_CUDA_OK(cudaMalloc(&biased, static_cast<size_t>(T) * E * 4));
+  DGPP_CUDA_OK(cudaMalloc(&scores_ref, static_cast<size_t>(T) * E * 4));
+  DevPool pool;
+  pool.kind = kPoolRouter;
+  pool.offsets[0] = 0;
+  pool.offsets[1] = wbytes + 256;
+  pool.rows = E;
+  pool.k = K;
+  Mxfp4Group g;
+  g.slots = tokens;
+  g.tokens = tokens;
+  g.count = T;
+  g.x_stride = K;
+  uint4* flushbuf = nullptr;
+  const size_t flush_n = (150u << 20) / 16;
+  DGPP_CUDA_OK(cudaMalloc(&flushbuf, flush_n * 16));
+  DGPP_CUDA_OK(cudaMemset(flushbuf, 3, flush_n * 16));
+  unsigned* sink = nullptr;
+  DGPP_CUDA_OK(cudaMalloc(&sink, 4));
+  cudaEvent_t e0 = nullptr, e1 = nullptr;
+  DGPP_CUDA_OK(cudaEventCreate(&e0));
+  DGPP_CUDA_OK(cudaEventCreate(&e1));
+  constexpr int kSmem = kFp8StagedSmemCap;
+  auto run = [&](auto kernel, const char* name, bool reference) {
+    DGPP_CUDA_OK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem));
+    kernel<<<units, kStepThreads, kSmem>>>(arena, pool, g, x, scores, biased, E);  // the first launch's costs
+    DGPP_CUDA_OK(cudaDeviceSynchronize());
+    std::vector<float> ms(3);
+    for (float& m : ms) {
+      stream_cs_kernel<<<47, 256>>>(flushbuf, flush_n, sink);
+      DGPP_CUDA_OK(cudaDeviceSynchronize());
+      stage_cg_kernel<<<47, 256>>>(reinterpret_cast<const uint4*>(arena), (wbytes + 256 + bbytes) / 16, sink);
+      DGPP_CUDA_OK(cudaDeviceSynchronize());
+      DGPP_CUDA_OK(cudaEventRecord(e0));
+      kernel<<<units, kStepThreads, kSmem>>>(arena, pool, g, x, scores, biased, E);
+      DGPP_CUDA_OK(cudaEventRecord(e1));
+      DGPP_CUDA_OK(cudaDeviceSynchronize());
+      DGPP_CUDA_OK(cudaEventElapsedTime(&m, e0, e1));
+    }
+    std::sort(ms.begin(), ms.end());
+    size_t differ = 0;
+    if (reference) DGPP_CUDA_OK(cudaMemcpy(scores_ref, scores, static_cast<size_t>(T) * E * 4, cudaMemcpyDeviceToDevice));
+    else differ = count_diff(scores, scores_ref, static_cast<size_t>(T) * E);
+    std::printf("   router unit, %d blocks of 16 rows, 5 tokens, rows staged in L2, %s: %5.1f us (median of 3), %zu scores differ from the first form\n", units, name,
+                ms[1] * 1e3, differ);
+  };
+  run(router_unit_rate_kernel<10, true>, "ten vectors ahead, tokens specialized (the kernel's)", true);
+  run(router_unit_rate_kernel<10, false>, "ten ahead, eight tokens always", false);
+  run(router_unit_rate_kernel<5, true>, "five ahead, specialized", false);
+  run(router_unit_rate_kernel<1, true>, "one at a time, specialized", false);
+  run(router_unit_rate_kernel<1, false>, "one at a time, eight tokens (the first form)", false);
+  cudaFree(arena); cudaFree(x); cudaFree(tokens); cudaFree(scores); cudaFree(biased); cudaFree(scores_ref); cudaFree(flushbuf); cudaFree(sink);
 }
 
 DGPP_TEST(mhc_site_matches_the_production_kernels) {

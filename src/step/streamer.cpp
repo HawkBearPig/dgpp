@@ -347,7 +347,18 @@ StreamReport Streamer::run(const StreamerConfig& cfg) {
       t.staged_mb = static_cast<double>(ctl_->pf_staged[P]) / 1e6;
       t.wait_us = static_cast<double>(ctl_->wait_ns[P]) / 1e3;
       t.ahead_mb = static_cast<double>(ctl_->ahead_begin[P]) / 1e6;
-      t.cursor_layer = ctl_->cursor_begin[P] < dp_.phases.size() ? dp_.phases[ctl_->cursor_begin[P]].layer : -1;
+      {  // the lead's cursor when the group began: a unit index, mapped to its phase's layer here
+        const unsigned pf = ctl_->cursor_begin[P];
+        t.cursor_layer = -1;
+        if (pf < dp_.lead_units) {
+          size_t lo = 0, hi = dp_.phases.size() - 1;
+          while (lo < hi) {
+            const size_t mid = (lo + hi + 1) / 2;
+            if (dp_.phases[mid].lead_begin <= pf) lo = mid; else hi = mid - 1;
+          }
+          t.cursor_layer = dp_.phases[lo].layer;
+        }
+      }
       t.look_blocked = ctl_->look_blocked[P];
       t.grabs = ctl_->grabs[P];
       t.merged = ph.merged;

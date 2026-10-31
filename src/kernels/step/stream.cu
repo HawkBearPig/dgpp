@@ -5,6 +5,7 @@
 #include "kernels/step/mhc.cuh"
 #include "kernels/step/mxfp4_expert.cuh"
 #include "kernels/step/mxfp4_row.cuh"
+#include "kernels/step/router.cuh"
 
 namespace dgpp::step {
 
@@ -228,15 +229,7 @@ __device__ bool locate_pool_bytes(const StepStreamParams& p, int layer, const De
 }
 
 // The phase that holds global lead unit `g` (the phases' lead_begin ascend).
-__device__ int phase_of_lead_unit(const StepStreamParams& p, int n_phases, unsigned g) {
-  int lo = 0, hi = n_phases - 1;
-  while (lo < hi) {
-    const int mid = (lo + hi + 1) >> 1;
-    if (p.phases[mid].lead_begin <= g) lo = mid; else hi = mid - 1;
-  }
-  return lo;
-}
-// The same over a shared-memory copy of the phases' lead_begin: the workers'
+// The phase a lead unit belongs to, over a shared-memory copy of the phases' lead_begin: the workers'
 // lead hand-out ran two of these searches over global memory a unit, about
 // fourteen dependent loads, which held the lead to half the ceiling in a
 // ten-microsecond latency window (2026-10-31).
@@ -501,118 +494,6 @@ __device__ bool fp8_matrix_dispatch(int k, int n, const uint8_t* w, const float*
   return false;
 }
 
-// ---- the router -----------------------------------------------------------
-// The production router's dot (kernels/glm_moe.cu router_dot), op for op: one
-// warp per expert row, each lane its strided 16-byte vectors of the row and
-// of the token's activations, eight fmas a vector in the file's order, then
-// the xor tree. Here a warp carries up to eight tokens' accumulators through
-// one read of its row, with the activations staged in shared memory; each
-// token's chain is the production's, so the scores are bitwise its.
-constexpr int kRouterUnitRows = 16;  // two expert rows a warp, sharing each staged activation vector: 24 units in one wave
-constexpr int kRouterTokens = 8;  // tokens a pass stages
-__device__ __forceinline__ float router_sqrt_softplus(float x) {
-  const float sp = x > 20.f ? x : log1pf(expf(x));
-  return sqrtf(sp);
-}
-// The two rows' dots against NT staged tokens: the row vectors of a batch
-// loaded before any is used (the unit was latency-bound at two in flight),
-// each (row, token) chain in the production's lane order.
-template <int kK, int NT>
-__device__ __forceinline__ void router_rows(const uint4* __restrict__ wv0, const uint4* __restrict__ wv1, const uint16_t* s_x, int lane,
-                                            float (&dot0)[kRouterTokens], float (&dot1)[kRouterTokens]) {
-  constexpr int kVecs = kK / 8 / 32;  // vectors a lane walks
-  constexpr int kBatch = kVecs < 10 ? kVecs : 10;
-  static_assert(kVecs % kBatch == 0, "the row's vectors in whole batches");
-  for (int b = 0; b < kVecs; b += kBatch) {
-    uint4 q0[kBatch], q1[kBatch];
-#pragma unroll
-    for (int i = 0; i < kBatch; ++i) { q0[i] = __ldcs(wv0 + lane + (b + i) * 32); q1[i] = __ldcs(wv1 + lane + (b + i) * 32); }
-#pragma unroll
-    for (int i = 0; i < kBatch; ++i) {
-      const int v = lane + (b + i) * 32;
-      const uint32_t w0[4] = {q0[i].x, q0[i].y, q0[i].z, q0[i].w}, w1[4] = {q1[i].x, q1[i].y, q1[i].z, q1[i].w};
-      float f0[8], f1[8];
-#pragma unroll
-      for (int k = 0; k < 4; ++k) {
-        f0[2 * k] = bf16_bits_to_float(static_cast<uint16_t>(w0[k] & 0xFFFFu)); f0[2 * k + 1] = bf16_bits_to_float(static_cast<uint16_t>(w0[k] >> 16));
-        f1[2 * k] = bf16_bits_to_float(static_cast<uint16_t>(w1[k] & 0xFFFFu)); f1[2 * k + 1] = bf16_bits_to_float(static_cast<uint16_t>(w1[k] >> 16));
-      }
-#pragma unroll
-      for (int t = 0; t < NT; ++t) {
-        const uint4 xq = *reinterpret_cast<const uint4*>(s_x + t * kK + v * 8);
-        const uint32_t xw[4] = {xq.x, xq.y, xq.z, xq.w};
-#pragma unroll
-        for (int k = 0; k < 4; ++k) {
-          const float xl = bf16_bits_to_float(static_cast<uint16_t>(xw[k] & 0xFFFFu)), xh = bf16_bits_to_float(static_cast<uint16_t>(xw[k] >> 16));
-          dot0[t] = __fmaf_rn(xl, f0[2 * k], dot0[t]);
-          dot0[t] = __fmaf_rn(xh, f0[2 * k + 1], dot0[t]);
-          dot1[t] = __fmaf_rn(xl, f1[2 * k], dot1[t]);
-          dot1[t] = __fmaf_rn(xh, f1[2 * k + 1], dot1[t]);
-        }
-      }
-    }
-  }
-}
-template <int kK>
-__device__ void router_unit(const uint8_t* __restrict__ w_base, const DevPool& pool, int rb, const Mxfp4Group& g, const uint16_t* __restrict__ x,
-                            float* __restrict__ scores, float* __restrict__ biased, int n_experts, int mode, uint8_t* smem) {
-  static_assert(kK % 256 == 0, "the router's inner width");
-  const uint16_t* w = reinterpret_cast<const uint16_t*>(w_base + pool.offsets[0]);
-  const float* bias = reinterpret_cast<const float*>(w_base + pool.offsets[1]);
-  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-  uint16_t* s_x = reinterpret_cast<uint16_t*>(smem);
-  const size_t xs = g.x_stride ? static_cast<size_t>(g.x_stride) : static_cast<size_t>(kK);
-  for (int t0 = 0; t0 < g.count; t0 += kRouterTokens) {
-    const int nt = min(kRouterTokens, g.count - t0);
-    __syncthreads();  // the previous pass's readers are done with the staged rows
-    const GroupTokens8 ids = group_tokens8(g, t0);  // the pass's token ids once, not a dependent load a piece
-    for (int q = threadIdx.x; q < nt * (kK / 8); q += kStepThreads) {
-      const int t = q / (kK / 8), c16 = q % (kK / 8);
-      cp_async_16(s_x + t * kK + c16 * 8, x + static_cast<size_t>(ids.at(t)) * xs + c16 * 8);
-    }
-    cp_async_commit();
-    cp_async_wait<0>();
-    __syncthreads();
-    // Both of the warp's rows against every staged token through one read of each activation
-    // vector; the token count specialized, so no issue slot goes to a token that is not there.
-    const int e0 = rb * kRouterUnitRows + warp, e1 = e0 + (kStepThreads / 32);
-    const bool live1 = e1 < n_experts;
-    if (e0 < n_experts) {
-      const uint4* wv0 = reinterpret_cast<const uint4*>(w + static_cast<size_t>(e0) * kK);
-      const uint4* wv1 = reinterpret_cast<const uint4*>(w + static_cast<size_t>(live1 ? e1 : e0) * kK);
-      float dot0[kRouterTokens], dot1[kRouterTokens];
-#pragma unroll
-      for (int t = 0; t < kRouterTokens; ++t) { dot0[t] = 0.f; dot1[t] = 0.f; }
-      switch (nt) {
-        case 1: router_rows<kK, 1>(wv0, wv1, s_x, lane, dot0, dot1); break;
-        case 2: router_rows<kK, 2>(wv0, wv1, s_x, lane, dot0, dot1); break;
-        case 3: router_rows<kK, 3>(wv0, wv1, s_x, lane, dot0, dot1); break;
-        case 4: router_rows<kK, 4>(wv0, wv1, s_x, lane, dot0, dot1); break;
-        case 5: router_rows<kK, 5>(wv0, wv1, s_x, lane, dot0, dot1); break;
-        case 6: router_rows<kK, 6>(wv0, wv1, s_x, lane, dot0, dot1); break;
-        case 7: router_rows<kK, 7>(wv0, wv1, s_x, lane, dot0, dot1); break;
-        default: router_rows<kK, 8>(wv0, wv1, s_x, lane, dot0, dot1); break;
-      }
-#pragma unroll
-      for (int t = 0; t < kRouterTokens; ++t) {
-        float d0 = dot0[t], d1 = dot1[t];
-#pragma unroll
-        for (int off = 16; off > 0; off >>= 1) { d0 += __shfl_xor_sync(0xFFFFFFFFu, d0, off); d1 += __shfl_xor_sync(0xFFFFFFFFu, d1, off); }
-        if (lane == 0 && t < nt) {
-          const int tok = ids.at(t);
-          const float s0 = mode == 2 ? router_sqrt_softplus(d0) : 1.0f / (1.0f + expf(-d0));
-          scores[static_cast<size_t>(tok) * n_experts + e0] = s0;
-          biased[static_cast<size_t>(tok) * n_experts + e0] = s0 + bias[e0];
-          if (live1) {
-            const float s1 = mode == 2 ? router_sqrt_softplus(d1) : 1.0f / (1.0f + expf(-d1));
-            scores[static_cast<size_t>(tok) * n_experts + e1] = s1;
-            biased[static_cast<size_t>(tok) * n_experts + e1] = s1 + bias[e1];
-          }
-        }
-      }
-    }
-  }
-}
 // The production router's select (kernels/glm_moe.cu router_select_warp), one
 // warp per token: top_k rounds of argmax over the biased scores, strict > and
 // the lower id on ties, the ids sorted ascending, the weights normalized with
@@ -703,7 +584,7 @@ __device__ void consumer_unit(const StepStreamParams& p, int layer, const DevPoo
     return;
   }
   if (pool.kind == kPoolRouter) {
-    if (pool.k == 5120) router_unit<5120>(base, pool, rb, grp, p.x, p.scores, p.biased, p.n_experts, p.router_mode, smem);
+    if (pool.k == 5120) router_unit<5120, kRouterBatch, kRouterSpecialize>(base, pool, rb, grp, p.x, p.scores, p.biased, p.n_experts, p.router_mode, smem);
     else if (threadIdx.x == 0) atomicCAS(&p.ctl->status, kStepOk, kStepBadUnit);
     return;
   }
@@ -896,14 +777,18 @@ __global__ void __launch_bounds__(kStepThreads, 1) step_stream_kernel(StepStream
               if (ld_acq(&ctl->poison)) { atomicCAS(&ctl->status, kStepOk, kStepPoisoned); sm_fail = 1; break; }
             }
           }
-          // The lead never takes the units of the group that is running: a
-          // stream phase's workers read them now, a latency phase's chain does.
-          for (int Q = P; Q <= P_last; ++Q) atomicMax(&ctl->pf_next, p.phases[Q].lead_begin + p.phases[Q].lead_units);
+          // The lead never takes the units of the phase that is running: a stream phase's
+          // workers read them now, a latency phase's chain does. The merged phases' lead-only
+          // bytes (a site's coefficient rows, the router's rows) stay on the lead's path: their
+          // classes open later in the group, behind the fold, and read them then. Exempted with
+          // the first phase's they came from DRAM under the lead's full stream, and the router's
+          // 24 units took 42 µs for 3.9 MB where they take 9 with the rows in L2 (2026-10-31).
+          atomicMax(&ctl->pf_next, ph.lead_begin + ph.lead_units);
           {
             const long long ahead = static_cast<long long>(ctl->pf_bytes) - static_cast<long long>(ctl->consumed_pf_bytes);
             ctl->ahead_begin[P] = ahead > 0 ? static_cast<unsigned long long>(ahead) : 0ull;
             const unsigned pf = ld_acq(&ctl->pf_next);
-            ctl->cursor_begin[P] = pf < p.lead_units ? static_cast<unsigned>(phase_of_lead_unit(p, n_phases, pf)) : static_cast<unsigned>(n_phases);
+            ctl->cursor_begin[P] = pf;  // the lead unit index; the host maps it to a phase (a binary search over the phase table here cost the chain several microseconds a group)
             ctl->look_blocked[P] = 0;
           }
           sm_first_stamped = 0;
