@@ -51,6 +51,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <memory>
 #include <set>
 #include <stdexcept>
@@ -100,6 +101,18 @@ struct ReplicatedDigest {
 
 using LoaderTensorMap = std::unordered_map<std::string, const TensorInfo*>;
 
+// The step engine's arena (MOONSHOT-1.md section 2.4, 2026-10-30): a layout
+// a family's plan generator chooses for its resident layers, as the device
+// offset of every main grant of a layer in the loader's grant order (a
+// permutation of the grant-order layout, the same bytes and total). Version
+// 0 is the grant-order layout the loader produces alone, keyed as today;
+// a nonzero version is mixed into the resident image key, so an image of
+// one layout never restores into the other.
+struct ResidentLayout {
+  uint64_t version = 0;
+  std::function<std::vector<size_t>(int layer)> placement;  // empty: grant order
+};
+
 template <class F>
 class ResidentLayerStream {
  public:
@@ -133,6 +146,18 @@ class ResidentLayerStream {
   // The byte formulas (counting builds and closed forms).
   static size_t layer_bytes(const Config& cfg, int layer, int rank = 0, int world = 1);
   static uint64_t planned_layer_source_bytes(const Config& cfg, int layer, int rank, int world);
+  // The layout of one layer without a checkpoint: the family's builder over
+  // a bump based at `base` (any address; nothing is read or written), so
+  // `out` holds base + each grant's offset in grant order, the staging
+  // mirror's and the image's layout. The step engine's plan generators
+  // (src/step) read every tensor's offset and geometry from it. Returns
+  // the layer's bytes, layer_bytes()'s figure.
+  static size_t layout_layer(const Config& cfg, int layer, int rank, int world, void* base, LayerResident& out,
+                             const std::vector<size_t>* placement = nullptr);
+  // The layout of the resident layers (the step engine's arena). Set
+  // before any layer loads; it re-keys and reopens the resident image.
+  void set_layout(ResidentLayout layout);
+  const ResidentLayout& layout() const { return layout_; }
   static size_t globals_bytes(const Config& cfg, int rank = 0, int world = 1,
                               LoaderHeadSharding head = LoaderHeadSharding::Full) {
     return F::globals_bytes(cfg, rank, world, head);
@@ -199,6 +224,7 @@ class ResidentLayerStream {
   LoaderHeadSharding head_ = LoaderHeadSharding::Full;
   bool resident_mtp_ = false;
   bool side_grants_ = false;  // packable matrices load into releasable ranges
+  ResidentLayout layout_;     // the arena, when a plan generator set one
   cudaStream_t reader_ = nullptr;
   uint64_t source_bytes_ = 0;
   uint64_t verbatim_bytes_ = 0;
@@ -409,6 +435,43 @@ size_t ResidentLayerStream<F>::layer_bytes(const Config& cfg, int layer, int ran
 }
 
 template <class F>
+size_t ResidentLayerStream<F>::layout_layer(const Config& cfg, int layer, int rank, int world, void* base,
+                                            LayerResident& out, const std::vector<size_t>* placement) {
+  const Geometry geo = Geometry::from_config(cfg, rank, world, LoaderHeadSharding::Full);
+  LayerBump bump;
+  bump.base = base;
+  bump.capacity = SIZE_MAX;
+  if (placement) bump.placement = *placement;
+  const std::vector<Expected> table = F::layer_table(cfg, layer);
+  std::unordered_map<std::string, const Expected*> by_name;
+  for (const auto& e : table) by_name.emplace(e.name, &e);
+  std::vector<DequantJob> jobs;
+  std::vector<PackJob> packs;
+  LoaderTensorMap no_tensors;
+  out = LayerResident{};
+  typename F::Builder ctx(cfg, geo, table, by_name, bump, out, no_tensors, jobs, packs, false);
+  ctx.build_layer(layer);
+  const size_t bytes = bump.cursor;
+  out.bytes = bytes;
+  bump.base = nullptr;  // not ours to free
+  return bytes;
+}
+
+template <class F>
+void ResidentLayerStream<F>::set_layout(ResidentLayout layout) {
+  for (const auto& b : resident_bumps_)
+    if (b) throw std::logic_error(std::string(F::who()) + ": set_layout after a layer was loaded");
+  if (resident_.layer >= 0) throw std::logic_error(std::string(F::who()) + ": set_layout after a layer was loaded");
+  if (layout.placement && side_grants_)
+    throw std::runtime_error(std::string(F::who()) + ": a placed layout does not take bf12 side grants");
+  layout_ = std::move(layout);
+  if (image_) {
+    image_.reset();
+    open_resident_image();
+  }
+}
+
+template <class F>
 uint64_t ResidentLayerStream<F>::planned_layer_source_bytes(const Config& cfg, int layer, int rank,
                                                             int world) {
   return count_layer(cfg, layer, rank, world).source_bytes;
@@ -483,6 +546,7 @@ uint64_t ResidentLayerStream<F>::resident_image_key() const {
   h = fnv_mix(h, static_cast<uint64_t>(world_));
   h = fnv_mix(h, static_cast<uint64_t>(rank_));
   h = fnv_mix(h, static_cast<uint64_t>(head_));
+  if (layout_.version) h = fnv_mix(h, layout_.version);  // the arena's layout; 0 keys as before it existed
   {
     std::ifstream f(std::filesystem::path(checkpoint_dir_) / "config.json", std::ios::binary);
     char c;
@@ -619,6 +683,7 @@ const typename F::LayerResident& ResidentLayerStream<F>::load_layer(int layer) {
                                " was never materialized before release_sources()");
     auto bump = std::make_unique<LayerBump>();
     bump->side_mode = side_grants_;
+    if (layout_.placement) bump->placement = layout_.placement(layer);
     const CountedBuild counted = count_layer(cfg_, layer, rank_, world_);
     bump->init(counted.bytes - (side_grants_ ? counted.side_bytes : 0));
     const bool restored =
@@ -638,6 +703,7 @@ const typename F::LayerResident& ResidentLayerStream<F>::load_layer(int layer) {
   if (resident_.layer == layer) return resident_;
   sync_load_boundary(reader_, stream_);
   layer_bump_->reset();
+  layer_bump_->placement = layout_.placement ? layout_.placement(layer) : std::vector<size_t>{};
   resident_ = LayerResident{};
   build_layer_into(layer, *layer_bump_, resident_);
   return resident_;

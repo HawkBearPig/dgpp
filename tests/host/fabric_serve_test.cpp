@@ -373,6 +373,10 @@ void test_settings_handshake() {
   sent.lookup_nstrong = 5;
   sent.lookup_agree = 1;
   sent.lookup_tail = 2;
+  sent.decode_engine = "step";
+  sent.step_sms = 47;
+  sent.l2_staging_mib = 12;
+  sent.stream_governor = 8;
   sent.fp8_head = "mma";
   sent.draft_head = "screen";
   sent.draft_head_blocks = 48;
@@ -412,6 +416,9 @@ void test_settings_handshake() {
     require(got.lookup_draft && got.lookup_nmin == 3 && got.lookup_nstrong == 5 && got.lookup_agree == 1,
             "the lookup thresholds travel with the settings");
     require(got.lookup_tail == 2, "the lookup tail travels with the settings");
+    require(got.decode_engine == "step", "the decode engine travels with the settings");
+    require(got.step_sms == 47 && got.l2_staging_mib == 12 && got.stream_governor == 8,
+            "the streamer's keys travel with the settings");
   }
   {
     // A peer of another version refuses: a mixed-version world cannot form.

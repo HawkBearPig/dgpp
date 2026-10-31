@@ -22,6 +22,7 @@
 #include "dsv41_fixture.hpp"
 #include "kda_test_helpers.hpp"
 #include "models/dsv41/model.hpp"
+#include "step/dsv41/arena.hpp"
 
 namespace {
 namespace fs = std::filesystem;
@@ -91,6 +92,48 @@ bool selection_flipped(const dgpp::Dsv41Model::Outputs& a, int row_a, const dgpp
 // spans), and the first decode step of each request bitwise the alone
 // model's (the draft state, positions and rings per request). The exact
 // prefill mode: the span limit is the walk's rows.
+// The step engine's arena (step/dsv41/arena.hpp) under the model: the same
+// bytes in another order, so a model built on the arena produces today's
+// prefill and decode transcripts bitwise. Resident residency, the serving
+// form; the layout is installed through the model's static default, the
+// hook the step engine adapter will use.
+DGPP_TEST(dsv41_model_arena_layout_is_bitwise) {
+  const Fixture fx = make_fixture();
+  const int V = fx.cfg.vocab_size;
+  const std::vector<int64_t> prompt = tokens_of(0xC4, 29, V);
+  const std::vector<int64_t> prompt2 = tokens_of(0xC5, 13, V);
+  struct Run {
+    dgpp::Dsv41Model::Outputs forward;
+    std::vector<float> prefill, step, prefill2;
+  };
+  auto run = [&]() {
+    dgpp::Dsv41Model m(fx.cfg, fx.dir, 96, 512, dgpp::Dsv41Residency::Resident, nullptr, 0, 1, 2, /*mtp=*/true, 8);
+    Run r;
+    r.forward = m.forward(prompt, true);
+    const auto o = m.session_prefill(0, prompt);
+    r.prefill = o.logits;
+    const int32_t first = argmax(o.logits.data(), size_t(V));
+    r.step = m.session_step(0, first).logits;
+    r.prefill2 = m.session_prefill(1, prompt2).logits;
+    return r;
+  };
+  const Run grant = run();
+  dgpp::Dsv41Model::set_default_resident_layout(dgpp::step::dsv41_resident_layout(fx.cfg, 0, 1));
+  Run arena;
+  try {
+    arena = run();
+  } catch (...) {
+    dgpp::Dsv41Model::set_default_resident_layout(dgpp::ResidentLayout{});
+    throw;
+  }
+  dgpp::Dsv41Model::set_default_resident_layout(dgpp::ResidentLayout{});
+  require(arena.forward.logits == grant.forward.logits && arena.forward.final_hidden_bits == grant.forward.final_hidden_bits,
+          "arena: the forward's logits and final hidden are bitwise the grant-order model's");
+  require(arena.forward.layer_states == grant.forward.layer_states, "arena: every layer's streams are bitwise");
+  require(arena.prefill == grant.prefill && arena.prefill2 == grant.prefill2, "arena: session prefills are bitwise");
+  require(arena.step == grant.step, "arena: the decode step is bitwise");
+}
+
 DGPP_TEST(dsv41_model_group_prefill_is_bitwise_the_prefills_alone) {
   const Fixture fx = make_fixture();
   const int V = fx.cfg.vocab_size;
