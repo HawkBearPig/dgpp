@@ -1269,7 +1269,7 @@ add_test(NAME step_stream_test COMMAND step_stream_test)
 # and group sizes, the plain grids' rate reported. GPU, about 1 GB free.
 add_executable(step_consumer_test tests/cuda/step_consumer_test.cu)
 target_include_directories(step_consumer_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(step_consumer_test PRIVATE CUDA::cudart)
+target_link_libraries(step_consumer_test PRIVATE dgpp_kernels CUDA::cudart)
 dgpp_set_common(step_consumer_test)
 add_test(NAME step_consumer_test COMMAND step_consumer_test)
 

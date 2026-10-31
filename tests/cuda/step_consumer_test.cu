@@ -22,6 +22,9 @@
 #include "common/dtypes.hpp"
 #include "common/test.hpp"
 #include "kernels/step/fp8_dense.cuh"
+#include "kernels/step/mhc.cuh"
+#include "kernels/glm_mhc_launch.hpp"
+#include "models/glm/mhc.hpp"
 #include "kernels/step/mxfp4_expert.cuh"
 #include "kernels/step/mxfp4_row.cuh"
 #include "step_reference.cuh"
@@ -1039,6 +1042,188 @@ DGPP_TEST(fp8_staged_form_matches_the_reference) {
   require(bad == 0, "the staged form disagrees with the reference");
   require(differ == 0, "the staged form is not bitwise across launches");
   require(differ_win == 0, "the staged form is not bitwise the windowed form");
+}
+
+// ---- the hyper-connection site against the production kernels
+
+namespace {
+constexpr int kMhcH = 5120, kMhcT = 5;
+__global__ void mhc_dots_test_kernel(const uint16_t* streams, const uint16_t* fn, float* logits, int hidden, float eps) {
+  __shared__ float scratch[8];
+  const int c = blockIdx.x, t = blockIdx.y;
+  const float d = mhc_dot(streams + static_cast<size_t>(t) * 4 * hidden, fn + static_cast<size_t>(c) * 4 * hidden, hidden, eps, scratch);
+  if (threadIdx.x == 0) logits[t * kMhcCoeffs + c] = d;
+}
+__global__ void mhc_finish_test_kernel(const uint16_t* streams, const float* logits, MhcSite site, int hidden, const float* pre_in, float* pre_out,
+                                       float* post, float* comb, uint16_t* normed) {
+  __shared__ float smem[kMhcN + kMhcN * kMhcN + 8];
+  const int t = blockIdx.x;
+  mhc_finish(streams + static_cast<size_t>(t) * 4 * hidden, logits + t * kMhcCoeffs, site, hidden, pre_in + t * 4, pre_out + t * 4, post + t * 4,
+             comb + t * 16, normed + static_cast<size_t>(t) * hidden, smem);
+}
+__global__ void mhc_update_test_kernel(const float* post, const float* comb, const uint16_t* h, const uint16_t* in, uint16_t* out, int hidden, int total) {
+  const int i0 = blockIdx.x * 512, i1 = min(i0 + 512, total);
+  mhc_update_chunk(post, comb, h, in, out, hidden, i0, i1);
+}
+__global__ void init_f32(float* p, int n, float lo, float span, unsigned seed) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  unsigned hh = static_cast<unsigned>(i) * 2654435761u + seed; hh ^= hh >> 15; hh *= 0x2c1b3c6du; hh ^= hh >> 12;
+  p[i] = lo + (hh & 0xffff) / 65536.0f * span;
+}
+template <typename T> size_t count_diff(const T* a, const T* b, size_t n) {
+  std::vector<T> ha(n), hb(n);
+  DGPP_CUDA_OK(cudaMemcpy(ha.data(), a, n * sizeof(T), cudaMemcpyDeviceToHost));
+  DGPP_CUDA_OK(cudaMemcpy(hb.data(), b, n * sizeof(T), cudaMemcpyDeviceToHost));
+  size_t d = 0;
+  for (size_t i = 0; i < n; ++i) if (std::memcmp(&ha[i], &hb[i], sizeof(T)) != 0) ++d;
+  return d;
+}
+}  // namespace
+
+// The site unit on its own: 40 blocks (five tokens by eight units of three
+// coefficients), each over 40 KB of streams and 120 KB of coefficient rows,
+// cold after a 150 MB stream and with the rows in L2 as the lead stages them.
+namespace {
+__global__ void mhc_unit_rate_kernel(const uint16_t* streams, const uint16_t* fn, float* logits, int hidden, float eps, int units_per_token) {
+  __shared__ float scratch[8];
+  const int t = blockIdx.x / units_per_token, u = blockIdx.x % units_per_token, c0 = u * kMhcUnitCoeffs;
+  float lg[kMhcUnitCoeffs];
+  mhc_dot_n<kMhcUnitCoeffs>(streams + static_cast<size_t>(t) * 4 * hidden, fn + static_cast<size_t>(c0) * 4 * hidden, hidden, eps, scratch, lg);
+  if (threadIdx.x < kMhcUnitCoeffs) logits[t * kMhcCoeffs + c0 + threadIdx.x] = lg[threadIdx.x];
+}
+}  // namespace
+
+DGPP_TEST(mhc_unit_rate) {
+  const int H = kMhcH, T = kMhcT, units = kMhcCoeffs / kMhcUnitCoeffs;
+  uint16_t *streams = nullptr, *fn = nullptr;
+  float* lg = nullptr;
+  const size_t sn = static_cast<size_t>(T) * 4 * H, fnn = static_cast<size_t>(kMhcCoeffs) * 4 * H;
+  DGPP_CUDA_OK(cudaMalloc(&streams, sn * 2));
+  DGPP_CUDA_OK(cudaMalloc(&fn, fnn * 2));
+  DGPP_CUDA_OK(cudaMalloc(&lg, T * kMhcCoeffs * 4));
+  init_x<<<static_cast<unsigned>((sn + 255) / 256), 256>>>(streams, static_cast<int>(sn));
+  init_x<<<static_cast<unsigned>((fnn + 255) / 256), 256>>>(fn, static_cast<int>(fnn));
+  uint4* flushbuf = nullptr;
+  const size_t flush_n = (150u << 20) / 16;
+  DGPP_CUDA_OK(cudaMalloc(&flushbuf, flush_n * 16));
+  DGPP_CUDA_OK(cudaMemset(flushbuf, 3, flush_n * 16));
+  unsigned* sink = nullptr;
+  DGPP_CUDA_OK(cudaMalloc(&sink, 4));
+  cudaEvent_t e0 = nullptr, e1 = nullptr;
+  DGPP_CUDA_OK(cudaEventCreate(&e0));
+  DGPP_CUDA_OK(cudaEventCreate(&e1));
+  mhc_unit_rate_kernel<<<T * units, kMhcThreads>>>(streams, fn, lg, H, 1e-6f, units);  // the first launch's costs
+  DGPP_CUDA_OK(cudaDeviceSynchronize());
+  const double unit_kb = (4.0 * H * 2 + kMhcUnitCoeffs * 4.0 * H * 2) / 1e3;
+  for (int mode = 0; mode < 3; ++mode) {
+    std::vector<float> ms(3);
+    for (float& m : ms) {
+      stream_cs_kernel<<<47, 256>>>(flushbuf, flush_n, sink);
+      DGPP_CUDA_OK(cudaDeviceSynchronize());
+      if (mode == 1) stage_cg_kernel<<<47, 256>>>(reinterpret_cast<const uint4*>(fn), fnn * 2 / 16, sink);
+      if (mode == 2) { stage_cg_kernel<<<47, 256>>>(reinterpret_cast<const uint4*>(fn), fnn * 2 / 16, sink); stage_cg_kernel<<<47, 256>>>(reinterpret_cast<const uint4*>(streams), sn * 2 / 16, sink); }
+      DGPP_CUDA_OK(cudaDeviceSynchronize());
+      DGPP_CUDA_OK(cudaEventRecord(e0));
+      mhc_unit_rate_kernel<<<T * units, kMhcThreads>>>(streams, fn, lg, H, 1e-6f, units);
+      DGPP_CUDA_OK(cudaEventRecord(e1));
+      DGPP_CUDA_OK(cudaDeviceSynchronize());
+      DGPP_CUDA_OK(cudaEventElapsedTime(&m, e0, e1));
+    }
+    std::sort(ms.begin(), ms.end());
+    std::printf("   mhc unit (3 coefficients, 160 KB), %d blocks, %s: %5.1f us (median of 3) = %5.1f GB/s a block\n", T * units,
+                mode == 0 ? "cold after a 150 MB stream" : mode == 1 ? "coefficient rows staged in L2" : "rows and streams staged in L2", ms[1] * 1e3,
+                unit_kb / ms[1] / 1e3);
+  }
+  // One coefficient a unit (mhc_dot, 120 blocks) and the finish alone (five blocks), rows in L2, for the unit shape's choice.
+  {
+    float *pre_in = nullptr, *pre_out = nullptr, *post = nullptr, *comb = nullptr, *base = nullptr, *scale = nullptr;
+    uint16_t *ln = nullptr, *normed = nullptr;
+    DGPP_CUDA_OK(cudaMalloc(&pre_in, T * 4 * 4)); DGPP_CUDA_OK(cudaMalloc(&pre_out, T * 4 * 4)); DGPP_CUDA_OK(cudaMalloc(&post, T * 4 * 4));
+    DGPP_CUDA_OK(cudaMalloc(&comb, T * 16 * 4)); DGPP_CUDA_OK(cudaMalloc(&base, kMhcCoeffs * 4)); DGPP_CUDA_OK(cudaMalloc(&scale, 3 * 4));
+    DGPP_CUDA_OK(cudaMalloc(&ln, H * 2)); DGPP_CUDA_OK(cudaMalloc(&normed, static_cast<size_t>(T) * H * 2));
+    DGPP_CUDA_OK(cudaMemset(pre_in, 0, T * 4 * 4));
+    init_f32<<<1, 32>>>(base, kMhcCoeffs, -1.f, 2.f, 11u);
+    init_f32<<<1, 32>>>(scale, 3, -1.5f, 3.f, 13u);
+    init_x<<<(H + 255) / 256, 256>>>(ln, H);
+    MhcSite site; site.base = base; site.scale = scale; site.ln = ln; site.hc_eps = 1e-6f; site.sinkhorn_iters = 20; site.ln_eps = 1e-6f;
+    DGPP_CUDA_OK(cudaDeviceSynchronize());
+    for (int which = 0; which < 2; ++which) {
+      std::vector<float> ms(3);
+      for (float& m : ms) {
+        stream_cs_kernel<<<47, 256>>>(flushbuf, flush_n, sink);
+        DGPP_CUDA_OK(cudaDeviceSynchronize());
+        stage_cg_kernel<<<47, 256>>>(reinterpret_cast<const uint4*>(fn), fnn * 2 / 16, sink);
+        stage_cg_kernel<<<47, 256>>>(reinterpret_cast<const uint4*>(streams), sn * 2 / 16, sink);
+        DGPP_CUDA_OK(cudaDeviceSynchronize());
+        DGPP_CUDA_OK(cudaEventRecord(e0));
+        if (which == 0) mhc_dots_test_kernel<<<dim3(kMhcCoeffs, T), kMhcThreads>>>(streams, fn, lg, H, 1e-6f);
+        else mhc_finish_test_kernel<<<T, kMhcThreads>>>(streams, lg, site, H, pre_in, pre_out, post, comb, normed);
+        DGPP_CUDA_OK(cudaEventRecord(e1));
+        DGPP_CUDA_OK(cudaDeviceSynchronize());
+        DGPP_CUDA_OK(cudaEventElapsedTime(&m, e0, e1));
+      }
+      std::sort(ms.begin(), ms.end());
+      if (which == 0) std::printf("   mhc unit (1 coefficient, 80 KB), %d blocks, rows and streams staged in L2: %5.1f us (median of 3)\n", kMhcCoeffs * T, ms[1] * 1e3);
+      else std::printf("   mhc finish alone, %d blocks, streams staged in L2: %5.1f us (median of 3)\n", T, ms[1] * 1e3);
+    }
+    cudaFree(pre_in); cudaFree(pre_out); cudaFree(post); cudaFree(comb); cudaFree(base); cudaFree(scale); cudaFree(ln); cudaFree(normed);
+  }
+  cudaFree(streams); cudaFree(fn); cudaFree(lg); cudaFree(flushbuf); cudaFree(sink);
+}
+
+DGPP_TEST(mhc_site_matches_the_production_kernels) {
+  const int H = kMhcH, T = kMhcT;
+  uint16_t *streams = nullptr, *fn = nullptr, *ln = nullptr, *h = nullptr, *normed_p = nullptr, *normed_s = nullptr, *out_p = nullptr, *out_s = nullptr, *post_bf16 = nullptr, *comb_bf16 = nullptr;
+  float *base = nullptr, *scale = nullptr, *pre_in = nullptr, *pre_p = nullptr, *pre_s = nullptr, *post_p = nullptr, *post_s = nullptr, *comb_p = nullptr, *comb_s = nullptr, *lg_p = nullptr, *lg_s = nullptr;
+  int* counters = nullptr;
+  const size_t sn = static_cast<size_t>(T) * 4 * H;
+  DGPP_CUDA_OK(cudaMalloc(&streams, sn * 2)); DGPP_CUDA_OK(cudaMalloc(&fn, static_cast<size_t>(kMhcCoeffs) * 4 * H * 2)); DGPP_CUDA_OK(cudaMalloc(&ln, H * 2));
+  DGPP_CUDA_OK(cudaMalloc(&h, static_cast<size_t>(T) * H * 2)); DGPP_CUDA_OK(cudaMalloc(&normed_p, static_cast<size_t>(T) * H * 2)); DGPP_CUDA_OK(cudaMalloc(&normed_s, static_cast<size_t>(T) * H * 2));
+  DGPP_CUDA_OK(cudaMalloc(&out_p, sn * 2)); DGPP_CUDA_OK(cudaMalloc(&out_s, sn * 2)); DGPP_CUDA_OK(cudaMalloc(&post_bf16, T * 4 * 2)); DGPP_CUDA_OK(cudaMalloc(&comb_bf16, T * 16 * 2));
+  DGPP_CUDA_OK(cudaMalloc(&base, kMhcCoeffs * 4)); DGPP_CUDA_OK(cudaMalloc(&scale, 3 * 4)); DGPP_CUDA_OK(cudaMalloc(&pre_in, T * 4 * 4));
+  DGPP_CUDA_OK(cudaMalloc(&pre_p, T * 4 * 4)); DGPP_CUDA_OK(cudaMalloc(&pre_s, T * 4 * 4)); DGPP_CUDA_OK(cudaMalloc(&post_p, T * 4 * 4)); DGPP_CUDA_OK(cudaMalloc(&post_s, T * 4 * 4));
+  DGPP_CUDA_OK(cudaMalloc(&comb_p, T * 16 * 4)); DGPP_CUDA_OK(cudaMalloc(&comb_s, T * 16 * 4)); DGPP_CUDA_OK(cudaMalloc(&lg_p, T * kMhcCoeffs * 4)); DGPP_CUDA_OK(cudaMalloc(&lg_s, T * kMhcCoeffs * 4));
+  DGPP_CUDA_OK(cudaMalloc(&counters, T * 4)); DGPP_CUDA_OK(cudaMemset(counters, 0, T * 4));
+  init_x<<<static_cast<unsigned>((sn + 255) / 256), 256>>>(streams, static_cast<int>(sn));
+  init_x<<<static_cast<unsigned>((static_cast<size_t>(kMhcCoeffs) * 4 * H + 255) / 256), 256>>>(fn, kMhcCoeffs * 4 * H);
+  init_x<<<static_cast<unsigned>((static_cast<size_t>(T) * H + 255) / 256), 256>>>(h, T * H);
+  init_f32<<<1, 32>>>(base, kMhcCoeffs, -1.f, 2.f, 11u);
+  init_f32<<<1, 32>>>(scale, 3, -1.5f, 3.f, 13u);
+  {  // ln around one, pre_in one-hot (the first site's seed, as the model's)
+    std::vector<uint16_t> hl(H);
+    for (int i = 0; i < H; ++i) hl[static_cast<size_t>(i)] = float_to_bf16_bits(0.9f + 0.2f * ((i * 7919) % 101) / 100.0f);
+    DGPP_CUDA_OK(cudaMemcpy(ln, hl.data(), H * 2, cudaMemcpyHostToDevice));
+    std::vector<float> oh(static_cast<size_t>(T) * 4, 0.f);
+    for (int t = 0; t < T; ++t) oh[static_cast<size_t>(t) * 4] = 1.f;
+    DGPP_CUDA_OK(cudaMemcpy(pre_in, oh.data(), oh.size() * 4, cudaMemcpyHostToDevice));
+  }
+  DGPP_CUDA_OK(cudaDeviceSynchronize());
+  // The production site: the fused decode form with the one-rounding norm, the single pass, the deferred comb.
+  GlmMhcConfig cfg;
+  cfg.hc_mult = 4; cfg.hidden = H; cfg.sinkhorn_iters = 20; cfg.hc_eps = 1e-6f; cfg.norm_eps = 1e-6f;
+  GlmMhcWeights w; w.fn = fn; w.base = base; w.scale = scale;
+  MhcSinglePass sp; sp.pre_in = pre_in; sp.pre_out = pre_p; sp.post_f32 = post_p; sp.comb_f32 = nullptr; sp.one_round_norm = true;
+  const float ln_eps = 1e-6f;
+  const bool deferred = launch_mhc_compute_normed(streams, w, cfg, nullptr, post_bf16, comb_bf16, lg_p, ln, normed_p, ln_eps, T, nullptr, counters, true, &sp, true);
+  require(deferred, "the production site defers its comb");
+  launch_mhc_comb(lg_p, w, cfg, comb_bf16, T, nullptr, comb_p);
+  launch_mhc_stream_update_f32(post_p, comb_p, h, streams, out_p, cfg, T, nullptr);
+  DGPP_CUDA_OK(cudaDeviceSynchronize());
+  // The step's units.
+  mhc_dots_test_kernel<<<dim3(kMhcCoeffs, T), kMhcThreads>>>(streams, fn, lg_s, H, cfg.norm_eps);
+  MhcSite site; site.base = base; site.scale = scale; site.ln = ln; site.hc_eps = cfg.hc_eps; site.sinkhorn_iters = cfg.sinkhorn_iters; site.ln_eps = ln_eps;
+  mhc_finish_test_kernel<<<T, kMhcThreads>>>(streams, lg_s, site, H, pre_in, pre_s, post_s, comb_s, normed_s);
+  mhc_update_test_kernel<<<static_cast<unsigned>((T * H + 511) / 512), kMhcThreads>>>(post_s, comb_s, h, streams, out_s, H, T * H);
+  DGPP_CUDA_OK(cudaDeviceSynchronize());
+  const size_t d_lg = count_diff(lg_p, lg_s, static_cast<size_t>(T) * kMhcCoeffs), d_pre = count_diff(pre_p, pre_s, static_cast<size_t>(T) * 4),
+               d_post = count_diff(post_p, post_s, static_cast<size_t>(T) * 4), d_comb = count_diff(comb_p, comb_s, static_cast<size_t>(T) * 16),
+               d_norm = count_diff(normed_p, normed_s, static_cast<size_t>(T) * H), d_out = count_diff(out_p, out_s, sn);
+  std::printf("   mhc site, %d tokens: logits %zu differ of %d, pre %zu, post %zu, comb %zu, normed %zu of %d, updated streams %zu of %zu\n", T, d_lg,
+              T * kMhcCoeffs, d_pre, d_post, d_comb, d_norm, T * H, d_out, sn);
+  require(d_lg == 0 && d_pre == 0 && d_post == 0 && d_comb == 0, "the step's coefficients differ from the production site's");
+  require(d_norm == 0, "the step's normed rows differ from the production site's");
+  require(d_out == 0, "the step's stream update differs from the production kernel's");
 }
 
 int main() { return dgpp::test::run_all(); }

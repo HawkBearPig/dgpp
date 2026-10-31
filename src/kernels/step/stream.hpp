@@ -68,6 +68,9 @@ struct alignas(128) StepCtl {
   // picks in ascending expert order (the router's normalized, scaled weights, or 1 / top_k
   // from the synthetic router), then 1 for its shared slot. slot = row * (top_k + 1) + pick.
   float slot_weight[kStepMaxLayers][32 * 9];
+  // A hyper-connection site's (coefficient, token) dots arrived, by layer, site and token: the
+  // 24th arrival runs the token's finish and resets the count for the next step.
+  unsigned mhc_done[kStepMaxLayers][2][32];
   unsigned pool_done[kStepMaxLayers][kStepMaxPhases];  // kPoolFp8Matrix with slabs: compute units of the pool completed this step, by layer and pool index
   unsigned long long stamp_begin[kStepMaxPhases];  // the last pass: the phase's publish or latency start
   unsigned long long stamp_end[kStepMaxPhases];    // the last pass: its units done, the fold after it included
@@ -112,7 +115,7 @@ struct StepStreamParams {
   // The MXFP4 expert consumers' operands when the plan has consumer pools:
   // x [kStepMaxRows][hidden] bf16, act [slots][inter] bf16, out partials
   // [tokens][hidden][slots_per_token] fp32, y [kStepMaxRows][hidden] bf16.
-  const uint16_t* x = nullptr;  // [kStepMaxRows][x_stride]: the consumers read a row at their own inner width
+  uint16_t* x = nullptr;  // [kStepMaxRows][x_stride]: the consumers read a row at their own inner width; a hyper-connection site writes its normed rows
   uint16_t* act = nullptr;
   float* out = nullptr;
   uint16_t* y = nullptr;
@@ -130,6 +133,19 @@ struct StepStreamParams {
   int router_mode = 2;
   float routed_scaling = 1.f;
   int norm_topk = 1;
+  // The hyper-connection sites' operands (kernels/step/mhc.cuh), by site parity: the attention
+  // site reads streams[0] and its update (on the output projection's reduce units) writes
+  // streams[1]; the MoE site reads streams[1] and the accumulate's fused update writes streams[0]. The pre coefficients chain the same way, pre[0]
+  // one-hot at a step's start. streams [kStepMaxRows][4][hidden] bf16, pre [kStepMaxRows][4],
+  // post [kStepMaxRows][4], comb [kStepMaxRows][16], logits [kStepMaxRows][24], all fp32.
+  uint16_t* streams[2] = {nullptr, nullptr};
+  float* pre[2] = {nullptr, nullptr};
+  float* post = nullptr;
+  float* comb = nullptr;
+  float* logits = nullptr;
+  float hc_eps = 1e-6f;
+  int sinkhorn_iters = 20;
+  float mhc_norm_eps = 1e-6f;  // the coefficient norm's and the sublayer norm's epsilon
   unsigned consumer_smem = 0;  // dynamic shared memory the consumer units need
   int lookahead_layers = 2;
   unsigned long long lead_cap_bytes = 0;  // 0: no lead
@@ -157,8 +173,9 @@ bool step_stream_has_fp8_matrix(int k, int rows);
 // The shared memory the MXFP4 consumer needs at this intermediate width.
 unsigned step_stream_mxfp4_smem(int inter);
 // The dynamic shared memory the consumer pools present need: the MXFP4 forms
-// when a routed pool at `inter` exists (0: none), the fp8 forms when `fp8`.
-unsigned step_stream_consumer_smem(int inter, bool fp8);
+// when a routed pool at `inter` exists (0: none), the fp8 forms when `fp8`,
+// the hyper-connection units' scratch when `mhc`.
+unsigned step_stream_consumer_smem(int inter, bool fp8, bool mhc = false);
 // Whether the kernel has a router unit at this inner width.
 bool step_stream_has_router(int k);
 // The partials' index: token-major, the slots of one output element in one sector.
@@ -166,7 +183,12 @@ __host__ __device__ inline size_t step_out_index(int slot, int row, int hidden, 
   return (static_cast<size_t>(slot / slots_per_token) * hidden + static_cast<size_t>(row)) * slots_per_token +
          static_cast<size_t>(slot % slots_per_token);
 }
-constexpr int kStepAccChunk = 512;  // outputs an accumulation unit folds
+// Outputs an accumulation or reduce unit covers: two a thread. Measured
+// 2026-10-31 against 2048 (one wave of units): a unit's time grew with its
+// chunk (3.6 to 12 µs; one block an SM cannot hide the loads' latency), so
+// the projection drains and the accumulate lengthened and the layer lost
+// three points.
+constexpr int kStepAccChunk = 512;
 // Test fixtures' fills: every listed range [offsets[i], +bytes[i]) of `base`
 // with hashed bytes in [lo, lo + span) (kFillBytes), e4m3 normals (kFillE4m3)
 // or F32 in [0.5, 2) (kFillF32Scales); and the activations x as small bf16.

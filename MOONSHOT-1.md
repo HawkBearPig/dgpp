@@ -904,7 +904,9 @@ and 96 percent of the qkv, attn_out and expert phases, the expert phase
 streams at 92 percent of the ceiling, the fixed phases at the ceiling in
 aggregate, and the median layer at 87 to 88 percent of its floor at any
 lead cap from 4 to 20 MB (beside production, at the uniform expert count;
-the clean figure at the measured count, 2026-10-31, is 83). The residue is the layer's latency: attn_in 9,
+the clean figure at the measured count, 2026-10-31, is 83 with the
+synthetic router, 80.6 with the real one, 78.4 with the mHC sites computed
+as well). The residue is the layer's latency: attn_in 9,
 attend 2, ffn_in 12, the router 18, the gap to the experts 8 and the
 accumulation 21 µs, about 70 µs a layer, of which the lead covers a few
 microseconds, because its cap is full when the latency begins. The bound
@@ -2388,7 +2390,7 @@ area, untracked.
       context the consumer reads KV at 90 percent of the ceiling.
 - [ ] Recurrences in replay form: KDA, GDN, convolutions, the PLE conv.
       Gate: forced rejection at every depth equals plain decode bitwise.
-- [ ] The router as a consumer pool, bitwise the production router's
+- [x] The router as a consumer pool, bitwise the production router's
       (2026-10-31): units of 16 expert rows, two a warp, in the production
       kernel's lane order over staged activations, the chain's select op
       for op, real slot weights in the accumulation.
@@ -2405,6 +2407,28 @@ area, untracked.
 - [ ] Fused latency phases: fold consumer with residual update and mHC or
       GR mix, norm plus router plus slot order, selection, the a8
       quantizer, the EXL3 rotation.
+      Progress 2026-10-31: the two mHC sites are consumer pools (units of
+      three coefficients of one token, the completing unit running the
+      token's finish: pre, post, the Sinkhorn comb, the collapse and the
+      one-rounding norm into x), bitwise the production kernels over a
+      layer's whole data flow (`step_mhc_sites_match_the_production_kernels`),
+      and both stream updates ride on existing units, the output
+      projection's reduce units and the accumulate, so no phase was added
+      (a separate update phase cost 13 µs and was removed). Cost at the
+      measured count, clean: 2.2 points of the layer (80.6 percent of the
+      floor without the sites, 78.4 with), each site phase 27 to 35 µs
+      against the chain's 8 and 12. The mechanism is the same as the
+      router's: a unit reads 160 KB in 9 to 14 µs whether cold or staged,
+      issue-bound at one block an SM (register-resident loads changed
+      nothing), the finish about 10 on one block, the phase boundary about
+      5. Owed here: the attention consumer, the folds and the select, and
+      the structural remedy for every latency-bound unit, which is
+      dependency-chained units inside the stream phases (as the reduce
+      units are) so these fill the fixed phases' drains instead of
+      standing as phases. Two defects fixed on the way: the test rig's
+      overlaid arena copies (one per distinct layer layout now) and the
+      host's wait on a faulted kernel. A 2048-output row chunk was tried
+      and reverted (unit time scaled with the chunk, three points).
 - [ ] No library kernel on the step engine's path, the existing walks
       untouched. Gate: no library kernel in a step's trace on any family.
 

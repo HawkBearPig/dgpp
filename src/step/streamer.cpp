@@ -67,9 +67,11 @@ Streamer::Streamer(const DevicePlan& dp, const std::vector<const uint8_t*>& base
   // launched with no dynamic shared memory and no activations once, and
   // faulted (2026-10-31).
   bool mxfp4 = false, fp8 = false;
+  int mhc_hidden = 0;
   for (const DevPool& pool : dp.pools) {
     if (pool.kind == kPoolBytes) continue;
     consumers_ = true;
+    if (pool.kind == kPoolMhc) { mhc_ = true; mhc_hidden = pool.k / 4; continue; }
     if (pool_is_gate_up(pool.kind) && pool.kind != kPoolFp8GateUp) { hidden_ = pool.k; inter_ = pool.rows; mxfp4 = true; }
     else if (pool.kind == kPoolFp8GateUp) { if (!hidden_) hidden_ = pool.k; if (!inter_) inter_ = pool.rows; fp8 = true; }
     else if (pool.kind == kPoolFp8Matrix || pool.kind == kPoolFp8Down) fp8 = true;
@@ -83,7 +85,8 @@ Streamer::Streamer(const DevicePlan& dp, const std::vector<const uint8_t*>& base
       if (pool.kind == kPoolFp8Matrix && !step_stream_has_fp8_matrix(pool.k, pool.rows))
         throw std::invalid_argument("Streamer: the kernel has no fp8 projection form for [" + std::to_string(pool.rows) + ", " +
                                     std::to_string(pool.k) + "]");
-    consumer_smem_ = step_stream_consumer_smem(mxfp4 ? inter_ : 0, fp8);
+    consumer_smem_ = step_stream_consumer_smem(mxfp4 ? inter_ : 0, fp8, mhc_);
+    if (!hidden_ && mhc_hidden) hidden_ = mhc_hidden;  // the sites' streams are four rows of hidden
     if (!hidden_) hidden_ = dp.max_k;  // projections only: the activations' width is the widest inner width
     if (!inter_) inter_ = 1;
     const size_t slots = static_cast<size_t>(kStepMaxRows) * 9;  // top_k up to 8, plus the shared slot
@@ -112,6 +115,23 @@ Streamer::Streamer(const DevicePlan& dp, const std::vector<const uint8_t*>& base
     DGPP_CUDA_OK(cudaMemset(out_, 0, slots * hidden_ * 4));
     DGPP_CUDA_OK(cudaMemset(y_, 0, static_cast<size_t>(kStepMaxRows) * hidden_ * 2));
     step_stream_init_x(x_, kStepMaxRows * x_stride_, 0x51e5u, nullptr);
+    if (mhc_) {
+      // The residual streams, small bf16 like x in streams[0]; the rest zero.
+      const size_t sn = static_cast<size_t>(kStepMaxRows) * 4 * hidden_, coeffs = static_cast<size_t>(kStepMaxRows) * 4;
+      for (int i = 0; i < 2; ++i) {
+        DGPP_CUDA_OK(cudaMalloc(&streams_[i], sn * 2));
+        DGPP_CUDA_OK(cudaMemset(streams_[i], 0, sn * 2));
+        DGPP_CUDA_OK(cudaMalloc(&pre_[i], coeffs * 4));
+        DGPP_CUDA_OK(cudaMemset(pre_[i], 0, coeffs * 4));
+      }
+      step_stream_init_x(streams_[0], static_cast<int>(sn), 0x7a11u, nullptr);
+      DGPP_CUDA_OK(cudaMalloc(&post_, coeffs * 4));
+      DGPP_CUDA_OK(cudaMalloc(&comb_, coeffs * 4 * 4));
+      DGPP_CUDA_OK(cudaMalloc(&logits_, coeffs * 6 * 4));
+      DGPP_CUDA_OK(cudaMemset(post_, 0, coeffs * 4));
+      DGPP_CUDA_OK(cudaMemset(comb_, 0, coeffs * 4 * 4));
+      DGPP_CUDA_OK(cudaMemset(logits_, 0, coeffs * 6 * 4));
+    }
     DGPP_CUDA_OK(cudaDeviceSynchronize());
   }
 }
@@ -137,6 +157,10 @@ Streamer::~Streamer() {
   cudaFree(y_);
   cudaFree(proj_);
   cudaFree(proj_part_);
+  for (int i = 0; i < 2; ++i) { cudaFree(streams_[i]); cudaFree(pre_[i]); }
+  cudaFree(post_);
+  cudaFree(comb_);
+  cudaFree(logits_);
 }
 
 void Streamer::poison() { std::atomic_ref<unsigned>(ctl_->poison).store(1u, std::memory_order_release); }
@@ -193,6 +217,13 @@ StreamReport Streamer::run(const StreamerConfig& cfg) {
   p.hidden = hidden_;
   p.inter = inter_;
   p.consumer_smem = consumer_smem_;
+  for (int i = 0; i < 2; ++i) { p.streams[i] = streams_[i]; p.pre[i] = pre_[i]; }
+  p.post = post_;
+  p.comb = comb_;
+  p.logits = logits_;
+  p.hc_eps = cfg.hc_eps;
+  p.sinkhorn_iters = cfg.sinkhorn_iters;
+  p.mhc_norm_eps = cfg.mhc_norm_eps;
   if (consumers_ && cfg.top_k > 8) throw std::invalid_argument("Streamer: the consumers' partials hold at most eight picks a row");
   cudaEvent_t e0 = nullptr, e1 = nullptr;
   DGPP_CUDA_OK(cudaEventCreate(&e0));
@@ -240,10 +271,12 @@ StreamReport Streamer::run(const StreamerConfig& cfg) {
         store_release(host_seq_, publish);
       });
     }
-    // The verdict, or the kernel's end.
+    // The verdict, or the kernel's end: a clean end, or a fault, which the
+    // synchronize below reports (a faulted kernel's query is an error, not
+    // "not ready"; waiting for cudaSuccess alone spun forever, 2026-10-31).
     for (;;) {
       if (load_acquire(&verdict_[slot].seq) == seq) break;
-      if (cudaStreamQuery(stream_) == cudaSuccess) { ended = true; break; }
+      if (cudaStreamQuery(stream_) != cudaErrorNotReady) { ended = true; break; }
       std::this_thread::yield();
     }
     if (gather.joinable()) gather.join();

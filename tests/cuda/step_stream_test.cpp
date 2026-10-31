@@ -30,7 +30,9 @@
 #include "step/dsv41/arena.hpp"
 #include "step/dsv41/plan.hpp"
 #include "step/streamer.hpp"
+#include "kernels/glm_mhc_launch.hpp"
 #include "kernels/glm_moe_launch.hpp"
+#include "models/glm/mhc.hpp"
 #include "models/glm/moe.hpp"
 #include "step_reference_host.hpp"
 
@@ -41,7 +43,7 @@ using namespace dgpp::step;
 
 constexpr double kCeilingGBs = 240.0;
 constexpr int kLayers = 8;      // the first eight main layers: Engram layers 1 and 14 aside, every phase kind appears
-constexpr int kCopies = 2;      // arena copies the layers cycle through, so a layer's bytes are cold
+constexpr int kByteCopies = 2;  // arena copies a byte-unit rig's layers cycle through, so a layer's bytes are cold
 constexpr int kWorld = 4;
 
 void require(bool cond, const std::string& what) {
@@ -53,6 +55,7 @@ struct Rig {
   std::vector<LayerPlan> plans;
   DevicePlan dp;
   std::vector<uint8_t*> copies;
+  std::vector<int> layer_copy;  // the copy each layer streams from
   std::vector<const uint8_t*> bases;
   Dsv41StepShape shape;
   ~Rig() {
@@ -83,22 +86,48 @@ std::unique_ptr<Rig> make_rig_mask(int layers, unsigned consumer_mask, bool tile
     max_span = std::max<uint64_t>(max_span, span);
   }
   rig->dp = lower_plan(rig->plans, 65536, consumer_mask);
+  // A byte-unit rig cycles its layers through two copies. A consumer rig
+  // gives every distinct layout its own copy: the layers' layouts differ
+  // (index sources, reusing layers, Engram layers), so layers overlaid on
+  // one copy read bytes filled for another layer's format, and once the
+  // hyper-connection sites interpret them the garbage reaches the router
+  // (2026-10-31: NaN rows, out-of-range expert ids, an illegal address).
+  int copies = 0;
+  rig->layer_copy.assign(static_cast<size_t>(layers), -1);
+  if (consumer_mask == 0u) {
+    copies = std::min(layers, kByteCopies);
+    for (int l = 0; l < layers; ++l) rig->layer_copy[static_cast<size_t>(l)] = l % copies;
+  } else {
+    auto same_layout = [&](int a, int b) {
+      const auto& ra = rig->plans[static_cast<size_t>(a)].ranges;
+      const auto& rb = rig->plans[static_cast<size_t>(b)].ranges;
+      if (ra.size() != rb.size()) return false;
+      for (size_t i = 0; i < ra.size(); ++i)
+        if (ra[i].source != rb[i].source || ra[i].offset != rb[i].offset || ra[i].bytes != rb[i].bytes || ra[i].format != rb[i].format) return false;
+      return true;
+    };
+    for (int l = 0; l < layers; ++l) {
+      for (int m = 0; m < l && rig->layer_copy[static_cast<size_t>(l)] < 0; ++m)
+        if (same_layout(l, m)) rig->layer_copy[static_cast<size_t>(l)] = rig->layer_copy[static_cast<size_t>(m)];
+      if (rig->layer_copy[static_cast<size_t>(l)] < 0) rig->layer_copy[static_cast<size_t>(l)] = copies++;
+    }
+  }
   size_t free_bytes = 0, total = 0;
   DGPP_CUDA_OK(cudaMemGetInfo(&free_bytes, &total));
-  const size_t need = static_cast<size_t>(max_span) * kCopies + (size_t{256} << 20);
+  const size_t need = static_cast<size_t>(max_span) * static_cast<size_t>(copies) + (size_t{256} << 20);
   if (free_bytes < need)
     dgpp::test::skip("needs " + std::to_string(need >> 20) + " MB of device memory, " + std::to_string(free_bytes >> 20) + " free");
-  for (int c = 0; c < kCopies; ++c) {
+  for (int c = 0; c < copies; ++c) {
     uint8_t* d = nullptr;
     DGPP_CUDA_OK(cudaMalloc(&d, max_span));
     DGPP_CUDA_OK(cudaMemset(d, 0x3c + c, max_span));
     rig->copies.push_back(d);
   }
-  for (int l = 0; l < layers; ++l) rig->bases.push_back(rig->copies[static_cast<size_t>(l % kCopies)]);
+  for (int l = 0; l < layers; ++l) rig->bases.push_back(rig->copies[static_cast<size_t>(rig->layer_copy[static_cast<size_t>(l)])]);
   if (consumer_mask != 0u) {
     // Payloads hashed over the whole copy, then every layer's e8m0 scale
     // ranges in [112, 136) so no dot product overflows.
-    for (int c = 0; c < kCopies; ++c) {
+    for (int c = 0; c < copies; ++c) {
       unsigned long long *offsets = nullptr, *bytes = nullptr;
       std::vector<unsigned long long> h_off = {0}, h_bytes = {max_span};
       DGPP_CUDA_OK(cudaMalloc(&offsets, sizeof(unsigned long long)));
@@ -118,9 +147,12 @@ std::unique_ptr<Rig> make_rig_mask(int layers, unsigned consumer_mask, bool tile
       for (const Pass& pass : passes) {
         h_off.clear();
         h_bytes.clear();
-        for (int l = c; l < layers; l += kCopies)
+        for (int l = 0; l < layers; ++l) {
+          if (rig->layer_copy[static_cast<size_t>(l)] != c) continue;
           for (const Range& r : rig->plans[static_cast<size_t>(l)].ranges)
             if (r.source == Source::Resident && r.format == pass.format) { h_off.push_back(r.offset); h_bytes.push_back(r.bytes); }
+          break;  // the copy's layers share one layout: one layer's ranges are every layer's
+        }
         if (h_off.empty()) continue;
         DGPP_CUDA_OK(cudaMalloc(&offsets, h_off.size() * 8));
         DGPP_CUDA_OK(cudaMalloc(&bytes, h_bytes.size() * 8));
@@ -358,7 +390,9 @@ DGPP_TEST(step_protocol_gather_phase_waits_for_the_host_sequence) {
 // ---- the consumers inside the stream (phase 3 items 1 and 2)
 
 void consumers_match_the_reference(bool tile_major) {
-  auto rig = make_rig(2, /*consumers=*/true, tile_major);
+  // Without the hyper-connection sites: the references read x after the run, and a site rewrites x
+  // (the sites' own case checks their rows and updates against the production kernels).
+  auto rig = make_rig_mask(2, kConsumeAll & ~kConsumeMhc, tile_major);
   Streamer s(rig->dp, rig->bases, rig->plans);
   require(s.consumers(), "the plan's expert pools took the MXFP4 consumer");
   StreamerConfig cfg = design_config();
@@ -602,11 +636,12 @@ DGPP_TEST(step_consumers_rate_at_the_design_chain) {
   const double tile = consumers_rate(/*tile_major=*/true);
 
   // Interim gates at the measured level less the run-to-run noise, clean
-  // (production down, the clock locked, a warm-up run): tile-major 81 to 82
-  // percent and row-major 76 to 77 with every weight computed and the real
-  // router (2026-10-31); the plan's 95 is the goal, section 1.4 the account.
-  require(tile >= 79.0, "the tile-major consumers' layers stream under 79 percent of the ceiling");
-  require(row >= 73.0, "the row-major consumers' layers stream under 73 percent of the ceiling");
+  // (production down, the clock locked, a warm-up run): tile-major 78 percent
+  // and row-major 73 with every weight computed, the real router and the
+  // hyper-connection sites (2026-10-31; 80.6 and 77 without the sites); the
+  // plan's 95 is the goal, section 1.4 the account.
+  require(tile >= 76.0, "the tile-major consumers' layers stream under 76 percent of the ceiling");
+  require(row >= 71.0, "the row-major consumers' layers stream under 71 percent of the ceiling");
 }
 
 // Which consumers cost the layer its share of the floor: the step with the
@@ -637,6 +672,7 @@ DGPP_TEST(step_consumers_attribution) {
   consumers_rate_mask(kConsumeExperts, "the routed experts as consumers:");
   consumers_rate_mask(kConsumeShared | kConsumeProjections, "the shared expert and projections as consumers:");
   consumers_rate_mask(kConsumeProjections, "the projections as consumers:");
+  consumers_rate_mask(kConsumeAll & ~kConsumeMhc, "every consumer but the hyper-connection sites:");
   consumers_rate_mask(kConsumeAll, "every consumer:");
 }
 
@@ -645,7 +681,9 @@ DGPP_TEST(step_consumers_attribution) {
 // the slot weights must equal launch_moe_router's ids and weights bitwise
 // (the dots in the production's lane order, the select op for op).
 DGPP_TEST(step_router_matches_the_production_kernel) {
-  auto rig = make_rig_mask(kLayers, kConsumeAll, /*tile_major=*/true);
+  // Without the hyper-connection sites x stays the rows every layer's router read; with them each
+  // site rewrites x, and the sites have their own case against the production kernels below.
+  auto rig = make_rig_mask(kLayers, kConsumeAll & ~kConsumeMhc, /*tile_major=*/true);
   Streamer s(rig->dp, rig->bases, rig->plans);
   require(s.n_experts() == 384, "the plan has a router pool of 384 experts");
   StreamerConfig cfg = design_config();
@@ -767,6 +805,170 @@ DGPP_TEST(step_consumers_lead_sweep) {
     std::printf("   lead %2d MB: median layer %.1f %% of the ceiling; layer 3 qkv %.0f us, attn_out %.0f us, experts %.0f us; lead read %.0f MB\n", mib,
                 pct[pct.size() / 2], qkv, attn_out, experts, r.lead_bytes / 1e6);
   }
+}
+
+// The hyper-connection sites inside the step against the production kernels
+// on one layer: the attention site's finish and its stream update on the
+// output projection's reduce units (h the step's own projection), the MoE
+// site's normed row (the pre chained
+// from the attention site), and the accumulate's fused update (h the step's
+// y) must equal launch_mhc_compute_normed, launch_mhc_comb and
+// launch_mhc_stream_update_f32 bitwise; the output projection the attention
+// site fed must sit within the fp8 reference's envelope of the production
+// normed row, so the attention site's row is checked through what read it.
+DGPP_TEST(step_mhc_sites_match_the_production_kernels) {
+  auto rig = make_rig_mask(1, kConsumeAll, /*tile_major=*/true);
+  Streamer s(rig->dp, rig->bases, rig->plans);
+  require(s.mhc(), "the plan has the hyper-connection pools");
+  const int rows = 5, H = rig->cfg.hidden_size, kCoeffs = 24;
+  const size_t sn = static_cast<size_t>(rows) * 4 * H, hn = static_cast<size_t>(rows) * H;
+  const LayerPlan& lp = rig->plans[0];
+  auto range = [&](const std::string& name) -> const Range& {
+    for (const Range& r : lp.ranges)
+      if (r.name == name && r.source == Source::Resident) return r;
+    throw std::runtime_error("no range " + name);
+  };
+  auto at = [&](const std::string& name) { return rig->bases[0] + range(name).offset; };
+  int h_pool = -1;
+  for (size_t i = 0; i < rig->dp.pools.size(); ++i)
+    if (rig->dp.pools[i].update_site) h_pool = static_cast<int>(i);
+  require(h_pool >= 0, "the output projection's pool carries the attention update");
+  const DevPool& hp = rig->dp.pools[static_cast<size_t>(h_pool)];
+  require(hp.rows == H && hp.slabs >= 2, "the output projection's rows are the hidden width and it has reduce units");
+  // The streams the step starts from.
+  uint16_t* s0_in = nullptr;
+  DGPP_CUDA_OK(cudaMalloc(&s0_in, sn * 2));
+  DGPP_CUDA_OK(cudaMemcpy(s0_in, s.streams(0), sn * 2, cudaMemcpyDeviceToDevice));
+  StreamerConfig cfg = design_config();
+  cfg.steps = 1;
+  cfg.rows = rows;
+  cfg.top_k = 6;
+  const StreamReport r = s.run(cfg);
+  require(r.status == kStepOk, std::string("the kernel ended on ") + r.status_text);
+  // The step's results: the streams after each update, the MoE site's normed rows (x), h of each update.
+  uint16_t *s1_step = nullptr, *s0_step = nullptr, *x_step = nullptr, *h1_step = nullptr, *y_step = nullptr;
+  DGPP_CUDA_OK(cudaMalloc(&s1_step, sn * 2));
+  DGPP_CUDA_OK(cudaMalloc(&s0_step, sn * 2));
+  DGPP_CUDA_OK(cudaMalloc(&x_step, hn * 2));
+  DGPP_CUDA_OK(cudaMalloc(&h1_step, hn * 2));
+  DGPP_CUDA_OK(cudaMalloc(&y_step, hn * 2));
+  DGPP_CUDA_OK(cudaMemcpy(s1_step, s.streams(1), sn * 2, cudaMemcpyDeviceToDevice));
+  DGPP_CUDA_OK(cudaMemcpy(s0_step, s.streams(0), sn * 2, cudaMemcpyDeviceToDevice));
+  DGPP_CUDA_OK(cudaMemcpy2D(x_step, static_cast<size_t>(H) * 2, s.x(), static_cast<size_t>(s.x_stride()) * 2, static_cast<size_t>(H) * 2, rows,
+                            cudaMemcpyDeviceToDevice));
+  DGPP_CUDA_OK(cudaMemcpy(h1_step, s.proj() + hp.out_offset, hn * 2, cudaMemcpyDeviceToDevice));
+  DGPP_CUDA_OK(cudaMemcpy(y_step, s.y(), hn * 2, cudaMemcpyDeviceToDevice));
+  // The production sites.
+  GlmMhcConfig mc;
+  mc.hc_mult = 4;
+  mc.hidden = H;
+  mc.sinkhorn_iters = cfg.sinkhorn_iters;
+  mc.hc_eps = cfg.hc_eps;
+  mc.norm_eps = cfg.mhc_norm_eps;
+  float *one_hot = nullptr, *pre_a = nullptr, *pre_f = nullptr, *post_a = nullptr, *post_f = nullptr, *comb_a = nullptr, *comb_f = nullptr, *lg = nullptr;
+  uint16_t *post16 = nullptr, *comb16 = nullptr, *normed_a = nullptr, *normed_f = nullptr, *out1 = nullptr, *out0 = nullptr;
+  int* counters = nullptr;
+  for (float** f : {&one_hot, &pre_a, &pre_f, &post_a, &post_f}) DGPP_CUDA_OK(cudaMalloc(f, rows * 4 * 4));
+  for (float** f : {&comb_a, &comb_f}) DGPP_CUDA_OK(cudaMalloc(f, rows * 16 * 4));
+  DGPP_CUDA_OK(cudaMalloc(&lg, rows * kCoeffs * 4));
+  DGPP_CUDA_OK(cudaMalloc(&post16, rows * 4 * 2));
+  DGPP_CUDA_OK(cudaMalloc(&comb16, rows * 16 * 2));
+  DGPP_CUDA_OK(cudaMalloc(&normed_a, hn * 2));
+  DGPP_CUDA_OK(cudaMalloc(&normed_f, hn * 2));
+  DGPP_CUDA_OK(cudaMalloc(&out1, sn * 2));
+  DGPP_CUDA_OK(cudaMalloc(&out0, sn * 2));
+  DGPP_CUDA_OK(cudaMalloc(&counters, rows * 4));
+  {
+    std::vector<float> oh(static_cast<size_t>(rows) * 4, 0.f);
+    for (int t = 0; t < rows; ++t) oh[static_cast<size_t>(t) * 4] = 1.f;
+    DGPP_CUDA_OK(cudaMemcpy(one_hot, oh.data(), oh.size() * 4, cudaMemcpyHostToDevice));
+  }
+  auto site = [&](const char* fn, const char* base, const char* scale, const char* ln, const uint16_t* streams, const float* pre_in, float* pre_out,
+                  float* post, float* comb, uint16_t* normed) {
+    GlmMhcWeights w;
+    w.fn = reinterpret_cast<const uint16_t*>(at(fn));
+    w.base = reinterpret_cast<const float*>(at(base));
+    w.scale = reinterpret_cast<const float*>(at(scale));
+    MhcSinglePass sp;
+    sp.pre_in = pre_in;
+    sp.pre_out = pre_out;
+    sp.post_f32 = post;
+    sp.comb_f32 = nullptr;
+    sp.one_round_norm = true;
+    DGPP_CUDA_OK(cudaMemset(counters, 0, rows * 4));
+    const bool deferred = launch_mhc_compute_normed(streams, w, mc, nullptr, post16, comb16, lg, reinterpret_cast<const uint16_t*>(at(ln)), normed,
+                                                    cfg.mhc_norm_eps, rows, nullptr, counters, true, &sp, true);
+    require(deferred, "the production site defers its comb");
+    launch_mhc_comb(lg, w, mc, comb16, rows, nullptr, comb);
+  };
+  // The attention site on the starting streams, its update with the step's h.
+  site("hc_attn_fn", "hc_attn_base", "hc_attn_scale", "attn_norm", s0_in, one_hot, pre_a, post_a, comb_a, normed_a);
+  launch_mhc_stream_update_f32(post_a, comb_a, h1_step, s0_in, out1, mc, rows, nullptr);
+  // The MoE site on the step's streams after that update, pre chained from the attention site; the fused update with the step's y.
+  site("hc_ffn_fn", "hc_ffn_base", "hc_ffn_scale", "ffn_norm", s1_step, pre_a, pre_f, post_f, comb_f, normed_f);
+  launch_mhc_stream_update_f32(post_f, comb_f, y_step, s1_step, out0, mc, rows, nullptr);
+  DGPP_CUDA_OK(cudaDeviceSynchronize());
+  auto differ = [](const uint16_t* a, const uint16_t* b, size_t n) {
+    std::vector<uint16_t> ha(n), hb(n);
+    DGPP_CUDA_OK(cudaMemcpy(ha.data(), a, n * 2, cudaMemcpyDeviceToHost));
+    DGPP_CUDA_OK(cudaMemcpy(hb.data(), b, n * 2, cudaMemcpyDeviceToHost));
+    size_t d = 0;
+    for (size_t i = 0; i < n; ++i) d += ha[i] != hb[i];
+    return d;
+  };
+  const size_t d1 = differ(out1, s1_step, sn), dx = differ(normed_f, x_step, hn), d0 = differ(out0, s0_step, sn);
+  // The attention site's normed row through the projection that read it: the step's h against the fp8 reference on the production row.
+  int32_t* tokens = nullptr;
+  DGPP_CUDA_OK(cudaMalloc(&tokens, rows * 4));
+  {
+    std::vector<int32_t> tk(static_cast<size_t>(rows));
+    for (int t = 0; t < rows; ++t) tk[static_cast<size_t>(t)] = t;
+    DGPP_CUDA_OK(cudaMemcpy(tokens, tk.data(), rows * 4, cudaMemcpyHostToDevice));
+  }
+  Mxfp4Group g;
+  g.slots = tokens;
+  g.tokens = tokens;
+  g.count = rows;
+  uint16_t* h_ref = nullptr;
+  float *h_exact = nullptr, *h_mag = nullptr;
+  DGPP_CUDA_OK(cudaMalloc(&h_ref, hn * 2));
+  DGPP_CUDA_OK(cudaMalloc(&h_exact, hn * 4));
+  DGPP_CUDA_OK(cudaMalloc(&h_mag, hn * 4));
+  const uint8_t* hbase = rig->bases[0] + hp.base;
+  step_ref::launch_fp8_matrix(hbase + hp.offsets[0], reinterpret_cast<const float*>(hbase + hp.offsets[1]), g, normed_a, H, hp.k, hp.rows, 32, h_ref,
+                              h_exact, h_mag, nullptr);
+  DGPP_CUDA_OK(cudaDeviceSynchronize());
+  size_t h_beyond = 0;
+  {
+    std::vector<uint16_t> got(hn), ref(hn);
+    std::vector<float> exact(hn), mag(hn);
+    DGPP_CUDA_OK(cudaMemcpy(got.data(), h1_step, hn * 2, cudaMemcpyDeviceToHost));
+    DGPP_CUDA_OK(cudaMemcpy(ref.data(), h_ref, hn * 2, cudaMemcpyDeviceToHost));
+    DGPP_CUDA_OK(cudaMemcpy(exact.data(), h_exact, hn * 4, cudaMemcpyDeviceToHost));
+    DGPP_CUDA_OK(cudaMemcpy(mag.data(), h_mag, hn * 4, cudaMemcpyDeviceToHost));
+    for (size_t i = 0; i < hn; ++i)
+      if (got[i] != ref[i] && !step_ref::value_ok(got[i], exact[i], mag[i])) ++h_beyond;
+  }
+  std::printf("   mhc sites in the step, one layer, %d rows: attention update %zu differ of %zu, MoE normed rows %zu of %zu, fused update %zu of %zu, "
+              "output projection on the attention row %zu beyond the envelope of %zu\n",
+              rows, d1, sn, dx, hn, d0, sn, h_beyond, hn);
+  for (void* ptr : {static_cast<void*>(s0_in), static_cast<void*>(s1_step), static_cast<void*>(s0_step), static_cast<void*>(x_step), static_cast<void*>(h1_step),
+                    static_cast<void*>(y_step), static_cast<void*>(one_hot), static_cast<void*>(pre_a), static_cast<void*>(pre_f), static_cast<void*>(post_a),
+                    static_cast<void*>(post_f), static_cast<void*>(comb_a), static_cast<void*>(comb_f), static_cast<void*>(lg), static_cast<void*>(post16),
+                    static_cast<void*>(comb16), static_cast<void*>(normed_a), static_cast<void*>(normed_f), static_cast<void*>(out1), static_cast<void*>(out0),
+                    static_cast<void*>(counters), static_cast<void*>(tokens), static_cast<void*>(h_ref), static_cast<void*>(h_exact), static_cast<void*>(h_mag)})
+    cudaFree(ptr);
+  require(d1 == 0, "the attention site's update differs from the production kernels'");
+  require(dx == 0, "the MoE site's normed rows differ from the production kernels'");
+  require(d0 == 0, "the fused update differs from the production kernel's");
+  require(h_beyond == 0, "the output projection did not read the attention site's row");
+  // The sites over the eight-layer rig for three steps: the pre chain, the stream parity and the
+  // arrival counters across layers and steps.
+  auto rig8 = make_rig_mask(kLayers, kConsumeAll, /*tile_major=*/true);
+  Streamer s8(rig8->dp, rig8->bases, rig8->plans);
+  cfg.steps = 3;
+  const StreamReport r8 = s8.run(cfg);
+  require(r8.status == kStepOk && r8.steps_run == 3, std::string("the eight-layer run ended on ") + r8.status_text);
 }
 
 int main() { return dgpp::test::run_all(); }

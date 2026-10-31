@@ -32,6 +32,7 @@ enum DevPoolKind : uint8_t {
   kPoolMxfp4RowDown = 6,    // MXFP4 down, row-major
   kPoolFp8Matrix = 7,       // one fp8 projection, row-major with F32 block scales: y = W x for every token
   kPoolRouter = 8,          // the router: bf16 [experts, hidden] with its F32 bias, units of 16 expert rows over every token, scores out
+  kPoolMhc = 9,             // a hyper-connection site: the coefficient matrix bf16 [24, 4 hidden], its base and scale, the norm weight; a unit is kMhcUnitCoeffs logits of one token, the token's last unit the finish
 };
 // Whose slots a pool's group holds.
 enum DevGroupKind : uint8_t {
@@ -40,6 +41,9 @@ enum DevGroupKind : uint8_t {
   kGroupTokens = 2,  // every token, slot i = token i
 };
 constexpr int kMaxPhasePools = 8;
+// A hyper-connection unit's coefficients: one token's streams read once for
+// this many logits, so a step's units fit one wave of the workers.
+constexpr int kMhcUnitCoeffs = 3;
 #if defined(__CUDACC__)
 #define DGPP_STEP_PLAN_HD __host__ __device__
 #else
@@ -58,7 +62,8 @@ struct DevPool {
   int32_t units_per_group = 0;
   uint8_t kind = kPoolBytes;
   uint8_t group_kind = kGroupRouted;
-  uint8_t pad[2] = {0, 0};
+  uint8_t site = 0;     // kPoolMhc: 0 the attention site, 1 the MoE site (the streams' and pre's buffer parity)
+  uint8_t update_site = 0;  // kPoolFp8Matrix: its reduce units follow with the attention site's stream update, this pool's y the h
   int32_t rows = 0;     // a consumer pool: the matrix's output rows (gate and up: I; down: H)
   int32_t k = 0;        // and its inner width (gate and up: H; down: I)
   int32_t grab = 1;     // units a worker takes at once: consecutive units of one group share their staged activations
@@ -82,6 +87,7 @@ struct DevPhase {
   uint8_t resolves = 0xff; // a Dependency value the phase's end resolves (0xff none)
   uint8_t waits_host = 0;  // the phase reads rows a host gather publishes (section 2.11): it waits on the host's sequence
   uint8_t accumulate = 0;  // the ordered accumulation of the routed partials as worker units
+  uint8_t update = 0;      // the MoE site's stream update inside the accumulation's units (h is the layer's y)
   // The next phase runs inside this one: its units follow this phase's in
   // the grab order, and a down unit of group g waits for the group's gate
   // and up units, so the pair's drain tail is filled with down work.
@@ -139,7 +145,7 @@ struct DevicePlan {
 // accumulate phase becomes worker units; without, every pool is bytes. The
 // mask form picks the consumer classes one by one, for attribution: the
 // routed experts, the shared expert and the fp8 projections.
-constexpr unsigned kConsumeExperts = 1u, kConsumeShared = 2u, kConsumeProjections = 4u, kConsumeRouter = 8u, kConsumeAll = 15u;
+constexpr unsigned kConsumeExperts = 1u, kConsumeShared = 2u, kConsumeProjections = 4u, kConsumeRouter = 8u, kConsumeMhc = 16u, kConsumeAll = 31u;
 DevicePlan lower_plan(const std::vector<LayerPlan>& layers, uint32_t unit_bytes, unsigned consumer_mask);
 inline DevicePlan lower_plan(const std::vector<LayerPlan>& layers, uint32_t unit_bytes, bool consumers = false) {
   return lower_plan(layers, unit_bytes, consumers ? kConsumeAll : 0u);

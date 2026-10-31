@@ -35,6 +35,11 @@ struct StreamerConfig {
   int router_mode = 2;           // the router pool's scoring: 0 sigmoid, 2 sqrt-softplus (DeepSeek-V4.1)
   float routed_scaling_factor = 1.5f;
   bool norm_topk = true;
+  // The hyper-connection sites (kernels/step/mhc.cuh): the model's constants; the adapter sets
+  // them from the family config (DeepSeek-V4.1: hc_eps 1e-6, 20 Sinkhorn iterations, rms_norm_eps).
+  float hc_eps = 1e-6f;
+  int sinkhorn_iters = 20;
+  float mhc_norm_eps = 1e-6f;
   uint64_t first_seq = 0;        // the first step's sequence number; steps count up from it
   uint64_t epoch = 0;            // echoed by every verdict
   int skip_at_step = -1;         // publish skip instead of this step (-1: never)
@@ -110,6 +115,15 @@ class Streamer {
   const uint16_t* y() const { return y_; }
   const uint16_t* proj() const { return proj_; }  // the projections' outputs, bf16, at each pool's out_offset
   const float* scores() const { return scores_; }  // the router pool's scores [kStepMaxRows][n_experts]
+  // The hyper-connection sites' operands when the plan has their pools (null otherwise): the
+  // residual streams [kStepMaxRows][4][hidden] bf16 by site parity (0: the attention site's input,
+  // the layer's output; 1: the MoE site's input), pre [kStepMaxRows][4] by the same parity,
+  // post [kStepMaxRows][4] and comb [kStepMaxRows][16] of the last site run.
+  uint16_t* streams(int parity) const { return streams_[parity & 1]; }
+  const float* pre(int parity) const { return pre_[parity & 1]; }
+  const float* post() const { return post_; }
+  const float* comb() const { return comb_; }
+  bool mhc() const { return mhc_; }
   int n_experts() const { return n_experts_; }
   int x_stride() const { return x_stride_; }       // elements a row of x
   int hidden() const { return hidden_; }
@@ -147,6 +161,12 @@ class Streamer {
   float* biased_ = nullptr;
   int n_experts_ = 0;
   unsigned consumer_smem_ = 0;
+  bool mhc_ = false;
+  uint16_t* streams_[2] = {nullptr, nullptr};
+  float* pre_[2] = {nullptr, nullptr};
+  float* post_ = nullptr;
+  float* comb_ = nullptr;
+  float* logits_ = nullptr;
 };
 
 }  // namespace dgpp::step

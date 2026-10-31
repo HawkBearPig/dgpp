@@ -196,17 +196,22 @@ the application clock (`sudo nvidia-smi -lgc 2418`, released with `-rgc`
 afterwards) and a warm-up run before the reported one. Each confound moved
 the two-second rate case by three to five points: production's requests on
 the shared GPU, the clock ramping from P8 on an otherwise idle device, and
-a fresh rig's first run reading low. Measured that way, the tile-major
-layers at the measured expert count read 83.2 percent of their floor plus
-or minus 0.3 over three runs and the row-major 77.3, and the lead cap sweep
-is flat from 12 MB to 128: the lead is bounded by the workers' idle time,
-not by the cap.
+a fresh rig's first run reading low. Measured that way with the synthetic
+router, the tile-major layers at the measured expert count read 83.2
+percent of their floor plus or minus 0.3 over three runs and the row-major
+77.3, and the lead cap sweep is flat from 12 MB to 128: the lead is bounded
+by the workers' idle time, not by the cap. With the real router and the
+hyper-connection sites computed as well (2026-10-31), the same layers read
+77.9 and 73.1.
 
 `step_consumers_attribution` runs the same phases with each consumer class
-alone and the rest as byte units, clean. Over three runs: every pool as
-bytes 96.6 to 97.9 percent of the floor, the routed experts as consumers
-86.1 to 90.8, the shared expert and projections 88.2 to 89.7, the
-projections alone 83.6 to 89.9, every consumer 82.5 to 83.9. The expert
+alone and the rest as byte units, clean. Every pool as bytes 97.0 percent
+of the floor, the routed experts as consumers 88.8, the shared expert and
+projections 84.1, the projections alone 86.8, every consumer but the
+hyper-connection sites 80.6, every consumer 78.4 (an earlier day's three
+runs, before the sites: bytes 96.6 to 97.9, experts 86.1 to 90.8, shared
+and projections 88.2 to 89.7, projections 83.6 to 89.9, all 82.5 to 83.9
+with the synthetic router). The expert
 consumers' phase costs five points against the byte units' (hand-outs, the
 drain, the forms at 233 GB/s against 240) and another five indirectly: its
 units keep every worker busy, so the lead stages 9.4 MB of the next qkv
@@ -228,17 +233,24 @@ layer times.
 
 Every spin in the kernel has a deadline and leaves through one path that
 writes a status word naming the phase, and the host's poison word ends a
-running kernel from outside. The step engine adapter will read
+running kernel from outside. The host's wait for a verdict ends on any
+stream state but not-ready, so a faulted kernel surfaces as its error
+rather than a spin (it spun once, 2026-10-31). The step engine adapter will read
 `engine.step_sms` as the worker count, `engine.l2_staging_mib` as the lead's
 cap and `engine.stream_governor` as the leaders bound. With synthetic
 consumers the lead's cap measured best at 8 MB; with every consumer real,
 whose units read what the lead staged, 12 to 16 MB.
 
-`step_stream_test` is the gate, on the GPU with about 4 GB free. The first
-eight main layers of DeepSeek-V4.1 at world 4, five rows and a 64 KB unit,
-streamed from a device arena of their sizes with the design chain's
-latencies interleaved, run at 99.6 percent of the ceiling at the median
-layer with an 8 MB lead and 97.0 without it, over 47 workers. A 50 µs
+`step_stream_test` is the gate, on the GPU with about 4 GB free for the
+byte-unit rigs and about 10 GB for the consumer rigs: a consumer rig gives
+every distinct layer layout its own arena copy, since DeepSeek-V4.1's index
+sources, reusing layers and Engram layer differ and layers overlaid on one
+copy read bytes filled for another layer's format (garbage the byte units
+summed harmlessly and the sites turned into NaN rows and out-of-range
+expert ids). The first eight main layers of DeepSeek-V4.1 at world 4, five
+rows and a 64 KB unit, streamed from a device arena of their sizes with the
+design chain's latencies interleaved, run at 99.6 percent of the ceiling at
+the median layer with an 8 MB lead and 97.0 without it, over 47 workers. A 50 µs
 deadline ends a run of 800 µs phases inside a millisecond with the phase in
 its status, and a poison set 200 ms into a long run ends it then.
 
@@ -271,6 +283,60 @@ took 11 (24 units of about 21 µs, the units latency-bound at one block an
 SM, while 23 idle workers lead through it), and the chain's select and
 finish about 7 and 5 µs. The step kernel uses the full 255 registers a
 thread.
+
+## The hyper-connection sites
+
+A layer's two hyper-connection sites (the attention site's `attn_in`, the
+MoE site's `ffn_in`) are consumer pools (`kPoolMhc`) over their coefficient
+matrix (bf16, 24 rows of four hidden widths), its base and scale, and the
+sublayer's norm weight. A unit is three coefficients of one token: the
+block holds the token's streams in registers, computes their norm, then the
+three logits with the production kernel's fma chain and reduction order
+(`kernels/step/mhc.cuh`), so the logits equal the production's bitwise. The
+arrival that completes a token's 24 logits runs its finish on the same
+block: pre and post from the logits, the comb seeded by softmax rows and
+balanced by twenty Sinkhorn iterations on one warp, the collapse of the
+streams under the previous site's pre, and the one-rounding RMSNorm into the
+token's row of x, which the next phase's projections or experts read. The
+residual streams live in two buffers by site parity and so do the pre
+coefficients: the attention site reads streams[0] and pre[0] and writes
+pre[1]; its stream update writes streams[1]; the MoE site reads those and
+writes pre[0]; its update writes streams[0], the layer's output and the next
+layer's input. A step seeds pre[0] with the one-hot, as the model's forward
+does.
+
+Neither update is a phase. The attention site's rides on the output
+projection's reduce units, which hold the final y of their chunk and so the
+update's h: each reduce unit mixes streams[0] under the site's post and comb
+and adds post times h, in the production's one-rounding form, for its chunk
+of (token, element) outputs. The MoE site's rides on the accumulate units
+the same way, with the layer's y as h. A separate update phase cost a
+protocol round trip of about 13 µs a layer and is gone.
+
+`step_mhc_sites_match_the_production_kernels` runs one layer in the step and
+replays it with `launch_mhc_compute_normed`, `launch_mhc_comb` and
+`launch_mhc_stream_update_f32` on the same streams and weights: the
+attention update, the MoE site's normed rows and the fused update are
+bitwise the production's, and the output projection the attention site fed
+sits within the fp8 reference's envelope of the production's row. The case
+then runs eight layers for three steps, the pre chain and stream parity
+across layers and steps.
+
+Measured clean at the measured expert count, the sites cost the layer 2.2
+points (80.6 percent of the floor without them, 78.4 with). A site's phase
+takes 27 to 35 µs against the chain's budget of 8 and 12: a unit reads its
+160 KB in 9 to 14 µs, the same whether the rows are cold or staged in L2,
+because one block of eight warps an SM cannot hide the unpack and fma chain
+(the standalone probe `mhc_unit_rate` gives 9 µs; loads issued ten deep
+changed nothing), the completing unit's finish takes about 10 (the
+Sinkhorn, the collapse and the norm on one block), and the phase boundary
+about 5. The remedy is structural rather than per unit: units chained on
+dependencies inside the stream phases, as the reduce units already are, so
+the sites, the router and the updates fill the fixed phases' drains instead
+of standing as phases of their own. (Wider accumulation and reduce chunks,
+2048 outputs for one wave of units, were tried the same day and reverted:
+a unit's time grew with its chunk and the projection drains lengthened,
+three points.)
 
 ## The step protocol
 

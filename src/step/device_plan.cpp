@@ -39,7 +39,7 @@ int add_pool(DevicePlan& dp, DevPhase& d, const DevPool& pool) {
   d.pools[d.n_pools] = index;
   if (pool.group_kind == kGroupRouted) d.routed = static_cast<int8_t>(d.n_pools);
   ++d.n_pools;
-  dp.max_k = std::max(dp.max_k, pool.k);
+  if (pool.kind != kPoolMhc) dp.max_k = std::max(dp.max_k, pool.k);  // a hyper-connection pool's width is the streams', not an activation row's
   return index;
 }
 
@@ -48,7 +48,8 @@ int add_pool(DevicePlan& dp, DevPhase& d, const DevPool& pool) {
 DevicePlan lower_plan(const std::vector<LayerPlan>& layers, uint32_t unit_bytes, unsigned consumer_mask) {
   if (unit_bytes == 0 || unit_bytes % 512 != 0) throw std::invalid_argument("lower_plan: unit_bytes must be a multiple of 512");
   const bool experts = (consumer_mask & kConsumeExperts) != 0, shared = (consumer_mask & kConsumeShared) != 0,
-             projections = (consumer_mask & kConsumeProjections) != 0, router = (consumer_mask & kConsumeRouter) != 0;
+             projections = (consumer_mask & kConsumeProjections) != 0, router = (consumer_mask & kConsumeRouter) != 0,
+             mhc = (consumer_mask & kConsumeMhc) != 0;
   const bool consumers = consumer_mask != 0;
   DevicePlan dp;
   dp.unit_bytes = unit_bytes;
@@ -63,6 +64,7 @@ DevicePlan lower_plan(const std::vector<LayerPlan>& layers, uint32_t unit_bytes,
     for (const Range& r : lp.ranges)
       if (r.source == Source::Resident) by_offset.push_back(&r);
     std::sort(by_offset.begin(), by_offset.end(), [](const Range* a, const Range* b) { return a->offset < b->offset; });
+    int32_t mhc_hidden = 0;  // the sites' hidden width once the attention site's pool is lowered
     for (size_t ph = 0; ph < lp.phases.size(); ++ph) {
       const Phase& phase = lp.phases[ph];
       DevPhase d;
@@ -75,7 +77,7 @@ DevicePlan lower_plan(const std::vector<LayerPlan>& layers, uint32_t unit_bytes,
       d.layer = static_cast<int32_t>(dp.layers.size());
       for (const Range& r : lp.ranges)
         if (r.phase == static_cast<int>(ph) && r.source == Source::Host && r.reads > 0) d.waits_host = 1;
-      if (experts && phase.name == "accumulate") { d.accumulate = 1; d.kind = 1; }
+      if (experts && phase.name == "accumulate") { d.accumulate = 1; d.kind = 1; if (mhc) d.update = 1; }
       // The shared expert's fp8 pair or down and the fp8 projections as
       // consumer pools of one group: their ranges leave the fixed segments
       // and become lead-only segments.
@@ -112,9 +114,59 @@ DevicePlan lower_plan(const std::vector<LayerPlan>& layers, uint32_t unit_bytes,
             phase_part_elems += static_cast<uint32_t>(pool.slabs) * static_cast<uint32_t>(pool.rows) * kStepRows;
           }
           dp.fixed_bytes += static_cast<double>(r.bytes_per_read()) * r.reads + static_cast<double>(scales->bytes_per_read()) * scales->reads;
+          // The attention site's stream update rides on the output projection's reduce units,
+          // which hold its final y for their chunk: no phase of its own, no round trip.
+          if (mhc && r.name == "attn.wo_b.payload") {
+            if (mhc_hidden == 0 || pool.rows != mhc_hidden)
+              throw std::logic_error("lower_plan: the attention update needs the hyper-connection site before the output projection, at its hidden width");
+            if (pool.slabs < 2) throw std::logic_error("lower_plan: the attention update rides on the output projection's reduce units, which need two slabs or more");
+            pool.update_site = 1;
+          }
           add_pool(dp, d, pool);
           shared_pool.push_back(&r);
           shared_pool.push_back(scales);
+        }
+        // A hyper-connection site as a consumer pool: the coefficient matrix, its
+        // base and scale, and the sublayer's norm weight; a unit is one
+        // (coefficient, token) dot and the token's last unit runs the finish.
+        if (mhc) {
+          const Range* fn = nullptr;
+          const Range* hbase = nullptr;
+          const Range* hscale = nullptr;
+          const Range* norm = nullptr;
+          for (const Range* r : by_offset) {
+            if (r->phase != static_cast<int>(ph) || r->source != Source::Resident || r->reads == 0) continue;
+            if (r->consumer == Consumer::HyperConn && r->format == Format::Bf16) fn = r;
+            else if (r->consumer == Consumer::HyperConn && r->format == Format::F32 && r->bytes == 24 * 4) hbase = r;
+            else if (r->consumer == Consumer::HyperConn && r->format == Format::F32 && r->bytes == 3 * 4) hscale = r;
+            else if (r->consumer == Consumer::Norm && r->format == Format::Bf16) norm = r;
+          }
+          if (fn && hbase && hscale && norm && fn->rows == 24 && fn->rows % kMhcUnitCoeffs == 0) {
+            DevPool pool;
+            pool.kind = kPoolMhc;
+            pool.group_kind = kGroupTokens;
+            pool.groups = 1;
+            pool.stride = 0;
+            const Range* parts[4] = {fn, hbase, hscale, norm};
+            uint64_t lo = UINT64_MAX, hi = 0;
+            for (const Range* r : parts) { lo = std::min(lo, r->offset); hi = std::max(hi, align_grant(r->offset + r->bytes)); }
+            pool.base = lo;
+            pool.bytes = hi - lo;
+            for (int i = 0; i < 4; ++i) pool.offsets[i] = parts[i]->offset - lo;
+            pool.rows = static_cast<int32_t>(fn->rows);   // the coefficients
+            pool.k = static_cast<int32_t>(fn->cols);      // 4 hidden
+            pool.unit_rows = kMhcUnitCoeffs;
+            pool.units_per_group = pool.rows / kMhcUnitCoeffs;  // a token's units; the kernel multiplies by the step's rows
+            pool.grab = 1;
+            pool.site = phase.name == "ffn_in" ? 1 : 0;
+            if (pool.site == 0) mhc_hidden = pool.k / 4;
+            for (const Range* r : parts) dp.fixed_bytes += static_cast<double>(r->bytes_per_read()) * r->reads;
+            add_pool(dp, d, pool);
+            for (const Range* r : parts) shared_pool.push_back(r);
+            // Real work in place of the modeled latency; the plan's latency stays as the phase's
+            // idle allowance for the lead (the units are latency-bound, the memory free).
+            d.kind = 1;
+          }
         }
         // The router as a consumer pool: its bf16 matrix and F32 bias, units of
         // 16 expert rows, the scores of every token out; the chain selects.

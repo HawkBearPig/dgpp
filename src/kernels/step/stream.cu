@@ -2,6 +2,7 @@
 #include "kernels/step/stream.hpp"
 
 #include "kernels/step/fp8_dense.cuh"
+#include "kernels/step/mhc.cuh"
 #include "kernels/step/mxfp4_expert.cuh"
 #include "kernels/step/mxfp4_row.cuh"
 
@@ -76,6 +77,7 @@ __device__ __forceinline__ void spin_us(float us) {
 // A pool's compute units a group this step: the plan's, or the split form's for a small group.
 __device__ __forceinline__ unsigned compute_units_per_group(const StepStreamParams& p, const DevPool& pool) {
   if (projection_split(p, pool)) return (static_cast<unsigned>(pool.rows) + kSplitUnitRows - 1) / kSplitUnitRows;
+  if (pool.kind == kPoolMhc) return static_cast<unsigned>(pool.units_per_group) * p.ctl->rows;  // a token's units for every token
   return static_cast<unsigned>(pool.units_per_group);
 }
 // A slabbed projection's reduce units: handed out after every pool's compute
@@ -322,33 +324,117 @@ __device__ void route_finish(const StepStreamParams& p, int layer, int* keys, in
 // token ascending with weight 1 / top_k each, then the shared slot with
 // weight 1, as the slot kernels' accumulation does (synthetic weights until
 // the router's are real).
-__device__ void accumulate_chunk(const StepStreamParams& p, int layer, unsigned unit) {
+// With `fused`, the MoE site's stream update follows on the same chunk: the
+// layer's output y is the update's h, read back as the bf16 the production
+// path rounds it to, streams[1] (the site's input) mix into streams[0].
+// An output's slots are contiguous in the partials (step_out_index), so a
+// thread issues every slot's load before its first fma, and four outputs'
+// loads together; a slot-by-slot loop ran 15 µs a unit at one block an SM.
+constexpr int kStepMaxSlotsPerToken = 9;
+__device__ void accumulate_chunk(const StepStreamParams& p, int layer, unsigned unit, bool fused) {
   const int rows = static_cast<int>(p.ctl->rows), top_k = static_cast<int>(p.ctl->top_k), spt = top_k + 1, H = p.hidden;
   const int i0 = static_cast<int>(unit) * kStepAccChunk, i1 = min(i0 + kStepAccChunk, rows * H);
-  const float* sw = p.ctl->slot_weight[layer];
-  for (int i = i0 + static_cast<int>(threadIdx.x); i < i1; i += kStepThreads) {
-    const int t = i / H, c = i - t * H;
-    float a = 0.f;
-    for (int j = 0; j < spt; ++j) a = __fmaf_rn(sw[t * spt + j], p.out[step_out_index(t * spt + j, c, H, spt)], a);
-    p.y[static_cast<size_t>(t) * H + c] = f32_to_bf16(a);
+  const float* __restrict__ sw = p.ctl->slot_weight[layer];
+  const float* __restrict__ out = p.out;
+  uint16_t* __restrict__ y = p.y;
+  // Four outputs a round: every slot of the four loaded, then the fmas (y and the partials
+  // may alias as far as the compiler knows, so the pipelining is written out).
+  constexpr int kRound = 4;
+  for (int i = i0 + static_cast<int>(threadIdx.x); i < i1; i += kRound * kStepThreads) {
+    float v[kRound][kStepMaxSlotsPerToken];
+#pragma unroll
+    for (int r = 0; r < kRound; ++r) {
+      const int ir = i + r * kStepThreads;
+      const float* src = out + static_cast<size_t>(ir) * spt;  // slot j of output (t, c): (t * H + c) * spt + j
+#pragma unroll
+      for (int j = 0; j < kStepMaxSlotsPerToken; ++j) v[r][j] = (ir < i1 && j < spt) ? src[j] : 0.f;
+    }
+#pragma unroll
+    for (int r = 0; r < kRound; ++r) {
+      const int ir = i + r * kStepThreads;
+      if (ir >= i1) break;
+      const int t = ir / H;
+      float a = 0.f;
+#pragma unroll
+      for (int j = 0; j < kStepMaxSlotsPerToken; ++j)
+        if (j < spt) a = __fmaf_rn(sw[t * spt + j], v[r][j], a);
+      y[ir] = f32_to_bf16(a);
+    }
   }
+  if (fused) mhc_update_chunk(p.post, p.comb, p.y, p.streams[1], p.streams[0], H, i0, i1);  // the same thread owns the same elements
+}
+
+// A hyper-connection site's unit: kMhcUnitCoeffs logits of one token (unit
+// rb = token * units + group), the arrival that completes the token's 24
+// runs its finish: pre, post, the Sinkhorn comb, the collapse and the normed
+// row into x. Site s reads streams[s] and pre[s], writes pre[s ^ 1].
+__device__ void mhc_unit(const StepStreamParams& p, int layer, const DevPool& pool, const uint8_t* base, int rb, uint8_t* smem) {
+  __shared__ unsigned sm_last;
+  constexpr int kUnits = kMhcCoeffs / kMhcUnitCoeffs;  // a token's units
+  const int H = p.hidden, s = pool.site;
+  const int t = rb / kUnits, c0 = (rb % kUnits) * kMhcUnitCoeffs;
+  const uint16_t* streams = p.streams[s] + static_cast<size_t>(t) * kMhcN * H;
+  const uint16_t* fn = reinterpret_cast<const uint16_t*>(base + pool.offsets[0]) + static_cast<size_t>(c0) * kMhcN * H;
+  float* f = reinterpret_cast<float*>(smem);  // [0, 8) the dot's scratch, [32, 56) the logits row, [64, 92) the finish's scratch
+  float lg[kMhcUnitCoeffs];
+  mhc_dot_n<kMhcUnitCoeffs>(streams, fn, H, p.mhc_norm_eps, f, lg);
+  if (threadIdx.x == 0) {
+#pragma unroll
+    for (int c = 0; c < kMhcUnitCoeffs; ++c) p.logits[t * kMhcCoeffs + c0 + c] = lg[c];
+    __threadfence();
+    const unsigned before = atomicAdd(&p.ctl->mhc_done[layer][s][t], static_cast<unsigned>(kMhcUnitCoeffs));
+    sm_last = before + kMhcUnitCoeffs == static_cast<unsigned>(kMhcCoeffs) ? 1u : 0u;
+    if (sm_last) p.ctl->mhc_done[layer][s][t] = 0;  // every logit of the token arrived: ready for the next step
+  }
+  __syncthreads();
+  if (!sm_last) return;
+  __threadfence();
+  if (threadIdx.x < static_cast<unsigned>(kMhcCoeffs)) f[32 + threadIdx.x] = __ldcg(p.logits + t * kMhcCoeffs + threadIdx.x);
+  __syncthreads();
+  MhcSite site;
+  site.base = reinterpret_cast<const float*>(base + pool.offsets[1]);
+  site.scale = reinterpret_cast<const float*>(base + pool.offsets[2]);
+  site.ln = reinterpret_cast<const uint16_t*>(base + pool.offsets[3]);
+  site.hc_eps = p.hc_eps;
+  site.sinkhorn_iters = p.sinkhorn_iters;
+  site.ln_eps = p.mhc_norm_eps;
+  mhc_finish(streams, f + 32, site, H, p.pre[s] + t * kMhcN, p.pre[s ^ 1] + t * kMhcN, p.post + t * kMhcN, p.comb + t * kMhcN * kMhcN,
+             p.x + static_cast<size_t>(t) * p.x_stride, f + 64);
 }
 
 // A slabbed projection's reduce unit: chunk `unit` of its [slots, rows]
 // outputs as the sum of the slab partials in slab order, rounded once.
+// With `update_site`, the attention site's stream update follows on the
+// chunk: the pool's y (the output projection, [token][hidden]) is h, and
+// streams[0] mix into streams[1] under the site's post and comb.
 __device__ void reduce_unit(const StepStreamParams& p, const DevPool& pool, unsigned unit) {
   const int rows = static_cast<int>(p.ctl->rows), N = pool.rows;
   const int i0 = static_cast<int>(unit) * kStepAccChunk, i1 = min(i0 + kStepAccChunk, rows * N);
-  const float* part = p.proj_part + pool.part_offset;
-  uint16_t* y = p.proj + pool.out_offset;
+  const float* __restrict__ part = p.proj_part + pool.part_offset;
+  uint16_t* __restrict__ y = p.proj + pool.out_offset;
   const size_t slab_stride = static_cast<size_t>(kStepMaxRows) * N;
-  for (int i = i0 + static_cast<int>(threadIdx.x); i < i1; i += kStepThreads) {
-    const int t = i / N, c = i - t * N;  // slot t is token t for a projection
-    const size_t at = static_cast<size_t>(t) * N + c;
-    float a = 0.f;
-    for (int s = 0; s < pool.slabs; ++s) a += part[static_cast<size_t>(s) * slab_stride + at];
-    y[at] = f32_to_bf16(a);
+  constexpr int kRound = 4, kMaxSlabs = 8;
+  for (int i = i0 + static_cast<int>(threadIdx.x); i < i1; i += kRound * kStepThreads) {
+    // Slot t is token t for a projection: y [t][N] is dense, i its index. Four outputs' slabs loaded, then summed in slab order.
+    float v[kRound][kMaxSlabs];
+#pragma unroll
+    for (int r = 0; r < kRound; ++r) {
+      const int ir = i + r * kStepThreads;
+#pragma unroll
+      for (int sl = 0; sl < kMaxSlabs; ++sl) v[r][sl] = (ir < i1 && sl < pool.slabs) ? part[static_cast<size_t>(sl) * slab_stride + static_cast<size_t>(ir)] : 0.f;
+    }
+#pragma unroll
+    for (int r = 0; r < kRound; ++r) {
+      const int ir = i + r * kStepThreads;
+      if (ir >= i1) break;
+      float a = 0.f;
+#pragma unroll
+      for (int sl = 0; sl < kMaxSlabs; ++sl)
+        if (sl < pool.slabs) a += v[r][sl];
+      y[ir] = f32_to_bf16(a);
+    }
   }
+  if (pool.update_site) mhc_update_chunk(p.post, p.comb, y, p.streams[0], p.streams[1], N, i0, i1);
 }
 
 // A consumer pool's unit: group g's 128-row block rb of the expert's pair or
@@ -542,6 +628,10 @@ __device__ void consumer_unit(const StepStreamParams& p, int layer, const DevPoo
     grp.tokens = p.ctl->token_slots;
     grp.count = static_cast<int>(p.ctl->rows);
   }
+  if (pool.kind == kPoolMhc) {
+    mhc_unit(p, layer, pool, base, rb, smem);
+    return;
+  }
   if (pool.kind == kPoolRouter) {
     if (pool.k == 5120) router_unit<5120>(base, pool, rb, grp, p.x, p.scores, p.biased, p.n_experts, p.router_mode, smem);
     else if (threadIdx.x == 0) atomicCAS(&p.ctl->status, kStepOk, kStepBadUnit);
@@ -669,6 +759,8 @@ __global__ void __launch_bounds__(kStepThreads, 1) step_stream_kernel(StepStream
       // ---- the tokens: the device feed the last step wrote, or the host's
       const int rows = static_cast<int>(ctl->rows);
       const unsigned long long seq = d->seq;
+      // The first hyper-connection site's pre is the one-hot, as the model's forward seeds it.
+      if (p.pre[0] && threadIdx.x < static_cast<unsigned>(rows) * kMhcN) p.pre[0][threadIdx.x] = (threadIdx.x % kMhcN) == 0 ? 1.f : 0.f;
       if (threadIdx.x < static_cast<unsigned>(rows)) {
         const int32_t tok = d->tokens_from_host ? d->tokens[threadIdx.x] : p.token_feed[slot * kStepMaxRows + threadIdx.x];
         const int32_t next = step_next_token(tok, seq, static_cast<int>(threadIdx.x));
@@ -901,7 +993,7 @@ __global__ void __launch_bounds__(kStepThreads, 1) step_stream_kernel(StepStream
             for (int q = P; q < n_phases; ++q) {
               const DevPhase& qh = p.phases[q];
               if (qh.kind == 1 && !(q == P && state == kStateStream) ) break;  // a later stream phase: the memory is busy again
-              if (qh.kind == 0) idle_us += qh.latency_us;
+              idle_us += qh.latency_us;  // a latency phase's time, or a compute-bound stream phase's allowance (the sites, the accumulate)
               const bool merged = qh.merged_next != 0;
               idle_us += merged ? p.phases[q + 1].fold_after_us : qh.fold_after_us;
               if (merged) ++q;
@@ -955,7 +1047,7 @@ __global__ void __launch_bounds__(kStepThreads, 1) step_stream_kernel(StepStream
       const DevPhase& uph = p.phases[xphase];
       if (q) __syncthreads();  // the previous unit's readers of the shared memory are done
       if (kind == 1 && uph.accumulate) {
-        accumulate_chunk(p, sm_layer, xunit);
+        accumulate_chunk(p, sm_layer, xunit, uph.update != 0);
         continue;
       }
       unsigned xv = 0;
@@ -1140,8 +1232,8 @@ bool step_stream_has_fp8_matrix(int k, int rows) {
 }
 unsigned step_stream_mxfp4_smem(int inter) { return step_stream_consumer_smem(inter, true); }
 bool step_stream_has_router(int k) { return k == 5120; }
-unsigned step_stream_consumer_smem(int inter, bool fp8) {
-  unsigned need = 0u;
+unsigned step_stream_consumer_smem(int inter, bool fp8, bool mhc) {
+  unsigned need = mhc ? 512u : 0u;  // the hyper-connection unit's scratch: 92 floats
   if (inter == kConsumerI) need = static_cast<unsigned>(mxfp4_unit_smem_bytes<kConsumerI>());
   if (fp8) {  // the fp8 forms and the router unit (eight tokens by 5120 bf16 staged: 80 KB) fit the staged cap
     const unsigned split = static_cast<unsigned>(fp8_split_smem_bytes<kSplitMaxK, kSplitRowTiles>());
