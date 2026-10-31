@@ -99,6 +99,12 @@ Streamer::Streamer(const DevicePlan& dp, const std::vector<const uint8_t*>& base
       DGPP_CUDA_OK(cudaMalloc(&biased_, static_cast<size_t>(kStepMaxRows) * n_experts_ * 4));
       DGPP_CUDA_OK(cudaMemset(scores_, 0, static_cast<size_t>(kStepMaxRows) * n_experts_ * 4));
       DGPP_CUDA_OK(cudaMemset(biased_, 0, static_cast<size_t>(kStepMaxRows) * n_experts_ * 4));
+      DGPP_CUDA_OK(cudaMalloc(&cand_id_, static_cast<size_t>(kStepMaxRows) * n_experts_ * 4));
+      DGPP_CUDA_OK(cudaMalloc(&cand_score_, static_cast<size_t>(kStepMaxRows) * n_experts_ * 4));
+      DGPP_CUDA_OK(cudaMalloc(&cand_biased_, static_cast<size_t>(kStepMaxRows) * n_experts_ * 4));
+      DGPP_CUDA_OK(cudaMemset(cand_id_, 0xff, static_cast<size_t>(kStepMaxRows) * n_experts_ * 4));
+      DGPP_CUDA_OK(cudaMemset(cand_score_, 0, static_cast<size_t>(kStepMaxRows) * n_experts_ * 4));
+      DGPP_CUDA_OK(cudaMemset(cand_biased_, 0, static_cast<size_t>(kStepMaxRows) * n_experts_ * 4));
     }
     if (dp.proj_elems) {
       DGPP_CUDA_OK(cudaMalloc(&proj_, static_cast<size_t>(dp.proj_elems) * 2));
@@ -143,6 +149,9 @@ Streamer::~Streamer() {
   cudaFreeHost(host_seq_);
   if (scores_) cudaFree(scores_);
   if (biased_) cudaFree(biased_);
+  if (cand_id_) cudaFree(cand_id_);
+  if (cand_score_) cudaFree(cand_score_);
+  if (cand_biased_) cudaFree(cand_biased_);
   cudaFree(const_cast<uint8_t**>(bases_));
   cudaFree(layers_);
   cudaFree(phases_);
@@ -199,6 +208,9 @@ StreamReport Streamer::run(const StreamerConfig& cfg) {
   p.route_pool = cfg.route_pool;
   p.scores = scores_;
   p.biased = biased_;
+  p.cand_id = cand_id_;
+  p.cand_score = cand_score_;
+  p.cand_biased = cand_biased_;
   p.n_experts = n_experts_;
   p.router_mode = cfg.router_mode;
   p.routed_scaling = cfg.routed_scaling_factor;

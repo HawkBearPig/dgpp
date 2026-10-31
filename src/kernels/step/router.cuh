@@ -2,6 +2,7 @@
 // The step engine's router unit (MOONSHOT-1.md phase 3): the production
 // router's dot as a consumer pool's unit, bitwise its scores. Shared by the
 // stream kernel and the standalone probe in tests/cuda/step_consumer_test.cu.
+#include <climits>
 #include <cstdint>
 
 #include <cuda_runtime.h>
@@ -24,6 +25,15 @@ constexpr bool kRouterSpecialize = true;
 // the xor tree. Here a warp carries up to eight tokens' accumulators through
 // one read of its row, with the activations staged in shared memory; each
 // token's chain is the production's, so the scores are bitwise its.
+// The warp argmax with the lower id on ties, the production select's rule (kernels/glm_moe.cu).
+__device__ __forceinline__ void router_argmax_lowest_id(float& v, int& id) {
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) {
+    const float ov = __shfl_xor_sync(0xFFFFFFFFu, v, off);
+    const int oid = __shfl_xor_sync(0xFFFFFFFFu, id, off);
+    if (ov > v || (ov == v && oid < id)) { v = ov; id = oid; }
+  }
+}
 constexpr int kRouterUnitRows = 16;  // two expert rows a warp, sharing each staged activation vector: 24 units in one wave
 constexpr int kRouterTokens = 8;  // tokens a pass stages
 __device__ __forceinline__ float router_sqrt_softplus(float x) {
@@ -86,14 +96,20 @@ __device__ __forceinline__ void router_rows(const uint4* __restrict__ wv0, const
 // kBatch: row vectors a lane loads before using any (1: one at a time, the
 // first form). kSpecialize: the token count specialized (false: eight tokens
 // always, rows past the group staging row 0 again for finite operands).
+// With `cand_id` set, the unit also writes its top-k candidates a token over its 16 rows
+// (the production select's rule: the larger biased score, the lower id on ties), at
+// cand_*[tok * n_experts + rb * top_k + i]; rows past the experts, or past the k-th, write id -1.
 template <int kK, int kBatch, bool kSpecialize, bool kPipeline = true>
 __device__ void router_unit(const uint8_t* __restrict__ w_base, const DevPool& pool, int rb, const Mxfp4Group& g, const uint16_t* __restrict__ x,
-                            float* __restrict__ scores, float* __restrict__ biased, int n_experts, int mode, uint8_t* smem) {
+                            float* __restrict__ scores, float* __restrict__ biased, int n_experts, int mode, uint8_t* smem, int top_k = 0,
+                            int32_t* __restrict__ cand_id = nullptr, float* __restrict__ cand_score = nullptr, float* __restrict__ cand_biased = nullptr) {
   static_assert(kK % 256 == 0, "the router's inner width");
   const uint16_t* w = reinterpret_cast<const uint16_t*>(w_base + pool.offsets[0]);
   const float* bias = reinterpret_cast<const float*>(w_base + pool.offsets[1]);
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
   uint16_t* s_x = reinterpret_cast<uint16_t*>(smem);
+  float* s_b = reinterpret_cast<float*>(smem + static_cast<size_t>(kRouterTokens) * kK * 2);  // [8 tokens][16 rows] biased, then scores
+  float* s_s = s_b + kRouterTokens * kRouterUnitRows;
   const size_t xs = g.x_stride ? static_cast<size_t>(g.x_stride) : static_cast<size_t>(kK);
   for (int t0 = 0; t0 < g.count; t0 += kRouterTokens) {
     const int nt = min(kRouterTokens, g.count - t0);
@@ -139,14 +155,49 @@ __device__ void router_unit(const uint8_t* __restrict__ w_base, const DevPool& p
         if (lane == 0 && t < nt) {
           const int tok = ids.at(t);
           const float s0 = mode == 2 ? router_sqrt_softplus(d0) : 1.0f / (1.0f + expf(-d0));
+          const float b0 = s0 + bias[e0];
           scores[static_cast<size_t>(tok) * n_experts + e0] = s0;
-          biased[static_cast<size_t>(tok) * n_experts + e0] = s0 + bias[e0];
+          biased[static_cast<size_t>(tok) * n_experts + e0] = b0;
+          s_b[t * kRouterUnitRows + warp] = b0;
+          s_s[t * kRouterUnitRows + warp] = s0;
+          float b1 = -INFINITY, s1 = 0.f;
           if (live1) {
-            const float s1 = mode == 2 ? router_sqrt_softplus(d1) : 1.0f / (1.0f + expf(-d1));
+            s1 = mode == 2 ? router_sqrt_softplus(d1) : 1.0f / (1.0f + expf(-d1));
+            b1 = s1 + bias[e1];
             scores[static_cast<size_t>(tok) * n_experts + e1] = s1;
-            biased[static_cast<size_t>(tok) * n_experts + e1] = s1 + bias[e1];
+            biased[static_cast<size_t>(tok) * n_experts + e1] = b1;
           }
+          s_b[t * kRouterUnitRows + warp + (kStepThreads / 32)] = b1;
+          s_s[t * kRouterUnitRows + warp + (kStepThreads / 32)] = s1;
         }
+      }
+    } else if (lane == 0) {
+#pragma unroll
+      for (int t = 0; t < kRouterTokens; ++t) { s_b[t * kRouterUnitRows + warp] = -INFINITY; s_b[t * kRouterUnitRows + warp + (kStepThreads / 32)] = -INFINITY; }
+    }
+    __syncthreads();
+    // The unit's top-k candidates a token over its rows, the production select's rule: one warp
+    // a token, a lane a row, top_k rounds of the warp argmax with the lower id on ties (a serial
+    // scan by one thread a token cost the unit several microseconds, 2026-10-31).
+    if (cand_id && warp < nt && top_k > 0) {
+      const int t = warp, tok = ids.at(t);
+      const int row = lane, e = rb * kRouterUnitRows + row;
+      const bool mine = row < kRouterUnitRows && e < n_experts;
+      float v = mine ? s_b[t * kRouterUnitRows + row] : -INFINITY;
+      const float sc = mine ? s_s[t * kRouterUnitRows + row] : 0.f;
+      for (int r = 0; r < top_k; ++r) {
+        float bv = v;
+        int best = (mine && v > -INFINITY) ? e : INT_MAX;
+        router_argmax_lowest_id(bv, best);
+        const bool found = best != INT_MAX;
+        const float ws = __shfl_sync(0xFFFFFFFFu, sc, found ? best - rb * kRouterUnitRows : 0);
+        if (lane == 0) {
+          const size_t at = static_cast<size_t>(tok) * n_experts + static_cast<size_t>(rb) * top_k + r;
+          cand_id[at] = found ? best : -1;
+          cand_biased[at] = found ? bv : -INFINITY;
+          cand_score[at] = found ? ws : 0.f;
+        }
+        if (found && e == best) v = -INFINITY;  // taken
       }
     }
   }

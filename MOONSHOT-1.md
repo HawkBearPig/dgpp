@@ -2449,9 +2449,19 @@ area, untracked.
       combination. The select's loads are batched, the finish works in
       shared memory, each site unit collapses its slice of the row so the
       finish only norms, and the class table resolves the routed counts at
-      load so no rebuild follows the select. What the remaining tail now
-      needs is units that run at their standalone speed under the stream
-      (staged operands, few round trips) rather than a different order.
+      load so no rebuild follows the select. The chain's own work came off
+      its path next: the lowering resolves each group's fold, router phase
+      and pools into one record, and the select is two-level (each router
+      unit's top-k candidates a token, one warp a token, merged by the
+      chain in registers with the same rule, bitwise the production's over
+      all scores), 13 to 15 µs under load down to 4.4 to 6.0. The router
+      unit's class grew by about ten with the scan in it and the kernel's
+      stack from 32 to 72 bytes a thread, so the unit's hot loop under
+      register pressure is measured next, standalone first; then units
+      that run at their standalone speed under the stream (staged
+      operands, few round trips) rather than a different order. Two
+      samples with all of it: 81.0 and 80.8 tile-major, 74.4 and 75.2
+      row-major.
       Owed here: the attention consumer, the folds and the select as
       consumers, and the chain's critical path after the attention-output
       fold, about 70 µs against the budget's 34: the MoE site's class 24

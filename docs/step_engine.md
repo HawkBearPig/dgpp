@@ -397,6 +397,27 @@ one clean run is about 1.5 points on the median and 6 µs on a class window,
 and no lever is judged on one sample or in isolation from the stages that
 would have to adapt with it.
 
+Two more pieces of the chain's own work came off its path the same night.
+The lowering resolves each group's facts into its first phase's record (the
+fold to spin, the phase that resolves the router, its router pool, the
+layer's first routed pool after the group), so the chain reads one record at
+a group's start instead of walking the phase and pool tables under a
+saturated memory. And the select is two-level: each router unit emits its
+top-k candidates a token over its sixteen rows, one warp a token with the
+production rule (the larger biased score, the lower id on ties), and the
+chain's select merges the units' candidates, 144 a token at top-k 6, in
+registers with the same rule, so the picks and their weights are the
+production select's over all 384 scores (a global top-k element is within
+its unit's top-k; `step_router_matches_the_production_kernel` holds bitwise).
+The chain's select fell from 13 to 15 µs under load to 4.4 to 6.0. The
+router unit's class grew by about ten (32 to 45 µs) with the candidate scan
+in it, and the kernel's stack from 32 to 72 bytes a thread (a pipelined
+router form compiled beside the plain one behind a runtime switch had taken
+it to 160, and is compiled no more); the unit's hot loop under that
+pressure is the next thing to measure, standalone first. Two samples with
+all of it: 81.0 and 80.8 percent of the floor tile-major, 74.4 and 75.2
+row-major; the attribution 79.6 with the sites and 79.4 without.
+
 `step_consumers_lever_matrix` measures the scheduling levers as a set, two
 samples each, on the tile-major rig, with the median and the
 attention-output group's site and router windows and tail. Its first full

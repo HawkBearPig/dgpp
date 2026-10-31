@@ -431,6 +431,26 @@ DevicePlan lower_plan(const std::vector<LayerPlan>& layers, uint32_t unit_bytes,
         if (down.partner < 0) throw std::logic_error("lower_plan: a down pool without its gate and up pool");
       }
     }
+  // The groups' facts for the chain (device_plan.hpp DevPhase::group_*), after the merges.
+  for (size_t i = 0; i < dp.phases.size(); ++i) {
+    DevPhase& a = dp.phases[i];
+    const size_t last = std::min(dp.phases.size() - 1, i + a.merged);
+    a.group_fold_us = 0.f;
+    for (size_t q = i; q <= last; ++q) {
+      const DevPhase& b = dp.phases[q];
+      a.group_fold_us = std::max(a.group_fold_us, b.fold_after_us);
+      if (b.resolves == static_cast<uint8_t>(Dependency::Router)) {
+        a.group_router_phase = static_cast<int32_t>(q);
+        for (int k = 0; k < b.n_pools; ++k)
+          if (dp.pools[static_cast<size_t>(b.pools[k])].kind == kPoolRouter) a.group_router_pool = b.pools[k];
+      }
+    }
+    if (a.group_router_phase >= 0) {
+      const DevLayer& dl = dp.layers[static_cast<size_t>(a.layer)];
+      for (int q = static_cast<int>(last) + 1; q < dl.phase_begin + dl.phase_count && a.group_routed_pool < 0; ++q)
+        if (dp.phases[static_cast<size_t>(q)].routed >= 0) a.group_routed_pool = dp.phases[static_cast<size_t>(q)].pools[dp.phases[static_cast<size_t>(q)].routed];
+    }
+  }
   return dp;
 }
 

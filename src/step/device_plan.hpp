@@ -108,6 +108,15 @@ struct DevPhase {
   // reduce units complete), kTriggerAccumulate (this phase's units complete).
   uint8_t fold_trigger = 0;
   int32_t trigger_pool = -1;
+  // The group's facts the chain needs at its start, resolved by the lowering so the chain reads
+  // one phase record rather than walking the phase and pool tables under a saturated memory:
+  // the fold to spin (the group's largest fold_after_us), the phase in the group that resolves
+  // the router (-1: none), its router pool (-1: synthetic), the layer's first routed pool after
+  // the group (how many groups the select makes; -1: none).
+  float group_fold_us = 0;
+  int32_t group_router_phase = -1;
+  int32_t group_router_pool = -1;
+  int32_t group_routed_pool = -1;
   float latency_us = 0;    // a latency phase's modeled time
   float fold_after_us = 0; // the fold that follows the phase
   int32_t seg_begin = 0;   // fixed segments

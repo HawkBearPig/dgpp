@@ -521,54 +521,51 @@ __device__ bool fp8_matrix_dispatch(int k, int n, const uint8_t* w, const float*
 // the lower id on ties, the ids sorted ascending, the weights normalized with
 // per-element division and scaled. keys[t * top_k + i] takes the ids, the
 // control block's slot_weight the weights, 1 for the shared slot.
-__device__ __forceinline__ void router_argmax_lowest_id(float& v, int& id) {
-#pragma unroll
-  for (int off = 16; off > 0; off >>= 1) {
-    const float ov = __shfl_xor_sync(0xFFFFFFFFu, v, off);
-    const int oid = __shfl_xor_sync(0xFFFFFFFFu, id, off);
-    if (ov > v || (ov == v && oid < id)) { v = ov; id = oid; }
-  }
-}
 __device__ void route_select(const StepStreamParams& p, int layer, int* keys, uint8_t* smem) {
   const int rows = static_cast<int>(p.ctl->rows), top_k = static_cast<int>(p.ctl->top_k), spt = top_k + 1, E = p.n_experts;
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-  float* s_scores = reinterpret_cast<float*>(smem);  // [8][E] scores, [8][E] biased, then each warp's sel [16] and wsel [16]
+  // The router units' candidates: units x top_k a token, each unit's top-k over its 16 rows.
+  // The merge applies the same rule, so the k picks and their order are the production
+  // select's over all E scores: a global top-k element is within its unit's top-k.
+  const int units = (E + kRouterUnitRows - 1) / kRouterUnitRows;
+  const int n = units * top_k;
+  constexpr int kMaxPer = 6;  // candidates a lane: 192 a token at most (24 units by top-k 8, or 32 by 6)
+  if (n > 32 * kMaxPer) {
+    if (threadIdx.x == 0) atomicCAS(&p.ctl->status, kStepOk, kStepBadUnit);
+    return;
+  }
   for (int t0 = 0; t0 < rows; t0 += 8) {
     __syncthreads();
     const int t = t0 + warp;
     if (t < rows) {
-      float* sc = s_scores + warp * E;
-      float* bs = s_scores + (8 + warp) * E;
-      // Every load of the token's scores issued before any is stored: a load then a store an
-      // expert cost a memory round trip each, 24 of them a token under the saturated memory.
-      constexpr int kMaxPer = 16;  // experts a lane carries: 512 at most
-      float a[kMaxPer], b[kMaxPer];
+      int cid[kMaxPer];
+      float cb[kMaxPer], cs[kMaxPer];
 #pragma unroll
       for (int i = 0; i < kMaxPer; ++i) {
-        const int e = lane + i * 32;
-        a[i] = e < E ? __ldcg(p.scores + static_cast<size_t>(t) * E + e) : 0.f;
-        b[i] = e < E ? __ldcg(p.biased + static_cast<size_t>(t) * E + e) : 0.f;
+        const int c = lane + i * 32;
+        const size_t at = static_cast<size_t>(t) * E + c;
+        cid[i] = c < n ? __ldcg(p.cand_id + at) : -1;
+        cb[i] = c < n ? __ldcg(p.cand_biased + at) : -INFINITY;
+        cs[i] = c < n ? __ldcg(p.cand_score + at) : 0.f;
       }
-#pragma unroll
-      for (int i = 0; i < kMaxPer; ++i) {
-        const int e = lane + i * 32;
-        if (e < E) { sc[e] = a[i]; bs[e] = b[i]; }
-      }
-      __syncwarp();
-      int* sel = reinterpret_cast<int*>(smem + static_cast<size_t>(16) * E * 4) + warp * 16;        // [8][16] after the score rows
-      float* wsel = reinterpret_cast<float*>(smem + static_cast<size_t>(16) * E * 4 + 8 * 16 * 4) + warp * 16;
+      int* sel = reinterpret_cast<int*>(smem) + warp * 16;  // [8][16]
+      float* wsel = reinterpret_cast<float*>(smem + 8 * 16 * 4) + warp * 16;
       for (int r = 0; r < top_k; ++r) {
         int best = INT_MAX;
         float bv = -INFINITY;
-        for (int e = lane; e < E; e += 32)
-          if (bs[e] > bv) { bv = bs[e]; best = e; }
+#pragma unroll
+        for (int i = 0; i < kMaxPer; ++i)
+          if (cid[i] >= 0 && (cb[i] > bv || (cb[i] == bv && cid[i] < best))) { bv = cb[i]; best = cid[i]; }
         router_argmax_lowest_id(bv, best);
-        sel[r] = best;
-        wsel[r] = sc[best];
-        __syncwarp();
-        if (lane == 0) bs[best] = -INFINITY;
-        __syncwarp();
+        float ws = -INFINITY;
+#pragma unroll
+        for (int i = 0; i < kMaxPer; ++i)
+          if (cid[i] == best) { ws = cs[i]; cb[i] = -INFINITY; cid[i] = -1; }
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) ws = fmaxf(ws, __shfl_xor_sync(0xFFFFFFFFu, ws, off));
+        if (lane == 0) { sel[r] = best; wsel[r] = ws; }
       }
+      __syncwarp();
       if (lane == 0) {
         for (int i = 1; i < top_k; ++i) {
           const int id = sel[i];
@@ -592,6 +589,7 @@ __device__ void route_select(const StepStreamParams& p, int layer, int* keys, ui
   }
   __syncthreads();
 }
+
 
 __device__ void consumer_unit(const StepStreamParams& p, int layer, const DevPool& pool, int g, int rb, uint8_t* smem, bool stage) {
   const bool routed = pool.group_kind == kGroupRouted;
@@ -618,8 +616,12 @@ __device__ void consumer_unit(const StepStreamParams& p, int layer, const DevPoo
   }
   if (pool.kind == kPoolRouter) {
     if (pool.k == 5120) {
-      if (p.router_pipeline) router_unit<5120, kRouterBatch, kRouterSpecialize, true>(base, pool, rb, grp, p.x, p.scores, p.biased, p.n_experts, p.router_mode, smem);
-      else router_unit<5120, kRouterBatch, kRouterSpecialize, false>(base, pool, rb, grp, p.x, p.scores, p.biased, p.n_experts, p.router_mode, smem);
+      // One form compiled: the pipelined batches, instantiated beside this one behind a runtime
+      // switch, raised the kernel's stack from 32 to 160 bytes a thread (2026-10-31); the probe
+      // measures that form standalone (router_unit_rate).
+      const int top_k = static_cast<int>(p.ctl->top_k);
+      router_unit<5120, kRouterBatch, kRouterSpecialize, kRouterPipeline>(base, pool, rb, grp, p.x, p.scores, p.biased, p.n_experts, p.router_mode, smem, top_k,
+                                                                          p.cand_id, p.cand_score, p.cand_biased);
     }
     else if (threadIdx.x == 0) atomicCAS(&p.ctl->status, kStepOk, kStepBadUnit);
     return;
@@ -781,23 +783,14 @@ __global__ void __launch_bounds__(kStepThreads, 1) step_stream_kernel(StepStream
         const DevLayer& dl = p.layers[l];
         const int merged = static_cast<int>(ph.merged);
         const int P_last = P + merged;
-        float fold_us = 0.f;
-        for (int Q = P; Q <= P_last; ++Q) fold_us = fmaxf(fold_us, p.phases[Q].fold_after_us);
-        // The group's router, if it resolves one: its real pool's units are counted, and the
-        // chain selects as soon as they are complete, inside the group, so the next phase's
-        // groups are known when the group ends.
-        int R = -1, router_pool = -1;
-        for (int Q = P; Q <= P_last; ++Q)
-          if (p.phases[Q].resolves == static_cast<uint8_t>(Dependency::Router)) {
-            R = Q;
-            for (int i = 0; i < p.phases[Q].n_pools; ++i)
-              if (p.pools[p.phases[Q].pools[i]].kind == kPoolRouter) router_pool = p.phases[Q].pools[i];
-          }
-        int routed_pool = -1;  // the first routed pool of the layer's later phases: how many groups the select makes
-        if (R >= 0)
-          for (int Q = P_last + 1; Q < dl.phase_begin + dl.phase_count && routed_pool < 0; ++Q)
-            if (p.phases[Q].routed >= 0) routed_pool = p.phases[Q].pools[p.phases[Q].routed];
+        // The group's facts, resolved by the lowering (one phase record, not a walk of the tables).
+        // Its router, if it resolves one: its real pool's units are counted, and the chain selects
+        // as soon as they are complete, inside the group, so the next phase's groups are known
+        // when the group ends.
+        const float fold_us = ph.group_fold_us;
+        const int R = ph.group_router_phase, router_pool = ph.group_router_pool, routed_pool = ph.group_routed_pool;
         const unsigned router_units = router_pool >= 0 && routed_pool >= 0 ? pool_compute_units(p, l, p.pools[router_pool]) : 0u;
+        (void)dl;
         if (t0) {
           sm_selected = 0;
           const unsigned long long t_begin = gtimer();
@@ -885,7 +878,7 @@ __global__ void __launch_bounds__(kStepThreads, 1) step_stream_kernel(StepStream
             const unsigned long long t_sel = gtimer();
             route_select(p, l, keys, chain_smem);
             const unsigned long long t_fin = gtimer();
-            route_finish(p, l, keys, sorted, chain_smem + static_cast<size_t>(16) * p.n_experts * 4 + 2 * 8 * 16 * 4);
+            route_finish(p, l, keys, sorted, chain_smem + 2 * 8 * 16 * 4);
             if (t0) {
               ctl->route_select_ns[l] = t_fin - t_sel;
               ctl->route_finish_ns[l] = gtimer() - t_fin;
@@ -912,7 +905,7 @@ __global__ void __launch_bounds__(kStepThreads, 1) step_stream_kernel(StepStream
             route_synthetic_picks(p, l, p.pools[routed_pool], keys);
           }
           const unsigned long long t_fin = gtimer();
-          route_finish(p, l, keys, sorted, chain_smem + static_cast<size_t>(16) * p.n_experts * 4 + 2 * 8 * 16 * 4);
+          route_finish(p, l, keys, sorted, chain_smem + 2 * 8 * 16 * 4);
           if (t0) {
             ctl->route_select_ns[l] = t_fin - t_sel;
             ctl->route_finish_ns[l] = gtimer() - t_fin;

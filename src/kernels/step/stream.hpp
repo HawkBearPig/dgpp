@@ -142,6 +142,12 @@ struct StepStreamParams {
   float* scores = nullptr;
   float* biased = nullptr;
   int n_experts = 0;
+  // Each router unit's top-k candidates a token over its 16 rows (id, score, biased), at
+  // [token * n_experts + unit * top_k + i]: the chain's select merges them (two levels, the same
+  // rule at each, so the picks are the production select's) in registers.
+  int32_t* cand_id = nullptr;
+  float* cand_score = nullptr;
+  float* cand_biased = nullptr;
   int router_mode = 2;
   float routed_scaling = 1.f;
   int norm_topk = 1;
@@ -175,7 +181,7 @@ struct StepStreamParams {
   unsigned gated_first = 0;
   unsigned critical_leaders = 0;
   int acc_chunk = 512;
-  unsigned router_pipeline = 0;
+  unsigned router_pipeline = 0;  // not compiled into the kernel (see consumer_unit); the probe's form
   unsigned yield_on_gate = 1;  // lead units yield when a gate opens, not only when a phase is published
   unsigned long long deadline_ns = 0;          // every in-step spin's deadline (0: none)
   unsigned long long pending_deadline_ns = 0;  // how long the chain waits for the host's next descriptor (0: forever)

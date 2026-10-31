@@ -181,6 +181,9 @@ class Streamer {
   int x_stride_ = 0;
   float* scores_ = nullptr;
   float* biased_ = nullptr;
+  int32_t* cand_id_ = nullptr;
+  float* cand_score_ = nullptr;
+  float* cand_biased_ = nullptr;
   int n_experts_ = 0;
   unsigned consumer_smem_ = 0;
   int acc_chunk_ = 512;  // the last run's accumulation chunk, for the report's class table
