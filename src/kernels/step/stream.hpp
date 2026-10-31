@@ -23,6 +23,7 @@
 namespace dgpp::step {
 
 constexpr int kStepMaxPhases = 1024;
+constexpr int kStepMaxClasses = 24;  // unit classes of one published phase group (its phases' pools, reduces and fixed units)
 constexpr int kStepMaxLayers = 64;
 constexpr int kStepMaxGroups = 512;  // run-list capacity a layer
 constexpr int kStepMaxWorkers = 128;
@@ -48,7 +49,11 @@ struct alignas(128) StepCtl {
   unsigned long long pf_bytes;           // bytes the lead has read
   unsigned long long consumed_pf_bytes;  // of them, the bytes of phases now complete
   unsigned pad3[28];
-  unsigned next[kStepMaxPhases];
+  // The hand-out counters of a published phase's unit classes (kernels/step/stream.cu: the
+  // group's classes in order, each with its own counter and gate), and the group's completed units.
+  unsigned cls_next[kStepMaxPhases][kStepMaxClasses];
+  uint4 cls_table[kStepMaxPhases][kStepMaxClasses];  // the group's classes, built by the chain (kernels/step/stream.cu build_class_table)
+  unsigned cls_n[kStepMaxPhases];
   unsigned done[kStepMaxPhases];
   unsigned pf_units[kStepMaxPhases];
   int run_count[kStepMaxLayers];
@@ -72,6 +77,10 @@ struct alignas(128) StepCtl {
   // 24th arrival runs the token's finish and resets the count for the next step.
   unsigned mhc_done[kStepMaxLayers][2][32];
   unsigned pool_done[kStepMaxLayers][kStepMaxPhases];  // kPoolFp8Matrix with slabs: compute units of the pool completed this step, by layer and pool index
+  unsigned reduce_done[kStepMaxLayers][kStepMaxPhases];  // and its reduce units completed, by layer and pool index (the fold trigger of a group)
+  unsigned acc_done[kStepMaxLayers];      // the accumulate units completed, by layer (the fold trigger of its group)
+  unsigned site_done[kStepMaxLayers][2];  // a hyper-connection site's tokens finished, by layer and site (the router's gate)
+  unsigned fold_done[kStepMaxPhases];     // the chain spun the group's fold, by the group's published phase (the gate of the units behind it; a layer has two groups with folds, so not by layer: 2026-10-31)
   unsigned long long stamp_begin[kStepMaxPhases];  // the last pass: the phase's publish or latency start
   unsigned long long stamp_end[kStepMaxPhases];    // the last pass: its units done, the fold after it included
   unsigned long long idle_first[kStepMaxPhases];   // the last pass: the first worker to find the phase drained
@@ -85,6 +94,8 @@ struct alignas(128) StepCtl {
   unsigned long long ahead_begin[kStepMaxPhases];   // the last pass: the lead's staged bytes not yet consumed when the chain entered the phase
   unsigned cursor_begin[kStepMaxPhases];            // the last pass: the phase the lead's cursor stood in when the chain entered the phase
   unsigned look_blocked[kStepMaxPhases];            // the last pass: workers that found the cursor past the lookahead while this phase was published
+  unsigned long long cls_first[kStepMaxPhases][kStepMaxClasses];  // the last pass: when each class of the published group handed out its first unit
+  unsigned long long cls_last[kStepMaxPhases][kStepMaxClasses];   // and when its last unit completed
   unsigned long long route_select_ns[kStepMaxLayers];  // the last pass: the chain's select over the router's scores
   unsigned long long route_finish_ns[kStepMaxLayers];  // the last pass: the run list, groups and slots from the picks
   unsigned steps_run;                              // steps this launch completed

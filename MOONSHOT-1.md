@@ -905,8 +905,8 @@ streams at 92 percent of the ceiling, the fixed phases at the ceiling in
 aggregate, and the median layer at 87 to 88 percent of its floor at any
 lead cap from 4 to 20 MB (beside production, at the uniform expert count;
 the clean figure at the measured count, 2026-10-31, is 83 with the
-synthetic router, 80.6 with the real one, 78.4 with the mHC sites computed
-as well). The residue is the layer's latency: attn_in 9,
+synthetic router, 80.6 with the real one, 79.4 with the mHC sites computed
+as well as gated classes of the stream phases). The residue is the layer's latency: attn_in 9,
 attend 2, ffn_in 12, the router 18, the gap to the experts 8 and the
 accumulation 21 µs, about 70 µs a layer, of which the lead covers a few
 microseconds, because its cap is full when the latency begins. The bound
@@ -2411,24 +2411,36 @@ area, untracked.
       three coefficients of one token, the completing unit running the
       token's finish: pre, post, the Sinkhorn comb, the collapse and the
       one-rounding norm into x), bitwise the production kernels over a
-      layer's whole data flow (`step_mhc_sites_match_the_production_kernels`),
-      and both stream updates ride on existing units, the output
-      projection's reduce units and the accumulate, so no phase was added
-      (a separate update phase cost 13 µs and was removed). Cost at the
-      measured count, clean: 2.2 points of the layer (80.6 percent of the
-      floor without the sites, 78.4 with), each site phase 27 to 35 µs
-      against the chain's 8 and 12. The mechanism is the same as the
-      router's: a unit reads 160 KB in 9 to 14 µs whether cold or staged,
-      issue-bound at one block an SM (register-resident loads changed
-      nothing), the finish about 10 on one block, the phase boundary about
-      5. Owed here: the attention consumer, the folds and the select, and
-      the structural remedy for every latency-bound unit, which is
-      dependency-chained units inside the stream phases (as the reduce
-      units are) so these fill the fixed phases' drains instead of
-      standing as phases. Two defects fixed on the way: the test rig's
-      overlaid arena copies (one per distinct layer layout now) and the
-      host's wait on a faulted kernel. A 2048-output row chunk was tried
-      and reverted (unit time scaled with the chunk, three points).
+      layer's whole data flow and across layers
+      (`step_mhc_sites_match_the_production_kernels`: one layer, then the
+      third of three from a two-layer run's state, then two eight-layer
+      runs bitwise equal). Both stream updates ride on existing units, the
+      output projection's reduce units and the accumulate. By the evening
+      the sites are not phases at all: a published phase hands out its
+      group's units as ordered classes with their own counters and gates
+      (a reduce class on its pool's compute units, a site on the group's
+      fold, the router on the site's finishes), the MoE site and the
+      router inside attn_out behind its fold (triggered by the output
+      projection's reduce), the attention site inside the previous layer's
+      accumulate behind the layer's fold, the select inside the group as
+      soon as the router's units are done, the class table built by the
+      chain while the previous group runs. Clean at the measured count the
+      sites cost 0.7 points (80.1 percent of the floor without them, 79.4
+      with), the median layer 79 tile-major, 74 row-major, the synthetic
+      chain 95.4. Owed here: the attention consumer, the folds and the
+      select as consumers, and the chain's critical path after the
+      attention-output fold, about 100 µs against the budget's 34: the
+      router's 24 units take 41 µs for 160 KB of rows and 50 KB of staged
+      activations each (a standalone probe next, as the site unit had),
+      the site 24, the select and finish about 15. Lessons kept in
+      `docs/step_engine.md`: gated classes first lost 3.6 points, merged
+      phases first deadlocked, the fold gate must be per group, a
+      dependent token-id load per staged 16-byte piece cost the projection
+      units a tenth, and workers building the class table cost up to 17 µs
+      a phase. Two defects fixed on the way: the test rig's overlaid arena
+      copies (one per distinct layer layout now) and the host's wait on a
+      faulted kernel. A 2048-output row chunk was tried and reverted (unit
+      time scaled with the chunk, three points).
 - [ ] No library kernel on the step engine's path, the existing walks
       untouched. Gate: no library kernel in a step's trace on any family.
 

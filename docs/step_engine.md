@@ -148,11 +148,13 @@ normal loads so the lines stay for the phase that consumes them. The
 governor bounds how many workers lead at once.
 
 Three details of the hand-out came from measurement with every consumer
-real. A worker builds the published phase's hand-out table once in shared
-memory (the unit count and, in hand-out order, each class's end and grab
-size), so a grab costs the counter's load and the atomic; recomputing the
-table's dependent loads under a saturated memory cost 3.5 to 4.5 µs a grab
-and was most of the idle worker time in the expert phase. A lead unit
+real. The chain builds the published group's class table into the control
+block while the previous group runs (and again after a select, since the
+expert pools' unit counts follow the run list), and a worker reads it in one
+round trip when the phase word changes, so a grab costs the class counter's
+load and the atomic, 1.4 to 1.9 µs; a worker building the table from the
+pool tables took up to 17 µs a phase under a saturated memory, and
+recomputing it a grab cost 3.5 to 4.5 µs. A lead unit
 streams in 16 KB pieces and stops when the chain publishes a new phase, so
 a worker is back at the hand-out within a piece rather than a unit at the
 memory's share; before that, phase starts waited behind lead work. And the
@@ -201,14 +203,15 @@ router, the tile-major layers at the measured expert count read 83.2
 percent of their floor plus or minus 0.3 over three runs and the row-major
 77.3, and the lead cap sweep is flat from 12 MB to 128: the lead is bounded
 by the workers' idle time, not by the cap. With the real router and the
-hyper-connection sites computed as well (2026-10-31), the same layers read
-77.9 and 73.1.
+hyper-connection sites computed as well, as gated classes of the stream
+phases (2026-10-31 evening), the same layers read 79 and 74 (the eight
+tile-major layers 76 to 86).
 
 `step_consumers_attribution` runs the same phases with each consumer class
-alone and the rest as byte units, clean. Every pool as bytes 97.0 percent
-of the floor, the routed experts as consumers 88.8, the shared expert and
-projections 84.1, the projections alone 86.8, every consumer but the
-hyper-connection sites 80.6, every consumer 78.4 (an earlier day's three
+alone and the rest as byte units, clean. Every pool as bytes 96.8 percent
+of the floor, the routed experts as consumers 88.1, the shared expert and
+projections 85.9, the projections alone 87.3, every consumer but the
+hyper-connection sites 80.1, every consumer 79.4 (an earlier day's three
 runs, before the sites: bytes 96.6 to 97.9, experts 86.1 to 90.8, shared
 and projections 88.2 to 89.7, projections 83.6 to 89.9, all 82.5 to 83.9
 with the synthetic router). The expert
@@ -311,7 +314,8 @@ update's h: each reduce unit mixes streams[0] under the site's post and comb
 and adds post times h, in the production's one-rounding form, for its chunk
 of (token, element) outputs. The MoE site's rides on the accumulate units
 the same way, with the layer's y as h. A separate update phase cost a
-protocol round trip of about 13 µs a layer and is gone.
+protocol round trip of about 13 µs a layer and is gone. Nor, since the
+evening of 2026-10-31, are the sites: see the end of this section.
 
 `step_mhc_sites_match_the_production_kernels` runs one layer in the step and
 replays it with `launch_mhc_compute_normed`, `launch_mhc_comb` and
@@ -322,21 +326,65 @@ sits within the fp8 reference's envelope of the production's row. The case
 then runs eight layers for three steps, the pre chain and stream parity
 across layers and steps.
 
-Measured clean at the measured expert count, the sites cost the layer 2.2
-points (80.6 percent of the floor without them, 78.4 with). A site's phase
-takes 27 to 35 µs against the chain's budget of 8 and 12: a unit reads its
-160 KB in 9 to 14 µs, the same whether the rows are cold or staged in L2,
-because one block of eight warps an SM cannot hide the unpack and fma chain
-(the standalone probe `mhc_unit_rate` gives 9 µs; loads issued ten deep
-changed nothing), the completing unit's finish takes about 10 (the
-Sinkhorn, the collapse and the norm on one block), and the phase boundary
-about 5. The remedy is structural rather than per unit: units chained on
-dependencies inside the stream phases, as the reduce units already are, so
-the sites, the router and the updates fill the fixed phases' drains instead
-of standing as phases of their own. (Wider accumulation and reduce chunks,
-2048 outputs for one wave of units, were tried the same day and reverted:
-a unit's time grew with its chunk and the projection drains lengthened,
-three points.)
+As phases of their own the sites cost the layer 2.2 points (measured clean
+at the measured expert count: 80.6 percent of the floor without them, 78.4
+with), each site phase 27 to 35 µs against the chain's budget of 8 and 12:
+a unit reads its 160 KB in 9 to 14 µs, the same whether the rows are cold
+or staged in L2, because one block of eight warps an SM cannot hide the
+unpack and fma chain (the standalone probe `mhc_unit_rate` gives 9 µs;
+loads issued ten deep changed nothing), the completing unit's finish takes
+about 10 (the Sinkhorn, the collapse and the norm on one block), and the
+phase boundary about 5. (Wider accumulation and reduce chunks, 2048 outputs
+for one wave of units, were tried the same day and reverted: a unit's time
+grew with its chunk and the projection drains lengthened, three points.)
+
+So the sites are no longer phases. A published phase hands out the units of
+a group: its own and those of the phases merged behind it, as ordered
+classes (a pool's compute units, that pool's reduce units, the fixed byte
+units, an accumulation's chunks), each class with its own counter in the
+control block and, where it depends on something, a gate: a reduce class
+opens when its pool's compute units are complete, a site's class when the
+chain has spun the group's fold, the router's class when the site has
+finished every token. A worker takes the first open class with units left,
+so a closed class is passed over rather than waited on, and the latency
+segments run inside the stream phase's drain. The MoE site and the router
+are merged into `attn_out`, whose output projection is handed out first and
+whose fold the chain spins as soon as that projection's reduce units (which
+carry the attention update) are complete; the chain selects as soon as the
+router's units are complete, inside the group, so the expert phase's run
+list is ready when the group ends. The attention site is merged into the
+previous layer's `accumulate`, behind the layer's fold, which the chain
+spins when the accumulate units are complete. The fold gate is a word per
+group, not per layer: a layer has two groups with folds, and a gate shared
+between them let the attention site read the streams before the accumulate
+had written them (caught by the three-layer replay and the two-run
+determinism check that `step_mhc_sites_match_the_production_kernels` now
+carries). A latency phase is never merged, and a layer whose first phase
+gathers host rows (an Engram layer) keeps its attention site as a phase.
+The classes are in phase order with the gated ones in place: gated classes
+first, so the merged units ran as soon as they opened, measured 3.6 points
+worse, since under the saturated stream their latency-bound units ran
+slower than in the drain and every grab paid their gate loads; merged
+phases first deadlocked, the down units (waited per expert group inside the
+unit) holding every worker ahead of the gate and up units. Completion
+signals are release adds rather than a fence and a plain add. The trace
+gives the first phase of a group its own units and the fold, the merged
+phases the rest, and each class its window from first hand-out to last
+completion.
+
+Measured clean with the sites as classes, the sites cost the layer 0.7
+points (80.1 percent of the floor without them, 79.4 with), the median
+layer 79 tile-major and 74 row-major. The class windows of `attn_out`
+(tile-major, layer 3, from the group's publish): the output projection's
+compute units 3 to 63 µs, its reduce units 62 to 74, the other projection
+32 to 86 with its reduce to 93, the fold, the MoE site 90 to 113, the
+router 113 to 155, the select, the group's end at 188 and the expert phase
+published at 193. The accumulate group: the accumulation 4 to 14, the fold
+to 28, the attention site to 36. So the chain's critical path after the
+attention-output fold is about 100 µs against the budget's 34: the router's
+24 units take 41 µs for 160 KB of rows and 50 KB of staged activations each
+(the next item, with a standalone probe), the site 24 and the select and
+finish about 15.
 
 ## The step protocol
 

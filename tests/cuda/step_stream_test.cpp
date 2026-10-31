@@ -198,6 +198,12 @@ void print_report(const char* title, const StreamReport& r, int layer) {
                 t.layer, t.name.c_str(), t.stream ? "stream " : "latency", t.begin_us, t.end_us, t.units, t.staged_mb, t.drained_us,
                 util * 100.0, t.grabs ? t.busy_us / t.grabs : 0.0, t.grabs, t.grabs ? t.handout_us / t.grabs : 0.0, t.lead_in_mb,
                 (t.stream && window > 0 && r.workers > 0) ? t.wait_us / (window * r.workers) * 100.0 : 0.0, t.ahead_mb, t.cursor_layer, t.look_blocked);
+    if (t.merged || t.classes.size() > 1) {  // the group's classes: when each ran, from the group's begin
+      static const char* const kinds[4] = {"compute", "reduce", "fixed", "accum"};
+      for (const ClassTiming& c : t.classes)
+        std::printf("            %-10s %-7s pool %3d (kind %2d) units %5u   %+8.1f .. %+8.1f us\n", c.phase_name.c_str(), kinds[c.kind & 3], c.pool, c.pool_kind,
+                    c.units, c.units && c.first_us > 0 ? c.first_us - t.begin_us : 0.0, c.units && c.last_us > 0 ? c.last_us - t.begin_us : 0.0);
+    }
   }
 }
 
@@ -962,10 +968,26 @@ DGPP_TEST(step_mhc_sites_match_the_production_kernels) {
   require(dx == 0, "the MoE site's normed rows differ from the production kernels'");
   require(d0 == 0, "the fused update differs from the production kernel's");
   require(h_beyond == 0, "the output projection did not read the attention site's row");
-  // The sites over the eight-layer rig for three steps: the pre chain, the stream parity and the
-  // arrival counters across layers and steps.
+  // The sites over the eight-layer rig: two streamers run one step each and must agree bitwise
+  // (the run list of every layer, the output streams, x), since the data flow has no race to
+  // show; then three steps for the pre chain, the stream parity and the arrival counters.
   auto rig8 = make_rig_mask(kLayers, kConsumeAll, /*tile_major=*/true);
   Streamer s8(rig8->dp, rig8->bases, rig8->plans);
+  {
+    Streamer s8b(rig8->dp, rig8->bases, rig8->plans);
+    const StreamReport ra = s8.run(cfg), rb = s8b.run(cfg);
+    require(ra.status == kStepOk && rb.status == kStepOk, "an eight-layer run ended on " + ra.status_text + " / " + rb.status_text);
+    int same_counts = 0;
+    for (int l = 0; l < kLayers; ++l) same_counts += s8.ctl()->run_count[l] == s8b.ctl()->run_count[l];
+    const size_t sn8 = static_cast<size_t>(rows) * 4 * rig8->cfg.hidden_size;
+    std::vector<uint16_t> a(sn8), b(sn8);
+    DGPP_CUDA_OK(cudaMemcpy(a.data(), s8.streams(0), sn8 * 2, cudaMemcpyDeviceToHost));
+    DGPP_CUDA_OK(cudaMemcpy(b.data(), s8b.streams(0), sn8 * 2, cudaMemcpyDeviceToHost));
+    size_t ds = 0;
+    for (size_t i = 0; i < sn8; ++i) ds += a[i] != b[i];
+    std::printf("   determinism over eight layers: run counts equal in %d of %d layers, output streams %zu of %zu differ\n", same_counts, kLayers, ds, sn8);
+    require(same_counts == kLayers && ds == 0, "two runs of the eight-layer rig differ: a race in the data flow");
+  }
   cfg.steps = 3;
   const StreamReport r8 = s8.run(cfg);
   require(r8.status == kStepOk && r8.steps_run == 3, std::string("the eight-layer run ended on ") + r8.status_text);

@@ -352,6 +352,64 @@ DevicePlan lower_plan(const std::vector<LayerPlan>& layers, uint32_t unit_bytes,
     dp.layers.push_back(dl);
   }
   dp.lead_units = lead;
+  // The merged groups. The hyper-connection sites and the router join the
+  // stream phase before them as gated classes: the MoE site and the router
+  // inside attn_out, behind its fold (triggered by the output projection's
+  // reduce units, which carry the attention update); the attention site
+  // inside the previous layer's accumulate, behind its fold. Measured as
+  // phases of their own (2026-10-31) each cost a boundary of about 5 µs and
+  // ran latency-bound while the memory idled; as classes they fill the
+  // stream phase's drain. A latency phase (no pool) is never merged.
+  auto has_pool = [&](const DevPhase& d, uint8_t kind, int site) {
+    for (int i = 0; i < d.n_pools; ++i) {
+      const DevPool& pool = dp.pools[static_cast<size_t>(d.pools[i])];
+      if (pool.kind == kind && (site < 0 || pool.site == site)) return true;
+    }
+    return false;
+  };
+  if (mhc)
+    for (size_t i = 0; i + 1 < dp.phases.size(); ++i) {
+      DevPhase& a = dp.phases[i];
+      if (a.kind != 1 || a.merged) continue;
+      // attn_out: its update-carrying projection first in the hand-out, the fold on its reduce.
+      int update_pool = -1;
+      for (int k = 0; k < a.n_pools; ++k)
+        if (dp.pools[static_cast<size_t>(a.pools[k])].update_site) update_pool = k;
+      if (update_pool >= 0 && a.fold_after_us > 0.f) {
+        std::swap(a.pools[0], a.pools[update_pool]);
+        if (a.routed == 0) a.routed = static_cast<int8_t>(update_pool);
+        else if (a.routed == update_pool) a.routed = 0;
+        a.fold_trigger = kTriggerReduce;
+        a.trigger_pool = a.pools[0];
+        DevPhase& b = dp.phases[i + 1];
+        if (b.layer == a.layer && b.kind == 1 && has_pool(b, kPoolMhc, 1)) {
+          a.merged = 1;
+          for (int k = 0; k < b.n_pools; ++k) {
+            DevPool& pool = dp.pools[static_cast<size_t>(b.pools[k])];
+            if (pool.kind == kPoolMhc) pool.gate_kind = kGateFold;
+          }
+          if (i + 2 < dp.phases.size()) {
+            DevPhase& c = dp.phases[i + 2];
+            if (c.layer == a.layer && c.kind == 1 && has_pool(c, kPoolRouter, -1)) {
+              a.merged = 2;
+              for (int k = 0; k < c.n_pools; ++k) {
+                DevPool& pool = dp.pools[static_cast<size_t>(c.pools[k])];
+                if (pool.kind == kPoolRouter) { pool.gate_kind = kGateSite; pool.gate_arg = 1; }
+              }
+            }
+          }
+        }
+      }
+      // accumulate: the next layer's attention site behind the layer's fold.
+      if (a.accumulate && a.fold_after_us > 0.f) {
+        a.fold_trigger = kTriggerAccumulate;
+        DevPhase& b = dp.phases[i + 1];
+        if (b.layer == a.layer + 1 && b.kind == 1 && b.n_pools == 1 && b.fixed_units == 0 && !b.waits_host && has_pool(b, kPoolMhc, 0)) {
+          a.merged = 1;
+          dp.pools[static_cast<size_t>(b.pools[0])].gate_kind = kGateFold;
+        }
+      }
+    }
   // The expert phases: a gate and up pool followed by a down pool merge, and
   // each down pool names the gate and up pool of its group kind as partner.
   if (experts || shared)
@@ -362,7 +420,7 @@ DevicePlan lower_plan(const std::vector<LayerPlan>& layers, uint32_t unit_bytes,
       if (!pool_is_gate_up(dp.pools[static_cast<size_t>(a.pools[a.routed])].kind) ||
           !pool_is_down(dp.pools[static_cast<size_t>(b.pools[b.routed])].kind))
         continue;
-      a.merged_next = 1;
+      a.merged = 1;
       for (int bi = 0; bi < b.n_pools; ++bi) {
         DevPool& down = dp.pools[static_cast<size_t>(b.pools[bi])];
         if (!pool_is_down(down.kind)) continue;

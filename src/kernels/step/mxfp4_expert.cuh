@@ -37,6 +37,29 @@ struct Mxfp4Group {
   int x_stride = 0;                // elements a row of x (0: the consumer's inner width)
 };
 
+#if defined(__CUDACC__)
+// Up to eight of a group's token ids, loaded once (independent loads, one
+// round trip) for a staging loop that walks the rows' 16-byte pieces: a
+// dependent load of the id per piece cost the fp8 projection unit twenty
+// memory round trips under a saturated memory (2026-10-31).
+struct GroupTokens8 {
+  int v[8];
+  __device__ __forceinline__ int at(int t) const {
+    int r = v[0];
+#pragma unroll
+    for (int i = 1; i < 8; ++i) r = t == i ? v[i] : r;
+    return r;
+  }
+};
+__device__ __forceinline__ GroupTokens8 group_tokens8(const Mxfp4Group& g, int first = 0) {
+  GroupTokens8 ids;
+  const int fallback = g.tokens[first < g.count ? first : 0];  // rows past the group stage a valid row again
+#pragma unroll
+  for (int t = 0; t < 8; ++t) ids.v[t] = first + t < g.count ? g.tokens[first + t] : fallback;
+  return ids;
+}
+#endif
+
 constexpr int kMxfp4GroupRows = 32;   // slots a group computes at once (four m16n8 tiles of eight)
 constexpr int kMxfp4UnitRows = 128;   // output rows a unit covers: eight warps, one 16-row tile each
 constexpr int kMxfp4Threads = 256;

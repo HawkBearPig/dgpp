@@ -41,6 +41,8 @@ enum DevGroupKind : uint8_t {
   kGroupTokens = 2,  // every token, slot i = token i
 };
 constexpr int kMaxPhasePools = 8;
+enum DevGateKind : uint8_t { kGateNone = 0, kGateFold = 1, kGateSite = 2 };
+enum DevFoldTrigger : uint8_t { kTriggerEnd = 0, kTriggerReduce = 1, kTriggerAccumulate = 2 };
 // A hyper-connection unit's coefficients: one token's streams read once for
 // this many logits, so a step's units fit one wave of the workers.
 constexpr int kMhcUnitCoeffs = 3;
@@ -64,6 +66,12 @@ struct DevPool {
   uint8_t group_kind = kGroupRouted;
   uint8_t site = 0;     // kPoolMhc: 0 the attention site, 1 the MoE site (the streams' and pre's buffer parity)
   uint8_t update_site = 0;  // kPoolFp8Matrix: its reduce units follow with the attention site's stream update, this pool's y the h
+  // The gate of the pool's compute units inside a merged group: the class is handed out only
+  // once it opens. kGateNone; kGateFold: the chain spun the group's fold; kGateSite: the site
+  // `gate_arg` of the unit's layer finished every token.
+  uint8_t gate_kind = 0;
+  uint8_t gate_arg = 0;
+  uint8_t pad3[2] = {0, 0};
   int32_t rows = 0;     // a consumer pool: the matrix's output rows (gate and up: I; down: H)
   int32_t k = 0;        // and its inner width (gate and up: H; down: I)
   int32_t grab = 1;     // units a worker takes at once: consecutive units of one group share their staged activations
@@ -88,10 +96,18 @@ struct DevPhase {
   uint8_t waits_host = 0;  // the phase reads rows a host gather publishes (section 2.11): it waits on the host's sequence
   uint8_t accumulate = 0;  // the ordered accumulation of the routed partials as worker units
   uint8_t update = 0;      // the MoE site's stream update inside the accumulation's units (h is the layer's y)
-  // The next phase runs inside this one: its units follow this phase's in
-  // the grab order, and a down unit of group g waits for the group's gate
-  // and up units, so the pair's drain tail is filled with down work.
-  uint8_t merged_next = 0;
+  // The next `merged` phases run inside this one as further unit classes
+  // behind its own, each class gated on what it depends on: a down unit of
+  // group g waits for the group's gate and up units, a hyper-connection site
+  // for the group's fold, the router for the site's finishes, so the latency
+  // segments fill the stream phase's drain instead of standing as phases.
+  uint8_t merged = 0;
+  // The group's fold (the first phase's fold_after_us) is spun by the chain
+  // when the trigger holds, and opens the kGateFold classes: kTriggerEnd (no
+  // merged phases: after the group), kTriggerReduce (pool `trigger_pool`'s
+  // reduce units complete), kTriggerAccumulate (this phase's units complete).
+  uint8_t fold_trigger = 0;
+  int32_t trigger_pool = -1;
   float latency_us = 0;    // a latency phase's modeled time
   float fold_after_us = 0; // the fold that follows the phase
   int32_t seg_begin = 0;   // fixed segments

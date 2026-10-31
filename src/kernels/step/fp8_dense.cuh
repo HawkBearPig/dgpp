@@ -365,9 +365,11 @@ __device__ void fp8_matrix_split_unit(const uint8_t* __restrict__ w, const float
   if (stage) {  // consecutive units of one matrix reuse the group's staged rows
     const size_t xs = g.x_stride ? static_cast<size_t>(g.x_stride) : static_cast<size_t>(kK);
     constexpr int per_row16 = kK / 8;  // 16-byte pieces a row over the whole width
+    static_assert(kFp8SplitRows <= 8, "the staged rows' token ids are loaded once, eight at most");
+    const GroupTokens8 ids = group_tokens8(g);
     for (int q = threadIdx.x; q < kFp8SplitRows * per_row16; q += kMxfp4Threads) {
       const int t = q / per_row16, c16 = q % per_row16;
-      const int tok = t < g.count ? g.tokens[t] : g.tokens[0];
+      const int tok = ids.at(t);
       const int code = c16 * 8, pp = code / kPartK, kk = code - pp * kPartK;
       cp_async_16(act + (static_cast<size_t>(pp) * kFp8SplitRows + t) * kStride + kk, x + static_cast<size_t>(tok) * xs + code);
     }
@@ -497,9 +499,11 @@ __device__ void fp8_matrix_staged_unit(const uint8_t* __restrict__ w, const floa
   {
     const size_t xs = g.x_stride ? static_cast<size_t>(g.x_stride) : static_cast<size_t>(kK);
     const int chunks16 = codes / 8;  // 16-byte pieces a row
+    static_assert(kFp8StagedRows <= 8, "the staged rows' token ids are loaded once, eight at most");
+    const GroupTokens8 ids = group_tokens8(g);
     for (int q = threadIdx.x; q < kFp8StagedRows * chunks16; q += kMxfp4Threads) {
       const int t = q / chunks16, c16 = q % chunks16;
-      const int tok = t < g.count ? g.tokens[t] : g.tokens[0];
+      const int tok = ids.at(t);
       cp_async_16(s_x + t * stride + c16 * 8, x + static_cast<size_t>(tok) * xs + static_cast<size_t>(c_begin) * 32 + c16 * 8);
     }
     cp_async_commit();

@@ -350,6 +350,43 @@ StreamReport Streamer::run(const StreamerConfig& cfg) {
       t.cursor_layer = ctl_->cursor_begin[P] < dp_.phases.size() ? dp_.phases[ctl_->cursor_begin[P]].layer : -1;
       t.look_blocked = ctl_->look_blocked[P];
       t.grabs = ctl_->grabs[P];
+      t.merged = ph.merged;
+      // The group's classes as the kernel builds them (phase order; a pool's compute units, its
+      // reduce units, the fixed bytes; an accumulation's chunks), with their traced windows.
+      if (ph.kind == 1) {
+        const unsigned rows = ctl_->rows;
+        int n = 0;
+        auto add = [&](int ip, int kind, int pool, unsigned units) {
+          if (n >= kStepMaxClasses) return;
+          ClassTiming c;
+          c.phase = ip;
+          c.phase_name = phase_names_[static_cast<size_t>(ip)];
+          c.kind = kind;
+          c.pool = pool;
+          c.pool_kind = pool >= 0 ? dp_.pools[static_cast<size_t>(pool)].kind : -1;
+          c.units = units;
+          const unsigned long long f = ctl_->cls_first[P][n], e = ctl_->cls_last[P][n];
+          c.first_us = f != ~0ull ? static_cast<double>(f - origin) / 1e3 : 0.0;
+          c.last_us = e ? static_cast<double>(e - origin) / 1e3 : 0.0;
+          t.classes.push_back(c);
+          ++n;
+        };
+        for (int ip = P; ip <= P + ph.merged; ++ip) {
+          const DevPhase& iph = dp_.phases[static_cast<size_t>(ip)];
+          const int il = iph.layer;
+          if (iph.accumulate) { add(ip, 3, -1, (rows * static_cast<unsigned>(hidden_) + kStepAccChunk - 1) / kStepAccChunk); continue; }
+          for (int rp = 0; rp < 2; ++rp)
+            for (int i = 0; i < iph.n_pools; ++i) {
+              if ((rp == 0) == (i == iph.routed)) continue;
+              const DevPool& gp = dp_.pools[static_cast<size_t>(iph.pools[i])];
+              const unsigned groups = gp.group_kind == kGroupRouted ? static_cast<unsigned>(ctl_->run_count[il]) : 1u;
+              const unsigned per_group = gp.kind == kPoolMhc ? static_cast<unsigned>(gp.units_per_group) * rows : static_cast<unsigned>(gp.units_per_group);
+              if (groups * per_group != 0u) add(ip, 0, iph.pools[i], groups * per_group);
+              if (gp.kind == kPoolFp8Matrix && gp.slabs > 1) add(ip, 1, iph.pools[i], (static_cast<unsigned>(gp.rows) * rows + kStepAccChunk - 1) / kStepAccChunk);
+            }
+          if (iph.fixed_units) add(ip, 2, -1, iph.fixed_units);
+        }
+      }
       first = std::min(first, ctl_->stamp_begin[P]);
       last = std::max(last, ctl_->stamp_end[P]);
       for (int i = 0; i < ph.seg_count; ++i) bytes += static_cast<double>(dp_.segments[static_cast<size_t>(ph.seg_begin + i)].bytes);

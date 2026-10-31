@@ -48,6 +48,20 @@ struct StreamerConfig {
   std::function<void(int step)> between_steps;  // host work done while the kernel waits for step `step`
 };
 
+// A unit class of a published group (kernels/step/stream.cu): its phase, kind
+// (0 compute, 1 reduce, 2 fixed bytes, 3 accumulate), pool, units and the
+// window from its first hand-out to its last completion, from the step's origin.
+struct ClassTiming {
+  int phase = 0;
+  std::string phase_name;
+  int kind = 0;
+  int pool = -1;
+  int pool_kind = 0;
+  unsigned units = 0;
+  double first_us = 0;
+  double last_us = 0;
+};
+
 struct PhaseTiming {
   int layer = 0;
   int phase = 0;        // index into DevicePlan::phases
@@ -67,6 +81,8 @@ struct PhaseTiming {
   int cursor_layer = -1;  // the layer the lead's cursor stood in when the chain entered the phase (-1: the sequence's end)
   unsigned look_blocked = 0;  // workers that found the cursor past the lookahead while this phase was published
   unsigned grabs = 0;
+  int merged = 0;                     // phases merged into this one's group
+  std::vector<ClassTiming> classes;   // the group's unit classes, in hand-out order (the published phase only)
 };
 
 struct StreamReport {
