@@ -31,6 +31,7 @@ enum DevPoolKind : uint8_t {
   kPoolMxfp4RowGateUp = 5,  // MXFP4 gate and up over the checkpoint's row-major layout, through the L2 bridge
   kPoolMxfp4RowDown = 6,    // MXFP4 down, row-major
   kPoolFp8Matrix = 7,       // one fp8 projection, row-major with F32 block scales: y = W x for every token
+  kPoolRouter = 8,          // the router: bf16 [experts, hidden] with its F32 bias, units of 16 expert rows over every token, scores out
 };
 // Whose slots a pool's group holds.
 enum DevGroupKind : uint8_t {
@@ -121,7 +122,8 @@ struct DevicePlan {
   uint32_t lead_units = 0;  // fixed units over the whole plan
   uint32_t proj_elems = 0;  // the projection buffer: every kPoolFp8Matrix pool's y [kStepMaxRows, rows], bf16
   uint32_t part_elems = 0;  // the partials scratch: the widest phase's slabs x [kStepMaxRows, rows] fp32, reused by every phase
-  int32_t max_k = 0;        // the widest inner width a consumer reads its activations at
+  int32_t max_k = 0;
+  int32_t n_experts = 0;   // the router pool's experts (0: no router pool)        // the widest inner width a consumer reads its activations at
   // Bytes a step reads at the plan's shape, by class, for the rate.
   double fixed_bytes = 0;
   double router_bytes = 0;
@@ -137,7 +139,7 @@ struct DevicePlan {
 // accumulate phase becomes worker units; without, every pool is bytes. The
 // mask form picks the consumer classes one by one, for attribution: the
 // routed experts, the shared expert and the fp8 projections.
-constexpr unsigned kConsumeExperts = 1u, kConsumeShared = 2u, kConsumeProjections = 4u, kConsumeAll = 7u;
+constexpr unsigned kConsumeExperts = 1u, kConsumeShared = 2u, kConsumeProjections = 4u, kConsumeRouter = 8u, kConsumeAll = 15u;
 DevicePlan lower_plan(const std::vector<LayerPlan>& layers, uint32_t unit_bytes, unsigned consumer_mask);
 inline DevicePlan lower_plan(const std::vector<LayerPlan>& layers, uint32_t unit_bytes, bool consumers = false) {
   return lower_plan(layers, unit_bytes, consumers ? kConsumeAll : 0u);

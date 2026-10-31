@@ -1260,7 +1260,7 @@ set_tests_properties(fabric_serve_test_wake PROPERTIES ENVIRONMENT "DGPP_TEST_ST
 # the deadline and poison exits. Needs the GPU and about 4 GB free.
 add_executable(step_stream_test tests/cuda/step_stream_test.cpp tests/cuda/step_reference_kernels.cu)
 target_include_directories(step_stream_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
-target_link_libraries(step_stream_test PRIVATE dgpp_step_stream dgpp_step_dsv41 CUDA::cudart Threads::Threads)
+target_link_libraries(step_stream_test PRIVATE dgpp_step_stream dgpp_step_dsv41 dgpp_kernels CUDA::cudart Threads::Threads)
 dgpp_set_common(step_stream_test)
 add_test(NAME step_stream_test COMMAND step_stream_test)
 

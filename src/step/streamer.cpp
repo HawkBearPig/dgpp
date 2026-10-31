@@ -73,6 +73,7 @@ Streamer::Streamer(const DevicePlan& dp, const std::vector<const uint8_t*>& base
     if (pool_is_gate_up(pool.kind) && pool.kind != kPoolFp8GateUp) { hidden_ = pool.k; inter_ = pool.rows; mxfp4 = true; }
     else if (pool.kind == kPoolFp8GateUp) { if (!hidden_) hidden_ = pool.k; if (!inter_) inter_ = pool.rows; fp8 = true; }
     else if (pool.kind == kPoolFp8Matrix || pool.kind == kPoolFp8Down) fp8 = true;
+    else if (pool.kind == kPoolRouter) { fp8 = true; n_experts_ = pool.rows; if (!step_stream_has_router(pool.k)) throw std::invalid_argument("Streamer: the kernel has no router unit for width " + std::to_string(pool.k)); }
   }
   if (consumers_) {
     if (mxfp4 && !step_stream_has_mxfp4_consumer(hidden_, inter_))
@@ -90,6 +91,12 @@ Streamer::Streamer(const DevicePlan& dp, const std::vector<const uint8_t*>& base
     // width from the same buffer, so it holds the widest.
     x_stride_ = std::max(hidden_, dp.max_k);
     DGPP_CUDA_OK(cudaMalloc(&x_, static_cast<size_t>(kStepMaxRows) * x_stride_ * 2));
+    if (n_experts_) {
+      DGPP_CUDA_OK(cudaMalloc(&scores_, static_cast<size_t>(kStepMaxRows) * n_experts_ * 4));
+      DGPP_CUDA_OK(cudaMalloc(&biased_, static_cast<size_t>(kStepMaxRows) * n_experts_ * 4));
+      DGPP_CUDA_OK(cudaMemset(scores_, 0, static_cast<size_t>(kStepMaxRows) * n_experts_ * 4));
+      DGPP_CUDA_OK(cudaMemset(biased_, 0, static_cast<size_t>(kStepMaxRows) * n_experts_ * 4));
+    }
     if (dp.proj_elems) {
       DGPP_CUDA_OK(cudaMalloc(&proj_, static_cast<size_t>(dp.proj_elems) * 2));
       DGPP_CUDA_OK(cudaMemset(proj_, 0, static_cast<size_t>(dp.proj_elems) * 2));
@@ -114,6 +121,8 @@ Streamer::~Streamer() {
   cudaFreeHost(desc_);
   cudaFreeHost(verdict_);
   cudaFreeHost(host_seq_);
+  if (scores_) cudaFree(scores_);
+  if (biased_) cudaFree(biased_);
   cudaFree(const_cast<uint8_t**>(bases_));
   cudaFree(layers_);
   cudaFree(phases_);
@@ -164,6 +173,12 @@ StreamReport Streamer::run(const StreamerConfig& cfg) {
   p.lookahead_layers = cfg.lookahead_layers;
   p.lead_bytes_per_us = cfg.lead_bytes_per_us;
   p.route_pool = cfg.route_pool;
+  p.scores = scores_;
+  p.biased = biased_;
+  p.n_experts = n_experts_;
+  p.router_mode = cfg.router_mode;
+  p.routed_scaling = cfg.routed_scaling_factor;
+  p.norm_topk = cfg.norm_topk ? 1 : 0;
   p.lead_cap_bytes = cfg.lead_cap_bytes;
   p.max_leaders = cfg.max_leaders;
   p.deadline_ns = static_cast<unsigned long long>(cfg.deadline_s * 1e9);
@@ -312,6 +327,8 @@ StreamReport Streamer::run(const StreamerConfig& cfg) {
       r.phases.push_back(std::move(t));
     }
     r.layer_us.push_back(static_cast<double>(last - first) / 1e3);
+    r.route_select_us.push_back(static_cast<double>(ctl_->route_select_ns[l]) / 1e3);
+    r.route_finish_us.push_back(static_cast<double>(ctl_->route_finish_ns[l]) / 1e3);
     r.layer_bytes.push_back(bytes);
   }
   r.lead_bytes = static_cast<double>(ctl_->pf_bytes);

@@ -242,6 +242,36 @@ layer with an 8 MB lead and 97.0 without it, over 47 workers. A 50 µs
 deadline ends a run of 800 µs phases inside a millisecond with the phase in
 its status, and a poison set 200 ms into a long run ends it then.
 
+## The router
+
+The router is a consumer pool (`kPoolRouter`): the bf16 matrix of expert
+rows with its F32 bias, in units of 16 rows, one group of every token. A
+unit stages the tokens' activations in shared memory and runs the
+production router's dot (`kernels/glm_moe.cu`) op for op: one warp per
+expert row, each lane its strided 16-byte vectors of the row, eight fmas a
+vector in the file's order, then the xor tree. A warp carries two rows and
+up to eight tokens through one read of each activation vector, and every
+(row, token) chain is the production's, so the scores are bitwise its;
+sqrt-softplus or sigmoid then the bias on the selection key, as the family
+configures. When the router phase completes, the chain runs the production
+select over the scores, one warp per token: top-k rounds of argmax with the
+lower id on ties, the ids sorted ascending, the weights normalized with
+per-element division and scaled. The run list, each expert's slots and the
+slot weights follow, and the accumulation phase folds the routed partials
+with those weights and the shared slot with one. (Holding the lead while the chain
+routes, so its writes and fence do not wait on a saturated memory, halved
+the select's time but cost the lead as much as it saved, and is not kept.)
+
+`step_router_matches_the_production_kernel` runs the step and
+`launch_moe_router` on the same activations and router weights over eight
+layers: every score bitwise, every pick and every weight equal. The real
+router costs the layer about two points against the synthetic one at the
+measured expert count: its phase takes about 28 µs where the byte units
+took 11 (24 units of about 21 µs, the units latency-bound at one block an
+SM, while 23 idle workers lead through it), and the chain's select and
+finish about 7 and 5 µs. The step kernel uses the full 255 registers a
+thread.
+
 ## The step protocol
 
 The kernel runs steps, not launches. The host and the kernel share two

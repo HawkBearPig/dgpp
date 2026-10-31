@@ -48,7 +48,7 @@ int add_pool(DevicePlan& dp, DevPhase& d, const DevPool& pool) {
 DevicePlan lower_plan(const std::vector<LayerPlan>& layers, uint32_t unit_bytes, unsigned consumer_mask) {
   if (unit_bytes == 0 || unit_bytes % 512 != 0) throw std::invalid_argument("lower_plan: unit_bytes must be a multiple of 512");
   const bool experts = (consumer_mask & kConsumeExperts) != 0, shared = (consumer_mask & kConsumeShared) != 0,
-             projections = (consumer_mask & kConsumeProjections) != 0;
+             projections = (consumer_mask & kConsumeProjections) != 0, router = (consumer_mask & kConsumeRouter) != 0;
   const bool consumers = consumer_mask != 0;
   DevicePlan dp;
   dp.unit_bytes = unit_bytes;
@@ -104,7 +104,7 @@ DevicePlan lower_plan(const std::vector<LayerPlan>& layers, uint32_t unit_bytes,
           pool.slabs = projection_slabs(pool.k);
           pool.unit_rows = kProjectionUnitRows;
           pool.units_per_group = ((pool.rows + pool.unit_rows - 1) / pool.unit_rows) * pool.slabs;  // the reduce units follow at run time
-          pool.grab = 1;
+          pool.grab = 1;  // (two a grab measured 1.5 points worse and noisier on 2026-10-31: the fewer, longer grabs ragged the tail)
           pool.out_offset = dp.proj_elems;
           dp.proj_elems += static_cast<uint32_t>(pool.rows) * kStepRows;
           if (pool.slabs > 1) {
@@ -115,6 +115,38 @@ DevicePlan lower_plan(const std::vector<LayerPlan>& layers, uint32_t unit_bytes,
           add_pool(dp, d, pool);
           shared_pool.push_back(&r);
           shared_pool.push_back(scales);
+        }
+        // The router as a consumer pool: its bf16 matrix and F32 bias, units of
+        // 16 expert rows, the scores of every token out; the chain selects.
+        if (router) {
+          const Range* weights = nullptr;
+          const Range* bias = nullptr;
+          for (const Range* r : by_offset) {
+            if (r->phase != static_cast<int>(ph) || r->consumer != Consumer::Router || r->source != Source::Resident || r->reads == 0) continue;
+            if (r->format == Format::Bf16 && r->rows > 0 && r->cols > 0) weights = r;
+            else if (r->format == Format::F32) bias = r;
+          }
+          if (weights && bias && weights->rows % 16 == 0) {
+            DevPool pool;
+            pool.kind = kPoolRouter;
+            pool.group_kind = kGroupTokens;
+            pool.groups = 1;
+            pool.stride = 0;
+            pool.base = std::min(weights->offset, bias->offset);
+            pool.bytes = std::max(align_grant(weights->offset + weights->bytes), align_grant(bias->offset + bias->bytes)) - pool.base;
+            pool.offsets[0] = weights->offset - pool.base;
+            pool.offsets[1] = bias->offset - pool.base;
+            pool.rows = static_cast<int32_t>(weights->rows);
+            pool.k = static_cast<int32_t>(weights->cols);
+            pool.unit_rows = 16;  // two expert rows a warp, the activations read once for both
+            pool.units_per_group = pool.rows / 16;
+            pool.grab = 1;
+            dp.fixed_bytes += static_cast<double>(weights->bytes_per_read()) * weights->reads + static_cast<double>(bias->bytes_per_read()) * bias->reads;
+            dp.n_experts = std::max(dp.n_experts, pool.rows);
+            add_pool(dp, d, pool);
+            shared_pool.push_back(weights);
+            shared_pool.push_back(bias);
+          }
         }
         const Range* payload[3] = {nullptr, nullptr, nullptr};
         const Range* scales[3] = {nullptr, nullptr, nullptr};

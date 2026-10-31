@@ -1003,6 +1003,17 @@ cannot count them. The GB10 exposes no DRAM-side counters to `ncu`, so the
 L2 miss count is the deepest observable, and the floor keeps the ceiling
 it has.
 
+*The router landed the next day* as the fused chain's first real piece:
+a consumer pool computing the production router's dot in its lane order,
+the chain's select op for op, every score, pick and weight bitwise the
+production kernel's over eight layers (`step_router_matches_the_production_kernel`).
+It costs about two points of the layer at the measured expert count, its
+units latency-bound at one block an SM, and it exposed two more facts: the
+step kernel runs at the full 255 registers a thread, and the chain's
+writes and fences crawl while the lead saturates the memory (holding the
+lead while the chain routes halved the select's time and cost the lead as
+much as it saved, so it is not kept).
+
 The order of work was a measurement sprint of the three experiments that
 decide a direction (H1's routing predictability, H2's per-SM rate by form,
 H6's sector efficiency), run the same evening with production down at the
@@ -2377,6 +2388,20 @@ area, untracked.
       context the consumer reads KV at 90 percent of the ceiling.
 - [ ] Recurrences in replay form: KDA, GDN, convolutions, the PLE conv.
       Gate: forced rejection at every depth equals plain decode bitwise.
+- [ ] The router as a consumer pool, bitwise the production router's
+      (2026-10-31): units of 16 expert rows, two a warp, in the production
+      kernel's lane order over staged activations, the chain's select op
+      for op, real slot weights in the accumulation.
+      `step_router_matches_the_production_kernel` holds
+      every score, pick and weight bitwise over eight layers. Cost at the
+      measured expert count: about two points of the layer (the phase 28
+      µs against the byte units' 11, the select and finish 7 and 5), the
+      layer at 81 to 82 percent of its floor. Owed: the units are
+      latency-bound at one block an SM (21 µs for two rows by five tokens
+      where the arithmetic is a few), so the phase is 28 µs where the
+      fused chain budgets 12 for update, mHC, router and slot order; the
+      mma form would be ten times cheaper but moves the dot's rounding,
+      so it waits on a near-tie policy for the step engine.
 - [ ] Fused latency phases: fold consumer with residual update and mHC or
       GR mix, norm plus router plus slot order, selection, the a8
       quantizer, the EXL3 rotation.

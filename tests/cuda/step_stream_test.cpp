@@ -30,6 +30,8 @@
 #include "step/dsv41/arena.hpp"
 #include "step/dsv41/plan.hpp"
 #include "step/streamer.hpp"
+#include "kernels/glm_moe_launch.hpp"
+#include "models/glm/moe.hpp"
 #include "step_reference_host.hpp"
 
 namespace {
@@ -110,8 +112,9 @@ std::unique_ptr<Rig> make_rig_mask(int layers, unsigned consumer_mask, bool tile
       // Then the formats whose bytes must decode finitely: e8m0 scales in
       // [112, 136), e4m3 payloads as normals, F32 scale grids in [0.5, 2).
       struct Pass { Format format; StepFillMode mode; unsigned lo, span, seed; };
-      const Pass passes[3] = {{Format::ScaleE8m0, kFillBytes, 112, 24, 0x7f4au}, {Format::Fp8E4m3, kFillE4m3, 0, 0, 0x1357u},
-                              {Format::ScaleF32, kFillF32Scales, 0, 0, 0x2468u}};
+      const Pass passes[5] = {{Format::ScaleE8m0, kFillBytes, 112, 24, 0x7f4au}, {Format::Fp8E4m3, kFillE4m3, 0, 0, 0x1357u},
+                              {Format::ScaleF32, kFillF32Scales, 0, 0, 0x2468u}, {Format::Bf16, kFillBf16, 0, 0, 0x3a5fu},
+                              {Format::F32, kFillF32Scales, 0, 0, 0x5b7du}};
       for (const Pass& pass : passes) {
         h_off.clear();
         h_bytes.clear();
@@ -480,13 +483,15 @@ void consumers_match_the_reference(bool tile_major) {
     ++out_n_live;
     if (!step_ref::partial_ok(out[i], out_r[i], out_m[i])) ++out_bad;
   }
-  // The accumulation, in the kernel's fma order, from the consumer's own partials.
+  // The accumulation, in the kernel's fma order, from the consumer's own partials with the
+  // step's slot weights (the router's normalized weights, which step_router_matches_the_production_kernel
+  // holds bitwise to the production router's, and 1 for the shared slot).
   size_t y_bad = 0;
+  const float* sw = ctl->slot_weight[L];
   for (int t = 0; t < cfg.rows; ++t)
     for (int c = 0; c < H; ++c) {
       float a = 0.f;
-      for (int j = 0; j < cfg.top_k; ++j) a = std::fma(1.0f / cfg.top_k, out[step_out_index(t * spt + j, c, H, spt)], a);
-      a = std::fma(1.0f, out[step_out_index(t * spt + cfg.top_k, c, H, spt)], a);
+      for (int j = 0; j < spt; ++j) a = std::fma(sw[t * spt + j], out[step_out_index(t * spt + j, c, H, spt)], a);
       if (float_to_bf16_bits(a) != y[static_cast<size_t>(t) * H + c]) ++y_bad;
     }
   std::printf("   %s experts, layer %d, %d routed and the shared over %d rows: act %zu exact, %zu within the envelope, %zu beyond of %zu; partials %zu beyond the bound of %zu; y %zu of %zu differ from the ordered sum\n",
@@ -553,8 +558,9 @@ void print_layers(const StreamReport& r) {
         exp_drain = t.drained_us;
       } else if (t.stream && t.units > 0 && t.name != "accumulate" && t.name != "down") fixed += t.end_us - t.begin_us;
     }
-    std::printf("      layer %zu: fixed %5.1f us, experts %5.1f us (busy %4.1f %%, waits %4.1f %%, drain %5.1f us), other %5.1f us of %6.1f, lead %5.1f MB\n",
-                l, fixed, experts, exp_busy, exp_wait, exp_drain, (end - begin) - fixed - experts, end - begin, lead);
+    std::printf("      layer %zu: fixed %5.1f us, experts %5.1f us (busy %4.1f %%, waits %4.1f %%, drain %5.1f us), other %5.1f us of %6.1f, lead %5.1f MB, route select %4.1f finish %4.1f us\n",
+                l, fixed, experts, exp_busy, exp_wait, exp_drain, (end - begin) - fixed - experts, end - begin, lead,
+                l < r.route_select_us.size() ? r.route_select_us[l] : 0.0, l < r.route_finish_us.size() ? r.route_finish_us[l] : 0.0);
   }
 }
 
@@ -595,11 +601,12 @@ DGPP_TEST(step_consumers_rate_at_the_design_chain) {
   const double row = consumers_rate(/*tile_major=*/false);
   const double tile = consumers_rate(/*tile_major=*/true);
 
-  // Interim gates at the measured plateau less the run-to-run noise (tile-major
-  // 86 to 90 percent, row-major 78 to 88 with every weight computed; the
-  // fused chain's structure is where the rest comes back, section 1.3).
-  require(tile >= 82.0, "the tile-major consumers' layers stream under 82 percent of the ceiling");
-  require(row >= 74.0, "the row-major consumers' layers stream under 74 percent of the ceiling");
+  // Interim gates at the measured level less the run-to-run noise, clean
+  // (production down, the clock locked, a warm-up run): tile-major 81 to 82
+  // percent and row-major 76 to 77 with every weight computed and the real
+  // router (2026-10-31); the plan's 95 is the goal, section 1.4 the account.
+  require(tile >= 79.0, "the tile-major consumers' layers stream under 79 percent of the ceiling");
+  require(row >= 73.0, "the row-major consumers' layers stream under 73 percent of the ceiling");
 }
 
 // Which consumers cost the layer its share of the floor: the step with the
@@ -631,6 +638,108 @@ DGPP_TEST(step_consumers_attribution) {
   consumers_rate_mask(kConsumeShared | kConsumeProjections, "the shared expert and projections as consumers:");
   consumers_rate_mask(kConsumeProjections, "the projections as consumers:");
   consumers_rate_mask(kConsumeAll, "every consumer:");
+}
+
+// The step's routing against the production router kernel on the same
+// activations and router weights: the run list, every expert's slots and
+// the slot weights must equal launch_moe_router's ids and weights bitwise
+// (the dots in the production's lane order, the select op for op).
+DGPP_TEST(step_router_matches_the_production_kernel) {
+  auto rig = make_rig_mask(kLayers, kConsumeAll, /*tile_major=*/true);
+  Streamer s(rig->dp, rig->bases, rig->plans);
+  require(s.n_experts() == 384, "the plan has a router pool of 384 experts");
+  StreamerConfig cfg = design_config();
+  cfg.steps = 1;
+  cfg.rows = 5;
+  cfg.top_k = 6;
+  const StreamReport r = s.run(cfg);
+  require(r.status == kStepOk, std::string("the kernel ended on ") + r.status_text);
+  const int rows = cfg.rows, top_k = cfg.top_k, spt = top_k + 1, E = 384, H = rig->cfg.hidden_size;
+  // The production kernel on a compact copy of x (the step's rows are at x_stride).
+  uint16_t* xc = nullptr;
+  DGPP_CUDA_OK(cudaMalloc(&xc, static_cast<size_t>(rows) * H * 2));
+  DGPP_CUDA_OK(cudaMemcpy2D(xc, static_cast<size_t>(H) * 2, s.x(), static_cast<size_t>(s.x_stride()) * 2, static_cast<size_t>(H) * 2, rows,
+                            cudaMemcpyDeviceToDevice));
+  int32_t* d_ids = nullptr;
+  float *d_w = nullptr, *d_sc = nullptr, *d_bs = nullptr;
+  DGPP_CUDA_OK(cudaMalloc(&d_ids, static_cast<size_t>(rows) * top_k * 4));
+  DGPP_CUDA_OK(cudaMalloc(&d_w, static_cast<size_t>(rows) * top_k * 4));
+  DGPP_CUDA_OK(cudaMalloc(&d_sc, static_cast<size_t>(rows) * E * 4));
+  DGPP_CUDA_OK(cudaMalloc(&d_bs, static_cast<size_t>(rows) * E * 4));
+  GlmMoeConfig mcfg;
+  mcfg.hidden = H;
+  mcfg.n_experts = E;
+  mcfg.top_k = top_k;
+  mcfg.routed_scaling_factor = cfg.routed_scaling_factor;
+  mcfg.norm_topk_prob = cfg.norm_topk;
+  mcfg.router_mode = MoeRouterMode::SqrtSoftplusBias;
+  size_t layers_checked = 0, bad_ids = 0, bad_w = 0;
+  for (int l = 0; l < kLayers; ++l) {
+    const Range* wr = nullptr;
+    const Range* br = nullptr;
+    for (const Range& rg : rig->plans[static_cast<size_t>(l)].ranges) {
+      if (rg.consumer != Consumer::Router || rg.source != Source::Resident) continue;
+      if (rg.format == Format::Bf16) wr = &rg; else if (rg.format == Format::F32) br = &rg;
+    }
+    if (!wr || !br) continue;
+    const uint16_t* gate = reinterpret_cast<const uint16_t*>(rig->bases[static_cast<size_t>(l)] + wr->offset);
+    const float* bias = reinterpret_cast<const float*>(rig->bases[static_cast<size_t>(l)] + br->offset);
+    launch_moe_router(xc, gate, bias, d_ids, d_w, d_sc, d_bs, mcfg, rows, nullptr, nullptr, /*allow_tiled=*/false);
+    DGPP_CUDA_OK(cudaDeviceSynchronize());
+    std::vector<int32_t> ids(static_cast<size_t>(rows) * top_k);
+    std::vector<float> w(static_cast<size_t>(rows) * top_k);
+    DGPP_CUDA_OK(cudaMemcpy(ids.data(), d_ids, ids.size() * 4, cudaMemcpyDeviceToHost));
+    DGPP_CUDA_OK(cudaMemcpy(w.data(), d_w, w.size() * 4, cudaMemcpyDeviceToHost));
+    // The step's picks by token from the groups: expert run_list[g] at slot = row * spt + pick.
+    std::vector<int32_t> step_ids(static_cast<size_t>(rows) * top_k, -1);
+    const StepCtl* ctl = s.ctl();
+    for (int g = 0; g < ctl->run_count[l]; ++g)
+      for (int n = 0; n < ctl->group_count[l][g]; ++n) {
+        const int slot = ctl->group_slots[l][g][n], row = slot / spt, pick = slot % spt;
+        if (row < rows && pick < top_k) step_ids[static_cast<size_t>(row) * top_k + pick] = ctl->run_list[l][g];
+      }
+    size_t layer_bad = 0;
+    for (int t = 0; t < rows; ++t)
+      for (int i = 0; i < top_k; ++i) {
+        if (step_ids[static_cast<size_t>(t) * top_k + i] != ids[static_cast<size_t>(t) * top_k + i]) { ++bad_ids; ++layer_bad; }
+        const float sw = ctl->slot_weight[l][t * spt + i];
+        if (std::memcmp(&sw, &w[static_cast<size_t>(t) * top_k + i], 4) != 0) ++bad_w;
+      }
+    if (layer_bad) {
+      std::printf("   layer %d: %zu ids differ (%d groups);", l, layer_bad, ctl->run_count[l]);
+      for (int t = 0; t < rows; ++t) {
+        bool diff = false;
+        for (int i = 0; i < top_k; ++i) diff = diff || step_ids[static_cast<size_t>(t) * top_k + i] != ids[static_cast<size_t>(t) * top_k + i];
+        if (!diff) continue;
+        std::printf(" row %d step [", t);
+        for (int i = 0; i < top_k; ++i) std::printf("%d ", step_ids[static_cast<size_t>(t) * top_k + i]);
+        std::printf("] production [");
+        for (int i = 0; i < top_k; ++i) std::printf("%d ", ids[static_cast<size_t>(t) * top_k + i]);
+        std::printf("]");
+        break;
+      }
+      std::printf("\n");
+    }
+    ++layers_checked;
+    if (l == kLayers - 1) {  // the step's scores buffer holds the last layer's: compare every score
+      std::vector<float> ps(static_cast<size_t>(rows) * E), ss(static_cast<size_t>(rows) * E);
+      DGPP_CUDA_OK(cudaMemcpy(ps.data(), d_sc, ps.size() * 4, cudaMemcpyDeviceToHost));
+      DGPP_CUDA_OK(cudaMemcpy(ss.data(), s.scores(), ss.size() * 4, cudaMemcpyDeviceToHost));
+      size_t exact = 0;
+      double worst = 0;
+      for (size_t i = 0; i < ps.size(); ++i) {
+        if (std::memcmp(&ps[i], &ss[i], 4) == 0) ++exact; else worst = std::max(worst, std::fabs(static_cast<double>(ps[i]) - ss[i]));
+      }
+      std::printf("   router scores, layer %d: %zu of %zu bitwise, worst difference %.3g (production %.6f %.6f %.6f, step %.6f %.6f %.6f)\n", l, exact,
+                  ps.size(), worst, ps[0], ps[1], ps[2], ss[0], ss[1], ss[2]);
+    }
+  }
+  std::printf("   router: %zu layers, %d rows, top %d against the production kernel: %zu ids differ, %zu weights differ\n", layers_checked, rows, top_k,
+              bad_ids, bad_w);
+  cudaFree(xc); cudaFree(d_ids); cudaFree(d_w); cudaFree(d_sc); cudaFree(d_bs);
+  require(layers_checked == static_cast<size_t>(kLayers), "every layer has a router pool");
+  require(bad_ids == 0, "the step's picks differ from the production router's");
+  require(bad_w == 0, "the step's slot weights differ from the production router's");
 }
 
 DGPP_TEST(step_consumers_lead_sweep) {

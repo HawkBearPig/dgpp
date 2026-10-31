@@ -64,6 +64,10 @@ struct alignas(128) StepCtl {
   int32_t shared_tokens[kStepMaxLayers][32];
   unsigned shared_gate_done[kStepMaxLayers];
   int32_t token_slots[32];  // the token group: slot i = token i
+  // The accumulation's weight of every slot of the running step, by layer: a token's routed
+  // picks in ascending expert order (the router's normalized, scaled weights, or 1 / top_k
+  // from the synthetic router), then 1 for its shared slot. slot = row * (top_k + 1) + pick.
+  float slot_weight[kStepMaxLayers][32 * 9];
   unsigned pool_done[kStepMaxLayers][kStepMaxPhases];  // kPoolFp8Matrix with slabs: compute units of the pool completed this step, by layer and pool index
   unsigned long long stamp_begin[kStepMaxPhases];  // the last pass: the phase's publish or latency start
   unsigned long long stamp_end[kStepMaxPhases];    // the last pass: its units done, the fold after it included
@@ -78,6 +82,8 @@ struct alignas(128) StepCtl {
   unsigned long long ahead_begin[kStepMaxPhases];   // the last pass: the lead's staged bytes not yet consumed when the chain entered the phase
   unsigned cursor_begin[kStepMaxPhases];            // the last pass: the phase the lead's cursor stood in when the chain entered the phase
   unsigned look_blocked[kStepMaxPhases];            // the last pass: workers that found the cursor past the lookahead while this phase was published
+  unsigned long long route_select_ns[kStepMaxLayers];  // the last pass: the chain's select over the router's scores
+  unsigned long long route_finish_ns[kStepMaxLayers];  // the last pass: the run list, groups and slots from the picks
   unsigned steps_run;                              // steps this launch completed
   unsigned rows;                                   // the running step's rows (the synthetic router's)
   unsigned top_k;
@@ -115,6 +121,15 @@ struct StepStreamParams {
   int x_stride = 0;             // elements a row of x
   int hidden = 0;
   int inter = 0;
+  // The router pool's operands: scores and biased scores [kStepMaxRows][n_experts] fp32 the
+  // router units write and the chain's select reads; the select's rule as the production
+  // router's (kernels/glm_moe.cu): mode 0 sigmoid, 2 sqrt-softplus, the bias on the key.
+  float* scores = nullptr;
+  float* biased = nullptr;
+  int n_experts = 0;
+  int router_mode = 2;
+  float routed_scaling = 1.f;
+  int norm_topk = 1;
   unsigned consumer_smem = 0;  // dynamic shared memory the consumer units need
   int lookahead_layers = 2;
   unsigned long long lead_cap_bytes = 0;  // 0: no lead
@@ -144,6 +159,8 @@ unsigned step_stream_mxfp4_smem(int inter);
 // The dynamic shared memory the consumer pools present need: the MXFP4 forms
 // when a routed pool at `inter` exists (0: none), the fp8 forms when `fp8`.
 unsigned step_stream_consumer_smem(int inter, bool fp8);
+// Whether the kernel has a router unit at this inner width.
+bool step_stream_has_router(int k);
 // The partials' index: token-major, the slots of one output element in one sector.
 __host__ __device__ inline size_t step_out_index(int slot, int row, int hidden, int slots_per_token) {
   return (static_cast<size_t>(slot / slots_per_token) * hidden + static_cast<size_t>(row)) * slots_per_token +
@@ -153,7 +170,7 @@ constexpr int kStepAccChunk = 512;  // outputs an accumulation unit folds
 // Test fixtures' fills: every listed range [offsets[i], +bytes[i]) of `base`
 // with hashed bytes in [lo, lo + span) (kFillBytes), e4m3 normals (kFillE4m3)
 // or F32 in [0.5, 2) (kFillF32Scales); and the activations x as small bf16.
-enum StepFillMode : unsigned { kFillBytes = 0, kFillE4m3 = 1, kFillF32Scales = 2 };
+enum StepFillMode : unsigned { kFillBytes = 0, kFillE4m3 = 1, kFillF32Scales = 2, kFillBf16 = 3 };
 void step_stream_fill_ranges(uint8_t* base, const unsigned long long* offsets, const unsigned long long* bytes, int n, unsigned seed,
                              unsigned lo, unsigned span, cudaStream_t stream, StepFillMode mode = kFillBytes);
 void step_stream_init_x(uint16_t* x, int n, unsigned seed, cudaStream_t stream);

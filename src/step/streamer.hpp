@@ -32,6 +32,9 @@ struct StreamerConfig {
   int top_k = 1;
   unsigned seed = 1;
   unsigned route_pool = 0;       // the synthetic router's window of experts a layer (0: all 384; 32 gives the measured overlap)
+  int router_mode = 2;           // the router pool's scoring: 0 sigmoid, 2 sqrt-softplus (DeepSeek-V4.1)
+  float routed_scaling_factor = 1.5f;
+  bool norm_topk = true;
   uint64_t first_seq = 0;        // the first step's sequence number; steps count up from it
   uint64_t epoch = 0;            // echoed by every verdict
   int skip_at_step = -1;         // publish skip instead of this step (-1: never)
@@ -75,6 +78,8 @@ struct StreamReport {
   std::vector<double> layer_us;     // the last completed step, each layer's first begin to last end
   std::vector<double> layer_bytes;  // what the layer streamed at its run list
   std::vector<int> run_counts;
+  std::vector<double> route_select_us;  // per layer: the chain's select (or synthetic picks)
+  std::vector<double> route_finish_us;  // per layer: the run list, groups and slots
   double lead_bytes = 0;            // the last step's lead reads
   int workers = 0;                  // the run's workers, for the phases' utilization
 };
@@ -104,6 +109,8 @@ class Streamer {
   const float* out() const { return out_; }
   const uint16_t* y() const { return y_; }
   const uint16_t* proj() const { return proj_; }  // the projections' outputs, bf16, at each pool's out_offset
+  const float* scores() const { return scores_; }  // the router pool's scores [kStepMaxRows][n_experts]
+  int n_experts() const { return n_experts_; }
   int x_stride() const { return x_stride_; }       // elements a row of x
   int hidden() const { return hidden_; }
   int inter() const { return inter_; }
@@ -136,6 +143,9 @@ class Streamer {
   uint16_t* proj_ = nullptr;
   float* proj_part_ = nullptr;
   int x_stride_ = 0;
+  float* scores_ = nullptr;
+  float* biased_ = nullptr;
+  int n_experts_ = 0;
   unsigned consumer_smem_ = 0;
 };
 

@@ -252,10 +252,11 @@ __device__ unsigned stream_unit(const uint8_t* ptr, unsigned bytes) {
 // of 32 yields 19.7 distinct experts for five rows and 10.1 for two, as
 // measured on DeepSeek-V4.1 (2026-10-30), where rows picking from all 384
 // yield 28.9 and 11.8.
-__device__ void route(const StepStreamParams& p, int layer, const DevPool& pool, int* keys, int* sorted) {
+__device__ void route_synthetic_picks(const StepStreamParams& p, int layer, const DevPool& pool, int* keys) {
   const int rows = static_cast<int>(p.ctl->rows), top_k = static_cast<int>(p.ctl->top_k);
-  const int picks = rows * top_k;
   if (threadIdx.x < static_cast<unsigned>(rows)) {
+    for (int i = 0; i < top_k; ++i) p.ctl->slot_weight[layer][threadIdx.x * (top_k + 1) + i] = 1.0f / static_cast<float>(top_k);
+    p.ctl->slot_weight[layer][threadIdx.x * (top_k + 1) + top_k] = 1.0f;
     unsigned h = p.ctl->seed * 2654435761u + 7919u * static_cast<unsigned>(layer) + 104729u * threadIdx.x;
     const unsigned window = (p.ctl->route_pool > 0 && p.ctl->route_pool < static_cast<unsigned>(pool.groups)) ? p.ctl->route_pool
                                                                                                              : static_cast<unsigned>(pool.groups);
@@ -275,6 +276,12 @@ __device__ void route(const StepStreamParams& p, int layer, const DevPool& pool,
     }
   }
   __syncthreads();
+}
+// From keys [rows][top_k] (a row's picks, any order): the run list of distinct
+// experts ascending, each expert's slots and tokens, the shared slots.
+__device__ void route_finish(const StepStreamParams& p, int layer, int* keys, int* sorted) {
+  const int rows = static_cast<int>(p.ctl->rows), top_k = static_cast<int>(p.ctl->top_k);
+  const int picks = rows * top_k;
   if (threadIdx.x < static_cast<unsigned>(picks)) {
     const int k = keys[threadIdx.x];
     int pos = 0;
@@ -315,15 +322,14 @@ __device__ void route(const StepStreamParams& p, int layer, const DevPool& pool,
 // token ascending with weight 1 / top_k each, then the shared slot with
 // weight 1, as the slot kernels' accumulation does (synthetic weights until
 // the router's are real).
-__device__ void accumulate_chunk(const StepStreamParams& p, unsigned unit) {
+__device__ void accumulate_chunk(const StepStreamParams& p, int layer, unsigned unit) {
   const int rows = static_cast<int>(p.ctl->rows), top_k = static_cast<int>(p.ctl->top_k), spt = top_k + 1, H = p.hidden;
   const int i0 = static_cast<int>(unit) * kStepAccChunk, i1 = min(i0 + kStepAccChunk, rows * H);
-  const float w = 1.0f / static_cast<float>(top_k);
+  const float* sw = p.ctl->slot_weight[layer];
   for (int i = i0 + static_cast<int>(threadIdx.x); i < i1; i += kStepThreads) {
     const int t = i / H, c = i - t * H;
     float a = 0.f;
-    for (int j = 0; j < top_k; ++j) a = __fmaf_rn(w, p.out[step_out_index(t * spt + j, c, H, spt)], a);
-    a = __fmaf_rn(1.0f, p.out[step_out_index(t * spt + top_k, c, H, spt)], a);
+    for (int j = 0; j < spt; ++j) a = __fmaf_rn(sw[t * spt + j], p.out[step_out_index(t * spt + j, c, H, spt)], a);
     p.y[static_cast<size_t>(t) * H + c] = f32_to_bf16(a);
   }
 }
@@ -371,6 +377,152 @@ __device__ bool fp8_matrix_dispatch(int k, int n, const uint8_t* w, const float*
   return false;
 }
 
+// ---- the router -----------------------------------------------------------
+// The production router's dot (kernels/glm_moe.cu router_dot), op for op: one
+// warp per expert row, each lane its strided 16-byte vectors of the row and
+// of the token's activations, eight fmas a vector in the file's order, then
+// the xor tree. Here a warp carries up to eight tokens' accumulators through
+// one read of its row, with the activations staged in shared memory; each
+// token's chain is the production's, so the scores are bitwise its.
+constexpr int kRouterUnitRows = 16;  // two expert rows a warp, sharing each staged activation vector: 24 units in one wave
+constexpr int kRouterTokens = 8;  // tokens a pass stages
+__device__ __forceinline__ float router_sqrt_softplus(float x) {
+  const float sp = x > 20.f ? x : log1pf(expf(x));
+  return sqrtf(sp);
+}
+template <int kK>
+__device__ void router_unit(const uint8_t* __restrict__ w_base, const DevPool& pool, int rb, const Mxfp4Group& g, const uint16_t* __restrict__ x,
+                            float* __restrict__ scores, float* __restrict__ biased, int n_experts, int mode, uint8_t* smem) {
+  static_assert(kK % 256 == 0, "the router's inner width");
+  const uint16_t* w = reinterpret_cast<const uint16_t*>(w_base + pool.offsets[0]);
+  const float* bias = reinterpret_cast<const float*>(w_base + pool.offsets[1]);
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  uint16_t* s_x = reinterpret_cast<uint16_t*>(smem);
+  const size_t xs = g.x_stride ? static_cast<size_t>(g.x_stride) : static_cast<size_t>(kK);
+  for (int t0 = 0; t0 < g.count; t0 += kRouterTokens) {
+    const int nt = min(kRouterTokens, g.count - t0);
+    __syncthreads();  // the previous pass's readers are done with the staged rows
+    for (int q = threadIdx.x; q < kRouterTokens * (kK / 8); q += kStepThreads) {  // rows past nt stage row 0 again: finite operands for the idle accumulators
+      const int t = q / (kK / 8), c16 = q % (kK / 8);
+      cp_async_16(s_x + t * kK + c16 * 8, x + static_cast<size_t>(g.tokens[t0 + (t < nt ? t : 0)]) * xs + c16 * 8);
+    }
+    cp_async_commit();
+    cp_async_wait<0>();
+    __syncthreads();
+    // Both of the warp's rows against every staged token through one read of each activation
+    // vector; each (row, token) chain is the production's lane order, so the scores are bitwise.
+    const int e0 = rb * kRouterUnitRows + warp, e1 = e0 + (kStepThreads / 32);
+    const bool live1 = e1 < n_experts;
+    if (e0 < n_experts) {
+      const uint4* wv0 = reinterpret_cast<const uint4*>(w + static_cast<size_t>(e0) * kK);
+      const uint4* wv1 = reinterpret_cast<const uint4*>(w + static_cast<size_t>(live1 ? e1 : e0) * kK);
+      float dot0[kRouterTokens], dot1[kRouterTokens];
+#pragma unroll
+      for (int t = 0; t < kRouterTokens; ++t) { dot0[t] = 0.f; dot1[t] = 0.f; }
+#pragma unroll 2
+      for (int v = lane; v < kK / 8; v += 32) {
+        const uint4 wq0 = __ldcs(wv0 + v), wq1 = __ldcs(wv1 + v);
+        const uint32_t w0[4] = {wq0.x, wq0.y, wq0.z, wq0.w}, w1[4] = {wq1.x, wq1.y, wq1.z, wq1.w};
+#pragma unroll
+        for (int t = 0; t < kRouterTokens; ++t) {
+          const uint4 xq = *reinterpret_cast<const uint4*>(s_x + t * kK + v * 8);
+          const uint32_t xw[4] = {xq.x, xq.y, xq.z, xq.w};
+#pragma unroll
+          for (int i = 0; i < 4; ++i) {
+            const float xl = bf16_bits_to_float(static_cast<uint16_t>(xw[i] & 0xFFFFu)), xh = bf16_bits_to_float(static_cast<uint16_t>(xw[i] >> 16));
+            dot0[t] = __fmaf_rn(xl, bf16_bits_to_float(static_cast<uint16_t>(w0[i] & 0xFFFFu)), dot0[t]);
+            dot0[t] = __fmaf_rn(xh, bf16_bits_to_float(static_cast<uint16_t>(w0[i] >> 16)), dot0[t]);
+            dot1[t] = __fmaf_rn(xl, bf16_bits_to_float(static_cast<uint16_t>(w1[i] & 0xFFFFu)), dot1[t]);
+            dot1[t] = __fmaf_rn(xh, bf16_bits_to_float(static_cast<uint16_t>(w1[i] >> 16)), dot1[t]);
+          }
+        }
+      }
+#pragma unroll
+      for (int t = 0; t < kRouterTokens; ++t) {
+        float d0 = dot0[t], d1 = dot1[t];
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) { d0 += __shfl_xor_sync(0xFFFFFFFFu, d0, off); d1 += __shfl_xor_sync(0xFFFFFFFFu, d1, off); }
+        if (lane == 0 && t < nt) {
+          const int tok = g.tokens[t0 + t];
+          const float s0 = mode == 2 ? router_sqrt_softplus(d0) : 1.0f / (1.0f + expf(-d0));
+          scores[static_cast<size_t>(tok) * n_experts + e0] = s0;
+          biased[static_cast<size_t>(tok) * n_experts + e0] = s0 + bias[e0];
+          if (live1) {
+            const float s1 = mode == 2 ? router_sqrt_softplus(d1) : 1.0f / (1.0f + expf(-d1));
+            scores[static_cast<size_t>(tok) * n_experts + e1] = s1;
+            biased[static_cast<size_t>(tok) * n_experts + e1] = s1 + bias[e1];
+          }
+        }
+      }
+    }
+  }
+}
+// The production router's select (kernels/glm_moe.cu router_select_warp), one
+// warp per token: top_k rounds of argmax over the biased scores, strict > and
+// the lower id on ties, the ids sorted ascending, the weights normalized with
+// per-element division and scaled. keys[t * top_k + i] takes the ids, the
+// control block's slot_weight the weights, 1 for the shared slot.
+__device__ __forceinline__ void router_argmax_lowest_id(float& v, int& id) {
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) {
+    const float ov = __shfl_xor_sync(0xFFFFFFFFu, v, off);
+    const int oid = __shfl_xor_sync(0xFFFFFFFFu, id, off);
+    if (ov > v || (ov == v && oid < id)) { v = ov; id = oid; }
+  }
+}
+__device__ void route_select(const StepStreamParams& p, int layer, int* keys, uint8_t* smem) {
+  const int rows = static_cast<int>(p.ctl->rows), top_k = static_cast<int>(p.ctl->top_k), spt = top_k + 1, E = p.n_experts;
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  float* s_scores = reinterpret_cast<float*>(smem);  // [8][E] scores, [8][E] biased, then each warp's sel [16] and wsel [16]
+  for (int t0 = 0; t0 < rows; t0 += 8) {
+    __syncthreads();
+    const int t = t0 + warp;
+    if (t < rows) {
+      float* sc = s_scores + warp * E;
+      float* bs = s_scores + (8 + warp) * E;
+      for (int e = lane; e < E; e += 32) {
+        sc[e] = __ldcg(p.scores + static_cast<size_t>(t) * E + e);
+        bs[e] = __ldcg(p.biased + static_cast<size_t>(t) * E + e);
+      }
+      __syncwarp();
+      int* sel = reinterpret_cast<int*>(smem + static_cast<size_t>(16) * E * 4) + warp * 16;        // [8][16] after the score rows
+      float* wsel = reinterpret_cast<float*>(smem + static_cast<size_t>(16) * E * 4 + 8 * 16 * 4) + warp * 16;
+      for (int r = 0; r < top_k; ++r) {
+        int best = INT_MAX;
+        float bv = -INFINITY;
+        for (int e = lane; e < E; e += 32)
+          if (bs[e] > bv) { bv = bs[e]; best = e; }
+        router_argmax_lowest_id(bv, best);
+        sel[r] = best;
+        wsel[r] = sc[best];
+        __syncwarp();
+        if (lane == 0) bs[best] = -INFINITY;
+        __syncwarp();
+      }
+      if (lane == 0) {
+        for (int i = 1; i < top_k; ++i) {
+          const int id = sel[i];
+          const float wv = wsel[i];
+          int j = i - 1;
+          while (j >= 0 && sel[j] > id) { sel[j + 1] = sel[j]; wsel[j + 1] = wsel[j]; --j; }
+          sel[j + 1] = id;
+          wsel[j + 1] = wv;
+        }
+        float denom = 0.f;
+        for (int i = 0; i < top_k; ++i) denom = __fadd_rn(denom, wsel[i]);
+        denom = __fadd_rn(denom, 1e-20f);
+        for (int i = 0; i < top_k; ++i) {
+          const float wv = p.norm_topk ? __fdiv_rn(wsel[i], denom) * p.routed_scaling : wsel[i] * p.routed_scaling;
+          keys[t * top_k + i] = sel[i];
+          p.ctl->slot_weight[layer][t * spt + i] = wv;
+        }
+        p.ctl->slot_weight[layer][t * spt + top_k] = 1.0f;
+      }
+    }
+  }
+  __syncthreads();
+}
+
 __device__ void consumer_unit(const StepStreamParams& p, int layer, const DevPool& pool, int g, int rb, uint8_t* smem, bool stage) {
   const bool routed = pool.group_kind == kGroupRouted;
   const int expert = routed ? p.ctl->run_list[layer][g] : 0;
@@ -389,6 +541,11 @@ __device__ void consumer_unit(const StepStreamParams& p, int layer, const DevPoo
     grp.slots = p.ctl->token_slots;
     grp.tokens = p.ctl->token_slots;
     grp.count = static_cast<int>(p.ctl->rows);
+  }
+  if (pool.kind == kPoolRouter) {
+    if (pool.k == 5120) router_unit<5120>(base, pool, rb, grp, p.x, p.scores, p.biased, p.n_experts, p.router_mode, smem);
+    else if (threadIdx.x == 0) atomicCAS(&p.ctl->status, kStepOk, kStepBadUnit);
+    return;
   }
   if (pool.kind == kPoolFp8Matrix) {
     const bool split = projection_split(p, pool);
@@ -447,6 +604,7 @@ __global__ void __launch_bounds__(kStepThreads, 1) step_stream_kernel(StepStream
     // ---- the chain: thread 0 drives the protocol and the phases, the block joins for the router and the tokens
     __shared__ int keys[kStepMaxGroups];
     __shared__ int sorted[kStepMaxGroups];
+    extern __shared__ __align__(128) uint8_t chain_smem[];  // the select's score rows
     __shared__ int sm_fail, sm_skip;
     __shared__ int32_t sm_tokens[kStepMaxRows];
     const bool t0 = threadIdx.x == 0;
@@ -475,6 +633,8 @@ __global__ void __launch_bounds__(kStepThreads, 1) step_stream_kernel(StepStream
         if (!sm_fail && !sm_skip) {
           ctl->rows = d->rows;
           ctl->top_k = d->top_k;
+          // The token group's slots are the step's rows from the start: the first layer's router reads them before any route ran.
+          for (int i = 0; i < 32; ++i) ctl->token_slots[i] = i;
           ctl->seed = d->seed + static_cast<unsigned>(d->seq);
           ctl->route_pool = p.route_pool;
           for (int P = 0; P < n_phases; ++P) {
@@ -582,7 +742,21 @@ __global__ void __launch_bounds__(kStepThreads, 1) step_stream_kernel(StepStream
             int pool_index = -1;
             for (int Q = P + 1; Q < dl.phase_begin + dl.phase_count && pool_index < 0; ++Q)
               if (p.phases[Q].routed >= 0) pool_index = p.phases[Q].pools[p.phases[Q].routed];
-            if (pool_index >= 0) route(p, l, p.pools[pool_index], keys, sorted);
+            if (pool_index >= 0) {
+              // The phase's own router pool, when it has one: the select over its scores; else the synthetic picks.
+              bool real = false;
+              for (int i = 0; i < ph.n_pools; ++i) real = real || p.pools[ph.pools[i]].kind == kPoolRouter;
+              const unsigned long long t_sel = gtimer();
+              if (real) {
+                if (t0) __threadfence();
+                route_select(p, l, keys, chain_smem);
+              } else {
+                route_synthetic_picks(p, l, p.pools[pool_index], keys);
+              }
+              const unsigned long long t_fin = gtimer();
+              route_finish(p, l, keys, sorted);
+              if (t0) { ctl->route_select_ns[l] = t_fin - t_sel; ctl->route_finish_ns[l] = gtimer() - t_fin; }
+            }
             if (t0) __threadfence();
           }
           const float fold_us = ph.merged_next ? p.phases[P + 1].fold_after_us : ph.fold_after_us;
@@ -781,7 +955,7 @@ __global__ void __launch_bounds__(kStepThreads, 1) step_stream_kernel(StepStream
       const DevPhase& uph = p.phases[xphase];
       if (q) __syncthreads();  // the previous unit's readers of the shared memory are done
       if (kind == 1 && uph.accumulate) {
-        accumulate_chunk(p, xunit);
+        accumulate_chunk(p, sm_layer, xunit);
         continue;
       }
       unsigned xv = 0;
@@ -928,7 +1102,10 @@ __global__ void fill_ranges_kernel(uint8_t* base, const unsigned long long* offs
     h ^= h >> 13; h *= 0x85ebca6bu; h ^= h >> 16;
     if (mode == kFillE4m3)
       base[a] = static_cast<uint8_t>((h & 0x80) | ((1 + (h >> 8) % 13) << 3) | ((h >> 16) & 7));
-    else
+    else if (mode == kFillBf16) {
+      if (a & 1) continue;  // one element a pair of bytes: a small bf16 in [-0.25, 0.25)
+      *reinterpret_cast<uint16_t*>(base + a) = float_to_bf16_bits(((h & 0xffff) / 65536.0f - 0.5f) * 0.5f);
+    } else
       base[a] = static_cast<uint8_t>(lo + (h % span));
   }
 }
@@ -962,10 +1139,11 @@ bool step_stream_has_fp8_matrix(int k, int rows) {
   return false;
 }
 unsigned step_stream_mxfp4_smem(int inter) { return step_stream_consumer_smem(inter, true); }
+bool step_stream_has_router(int k) { return k == 5120; }
 unsigned step_stream_consumer_smem(int inter, bool fp8) {
   unsigned need = 0u;
   if (inter == kConsumerI) need = static_cast<unsigned>(mxfp4_unit_smem_bytes<kConsumerI>());
-  if (fp8) {
+  if (fp8) {  // the fp8 forms and the router unit (eight tokens by 5120 bf16 staged: 80 KB) fit the staged cap
     const unsigned split = static_cast<unsigned>(fp8_split_smem_bytes<kSplitMaxK, kSplitRowTiles>());
     const unsigned staged = static_cast<unsigned>(kFp8StagedSmemCap);  // the one-token-group projection form stages its slice
     need = std::max(need, std::max(split, staged));
