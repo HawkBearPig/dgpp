@@ -1428,12 +1428,19 @@ int64_t sample_of(const std::string& text, const std::string& series) {
 }
 
 void test_rank_metrics(FabricRig& rig) {
-  const std::string r0 = scrape_metrics(rig.port());
+  // The reply can reach HTTP before the engine publishes the pass's meters.
+  // Wait for rank 0's snapshot, just as we wait for the peers below.
+  std::string r0;
+  int64_t tokens = 0;
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  do {
+    r0 = scrape_metrics(rig.port());
+    tokens = sample_of(
+        r0, "dgpp_rank_generation_tokens_total{model_name=\"glm-5.3-flash-fp8\",rank=\"0\"}");
+  } while (tokens <= 0 && std::chrono::steady_clock::now() < deadline);
   require(r0.find("dgpp_rank_info{model_name=\"glm-5.3-flash-fp8\",rank=\"0\",world_size=\"3\",version=\"v\","
                   "git_sha=\"g\"} 1\n") != std::string::npos,
           "rank 0's identity: " + r0);
-  const int64_t tokens =
-      sample_of(r0, "dgpp_rank_generation_tokens_total{model_name=\"glm-5.3-flash-fp8\",rank=\"0\"}");
   require(tokens > 0, "rank 0 counted its generated tokens");
   require(r0.find("dgpp_rank_ticks_total") == std::string::npos, "rank 0 follows no journal");
   for (size_t i = 0; i < rig.peers.size(); ++i) {
