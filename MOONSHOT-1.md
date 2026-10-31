@@ -180,8 +180,9 @@ from 69 to 59 percent at five rows, so the fixed phases, the latency and
 the tails weigh more in the pass: the eight-layer gate of section 1.3 now
 routes through a window of 32 experts a layer, which reproduces the
 measured overlap (19.7 distinct at five rows, 10.1 at two), and with every
-weight computed the median layer stands at 85 to 86 percent of its floor
-there, against 89 at the uniform count. The draft stages keep the uniform
+weight computed the median layer stands at 83 percent of its floor there
+(production down, clocks locked, a warm-up run), against 89 at the uniform
+count measured beside production. The draft stages keep the uniform
 expectation (14.2 of 128 at top-3) until their routing is measured.
 
 **Today's engine is far closer to its floor than the plan assumed.** The
@@ -902,7 +903,8 @@ the memory's share), and slabs of at least 640 codes for the projections
 and 96 percent of the qkv, attn_out and expert phases, the expert phase
 streams at 92 percent of the ceiling, the fixed phases at the ceiling in
 aggregate, and the median layer at 87 to 88 percent of its floor at any
-lead cap from 4 to 20 MB. The residue is the layer's latency: attn_in 9,
+lead cap from 4 to 20 MB (beside production, at the uniform expert count;
+the clean figure at the measured count, 2026-10-31, is 83). The residue is the layer's latency: attn_in 9,
 attend 2, ffn_in 12, the router 18, the gap to the experts 8 and the
 accumulation 21 µs, about 70 µs a layer, of which the lead covers a few
 microseconds, because its cap is full when the latency begins. The bound
@@ -2249,7 +2251,9 @@ area, untracked.
       codes, and the trace's per-phase worker utilization, grab time and
       hand-out time. Hand-out 3.5 to 4.5 µs a grab to 1.0 to 1.6, workers
       busy 83, 78 and 96 percent of the qkv, attn_out and expert phases,
-      the median layer 87 to 88 percent of its floor at any lead cap.
+      the median layer 87 to 88 percent of its floor at any lead cap
+      (beside production, at the uniform expert count; 83 measured clean
+      at the measured count the next day).
 - [x] The lead's accounting (2026-10-30 night): latency phases published
       to the workers, staged bytes credited as units consume them, a
       yielded unit counting what it read and yielding only to a stream
@@ -2268,8 +2272,8 @@ area, untracked.
       reproduces the overlap, and the slab reduce's completion counter is
       per layer (it was per pool across layers, so a later layer's reduce
       units did not wait on their own layer's compute units, masked by
-      their late hand-out). The median layer at the measured overlap: 85
-      to 86 percent of its floor.
+      their late hand-out). The median layer at the measured overlap: 83
+      percent of its floor, measured clean.
 - [x] The lead's hand-out and two policy experiments (2026-10-31): the
       lead's two binary searches over the phase table ran in global
       memory, about fourteen dependent loads a unit, and held the lead to
@@ -2287,17 +2291,34 @@ area, untracked.
       learned the hard way: the rate case runs in about two seconds and
       production's requests on the shared GPU contaminate it, so a run
       counts only when the serve log shows no decode in its window.
-- [ ] The residue after the lead: the expert phase inside the stream at
-      93 to 94 percent of the ceiling, about 4 percent of the layer, and
-      the fixed phases' tails and hand-outs, about 3. At the measured
-      expert count the accounting is: a layer of 147 MB takes about 710
-      µs against 615 at the ceiling, the expert phase 440 of 417, the
-      fixed phases 190 (40 MB cold at the ceiling plus 20 MB hot from L2
-      plus tails), the latency windows 70 filled by the lead at the
-      ceiling, so the memory idles about 85 µs a layer: 25 in the expert
-      phase's structure, 25 in the fixed phases' hot stretches, 35 in
-      tails, drains and hand-outs. The lead is saturated and more of it
-      does not pay. A probe of the
+- [x] The measurement method for the stream's rates (2026-10-31): the
+      rate case runs in about two seconds, and three confounds moved it
+      by three to five points: production's requests on the shared GPU,
+      the device's clock ramping from P8 on a now-idle GPU (`nvidia-smi
+      -lgc 2418`, the application clock, holds it), and a fresh rig's
+      first run reading low (the case runs the streamer once as a
+      warm-up and reports the second run). Clean, the tile-major layers
+      read 83.2 percent of their floor plus or minus 0.3 over three runs,
+      the row-major 77.3. The lead cap sweep extended to 128 MB is flat
+      from 12 MB on (83.9, 83.7, 83.8, 83.3, 83.3 at 12 to 64), the lead
+      reading the same 29 MB a layer at every cap above 12: the lead is
+      bounded by idle worker time, not by the cap. Earlier figures of 85
+      to 89 were taken beside production and are superseded.
+- [ ] The residue after the lead: at the measured expert count and the
+      clean method, a layer of 147 MB takes about 730 µs against 615 at
+      the ceiling. The expert phase takes 444 of 417, its workers 94
+      percent busy. The fixed phases take 210: qkv is 26 MB with 12.8
+      staged and reads 80 µs, its model (cold bytes at the ceiling, hot
+      bytes at the L2 rate, hand-outs, the reduce tail), and attn_out 29
+      MB with 4.3 staged reads 115. The windows take 78, and the lead
+      streams 20 MB in them, 87 percent of the ceiling. So the memory
+      idles about 117 µs a layer: 27 in the expert phase's structure, 25
+      in the fixed phases' hot stretches (units reading staged bytes run
+      from L2 and nothing streams meanwhile), 15 in hand-outs, 8 in
+      tails, 13 in the lead's own rate, and about 30 not yet attributed.
+      Two remedies for the hot stretches were measured clean and lost: a
+      minimum of leaders during hot phases (minus 2) and the lead's units
+      interleaved (minus 1.3), both removed. A probe of the
       pair's request pattern cleared it: a warp streaming a gate and an
       up tile 4 MB apart reads 238 GB/s at 48 blocks, the same as one
       stream of 512-byte or 1 KB runs (237 to 238.5), so the pair's 233

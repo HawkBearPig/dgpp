@@ -534,17 +534,18 @@ DGPP_TEST(step_consumers_in_the_stream_match_the_reference) {
   consumers_match_the_reference(/*tile_major=*/true);   // the arena's tile-major experts
 }
 
-double consumers_rate(bool tile_major, bool interleave = false) {
+double consumers_rate(bool tile_major) {
   auto rig = make_rig(kLayers, /*consumers=*/true, tile_major);
   Streamer s(rig->dp, rig->bases, rig->plans);
   StreamerConfig cfg = design_config();
-  cfg.lead_interleave = interleave ? 1u : 0u;
   cfg.steps = 3;
   cfg.rows = 5;
   cfg.top_k = 6;
+  // A warm-up run first: with nothing else on the device its memory clock ramps over the first
+  // second or so of streaming, and a fresh rig's first run read three to five points low (2026-10-31).
+  (void)s.run(cfg);
   const StreamReport r = s.run(cfg);
-  print_report(tile_major ? (interleave ? "tile-major experts, design chain, lead 16 MB, interleaved lead" : "tile-major experts, design chain, lead 16 MB")
-                          : "row-major experts, design chain, lead 16 MB", r, 3);
+  print_report(tile_major ? "tile-major experts, design chain, lead 16 MB" : "row-major experts, design chain, lead 16 MB", r, 3);
   {  // the slowest layer's phases too, when it is not layer 3
     int slowest = 0;
     for (size_t l = 1; l < r.layer_us.size(); ++l)
@@ -553,17 +554,21 @@ double consumers_rate(bool tile_major, bool interleave = false) {
   }
   // Every layer's phases in one line: the fixed stream phases, the expert phase, the rest (latency and gaps), the lead's bytes.
   for (size_t l = 0; l < r.layer_us.size(); ++l) {
-    double fixed = 0, experts = 0, lead = 0, begin = 1e30, end = 0;
+    double fixed = 0, experts = 0, lead = 0, begin = 1e30, end = 0, exp_busy = 0, exp_wait = 0, exp_drain = 0;
     for (const PhaseTiming& t : r.phases) {
       if (t.layer != static_cast<int>(l)) continue;
       begin = std::min(begin, t.begin_us);
       end = std::max(end, t.end_us);
       lead += t.lead_in_mb;
-      if (t.name == "gate_up" || t.name == "down") experts = std::max(experts, t.end_us) - std::min(experts > 0 ? t.begin_us : t.begin_us, t.begin_us), experts = t.end_us - t.begin_us > experts ? t.end_us - t.begin_us : experts;
-      else if (t.stream && t.units > 0 && t.name != "accumulate") fixed += t.end_us - t.begin_us;
+      if (t.name == "gate_up") {
+        experts = t.end_us - t.begin_us;
+        exp_busy = (experts > 0 && r.workers > 0) ? t.busy_us / (experts * r.workers) * 100.0 : 0.0;
+        exp_wait = (experts > 0 && r.workers > 0) ? t.wait_us / (experts * r.workers) * 100.0 : 0.0;
+        exp_drain = t.drained_us;
+      } else if (t.stream && t.units > 0 && t.name != "accumulate" && t.name != "down") fixed += t.end_us - t.begin_us;
     }
-    std::printf("      layer %zu: fixed %5.1f us, experts %5.1f us, other %5.1f us of %6.1f, lead %5.1f MB\n", l, fixed, experts,
-                (end - begin) - fixed - experts, end - begin, lead);
+    std::printf("      layer %zu: fixed %5.1f us, experts %5.1f us (busy %4.1f %%, waits %4.1f %%, drain %5.1f us), other %5.1f us of %6.1f, lead %5.1f MB\n",
+                l, fixed, experts, exp_busy, exp_wait, exp_drain, (end - begin) - fixed - experts, end - begin, lead);
   }
   require(r.status == kStepOk, "the kernel ended on " + r.status_text);
   std::vector<double> pct;
@@ -582,8 +587,7 @@ double consumers_rate(bool tile_major, bool interleave = false) {
 DGPP_TEST(step_consumers_rate_at_the_design_chain) {
   const double row = consumers_rate(/*tile_major=*/false);
   const double tile = consumers_rate(/*tile_major=*/true);
-  const double tile_il = consumers_rate(/*tile_major=*/true, /*interleave=*/true);
-  std::printf("   interleaved lead against the consumers' order: %.1f against %.1f percent\n", tile_il, tile);
+
   // Interim gates at the measured plateau less the run-to-run noise (tile-major
   // 86 to 90 percent, row-major 78 to 88 with every weight computed; the
   // fused chain's structure is where the rest comes back, section 1.3).
@@ -595,7 +599,7 @@ DGPP_TEST(step_consumers_lead_sweep) {
   // The lead's cap against the consumers' own L2 use, with every consumer real (report only).
   auto rig = make_rig(kLayers, /*consumers=*/true, /*tile_major=*/true);
   Streamer s(rig->dp, rig->bases, rig->plans);
-  for (const int mib : {4, 8, 12, 16, 20}) {
+  for (const int mib : {4, 8, 12, 16, 20, 32, 64, 128}) {
     StreamerConfig cfg = design_config();
     cfg.steps = 3;
     cfg.rows = 5;

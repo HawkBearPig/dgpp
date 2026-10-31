@@ -175,10 +175,10 @@ lead stays within the next layer (`lookahead_layers` 1), so its cursor is
 at the bytes a latency window can stage. Reduce units of slabbed
 projections are handed out after every pool's compute units, so the pool
 they wait on has only its stragglers left. Measured together, the lead
-stages about 22 MB a layer in windows that total about 23 MB at the
-ceiling: the idle windows are nearly spent, and what remains of the layer
-is the expert phase's forms, at 93 to 94 percent of the ceiling inside the
-stream, and the tails and hand-outs of the fixed phases. Staging into L2
+stages about 29 MB a layer, the idle windows are spent, and what remains
+of the layer is the expert phase's structure, the fixed phases' hot
+stretches (units reading staged bytes run from L2 while nothing streams),
+their hand-outs and tails. Staging into L2
 with the evict-last priority rather than evict-normal changed nothing; a
 probe showed evict-normal lines surviving a 150 MB evict-first stream at
 92 to 95 percent. The lead's own hand-out searches the phase table in a
@@ -187,13 +187,20 @@ searches a unit over global memory held the lead to half the ceiling in a
 ten-microsecond window. Two policies were measured and left out: a minimum
 of leaders during hot phases (their traffic competes with the fixed
 phases' cold units) and the lead walking a phase's units even first then
-odd (`lead_interleave`, within the noise). The trace reports, per phase,
+odd (1.3 points worse, measured clean). The trace reports, per phase,
 the lead's bytes ahead when the chain entered it, the layer its cursor
 stood in and how many workers found the cursor past the lookahead.
 
-The rate case runs in about two seconds, and production's requests on the
-shared GPU contaminate it: a run counts only when the serve log shows no
-decode in its window.
+The rates are measured with production down, the device's clock locked at
+the application clock (`sudo nvidia-smi -lgc 2418`, released with `-rgc`
+afterwards) and a warm-up run before the reported one. Each confound moved
+the two-second rate case by three to five points: production's requests on
+the shared GPU, the clock ramping from P8 on an otherwise idle device, and
+a fresh rig's first run reading low. Measured that way, the tile-major
+layers at the measured expert count read 83.2 percent of their floor plus
+or minus 0.3 over three runs and the row-major 77.3, and the lead cap sweep
+is flat from 12 MB to 128: the lead is bounded by the workers' idle time,
+not by the cap.
 
 The plan reaches the kernel through `lower_plan` (`src/step/device_plan.hpp`):
 each phase's fixed ranges under the arena coalesce into a few contiguous

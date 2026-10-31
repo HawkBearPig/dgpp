@@ -149,17 +149,12 @@ __device__ __forceinline__ bool locate_segment(const StepStreamParams& p, const 
 }
 // Lead unit u of phase P: the fixed segments, then the lead-only ones.
 // Lead unit u of phase P: the fixed segments, then the lead-only ones, in
-// the consumers' order; or, with `lead_interleave`, a phase's even units
-// first and then its odd ones, so a partly staged phase runs hot and cold
-// units side by side (an A/B switch for the stream test).
-__device__ __forceinline__ unsigned lead_interleave(unsigned u, unsigned n) {
-  const unsigned half = (n + 1) / 2;
-  return u < half ? 2 * u : 2 * (u - half) + 1;
-}
+// the consumers' order. (The lead walking a phase's even units first and
+// then its odd ones, so a partly staged phase ran hot and cold units side by
+// side, measured 1.3 points worse over three clean runs on 2026-10-31.)
 __device__ bool locate_lead(const StepStreamParams& p, int layer, int P, unsigned u, const uint8_t** ptr, unsigned* bytes) {
   const DevPhase& ph = p.phases[P];
   const uint8_t* base = p.bases[layer];
-  if (p.lead_interleave) u = lead_interleave(u, ph.lead_units);
   for (int i = 0; i < ph.seg_count; ++i)
     if (locate_segment(p, base, p.segments[ph.seg_begin + i], u, ptr, bytes)) return true;
   for (int i = 0; i < ph.lead_seg_count; ++i)

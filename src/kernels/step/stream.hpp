@@ -125,7 +125,6 @@ struct StepStreamParams {
   // the very next stream phases, so the parked set stays the cap's.
   float lead_bytes_per_us = 0.f;
   unsigned route_pool = 0;  // the synthetic router's window of experts a layer (0: all)
-  unsigned lead_interleave = 0;  // 1: the lead walks a phase's units even ones first, then odd (an A/B switch)
   unsigned max_leaders = 0;               // 0: unbounded
   unsigned long long deadline_ns = 0;          // every in-step spin's deadline (0: none)
   unsigned long long pending_deadline_ns = 0;  // how long the chain waits for the host's next descriptor (0: forever)
