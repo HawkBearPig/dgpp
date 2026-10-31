@@ -133,36 +133,39 @@ __device__ void build_class_table(const StepStreamParams& p, int P) {
   StepCtl* ctl = p.ctl;
   const unsigned rows = ctl->rows;
   unsigned n = 0;
-  auto put = [&](unsigned count, unsigned grab, uint8_t kind, int phase, int pool, uint8_t gate_kind, uint8_t gate_arg) {
+  // w = 1: the count is a group's units, the worker multiplies by the layer's run count when it
+  // loads the table, so the table is built once before the select and never waits on it.
+  auto put = [&](unsigned count, unsigned grab, uint8_t kind, int phase, int pool, uint8_t gate_kind, uint8_t gate_arg, unsigned per_run) {
     if (n >= static_cast<unsigned>(kStepMaxClasses)) return;
     uint4 e;
     e.x = count;
     e.y = grab | (static_cast<unsigned>(kind) << 8) | (static_cast<unsigned>(gate_kind) << 16) | (static_cast<unsigned>(gate_arg) << 24);
     e.z = static_cast<unsigned>(phase) | (static_cast<unsigned>(pool & 0xffff) << 16);
-    e.w = 0;
+    e.w = per_run;
     ctl->cls_table[P][n++] = e;
   };
   for (int ip = P; ip <= P + static_cast<int>(p.phases[P].merged); ++ip) {
     const DevPhase& iph = p.phases[ip];
     const int il = iph.layer;
     if (iph.accumulate) {  // the ordered accumulation's chunks are the phase's only units
-      put(own_units(p, il, ip), 1u, kClassAccumulate, ip, -1, kGateNone, 0);
+      put(own_units(p, il, ip), 1u, kClassAccumulate, ip, -1, kGateNone, 0, 0u);
       continue;
     }
     for (int rp = 0; rp < 2; ++rp)
       for (int i = 0; i < iph.n_pools; ++i) {
         if ((rp == 0) == (i == iph.routed)) continue;  // the routed pool after the others
         const DevPool& gp = p.pools[iph.pools[i]];
-        const unsigned compute = pool_compute_units(p, il, gp);
-        if (compute)
-          put(compute, gp.kind == kPoolBytes ? 1u : (projection_split(p, gp) ? 4u : static_cast<unsigned>(gp.grab)), kClassCompute, ip, iph.pools[i],
-              gp.gate_kind, gp.gate_arg);
+        const bool routed = gp.group_kind == kGroupRouted;
+        const unsigned per_group = compute_units_per_group(p, gp);
+        if (per_group)
+          put(per_group, gp.kind == kPoolBytes ? 1u : (projection_split(p, gp) ? 4u : static_cast<unsigned>(gp.grab)), kClassCompute, ip, iph.pools[i],
+              gp.gate_kind, gp.gate_arg, routed ? 1u : 0u);
         // Its reduce units, gated on its compute units: the update-carrying projection's y (and
         // the attention update) completes early in the group.
         const unsigned reduce = reduce_units(p, gp);
-        if (reduce) put(reduce, 1u, kClassReduce, ip, iph.pools[i], kGateOwnPool, 0);
+        if (reduce) put(reduce, 1u, kClassReduce, ip, iph.pools[i], kGateOwnPool, 0, 0u);
       }
-    if (iph.fixed_units) put(iph.fixed_units, 1u, kClassFixed, ip, -1, kGateNone, 0);  // the shortest units, they fill the tail
+    if (iph.fixed_units) put(iph.fixed_units, 1u, kClassFixed, ip, -1, kGateNone, 0, 0u);  // the shortest units, they fill the tail
   }
   (void)rows;
   ctl->cls_n[P] = n;
@@ -312,7 +315,12 @@ __device__ void route_synthetic_picks(const StepStreamParams& p, int layer, cons
 }
 // From keys [rows][top_k] (a row's picks, any order): the run list of distinct
 // experts ascending, each expert's slots and tokens, the shared slots.
-__device__ void route_finish(const StepStreamParams& p, int layer, int* keys, int* sorted) {
+// `smem`: the chain's dynamic shared memory past the select's rows (static shared memory is at
+// the device's 100 KB block limit with the consumers' dynamic region: a static array here failed
+// the launch, 2026-10-31).
+__device__ void route_finish(const StepStreamParams& p, int layer, int* keys, int* sorted, uint8_t* smem) {
+  int* s_run = reinterpret_cast<int*>(smem);  // the run list in shared memory: no global round trip to read it back
+  int& s_n = s_run[kStepMaxRows * 8];
   const int rows = static_cast<int>(p.ctl->rows), top_k = static_cast<int>(p.ctl->top_k);
   const int picks = rows * top_k;
   if (threadIdx.x < static_cast<unsigned>(picks)) {
@@ -325,13 +333,14 @@ __device__ void route_finish(const StepStreamParams& p, int layer, int* keys, in
   if (threadIdx.x == 0) {
     int n = 0, prev = -1;
     for (int o = 0; o < picks; ++o)
-      if (sorted[o] != prev) { p.ctl->run_list[layer][n++] = sorted[o]; prev = sorted[o]; }
+      if (sorted[o] != prev) { s_run[n] = sorted[o]; p.ctl->run_list[layer][n] = sorted[o]; ++n; prev = sorted[o]; }
+    s_n = n;
     p.ctl->run_count[layer] = n;
   }
   __syncthreads();
   // Group g: the slots of run_list[g], slot = row * (top_k + 1) + pick, in row order.
-  if (threadIdx.x < static_cast<unsigned>(p.ctl->run_count[layer])) {
-    const int g = static_cast<int>(threadIdx.x), expert = p.ctl->run_list[layer][g];
+  if (threadIdx.x < static_cast<unsigned>(s_n)) {
+    const int g = static_cast<int>(threadIdx.x), expert = s_run[g];
     int n = 0;
     for (int o = 0; o < picks && n < 32; ++o)
       if (keys[o] == expert) {
@@ -409,6 +418,14 @@ __device__ void mhc_unit(const StepStreamParams& p, int layer, const DevPool& po
   float* f = reinterpret_cast<float*>(smem);  // [0, 8) the dot's scratch, [32, 56) the logits row, [64, 92) the finish's scratch
   float lg[kMhcUnitCoeffs];
   mhc_dot_n<kMhcUnitCoeffs>(streams, fn, H, p.mhc_norm_eps, f, lg);
+  // The unit's slice of the token's collapsed row under the previous site's pre, into x: the
+  // finish then norms the row in place (the collapse on the finishing block alone cost it half).
+  uint16_t* row = p.x + static_cast<size_t>(t) * p.x_stride;
+  {
+    const int vecs = H / 8, per = (vecs + kUnits - 1) / kUnits;
+    mhc_collapse_slice(streams, p.pre[s] + t * kMhcN, H, (rb % kUnits) * per, min(vecs, (rb % kUnits + 1) * per), row);
+  }
+  __syncthreads();  // the slice is written before the ticket releases it
   if (threadIdx.x == 0) {
 #pragma unroll
     for (int c = 0; c < kMhcUnitCoeffs; ++c) p.logits[t * kMhcCoeffs + c0 + c] = lg[c];
@@ -427,8 +444,7 @@ __device__ void mhc_unit(const StepStreamParams& p, int layer, const DevPool& po
   site.hc_eps = p.hc_eps;
   site.sinkhorn_iters = p.sinkhorn_iters;
   site.ln_eps = p.mhc_norm_eps;
-  mhc_finish(streams, f + 32, site, H, p.pre[s] + t * kMhcN, p.pre[s ^ 1] + t * kMhcN, p.post + t * kMhcN, p.comb + t * kMhcN * kMhcN,
-             p.x + static_cast<size_t>(t) * p.x_stride, f + 64);
+  mhc_finish_normed(row, f + 32, site, H, p.pre[s ^ 1] + t * kMhcN, p.post + t * kMhcN, p.comb + t * kMhcN * kMhcN, f + 64);
   __syncthreads();
   if (threadIdx.x == 0) red_release(&p.ctl->site_done[layer][s], 1u);  // the router's gate
 }
@@ -517,9 +533,20 @@ __device__ void route_select(const StepStreamParams& p, int layer, int* keys, ui
     if (t < rows) {
       float* sc = s_scores + warp * E;
       float* bs = s_scores + (8 + warp) * E;
-      for (int e = lane; e < E; e += 32) {
-        sc[e] = __ldcg(p.scores + static_cast<size_t>(t) * E + e);
-        bs[e] = __ldcg(p.biased + static_cast<size_t>(t) * E + e);
+      // Every load of the token's scores issued before any is stored: a load then a store an
+      // expert cost a memory round trip each, 24 of them a token under the saturated memory.
+      constexpr int kMaxPer = 16;  // experts a lane carries: 512 at most
+      float a[kMaxPer], b[kMaxPer];
+#pragma unroll
+      for (int i = 0; i < kMaxPer; ++i) {
+        const int e = lane + i * 32;
+        a[i] = e < E ? __ldcg(p.scores + static_cast<size_t>(t) * E + e) : 0.f;
+        b[i] = e < E ? __ldcg(p.biased + static_cast<size_t>(t) * E + e) : 0.f;
+      }
+#pragma unroll
+      for (int i = 0; i < kMaxPer; ++i) {
+        const int e = lane + i * 32;
+        if (e < E) { sc[e] = a[i]; bs[e] = b[i]; }
       }
       __syncwarp();
       int* sel = reinterpret_cast<int*>(smem + static_cast<size_t>(16) * E * 4) + warp * 16;        // [8][16] after the score rows
@@ -584,7 +611,7 @@ __device__ void consumer_unit(const StepStreamParams& p, int layer, const DevPoo
     return;
   }
   if (pool.kind == kPoolRouter) {
-    if (pool.k == 5120) router_unit<5120, kRouterBatch, kRouterSpecialize>(base, pool, rb, grp, p.x, p.scores, p.biased, p.n_experts, p.router_mode, smem);
+    if (pool.k == 5120) router_unit<5120, kRouterBatch, kRouterSpecialize, kRouterPipeline>(base, pool, rb, grp, p.x, p.scores, p.biased, p.n_experts, p.router_mode, smem);
     else if (threadIdx.x == 0) atomicCAS(&p.ctl->status, kStepOk, kStepBadUnit);
     return;
   }
@@ -799,8 +826,8 @@ __global__ void __launch_bounds__(kStepThreads, 1) step_stream_kernel(StepStream
             // the chain is in: its idle budget and the next stream phase's exemption.
             st_rel(&ctl->phase_word, word(step, P, kStateIdle));
           }
-          // The next group's classes, built while this group runs (rebuilt after a select, since
-          // the routed pools' unit counts follow the run list).
+          // The next group's classes, built while this group runs; the routed pools' counts are
+          // resolved by the workers against the run list when they load the table.
           if (!sm_fail && P_last + 1 < n_phases) build_class_table(p, P_last + 1);
           if (!sm_fail && ph.kind != 1) spin_us(ph.latency_us);
         }
@@ -841,18 +868,16 @@ __global__ void __launch_bounds__(kStepThreads, 1) step_stream_kernel(StepStream
             }
             __syncthreads();
             if (sm_fail || sm_event == 2) break;
-            // The select inside the group: the router's units are complete.
-            if (t0) __threadfence();
+            // The select inside the group: the router's units are complete (thread 0 acquired their
+            // count; the barrier carries it to the block, which reads the scores past L1).
             const unsigned long long t_sel = gtimer();
             route_select(p, l, keys, chain_smem);
             const unsigned long long t_fin = gtimer();
-            route_finish(p, l, keys, sorted);
+            route_finish(p, l, keys, sorted, chain_smem + static_cast<size_t>(16) * p.n_experts * 4 + 2 * 8 * 16 * 4);
             if (t0) {
               ctl->route_select_ns[l] = t_fin - t_sel;
               ctl->route_finish_ns[l] = gtimer() - t_fin;
-              __threadfence();
               sm_selected = 1;
-              if (P_last + 1 < n_phases) build_class_table(p, P_last + 1);  // the expert phases' counts follow the run list
             }
             __syncthreads();
           }
@@ -870,18 +895,15 @@ __global__ void __launch_bounds__(kStepThreads, 1) step_stream_kernel(StepStream
           // The select after the group: the synthetic picks, or a router whose units ran as a lone phase.
           const unsigned long long t_sel = gtimer();
           if (router_pool >= 0) {
-            if (t0) __threadfence();
             route_select(p, l, keys, chain_smem);
           } else {
             route_synthetic_picks(p, l, p.pools[routed_pool], keys);
           }
           const unsigned long long t_fin = gtimer();
-          route_finish(p, l, keys, sorted);
+          route_finish(p, l, keys, sorted, chain_smem + static_cast<size_t>(16) * p.n_experts * 4 + 2 * 8 * 16 * 4);
           if (t0) {
             ctl->route_select_ns[l] = t_fin - t_sel;
             ctl->route_finish_ns[l] = gtimer() - t_fin;
-            __threadfence();
-            if (P_last + 1 < n_phases) build_class_table(p, P_last + 1);
           }
           __syncthreads();
         }
@@ -960,7 +982,8 @@ __global__ void __launch_bounds__(kStepThreads, 1) step_stream_kernel(StepStream
             for (int c = 0; c < kStepMaxClasses; ++c) e[c] = c < static_cast<int>(n) ? __ldcg(&ctl->cls_table[P][c]) : make_uint4(0u, 0u, 0u, 0u);
 #pragma unroll
             for (int c = 0; c < kStepMaxClasses; ++c) {
-              sm_cls_count[c] = e[c].x;
+              const int cphase = static_cast<int>(e[c].z & 0xffffu);
+              sm_cls_count[c] = e[c].w ? e[c].x * static_cast<unsigned>(ld_acq(reinterpret_cast<unsigned*>(&ctl->run_count[p.phases[cphase].layer]))) : e[c].x;
               sm_cls_grab[c] = e[c].y & 0xffu;
               sm_cls_kind[c] = static_cast<uint8_t>((e[c].y >> 8) & 0xffu);
               sm_cls_gate[c] = static_cast<uint8_t>((e[c].y >> 16) & 0xffu);

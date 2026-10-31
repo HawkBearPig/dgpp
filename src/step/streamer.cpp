@@ -216,7 +216,9 @@ StreamReport Streamer::run(const StreamerConfig& cfg) {
   p.x_stride = x_stride_;
   p.hidden = hidden_;
   p.inter = inter_;
-  p.consumer_smem = consumer_smem_;
+  // The chain's select and finish use the dynamic region too (the run list, the scores), so a
+  // rig with no consumer pools still launches with a little of it.
+  p.consumer_smem = std::max(consumer_smem_, 4096u);
   for (int i = 0; i < 2; ++i) { p.streams[i] = streams_[i]; p.pre[i] = pre_[i]; }
   p.post = post_;
   p.comb = comb_;
@@ -234,7 +236,7 @@ StreamReport Streamer::run(const StreamerConfig& cfg) {
     cudaEventDestroy(e0);
     cudaEventDestroy(e1);
     throw std::runtime_error(std::string("Streamer: launch failed: ") + cudaGetErrorString(launch) +
-                             " (workers " + std::to_string(cfg.workers) + ", capacity " + std::to_string(step_stream_capacity(consumer_smem_)) + ")");
+                             " (workers " + std::to_string(cfg.workers) + ", capacity " + std::to_string(step_stream_capacity(p.consumer_smem)) + ")");
   }
   DGPP_CUDA_OK(cudaEventRecord(e1, stream_));
 

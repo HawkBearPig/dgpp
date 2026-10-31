@@ -149,8 +149,9 @@ governor bounds how many workers lead at once.
 
 Three details of the hand-out came from measurement with every consumer
 real. The chain builds the published group's class table into the control
-block while the previous group runs (and again after a select, since the
-expert pools' unit counts follow the run list), and a worker reads it in one
+block while the previous group runs (a routed pool's entry holds its units a
+group, which the worker multiplies by the run list's length when it loads
+the table, so no rebuild waits on the select), and a worker reads it in one
 round trip when the phase word changes, so a grab costs the class counter's
 load and the atomic, 1.4 to 1.9 µs; a worker building the table from the
 pool tables took up to 17 µs a phase under a saturated memory, and
@@ -389,7 +390,11 @@ start, moved to the host: it cost the chain several microseconds a group.
 Measured clean with all of that, the sites cost the layer nothing the
 attribution can see (81.2 percent of the floor without them, 83.3 with,
 inside the run-to-run band), the median layer 83.1 tile-major and 78.1
-row-major. The class windows of `attn_out` (tile-major, layer 3, from the
+row-major in that run; two back-to-back samples later that night read 81.9
+and 80.5 tile-major, 75.8 and 76.7 row-major, so the band of one clean run
+is about 1.5 points on the median and 6 µs on a class window, and no lever
+is judged on one sample or in isolation from the stages that would have to
+adapt with it (the plan's fused-phases item keeps the list). The class windows of `attn_out` (tile-major, layer 3, from the
 group's publish): the output projection's compute units 2 to 64 µs, its
 reduce units 62 to 74, the other projection 40 to 85 with its reduce to 89,
 the fold, the MoE site 88 to 111, the router 109 to 132, the select and

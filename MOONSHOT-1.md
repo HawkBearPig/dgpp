@@ -2428,10 +2428,26 @@ area, untracked.
       chain while the previous group runs, the merged phases' rows kept on
       the lead's path so they are in L2 when their classes open, lead
       units yielding when a gate opens. Clean at the measured count the
-      median layer reads 83.1 percent of its floor tile-major and 78.1
-      row-major with every weight, both sites and the real router computed
-      (83.3 and 81.2 with and without the sites in the attribution, inside
-      the band), above the 83.2 the synthetic router and no sites had read.
+      median layer reads 80.5 to 83.1 percent of its floor tile-major and
+      75.8 to 78.1 row-major across three samples with every weight, both
+      sites and the real router computed (the attribution's with and
+      without the sites inside the same band), level with the 83.2 the
+      synthetic router and no sites had read. The band of one clean run
+      is about 1.5 points on the median and 6 µs on a class window, so a
+      lever is judged on two samples at least and together with the
+      stages that would have to adapt with it. Three levers measured
+      alone against a saturated stream and set aside are to be
+      re-evaluated as a set, since each is right in the design: gated
+      classes first (needs the lead to back off while critical classes
+      run, and site and router units insensitive to memory contention:
+      staged operands, few round trips); the 2048-output row chunk (needs
+      the accumulate and reduce units' loads pipelined, which they now
+      are); the pipelined router batches (needs the kernel's register
+      budget, 255 with spills). The select's loads are batched, the finish
+      works in shared memory, each site unit collapses its slice of the
+      row so the finish only norms, and the class table resolves the
+      routed counts at load so no rebuild follows the select; each within
+      the band on its own.
       Owed here: the attention consumer, the folds and the select as
       consumers, and the chain's critical path after the attention-output
       fold, about 70 µs against the budget's 34: the MoE site's class 24

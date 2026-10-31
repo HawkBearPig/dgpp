@@ -299,6 +299,87 @@ __device__ inline void mhc_finish(const uint16_t* __restrict__ x, const float* _
   }
 }
 
+// One token's collapse under the previous site's pre for the vectors [v0, v1)
+// of its row (eight elements each): bf16 of p0 s0 + p1 s1 + p2 s2 + p3 s3 in
+// that order, as mhc_finish rounds it, into `row` (the token's row of x) for
+// mhc_finish_normed to norm in place. Split over a token's units, it leaves
+// the finishing block the norm alone.
+__device__ inline void mhc_collapse_slice(const uint16_t* __restrict__ x, const float* __restrict__ pre_in, int hidden, int v0, int v1,
+                                          uint16_t* __restrict__ row) {
+  const float p0 = pre_in[0], p1 = pre_in[1], p2 = pre_in[2], p3 = pre_in[3];
+  for (int v = v0 + static_cast<int>(threadIdx.x); v < v1; v += kMhcThreads) {
+    uint4 q[kMhcN];
+#pragma unroll
+    for (int j = 0; j < kMhcN; ++j) q[j] = reinterpret_cast<const uint4*>(x + static_cast<size_t>(j) * hidden)[v];
+    float s0[8], s1[8], s2[8], s3[8];
+    mhc_unpack8(q[0], s0);
+    mhc_unpack8(q[1], s1);
+    mhc_unpack8(q[2], s2);
+    mhc_unpack8(q[3], s3);
+    uint32_t packed[4];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      const float val = p0 * s0[j] + p1 * s1[j] + p2 * s2[j] + p3 * s3[j];
+      const uint16_t cb = float_to_bf16_bits(val);
+      if (j % 2 == 0) packed[j / 2] = cb;
+      else packed[j / 2] |= static_cast<uint32_t>(cb) << 16;
+    }
+    reinterpret_cast<uint4*>(row)[v] = make_uint4(packed[0], packed[1], packed[2], packed[3]);
+  }
+}
+
+// The finish over a collapsed row other blocks wrote (read past L1): the
+// coefficients from the logits as mhc_finish, then the one-rounding norm of
+// the row in place. Bitwise mhc_finish: the sum of squares walks the same
+// rounded values in the same thread order.
+__device__ inline void mhc_finish_normed(uint16_t* __restrict__ row, const float* __restrict__ lg, const MhcSite& site, int hidden,
+                                         float* __restrict__ pre_out, float* __restrict__ post_f32, float* __restrict__ comb_f32, float* smem) {
+  float* comb_seed = smem + kMhcN;      // [16]
+  float* scratch = smem + kMhcN + kMhcN * kMhcN;  // [8]
+  const float* base = site.base;
+  const float* scale = site.scale;
+  if (threadIdx.x < kMhcN) {
+    const int i = threadIdx.x;
+    pre_out[i] = mhc_sigmoid(lg[i] * scale[0] + base[i]) + site.hc_eps;
+  } else if (threadIdx.x < 2 * kMhcN) {
+    const int i = threadIdx.x - kMhcN;
+    post_f32[i] = 2.f * mhc_sigmoid(lg[kMhcN + i] * scale[1] + base[kMhcN + i]);
+  } else if (threadIdx.x < 3 * kMhcN) {
+    mhc_comb_seed_row(lg, base, scale, site.hc_eps, threadIdx.x - 2 * kMhcN, comb_seed);
+  }
+  __syncthreads();
+  if (threadIdx.x < 32) mhc_sinkhorn_warp(comb_seed, site.hc_eps, site.sinkhorn_iters, comb_f32, threadIdx.x);
+  const int vecs = hidden / 8;
+  const int runs = (vecs + kMhcThreads - 1) / kMhcThreads;
+  float ssq = 0.f;
+  for (int i = 0; i < runs; ++i) {
+    const int v = threadIdx.x + i * kMhcThreads;
+    if (v >= vecs) continue;
+    float cv[8];
+    mhc_unpack8(__ldcg(reinterpret_cast<const uint4*>(row) + v), cv);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) ssq = __fmaf_rn(cv[j], cv[j], ssq);
+  }
+  const float total = mhc_block_sum(ssq, scratch);
+  const float rstd = rsqrtf(total / static_cast<float>(hidden) + site.ln_eps);
+  for (int i = 0; i < runs; ++i) {
+    const int v = threadIdx.x + i * kMhcThreads;
+    if (v >= vecs) continue;
+    float kept[8], lw[8];
+    mhc_unpack8(__ldcg(reinterpret_cast<const uint4*>(row) + v), kept);
+    mhc_unpack8(reinterpret_cast<const uint4*>(site.ln)[v], lw);
+    uint32_t packed[4];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      const float xn = kept[j] * rstd;
+      const uint16_t y = float_to_bf16_bits(__fmul_rn(lw[j], xn));
+      if (j % 2 == 0) packed[j / 2] = y;
+      else packed[j / 2] |= static_cast<uint32_t>(y) << 16;
+    }
+    reinterpret_cast<uint4*>(row)[v] = make_uint4(packed[0], packed[1], packed[2], packed[3]);
+  }
+}
+
 // The one-rounding stream update for a chunk of (token, d) outputs
 // [i0, i1) of tokens * hidden: streams_out[t][i][d] = bf16(post[t][i] * h[t][d] +
 // sum_j comb[t][j][i] * streams_in[t][j][d]) (glm_mhc.cu mhc_stream_update_f32_kernel).

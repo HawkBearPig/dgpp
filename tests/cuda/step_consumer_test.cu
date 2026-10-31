@@ -1178,10 +1178,10 @@ DGPP_TEST(mhc_unit_rate) {
 // the forms the unit can take: row vectors loaded one, five or ten ahead,
 // the token count specialized or eight always.
 namespace {
-template <int kBatch, bool kSpecialize>
+template <int kBatch, bool kSpecialize, bool kPipeline = false>
 __global__ void router_unit_rate_kernel(const uint8_t* w_base, DevPool pool, Mxfp4Group g, const uint16_t* x, float* scores, float* biased, int n_experts) {
   extern __shared__ __align__(128) uint8_t smem[];
-  router_unit<5120, kBatch, kSpecialize>(w_base, pool, blockIdx.x, g, x, scores, biased, n_experts, 2, smem);
+  router_unit<5120, kBatch, kSpecialize, kPipeline>(w_base, pool, blockIdx.x, g, x, scores, biased, n_experts, 2, smem);
 }
 }  // namespace
 
@@ -1250,9 +1250,11 @@ DGPP_TEST(router_unit_rate) {
     std::printf("   router unit, %d blocks of 16 rows, 5 tokens, rows staged in L2, %s: %5.1f us (median of 3), %zu scores differ from the first form\n", units, name,
                 ms[1] * 1e3, differ);
   };
-  run(router_unit_rate_kernel<10, true>, "ten vectors ahead, tokens specialized (the kernel's)", true);
+  run(router_unit_rate_kernel<10, true>, "ten vectors ahead, tokens specialized", true);
   run(router_unit_rate_kernel<10, false>, "ten ahead, eight tokens always", false);
   run(router_unit_rate_kernel<5, true>, "five ahead, specialized", false);
+  run(router_unit_rate_kernel<5, true, true>, "five ahead, specialized, pipelined (the kernel's)", false);
+  run(router_unit_rate_kernel<10, true, true>, "ten ahead, specialized, pipelined", false);
   run(router_unit_rate_kernel<1, true>, "one at a time, specialized", false);
   run(router_unit_rate_kernel<1, false>, "one at a time, eight tokens (the first form)", false);
   cudaFree(arena); cudaFree(x); cudaFree(tokens); cudaFree(scores); cudaFree(biased); cudaFree(scores_ref); cudaFree(flushbuf); cudaFree(sink);

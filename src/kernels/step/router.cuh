@@ -14,6 +14,7 @@ namespace dgpp::step {
 
 // The form the stream kernel uses (the probe measures the others).
 constexpr int kRouterBatch = 5;  // measured 2026-10-31 standalone: 11.1 us a wave at five ahead, 11.8 at ten, 17.6 one at a time with eight tokens always
+constexpr bool kRouterPipeline = false;  // the next batch's loads in flight under this one's fmas: 12.7 us standalone against 11.9 without, and 38 us a class inside the kernel against 23 (2026-10-31)
 constexpr bool kRouterSpecialize = true;
 
 // ---- the router -----------------------------------------------------------
@@ -32,20 +33,30 @@ __device__ __forceinline__ float router_sqrt_softplus(float x) {
 // The two rows' dots against NT staged tokens: the row vectors of a batch
 // loaded before any is used (the unit was latency-bound at two in flight),
 // each (row, token) chain in the production's lane order.
-template <int kK, int NT, int kBatchWanted>
+template <int kK, int NT, int kBatchWanted, bool kPipeline>
 __device__ __forceinline__ void router_rows(const uint4* __restrict__ wv0, const uint4* __restrict__ wv1, const uint16_t* s_x, int lane,
                                             float (&dot0)[kRouterTokens], float (&dot1)[kRouterTokens]) {
   constexpr int kVecs = kK / 8 / 32;  // vectors a lane walks
   constexpr int kBatch = kVecs < kBatchWanted ? kVecs : kBatchWanted;
   static_assert(kVecs % kBatch == 0, "the row's vectors in whole batches");
-  for (int b = 0; b < kVecs; b += kBatch) {
-    uint4 q0[kBatch], q1[kBatch];
+  constexpr int kBatches = kVecs / kBatch;
+  // With kPipeline the next batch's loads are in flight while this one is computed. The loads
+  // are streaming (evict-first): the read-only-cache form took the unit's class from 23 to 38 µs
+  // inside the kernel while the standalone probe saw no difference (2026-10-31).
+  uint4 q0[2][kBatch], q1[2][kBatch];
 #pragma unroll
-    for (int i = 0; i < kBatch; ++i) { q0[i] = __ldcs(wv0 + lane + (b + i) * 32); q1[i] = __ldcs(wv1 + lane + (b + i) * 32); }
+  for (int i = 0; i < kBatch; ++i) { q0[0][i] = __ldcs(wv0 + lane + i * 32); q1[0][i] = __ldcs(wv1 + lane + i * 32); }
+#pragma unroll
+  for (int nb = 0; nb < kBatches; ++nb) {
+    const int b = nb * kBatch, cur = kPipeline ? (nb & 1) : 0;
+    if (kPipeline && nb + 1 < kBatches) {
+#pragma unroll
+      for (int i = 0; i < kBatch; ++i) { q0[cur ^ 1][i] = __ldcs(wv0 + lane + (b + kBatch + i) * 32); q1[cur ^ 1][i] = __ldcs(wv1 + lane + (b + kBatch + i) * 32); }
+    }
 #pragma unroll
     for (int i = 0; i < kBatch; ++i) {
       const int v = lane + (b + i) * 32;
-      const uint32_t w0[4] = {q0[i].x, q0[i].y, q0[i].z, q0[i].w}, w1[4] = {q1[i].x, q1[i].y, q1[i].z, q1[i].w};
+      const uint32_t w0[4] = {q0[cur][i].x, q0[cur][i].y, q0[cur][i].z, q0[cur][i].w}, w1[4] = {q1[cur][i].x, q1[cur][i].y, q1[cur][i].z, q1[cur][i].w};
       float f0[8], f1[8];
 #pragma unroll
       for (int k = 0; k < 4; ++k) {
@@ -66,12 +77,16 @@ __device__ __forceinline__ void router_rows(const uint4* __restrict__ wv0, const
         }
       }
     }
+    if (!kPipeline && nb + 1 < kBatches) {
+#pragma unroll
+      for (int i = 0; i < kBatch; ++i) { q0[0][i] = __ldcs(wv0 + lane + (b + kBatch + i) * 32); q1[0][i] = __ldcs(wv1 + lane + (b + kBatch + i) * 32); }
+    }
   }
 }
 // kBatch: row vectors a lane loads before using any (1: one at a time, the
 // first form). kSpecialize: the token count specialized (false: eight tokens
 // always, rows past the group staging row 0 again for finite operands).
-template <int kK, int kBatch, bool kSpecialize>
+template <int kK, int kBatch, bool kSpecialize, bool kPipeline = true>
 __device__ void router_unit(const uint8_t* __restrict__ w_base, const DevPool& pool, int rb, const Mxfp4Group& g, const uint16_t* __restrict__ x,
                             float* __restrict__ scores, float* __restrict__ biased, int n_experts, int mode, uint8_t* smem) {
   static_assert(kK % 256 == 0, "the router's inner width");
@@ -103,17 +118,17 @@ __device__ void router_unit(const uint8_t* __restrict__ w_base, const DevPool& p
 #pragma unroll
       for (int t = 0; t < kRouterTokens; ++t) { dot0[t] = 0.f; dot1[t] = 0.f; }
       if (!kSpecialize) {
-        router_rows<kK, kRouterTokens, kBatch>(wv0, wv1, s_x, lane, dot0, dot1);
+        router_rows<kK, kRouterTokens, kBatch, kPipeline>(wv0, wv1, s_x, lane, dot0, dot1);
       } else {
         switch (nt) {
-          case 1: router_rows<kK, 1, kBatch>(wv0, wv1, s_x, lane, dot0, dot1); break;
-          case 2: router_rows<kK, 2, kBatch>(wv0, wv1, s_x, lane, dot0, dot1); break;
-          case 3: router_rows<kK, 3, kBatch>(wv0, wv1, s_x, lane, dot0, dot1); break;
-          case 4: router_rows<kK, 4, kBatch>(wv0, wv1, s_x, lane, dot0, dot1); break;
-          case 5: router_rows<kK, 5, kBatch>(wv0, wv1, s_x, lane, dot0, dot1); break;
-          case 6: router_rows<kK, 6, kBatch>(wv0, wv1, s_x, lane, dot0, dot1); break;
-          case 7: router_rows<kK, 7, kBatch>(wv0, wv1, s_x, lane, dot0, dot1); break;
-          default: router_rows<kK, 8, kBatch>(wv0, wv1, s_x, lane, dot0, dot1); break;
+          case 1: router_rows<kK, 1, kBatch, kPipeline>(wv0, wv1, s_x, lane, dot0, dot1); break;
+          case 2: router_rows<kK, 2, kBatch, kPipeline>(wv0, wv1, s_x, lane, dot0, dot1); break;
+          case 3: router_rows<kK, 3, kBatch, kPipeline>(wv0, wv1, s_x, lane, dot0, dot1); break;
+          case 4: router_rows<kK, 4, kBatch, kPipeline>(wv0, wv1, s_x, lane, dot0, dot1); break;
+          case 5: router_rows<kK, 5, kBatch, kPipeline>(wv0, wv1, s_x, lane, dot0, dot1); break;
+          case 6: router_rows<kK, 6, kBatch, kPipeline>(wv0, wv1, s_x, lane, dot0, dot1); break;
+          case 7: router_rows<kK, 7, kBatch, kPipeline>(wv0, wv1, s_x, lane, dot0, dot1); break;
+          default: router_rows<kK, 8, kBatch, kPipeline>(wv0, wv1, s_x, lane, dot0, dot1); break;
         }
       }
 #pragma unroll
