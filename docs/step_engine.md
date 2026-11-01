@@ -431,11 +431,21 @@ samples (78.6 and 77.4 tile-major, 72.2 and 72.6 row-major): the expert
 units' hot loops pay the call frames and the ABI's reservation, and the
 router class did not move. The units stay inlined. What the chain's tail
 still needs is units that keep their standalone speed under the stream,
-and the next form to try is the staged one: the router's rows and the
-site's coefficient rows through cp.async into shared memory in two or
-three stages, as the fp8 projection unit does, so a unit's loads are in
-flight together and its wait is one latency rather than a round trip a
-batch.
+and the trace now says where. Each class's last hand-out is stamped
+beside its first and its last completion (`last hand-out` in the class
+lines): the router's 24 units are all handed out within 2 to 3 µs of the
+gate opening, and the last of them completes 30 µs later, so the class is
+the units, running at three times their standalone time under the stream
+(13 µs a wave standalone, rows in L2); the MoE site's 40 units are handed
+out within 5 µs and complete 20 later (14 for the dots, about 5 for the
+finish, against 9 standalone); the attention site's units in the accumulate
+group are handed out over 10 µs after the fold, the workers arriving from
+lead units, and complete 17 after the last. The unit forms under the
+stream are the target, not the arrival: the router's rows and the site's
+coefficient rows staged through cp.async in stages as the fp8 projection
+unit does, so a unit's loads are in flight together and its wait is one
+latency rather than a round trip a batch; and the router's bf16 rows have a
+lossless bf12 companion in the repo, a quarter fewer bytes.
 
 `step_consumers_lever_matrix` measures the scheduling levers as a set, two
 samples each, on the tile-major rig, with the median and the

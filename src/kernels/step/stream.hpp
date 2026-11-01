@@ -97,6 +97,7 @@ struct alignas(128) StepCtl {
   unsigned look_blocked[kStepMaxPhases];            // the last pass: workers that found the cursor past the lookahead while this phase was published
   unsigned long long cls_first[kStepMaxPhases][kStepMaxClasses];  // the last pass: when each class of the published group handed out its first unit
   unsigned long long cls_last[kStepMaxPhases][kStepMaxClasses];   // and when its last unit completed
+  unsigned long long cls_last_grab[kStepMaxPhases][kStepMaxClasses];  // and when its last unit was handed out (the window's stagger ends here)
   unsigned long long route_select_ns[kStepMaxLayers];  // the last pass: the chain's select over the router's scores
   unsigned long long route_finish_ns[kStepMaxLayers];  // the last pass: the run list, groups and slots from the picks
   unsigned steps_run;                              // steps this launch completed

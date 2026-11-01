@@ -397,9 +397,10 @@ StreamReport Streamer::run(const StreamerConfig& cfg) {
           c.pool = pool;
           c.pool_kind = pool >= 0 ? dp_.pools[static_cast<size_t>(pool)].kind : -1;
           c.units = units;
-          const unsigned long long f = ctl_->cls_first[P][n], e = ctl_->cls_last[P][n];
+          const unsigned long long f = ctl_->cls_first[P][n], e = ctl_->cls_last[P][n], lg = ctl_->cls_last_grab[P][n];
           c.first_us = f != ~0ull ? static_cast<double>(f - origin) / 1e3 : 0.0;
           c.last_us = e ? static_cast<double>(e - origin) / 1e3 : 0.0;
+          c.last_grab_us = lg ? static_cast<double>(lg - origin) / 1e3 : 0.0;
           t.classes.push_back(c);
           ++n;
         };

@@ -65,6 +65,7 @@ struct ClassTiming {
   int pool_kind = 0;
   unsigned units = 0;
   double first_us = 0;
+  double last_grab_us = 0;  // the last hand-out: first_us to here is the class's stagger, here to last_us its last unit
   double last_us = 0;
 };
 

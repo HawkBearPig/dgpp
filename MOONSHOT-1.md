@@ -2463,10 +2463,15 @@ area, untracked.
       45 in the kernel is the stream's contention and the hand-out's
       stagger; taking the unit entries out of line lost 2.5 points on
       both forms (the expert units pay the call frames), so they stay
-      inlined. Next: the staged form for the router's rows and the site's
-      coefficient rows (cp.async in two or three stages, as the fp8
-      projection unit), so a unit under the stream waits one latency
-      rather than a round trip a batch.
+      inlined. The class trace's last-hand-out stamp then split the
+      windows: the router's units are all out within 2 to 3 µs of their
+      gate and run 30 µs where they take 13 standalone, the MoE site's
+      out within 5 and run 20, the attention site's out over 10 µs (the
+      workers arriving from lead units) and run 17. The units under the
+      stream are the target: the staged form for the router's rows and
+      the site's coefficient rows (cp.async in stages, as the fp8
+      projection unit), and the lossless bf12 companion for the router's
+      bf16 rows.
       Owed here: the attention consumer, the folds and the select as
       consumers, and the chain's critical path after the attention-output
       fold, about 70 µs against the budget's 34: the MoE site's class 24

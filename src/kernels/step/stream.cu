@@ -736,7 +736,7 @@ __global__ void __launch_bounds__(kStepThreads, 1) step_stream_kernel(StepStream
           ctl->done[i] = 0; ctl->pf_units[i] = 0; ctl->idle_first[i] = 0; ctl->fold_done[i] = 0;
           ctl->busy_ns[i] = 0; ctl->grabs[i] = 0; ctl->handout_ns[i] = 0; ctl->lead_in_bytes[i] = 0; ctl->pf_credit[i] = 0; ctl->pf_staged[i] = 0;
           ctl->wait_ns[i] = 0;
-          for (int c = 0; c < kStepMaxClasses; ++c) { ctl->cls_next[i][c] = 0; ctl->cls_first[i][c] = ~0ull; ctl->cls_last[i][c] = 0; }
+          for (int c = 0; c < kStepMaxClasses; ++c) { ctl->cls_next[i][c] = 0; ctl->cls_first[i][c] = ~0ull; ctl->cls_last[i][c] = 0; ctl->cls_last_grab[i][c] = 0; }
         }
         for (int i = static_cast<int>(threadIdx.x); i < kStepMaxLayers * n_phases; i += kStepThreads) {
           ctl->pool_done[i / n_phases][i % n_phases] = 0;
@@ -1033,6 +1033,7 @@ __global__ void __launch_bounds__(kStepThreads, 1) step_stream_kernel(StepStream
             sm_kind = 1; sm_class = c; sm_unit = u; sm_phase = static_cast<unsigned>(P);
             sm_count = min(grab, count - u);
             if (u == 0) ctl->cls_first[P][c] = t_top;  // the class's first unit: its trace
+            atomicMax(&ctl->cls_last_grab[P][c], t_top);
             atomicAdd(&ctl->handout_ns[P], gtimer() - t_top);
           }
           // (Workers leading inside the routed expert phase in place of taking its units were
