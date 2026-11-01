@@ -1178,10 +1178,12 @@ DGPP_TEST(mhc_unit_rate) {
 // the forms the unit can take: row vectors loaded one, five or ten ahead,
 // the token count specialized or eight always.
 namespace {
-template <int kBatch, bool kSpecialize, bool kPipeline = false>
-__global__ void router_unit_rate_kernel(const uint8_t* w_base, DevPool pool, Mxfp4Group g, const uint16_t* x, float* scores, float* biased, int n_experts) {
+template <int kBatch, bool kSpecialize, bool kPipeline = false, bool kCandidates = false>
+__global__ void router_unit_rate_kernel(const uint8_t* w_base, DevPool pool, Mxfp4Group g, const uint16_t* x, float* scores, float* biased, int n_experts,
+                                        int32_t* cand_id = nullptr, float* cand_score = nullptr, float* cand_biased = nullptr) {
   extern __shared__ __align__(128) uint8_t smem[];
-  router_unit<5120, kBatch, kSpecialize, kPipeline>(w_base, pool, blockIdx.x, g, x, scores, biased, n_experts, 2, smem);
+  if (kCandidates) router_unit<5120, kBatch, kSpecialize, kPipeline>(w_base, pool, blockIdx.x, g, x, scores, biased, n_experts, 2, smem, 6, cand_id, cand_score, cand_biased);
+  else router_unit<5120, kBatch, kSpecialize, kPipeline>(w_base, pool, blockIdx.x, g, x, scores, biased, n_experts, 2, smem);
 }
 }  // namespace
 
@@ -1227,9 +1229,14 @@ DGPP_TEST(router_unit_rate) {
   DGPP_CUDA_OK(cudaEventCreate(&e0));
   DGPP_CUDA_OK(cudaEventCreate(&e1));
   constexpr int kSmem = kFp8StagedSmemCap;
+  int32_t* cand_id = nullptr;
+  float *cand_score = nullptr, *cand_biased = nullptr;
+  DGPP_CUDA_OK(cudaMalloc(&cand_id, static_cast<size_t>(T) * E * 4));
+  DGPP_CUDA_OK(cudaMalloc(&cand_score, static_cast<size_t>(T) * E * 4));
+  DGPP_CUDA_OK(cudaMalloc(&cand_biased, static_cast<size_t>(T) * E * 4));
   auto run = [&](auto kernel, const char* name, bool reference) {
     DGPP_CUDA_OK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem));
-    kernel<<<units, kStepThreads, kSmem>>>(arena, pool, g, x, scores, biased, E);  // the first launch's costs
+    kernel<<<units, kStepThreads, kSmem>>>(arena, pool, g, x, scores, biased, E, cand_id, cand_score, cand_biased);  // the first launch's costs
     DGPP_CUDA_OK(cudaDeviceSynchronize());
     std::vector<float> ms(3);
     for (float& m : ms) {
@@ -1238,7 +1245,7 @@ DGPP_TEST(router_unit_rate) {
       stage_cg_kernel<<<47, 256>>>(reinterpret_cast<const uint4*>(arena), (wbytes + 256 + bbytes) / 16, sink);
       DGPP_CUDA_OK(cudaDeviceSynchronize());
       DGPP_CUDA_OK(cudaEventRecord(e0));
-      kernel<<<units, kStepThreads, kSmem>>>(arena, pool, g, x, scores, biased, E);
+      kernel<<<units, kStepThreads, kSmem>>>(arena, pool, g, x, scores, biased, E, cand_id, cand_score, cand_biased);
       DGPP_CUDA_OK(cudaEventRecord(e1));
       DGPP_CUDA_OK(cudaDeviceSynchronize());
       DGPP_CUDA_OK(cudaEventElapsedTime(&m, e0, e1));
@@ -1253,11 +1260,13 @@ DGPP_TEST(router_unit_rate) {
   run(router_unit_rate_kernel<10, true>, "ten vectors ahead, tokens specialized", true);
   run(router_unit_rate_kernel<10, false>, "ten ahead, eight tokens always", false);
   run(router_unit_rate_kernel<5, true>, "five ahead, specialized", false);
+  run(router_unit_rate_kernel<5, true, false, true>, "five ahead, specialized, with the candidate scan (the kernel's)", false);
   run(router_unit_rate_kernel<5, true, true>, "five ahead, specialized, pipelined (the kernel's)", false);
   run(router_unit_rate_kernel<10, true, true>, "ten ahead, specialized, pipelined", false);
   run(router_unit_rate_kernel<1, true>, "one at a time, specialized", false);
   run(router_unit_rate_kernel<1, false>, "one at a time, eight tokens (the first form)", false);
   cudaFree(arena); cudaFree(x); cudaFree(tokens); cudaFree(scores); cudaFree(biased); cudaFree(scores_ref); cudaFree(flushbuf); cudaFree(sink);
+  cudaFree(cand_id); cudaFree(cand_score); cudaFree(cand_biased);
 }
 
 DGPP_TEST(mhc_site_matches_the_production_kernels) {

@@ -2456,12 +2456,17 @@ area, untracked.
       chain in registers with the same rule, bitwise the production's over
       all scores), 13 to 15 µs under load down to 4.4 to 6.0. The router
       unit's class grew by about ten with the scan in it and the kernel's
-      stack from 32 to 72 bytes a thread, so the unit's hot loop under
-      register pressure is measured next, standalone first; then units
-      that run at their standalone speed under the stream (staged
-      operands, few round trips) rather than a different order. Two
-      samples with all of it: 81.0 and 80.8 tile-major, 74.4 and 75.2
-      row-major.
+      stack from 32 to 72 bytes a thread. Two samples with all of it:
+      81.0 and 80.8 tile-major, 74.4 and 75.2 row-major. Measured next
+      (2026-11-01): the scan costs the unit 1.4 µs a wave standalone and
+      every form of the unit sits within 12 to 15, so the class's 32 to
+      45 in the kernel is the stream's contention and the hand-out's
+      stagger; taking the unit entries out of line lost 2.5 points on
+      both forms (the expert units pay the call frames), so they stay
+      inlined. Next: the staged form for the router's rows and the site's
+      coefficient rows (cp.async in two or three stages, as the fp8
+      projection unit), so a unit under the stream waits one latency
+      rather than a round trip a batch.
       Owed here: the attention consumer, the folds and the select as
       consumers, and the chain's critical path after the attention-output
       fold, about 70 µs against the budget's 34: the MoE site's class 24

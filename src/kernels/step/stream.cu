@@ -591,6 +591,11 @@ __device__ void route_select(const StepStreamParams& p, int layer, int* keys, ui
 }
 
 
+// Inlined, with every unit entry: out of line (__noinline__ on the units, the select and the finish)
+// the kernel lost 2.5 points on both forms over two samples (2026-11-01), the expert units' hot
+// loops paying the call frames and the ABI's register reservation; the router class in the kernel
+// was unchanged, so its inflation over the standalone probe (13 µs a wave with the candidate scan)
+// is the stream's contention and the hand-out's stagger, not register pressure.
 __device__ void consumer_unit(const StepStreamParams& p, int layer, const DevPool& pool, int g, int rb, uint8_t* smem, bool stage) {
   const bool routed = pool.group_kind == kGroupRouted;
   const int expert = routed ? p.ctl->run_list[layer][g] : 0;

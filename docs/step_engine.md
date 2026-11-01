@@ -418,6 +418,25 @@ pressure is the next thing to measure, standalone first. Two samples with
 all of it: 81.0 and 80.8 percent of the floor tile-major, 74.4 and 75.2
 row-major; the attribution 79.6 with the sites and 79.4 without.
 
+Measured next (2026-11-01): standalone, the candidate scan costs the router
+unit 1.4 µs a wave (13.4 against 12.0), and the forms (one, five or ten
+vectors ahead, pipelined or not, tokens specialized or not) sit within
+12.0 to 15.4, so the unit's class in the kernel, 32 to 45 µs, is three
+times its standalone wave: the stream's contention and the hand-out's
+stagger, not the unit's own work. Taking every unit entry out of line
+(`__noinline__` on the consumers, the accumulation, the reduce, the select
+and the finish), so each had its own register allocation rather than the
+worker loop's at the 255 limit, lost 2.5 points on both forms over two
+samples (78.6 and 77.4 tile-major, 72.2 and 72.6 row-major): the expert
+units' hot loops pay the call frames and the ABI's reservation, and the
+router class did not move. The units stay inlined. What the chain's tail
+still needs is units that keep their standalone speed under the stream,
+and the next form to try is the staged one: the router's rows and the
+site's coefficient rows through cp.async into shared memory in two or
+three stages, as the fp8 projection unit does, so a unit's loads are in
+flight together and its wait is one latency rather than a round trip a
+batch.
+
 `step_consumers_lever_matrix` measures the scheduling levers as a set, two
 samples each, on the tile-major rig, with the median and the
 attention-output group's site and router windows and tail. Its first full
