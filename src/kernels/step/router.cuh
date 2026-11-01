@@ -159,29 +159,36 @@ __device__ void router_unit(const uint8_t* __restrict__ w_base, const DevPool& p
           default: router_rows<kK, 8, kBatch, kPipeline>(wv0, wv1, s_x, lane, dot0, dot1, tr); break;
         }
       }
+      // The xor trees leave every lane the sums; lane t then finishes token t (the activation and
+      // its four stores) in parallel with the other tokens, where lane 0 did them all in turn.
 #pragma unroll
       for (int t = 0; t < kRouterTokens; ++t) {
         float d0 = dot0[t], d1 = dot1[t];
 #pragma unroll
         for (int off = 16; off > 0; off >>= 1) { d0 += __shfl_xor_sync(0xFFFFFFFFu, d0, off); d1 += __shfl_xor_sync(0xFFFFFFFFu, d1, off); }
-        if (lane == 0 && t < nt) {
-          const int tok = ids.at(t);
-          const float s0 = mode == 2 ? router_sqrt_softplus(d0) : 1.0f / (1.0f + expf(-d0));
-          const float b0 = s0 + bias[e0];
-          scores[static_cast<size_t>(tok) * n_experts + e0] = s0;
-          biased[static_cast<size_t>(tok) * n_experts + e0] = b0;
-          s_b[t * kRouterUnitRows + warp] = b0;
-          s_s[t * kRouterUnitRows + warp] = s0;
-          float b1 = -INFINITY, s1 = 0.f;
-          if (live1) {
-            s1 = mode == 2 ? router_sqrt_softplus(d1) : 1.0f / (1.0f + expf(-d1));
-            b1 = s1 + bias[e1];
-            scores[static_cast<size_t>(tok) * n_experts + e1] = s1;
-            biased[static_cast<size_t>(tok) * n_experts + e1] = b1;
-          }
-          s_b[t * kRouterUnitRows + warp + (kStepThreads / 32)] = b1;
-          s_s[t * kRouterUnitRows + warp + (kStepThreads / 32)] = s1;
+        dot0[t] = d0;
+        dot1[t] = d1;
+      }
+      float my0 = dot0[0], my1 = dot1[0];
+#pragma unroll
+      for (int t = 1; t < kRouterTokens; ++t) { my0 = lane == t ? dot0[t] : my0; my1 = lane == t ? dot1[t] : my1; }
+      if (lane < nt) {
+        const int t = lane, tok = ids.at(t);
+        const float s0 = mode == 2 ? router_sqrt_softplus(my0) : 1.0f / (1.0f + expf(-my0));
+        const float b0 = s0 + bias[e0];
+        scores[static_cast<size_t>(tok) * n_experts + e0] = s0;
+        biased[static_cast<size_t>(tok) * n_experts + e0] = b0;
+        s_b[t * kRouterUnitRows + warp] = b0;
+        s_s[t * kRouterUnitRows + warp] = s0;
+        float b1 = -INFINITY, s1 = 0.f;
+        if (live1) {
+          s1 = mode == 2 ? router_sqrt_softplus(my1) : 1.0f / (1.0f + expf(-my1));
+          b1 = s1 + bias[e1];
+          scores[static_cast<size_t>(tok) * n_experts + e1] = s1;
+          biased[static_cast<size_t>(tok) * n_experts + e1] = b1;
         }
+        s_b[t * kRouterUnitRows + warp + (kStepThreads / 32)] = b1;
+        s_s[t * kRouterUnitRows + warp + (kStepThreads / 32)] = s1;
       }
     } else if (lane == 0) {
 #pragma unroll
@@ -197,19 +204,23 @@ __device__ void router_unit(const uint8_t* __restrict__ w_base, const DevPool& p
       const bool mine = row < kRouterUnitRows && e < n_experts;
       float v = mine ? s_b[t * kRouterUnitRows + row] : -INFINITY;
       const float sc = mine ? s_s[t * kRouterUnitRows + row] : 0.f;
+      // Lane r keeps round r's pick; the k lanes store their entries together after the rounds.
+      int my_id = -1;
+      float my_bv = -INFINITY, my_ws = 0.f;
       for (int r = 0; r < top_k; ++r) {
         float bv = v;
         int best = (mine && v > -INFINITY) ? e : INT_MAX;
         router_argmax_lowest_id(bv, best);
         const bool found = best != INT_MAX;
         const float ws = __shfl_sync(0xFFFFFFFFu, sc, found ? best - rb * kRouterUnitRows : 0);
-        if (lane == 0) {
-          const size_t at = static_cast<size_t>(tok) * n_experts + static_cast<size_t>(rb) * top_k + r;
-          cand_id[at] = found ? best : -1;
-          cand_biased[at] = found ? bv : -INFINITY;
-          cand_score[at] = found ? ws : 0.f;
-        }
+        if (lane == r) { my_id = found ? best : -1; my_bv = found ? bv : -INFINITY; my_ws = found ? ws : 0.f; }
         if (found && e == best) v = -INFINITY;  // taken
+      }
+      if (lane < top_k) {
+        const size_t at = static_cast<size_t>(tok) * n_experts + static_cast<size_t>(rb) * top_k + lane;
+        cand_id[at] = my_id;
+        cand_biased[at] = my_bv;
+        cand_score[at] = my_ws;
       }
     }
     if (tr && threadIdx.x == 0) tr[kRouterTraceWords - 1] = router_timer();  // the unit done

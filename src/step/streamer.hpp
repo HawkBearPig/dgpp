@@ -46,6 +46,7 @@ struct StreamerConfig {
   int acc_chunk = 512;
   bool router_pipeline = false;
   bool lead_yield_on_gate = true;
+  bool router_pause_lead = false;
   uint64_t first_seq = 0;        // the first step's sequence number; steps count up from it
   uint64_t epoch = 0;            // echoed by every verdict
   int skip_at_step = -1;         // publish skip instead of this step (-1: never)

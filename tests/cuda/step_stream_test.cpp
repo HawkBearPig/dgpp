@@ -691,16 +691,13 @@ DGPP_TEST(step_consumers_lever_matrix) {
   // The second set (2026-11-01): the latency-bound classes run two to three times their standalone
   // time in the kernel whether or not the memory is saturated; the lead runs in every case, so the
   // variants take it away (no lead at all; one leader while a site's or the router's units run).
-  struct Variant { const char* name; bool gated_first; unsigned critical_leaders; int chunk; bool pipeline; bool yield; uint64_t lead_cap; };
+  struct Variant { const char* name; bool gated_first; unsigned critical_leaders; int chunk; bool pipeline; bool yield; uint64_t lead_cap; bool router_pause; };
   const uint64_t kCap = uint64_t{16} << 20;
   const Variant variants[] = {
-      {"baseline (phase order, chunk 512, lead 16 MB)", false, 0, 512, false, true, kCap},
-      {"no lead", false, 0, 512, false, true, 0},
-      {"one leader while critical", false, 1, 512, false, true, kCap},
-      {"baseline without the lead's yield on gates", false, 0, 512, false, false, kCap},
-      {"gated classes first", true, 0, 512, false, true, kCap},
-      {"gated first, one leader while critical", true, 1, 512, false, true, kCap},
-      {"8 leaders while critical alone", false, 8, 512, false, true, kCap},
+      {"baseline (phase order, chunk 512, lead 16 MB)", false, 0, 512, false, true, kCap, false},
+      {"the lead paused while the router's units run", false, 0, 512, false, true, kCap, true},
+      {"one leader while critical", false, 1, 512, false, true, kCap, false},
+      {"no lead", false, 0, 512, false, true, 0, false},
   };
   for (const Variant& v : variants) {
     Streamer s(rig->dp, rig->bases, rig->plans);
@@ -714,6 +711,7 @@ DGPP_TEST(step_consumers_lever_matrix) {
     cfg.router_pipeline = v.pipeline;
     cfg.lead_yield_on_gate = v.yield;
     cfg.lead_cap_bytes = v.lead_cap;
+    cfg.router_pause_lead = v.router_pause;
     (void)s.run(cfg);  // warm-up
     for (int sample = 0; sample < 2; ++sample) {
       const StreamReport r = s.run(cfg);

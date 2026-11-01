@@ -185,6 +185,7 @@ struct StepStreamParams {
   int acc_chunk = 512;
   unsigned router_pipeline = 0;  // not compiled into the kernel (see consumer_unit); the probe's form
   unsigned yield_on_gate = 1;  // lead units yield when a gate opens, not only when a phase is published
+  unsigned router_pause_lead = 0;  // no worker leads while the router's units are out running (its row batches took twice their standalone time under the lead's fills)
   unsigned long long deadline_ns = 0;          // every in-step spin's deadline (0: none)
   unsigned long long pending_deadline_ns = 0;  // how long the chain waits for the host's next descriptor (0: forever)
 };

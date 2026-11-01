@@ -968,7 +968,7 @@ __global__ void __launch_bounds__(kStepThreads, 1) step_stream_kernel(StepStream
   }
   // ---- a worker
   extern __shared__ __align__(128) uint8_t smem[];
-  __shared__ unsigned sm_kind, sm_unit, sm_phase, sm_count, sm_word, sm_stop, sm_published, sm_look_blocked, sm_class, sm_critical, sm_gen;
+  __shared__ unsigned sm_kind, sm_unit, sm_phase, sm_count, sm_word, sm_stop, sm_published, sm_look_blocked, sm_class, sm_critical, sm_gen, sm_router_running;
   __shared__ unsigned sm_lead_begin[kStepMaxPhases];  // the lead sequence's phase boundaries, for the lead's hand-out
   __shared__ unsigned long long sm_grab_bytes;
   // The published group's unit classes, built once a group a worker: in hand-out order, each
@@ -1024,8 +1024,16 @@ __global__ void __launch_bounds__(kStepThreads, 1) step_stream_kernel(StepStream
           // staging while the class has units for every worker; the tail takes them singly.
           bool any_pending = false;  // a closed gate: units will come
           sm_critical = 0;           // an open gated class with its units all out: they run now, the lead gives way
+          sm_router_running = 0;     // the router's class out and not complete
           for (unsigned c = 0; c < sm_nclasses && sm_kind == 0; ++c) {
-            if (sm_cls_exhausted & (1u << c)) { if (sm_cls_gate[c] == kGateFold || sm_cls_gate[c] == kGateSite) sm_critical = 1; continue; }
+            if (sm_cls_exhausted & (1u << c)) {
+              const uint8_t egk = sm_cls_gate[c];
+              if (egk == kGateFold || egk == kGateSite) sm_critical = 1;
+              if (egk == kGateSite && p.router_pause_lead && sm_cls_pool[c] >= 0 &&
+                  ld_acq(&ctl->pool_done[p.phases[sm_cls_phase[c]].layer][sm_cls_pool[c]]) < sm_cls_count[c])
+                sm_router_running = 1;
+              continue;
+            }
             const uint8_t gk = sm_cls_gate[c];
             if (gk != kGateNone) {
               const int il = p.phases[sm_cls_phase[c]].layer;
@@ -1038,7 +1046,12 @@ __global__ void __launch_bounds__(kStepThreads, 1) step_stream_kernel(StepStream
             }
             const unsigned count = sm_cls_count[c];
             const unsigned at = ld_acq(&ctl->cls_next[P][c]);
-            if (at >= count) { sm_cls_exhausted |= 1u << c; if (gk == kGateFold || gk == kGateSite) sm_critical = 1; continue; }
+            if (at >= count) {
+              sm_cls_exhausted |= 1u << c;
+              if (gk == kGateFold || gk == kGateSite) sm_critical = 1;
+              if (gk == kGateSite && p.router_pause_lead) sm_router_running = 1;  // just out: running
+              continue;
+            }
             unsigned grab = sm_cls_grab[c];
             if (grab > 1) {  // the tail shrinks the grab gradually: at most a worker's share of what remains
               const unsigned share = (count - at) / (gridDim.x - 1);
@@ -1057,7 +1070,7 @@ __global__ void __launch_bounds__(kStepThreads, 1) step_stream_kernel(StepStream
           // so the staging added to it one to one and bought back a quarter of itself in qkv.)
           if (sm_kind == 0 && !any_pending && ctl->idle_first[P] == 0) ctl->idle_first[P] = gtimer();
         }
-        if (sm_kind == 0 && p.lead_cap_bytes) {
+        if (sm_kind == 0 && p.lead_cap_bytes && !sm_router_running) {  // the lead pauses while the router's units run, when asked
           long long ahead = static_cast<long long>(ctl->pf_bytes) - static_cast<long long>(ctl->consumed_pf_bytes);
           if (ahead < 0) ahead = 0;
           // The idle budget: the modeled time until the next stream phase has units, a latency

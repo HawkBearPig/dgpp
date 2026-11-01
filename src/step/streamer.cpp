@@ -226,6 +226,7 @@ StreamReport Streamer::run(const StreamerConfig& cfg) {
   p.acc_chunk = cfg.acc_chunk > 0 ? cfg.acc_chunk : kStepAccChunk;
   p.router_pipeline = cfg.router_pipeline ? 1u : 0u;
   p.yield_on_gate = cfg.lead_yield_on_gate ? 1u : 0u;
+  p.router_pause_lead = cfg.router_pause_lead ? 1u : 0u;
   acc_chunk_ = p.acc_chunk;
   gated_first_ = cfg.gated_first;
   p.deadline_ns = static_cast<unsigned long long>(cfg.deadline_s * 1e9);

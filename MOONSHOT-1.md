@@ -2477,8 +2477,28 @@ area, untracked.
       memory in its loop and its rows hot; so the cost is the L2's latency
       under the lead's fills and the epilogue, and the levers are a lead
       paused for the router's twenty microseconds, bf12 rows and a lighter
-      epilogue. The expert and projection units lost their local-memory
-      re-reads of the group struct on the way (stack 80 to 48).
+      epilogue, all three pursued (2026-11-01). The epilogue first: a lane
+      a token for the activations and their stores where lane 0 did every
+      token in turn, and the candidates stored by the k lanes together;
+      the standalone unit 11.4 to 8.1 µs (its epilogue 4.2 to 2.0), the
+      unit alone in the kernel 21 to 11 to 13, the router class in the
+      attention-output group 25 µs where it had been 32 to 45, the group's
+      end at 151 µs where it had been 157 to 176, the median 81.7 and 81.8
+      on two samples. The lead paused while the router's units run: a knob
+      on the streamer, measured at 79.5 and 79.3 with the router class no
+      shorter (the batches no longer wait on the lead's fills once the
+      epilogue is light), so it stays off. The bf12 router rows depend on
+      four things the repo does not do yet, in order: the loader packing
+      each layer's gate matrix into a companion (`Bf12Host`, as the lm
+      head's), an arena side grant for the companion under the placed
+      layout (the loader refuses one today), the plan's router range as
+      Format::Bf12 with read_bytes three quarters and the raw rows, and
+      the unit decoding a lane's 16-byte vectors through
+      `bf12_gemv::consume_step`; the production router's lane order (lane l
+      owns vectors l + 32 i, eight fmas a vector) is the bf16 GEMV's, so
+      the chain stays bitwise. The expert and projection units lost their
+      local-memory re-reads of the group struct on the way (stack 80 to
+      48).
       Owed here: the attention consumer, the folds and the select as
       consumers, and the chain's critical path after the attention-output
       fold, about 70 µs against the budget's 34: the MoE site's class 24

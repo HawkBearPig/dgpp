@@ -469,11 +469,25 @@ the kernel, alone with the lead, the same unit takes 2.0, then 2.5 to 3.0 a
 batch, then 7: about 21. So the latency-bound unit's cost under the kernel
 is its row batches' round trips at the L2's latency under the lead's fills,
 plus an epilogue that doubles too; the arrival, the registers, the clock and
-the rows' residency are not it. What would cut it: the lead paused for the
-router's 20 µs (the matrix priced eight leaders at five points; zero for
-twenty microseconds is a different trade), bf12 rows (a quarter fewer
-bytes), and a lighter epilogue (the candidate scan and the per-warp stores
-cost 4 to 7 µs where the dots cost 6 to 12).
+the rows' residency are not it. Three levers followed, as a set. The
+epilogue, first: lane t finishes token t (the sqrt-softplus, the four
+stores of scores and biased scores, the shared-memory rows for the scan)
+where lane 0 had done every token in turn, and the candidate rounds leave
+their picks in lanes 0 to k-1, which store them together. The standalone
+unit fell from 11.4 to 8.1 µs (its epilogue 4.2 to 2.0, and the batches
+5.7 to 4.6 with the warps no longer waiting behind lane 0), the unit alone
+in the kernel from 21 to 11 to 13, the router's class in the
+attention-output group to 25 µs where it had been 32 to 45, the group's end
+to 151 where it had been 157 to 176; two samples read 81.7 and 81.8 percent
+of the floor. The lead paused while the router's units run
+(`router_pause_lead`, no worker leads while the router's class is out and
+its pool not complete) measured 79.5 and 79.3 with the router class no
+shorter, so it stays off: with the epilogue light the batches no longer
+wait on the lead's fills. The bf12 rows need the loader to pack the gate
+matrices, an arena side grant under the placed layout, the plan's range
+and the unit's decode (the plan's fused-phases item lists the four); the
+production router's lane order is the bf16 GEMV's, so that chain would
+stay bitwise.
 
 `step_consumers_lever_matrix` measures the scheduling levers as a set, two
 samples each, on the tile-major rig, with the median and the
