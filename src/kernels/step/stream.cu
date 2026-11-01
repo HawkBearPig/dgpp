@@ -543,13 +543,18 @@ __device__ void attention_unit(const StepStreamParams& p, int layer, const DevPo
 #define DGPP_STEP_ATTN_ARGS                                                                                                   \
   bx, s, smem, a.q, latent, nullptr, a.req_ids, a.pos, list, stride, counts, rows, n_split, a.local_heads, block_tokens, tables, \
       bpr, total, a.scale, a.m[src], a.l[src], a.c[src], a.tickets[src], a.mg[src], a.lg[src], a.cg[src]
+  // The step's form of the body (kernels/dsa_attn_flash.cuh): a tile's rows fetched in one pass,
+  // four fold outputs a thread, the ring's identity table resolved without the table load; the
+  // arithmetic the production's. At one block a worker under the lead's stream each dependent
+  // round trip to L2 is about 2 µs, and the production's form had about sixteen (2026-11-01).
   using dgpp::dsa_flash::attn_flash_body;
+  constexpr int kPasses = 1, kFoldPer = 4;
   if (src == 0) {
-    if (grouped) attn_flash_body<kAttnLatent, kAttnLatent, true, LatentFormat::kFp8Block, kAttnSplitGroup>(DGPP_STEP_ATTN_ARGS);
-    else attn_flash_body<kAttnLatent, kAttnLatent, true, LatentFormat::kFp8Block, 1>(DGPP_STEP_ATTN_ARGS);
+    if (grouped) attn_flash_body<kAttnLatent, kAttnLatent, true, LatentFormat::kFp8Block, kAttnSplitGroup, kPasses, kFoldPer, true>(DGPP_STEP_ATTN_ARGS);
+    else attn_flash_body<kAttnLatent, kAttnLatent, true, LatentFormat::kFp8Block, 1, kPasses, kFoldPer, true>(DGPP_STEP_ATTN_ARGS);
   } else {
-    if (grouped) attn_flash_body<kAttnLatent, kAttnLatent, true, LatentFormat::kFp4Block, kAttnSplitGroup>(DGPP_STEP_ATTN_ARGS);
-    else attn_flash_body<kAttnLatent, kAttnLatent, true, LatentFormat::kFp4Block, 1>(DGPP_STEP_ATTN_ARGS);
+    if (grouped) attn_flash_body<kAttnLatent, kAttnLatent, true, LatentFormat::kFp4Block, kAttnSplitGroup, kPasses, kFoldPer, false>(DGPP_STEP_ATTN_ARGS);
+    else attn_flash_body<kAttnLatent, kAttnLatent, true, LatentFormat::kFp4Block, 1, kPasses, kFoldPer, false>(DGPP_STEP_ATTN_ARGS);
   }
 #undef DGPP_STEP_ATTN_ARGS
 }

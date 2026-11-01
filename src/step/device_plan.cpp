@@ -449,6 +449,24 @@ DevicePlan lower_plan(const std::vector<LayerPlan>& layers, uint32_t unit_bytes,
         }
       }
     }
+  // The attention behind the stream phase before it, where they are consecutive (the layers
+  // without an index source; a selection latency phase between them keeps the attention a phase
+  // of its own until the selection is units too): its classes follow the projections' in the
+  // hand-out, so they run in the projections' drain, and the output projection publishes when
+  // the group ends, after the finish. Measured as a phase of its own (2026-11-01) the attention
+  // cost the layer six points. Gated on nothing yet: the queries are given, not produced here.
+  if (attention)
+    for (size_t i = 0; i + 1 < dp.phases.size(); ++i) {
+      DevPhase& a = dp.phases[i];
+      DevPhase& b = dp.phases[i + 1];
+      if (a.kind != 1 || a.merged || a.accumulate || a.fold_after_us > 0.f || b.layer != a.layer || b.kind != 1 || b.merged) continue;
+      if (b.n_pools == 0 || b.fixed_units != 0 || b.waits_host) continue;
+      bool all_attention = true;
+      for (int k = 0; k < b.n_pools; ++k)
+        if (dp.pools[static_cast<size_t>(b.pools[k])].kind != kPoolAttention) all_attention = false;
+      if (!all_attention) continue;
+      a.merged = 1;
+    }
   // The expert phases: a gate and up pool followed by a down pool merge, and
   // each down pool names the gate and up pool of its group kind as partner.
   if (experts || shared)

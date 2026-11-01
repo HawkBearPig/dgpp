@@ -662,11 +662,38 @@ round trips (the queries, the list's resolve through the table, the two
 fetch passes, the publish, and for the group's last block the fold's 512
 KB of partials from L2) each at the L2's latency under the lead's stream.
 What the design budgets for attend is 2 µs of exposed latency, which means
-its classes inside a stream phase's drain, not a phase: the next change
-merges the attend phase into the qkv group behind the q projection (so
-the units run under the projections' drain and the output projection
-publishes when the finish ends, no phase boundary either side), and the
-unit form under the stream follows the router's and the site's lessons.
+its classes inside a stream phase's drain, not a phase. Two changes
+followed the same night. The body took its load batching as template
+parameters, the same arithmetic in every form: the passes a tile's rows
+are fetched in (the production's four hold the registers of two blocks an
+SM; the step's one issues every row's loads together), the fold outputs a
+thread per round of the group merge (two in production, four in the step),
+and the ring's identity table resolved without the table load; the
+production kernels keep their parameters and the DSA suite passed
+unchanged, the oracle test bitwise in the step's form. And the attend phase
+merges behind the stream phase before it where the two are consecutive
+(the layers without an index source; where a selection latency phase sits
+between them the attention stays a phase until the selection is units
+too), its classes after the projections' in the hand-out, so they run in
+the projections' drain and the output projection publishes when the group
+ends, after the finish; the merge is gated on nothing yet, since the
+queries are given rather than produced in the kernel. The merged group at
+layer 3 (five rows, the attention rig): the q projections' compute units
+27 to 89 µs and their reduce to 91, the window's 24 blocks handed out
+from 59 to 84 as workers come free and complete at 112, the main's 96 from
+84 to 118 and complete at 146, the finish's 80 units to 166. The
+attention still adds about 75 µs to the group where it took 87 as a
+phase (the attribution reads 74.8 to 75.0 with it on three samples against
+75.2 to 78.7 without in the same windows, the rate case's set at 79.6 and
+80.1: three to five points, from six), because a block still takes 25 to
+28 µs: its rows come from DRAM
+(the state pool's rows are not staged by anyone) under the lead's and
+the projections' stream, where the production reads them with the memory
+to itself. The lever that follows is a staging class for the attention's
+rows inside the merged group, the window's ring regions and the selected
+entries gathered through the lists into L2 during the projections, so the
+blocks read L2 at the memory's share rather than DRAM; with it the lead's
+pause and the staging cap come back into the measurement as a set.
 
 ## The step protocol
 

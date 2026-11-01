@@ -392,7 +392,15 @@ constexpr size_t attn_flash_smem_bytes() {
   return dense::Geo<KV, SD, kListed ? 16 : dense::kTile>::smem_bytes + 16 + (kListed ? size_t(2) * 512 * 4 : 0) + 16 +
          size_t(kGroup) * dense::kM * 4;
 }
-template <int KV, int SD, bool kListed, LatentFormat F, int kGroup = 1>
+// The body's load batching, the same arithmetic in every form: kFetchPasses
+// passes fetch a tile's rows (the production's four hold the registers of two
+// blocks an SM; one pass issues every row's loads together, the step engine's
+// form at one block a worker), kFoldPer outputs a thread per round of the
+// group merge (two in production, four in the step: each round is a round
+// trip to L2 under a saturated memory), and kIdentityTable resolves a listed
+// token's row without the table load when the table is the identity over the
+// requests at one block each (the decode window's ring: request r's region r).
+template <int KV, int SD, bool kListed, LatentFormat F, int kGroup = 1, int kFetchPasses = 4, int kFoldPer = 2, bool kIdentityTable = false>
 __device__ __forceinline__ void attn_flash_body(
     int bx, int s, uint8_t* dsmem, const uint16_t* __restrict__ q_tilde, const uint8_t* __restrict__ latent,
     const float* __restrict__ latent_scale,
@@ -434,6 +442,7 @@ __device__ __forceinline__ void attn_flash_body(
   const int qrow_first = m0 / local_heads;
   const int32_t req = req_ids[qrow_first];
   const int32_t* bt = block_tables + int64_t(req) * blocks_per_request;
+  int32_t req_slab = req;  // the slab's own request (listed): the identity table's block
 
   // The split's token range: dense — the block's longest causal prefix,
   // split n ways, masked per M-row; listed — the slab's row's selection,
@@ -451,6 +460,7 @@ __device__ __forceinline__ void attn_flash_body(
     // The slab's own request's block table (2026-09-06, the decode use:
     // a block's two slabs may be rows of different requests).
     bt = block_tables + int64_t(req_ids[qrow]) * blocks_per_request;
+    req_slab = req_ids[qrow];
   } else {
     const int qrow_last = min(total_m, m0 + M) > m0
                               ? (min(total_m, m0 + M) - 1) / local_heads
@@ -509,7 +519,7 @@ __device__ __forceinline__ void attn_flash_body(
   constexpr int kTilesPerRound = kAddrRound / NTOK;
   constexpr int GTHREADS = kListed ? 128 : dense::kThreads;  // the gather's threads (per slab when listed)
   constexpr int TPT = NTOK * (SD / 8) / GTHREADS;              // uint4 per thread per tile
-  constexpr int HALF = (TPT + 3) / 4;  // uint4 per pass: four passes, the registers of two blocks per SM
+  constexpr int HALF = (TPT + kFetchPasses - 1) / kFetchPasses;  // uint4 per pass (four passes: the registers of two blocks per SM)
   static_assert(NTOK * (SD / 8) % GTHREADS == 0, "the gather's uint4s divide its threads");
   const int gtid = threadIdx.x % GTHREADS;
   const auto resolve_round = [&](int t_round0) {
@@ -530,7 +540,8 @@ __device__ __forceinline__ void attn_flash_body(
           // one-entry table over many physical blocks — the decode
           // window's ring, request r's region r — is bounded by the
           // pool's count, 2026-10-19).
-          const int32_t blk = (bidx >= 0 && bidx < blocks_per_request) ? bt[bidx] : -1;
+          const int32_t blk = kIdentityTable ? (bidx == 0 && blocks_per_request == 1 ? req_slab : -1)
+                                             : ((bidx >= 0 && bidx < blocks_per_request) ? bt[bidx] : -1);
           if (blk >= 0 && blk < blocks_total)
             phys = static_cast<int32_t>(int64_t(blk) * block_tokens + (tok % block_tokens));
           else
@@ -784,7 +795,7 @@ __device__ __forceinline__ void attn_flash_body(
     // tail on every launch, 2026-10-23). A dead output (an M-row past the
     // batch) loads the block's first row and stores nothing.
     constexpr int V4 = KV / 4;
-    constexpr int kPer = 2;
+    constexpr int kPer = kFoldPer;
     const int qr0 = m0 / local_heads, h0 = m0 % local_heads;
     for (int i0 = static_cast<int>(threadIdx.x); i0 < M * V4; i0 += kPer * dense::kThreads) {
       float4 v[kPer][kGroup];

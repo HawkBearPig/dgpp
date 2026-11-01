@@ -2547,9 +2547,21 @@ area, untracked.
       points (73.5 against 79.5; a flash block 30 µs in the kernel against
       5 to 7 in production, the fold's 512 KB of partials on the last
       block), so it is behind its mask bit (`kConsumeAttention`, outside
-      `kConsumeAll`) until its classes run inside the qkv group's drain
-      with the output projection published off the finish; that merge and
-      the unit's form under the stream are the next step of this item.
+      `kConsumeAll`) until it fits the budget. Two steps followed: the
+      body's load batching as template parameters (one fetch pass, four
+      fold outputs a thread, the ring's identity table without the table
+      load; the production kernels keep their form, the oracle bitwise in
+      the step's) and the attend phase merged behind the projections where
+      consecutive, its classes in their drain and the output projection
+      published off the group's end. The attention then adds about 75 µs
+      to the group where it took 87 as a phase: a block still takes 25 to
+      28 µs because its rows come from DRAM under the stream (nobody
+      stages the state pool's rows), where the production reads them with
+      the memory to itself. Next in this item: a staging class for the
+      attention's rows inside the merged group (the ring regions and the
+      selected entries gathered through the lists into L2 during the
+      projections), measured as a set with the lead's pause and the
+      staging cap; then the output projection reading o.
       Owed here: the folds and the select as
       consumers, and the chain's critical path after the attention-output
       fold, now about 60 µs against the budget's 34: the site's class
