@@ -686,14 +686,22 @@ attention still adds about 75 µs to the group where it took 87 as a
 phase (the attribution reads 74.8 to 75.0 with it on three samples against
 75.2 to 78.7 without in the same windows, the rate case's set at 79.6 and
 80.1: three to five points, from six), because a block still takes 25 to
-28 µs: its rows come from DRAM
-(the state pool's rows are not staged by anyone) under the lead's and
-the projections' stream, where the production reads them with the memory
-to itself. The lever that follows is a staging class for the attention's
-rows inside the merged group, the window's ring regions and the selected
-entries gathered through the lists into L2 during the projections, so the
-blocks read L2 at the memory's share rather than DRAM; with it the lead's
-pause and the staging cap come back into the measurement as a set.
+28 µs under the lead's and the projections' stream, where the
+production's take 5 to 7 with the memory to itself. A gather class was
+measured next (one unit a row a source, prefetching the request's ring
+region and the selected entries through the lists into L2 ahead of the
+blocks; it ran from 61 to 81 µs into the group, before the blocks at 75 to
+146): the blocks did not shorten by a microsecond and the attribution read
+74.5 and 72.7 with it against 74.5 to 75.0 before, so it came out. The
+rows were not the wait; a block's dependent round trips to L2 (the
+queries, the list and the table, the fetch, the publish, the fold's 512 KB
+of partials) each take the L2's latency under the stream, two to three
+times the quiet latency, as the router's row batches did before their
+epilogue was lightened. What the attention needs under the stream is
+fewer dependent round trips a block, or a quieter memory while its blocks
+run (the lead paused, which cost the expert phase its staging when the
+staging class was the reason), measured as a set; its remaining cost is
+recorded against the item rather than hidden behind the mask alone.
 
 ## The step protocol
 

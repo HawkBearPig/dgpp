@@ -2557,11 +2557,15 @@ area, untracked.
       to the group where it took 87 as a phase: a block still takes 25 to
       28 µs because its rows come from DRAM under the stream (nobody
       stages the state pool's rows), where the production reads them with
-      the memory to itself. Next in this item: a staging class for the
-      attention's rows inside the merged group (the ring regions and the
-      selected entries gathered through the lists into L2 during the
-      projections), measured as a set with the lead's pause and the
-      staging cap; then the output projection reading o.
+      the memory to itself. A gather class (the ring regions and the
+      selected entries prefetched into L2 ahead of the blocks) was
+      measured and removed: the blocks did not shorten, the attribution
+      74.5 and 72.7 with it against 74.5 to 75.0; the wait is the L2's
+      latency under the stream on each of a block's dependent round
+      trips, not the rows' residency. Open in this item: fewer round
+      trips a block or a quieter memory while the blocks run, as a set;
+      the output projection reading o; the attention stays behind its
+      mask bit meanwhile, three to five points.
       Owed here: the folds and the select as
       consumers, and the chain's critical path after the attention-output
       fold, now about 60 µs against the budget's 34: the site's class
