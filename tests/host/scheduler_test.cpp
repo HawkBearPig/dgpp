@@ -2967,6 +2967,89 @@ DGPP_TEST(scheduler_prefixCache_cancelledSpeculativeBatchRetainsOnlyEligibleCuts
   }
 }
 
+DGPP_TEST(scheduler_prefixCache_cancelledHistoryReclaimsSharedBlocksUnderPressure) {
+  // Physical block identities matter: the prompt and rolling snapshots
+  // share their first block. Evicting only the prompt entry cannot free it.
+  for (int arena_slots : {1, 2, 3}) {
+    SharedPrefixEngine engine(1, 8, arena_slots);
+    Scheduler sched(&engine, {kEos});
+    for (int round = 0; round < 12; ++round) {
+      const auto prompt = counted_prompt(9, 1000 + round * 100);
+      engine.arm(0, long_script(12), 12);
+      const auto before = sched.meters();
+      sched.submit(make_cached_request("cancel-" + std::to_string(round), prompt, {4}, 12));
+      for (int tick = 0; tick < 20 && sched.meters().tokens_generated < before.tokens_generated + 5;
+           ++tick) {
+        sched.tick();
+        require(engine.pool_blocks_in_use() <= 8, "cancellation fixture stays within the pool");
+      }
+      require(sched.meters().tokens_generated == before.tokens_generated + 5,
+              "cancel after a committed rolling snapshot exists");
+      require(sched.cancel("cancel-" + std::to_string(round)), "cancel the active request");
+      sched.run_to_completion();
+      require(!sched.has_pending() && sched.meters().requests_shed_pool == 0,
+              "old cancelled histories do not shed later requests");
+      require(engine.pool_blocks_in_use() == 3,
+              "only three physical snapshot blocks remain after cancellation");
+      require(sched.meters().prefix_entries <= arena_slots, "arena slots do not leak");
+      require(sched.meters().prefix_misses == before.prefix_misses + 1,
+              "each distinct history starts with a cache miss");
+
+      auto next = prompt;
+      const auto& generated = sched.find("cancel-" + std::to_string(round))->generated;
+      next.insert(next.end(), generated.begin(), generated.end());
+      next.push_back(9000);
+      engine.arm(0, {90}, 1);
+      const auto saved = sched.meters().prefix_tokens_saved;
+      sched.submit(make_cached_request("reuse-" + std::to_string(round), next, {4, 14}, 1));
+      sched.run_to_completion();
+      require(sched.meters().prefix_tokens_saved == saved + 12,
+              "the newest cancelled history remains reusable under pressure");
+      require(engine.pool_blocks_in_use() == 3, "reuse releases its private suffix blocks");
+    }
+    require(sched.meters().prefix_evictions > 0, "the test exercised eviction");
+    if (arena_slots > 1) {
+      require(std::any_of(engine.releases.begin(), engine.releases.end(),
+                          [](const auto& release) { return release.second == 0; }),
+              "eviction includes a shared reference that frees no physical blocks");
+    }
+    // An uncached request reserves the entire pool. All cancelled-history
+    // references must be evictable, including multiple refs to one block.
+    engine.arm(0, {kEos}, 23);
+    auto flush = make_request("full-pool", 9, 23);
+    flush.no_cache = true;
+    sched.submit(flush);
+    sched.run_to_completion();
+    require(sched.find("full-pool")->reason == Scheduler::Result::Reason::kEos,
+            "cache retention does not prevent full-pool admission");
+    require(engine.pool_blocks_in_use() == 0 && sched.meters().prefix_entries == 0,
+            "all retained blocks and arena entries are reclaimed");
+  }
+}
+
+DGPP_TEST(scheduler_prefixCache_cancelledHistoryHonorsOptOutAndEntryFloor) {
+  for (bool opt_out : {false, true}) {
+    SharedPrefixEngine engine(1, 8, 2);
+    dgpp::sched::AdmissionPolicy policy;
+    policy.prefix_min_tokens = opt_out ? 0 : 32;
+    Scheduler sched(&engine, {kEos}, 0, policy);
+    for (int round = 0; round < 12; ++round) {
+      engine.arm(0, long_script(12), 12);
+      auto request =
+          make_cached_request("cancel-" + std::to_string(round), counted_prompt(9), {4}, 12);
+      request.no_cache = opt_out;
+      request.cancel_after = 5;
+      sched.submit(request);
+      sched.run_to_completion();
+      require(sched.find(request.id)->reason == Scheduler::Result::Reason::kCancelled,
+              "request is cancelled rather than shed");
+      require(engine.pool_blocks_in_use() == 0 && sched.meters().prefix_entries == 0 &&
+                  sched.meters().prefix_close_entries == 0,
+              "opted-out or below-floor cancellations retain no blocks or entries");
+    }
+  }
+}
+
 DGPP_TEST(scheduler_prefixCache_rollingSnapshotBecomesTheCloseEntryTheNextTurnAttachesTo) {
   // GIVEN a 21-token prompt whose answer runs six tokens and ends in EOS:
   // committed positions 21 (after the prefill pick), 22, 23, 24 <- aligned,
