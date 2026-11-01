@@ -1,0 +1,622 @@
+// The streamer's host side (step/streamer.hpp).
+#include "step/streamer.hpp"
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstring>
+#include <stdexcept>
+#include <thread>
+
+#include "common/cuda_check.hpp"
+
+namespace dgpp::step {
+
+namespace {
+
+template <typename T>
+T* upload(const std::vector<T>& v) {
+  T* d = nullptr;
+  const size_t bytes = std::max<size_t>(v.size(), 1) * sizeof(T);
+  DGPP_CUDA_OK(cudaMalloc(&d, bytes));
+  if (!v.empty()) DGPP_CUDA_OK(cudaMemcpy(d, v.data(), v.size() * sizeof(T), cudaMemcpyHostToDevice));
+  return d;
+}
+
+template <typename T>
+void pinned(T** host, T** dev, size_t n) {
+  DGPP_CUDA_OK(cudaHostAlloc(reinterpret_cast<void**>(host), n * sizeof(T), cudaHostAllocMapped));
+  std::memset(static_cast<void*>(*host), 0, n * sizeof(T));
+  DGPP_CUDA_OK(cudaHostGetDevicePointer(reinterpret_cast<void**>(dev), *host, 0));
+}
+
+void store_release(uint32_t* p, uint32_t v) { std::atomic_ref<uint32_t>(*p).store(v, std::memory_order_release); }
+void store_release(uint64_t* p, uint64_t v) { std::atomic_ref<uint64_t>(*p).store(v, std::memory_order_release); }
+uint64_t load_acquire(const uint64_t* p) { return std::atomic_ref<const uint64_t>(*p).load(std::memory_order_acquire); }
+
+}  // namespace
+
+Streamer::Streamer(const DevicePlan& dp, const std::vector<const uint8_t*>& bases, const std::vector<LayerPlan>& plans)
+    : dp_(dp) {
+  if (bases.size() != dp.layers.size() || plans.size() != dp.layers.size())
+    throw std::invalid_argument("Streamer: one base and one plan per layer");
+  if (dp.layers.size() > static_cast<size_t>(kStepMaxLayers) || dp.phases.size() > static_cast<size_t>(kStepMaxPhases))
+    throw std::invalid_argument("Streamer: the plan exceeds the control block's layers or phases");
+  for (const LayerPlan& lp : plans)
+    if (lp.groups > kStepMaxGroups) throw std::invalid_argument("Streamer: a layer's groups exceed the run list");
+  for (const LayerPlan& lp : plans)
+    for (const Phase& ph : lp.phases) phase_names_.push_back(ph.name);
+  bases_ = upload(bases);
+  layers_ = upload(dp.layers);
+  phases_ = upload(dp.phases);
+  segments_ = upload(dp.segments);
+  pools_ = upload(dp.pools);
+  DGPP_CUDA_OK(cudaMalloc(&sink_, sizeof(unsigned) * kStepMaxWorkers * 8));
+  DGPP_CUDA_OK(cudaMemset(sink_, 0, sizeof(unsigned) * kStepMaxWorkers * 8));
+  DGPP_CUDA_OK(cudaMalloc(&token_feed_, sizeof(int32_t) * 2 * kStepMaxRows));
+  DGPP_CUDA_OK(cudaMemset(token_feed_, 0, sizeof(int32_t) * 2 * kStepMaxRows));
+  DGPP_CUDA_OK(cudaMallocManaged(&ctl_, sizeof(StepCtl)));
+  std::memset(ctl_, 0, sizeof(StepCtl));
+  pinned(&desc_, &desc_dev_, static_cast<size_t>(kStepRingSlots));
+  pinned(&verdict_, &verdict_dev_, static_cast<size_t>(kStepRingSlots));
+  pinned(&host_seq_, &host_seq_dev_, 1);
+  pinned(&fold_table_, &fold_table_dev_, static_cast<size_t>(kStepRingSlots) * kStepMaxFolds);
+  for (size_t i = 0; i < static_cast<size_t>(kStepRingSlots) * kStepMaxFolds; ++i) fold_table_[i] = StepFoldDev{};
+  DGPP_CUDA_OK(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking));
+  // The consumers' operands, when the plan has consumer pools of any class:
+  // the routed experts (the MXFP4 forms), the shared expert and the fp8
+  // projections (the fp8 forms). A plan with fp8 pools and no routed pool
+  // launched with no dynamic shared memory and no activations once, and
+  // faulted (2026-10-31).
+  bool mxfp4 = false, fp8 = false;
+  int mhc_hidden = 0;
+  for (const DevPool& pool : dp.pools) {
+    if (pool.kind == kPoolBytes) continue;
+    consumers_ = true;
+    if (pool.kind == kPoolMhc) { mhc_ = true; mhc_hidden = pool.k / 4; continue; }
+    if (pool.kind == kPoolAttention) {
+      attention_ = true;
+      attn_local_heads_ = pool.unit_rows;
+      if (pool.in_src == 0) attn_needs_q_ = true;
+      if (pool.site < kStepAttnSources) { attn_n_split_[pool.site] = std::max(attn_n_split_[pool.site], pool.rows); attn_group_[pool.site] = pool.slabs; }
+      continue;
+    }
+    if (pool.kind == kPoolRowTail) {
+      if (pool.rope_heads || pool.append) tails_ = true;
+      continue;
+    }
+    if (pool.kind == kPoolEmbed) { embed_ = true; continue; }
+    if (pool.kind == kPoolHead) { head_n_ = pool.rows; continue; }
+    if (pool.kind == kPoolPick) { pick_pool_ = static_cast<int>(&pool - dp.pools.data()); continue; }
+    if (pool_is_gate_up(pool.kind) && pool.kind != kPoolFp8GateUp) { hidden_ = pool.k; inter_ = pool.rows; mxfp4 = true; }
+    else if (pool.kind == kPoolFp8GateUp) { if (!hidden_) hidden_ = pool.k; if (!inter_) inter_ = pool.rows; fp8 = true; }
+    else if (pool.kind == kPoolFp8Matrix || pool.kind == kPoolFp8Down) { fp8 = true; if (pool.rope_heads) tails_ = true; }
+    else if (pool.kind == kPoolRouter) { fp8 = true; n_experts_ = pool.rows; if (!step_stream_has_router(pool.k)) throw std::invalid_argument("Streamer: the kernel has no router unit for width " + std::to_string(pool.k)); }
+  }
+  if (consumers_) {
+    if (mxfp4 && !step_stream_has_mxfp4_consumer(hidden_, inter_))
+      throw std::invalid_argument("Streamer: the kernel has no MXFP4 consumer for hidden " + std::to_string(hidden_) + ", inter " +
+                                  std::to_string(inter_));
+    for (const DevPool& pool : dp.pools)
+      if (pool.kind == kPoolFp8Matrix && !step_stream_has_fp8_matrix(pool.k, pool.rows))
+        throw std::invalid_argument("Streamer: the kernel has no fp8 projection form for [" + std::to_string(pool.rows) + ", " +
+                                    std::to_string(pool.k) + "]");
+    consumer_smem_ = step_stream_consumer_smem(mxfp4 ? inter_ : 0, fp8, mhc_, attention_, head_n_ > 0);
+    if (attention_) {
+      // The split partials per source at the step's widest shape, their group partials and the
+      // merge tickets (zero at rest), and the output rows.
+      const size_t blocks = (static_cast<size_t>(kStepMaxRows) * attn_local_heads_ + 31) / 32;
+      for (int i = 0; i < kStepAttnSources; ++i) {
+        if (attn_n_split_[i] == 0) continue;
+        const size_t ml = static_cast<size_t>(kStepMaxRows) * attn_n_split_[i] * attn_local_heads_;
+        DGPP_CUDA_OK(cudaMalloc(&attn_m_[i], ml * 4));
+        DGPP_CUDA_OK(cudaMalloc(&attn_l_[i], ml * 4));
+        DGPP_CUDA_OK(cudaMalloc(&attn_c_[i], ml * kAttnLatent * 4));
+        DGPP_CUDA_OK(cudaMemset(attn_m_[i], 0, ml * 4));
+        DGPP_CUDA_OK(cudaMemset(attn_l_[i], 0, ml * 4));
+        DGPP_CUDA_OK(cudaMemset(attn_c_[i], 0, ml * kAttnLatent * 4));
+        if (attn_group_[i] > 1) {
+          const size_t groups = ml / attn_group_[i];
+          DGPP_CUDA_OK(cudaMalloc(&attn_mg_[i], groups * 4));
+          DGPP_CUDA_OK(cudaMalloc(&attn_lg_[i], groups * 4));
+          DGPP_CUDA_OK(cudaMalloc(&attn_cg_[i], groups * kAttnLatent * 4));
+          DGPP_CUDA_OK(cudaMemset(attn_mg_[i], 0, groups * 4));
+          DGPP_CUDA_OK(cudaMemset(attn_lg_[i], 0, groups * 4));
+          DGPP_CUDA_OK(cudaMemset(attn_cg_[i], 0, groups * kAttnLatent * 4));
+          DGPP_CUDA_OK(cudaMalloc(&attn_tickets_[i], blocks * (attn_n_split_[i] / attn_group_[i]) * 4));
+          DGPP_CUDA_OK(cudaMemset(attn_tickets_[i], 0, blocks * (attn_n_split_[i] / attn_group_[i]) * 4));
+        }
+      }
+      DGPP_CUDA_OK(cudaMalloc(&attn_o_, static_cast<size_t>(kStepMaxRows) * attn_local_heads_ * kAttnLatent * 2));
+      DGPP_CUDA_OK(cudaMemset(attn_o_, 0, static_cast<size_t>(kStepMaxRows) * attn_local_heads_ * kAttnLatent * 2));
+    }
+    if (head_n_ > 0) {
+      DGPP_CUDA_OK(cudaMalloc(&logits_out_, static_cast<size_t>(kStepMaxRows) * head_n_ * sizeof(float)));
+      DGPP_CUDA_OK(cudaMemset(logits_out_, 0, static_cast<size_t>(kStepMaxRows) * head_n_ * sizeof(float)));
+    }
+    if (attention_ || tails_) {
+      DGPP_CUDA_OK(cudaMalloc(&attn_slots_, static_cast<size_t>(kStepMaxRows) * sizeof(int64_t)));
+      DGPP_CUDA_OK(cudaMemset(attn_slots_, 0xff, static_cast<size_t>(kStepMaxRows) * sizeof(int64_t)));
+    }
+    if (!hidden_ && mhc_hidden) hidden_ = mhc_hidden;  // the sites' streams are four rows of hidden
+    if (!hidden_) hidden_ = dp.max_k;  // projections only: the activations' width is the widest inner width
+    if (!inter_) inter_ = 1;
+    const size_t slots = static_cast<size_t>(kStepMaxRows) * 9;  // top_k up to 8, plus the shared slot
+    // The activations: every consumer reads a token's row at its own inner
+    // width from the same buffer, so it holds the widest.
+    x_stride_ = std::max(hidden_, dp.max_k);
+    DGPP_CUDA_OK(cudaMalloc(&x_, static_cast<size_t>(kStepMaxRows) * x_stride_ * 2));
+    if (n_experts_) {
+      DGPP_CUDA_OK(cudaMalloc(&scores_, static_cast<size_t>(kStepMaxRows) * n_experts_ * 4));
+      DGPP_CUDA_OK(cudaMalloc(&biased_, static_cast<size_t>(kStepMaxRows) * n_experts_ * 4));
+      DGPP_CUDA_OK(cudaMemset(scores_, 0, static_cast<size_t>(kStepMaxRows) * n_experts_ * 4));
+      DGPP_CUDA_OK(cudaMemset(biased_, 0, static_cast<size_t>(kStepMaxRows) * n_experts_ * 4));
+      DGPP_CUDA_OK(cudaMalloc(&unit_trace_, static_cast<size_t>(3 * kStepMaxWorkers) * 8 * 8));  // a worker's last router unit, its last site unit, the traced pool's units
+      DGPP_CUDA_OK(cudaMemset(unit_trace_, 0, static_cast<size_t>(3 * kStepMaxWorkers) * 8 * 8));
+      DGPP_CUDA_OK(cudaMalloc(&cand_id_, static_cast<size_t>(kStepMaxRows) * n_experts_ * 4));
+      DGPP_CUDA_OK(cudaMalloc(&cand_score_, static_cast<size_t>(kStepMaxRows) * n_experts_ * 4));
+      DGPP_CUDA_OK(cudaMalloc(&cand_biased_, static_cast<size_t>(kStepMaxRows) * n_experts_ * 4));
+      DGPP_CUDA_OK(cudaMemset(cand_id_, 0xff, static_cast<size_t>(kStepMaxRows) * n_experts_ * 4));
+      DGPP_CUDA_OK(cudaMemset(cand_score_, 0, static_cast<size_t>(kStepMaxRows) * n_experts_ * 4));
+      DGPP_CUDA_OK(cudaMemset(cand_biased_, 0, static_cast<size_t>(kStepMaxRows) * n_experts_ * 4));
+    }
+    if (dp.proj_elems) {
+      DGPP_CUDA_OK(cudaMalloc(&proj_, static_cast<size_t>(dp.proj_elems) * 2));
+      DGPP_CUDA_OK(cudaMemset(proj_, 0, static_cast<size_t>(dp.proj_elems) * 2));
+    }
+    if (dp.part_elems) {
+      DGPP_CUDA_OK(cudaMalloc(&proj_part_, static_cast<size_t>(dp.part_elems) * 4));
+      DGPP_CUDA_OK(cudaMemset(proj_part_, 0, static_cast<size_t>(dp.part_elems) * 4));
+    }
+    DGPP_CUDA_OK(cudaMalloc(&act_, slots * inter_ * 2));
+    DGPP_CUDA_OK(cudaMalloc(&out_, slots * hidden_ * 4));
+    DGPP_CUDA_OK(cudaMalloc(&y_, static_cast<size_t>(kStepMaxRows) * hidden_ * 2));
+    DGPP_CUDA_OK(cudaMemset(act_, 0, slots * inter_ * 2));
+    DGPP_CUDA_OK(cudaMemset(out_, 0, slots * hidden_ * 4));
+    DGPP_CUDA_OK(cudaMemset(y_, 0, static_cast<size_t>(kStepMaxRows) * hidden_ * 2));
+    step_stream_init_x(x_, kStepMaxRows * x_stride_, 0x51e5u, nullptr);
+    if (mhc_ || embed_ || head_n_ > 0) {
+      // The residual streams (the sites', the embedding's, the head's input), small bf16 like x in streams[0]; the rest zero.
+      const size_t sn = static_cast<size_t>(kStepMaxRows) * 4 * hidden_, coeffs = static_cast<size_t>(kStepMaxRows) * 4;
+      for (int i = 0; i < 2; ++i) {
+        DGPP_CUDA_OK(cudaMalloc(&streams_[i], sn * 2));
+        DGPP_CUDA_OK(cudaMemset(streams_[i], 0, sn * 2));
+        DGPP_CUDA_OK(cudaMalloc(&pre_[i], coeffs * 4));
+        DGPP_CUDA_OK(cudaMemset(pre_[i], 0, coeffs * 4));
+      }
+      step_stream_init_x(streams_[0], static_cast<int>(sn), 0x7a11u, nullptr);
+      DGPP_CUDA_OK(cudaMalloc(&post_, coeffs * 4));
+      DGPP_CUDA_OK(cudaMalloc(&comb_, coeffs * 4 * 4));
+      DGPP_CUDA_OK(cudaMalloc(&logits_, coeffs * 6 * 4));
+      DGPP_CUDA_OK(cudaMemset(post_, 0, coeffs * 4));
+      DGPP_CUDA_OK(cudaMemset(comb_, 0, coeffs * 4 * 4));
+      DGPP_CUDA_OK(cudaMemset(logits_, 0, coeffs * 6 * 4));
+    }
+    DGPP_CUDA_OK(cudaDeviceSynchronize());
+  }
+}
+
+Streamer::~Streamer() {
+  cudaStreamDestroy(stream_);
+  cudaFreeHost(desc_);
+  cudaFreeHost(verdict_);
+  cudaFreeHost(host_seq_);
+  if (scores_) cudaFree(scores_);
+  if (biased_) cudaFree(biased_);
+  if (unit_trace_) cudaFree(unit_trace_);
+  for (int i = 0; i < kStepAttnSources; ++i) {
+    if (attn_m_[i]) cudaFree(attn_m_[i]);
+    if (attn_l_[i]) cudaFree(attn_l_[i]);
+    if (attn_c_[i]) cudaFree(attn_c_[i]);
+    if (attn_mg_[i]) cudaFree(attn_mg_[i]);
+    if (attn_lg_[i]) cudaFree(attn_lg_[i]);
+    if (attn_cg_[i]) cudaFree(attn_cg_[i]);
+    if (attn_tickets_[i]) cudaFree(attn_tickets_[i]);
+  }
+  if (attn_o_) cudaFree(attn_o_);
+  if (attn_slots_) cudaFree(attn_slots_);
+  if (logits_out_) cudaFree(logits_out_);
+  if (cand_id_) cudaFree(cand_id_);
+  if (cand_score_) cudaFree(cand_score_);
+  if (cand_biased_) cudaFree(cand_biased_);
+  cudaFree(const_cast<uint8_t**>(bases_));
+  cudaFree(layers_);
+  cudaFree(phases_);
+  cudaFree(segments_);
+  cudaFree(pools_);
+  cudaFree(sink_);
+  cudaFree(token_feed_);
+  cudaFree(ctl_);
+  cudaFree(x_);
+  cudaFree(act_);
+  cudaFree(out_);
+  cudaFree(y_);
+  cudaFree(proj_);
+  cudaFree(proj_part_);
+  for (int i = 0; i < 2; ++i) { cudaFree(streams_[i]); cudaFree(pre_[i]); }
+  cudaFree(post_);
+  cudaFree(comb_);
+  cudaFree(logits_);
+}
+
+void Streamer::poison() { std::atomic_ref<unsigned>(ctl_->poison).store(1u, std::memory_order_release); }
+
+StreamReport Streamer::run(const StreamerConfig& cfg) {
+  if (cfg.steps < 1) throw std::invalid_argument("Streamer: at least one step");
+  if (cfg.rows < 1 || cfg.rows > kStepMaxRows) throw std::invalid_argument("Streamer: rows out of range");
+  std::memset(ctl_, 0, sizeof(StepCtl));
+  for (int s = 0; s < kStepRingSlots; ++s) {
+    desc_[s] = StepDescriptor{};
+    verdict_[s] = StepVerdict{};
+    verdict_[s].seq = ~uint64_t{0};
+  }
+  *host_seq_ = 0;
+  std::vector<int32_t> feed(static_cast<size_t>(cfg.rows), 0);
+  for (size_t i = 0; i < feed.size() && i < cfg.tokens.size(); ++i) feed[i] = cfg.tokens[i];
+
+  StepStreamParams p;
+  p.desc = desc_dev_;
+  p.verdict = verdict_dev_;
+  p.token_feed = token_feed_;
+  p.host_seq = host_seq_dev_;
+  p.max_steps = cfg.steps;
+  p.bases = bases_;
+  p.layers = layers_;
+  p.phases = phases_;
+  p.segments = segments_;
+  p.pools = pools_;
+  p.n_layers = static_cast<int>(dp_.layers.size());
+  p.n_pools = static_cast<int>(dp_.pools.size());
+  p.unit_bytes = dp_.unit_bytes;
+  p.lead_units = dp_.lead_units;
+  p.ctl = ctl_;
+  p.sink = sink_;
+  p.lookahead_layers = cfg.lookahead_layers;
+  p.lead_bytes_per_us = cfg.lead_bytes_per_us;
+  p.route_pool = cfg.route_pool;
+  p.scores = scores_;
+  p.biased = biased_;
+  p.unit_trace = unit_trace_;
+  p.trace_pool = cfg.trace_pool;
+  if (unit_trace_) DGPP_CUDA_OK(cudaMemsetAsync(unit_trace_, 0, static_cast<size_t>(3 * kStepMaxWorkers) * 8 * 8, stream_));  // a run's own traces
+  p.cand_id = cand_id_;
+  p.cand_score = cand_score_;
+  p.cand_biased = cand_biased_;
+  p.n_experts = n_experts_;
+  p.router_mode = cfg.router_mode;
+  p.routed_scaling = cfg.routed_scaling_factor;
+  p.norm_topk = cfg.norm_topk ? 1 : 0;
+  p.lead_cap_bytes = cfg.lead_cap_bytes;
+  p.max_leaders = cfg.max_leaders;
+  p.stage_workers = cfg.stage_workers;
+  p.stage_lead_pause = cfg.stage_lead_pause ? 1u : 0u;
+  p.deadline_ns = static_cast<unsigned long long>(cfg.deadline_s * 1e9);
+  p.pending_deadline_ns = static_cast<unsigned long long>(cfg.pending_deadline_s * 1e9);
+  p.x = x_;
+  p.act = act_;
+  p.out = out_;
+  p.y = y_;
+  p.proj = proj_;
+  p.proj_part = proj_part_;
+  p.x_stride = x_stride_;
+  p.hidden = hidden_;
+  p.inter = inter_;
+  // The chain's select and finish use the dynamic region too (the run list, the scores), so a
+  // rig with no consumer pools still launches with a little of it.
+  p.consumer_smem = std::max(consumer_smem_, 4096u);
+  for (int i = 0; i < 2; ++i) { p.streams[i] = streams_[i]; p.pre[i] = pre_[i]; }
+  p.post = post_;
+  p.comb = comb_;
+  p.logits = logits_;
+  if (fold_world_ > 1) {
+    if (bus_ == nullptr) throw std::invalid_argument("Streamer: folds past world 1 need the bus (set_fold)");
+    if (!bus_->write_view(&p.fold.view)) throw std::invalid_argument("Streamer: the folds need the bus on the write transport, past world 1");
+    if (dp_.fold_count > static_cast<int>(net::kBusStepRing) || dp_.fold_count > kStepMaxFolds)
+      throw std::invalid_argument("Streamer: a step's folds (" + std::to_string(dp_.fold_count) + ") exceed the step ring the host issues ahead into");
+    p.fold.world = fold_world_;
+    p.fold.my_rank = fold_rank_;
+    p.fold.table = fold_table_dev_;
+    p.fold.deadline_cycles = bus_->collective_deadline_cycles();
+  }
+  if (attention_ || tails_) {
+    if ((attn_needs_q_ && attn_in_.q == nullptr) || attn_in_.req_ids == nullptr || attn_in_.pos == nullptr || attn_in_.ring == nullptr ||
+        attn_in_.inv_freq == nullptr)
+      throw std::invalid_argument("Streamer: the attention consumer and the row tails need their inputs (set_attention) before a run");
+    p.attn = attn_in_;
+    p.attn.local_heads = attn_local_heads_;
+    for (int i = 0; i < kStepAttnSources; ++i) {
+      p.attn.m[i] = attn_m_[i]; p.attn.l[i] = attn_l_[i]; p.attn.c[i] = attn_c_[i];
+      p.attn.mg[i] = attn_mg_[i]; p.attn.lg[i] = attn_lg_[i]; p.attn.cg[i] = attn_cg_[i];
+      p.attn.tickets[i] = attn_tickets_[i];
+    }
+    p.attn.o = attn_o_;
+    p.attn.slots = attn_slots_;
+  }
+  if (head_n_ > 0) {
+    if (head_in_.packed == nullptr || head_in_.rows == nullptr || head_in_.esc == nullptr || head_in_.raw == nullptr || head_in_.n != head_n_)
+      throw std::invalid_argument("Streamer: the head needs its bf12 companion (set_head) at the plan's rows before a run");
+    p.head = head_in_;
+    p.logits_out = logits_out_;
+    p.pick_pool = pick_pool_;
+  }
+  p.norm_eps = cfg.norm_eps;
+  p.hc_eps = cfg.hc_eps;
+  p.sinkhorn_iters = cfg.sinkhorn_iters;
+  p.mhc_norm_eps = cfg.mhc_norm_eps;
+  if (consumers_ && cfg.top_k > 8) throw std::invalid_argument("Streamer: the consumers' partials hold at most eight picks a row");
+  cudaEvent_t e0 = nullptr, e1 = nullptr;
+  DGPP_CUDA_OK(cudaEventCreate(&e0));
+  DGPP_CUDA_OK(cudaEventCreate(&e1));
+  DGPP_CUDA_OK(cudaEventRecord(e0, stream_));
+  // A step's descriptor: its slot of the ring filled and published (the fold generations of a
+  // world past one issued into the slot's row of the fold table first).
+  auto fill = [&](int step) {
+    const uint64_t seq = cfg.first_seq + static_cast<uint64_t>(step);
+    const int slot = step & 1;
+    StepDescriptor& d = desc_[slot];
+    store_release(&d.seq, seq);
+    if (cfg.between_steps) cfg.between_steps(step);
+    d.rows = static_cast<uint32_t>(cfg.rows);
+    d.top_k = static_cast<uint32_t>(cfg.top_k);
+    d.seed = cfg.seed;
+    d.epoch = cfg.epoch;
+    d.gather_seq = cfg.gather_delay_us > 0 ? seq + 1 : 0;
+    d.tokens_from_host = step == 0 ? 1u : 0u;
+    if (step == 0)
+      for (int i = 0; i < cfg.rows; ++i) d.tokens[i] = feed[static_cast<size_t>(i)];
+    const bool skip = step == cfg.skip_at_step;
+    if (fold_world_ > 1 && !skip) {
+      // The step's fold generations, in fold order, into this slot's row of the table (the kernel
+      // reads them after it acquires the descriptor): the stream pass posts and completes them.
+      for (size_t P = 0; P < dp_.phases.size(); ++P) {
+        const DevPhase& ph = dp_.phases[P];
+        if (ph.fold_index < 0) continue;
+        unsigned n = 0;
+        if (ph.accumulate) {
+          n = static_cast<unsigned>(hidden_);
+        } else {
+          for (int i = 0; i < ph.n_pools; ++i) {
+            const DevPool& pool = dp_.pools[static_cast<size_t>(ph.pools[i])];
+            if (pool.kind == kPoolFp8Matrix && pool.update_site) n = static_cast<unsigned>(pool.rows);
+          }
+        }
+        if (n == 0) continue;  // no partial to fold in this group (the kernel's fold_units is zero too)
+        net::CollectiveBus::StepFold f;
+        std::string err;
+        if (bus_->step_prepare(static_cast<size_t>(cfg.rows) * n, &f, &err) == 0) throw std::runtime_error("Streamer: step_prepare: " + err);
+        StepFoldDev& e = fold_table_[static_cast<size_t>(slot) * kStepMaxFolds + static_cast<size_t>(ph.fold_index)];
+        e.gen = static_cast<uint32_t>(f.gen);
+        e.elems = f.elems;
+        e.cell = f.cell;
+        e.recs = f.recs;
+      }
+    }
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    store_release(&d.state, skip ? kStepSkip : kStepExecute);
+    return skip;
+  };
+  if (cfg.prepublish) {
+    if (cfg.steps > kStepRingSlots || fold_world_ > 1 || cfg.gather_delay_us > 0 || cfg.skip_at_step >= 0)
+      throw std::invalid_argument("Streamer: prepublish takes at most the ring's steps at world 1, without gathers or skips");
+    for (int s = 0; s < cfg.steps; ++s) (void)fill(s);
+  }
+  const cudaError_t launch = launch_step_stream(p, cfg.workers, stream_);
+  if (launch != cudaSuccess) {
+    cudaEventDestroy(e0);
+    cudaEventDestroy(e1);
+    throw std::runtime_error(std::string("Streamer: launch failed: ") + cudaGetErrorString(launch) +
+                             " (workers " + std::to_string(cfg.workers) + ", capacity " + std::to_string(step_stream_capacity(p.consumer_smem)) + ")");
+  }
+  DGPP_CUDA_OK(cudaEventRecord(e1, stream_));
+
+  // ---- the host's side of the protocol: one descriptor at a time, in order
+  StreamReport r;
+  uint64_t fold_seed = 0x9e3779b97f4a7c15ull;
+  (void)fold_seed;
+  uint64_t last_end_ns = 0;
+  bool ended = false;
+  for (int step = 0; step < cfg.steps && !ended; ++step) {
+    const uint64_t seq = cfg.first_seq + static_cast<uint64_t>(step);
+    const int slot = step & 1;
+    StepDescriptor& d = desc_[slot];
+    // The slot is the host's: its previous verdict was read two steps ago.
+    const bool skip = cfg.prepublish ? false : fill(step);
+    std::thread gather;
+    if (!skip && cfg.gather_delay_us > 0) {
+      const uint64_t publish = seq + 1;
+      const double delay = cfg.gather_delay_us;
+      gather = std::thread([this, publish, delay] {
+        std::this_thread::sleep_for(std::chrono::microseconds(static_cast<long>(delay)));
+        store_release(host_seq_, publish);
+      });
+    }
+    // The verdict, or the kernel's end: a clean end, or a fault, which the
+    // synchronize below reports (a faulted kernel's query is an error, not
+    // "not ready"; waiting for cudaSuccess alone spun forever, 2026-10-31).
+    for (;;) {
+      if (load_acquire(&verdict_[slot].seq) == seq) break;
+      if (cudaStreamQuery(stream_) != cudaErrorNotReady) { ended = true; break; }
+      std::this_thread::yield();
+    }
+    if (gather.joinable()) gather.join();
+    if (load_acquire(&verdict_[slot].seq) != seq) break;  // the kernel ended before this step's verdict
+    std::atomic_thread_fence(std::memory_order_acquire);
+    StepVerdict v = verdict_[slot];
+    // The verdict's tokens and their fold; on the synthetic token path (no head) the host's replica of the feed too.
+    if (v.status == kVerdictOk) {
+      uint64_t fold = 0x9e3779b97f4a7c15ull;
+      for (int i = 0; i < cfg.rows; ++i) {
+        if (pick_pool_ < 0) {
+          feed[static_cast<size_t>(i)] = step_next_token(feed[static_cast<size_t>(i)], seq, i);
+          if (feed[static_cast<size_t>(i)] != v.tokens[i]) r.folds_match = false;
+        } else {
+          feed[static_cast<size_t>(i)] = v.tokens[i];
+        }
+        fold = step_fold_mix(fold, static_cast<uint64_t>(static_cast<uint32_t>(v.tokens[i])));
+      }
+      if (fold != v.tokens_fold) r.folds_match = false;
+      r.pending_us.push_back(last_end_ns ? static_cast<double>(v.published_ns - last_end_ns) / 1e3 : 0.0);
+      r.bind_us.push_back(static_cast<double>(v.begin_ns - v.published_ns) / 1e3);
+      r.step_us.push_back(static_cast<double>(v.end_ns - v.begin_ns) / 1e3);
+      last_end_ns = v.end_ns;
+    } else {
+      ended = true;
+    }
+    r.verdicts.push_back(v);
+    // The slot returns to the host; reset its state for the next use.
+    store_release(&d.state, kStepPending);
+  }
+  if (fold_world_ > 1 && bus_) {
+    // Every fold generation issued walked (or the era failed): the verdict of the bus side.
+    std::string err;
+    if (!bus_->allreduce_settle(60000, &err)) throw std::runtime_error("Streamer: the folds did not settle: " + err);
+  }
+  DGPP_CUDA_OK(cudaStreamSynchronize(stream_));
+  DGPP_CUDA_OK(cudaEventElapsedTime(&r.kernel_ms, e0, e1));
+  cudaEventDestroy(e0);
+  cudaEventDestroy(e1);
+  r.status = ctl_->status;
+  r.steps_run = ctl_->steps_run;
+  switch (r.status & 0xff) {
+    case kStepOk: r.status_text = "ok"; break;
+    case kStepDeadline:
+      r.status_text = (r.status >> 8) == 0xfffu ? "deadline waiting for the host's descriptor"
+                                                : "deadline in phase " + std::to_string(r.status >> 8);
+      break;
+    case kStepPoisoned: r.status_text = "poisoned"; break;
+    case kStepBadUnit: r.status_text = "a unit outside its phase"; break;
+    default: r.status_text = "unknown";
+  }
+  if (!r.verdicts.empty() && r.verdicts.back().status == kVerdictSkipped) r.status_text += ", skipped";
+  // The last completed step's phase trace.
+  unsigned long long origin = ~0ull;
+  for (const DevLayer& dl : dp_.layers)
+    for (int P = dl.phase_begin; P < dl.phase_begin + dl.phase_count; ++P) origin = std::min(origin, ctl_->stamp_begin[P]);
+  r.run_counts.assign(ctl_->run_count, ctl_->run_count + dp_.layers.size());
+  for (size_t l = 0; l < dp_.layers.size(); ++l) {
+    const DevLayer& dl = dp_.layers[l];
+    unsigned long long first = ~0ull, last = 0;
+    double bytes = 0;
+    for (int P = dl.phase_begin; P < dl.phase_begin + dl.phase_count; ++P) {
+      const DevPhase& ph = dp_.phases[static_cast<size_t>(P)];
+      PhaseTiming t;
+      t.layer = static_cast<int>(l);
+      t.phase = P;
+      t.name = phase_names_[static_cast<size_t>(P)];
+      t.stream = ph.kind == 1;
+      t.begin_us = static_cast<double>(ctl_->stamp_begin[P] - origin) / 1e3;
+      t.end_us = static_cast<double>(ctl_->stamp_end[P] - origin) / 1e3;
+      t.units = ctl_->done[P];
+      t.pf_units = ctl_->pf_units[P];
+      if (ctl_->idle_first[P] && ctl_->idle_first[P] < ctl_->stamp_end[P])
+        t.drained_us = static_cast<double>(ctl_->stamp_end[P] - ctl_->idle_first[P]) / 1e3;
+      t.busy_us = static_cast<double>(ctl_->busy_ns[P]) / 1e3;
+      t.handout_us = static_cast<double>(ctl_->handout_ns[P]) / 1e3;
+      t.lead_in_mb = static_cast<double>(ctl_->lead_in_bytes[P]) / 1e6;
+      t.staged_mb = static_cast<double>(ctl_->pf_staged[P]) / 1e6;
+      t.wait_us = static_cast<double>(ctl_->wait_ns[P]) / 1e3;
+      t.ahead_mb = static_cast<double>(ctl_->ahead_begin[P]) / 1e6;
+      {  // the lead's cursor when the group began: a unit index, mapped to its phase's layer here
+        const unsigned pf = ctl_->cursor_begin[P];
+        t.cursor_layer = -1;
+        if (pf < dp_.lead_units) {
+          size_t lo = 0, hi = dp_.phases.size() - 1;
+          while (lo < hi) {
+            const size_t mid = (lo + hi + 1) / 2;
+            if (dp_.phases[mid].lead_begin <= pf) lo = mid; else hi = mid - 1;
+          }
+          t.cursor_layer = dp_.phases[lo].layer;
+        }
+      }
+      t.look_blocked = ctl_->look_blocked[P];
+      t.grabs = ctl_->grabs[P];
+      t.merged = ph.merged;
+      // The group's classes as the kernel builds them (phase order; a pool's compute units, its
+      // reduce units, the fixed bytes; an accumulation's chunks), with their traced windows.
+      if (ph.kind == 1) {
+        const unsigned rows = ctl_->rows;
+        int n = 0;
+        auto add = [&](int ip, int kind, int pool, unsigned units) {
+          if (n >= kStepMaxClasses) return;
+          ClassTiming c;
+          c.phase = ip;
+          c.phase_name = phase_names_[static_cast<size_t>(ip)];
+          c.kind = kind;
+          c.pool = pool;
+          c.pool_kind = pool >= 0 ? dp_.pools[static_cast<size_t>(pool)].kind : -1;
+          c.units = units;
+          const unsigned long long f = ctl_->cls_first[P][n], e = ctl_->cls_last[P][n], lg = ctl_->cls_last_grab[P][n];
+          c.first_us = f != ~0ull ? static_cast<double>(f - origin) / 1e3 : 0.0;
+          c.last_us = e ? static_cast<double>(e - origin) / 1e3 : 0.0;
+          c.last_grab_us = lg ? static_cast<double>(lg - origin) / 1e3 : 0.0;
+          t.classes.push_back(c);
+          ++n;
+        };
+        // The kernel's order (build_class_table): phase order; a phase's pools' compute then
+        // reduce classes, its fixed units, and for a merged phase its staging class last.
+        for (int ip = P; ip <= P + ph.merged; ++ip) {
+          const DevPhase& iph = dp_.phases[static_cast<size_t>(ip)];
+          const int il = iph.layer;
+          if (iph.accumulate) {
+            add(ip, 3, -1, (rows * static_cast<unsigned>(hidden_) + kStepAccChunk - 1) / kStepAccChunk);
+          } else {
+            for (int rp = 0; rp < 2; ++rp)
+              for (int i = 0; i < iph.n_pools; ++i) {
+                if ((rp == 0) == (i == iph.routed)) continue;
+                const DevPool& gp = dp_.pools[static_cast<size_t>(iph.pools[i])];
+                const unsigned groups = gp.group_kind == kGroupRouted ? static_cast<unsigned>(ctl_->run_count[il]) : 1u;
+                const unsigned attn_blocks = (rows * static_cast<unsigned>(attn_local_heads_) + 31u) / 32u;
+                const unsigned per_group = gp.kind == kPoolMhc         ? static_cast<unsigned>(gp.units_per_group) * rows
+                                           : gp.kind == kPoolRowTail   ? rows
+                                           : gp.kind == kPoolEmbed     ? rows
+                                           : gp.kind == kPoolPick      ? rows
+                                           : gp.kind == kPoolAttention ? static_cast<unsigned>(gp.units_per_group) * attn_blocks
+                                                                       : static_cast<unsigned>(gp.units_per_group);
+                if (groups * per_group != 0u) add(ip, 0, iph.pools[i], groups * per_group);
+                if (gp.kind == kPoolFp8Matrix && gp.slabs > 1 && !gp.reduce_by_tail) add(ip, 1, iph.pools[i], (static_cast<unsigned>(gp.rows) * rows + kStepAccChunk - 1) / kStepAccChunk);
+                if (gp.kind == kPoolAttention && gp.gate_arg) add(ip, 1, iph.pools[i], rows * static_cast<unsigned>(attn_local_heads_));
+              }
+            if (iph.fixed_units) add(ip, 2, -1, iph.fixed_units);
+            for (int i = 0; i < iph.n_pools; ++i) {
+              const DevPool& gp = dp_.pools[static_cast<size_t>(iph.pools[i])];
+              if (gp.gate_kind == kGatePool && gp.stage_units) add(ip, 4, iph.pools[i], gp.stage_units);  // a gated pool's staging
+            }
+          }
+          if (ip > P && iph.lead_units > iph.fixed_units) add(ip, 4, -1, iph.lead_units - iph.fixed_units);  // the staging class
+          if (ip == P && fold_world_ > 1 && iph.fold_index >= 0 && iph.fold_trigger != kTriggerEnd) {
+            unsigned n = 0;
+            if (iph.accumulate) n = static_cast<unsigned>(hidden_);
+            else
+              for (int i = 0; i < iph.n_pools; ++i) {
+                const DevPool& gp = dp_.pools[static_cast<size_t>(iph.pools[i])];
+                if (gp.kind == kPoolFp8Matrix && gp.update_site) n = static_cast<unsigned>(gp.rows);
+              }
+            if (n) {
+              const unsigned fu = net::bus_write_blocks(net::bus_write_chunks(static_cast<size_t>(rows) * n));
+              add(ip, 6, -1, fu);
+              add(ip, 7, -1, fu);
+            }
+          }
+        }
+      }
+      first = std::min(first, ctl_->stamp_begin[P]);
+      last = std::max(last, ctl_->stamp_end[P]);
+      for (int i = 0; i < ph.seg_count; ++i) bytes += static_cast<double>(dp_.segments[static_cast<size_t>(ph.seg_begin + i)].bytes);
+      for (int i = 0; i < ph.n_pools; ++i) {
+        const DevPool& pool = dp_.pools[static_cast<size_t>(ph.pools[i])];
+        bytes += static_cast<double>(pool.bytes) * (pool.group_kind == kGroupRouted ? ctl_->run_count[l] : 1);
+      }
+      r.phases.push_back(std::move(t));
+    }
+    r.model_layers.push_back(dp_.layers[static_cast<size_t>(l)].model_layer);
+    r.layer_us.push_back(static_cast<double>(last - first) / 1e3);
+    r.route_select_us.push_back(static_cast<double>(ctl_->route_select_ns[l]) / 1e3);
+    r.route_finish_us.push_back(static_cast<double>(ctl_->route_finish_ns[l]) / 1e3);
+    r.layer_bytes.push_back(bytes);
+  }
+  r.lead_bytes = static_cast<double>(ctl_->pf_bytes);
+  r.workers = cfg.workers;
+  return r;
+}
+
+}  // namespace dgpp::step

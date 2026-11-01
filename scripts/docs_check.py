@@ -4,7 +4,7 @@ keeps its style.
 
 Every tracked Markdown file is scanned for relative links. A link must
 name a file or directory that exists, and a fragment on a Markdown target
-must name a heading in that file (GitHub's slug rules). README.md must
+must name a heading in that file (GitHub's slug rules) or a line, L<n>. README.md must
 also contain no em-dash, en-dash or semicolon.
 
 Run from the repository root. Exit status 1 lists every failure.
@@ -75,6 +75,8 @@ def main() -> int:
                     continue
             else:
                 full = path
+            if fragment and re.match(r"^L\d+(-L\d+)?$", fragment):
+                continue  # a line reference, which GitHub resolves on any file
             if fragment and full.endswith(".md") and os.path.isfile(full):
                 if full not in heading_cache:
                     heading_cache[full] = headings(full)

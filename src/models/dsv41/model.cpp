@@ -113,6 +113,7 @@ Dsv41Model::Dsv41Model(const Dsv41TextConfig& cfg, const std::string& checkpoint
     throw std::invalid_argument("Dsv41Model: a boundary reducer is required exactly when tp_world > 1");
   init_stream();
   loader_.set_reader_stream(stream_);
+  if (s_default_resident_layout.placement) loader_.set_layout(s_default_resident_layout);
   log_memory_ledger("dsv41: loader opened");
   const int H = cfg_.hidden_size;
   globals_ = loader_.load_globals();

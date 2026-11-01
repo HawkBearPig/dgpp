@@ -102,6 +102,16 @@ struct LayerBump {
   bool side_mode = false;  // alloc_side grants go aside (set before the first grant)
   size_t dev_cursor = 0;   // bytes granted from base (== cursor while nothing went aside)
   size_t side_bytes = 0;   // bytes granted aside
+  // PLACEMENT (2026-10-30, the step engine's arena — MOONSHOT-1.md 2.4):
+  // when set, main grant i lands at base + placement[i] instead of the
+  // next free byte, and the staging mirror takes the same layout, so
+  // host(), upload() and download() are unchanged and the image written
+  // from such a bump holds the placed layout (its key carries the layout's
+  // version). The grants are a permutation of the grant-order layout, so
+  // `cursor`, the byte formula and the counting pass do not change. Set
+  // before the first grant; not combined with side grants.
+  std::vector<size_t> placement;
+  size_t grant_index = 0;  // main grants handed out so far (indexes placement)
 
   struct SideGrant {
     size_t stage_off = 0;
@@ -154,7 +164,16 @@ struct LayerBump {
     const size_t grant = align_up_256(bytes);
     if (dev_cursor + grant > capacity)
       throw std::runtime_error("weight bump OOM");
-    void* p = counting ? nullptr : static_cast<char*>(base) + dev_cursor;
+    size_t at = dev_cursor;
+    if (!placement.empty()) {
+      if (side_mode) throw std::logic_error("weight bump: a placed layout does not take side grants");
+      if (grant_index >= placement.size())
+        throw std::logic_error("weight bump: more grants than the placement names");
+      at = placement[grant_index++];
+      if (at % kWeightAllocAlign != 0 || at + grant > capacity)
+        throw std::logic_error("weight bump: a placement outside the layer or unaligned");
+    }
+    void* p = counting ? nullptr : static_cast<char*>(base) + at;
     if (side_mode && !counting) {
       if (!runs.empty() && runs.back().stage_off + runs.back().bytes == cursor)
         runs.back().bytes += grant;
@@ -230,6 +249,7 @@ struct LayerBump {
 
   void reset() {
     cursor = dev_cursor = side_bytes = 0;
+    grant_index = 0;
     sides.clear();
     runs.clear();
   }

@@ -9,6 +9,23 @@ The persistence section of `qwen_decode_test` also restores GPU state with
 explicit reuse and verifies that rejected reuse and world disagreement leave
 the selected files unchanged. Run GPU checks on idle hardware.
 
+`step_plan_test` is the step engine's plan gate ([step_engine.md](step_engine.md)):
+the DeepSeek-V4.1 stream plan built from the config alone tiles every
+layer's resident span against the loader's byte formulas, on every rank of
+world 4 and at world 1, and its step bytes match the hand count from the
+checkpoint's safetensors headers within one percent at the two C1 shapes.
+Host only, no model, always runs. `step_stream_test` is the streamer's gate:
+the same plan streamed from a device arena at the design chain's latencies
+reaches 95 percent of the ceiling, the deadline and poison exits end the
+kernel with their status, and the step protocol runs a thousand-step soak
+from the device token feed, host work beside a pending kernel, a skip, the
+sequence boundaries and a late gather. GPU, about 4 GB free, skips
+otherwise. `step_consumer_test` is the gate of the MXFP4 expert consumer
+and of the row-major fp8 consumer: within two bf16 ulps or the
+accumulation envelope of a double-precision reference, bitwise across
+launches and group sizes, the plain grids' rate reported. GPU, about 1 GB
+free.
+
 `chat_template_generator_test` exercises the Python golden generator's Jinja
 sandbox without a checkpoint or GPU. It checks private-attribute restrictions,
 input immutability, literal message data, namespace/loop behavior, JSON rendering

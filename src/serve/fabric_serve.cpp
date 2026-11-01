@@ -574,6 +574,9 @@ std::string encode_journal_settings(const WorldSettings& s) {
   out += std::format(",\"mdt\":{:.17g}", s.mtp_draft_temperature);
   out += ",\"mvf\":";
   append_json_string(&out, s.mtp_verify);
+  out += ",\"deng\":";
+  append_json_string(&out, s.decode_engine);
+  out += std::format(",\"ssm\":{},\"l2s\":{},\"sgov\":{}", s.step_sms, s.l2_staging_mib, s.stream_governor);
   out += std::format(",\"dbr\":{},\"lk\":{},\"lkn\":{},\"lks\":{},\"lka\":{},\"lkt\":{}", s.dflash_batch_rows,
                      s.lookup_draft ? 1 : 0, s.lookup_nmin, s.lookup_nstrong, s.lookup_agree, s.lookup_tail);
   out.push_back('}');
@@ -946,6 +949,16 @@ JournalRecord decode_journal_line(std::string_view line) {
     if (const dgpp::minijson::Value* mvf = v.find("mvf")) s.mtp_verify = std::string(mvf->as_string());
     if (s.mtp_verify != "token" && s.mtp_verify != "block")
       throw std::runtime_error("worker settings: mvf must be token or block");
+    // Records before the step engine's key carry none: the graph engines.
+    if (const dgpp::minijson::Value* deng = v.find("deng")) s.decode_engine = std::string(deng->as_string());
+    if (s.decode_engine != "graph" && s.decode_engine != "step")
+      throw std::runtime_error("worker settings: deng must be graph or step");
+    if (const dgpp::minijson::Value* ssm = v.find("ssm")) s.step_sms = static_cast<int>(ssm->as_int());
+    if (const dgpp::minijson::Value* l2s = v.find("l2s")) s.l2_staging_mib = static_cast<int>(l2s->as_int());
+    if (const dgpp::minijson::Value* sgov = v.find("sgov")) s.stream_governor = static_cast<int>(sgov->as_int());
+    if (s.step_sms < 0 || s.step_sms > 256 || s.l2_staging_mib < 0 || s.l2_staging_mib > 24 || s.stream_governor < 0 ||
+        s.stream_governor > 256)
+      throw std::runtime_error("worker settings: ssm, l2s or sgov out of range");
     if (const dgpp::minijson::Value* dbr = v.find("dbr")) s.dflash_batch_rows = static_cast<int>(dbr->as_int());
     if (s.dflash_batch_rows < 0) throw std::runtime_error("worker settings: dbr must be >= 0");
     // Records before context-lookup drafting carry none: off with defaults.

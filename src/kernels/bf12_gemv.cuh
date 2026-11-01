@@ -205,6 +205,35 @@ __device__ __forceinline__ void consume_tail(const TailLoads& v, const Tail& t, 
                         word_of(v.part_exp, lane & 3), base23, sx, sk, cs, c0, esc, eb, ee, acc);
 }
 
+// One window of a row kept bf16 (the wide kernel's raw rows): the
+// production chain over columns [col0, col0 + cols) — bf16_gemv::row_dots'
+// steps of it, in its order, into the running accumulators. sk: the staged
+// window's row stride.
+template <int kRows>
+__device__ __forceinline__ void raw_window(const uint16_t* __restrict__ w_row, int col0, int cols,
+                                           const uint16_t* __restrict__ sx, int sk, int lane,
+                                           float (&acc)[kRows]) {
+  uint4 wv[4];
+#pragma unroll
+  for (int t = 0; t < 4; ++t) {
+    const int c = t * 256 + lane * 8;
+    wv[t] = c < cols ? *reinterpret_cast<const uint4*>(w_row + col0 + c) : make_uint4(0u, 0u, 0u, 0u);
+  }
+#pragma unroll
+  for (int t = 0; t < 4; ++t) {
+    const int c = t * 256 + lane * 8;
+    if (c >= cols) break;  // per lane: its later chunks are past the window too
+#pragma unroll
+    for (int r = 0; r < kRows; ++r) {
+      const uint4 xv = *reinterpret_cast<const uint4*>(sx + static_cast<size_t>(r) * sk + c);
+      bf16_gemv::fma_pair(wv[t].x, xv.x, acc[r]);
+      bf16_gemv::fma_pair(wv[t].y, xv.y, acc[r]);
+      bf16_gemv::fma_pair(wv[t].z, xv.z, acc[r]);
+      bf16_gemv::fma_pair(wv[t].w, xv.w, acc[r]);
+    }
+  }
+}
+
 // One warp, one PACKED row (wr: its bytes, base23 / [eb, ee): its window
 // base and escapes), kRows staged activation rows of stride k: the lane's
 // chain into acc (zeroed here; no reduce). kSB super-blocks (3 * kSB warp

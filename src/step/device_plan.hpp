@@ -1,0 +1,234 @@
+#pragma once
+// The stream plan lowered for the streamer (MOONSHOT-1.md sections 2.1 to
+// 2.6): a layer's phases in walk order, each with its fixed-class bytes as
+// a few contiguous segments of the arena, its router-bound bytes as one
+// pool of equal-stride groups, and the chain's modeled latencies. Units are
+// fixed-size byte runs the workers grab by atomic counter; the fixed units
+// of every phase form one global sequence the lead walks ahead of the
+// chain. Host data, uploaded as flat tables.
+#include <cstdint>
+#include <string>
+#include <vector>
+
+#include "step/plan.hpp"
+
+namespace dgpp::step {
+
+struct DevSegment {
+  uint64_t offset = 0;  // into the layer's device span
+  uint64_t bytes = 0;
+  uint32_t unit_begin = 0;  // the phase's first unit of this segment
+  uint32_t units = 0;
+};
+
+// A pool's consumer: how its units are cut and computed.
+enum DevPoolKind : uint8_t {
+  kPoolBytes = 0,        // synthetic: units of unit_bytes, streamed and folded
+  kPoolMxfp4GateUp = 1,  // MXFP4 gate and up pair: units of 128 output rows a group
+  kPoolMxfp4Down = 2,    // MXFP4 down: units of 128 output rows a group
+  kPoolFp8GateUp = 3,    // the shared expert's fp8 pair, row-major with F32 32 x 32 scales: one group of every token
+  kPoolFp8Down = 4,      // the shared expert's fp8 down
+  kPoolMxfp4RowGateUp = 5,  // MXFP4 gate and up over the checkpoint's row-major layout, through the L2 bridge
+  kPoolMxfp4RowDown = 6,    // MXFP4 down, row-major
+  kPoolFp8Matrix = 7,       // one fp8 projection, row-major with F32 block scales: y = W x for every token
+  kPoolRouter = 8,          // the router: bf16 [experts, hidden] with its F32 bias, units of 16 expert rows over every token, scores out
+  kPoolMhc = 9,             // a hyper-connection site: the coefficient matrix bf16 [24, 4 hidden], its base and scale, the norm weight; a unit is kMhcUnitCoeffs logits of one token, the token's last unit the finish
+  kPoolAttention = 10,      // the CSA2 attention over one latent source of the state pool (site 0 the window ring, 1 the main cache): a unit is one block of the production flash kernel (kernels/dsa_attn_flash.cuh), the phase's last such pool's reduce class the finish (kernels/csa2_attn_finish.cuh)
+  kPoolRowTail = 11,        // a row's tail behind a projection (kernels/csa2_norm.cuh, dsa_latent_append.cuh): the norm with the pool's weight (k > 0), the rotation of rope_heads heads, the kv row's ring append; a unit is one row of the source pool's y, written to this pool's own y
+  kPoolEmbed = 12,          // the embedding: a unit gathers one row's token (the step's, less the table's first id) onto the four streams (glm_embed_bcast_kernel's copy)
+  kPoolHead = 13,           // the lm head over its bf12 companion (StepHeadParams; kernels/mma_gemv_body.cuh): a unit is 64 vocab rows, eight warps of eight, the logits fp32 [rows][n]
+  kPoolPick = 14,           // the pick: a unit is one row's top-2 over the rank's logits (kernels/pick_body.cuh), the winner into the device feed and the verdict
+};
+// The attention pools' geometry (DeepSeek-V4.1's CSA2): the latent width, the
+// keys a flash tile spans and the split group (kernels/dsa.hpp kAttnSplitGroup),
+// the rotated tail of a latent or index head and the index head's width.
+constexpr int kAttnLatent = 512;
+constexpr int kAttnTile = 16;
+constexpr int kAttnGroup = 8;
+constexpr int kAttnRope = 64;
+constexpr int kAttnIndexDim = 128;
+// Whose slots a pool's group holds.
+enum DevGroupKind : uint8_t {
+  kGroupRouted = 0,  // the run list's experts, each with its slots
+  kGroupShared = 1,  // every token's shared slot
+  kGroupTokens = 2,  // every token, slot i = token i
+};
+constexpr int kMaxPhasePools = 12;
+// A pool's compute class gate inside its group (the kernel holds further gates of its own classes).
+enum DevGateKind : uint8_t { kGateNone = 0, kGateFold = 1, kGateSite = 2, kGatePool = 7 };
+enum DevFoldTrigger : uint8_t { kTriggerEnd = 0, kTriggerReduce = 1, kTriggerAccumulate = 2 };
+// A hyper-connection unit's coefficients: one token's streams read once for
+// this many logits, so a step's units fit one wave of the workers.
+constexpr int kMhcUnitCoeffs = 3;
+#if defined(__CUDACC__)
+#define DGPP_STEP_PLAN_HD __host__ __device__
+#else
+#define DGPP_STEP_PLAN_HD
+#endif
+DGPP_STEP_PLAN_HD inline bool pool_is_gate_up(uint8_t kind) {
+  return kind == kPoolMxfp4GateUp || kind == kPoolFp8GateUp || kind == kPoolMxfp4RowGateUp;
+}
+DGPP_STEP_PLAN_HD inline bool pool_is_down(uint8_t kind) { return kind == kPoolMxfp4Down || kind == kPoolFp8Down || kind == kPoolMxfp4RowDown; }
+
+struct DevPool {
+  uint64_t base = 0;    // group 0's first byte
+  uint64_t stride = 0;  // group g begins at base + g * stride
+  uint64_t bytes = 0;   // the bytes of one group
+  int32_t groups = 0;
+  int32_t units_per_group = 0;
+  uint8_t kind = kPoolBytes;
+  uint8_t group_kind = kGroupRouted;
+  uint8_t site = 0;     // kPoolMhc: 0 the attention site, 1 the MoE site (the streams' and pre's buffer parity); kPoolAttention: 0 the window ring, 1 the main cache
+  uint8_t update_site = 0;  // kPoolFp8Matrix: its reduce units follow with the attention site's stream update, this pool's y the h
+  // The gate of the pool's compute units inside a merged group: the class is handed out only
+  // once it opens. kGateNone; kGateFold: the chain spun the group's fold; kGateSite: the site
+  // `gate_arg` of the unit's layer finished every token.
+  uint8_t gate_kind = 0;
+  uint8_t gate_arg = 0;  // kPoolAttention: 1 on the phase's last attention pool, whose reduce class is the finish over every source
+  // The projection chain's wiring (2026-11-01): where the pool's units read their activations
+  // (in_src 0: the step's x rows; 1: pool in_pool's y, at its out_offset and row width; 2: the
+  // attention's output o [rows][local_heads * 512]; 3, a row tail: the streams collapsed under the
+  // last site's pre, the head's input) and, with kGatePool, the pools whose completion
+  // (compute units, and reduce units when slabbed) opens its class: in_pool and gate_pool (-1 none).
+  // A block-diagonal matrix (wo_a: group g's rows read the heads of group g) reads columns
+  // [g * in_group_cols, + k) for output rows [g * in_group_rows, + in_group_rows) (0: dense).
+  uint8_t in_src = 0;
+  uint8_t append = 0;  // kPoolRowTail: the row (the kv latent, kAttnLatent wide) goes into the window ring at its position's slot, with the row's slot list
+  uint8_t reduce_by_tail = 0;  // kPoolFp8Matrix with slabs: its row tail's units sum the slab partials into y (no reduce class of its own)
+  uint8_t pad4 = 0;
+  // A gated pool's bytes as lead units of its phase (fixed units first, as locate_lead counts
+  // them): a staging class streams them into L2 while the pool waits for its gate, and closes
+  // when the gate opens.
+  uint32_t stage_unit_begin = 0;
+  uint32_t stage_units = 0;
+  int32_t in_pool = -1;
+  int32_t gate_pool = -1;
+  int32_t in_group_rows = 0;
+  int32_t in_group_cols = 0;
+  int32_t rope_heads = 0;        // kPoolRowTail: heads rotated (0: none), each at rope_head_stride, its pairs from rope_off, kAttnRope / 2 pairs; kPoolFp8Matrix (one slab): the rotation in the unit's epilogue over its output block (the q projections)
+  int32_t rope_head_stride = 0;
+  int32_t rope_off = 0;
+  int32_t rows = 0;     // a consumer pool: the matrix's output rows (gate and up: I; down: H); kPoolAttention: the source's splits (one 16-key tile each)
+  int32_t k = 0;        // and its inner width (gate and up: H; down: I); kPoolAttention: the latent width
+  int32_t grab = 1;     // units a worker takes at once: consecutive units of one group share their staged activations
+  int32_t partner = -1; // a down pool: the pool whose gate and up units its group waits for
+  uint32_t out_offset = 0;  // kPoolFp8Matrix: where its y [slots, rows] begins in the step's projection buffer (elements)
+  // kPoolFp8Matrix: the inner width is cut into `slabs` so a unit is a
+  // 128-row block over one slab; with more than one, units write fp32
+  // partials at part_offset [slab][slot][rows] and reduce units, after the
+  // pool's compute units, sum them in slab order into y.
+  int32_t slabs = 1;        // kPoolAttention: the split group (kAttnGroup, or 1 when the splits do not divide)
+  uint32_t part_offset = 0;
+  int32_t unit_rows = 128;  // output rows a unit covers (a multiple of 16; warps past them idle): finer for the fixed matrices; kPoolAttention: local_heads
+  // A consumer pool's matrices inside a group: gate payload, gate scales,
+  // up payload, up scales (gate_up), or down payload, down scales (down),
+  // or the matrix's payload and scales (kPoolFp8Matrix), or the layer's attention sink
+  // (kPoolAttention, offsets[0]: F32 [local_heads], the finish's).
+  uint64_t offsets[4] = {0, 0, 0, 0};
+};
+
+struct DevPhase {
+  uint8_t kind = 0;        // 0 latency, 1 stream
+  uint8_t resolves = 0xff; // a Dependency value the phase's end resolves (0xff none)
+  uint8_t waits_host = 0;  // the phase reads rows a host gather publishes (section 2.11): it waits on the host's sequence
+  uint8_t accumulate = 0;  // the ordered accumulation of the routed partials as worker units
+  uint8_t update = 0;      // the MoE site's stream update inside the accumulation's units (h is the layer's y)
+  // The next `merged` phases run inside this one as further unit classes
+  // behind its own, each class gated on what it depends on: a down unit of
+  // group g waits for the group's gate and up units, a hyper-connection site
+  // for the group's fold, the router for the site's finishes, so the latency
+  // segments fill the stream phase's drain instead of standing as phases.
+  uint8_t merged = 0;
+  // The group's fold (the first phase's fold_after_us) is spun by the chain
+  // when the trigger holds, and opens the kGateFold classes: kTriggerEnd (no
+  // merged phases: after the group), kTriggerReduce (pool `trigger_pool`'s
+  // reduce units complete), kTriggerAccumulate (this phase's units complete).
+  uint8_t fold_trigger = 0;
+  int32_t trigger_pool = -1;
+  int32_t fold_index = -1;  // the group's fold in the step's fold order (the host issues its generation ahead), -1 none
+  // The group's facts the chain needs at its start, resolved by the lowering so the chain reads
+  // one phase record rather than walking the phase and pool tables under a saturated memory:
+  // the fold to spin (the group's largest fold_after_us), the phase in the group that resolves
+  // the router (-1: none), its router pool (-1: synthetic), the layer's first routed pool after
+  // the group (how many groups the select makes; -1: none).
+  float group_fold_us = 0;
+  int32_t group_router_phase = -1;
+  int32_t group_router_pool = -1;
+  int32_t group_routed_pool = -1;
+  float latency_us = 0;    // a latency phase's modeled time
+  float fold_after_us = 0; // the fold that follows the phase
+  int32_t seg_begin = 0;   // fixed segments
+  int32_t seg_count = 0;
+  uint32_t fixed_units = 0;
+  // Lead-only segments: fixed-class bytes a consumer pool reads (the shared
+  // expert's), which the lead prefetches into L2 but no worker streams.
+  int32_t lead_seg_begin = 0;
+  int32_t lead_seg_count = 0;
+  uint32_t lead_units = 0;  // fixed_units plus the lead-only units: the phase's share of the lead sequence
+  // The phase's pools: units are handed out fixed segments first, then the
+  // pools in order with the routed pool (`routed`, a slot in `pools`) last,
+  // since its units depend on the router and the others' are the longest.
+  int32_t pools[kMaxPhasePools] = {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1};
+  uint8_t n_pools = 0;
+  int8_t routed = -1;
+  uint8_t pad2[2] = {0, 0};
+  uint32_t lead_begin = 0; // this phase's first unit in the global lead sequence
+  int32_t layer = 0;       // the layer (index into DevicePlan::layers) the phase belongs to
+};
+
+struct DevLayer {
+  int32_t phase_begin = 0;
+  int32_t phase_count = 0;
+  int32_t model_layer = -1;  // the family's layer this stands for (the attention's state and rotary tables are indexed by it); -1: a pseudo-layer of the globals (the embedding, the head)
+  int32_t pad = 0;
+  uint64_t span_bytes = 0;
+};
+
+struct DevicePlan {
+  int32_t fold_count = 0;  // groups with a fold the step engine's kernel carries (DevPhase::fold_index)
+  uint32_t unit_bytes = 0;
+  std::vector<DevLayer> layers;
+  std::vector<DevPhase> phases;
+  std::vector<DevSegment> segments;
+  std::vector<DevPool> pools;
+  uint32_t lead_units = 0;  // fixed units over the whole plan
+  uint32_t proj_elems = 0;  // the projection buffer: every kPoolFp8Matrix pool's y [kStepMaxRows, rows], bf16
+  uint32_t part_elems = 0;  // the partials scratch: the widest phase's slabs x [kStepMaxRows, rows] fp32, reused by every phase
+  int32_t max_k = 0;
+  int32_t n_experts = 0;   // the router pool's experts (0: no router pool)        // the widest inner width a consumer reads its activations at
+  // Bytes a step reads at the plan's shape, by class, for the rate.
+  double fixed_bytes = 0;
+  double router_bytes = 0;
+};
+
+// Lowers the layers of a plan whose offsets are the arena's (dsv41_layer_plan
+// over a placed layout). Consecutive resident ranges of one phase and class
+// coalesce into a segment; a phase's router-bound ranges must form equal
+// groups at one stride, or the lowering throws. Ranges outside the resident
+// span (KV rows, gathered tables) are not streamed from the arena and are
+// left out. `unit_bytes` is the grab size, a multiple of 512. With
+// `consumers`, the MXFP4 expert pools take the consumer kinds and the
+// accumulate phase becomes worker units; without, every pool is bytes. The
+// mask form picks the consumer classes one by one, for attribution: the
+// routed experts, the shared expert and the fp8 projections.
+// kConsumeAll is the set the rate gates run with; the attention (kConsumeAttention) is landed
+// bitwise and measured apart until its classes run inside a stream phase's drain (as its own
+// phase it cost the layer six points, 2026-11-01: docs/step_engine.md).
+constexpr unsigned kConsumeExperts = 1u, kConsumeShared = 2u, kConsumeProjections = 4u, kConsumeRouter = 8u, kConsumeMhc = 16u,
+                   kConsumeAttention = 32u, kConsumeChain = 64u, kConsumeHead = 128u, kConsumeAll = 31u | 64u;
+// kConsumeChain: the projection chain's wiring (the row tails, the pools reading another's y, the
+// attention behind the rotated q); without it every projection reads x, the data flow before
+// 2026-11-01, kept for the attribution's A/B. kConsumeAttention stays outside kConsumeAll (the
+// rate gates' set): the attention costs 3-5 points of its own.
+// kConsumeHead: the globals' pools (the embedding gather, the head's input, the lm head over its
+// bf12 companion, the pick) from the embed and head pseudo-layers a caller orders around the main
+// layers (plan.hpp split_globals); outside kConsumeAll since the rigs without the globals index
+// the device plan's layers as the family's.
+DevicePlan lower_plan(const std::vector<LayerPlan>& layers, uint32_t unit_bytes, unsigned consumer_mask);
+inline DevicePlan lower_plan(const std::vector<LayerPlan>& layers, uint32_t unit_bytes, bool consumers = false) {
+  return lower_plan(layers, unit_bytes, consumers ? kConsumeAll : 0u);
+}
+
+std::string device_plan_summary(const DevicePlan& dp);
+
+}  // namespace dgpp::step

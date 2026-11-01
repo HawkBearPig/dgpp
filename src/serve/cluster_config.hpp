@@ -264,6 +264,17 @@ struct ClusterConfig {
     bool no_eos = false;
     bool compact_batches = true;
     bool decode_graph = false;
+    // The decode engine (MOONSHOT-1.md §1.1): "graph", the engines that
+    // serve today, or "step", the persistent-step engine, which selects
+    // its own weight layout with it. A template that does not set it
+    // cannot observe that the step engine exists.
+    std::string decode_engine = "graph";
+    // The step engine's streamer (docs/step_engine.md): the SMs its workers
+    // take (0: every SM but the chain's), the lead's L2 cap in MiB, and the
+    // governor as the workers that stream the lead at once (0: unbounded).
+    int step_sms = 0;
+    int l2_staging_mib = 8;
+    int stream_governor = 0;
     bool mtp = false;
     int mtp_depth = 1;             // draft tokens per step (1..5); needs mtp
     bool mtp_depth_set = false;    // the file named it (else a family may default it: DSpark's block is 5)

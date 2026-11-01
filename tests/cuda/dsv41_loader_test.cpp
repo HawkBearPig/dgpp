@@ -35,6 +35,8 @@
 #include "models/dsv41/engram_tables.hpp"
 #include "models/dsv41/loader.hpp"
 #include "models/exl3_matrix.hpp"
+#include "step/dsv41/arena.hpp"
+#include "step/dsv41/plan.hpp"
 
 namespace {
 namespace fs = std::filesystem;
@@ -771,6 +773,97 @@ DGPP_TEST(dsv41_loader_exl3_globals_head_rows_on_blocks) {
       require(g.bytes == Dsv41LayerStream::globals_bytes(fx.cfg, rank, world, head), "exl3 globals formula");
     }
   }
+}
+
+// The step engine's arena (MOONSHOT-1.md 2.4; step/dsv41/arena.hpp): the
+// same bytes in the order the step consumes them. Every tensor under the
+// arena equals its checkpoint slice and its grant-order twin, the image
+// written from the arena restores bitwise, and the two layouts key to two
+// image files.
+DGPP_TEST(dsv41_loader_arena_layout_round_trip) {
+  const Fixture fx = write_fixture();
+  const fs::path cache = fs::current_path() / "dsv41_loader_arena_image_cache";
+  fs::remove_all(cache);
+  const std::string saved = Dsv41LayerStream::resident_image_dir();
+  Dsv41LayerStream::set_resident_image_dir(cache.string());
+  const int layers = fx.cfg.max_layer();
+  const dgpp::Dsv41LocalGeometry geo =
+      dgpp::Dsv41LocalGeometry::from_config(fx.cfg, 1, 2, dgpp::Dsv41HeadSharding::VocabSharded);
+  dgpp::step::Dsv41StepShape shape;
+  shape.rows = 2;
+  shape.draft_rows = 5;
+  std::vector<std::vector<uint8_t>> grant_bytes(static_cast<size_t>(layers));
+  std::vector<dgpp::step::LayerPlan> grant_plan(static_cast<size_t>(layers));
+  {
+    Dsv41LayerStream s(fx.cfg, fx.dir, 1, 2, dgpp::Dsv41Residency::Resident, dgpp::Dsv41HeadSharding::VocabSharded, true);
+    for (int l = 0; l < layers; ++l) {
+      const auto& r = s.load_layer(l);
+      const auto span = s.resident_layer_span(l);
+      grant_bytes[static_cast<size_t>(l)] = device_bytes(span.first, span.second);
+      grant_plan[static_cast<size_t>(l)] = dgpp::step::dsv41_layer_plan(fx.cfg, geo, r, span.first, span.second, shape);
+    }
+  }
+  std::vector<std::vector<uint8_t>> arena_bytes(static_cast<size_t>(layers));
+  {
+    Dsv41LayerStream s(fx.cfg, fx.dir, 1, 2, dgpp::Dsv41Residency::Resident, dgpp::Dsv41HeadSharding::VocabSharded, true);
+    s.set_layout(dgpp::step::dsv41_resident_layout(fx.cfg, 1, 2));
+    size_t moved = 0;
+    for (int l = 0; l < layers; ++l) {
+      const auto& r = s.load_layer(l);
+      check_layer(fx, s, r);  // every tensor's bytes against the checkpoint, at its arena address
+      const auto span = s.resident_layer_span(l);
+      require(span.second == grant_bytes[static_cast<size_t>(l)].size(), "arena: the span is the layer's bytes");
+      arena_bytes[static_cast<size_t>(l)] = device_bytes(span.first, span.second);
+      const dgpp::step::LayerPlan pa = dgpp::step::dsv41_layer_plan(fx.cfg, geo, r, span.first, span.second, shape);
+      require(dgpp::step::plan_check(pa).empty(), "arena: the plan under the arena is sound");
+      const dgpp::step::LayerPlan& pg = grant_plan[static_cast<size_t>(l)];
+      require(pa.ranges.size() == pg.ranges.size(), "arena: the same ranges");
+      for (size_t i = 0; i < pa.ranges.size(); ++i) {
+        const dgpp::step::Range& a = pa.ranges[i];
+        const dgpp::step::Range& g = pg.ranges[i];
+        require(a.name == g.name && a.bytes == g.bytes, "arena: range " + a.name + " keeps its identity");
+        if (a.source != dgpp::step::Source::Resident) continue;
+        require(std::memcmp(arena_bytes[static_cast<size_t>(l)].data() + a.offset,
+                            grant_bytes[static_cast<size_t>(l)].data() + g.offset, a.bytes) == 0,
+                "arena: range " + a.name + " holds its grant-order bytes");
+        if (a.offset != g.offset) ++moved;
+      }
+    }
+    require(moved > 0, "arena: the layout differs from grant order");
+    require(s.image_layers_captured() == layers, "arena: every layer captured");
+  }
+  {
+    Dsv41LayerStream s(fx.cfg, fx.dir, 1, 2, dgpp::Dsv41Residency::Resident, dgpp::Dsv41HeadSharding::VocabSharded, true);
+    s.set_layout(dgpp::step::dsv41_resident_layout(fx.cfg, 1, 2));
+    const uint64_t before = s.source_bytes_read();
+    for (int l = 0; l < layers; ++l) {
+      const auto& r = s.load_layer(l);
+      const auto span = s.resident_layer_span(l);
+      require(device_bytes(span.first, span.second) == arena_bytes[static_cast<size_t>(l)], "arena: restored bitwise");
+      check_layer(fx, s, r);
+    }
+    require(s.image_layers_restored() == layers && s.source_bytes_read() == before,
+            "arena: every layer restored from the arena's image, no source reads");
+  }
+  {
+    // The grant-order stream keys to its own image, the one the first block
+    // captured, and restores grant-order bytes from it.
+    Dsv41LayerStream s(fx.cfg, fx.dir, 1, 2, dgpp::Dsv41Residency::Resident, dgpp::Dsv41HeadSharding::VocabSharded, true);
+    for (int l = 0; l < layers; ++l) {
+      (void)s.load_layer(l);
+      const auto span = s.resident_layer_span(l);
+      require(device_bytes(span.first, span.second) == grant_bytes[static_cast<size_t>(l)],
+              "the grant-order layout restores its own image's bytes");
+    }
+    require(s.image_layers_restored() == layers && s.image_layers_captured() == 0,
+            "the grant-order layout reads its own image, not the arena's");
+    size_t images = 0;
+    for (const auto& e : fs::directory_iterator(cache))
+      if (e.path().extension() == ".img") ++images;
+    require(images == 2, "two layouts, two image files");
+  }
+  Dsv41LayerStream::set_resident_image_dir(saved);
+  fs::remove_all(cache);
 }
 
 DGPP_TEST(dsv41_loader_exl3_resident_image_round_trip) {
