@@ -43,9 +43,17 @@ __device__ __forceinline__ float router_sqrt_softplus(float x) {
 // The two rows' dots against NT staged tokens: the row vectors of a batch
 // loaded before any is used (the unit was latency-bound at two in flight),
 // each (row, token) chain in the production's lane order.
+// A unit's timeline for the trace: the global timer, and stamps at the unit's stages into
+// `tr` (eight words a block: entry, activations staged, each row batch done, the scan done).
+__device__ __forceinline__ unsigned long long router_timer() {
+  unsigned long long t;
+  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+  return t;
+}
+constexpr int kRouterTraceWords = 8;
 template <int kK, int NT, int kBatchWanted, bool kPipeline>
 __device__ __forceinline__ void router_rows(const uint4* __restrict__ wv0, const uint4* __restrict__ wv1, const uint16_t* s_x, int lane,
-                                            float (&dot0)[kRouterTokens], float (&dot1)[kRouterTokens]) {
+                                            float (&dot0)[kRouterTokens], float (&dot1)[kRouterTokens], unsigned long long* tr = nullptr) {
   constexpr int kVecs = kK / 8 / 32;  // vectors a lane walks
   constexpr int kBatch = kVecs < kBatchWanted ? kVecs : kBatchWanted;
   static_assert(kVecs % kBatch == 0, "the row's vectors in whole batches");
@@ -91,6 +99,7 @@ __device__ __forceinline__ void router_rows(const uint4* __restrict__ wv0, const
 #pragma unroll
       for (int i = 0; i < kBatch; ++i) { q0[0][i] = __ldcs(wv0 + lane + (b + kBatch + i) * 32); q1[0][i] = __ldcs(wv1 + lane + (b + kBatch + i) * 32); }
     }
+    if (tr && threadIdx.x == 0 && 2 + nb < kRouterTraceWords - 1) tr[2 + nb] = router_timer();  // batch nb computed (warp 0's view)
   }
 }
 // kBatch: row vectors a lane loads before using any (1: one at a time, the
@@ -100,9 +109,11 @@ __device__ __forceinline__ void router_rows(const uint4* __restrict__ wv0, const
 // (the production select's rule: the larger biased score, the lower id on ties), at
 // cand_*[tok * n_experts + rb * top_k + i]; rows past the experts, or past the k-th, write id -1.
 template <int kK, int kBatch, bool kSpecialize, bool kPipeline = true>
-__device__ void router_unit(const uint8_t* __restrict__ w_base, const DevPool& pool, int rb, const Mxfp4Group& g, const uint16_t* __restrict__ x,
+__device__ void router_unit(const uint8_t* __restrict__ w_base, const DevPool& pool, int rb, Mxfp4Group g, const uint16_t* __restrict__ x,
                             float* __restrict__ scores, float* __restrict__ biased, int n_experts, int mode, uint8_t* smem, int top_k = 0,
-                            int32_t* __restrict__ cand_id = nullptr, float* __restrict__ cand_score = nullptr, float* __restrict__ cand_biased = nullptr) {
+                            int32_t* __restrict__ cand_id = nullptr, float* __restrict__ cand_score = nullptr, float* __restrict__ cand_biased = nullptr,
+                            unsigned long long* tr = nullptr) {
+  if (tr && threadIdx.x == 0) tr[0] = router_timer();
   static_assert(kK % 256 == 0, "the router's inner width");
   const uint16_t* w = reinterpret_cast<const uint16_t*>(w_base + pool.offsets[0]);
   const float* bias = reinterpret_cast<const float*>(w_base + pool.offsets[1]);
@@ -123,6 +134,7 @@ __device__ void router_unit(const uint8_t* __restrict__ w_base, const DevPool& p
     cp_async_commit();
     cp_async_wait<0>();
     __syncthreads();
+    if (tr && threadIdx.x == 0) tr[1] = router_timer();  // the activations staged
     // Both of the warp's rows against every staged token through one read of each activation
     // vector; the token count specialized, so no issue slot goes to a token that is not there.
     const int e0 = rb * kRouterUnitRows + warp, e1 = e0 + (kStepThreads / 32);
@@ -134,17 +146,17 @@ __device__ void router_unit(const uint8_t* __restrict__ w_base, const DevPool& p
 #pragma unroll
       for (int t = 0; t < kRouterTokens; ++t) { dot0[t] = 0.f; dot1[t] = 0.f; }
       if (!kSpecialize) {
-        router_rows<kK, kRouterTokens, kBatch, kPipeline>(wv0, wv1, s_x, lane, dot0, dot1);
+        router_rows<kK, kRouterTokens, kBatch, kPipeline>(wv0, wv1, s_x, lane, dot0, dot1, tr);
       } else {
         switch (nt) {
-          case 1: router_rows<kK, 1, kBatch, kPipeline>(wv0, wv1, s_x, lane, dot0, dot1); break;
-          case 2: router_rows<kK, 2, kBatch, kPipeline>(wv0, wv1, s_x, lane, dot0, dot1); break;
-          case 3: router_rows<kK, 3, kBatch, kPipeline>(wv0, wv1, s_x, lane, dot0, dot1); break;
-          case 4: router_rows<kK, 4, kBatch, kPipeline>(wv0, wv1, s_x, lane, dot0, dot1); break;
-          case 5: router_rows<kK, 5, kBatch, kPipeline>(wv0, wv1, s_x, lane, dot0, dot1); break;
-          case 6: router_rows<kK, 6, kBatch, kPipeline>(wv0, wv1, s_x, lane, dot0, dot1); break;
-          case 7: router_rows<kK, 7, kBatch, kPipeline>(wv0, wv1, s_x, lane, dot0, dot1); break;
-          default: router_rows<kK, 8, kBatch, kPipeline>(wv0, wv1, s_x, lane, dot0, dot1); break;
+          case 1: router_rows<kK, 1, kBatch, kPipeline>(wv0, wv1, s_x, lane, dot0, dot1, tr); break;
+          case 2: router_rows<kK, 2, kBatch, kPipeline>(wv0, wv1, s_x, lane, dot0, dot1, tr); break;
+          case 3: router_rows<kK, 3, kBatch, kPipeline>(wv0, wv1, s_x, lane, dot0, dot1, tr); break;
+          case 4: router_rows<kK, 4, kBatch, kPipeline>(wv0, wv1, s_x, lane, dot0, dot1, tr); break;
+          case 5: router_rows<kK, 5, kBatch, kPipeline>(wv0, wv1, s_x, lane, dot0, dot1, tr); break;
+          case 6: router_rows<kK, 6, kBatch, kPipeline>(wv0, wv1, s_x, lane, dot0, dot1, tr); break;
+          case 7: router_rows<kK, 7, kBatch, kPipeline>(wv0, wv1, s_x, lane, dot0, dot1, tr); break;
+          default: router_rows<kK, 8, kBatch, kPipeline>(wv0, wv1, s_x, lane, dot0, dot1, tr); break;
         }
       }
 #pragma unroll
@@ -200,6 +212,7 @@ __device__ void router_unit(const uint8_t* __restrict__ w_base, const DevPool& p
         if (found && e == best) v = -INFINITY;  // taken
       }
     }
+    if (tr && threadIdx.x == 0) tr[kRouterTraceWords - 1] = router_timer();  // the unit done
   }
 }
 

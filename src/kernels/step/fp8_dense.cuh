@@ -94,7 +94,7 @@ __device__ __forceinline__ void fp8_fragments(const uint4& v, int gid, int tid, 
 // The gate and up pair over 128-row block `rb` of a row-major fp8 expert for
 // group `g` (the activations x, bf16 [tokens, kH]), into act[slot][row].
 template <int kH, int kI, int kBlock, int kTG>
-__device__ void fp8_gate_up_unit(const Fp8Expert& e, const Mxfp4Group& g, int rb, const uint16_t* __restrict__ x, uint16_t* __restrict__ act,
+__device__ void fp8_gate_up_unit(const Fp8Expert& e, Mxfp4Group g, int rb, const uint16_t* __restrict__ x, uint16_t* __restrict__ act,
                                  uint8_t* smem) {
   static_assert(kH % kFp8SlabBytes == 0 && kBlock % 32 == 0 && kI % kTileRows == 0, "the pair's shape");
   constexpr int kD = 4;                     // chunks in flight a matrix
@@ -188,7 +188,7 @@ __device__ void fp8_gate_up_unit(const Fp8Expert& e, const Mxfp4Group& g, int rb
 // The down matrix over 128-row block `rb` for group `g`, the group's act rows
 // staged in smem (mxfp4_stage_down_act<kI>): fp32 partials out[out_index(slot, row)].
 template <int kH, int kI, int kBlock, int kTG, class OutIndex>
-__device__ void fp8_down_unit(const Fp8Expert& e, const Mxfp4Group& g, int rb, const uint8_t* smem, float* __restrict__ out,
+__device__ void fp8_down_unit(const Fp8Expert& e, Mxfp4Group g, int rb, const uint8_t* smem, float* __restrict__ out,
                               OutIndex out_index) {
   static_assert(kI % 32 == 0 && kH % kMxfp4UnitRows == 0 && kBlock % 32 == 0, "the down shape");
   constexpr int kChunks = kI / 32;
@@ -248,7 +248,7 @@ __device__ void fp8_down_unit(const Fp8Expert& e, const Mxfp4Group& g, int rb, c
 // `partial` is null, else the fp32 slab partial partial[slot * kN + row]. A
 // projection's form: the pair's with one matrix.
 template <int kK, int kN, int kBlock, int kTG>
-__device__ void fp8_matrix_unit(const uint8_t* __restrict__ w, const float* __restrict__ scales, const Mxfp4Group& g, int rb,
+__device__ void fp8_matrix_unit(const uint8_t* __restrict__ w, const float* __restrict__ scales, Mxfp4Group g, int rb,
                                 const uint16_t* __restrict__ x, uint16_t* __restrict__ y, float* __restrict__ partial, uint8_t* smem,
                                 int w0, int w1, int unit_rows) {
   static_assert(kK % kMxfp4WindowCodes == 0 && kBlock % 32 == 0 && kN % kTileRows == 0, "the matrix's shape");
@@ -341,7 +341,7 @@ __host__ __device__ constexpr int fp8_split_smem_bytes() {
   return split * kFp8SplitRows * (kK / split + 8) * 2 + 8 * 16 * 8 * 4;
 }
 template <int kK, int kN, int kBlock, int kRowTiles>
-__device__ void fp8_matrix_split_unit(const uint8_t* __restrict__ w, const float* __restrict__ scales, const Mxfp4Group& g, int rb,
+__device__ void fp8_matrix_split_unit(const uint8_t* __restrict__ w, const float* __restrict__ scales, Mxfp4Group g, int rb,
                                       const uint16_t* __restrict__ x, uint16_t* __restrict__ y, uint8_t* smem, bool stage = true) {
   constexpr int kSplit = 8 / kRowTiles;
   constexpr int kPartK = kK / kSplit;  // codes a part
@@ -454,7 +454,7 @@ __host__ __device__ constexpr int fp8_staged_smem_bytes(int codes) {  // codes: 
   return kFp8StagedRows * (kK / kBlock) * 4 + kFp8StagedRows * (codes + kFp8StagedPad) * 2;
 }
 template <int kK, int kN, int kBlock>
-__device__ void fp8_matrix_staged_unit(const uint8_t* __restrict__ w, const float* __restrict__ scales, const Mxfp4Group& g, int rb,
+__device__ void fp8_matrix_staged_unit(const uint8_t* __restrict__ w, const float* __restrict__ scales, Mxfp4Group g, int rb,
                                        const uint16_t* __restrict__ x, uint16_t* __restrict__ y, float* __restrict__ partial, uint8_t* smem,
                                        int w0, int w1, int unit_rows) {
   static_assert(kK % kMxfp4WindowCodes == 0 && kBlock % 32 == 0 && kN % kTileRows == 0, "the matrix's shape");
@@ -549,7 +549,7 @@ __device__ void fp8_matrix_staged_unit(const uint8_t* __restrict__ w, const floa
 }
 
 template <int kK, int kN, int kBlock>
-__device__ __forceinline__ void fp8_matrix(const uint8_t* w, const float* scales, const Mxfp4Group& g, int rb, const uint16_t* x, uint16_t* y,
+__device__ __forceinline__ void fp8_matrix(const uint8_t* w, const float* scales, Mxfp4Group g, int rb, const uint16_t* x, uint16_t* y,
                                            float* partial, uint8_t* smem, int w0, int w1, int unit_rows = kMxfp4UnitRows) {
   switch ((g.count + 7) / 8) {
     case 1:
@@ -565,7 +565,7 @@ __device__ __forceinline__ void fp8_matrix(const uint8_t* w, const float* scales
 }
 
 template <int kH, int kI, int kBlock>
-__device__ __forceinline__ void fp8_gate_up(const Fp8Expert& e, const Mxfp4Group& g, int rb, const uint16_t* x, uint16_t* act, uint8_t* smem) {
+__device__ __forceinline__ void fp8_gate_up(const Fp8Expert& e, Mxfp4Group g, int rb, const uint16_t* x, uint16_t* act, uint8_t* smem) {
   switch ((g.count + 7) / 8) {
     case 1: fp8_gate_up_unit<kH, kI, kBlock, 1>(e, g, rb, x, act, smem); break;
     case 2: fp8_gate_up_unit<kH, kI, kBlock, 2>(e, g, rb, x, act, smem); break;
@@ -574,7 +574,7 @@ __device__ __forceinline__ void fp8_gate_up(const Fp8Expert& e, const Mxfp4Group
   }
 }
 template <int kH, int kI, int kBlock, class OutIndex>
-__device__ __forceinline__ void fp8_down(const Fp8Expert& e, const Mxfp4Group& g, int rb, const uint8_t* smem, float* out, OutIndex out_index) {
+__device__ __forceinline__ void fp8_down(const Fp8Expert& e, Mxfp4Group g, int rb, const uint8_t* smem, float* out, OutIndex out_index) {
   switch ((g.count + 7) / 8) {
     case 1: fp8_down_unit<kH, kI, kBlock, 1>(e, g, rb, smem, out, out_index); break;
     case 2: fp8_down_unit<kH, kI, kBlock, 2>(e, g, rb, smem, out, out_index); break;

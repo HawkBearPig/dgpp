@@ -34,7 +34,7 @@ __device__ __forceinline__ void mxfp4_row_fragments(const uint4& v, int gid, int
 }
 
 template <int kH, int kI, int kTG>
-__device__ void mxfp4_row_gate_up_unit(const Mxfp4Expert& e, const Mxfp4Group& g, int rb, const uint16_t* __restrict__ x,
+__device__ void mxfp4_row_gate_up_unit(const Mxfp4Expert& e, Mxfp4Group g, int rb, const uint16_t* __restrict__ x,
                                        uint16_t* __restrict__ act, uint8_t* smem) {
   static_assert(kH % kMxfp4WindowCodes == 0 && kI % kTileRows == 0, "the pair's shape");
   constexpr int kD = 4;                        // chunk pairs in flight a matrix
@@ -135,7 +135,7 @@ __device__ void mxfp4_row_gate_up_unit(const Mxfp4Expert& e, const Mxfp4Group& g
 }
 
 template <int kH, int kI, int kTG, class OutIndex>
-__device__ void mxfp4_row_down_unit(const Mxfp4Expert& e, const Mxfp4Group& g, int rb, const uint8_t* smem, float* __restrict__ out,
+__device__ void mxfp4_row_down_unit(const Mxfp4Expert& e, Mxfp4Group g, int rb, const uint8_t* smem, float* __restrict__ out,
                                     OutIndex out_index) {
   static_assert(kI % 64 == 0 && kH % kMxfp4UnitRows == 0, "the down shape");
   constexpr int kPairs = kI / 64;
@@ -192,7 +192,7 @@ __device__ void mxfp4_row_down_unit(const Mxfp4Expert& e, const Mxfp4Group& g, i
 }
 
 template <int kH, int kI>
-__device__ __forceinline__ void mxfp4_row_gate_up(const Mxfp4Expert& e, const Mxfp4Group& g, int rb, const uint16_t* x, uint16_t* act,
+__device__ __forceinline__ void mxfp4_row_gate_up(const Mxfp4Expert& e, Mxfp4Group g, int rb, const uint16_t* x, uint16_t* act,
                                                   uint8_t* smem) {
   switch ((g.count + 7) / 8) {
     case 1: mxfp4_row_gate_up_unit<kH, kI, 1>(e, g, rb, x, act, smem); break;
@@ -202,7 +202,7 @@ __device__ __forceinline__ void mxfp4_row_gate_up(const Mxfp4Expert& e, const Mx
   }
 }
 template <int kH, int kI, class OutIndex>
-__device__ __forceinline__ void mxfp4_row_down(const Mxfp4Expert& e, const Mxfp4Group& g, int rb, const uint8_t* smem, float* out,
+__device__ __forceinline__ void mxfp4_row_down(const Mxfp4Expert& e, Mxfp4Group g, int rb, const uint8_t* smem, float* out,
                                                OutIndex out_index) {
   switch ((g.count + 7) / 8) {
     case 1: mxfp4_row_down_unit<kH, kI, 1>(e, g, rb, smem, out, out_index); break;

@@ -447,6 +447,34 @@ unit does, so a unit's loads are in flight together and its wait is one
 latency rather than a round trip a batch; and the router's bf16 rows have a
 lossless bf12 companion in the repo, a quarter fewer bytes.
 
+The night's last measurements (2026-11-01) took the question down to the
+unit's stages. A staging class per merged phase, gated on the group's fold
+trigger, now brings a site's coefficient rows and the router's rows into L2
+during the fold's idle window (the lead's early staging of them did not
+survive the group); it is correct and cheap and moved nothing: the router's
+units run 27 to 30 µs with their rows hot, and the same without any lead
+at all (the lever matrix's `no lead` variant), and alone in the kernel with
+every other pool bytes (`step_router_class_alone`: 22 to 26 µs, the 24
+units handed out within 2 to 3 µs). The SM clock stays at 2398 MHz through
+a rate run with no throttle reason set. The SASS with line info shows no
+local-memory traffic in the router's hot loop (13.5k instructions); the
+spills it does show, 496 and 320 local accesses in the expert and
+projection units' staging loops, were the group struct passed by reference
+and re-read from local memory a piece, and it goes by value now (the
+kernel's stack 80 to 48 bytes a thread). The router unit stamps its stages
+(`unit_trace`, printed by `router_unit_rate` and the lone-class case): the
+standalone unit stages its activations in 1.5 µs, runs its four row batches
+in 1.3 each and its epilogue and candidate scan in 4.2, 11.4 in all; inside
+the kernel, alone with the lead, the same unit takes 2.0, then 2.5 to 3.0 a
+batch, then 7: about 21. So the latency-bound unit's cost under the kernel
+is its row batches' round trips at the L2's latency under the lead's fills,
+plus an epilogue that doubles too; the arrival, the registers, the clock and
+the rows' residency are not it. What would cut it: the lead paused for the
+router's 20 µs (the matrix priced eight leaders at five points; zero for
+twenty microseconds is a different trade), bf12 rows (a quarter fewer
+bytes), and a lighter epilogue (the candidate scan and the per-warp stores
+cost 4 to 7 µs where the dots cost 6 to 12).
+
 `step_consumers_lever_matrix` measures the scheduling levers as a set, two
 samples each, on the tile-major rig, with the median and the
 attention-output group's site and router windows and tail. Its first full

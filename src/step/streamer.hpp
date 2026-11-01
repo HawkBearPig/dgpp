@@ -55,7 +55,7 @@ struct StreamerConfig {
 };
 
 // A unit class of a published group (kernels/step/stream.cu): its phase, kind
-// (0 compute, 1 reduce, 2 fixed bytes, 3 accumulate), pool, units and the
+// (0 compute, 1 reduce, 2 fixed bytes, 3 accumulate, 4 staging), pool, units and the
 // window from its first hand-out to its last completion, from the step's origin.
 struct ClassTiming {
   int phase = 0;
@@ -147,6 +147,9 @@ class Streamer {
   const float* post() const { return post_; }
   const float* comb() const { return comb_; }
   bool mhc() const { return mhc_; }
+  // A router unit's stage stamps (globaltimer ns), the last unit worker w ran: [w * 8 + k], k 0 entry,
+  // 1 activations staged, 2.. each row batch, 7 done.
+  const unsigned long long* unit_trace() const { return unit_trace_; }
   int n_experts() const { return n_experts_; }
   int x_stride() const { return x_stride_; }       // elements a row of x
   int hidden() const { return hidden_; }
@@ -182,6 +185,7 @@ class Streamer {
   int x_stride_ = 0;
   float* scores_ = nullptr;
   float* biased_ = nullptr;
+  unsigned long long* unit_trace_ = nullptr;
   int32_t* cand_id_ = nullptr;
   float* cand_score_ = nullptr;
   float* cand_biased_ = nullptr;

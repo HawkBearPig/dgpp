@@ -199,10 +199,10 @@ void print_report(const char* title, const StreamReport& r, int layer) {
                 t.layer, t.name.c_str(), t.stream ? "stream " : "latency", t.begin_us, t.end_us, t.units, t.staged_mb, t.drained_us,
                 util * 100.0, t.grabs ? t.busy_us / t.grabs : 0.0, t.grabs, t.grabs ? t.handout_us / t.grabs : 0.0, t.lead_in_mb,
                 (t.stream && window > 0 && r.workers > 0) ? t.wait_us / (window * r.workers) * 100.0 : 0.0, t.ahead_mb, t.cursor_layer, t.look_blocked);
-    if (t.merged || t.classes.size() > 1) {  // the group's classes: when each ran, from the group's begin
-      static const char* const kinds[4] = {"compute", "reduce", "fixed", "accum"};
+    if (t.merged || !t.classes.empty()) {  // the group's classes: when each ran, from the group's begin
+      static const char* const kinds[8] = {"compute", "reduce", "fixed", "accum", "stage", "?", "?", "?"};
       for (const ClassTiming& c : t.classes)
-        std::printf("            %-10s %-7s pool %3d (kind %2d) units %5u   %+8.1f .. %+8.1f us (last hand-out %+8.1f)\n", c.phase_name.c_str(), kinds[c.kind & 3],
+        std::printf("            %-10s %-7s pool %3d (kind %2d) units %5u   %+8.1f .. %+8.1f us (last hand-out %+8.1f)\n", c.phase_name.c_str(), kinds[c.kind & 7],
                     c.pool, c.pool_kind, c.units, c.units && c.first_us > 0 ? c.first_us - t.begin_us : 0.0, c.units && c.last_us > 0 ? c.last_us - t.begin_us : 0.0,
                     c.units && c.last_grab_us > 0 ? c.last_grab_us - t.begin_us : 0.0);
     }
@@ -688,17 +688,19 @@ double consumers_rate_mask(unsigned mask, const char* title) {
 // site and router class windows and tail.
 DGPP_TEST(step_consumers_lever_matrix) {
   auto rig = make_rig_mask(kLayers, kConsumeAll, /*tile_major=*/true);
-  struct Variant { const char* name; bool gated_first; unsigned critical_leaders; int chunk; bool pipeline; bool yield; };
+  // The second set (2026-11-01): the latency-bound classes run two to three times their standalone
+  // time in the kernel whether or not the memory is saturated; the lead runs in every case, so the
+  // variants take it away (no lead at all; one leader while a site's or the router's units run).
+  struct Variant { const char* name; bool gated_first; unsigned critical_leaders; int chunk; bool pipeline; bool yield; uint64_t lead_cap; };
+  const uint64_t kCap = uint64_t{16} << 20;
   const Variant variants[] = {
-      {"baseline (phase order, chunk 512)", false, 0, 512, false, true},
-      {"baseline without the lead's yield on gates", false, 0, 512, false, false},
-      {"gated classes first", true, 0, 512, false, true},
-      {"gated first, 8 leaders while critical", true, 8, 512, false, true},
-      {"gated first, 8 leaders, chunk 2048", true, 8, 2048, false, true},
-      {"gated first, 8 leaders, chunk 2048, pipelined router", true, 8, 2048, true, true},
-      {"chunk 2048 alone", false, 0, 2048, false, true},
-      {"pipelined router alone", false, 0, 512, true, true},
-      {"8 leaders while critical alone", false, 8, 512, false, true},
+      {"baseline (phase order, chunk 512, lead 16 MB)", false, 0, 512, false, true, kCap},
+      {"no lead", false, 0, 512, false, true, 0},
+      {"one leader while critical", false, 1, 512, false, true, kCap},
+      {"baseline without the lead's yield on gates", false, 0, 512, false, false, kCap},
+      {"gated classes first", true, 0, 512, false, true, kCap},
+      {"gated first, one leader while critical", true, 1, 512, false, true, kCap},
+      {"8 leaders while critical alone", false, 8, 512, false, true, kCap},
   };
   for (const Variant& v : variants) {
     Streamer s(rig->dp, rig->bases, rig->plans);
@@ -711,6 +713,7 @@ DGPP_TEST(step_consumers_lever_matrix) {
     cfg.acc_chunk = v.chunk;
     cfg.router_pipeline = v.pipeline;
     cfg.lead_yield_on_gate = v.yield;
+    cfg.lead_cap_bytes = v.lead_cap;
     (void)s.run(cfg);  // warm-up
     for (int sample = 0; sample < 2; ++sample) {
       const StreamReport r = s.run(cfg);
@@ -733,6 +736,41 @@ DGPP_TEST(step_consumers_lever_matrix) {
       }
       std::printf("   %-56s sample %d: median %.1f %%, attn_out group: site %+.0f..%+.0f, router %+.0f..%+.0f, end %+.0f, experts at %+.0f us\n",
                   v.name, sample + 1, pct[pct.size() / 2], site_a, site_b, router_a, router_b, group_end, next_begin);
+    }
+  }
+}
+
+// The router's class alone in the kernel: the router pool real and every other pool bytes, so its
+// phase is a lone group of 24 units with no site before it and no stream beside it. Its window
+// against the standalone probe (13 us a wave with the rows in L2) says whether the kernel's
+// environment or the merged group's slows the unit (2026-11-01).
+DGPP_TEST(step_router_class_alone) {
+  auto rig = make_rig_mask(kLayers, kConsumeRouter, /*tile_major=*/true);
+  Streamer s(rig->dp, rig->bases, rig->plans);
+  StreamerConfig cfg = design_config();
+  cfg.steps = 3;
+  cfg.rows = 5;
+  cfg.top_k = 6;
+  (void)s.run(cfg);
+  for (int sample = 0; sample < 2; ++sample) {
+    const StreamReport r = s.run(cfg);
+    require(r.status == kStepOk, std::string("the kernel ended on ") + r.status_text);
+    for (const PhaseTiming& t : r.phases) {
+      if (t.layer != 3 || t.name != "router") continue;
+      for (const ClassTiming& c : t.classes)
+        std::printf("   router class alone, sample %d: units %u, first hand-out %+.1f, last hand-out %+.1f, last completion %+.1f us from the phase's publish (phase %.1f us)\n",
+                    sample + 1, c.units, c.first_us - t.begin_us, c.last_grab_us - t.begin_us, c.last_us - t.begin_us, t.end_us - t.begin_us);
+    }
+    // One worker's last router unit, stage by stage (the last layer's router: the same unit shape).
+    std::vector<unsigned long long> tr(static_cast<size_t>(kStepMaxWorkers) * 8);
+    DGPP_CUDA_OK(cudaMemcpy(tr.data(), s.unit_trace(), tr.size() * 8, cudaMemcpyDeviceToHost));
+    int shown = 0;
+    for (int w = 1; w < kStepMaxWorkers && shown < 3; ++w) {
+      const unsigned long long* u = tr.data() + static_cast<size_t>(w) * 8;
+      if (!u[0] || !u[7]) continue;
+      std::printf("      worker %2d unit: activations staged %+.1f, batches done %+.1f %+.1f %+.1f %+.1f, scan done %+.1f us\n", w, (u[1] - u[0]) / 1e3, (u[2] - u[0]) / 1e3,
+                  (u[3] - u[0]) / 1e3, (u[4] - u[0]) / 1e3, (u[5] - u[0]) / 1e3, (u[7] - u[0]) / 1e3);
+      ++shown;
     }
   }
 }

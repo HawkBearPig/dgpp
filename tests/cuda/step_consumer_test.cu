@@ -1178,11 +1178,13 @@ DGPP_TEST(mhc_unit_rate) {
 // the forms the unit can take: row vectors loaded one, five or ten ahead,
 // the token count specialized or eight always.
 namespace {
+__device__ unsigned long long g_probe_trace[64 * kRouterTraceWords];
 template <int kBatch, bool kSpecialize, bool kPipeline = false, bool kCandidates = false>
 __global__ void router_unit_rate_kernel(const uint8_t* w_base, DevPool pool, Mxfp4Group g, const uint16_t* x, float* scores, float* biased, int n_experts,
                                         int32_t* cand_id = nullptr, float* cand_score = nullptr, float* cand_biased = nullptr) {
   extern __shared__ __align__(128) uint8_t smem[];
-  if (kCandidates) router_unit<5120, kBatch, kSpecialize, kPipeline>(w_base, pool, blockIdx.x, g, x, scores, biased, n_experts, 2, smem, 6, cand_id, cand_score, cand_biased);
+  if (kCandidates) router_unit<5120, kBatch, kSpecialize, kPipeline>(w_base, pool, blockIdx.x, g, x, scores, biased, n_experts, 2, smem, 6, cand_id, cand_score, cand_biased,
+                                                                   g_probe_trace + blockIdx.x * kRouterTraceWords);
   else router_unit<5120, kBatch, kSpecialize, kPipeline>(w_base, pool, blockIdx.x, g, x, scores, biased, n_experts, 2, smem);
 }
 }  // namespace
@@ -1261,6 +1263,16 @@ DGPP_TEST(router_unit_rate) {
   run(router_unit_rate_kernel<10, false>, "ten ahead, eight tokens always", false);
   run(router_unit_rate_kernel<5, true>, "five ahead, specialized", false);
   run(router_unit_rate_kernel<5, true, false, true>, "five ahead, specialized, with the candidate scan (the kernel's)", false);
+  {
+    unsigned long long tr[64 * kRouterTraceWords];
+    DGPP_CUDA_OK(cudaMemcpyFromSymbol(tr, g_probe_trace, sizeof(tr)));
+    for (int b = 0; b < 2; ++b) {
+      const unsigned long long* u = tr + b * kRouterTraceWords;
+      if (u[0] && u[7])
+        std::printf("      probe block %d unit: activations staged %+.1f, batches done %+.1f %+.1f %+.1f %+.1f, scan done %+.1f us\n", b, (u[1] - u[0]) / 1e3, (u[2] - u[0]) / 1e3,
+                    (u[3] - u[0]) / 1e3, (u[4] - u[0]) / 1e3, (u[5] - u[0]) / 1e3, (u[7] - u[0]) / 1e3);
+    }
+  }
   run(router_unit_rate_kernel<5, true, true>, "five ahead, specialized, pipelined (the kernel's)", false);
   run(router_unit_rate_kernel<10, true, true>, "ten ahead, specialized, pipelined", false);
   run(router_unit_rate_kernel<1, true>, "one at a time, specialized", false);

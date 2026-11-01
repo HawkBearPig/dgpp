@@ -30,6 +30,9 @@ struct Mxfp4Expert {
 
 // A group: the slots of one expert in the step, `count` of them (at most
 // kMxfp4GroupRows), slot i's token row in `token`.
+// Passed to the consumers by value (24 bytes, six registers): passed by reference it lived in
+// local memory, and every unit's staging loop re-read its count and pointers from there a piece
+// (the SASS with line info showed 496 and 320 local loads at two such lines, 2026-11-01).
 struct Mxfp4Group {
   const int32_t* slots = nullptr;  // the slot ids, for the act and out rows
   const int32_t* tokens = nullptr; // slot i's token row of x
@@ -51,7 +54,7 @@ struct GroupTokens8 {
     return r;
   }
 };
-__device__ __forceinline__ GroupTokens8 group_tokens8(const Mxfp4Group& g, int first = 0) {
+__device__ __forceinline__ GroupTokens8 group_tokens8(Mxfp4Group g, int first = 0) {
   GroupTokens8 ids;
   const int fallback = g.tokens[first < g.count ? first : 0];  // rows past the group stage a valid row again
 #pragma unroll
@@ -94,7 +97,7 @@ __device__ __forceinline__ uint16_t swiglu_bf16(float gate, float up) {
 // Stages window `w` of the group's token rows: codes [w * 256, +256) of x
 // (bf16 [tokens, kH]) into buffer `buf`, one cp.async group.
 template <int kH>
-__device__ __forceinline__ void mxfp4_fill_window(const uint16_t* __restrict__ x, const Mxfp4Group& g, int w, int buf, uint8_t* smem) {
+__device__ __forceinline__ void mxfp4_fill_window(const uint16_t* __restrict__ x, Mxfp4Group g, int w, int buf, uint8_t* smem) {
   uint8_t* dst = smem + buf * kMxfp4WindowBytes;
   const int rows_staged = ((g.count + 7) / 8) * 8;  // the tiles the group's slots fill
   const int chunks16 = rows_staged * (kMxfp4WindowCodes / 8);
@@ -111,7 +114,7 @@ __device__ __forceinline__ void mxfp4_fill_window(const uint16_t* __restrict__ x
 // `g`: writes act[slot][row] (bf16 [slots, kI]) for the block's rows.
 // kTG: the group's m16n8 tiles of eight slots (1 to 4).
 template <int kH, int kI, int kTG>
-__device__ void mxfp4_gate_up_unit(const Mxfp4Expert& e, const Mxfp4Group& g, int rb, const uint16_t* __restrict__ x,
+__device__ void mxfp4_gate_up_unit(const Mxfp4Expert& e, Mxfp4Group g, int rb, const uint16_t* __restrict__ x,
                                    uint16_t* __restrict__ act, uint8_t* smem) {
   static_assert(kH % kMxfp4WindowCodes == 0 && kI % kTileRows == 0, "the pair's shape");
   constexpr int kD = 4;                        // 512-byte loads in flight a matrix
@@ -204,7 +207,7 @@ __device__ void mxfp4_gate_up_unit(const Mxfp4Expert& e, const Mxfp4Group& g, in
 
 // Stages the group's act rows [count][kI] into shared memory at a padded stride.
 template <int kI>
-__device__ __forceinline__ void mxfp4_stage_down_act(const uint16_t* __restrict__ act, const Mxfp4Group& g, uint8_t* smem) {
+__device__ __forceinline__ void mxfp4_stage_down_act(const uint16_t* __restrict__ act, Mxfp4Group g, uint8_t* smem) {
   uint16_t* sx = reinterpret_cast<uint16_t*>(smem);
   constexpr int stride = kI + 8;
   for (int q = threadIdx.x; q < kMxfp4GroupRows * (kI / 8); q += kMxfp4Threads) {
@@ -218,7 +221,7 @@ __device__ __forceinline__ void mxfp4_stage_down_act(const uint16_t* __restrict_
 // the group's act rows staged in `smem` (mxfp4_stage_down_act): writes the
 // fp32 partial out[out_index(slot, row)] for the block's rows.
 template <int kH, int kI, int kTG, class OutIndex>
-__device__ void mxfp4_down_unit(const Mxfp4Expert& e, const Mxfp4Group& g, int rb, const uint8_t* smem, float* __restrict__ out,
+__device__ void mxfp4_down_unit(const Mxfp4Expert& e, Mxfp4Group g, int rb, const uint8_t* smem, float* __restrict__ out,
                                 OutIndex out_index) {
   static_assert(kI % 64 == 0 && kH % kMxfp4UnitRows == 0, "the down shape");
   constexpr int kRuns = kI / 64;
@@ -279,7 +282,7 @@ __device__ void mxfp4_down_unit(const Mxfp4Expert& e, const Mxfp4Group& g, int r
 
 // The dispatch on the group's size: tiles of eight slots.
 template <int kH, int kI>
-__device__ __forceinline__ void mxfp4_gate_up(const Mxfp4Expert& e, const Mxfp4Group& g, int rb, const uint16_t* x, uint16_t* act,
+__device__ __forceinline__ void mxfp4_gate_up(const Mxfp4Expert& e, Mxfp4Group g, int rb, const uint16_t* x, uint16_t* act,
                                               uint8_t* smem) {
   switch ((g.count + 7) / 8) {
     case 1: mxfp4_gate_up_unit<kH, kI, 1>(e, g, rb, x, act, smem); break;
@@ -289,7 +292,7 @@ __device__ __forceinline__ void mxfp4_gate_up(const Mxfp4Expert& e, const Mxfp4G
   }
 }
 template <int kH, int kI, class OutIndex>
-__device__ __forceinline__ void mxfp4_down(const Mxfp4Expert& e, const Mxfp4Group& g, int rb, const uint8_t* smem, float* out,
+__device__ __forceinline__ void mxfp4_down(const Mxfp4Expert& e, Mxfp4Group g, int rb, const uint8_t* smem, float* out,
                                            OutIndex out_index) {
   switch ((g.count + 7) / 8) {
     case 1: mxfp4_down_unit<kH, kI, 1>(e, g, rb, smem, out, out_index); break;

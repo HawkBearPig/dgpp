@@ -2468,10 +2468,17 @@ area, untracked.
       gate and run 30 µs where they take 13 standalone, the MoE site's
       out within 5 and run 20, the attention site's out over 10 µs (the
       workers arriving from lead units) and run 17. The units under the
-      stream are the target: the staged form for the router's rows and
-      the site's coefficient rows (cp.async in stages, as the fp8
-      projection unit), and the lossless bf12 companion for the router's
-      bf16 rows.
+      stream are the target. Taken down to the unit's stages the same
+      night (a staging class per merged phase at the fold's trigger, the
+      group struct by value, the SM clock checked, the SASS read with
+      line info, the unit stamped): the router's four row batches take
+      1.3 µs each standalone and 2.5 to 3.0 inside the kernel alone with
+      the lead, its epilogue and candidate scan 4.2 and 7, with no local
+      memory in its loop and its rows hot; so the cost is the L2's latency
+      under the lead's fills and the epilogue, and the levers are a lead
+      paused for the router's twenty microseconds, bf12 rows and a lighter
+      epilogue. The expert and projection units lost their local-memory
+      re-reads of the group struct on the way (stack 80 to 48).
       Owed here: the attention consumer, the folds and the select as
       consumers, and the chain's critical path after the attention-output
       fold, about 70 µs against the budget's 34: the MoE site's class 24

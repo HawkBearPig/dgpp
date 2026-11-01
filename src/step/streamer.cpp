@@ -99,6 +99,8 @@ Streamer::Streamer(const DevicePlan& dp, const std::vector<const uint8_t*>& base
       DGPP_CUDA_OK(cudaMalloc(&biased_, static_cast<size_t>(kStepMaxRows) * n_experts_ * 4));
       DGPP_CUDA_OK(cudaMemset(scores_, 0, static_cast<size_t>(kStepMaxRows) * n_experts_ * 4));
       DGPP_CUDA_OK(cudaMemset(biased_, 0, static_cast<size_t>(kStepMaxRows) * n_experts_ * 4));
+      DGPP_CUDA_OK(cudaMalloc(&unit_trace_, static_cast<size_t>(kStepMaxWorkers) * 8 * 8));
+      DGPP_CUDA_OK(cudaMemset(unit_trace_, 0, static_cast<size_t>(kStepMaxWorkers) * 8 * 8));
       DGPP_CUDA_OK(cudaMalloc(&cand_id_, static_cast<size_t>(kStepMaxRows) * n_experts_ * 4));
       DGPP_CUDA_OK(cudaMalloc(&cand_score_, static_cast<size_t>(kStepMaxRows) * n_experts_ * 4));
       DGPP_CUDA_OK(cudaMalloc(&cand_biased_, static_cast<size_t>(kStepMaxRows) * n_experts_ * 4));
@@ -149,6 +151,7 @@ Streamer::~Streamer() {
   cudaFreeHost(host_seq_);
   if (scores_) cudaFree(scores_);
   if (biased_) cudaFree(biased_);
+  if (unit_trace_) cudaFree(unit_trace_);
   if (cand_id_) cudaFree(cand_id_);
   if (cand_score_) cudaFree(cand_score_);
   if (cand_biased_) cudaFree(cand_biased_);
@@ -208,6 +211,7 @@ StreamReport Streamer::run(const StreamerConfig& cfg) {
   p.route_pool = cfg.route_pool;
   p.scores = scores_;
   p.biased = biased_;
+  p.unit_trace = unit_trace_;
   p.cand_id = cand_id_;
   p.cand_score = cand_score_;
   p.cand_biased = cand_biased_;
@@ -412,6 +416,10 @@ StreamReport Streamer::run(const StreamerConfig& cfg) {
             const DevPhase& iph = dp_.phases[static_cast<size_t>(ip)];
             const int il = iph.layer;
             const bool want_gated = passes == 2 && pass == 0, want_ungated = passes == 1 || pass == 1;
+            if (ip > P && iph.lead_units > iph.fixed_units) {  // the staging class, gated when the group has a fold trigger
+              const bool gated = ph.fold_trigger != kTriggerEnd;
+              if (passes == 1 || gated == want_gated) add(ip, 4, -1, iph.lead_units - iph.fixed_units);
+            }
             if (iph.accumulate) {
               if (want_ungated) add(ip, 3, -1, (rows * static_cast<unsigned>(hidden_) + acc_chunk_ - 1) / acc_chunk_);
               continue;

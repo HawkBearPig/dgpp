@@ -149,6 +149,7 @@ struct StepStreamParams {
   int32_t* cand_id = nullptr;
   float* cand_score = nullptr;
   float* cand_biased = nullptr;
+  unsigned long long* unit_trace = nullptr;  // [kStepMaxWorkers][8]: a router unit's stage stamps, the last unit a worker ran (null: off)
   int router_mode = 2;
   float routed_scaling = 1.f;
   int norm_topk = 1;
