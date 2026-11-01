@@ -60,6 +60,7 @@ struct alignas(128) StepVerdict {
   uint64_t begin_ns = 0;       // the kernel's globaltimer at the step's start and end
   uint64_t end_ns = 0;
   uint64_t published_ns = 0;   // when the kernel saw the descriptor's execute
+  int32_t tokens[32];          // the step's output tokens, a row each: the picks, or the synthetic feed's (tokens_fold folds them)
 };
 
 constexpr int kStepRingSlots = 2;

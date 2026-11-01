@@ -793,6 +793,73 @@ the 15 to 20 µs a short group costs is the chain's bookkeeping around a
 group (the publish, the cursor's atomics, the lead accounting, the stamps),
 each a dependent access under the stream, not the table.
 
+## The token path
+
+The step begins and ends where the decode walk does (2026-11-01). The plan's
+globals become two pseudo-layers of the device plan (`plan.hpp
+split_globals`): the embedding's phase first, before the main layers, and
+the head's phase after them, both on the globals' arena span; a device-plan
+layer carries the family's layer index (`DevLayer::model_layer`, -1 for the
+pseudo-layers) and the attention's state and rotary tables are indexed by
+it. Four pools come from their ranges (`kConsumeHead`, outside `kConsumeAll`
+since the rigs without the globals index the plan's layers as the family's).
+The embedding (`kPoolEmbed`): a unit copies one row's token onto its four
+streams, `glm_embed_bcast_kernel`'s copy; the chain publishes the step's
+tokens in the control block before the first phase, and a token outside a
+sharded table's slice leaves zeros for a fold to complete. The head's input
+(`kPoolRowTail` with `in_src` 3): the streams collapsed under the last site's
+pre (`mhc_collapse_slice`, the production collapse's values and rounding)
+then the final norm in place (`csa2_norm::rmsnorm_row`), the walk's
+`launch_mhc_collapse_normed` without its norm followed by
+`csa2_rmsnorm_bf16`. The lm head (`kPoolHead`): the production tensor-core
+bf12 form's block body, moved from `kernels/mma_gemv.cu` into
+`kernels/mma_gemv_body.cuh` so the production kernels and the step call one
+body, at the step block's eight warps over the 12-bit companion the model
+packs at boot (`StepHeadParams`, outside the arena), 64 vocab rows a unit,
+four a grab, the logits fp32 [rows][n]; the two-tile form at every row count
+(the forms are bitwise each other's). The pick (`kPoolPick`): one row's top-2
+under the canonical order, `pick_local_kernel`'s scan moved into
+`kernels/pick_body.cuh`, the winner into the next step's device feed and the
+verdict, which carries the step's tokens (`StepVerdict::tokens`). The test
+(`step_token_path_matches_the_production_kernels`) runs two steps on the
+globals alone and with the first eight layers and the attention, and checks
+every stage against the production launch on the step's own upstream output,
+bitwise: the embedding of the second step's tokens (the first step's picks),
+the head's input, the logits (`launch_mma_gemv_bf12_f32`), the picks
+(`device_pick_local`), and a fresh streamer's repeat.
+
+The second step found a defect the one-step tests could not: the per-pool
+counters (`pool_done`, `reduce_done`) are indexed by the pool table, which
+outruns the phase count, and the per-step reset covered the phase count
+only, so a pool past it kept the previous step's count and its gated classes
+opened at once from the second step on. In the eight-layer rig that was the
+last layer's pools; every rate figure read from the third step until then
+had the last layer's reduce, fold and chain gates open early. The reset now
+covers the pool table (`StepStreamParams::n_pools`), and the chain,
+attention and token-path tests run two steps.
+
+The cost, measured in one window with the committed kernel rebuilt with the
+reset fix alone beside it, interleaved: the head streams its 248 MB at 60
+to 73 percent of the ceiling (1.4 to 1.7 ms, a unit about 2 µs of bytes
+against a hand-out of about as long: four units a grab); the embedding's
+group costs about 45 µs of the chain's bookkeeping for five rows of 10 KB.
+And the head body's presence in the kernel costs the expert stream about
+three points whether or not a head unit runs: the unwired canary (no head
+in its plan) read 75.5 to 76.1 against 78.2 to 79.5, the rate case
+tile-major 72.2 to 73.0 and row-major 65.2 to 67.4 against 73.4 to 76.0 and
+70.1 to 71.1 before. Neither code size nor the stack frame reproduces it:
+the same kernel with the head body replaced by a stub read 78.1 to 79.0, and
+with a never-run body of 21 thousand instructions added, or a never-run
+local array that grew the frame to 1136 bytes, 77.6 to 78.7. One
+instantiation of the body (the two-tile form) instead of two took the gap
+from 4.5 points to 3.3, and its own call site rather than the latency
+units' another 0.6. The profiler cannot see it yet: `ncu` holds the launch
+until the kernel ends and the chain's wait for the host's descriptor
+deadlines, so a profile needs a run whose descriptors are published before
+the launch. That is the first lever of the next round, with the gates
+meanwhile at the measured level less the noise (tile 70, row 65, the canary
+74).
+
 ## The fold
 
 The fold is the TP all-reduce at each layer's two boundaries. The bus

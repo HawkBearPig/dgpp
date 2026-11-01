@@ -81,6 +81,29 @@ double consumer_step_bytes(const StepPlan& plan, Consumer consumer) {
   return b;
 }
 
+void split_globals(const LayerPlan& globals, LayerPlan* embed, LayerPlan* head) {
+  *embed = LayerPlan{};
+  *head = LayerPlan{};
+  embed->layer = head->layer = globals.layer;
+  embed->span_bytes = head->span_bytes = globals.span_bytes;
+  std::vector<int> is_embed(globals.phases.size(), 0);
+  for (const Range& r : globals.ranges)
+    if (r.consumer == Consumer::Embedding && r.phase >= 0 && r.phase < static_cast<int>(globals.phases.size())) is_embed[static_cast<size_t>(r.phase)] = 1;
+  std::vector<int> renum(globals.phases.size(), -1);
+  for (size_t i = 0; i < globals.phases.size(); ++i) {
+    LayerPlan& to = is_embed[i] ? *embed : *head;
+    renum[i] = static_cast<int>(to.phases.size());
+    to.phases.push_back(globals.phases[i]);
+  }
+  for (const Range& r : globals.ranges) {
+    if (r.phase < 0 || r.phase >= static_cast<int>(globals.phases.size())) continue;
+    LayerPlan& to = is_embed[static_cast<size_t>(r.phase)] ? *embed : *head;
+    Range c = r;
+    c.phase = renum[static_cast<size_t>(r.phase)];
+    to.ranges.push_back(std::move(c));
+  }
+}
+
 std::vector<std::string> plan_check(const LayerPlan& lp) {
   std::vector<std::string> problems;
   const std::string where = lp.layer < 0 ? std::string("globals") : "layer " + std::to_string(lp.layer);

@@ -138,6 +138,13 @@ struct StepPlan {
   LayerPlan globals;              // embeddings, the final norm, the head
 };
 
+// The globals as the step's two pseudo-layers (the embedding first, the
+// head after the main layers): the phase that gathers the embedding and
+// its ranges into `embed`, the rest into `head`, each keeping the globals'
+// span (the same arena base serves both). A phase's ranges renumber to its
+// own phase index.
+void split_globals(const LayerPlan& globals, LayerPlan* embed, LayerPlan* head);
+
 // The bytes a step reads, by dependency class. Router-bound bytes are the
 // expectation at the plan's shape, so the totals are real-valued.
 struct ByteTotals {

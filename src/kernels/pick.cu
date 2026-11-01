@@ -1,5 +1,6 @@
 #include "kernels/pick.hpp"
 #include "kernels/pdl.cuh"
+#include "kernels/pick_body.cuh"
 
 #include <cmath>
 #include <limits>
@@ -13,70 +14,7 @@ namespace dgpp {
 namespace {
 
 constexpr int kLocalThreads = 1024;
-constexpr int kWarp = 32;
-constexpr int32_t kNoId = 0x7fffffff;  // sorts after every real id
-
-struct Pair {
-  float v;
-  int32_t id;
-};
-
-// sample::candidate_before, on the device.
-__host__ __device__ inline bool before(Pair a, Pair b) {
-  if (a.v != b.v) return a.v > b.v;
-  return a.id < b.id;
-}
-
-struct Top2 {
-  Pair a;  // the row's argmax
-  Pair b;  // the runner-up
-};
-
-__host__ __device__ inline Top2 empty_top2() {
-  const Pair none{-INFINITY, kNoId};
-  return Top2{none, none};
-}
-
-__host__ __device__ inline void push(Top2& t, Pair p) {
-  if (before(p, t.a)) {
-    t.b = t.a;
-    t.a = p;
-  } else if (before(p, t.b)) {
-    t.b = p;
-  }
-}
-
-__device__ inline Top2 merge(Top2 x, const Top2& y) {
-  push(x, y.a);
-  push(x, y.b);
-  return x;
-}
-
-// xor butterfly, not shfl_down: every lane pairs with a DISTINCT lane at
-// every step, so no Top2 is ever merged with itself (a self-merge would
-// duplicate the argmax into the runner-up slot, and ids are unique across
-// lanes only as long as no lane's pair is its own copy).
-__device__ inline Top2 shfl_xor(const Top2& t, int mask) {
-  Top2 r;
-  r.a.v = __shfl_xor_sync(0xffffffffu, t.a.v, mask);
-  r.a.id = __shfl_xor_sync(0xffffffffu, t.a.id, mask);
-  r.b.v = __shfl_xor_sync(0xffffffffu, t.b.v, mask);
-  r.b.id = __shfl_xor_sync(0xffffffffu, t.b.id, mask);
-  return r;
-}
-
-__device__ inline void encode_digits(uint16_t* slots, uint64_t value,
-                                     int digits) {
-  for (int d = 0; d < digits; ++d)
-    slots[d] = static_cast<uint16_t>((value >> (6 * d)) & 63);
-}
-
-__device__ inline uint64_t decode_digits(const uint16_t* slots, int digits) {
-  uint64_t value = 0;
-  for (int d = 0; d < digits; ++d)
-    value |= static_cast<uint64_t>(slots[d] & 63) << (6 * d);
-  return value;
-}
+using namespace ::dgpp::pick_body;  // the row scan and the digit coding: kernels/pick_body.cuh (the step kernel runs the same)
 
 // One block per row: a strided scan keeps each thread's top-2, warp
 // shuffles and one shared pass merge them. The canonical order is a total
@@ -106,20 +44,9 @@ __global__ __launch_bounds__(kLocalThreads) void pick_local_kernel(
     if (tid < tail) table[rows * group_slots + tid] = 0;
   }
 
-  Top2 mine = empty_top2();
-  const float* slice = logits + static_cast<size_t>(logits_row) * vocab_count;
-  for (int i = tid; i < vocab_count; i += kLocalThreads)
-    push(mine, Pair{slice[i], vocab_begin + i});
-
-  for (int mask = kWarp / 2; mask > 0; mask >>= 1)
-    mine = merge(mine, shfl_xor(mine, mask));
-
   __shared__ Top2 warps[kLocalThreads / kWarp];
-  if ((tid & (kWarp - 1)) == 0) warps[tid / kWarp] = mine;
-  __syncthreads();
+  const Top2 best = row_top2<kLocalThreads>(logits + static_cast<size_t>(logits_row) * vocab_count, vocab_count, vocab_begin, warps);
   if (tid != 0) return;
-  Top2 best = warps[0];
-  for (int w = 1; w < kLocalThreads / kWarp; ++w) best = merge(best, warps[w]);
 
   locals[row].best_id = best.a.id;
   locals[row].best_logit = best.a.v;

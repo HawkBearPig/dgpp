@@ -8,6 +8,8 @@
 #include "kernels/dsa.hpp"
 #include "kernels/dsa_attn_flash.cuh"
 #include "kernels/dsa_latent_append.cuh"
+#include "kernels/mma_gemv_body.cuh"
+#include "kernels/pick_body.cuh"
 #include "net/bus_write.cuh"
 #include "kernels/step/mxfp4_expert.cuh"
 #include "kernels/step/mxfp4_row.cuh"
@@ -103,7 +105,7 @@ __device__ __forceinline__ unsigned attn_blocks(const StepStreamParams& p) {
 __device__ __forceinline__ unsigned compute_units_per_group(const StepStreamParams& p, const DevPool& pool) {
   if (projection_split(p, pool)) return (static_cast<unsigned>(pool.rows) + kSplitUnitRows - 1) / kSplitUnitRows;
   if (pool.kind == kPoolMhc) return static_cast<unsigned>(pool.units_per_group) * p.ctl->rows;  // a token's units for every token
-  if (pool.kind == kPoolRowTail) return p.ctl->rows;  // a row a unit
+  if (pool.kind == kPoolRowTail || pool.kind == kPoolEmbed || pool.kind == kPoolPick) return p.ctl->rows;  // a row a unit
   if (pool.kind == kPoolAttention) return static_cast<unsigned>(pool.rows) * attn_blocks(p);  // a split of every (row, head) block
   return static_cast<unsigned>(pool.units_per_group);
 }
@@ -621,13 +623,14 @@ __device__ __forceinline__ void attention_unit(const StepStreamParams& p, int la
   const int32_t* list = nullptr;
   const int32_t* counts = nullptr;
   int block_tokens = 0, bpr = 0, total = 0, stride = 0;
+  const int ml = p.layers[layer].model_layer;  // the state and rotary tables are the family's layers'
   if (src == 0) {
-    latent = a.ring + static_cast<unsigned long long>(layer) * a.ring_layer_bytes;
+    latent = a.ring + static_cast<unsigned long long>(ml) * a.ring_layer_bytes;
     block_tokens = a.ring_slots; tables = a.ring_table; bpr = 1; total = a.max_requests;
     list = a.wlist; stride = a.window; counts = a.wcounts;
   } else {
-    latent = a.main ? a.main[layer] : nullptr;
-    block_tokens = a.epb ? a.epb[layer] : 0; tables = a.block_tables; bpr = a.blocks_per_request; total = a.blocks_total;
+    latent = a.main ? a.main[ml] : nullptr;
+    block_tokens = a.epb ? a.epb[ml] : 0; tables = a.block_tables; bpr = a.blocks_per_request; total = a.blocks_total;
     list = a.topk; stride = a.index_topk; counts = a.counts;
   }
   if (latent == nullptr || q == nullptr || list == nullptr || counts == nullptr || block_tokens <= 0) {
@@ -775,7 +778,7 @@ __device__ __noinline__ void attention_finish_unit(const StepStreamParams& p, in
   }
   csa2_finish::FinishSmem& sm = *reinterpret_cast<csa2_finish::FinishSmem*>(smem);
   const float* sink = reinterpret_cast<const float*>(p.bases[layer] + pool.offsets[0]);
-  const float* inv_freq = a.inv_freq ? a.inv_freq[layer] : nullptr;
+  const float* inv_freq = a.inv_freq ? a.inv_freq[p.layers[layer].model_layer] : nullptr;
   if (a.o == nullptr || inv_freq == nullptr || a.pos == nullptr) {
     if (threadIdx.x == 0) atomicCAS(&p.ctl->status, kStepOk, kStepBadUnit);
     return;
@@ -931,12 +934,27 @@ __device__ void route_select(const StepStreamParams& p, int layer, int* keys, ui
 // result goes to this pool's own y (the production writes in place; here each stage's output
 // stays for the checks, and the pools behind read this pool's y).
 __device__ __forceinline__ void row_tail_unit(const StepStreamParams& p, int layer, const DevPool& pool, const uint8_t* base, int row, uint8_t* smem) {
+  uint16_t* out = p.proj + pool.out_offset + static_cast<size_t>(row) * pool.rows;
+  if (pool.in_src == 3) {
+    // The head's input: the streams collapsed under the last site's pre (mhc_collapse_slice, the
+    // production collapse's values and rounding) into this pool's y, then the final norm in place:
+    // the walk's launch_mhc_collapse_normed without its norm followed by csa2_rmsnorm_bf16.
+    const int H = pool.k;
+    if (p.streams[0] == nullptr || p.pre[0] == nullptr || H != pool.rows) {
+      if (threadIdx.x == 0) atomicCAS(&p.ctl->status, kStepOk, kStepBadUnit);
+      return;
+    }
+    mhc_collapse_slice(p.streams[0] + static_cast<size_t>(row) * kMhcN * H, p.pre[0] + row * kMhcN, H, 0, H / 8, out);
+    __syncthreads();  // the collapsed row is written before its norm
+    csa2_norm::rmsnorm_row(out, reinterpret_cast<const uint16_t*>(base + pool.offsets[0]), out, H, p.norm_eps, reinterpret_cast<float*>(smem));
+    return;
+  }
   const DevPool& sp = p.pools[pool.in_pool];
   const uint16_t* in = p.proj + sp.out_offset + static_cast<size_t>(row) * sp.rows;
-  uint16_t* out = p.proj + pool.out_offset + static_cast<size_t>(row) * pool.rows;
   const StepAttnParams& a = p.attn;
+  const int ml = p.layers[layer].model_layer;
   const bool rope = pool.rope_heads > 0;
-  if (((rope || pool.append) && a.pos == nullptr) || (rope && (a.inv_freq == nullptr || a.inv_freq[layer] == nullptr)) ||
+  if (((rope || pool.append) && a.pos == nullptr) || (rope && (a.inv_freq == nullptr || a.inv_freq[ml] == nullptr)) ||
       (pool.append && (a.ring == nullptr || a.slots == nullptr || a.wlist == nullptr || a.wcounts == nullptr || a.ring_table == nullptr ||
                        a.req_ids == nullptr || a.ring_slots <= 0 || a.window <= 0))) {
     if (threadIdx.x == 0) atomicCAS(&p.ctl->status, kStepOk, kStepBadUnit);
@@ -959,13 +977,13 @@ __device__ __forceinline__ void row_tail_unit(const StepStreamParams& p, int lay
     for (int i = threadIdx.x; i < pool.rows; i += kStepThreads) out[i] = in[i];
   if (rope) {
     __syncthreads();  // the row is written before its rotation
-    csa2_norm::rope_row(out, out, pool.rope_heads, pool.rope_head_stride, pool.rope_off, kAttnRope / 2, a.pos[row], a.inv_freq[layer]);
+    csa2_norm::rope_row(out, out, pool.rope_heads, pool.rope_head_stride, pool.rope_off, kAttnRope / 2, a.pos[row], a.inv_freq[ml]);
   }
   if (pool.append) {
     dsa_tail::decode_tail_slots(row, a.pos[row], a.slots, a.ring_slots, a.window, a.wlist, a.wcounts, nullptr, 0);
     __syncthreads();  // the rotated row and its slot are written for the append
     dsa_tail::latent_append_fp8block_row(p.proj + pool.out_offset, a.req_ids, a.slots, a.ring_table, 1, a.ring_slots,
-                                         a.ring + static_cast<unsigned long long>(layer) * a.ring_layer_bytes, kAttnLatent,
+                                         a.ring + static_cast<unsigned long long>(ml) * a.ring_layer_bytes, kAttnLatent,
                                          latent_row_bytes(LatentFormat::kFp8Block, kAttnLatent), nullptr, 0, row);
   }
 }
@@ -975,14 +993,83 @@ __device__ __forceinline__ void row_tail_unit(const StepStreamParams& p, int lay
 // warp has written it). Out of line: the production pair math's cosf and sinf keep a local array
 // for their range reduction, which inlined grew the kernel's frame (160 to 192 bytes, 2026-11-01).
 __device__ __forceinline__ void projection_epilogue_rope(const StepStreamParams& p, int layer, const DevPool& pool, int rows, int block, bool split) {
-  if (p.attn.pos == nullptr || p.attn.inv_freq == nullptr || p.attn.inv_freq[layer] == nullptr) {
+  const int ml = p.layers[layer].model_layer;
+  if (p.attn.pos == nullptr || p.attn.inv_freq == nullptr || p.attn.inv_freq[ml] == nullptr) {
     if (threadIdx.x == 0) atomicCAS(&p.ctl->status, kStepOk, kStepBadUnit);
     return;
   }
   __syncthreads();
   const int unit_rows = split ? kSplitUnitRows : pool.unit_rows;
   const int n0 = block * unit_rows, n1 = min(n0 + unit_rows, pool.rows);
-  csa2_norm::rope_block(p.proj + pool.out_offset, pool.rows, rows, n0, n1, pool.rope_head_stride, pool.rope_off, kAttnRope / 2, p.attn.pos, p.attn.inv_freq[layer]);
+  csa2_norm::rope_block(p.proj + pool.out_offset, pool.rows, rows, n0, n1, pool.rope_head_stride, pool.rope_off, kAttnRope / 2, p.attn.pos, p.attn.inv_freq[ml]);
+}
+
+// The embedding (kPoolEmbed): row `row`'s token (the step's, less the table's first id) copied
+// onto its four streams, glm_embed_bcast_kernel's copy; a token outside this rank's slice leaves
+// zeros (a vocab-sharded table's rows are completed by a fold).
+__device__ __forceinline__ void embed_unit(const StepStreamParams& p, const DevPool& pool, const uint8_t* base, int row) {
+  const int H = pool.k;
+  if (p.streams[0] == nullptr) {
+    if (threadIdx.x == 0) atomicCAS(&p.ctl->status, kStepOk, kStepBadUnit);
+    return;
+  }
+  const int tok = p.ctl->tokens[row] - p.head.embed_vocab_begin;
+  const bool in = tok >= 0 && tok < pool.rows;
+  const uint16_t* src = reinterpret_cast<const uint16_t*>(base + pool.offsets[0]) + (in ? static_cast<size_t>(tok) * H : 0);
+  uint16_t* dst = p.streams[0] + static_cast<size_t>(row) * kMhcN * H;
+  for (int h = threadIdx.x; h < H; h += kStepThreads) {
+    const uint16_t v = in ? src[h] : static_cast<uint16_t>(0);
+    dst[h] = v;
+    dst[H + h] = v;
+    dst[2 * H + h] = v;
+    dst[3 * H + h] = v;
+  }
+}
+
+// The lm head (kPoolHead): unit rb's 64 vocab rows of the bf12 companion over the head's input
+// rows, the production tensor-core bf12 form's block body (kernels/mma_gemv_body.cuh) at the
+// step block's eight warps, the logits fp32 [rows][n]: a row's chain is the production launch's.
+// Out of line on its own call (2026-11-01): the body's presence in the kernel costs the expert
+// stream about three points whether it runs or not, and neither its code size nor the stack
+// frame it adds reproduces the effect alone (docs/step_engine.md, the token path); behind the
+// latency units' call it read another 0.6 lower.
+constexpr int kHeadWarps = kStepThreads / 32;
+static_assert(kHeadWarps * mma_gemv_body::kRowsPerWarp == 64, "a head unit is 64 vocab rows (device_plan.cpp kHeadUnitRows)");
+__device__ __noinline__ void head_unit(const StepStreamParams& p, const DevPool& pool, int rb, uint8_t* smem) {
+  const StepHeadParams& h = p.head;
+  const DevPool& sp = p.pools[pool.in_pool];
+  const int rows = static_cast<int>(p.ctl->rows);
+  if (h.packed == nullptr || h.rows == nullptr || h.esc == nullptr || h.raw == nullptr || p.logits_out == nullptr || h.n != pool.rows ||
+      h.k != pool.k || sp.rows != pool.k || rows > kMmaGemvMaxRows) {
+    if (threadIdx.x == 0) atomicCAS(&p.ctl->status, kStepOk, kStepBadUnit);
+    return;
+  }
+  const uint16_t* act = p.proj + sp.out_offset;  // the head's input rows at the row width k
+  // The two-tile form at every row count (the forms are bitwise each other's: a row's chain is a
+  // function of k and the window layout): one instantiation in the kernel, since the body's code
+  // beside the expert units' cost them points on 2026-11-01 (docs/step_engine.md, the token path).
+  mma_gemv_body::mma_gemv_block<2, false, kHeadWarps, float, float, true>(rb, 0, 1, smem, act, static_cast<size_t>(sp.rows), h.packed, nullptr, p.logits_out,
+                                                                          rows, h.n, h.k, static_cast<size_t>(h.n), 0, 0, nullptr, nullptr, 0.f, nullptr, nullptr,
+                                                                          nullptr, nullptr, 0, 0, 0, h.rows, h.esc, h.raw);
+}
+
+// The pick (kPoolPick): row `row`'s top-2 over this rank's logits under the canonical order
+// (kernels/pick_body.cuh, pick_local_kernel's scan), the winner into the next step's device feed
+// and the control block (the chain folds the picks into the verdict).
+__device__ __forceinline__ void pick_unit(const StepStreamParams& p, const DevPool& pool, int row, uint8_t* smem) {
+  const DevPool& hp = p.pools[pool.in_pool];
+  if (p.logits_out == nullptr || hp.rows <= 0) {
+    if (threadIdx.x == 0) atomicCAS(&p.ctl->status, kStepOk, kStepBadUnit);
+    return;
+  }
+  pick_body::Top2* warps = reinterpret_cast<pick_body::Top2*>(smem);
+  const pick_body::Top2 best = pick_body::row_top2<kStepThreads>(p.logits_out + static_cast<size_t>(row) * hp.rows, hp.rows, p.head.vocab_begin, warps);
+  if (threadIdx.x == 0) {
+    p.ctl->picks[row] = best.a.id;
+    p.ctl->pick_logit[row] = best.a.v;
+    p.ctl->pick_second[row] = best.b.v;
+    p.token_feed[(p.ctl->feed_slot ^ 1u) * kStepMaxRows + row] = best.a.id;
+  }
 }
 
 // The latency units and the q projections' epilogue behind one call: out of line, so their code
@@ -1003,6 +1090,14 @@ __device__ __noinline__ void out_of_line_unit(const StepStreamParams& p, int lay
   if (pool.kind == kPoolMhc) {
     mhc_unit(p, layer, pool, base, rb, smem,
              p.unit_trace ? p.unit_trace + (static_cast<size_t>(kStepMaxWorkers) + blockIdx.x % kStepMaxWorkers) * kMhcTraceWords : nullptr);
+    return;
+  }
+  if (pool.kind == kPoolEmbed) {
+    embed_unit(p, pool, base, rb);
+    return;
+  }
+  if (pool.kind == kPoolPick) {
+    pick_unit(p, pool, rb, smem);
     return;
   }
   row_tail_unit(p, layer, pool, base, rb, smem);
@@ -1027,7 +1122,11 @@ __device__ void consumer_unit(const StepStreamParams& p, int layer, const DevPoo
     grp.tokens = p.ctl->token_slots;
     grp.count = static_cast<int>(p.ctl->rows);
   }
-  if (pool.kind == kPoolAttention || pool.kind == kPoolRowTail || pool.kind == kPoolMhc) {
+  if (pool.kind == kPoolHead) {  // its own call site: behind the latency units' call it read 0.6 points lower (2026-11-01)
+    head_unit(p, pool, rb, smem);
+    return;
+  }
+  if (pool.kind == kPoolAttention || pool.kind == kPoolRowTail || pool.kind == kPoolMhc || pool.kind == kPoolEmbed || pool.kind == kPoolPick) {
     out_of_line_unit(p, layer, pool, base, rb, smem, false);
     return;
   }
@@ -1167,9 +1266,12 @@ __global__ void __launch_bounds__(kStepThreads, 1) step_stream_kernel(StepStream
           ctl->wait_ns[i] = 0;
           for (int c = 0; c < kStepMaxClasses; ++c) { ctl->cls_next[i][c] = 0; ctl->cls_first[i][c] = ~0ull; ctl->cls_last[i][c] = 0; ctl->cls_last_grab[i][c] = 0; }
         }
-        for (int i = static_cast<int>(threadIdx.x); i < kStepMaxLayers * n_phases; i += kStepThreads) {
-          ctl->pool_done[i / n_phases][i % n_phases] = 0;
-          ctl->reduce_done[i / n_phases][i % n_phases] = 0;
+        // The per-pool counters by (layer, pool index): the pool index is the pool table's, which
+        // outruns the phase count (reset over the phase count until 2026-11-01, a pool past it kept
+        // the previous step's count and its gated classes opened at once from the second step).
+        for (int i = static_cast<int>(threadIdx.x); i < p.n_layers * p.n_pools; i += kStepThreads) {
+          ctl->pool_done[i / p.n_pools][i % p.n_pools] = 0;
+          ctl->reduce_done[i / p.n_pools][i % p.n_pools] = 0;
         }
         for (int i = static_cast<int>(threadIdx.x); i < kStepMaxLayers; i += kStepThreads) {
           ctl->acc_done[i] = 0; ctl->site_done[i][0] = 0; ctl->site_done[i][1] = 0;
@@ -1202,11 +1304,18 @@ __global__ void __launch_bounds__(kStepThreads, 1) step_stream_kernel(StepStream
       const unsigned long long seq = d->seq;
       // The first hyper-connection site's pre is the one-hot, as the model's forward seeds it.
       if (p.pre[0] && threadIdx.x < static_cast<unsigned>(rows) * kMhcN) p.pre[0][threadIdx.x] = (threadIdx.x % kMhcN) == 0 ? 1.f : 0.f;
+      if (threadIdx.x == 0) ctl->feed_slot = static_cast<unsigned>(slot);
       if (threadIdx.x < static_cast<unsigned>(rows)) {
         const int32_t tok = d->tokens_from_host ? d->tokens[threadIdx.x] : p.token_feed[slot * kStepMaxRows + threadIdx.x];
-        const int32_t next = step_next_token(tok, seq, static_cast<int>(threadIdx.x));
-        p.token_feed[(slot ^ 1) * kStepMaxRows + threadIdx.x] = next;
-        sm_tokens[threadIdx.x] = next;
+        ctl->tokens[threadIdx.x] = tok;  // the embedding's
+        if (p.pick_pool < 0) {
+          // The synthetic token path (no head in the plan): the next step's tokens are a function of this step's.
+          const int32_t next = step_next_token(tok, seq, static_cast<int>(threadIdx.x));
+          p.token_feed[(slot ^ 1) * kStepMaxRows + threadIdx.x] = next;
+          sm_tokens[threadIdx.x] = next;
+        } else {
+          sm_tokens[threadIdx.x] = tok;
+        }
       }
       __syncthreads();
       const unsigned long long t_step = gtimer();
@@ -1369,8 +1478,13 @@ __global__ void __launch_bounds__(kStepThreads, 1) step_stream_kernel(StepStream
       // ---- the verdict
       if (t0) {
         volatile StepVerdict* v = p.verdict + slot;
+        // The step's output tokens: the pick units' winners (every unit of the last group is done), or the synthetic feed's.
         unsigned long long fold = 0x9e3779b97f4a7c15ull;
-        for (int r = 0; r < rows; ++r) fold = step_fold_mix(fold, static_cast<uint64_t>(static_cast<uint32_t>(sm_tokens[r])));
+        for (int r = 0; r < rows; ++r) {
+          const int32_t tok = p.pick_pool >= 0 ? ld_acq(reinterpret_cast<unsigned*>(&ctl->picks[r])) : static_cast<unsigned>(sm_tokens[r]);
+          v->tokens[r] = tok;
+          fold = step_fold_mix(fold, static_cast<uint64_t>(static_cast<uint32_t>(tok)));
+        }
         const unsigned st = ctl->status & 0xffu;
         v->status = sm_fail ? (st == kStepPoisoned ? kVerdictPoisoned : st == kStepBadUnit ? kVerdictBadUnit : kVerdictDeadline) | (ctl->status & ~0xffu)
                             : kVerdictOk;
@@ -1657,7 +1771,8 @@ __global__ void __launch_bounds__(kStepThreads, 1) step_stream_kernel(StepStream
         last_group = key;
         last_pool = pool_id;
         if (threadIdx.x == 0) sm_grab_bytes += upool->bytes / upg;
-        if (upool->kind == kPoolFp8Matrix || upool->kind == kPoolRouter || upool->kind == kPoolAttention || upool->kind == kPoolRowTail) {
+        if (upool->kind == kPoolFp8Matrix || upool->kind == kPoolRouter || upool->kind == kPoolAttention || upool->kind == kPoolRowTail ||
+            upool->kind == kPoolEmbed || upool->kind == kPoolHead || upool->kind == kPoolPick) {
           __syncthreads();  // the pool's compute units complete: its reduce units' gate, the chain's select, or the pools behind it (kGatePool)
           if (threadIdx.x == 0) {
             const unsigned before = atom_add_acq_rel(&ctl->pool_done[xlayer][pool_id], 1u);
@@ -1805,8 +1920,12 @@ bool step_stream_has_fp8_matrix(int k, int rows) {
 }
 unsigned step_stream_mxfp4_smem(int inter) { return step_stream_consumer_smem(inter, true); }
 bool step_stream_has_router(int k) { return k == 5120; }
-unsigned step_stream_consumer_smem(int inter, bool fp8, bool mhc, bool attention) {
+unsigned step_stream_consumer_smem(int inter, bool fp8, bool mhc, bool attention, bool head) {
   unsigned need = mhc ? kMhcUnitSmem + static_cast<unsigned>(kMhcFinishSmemFloats) * 4u : 0u;  // the hyper-connection unit's slice exchange and its finish's
+  if (head) {  // the head unit's activation windows (the mma body's two buffers at two tiles), the pick's warp slots
+    need = std::max(need, static_cast<unsigned>(mma_gemv_body::WarpLoads<2, false, kHeadWarps, true>::kSmemBytes));
+    need = std::max(need, static_cast<unsigned>(sizeof(pick_body::Top2) * (kStepThreads / 32)));
+  }
   if (attention) {  // the flash body's tile, exchange and scratch; the finish's block
     const size_t flash = dgpp::dsa_flash::attn_flash_smem_bytes<kAttnLatent, kAttnLatent, true, kAttnSplitGroup>();
     need = std::max(need, static_cast<unsigned>(std::max(flash, sizeof(csa2_finish::FinishSmem))) + 256u);

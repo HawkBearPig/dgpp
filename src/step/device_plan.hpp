@@ -35,6 +35,9 @@ enum DevPoolKind : uint8_t {
   kPoolMhc = 9,             // a hyper-connection site: the coefficient matrix bf16 [24, 4 hidden], its base and scale, the norm weight; a unit is kMhcUnitCoeffs logits of one token, the token's last unit the finish
   kPoolAttention = 10,      // the CSA2 attention over one latent source of the state pool (site 0 the window ring, 1 the main cache): a unit is one block of the production flash kernel (kernels/dsa_attn_flash.cuh), the phase's last such pool's reduce class the finish (kernels/csa2_attn_finish.cuh)
   kPoolRowTail = 11,        // a row's tail behind a projection (kernels/csa2_norm.cuh, dsa_latent_append.cuh): the norm with the pool's weight (k > 0), the rotation of rope_heads heads, the kv row's ring append; a unit is one row of the source pool's y, written to this pool's own y
+  kPoolEmbed = 12,          // the embedding: a unit gathers one row's token (the step's, less the table's first id) onto the four streams (glm_embed_bcast_kernel's copy)
+  kPoolHead = 13,           // the lm head over its bf12 companion (StepHeadParams; kernels/mma_gemv_body.cuh): a unit is 64 vocab rows, eight warps of eight, the logits fp32 [rows][n]
+  kPoolPick = 14,           // the pick: a unit is one row's top-2 over the rank's logits (kernels/pick_body.cuh), the winner into the device feed and the verdict
 };
 // The attention pools' geometry (DeepSeek-V4.1's CSA2): the latent width, the
 // keys a flash tile spans and the split group (kernels/dsa.hpp kAttnSplitGroup),
@@ -84,7 +87,8 @@ struct DevPool {
   uint8_t gate_arg = 0;  // kPoolAttention: 1 on the phase's last attention pool, whose reduce class is the finish over every source
   // The projection chain's wiring (2026-11-01): where the pool's units read their activations
   // (in_src 0: the step's x rows; 1: pool in_pool's y, at its out_offset and row width; 2: the
-  // attention's output o [rows][local_heads * 512]) and, with kGatePool, the pools whose completion
+  // attention's output o [rows][local_heads * 512]; 3, a row tail: the streams collapsed under the
+  // last site's pre, the head's input) and, with kGatePool, the pools whose completion
   // (compute units, and reduce units when slabbed) opens its class: in_pool and gate_pool (-1 none).
   // A block-diagonal matrix (wo_a: group g's rows read the heads of group g) reads columns
   // [g * in_group_cols, + k) for output rows [g * in_group_rows, + in_group_rows) (0: dense).
@@ -175,6 +179,8 @@ struct DevPhase {
 struct DevLayer {
   int32_t phase_begin = 0;
   int32_t phase_count = 0;
+  int32_t model_layer = -1;  // the family's layer this stands for (the attention's state and rotary tables are indexed by it); -1: a pseudo-layer of the globals (the embedding, the head)
+  int32_t pad = 0;
   uint64_t span_bytes = 0;
 };
 
@@ -209,11 +215,15 @@ struct DevicePlan {
 // bitwise and measured apart until its classes run inside a stream phase's drain (as its own
 // phase it cost the layer six points, 2026-11-01: docs/step_engine.md).
 constexpr unsigned kConsumeExperts = 1u, kConsumeShared = 2u, kConsumeProjections = 4u, kConsumeRouter = 8u, kConsumeMhc = 16u,
-                   kConsumeAttention = 32u, kConsumeChain = 64u, kConsumeAll = 31u | 64u;
+                   kConsumeAttention = 32u, kConsumeChain = 64u, kConsumeHead = 128u, kConsumeAll = 31u | 64u;
 // kConsumeChain: the projection chain's wiring (the row tails, the pools reading another's y, the
 // attention behind the rotated q); without it every projection reads x, the data flow before
 // 2026-11-01, kept for the attribution's A/B. kConsumeAttention stays outside kConsumeAll (the
 // rate gates' set): the attention costs 3-5 points of its own.
+// kConsumeHead: the globals' pools (the embedding gather, the head's input, the lm head over its
+// bf12 companion, the pick) from the embed and head pseudo-layers a caller orders around the main
+// layers (plan.hpp split_globals); outside kConsumeAll since the rigs without the globals index
+// the device plan's layers as the family's.
 DevicePlan lower_plan(const std::vector<LayerPlan>& layers, uint32_t unit_bytes, unsigned consumer_mask);
 inline DevicePlan lower_plan(const std::vector<LayerPlan>& layers, uint32_t unit_bytes, bool consumers = false) {
   return lower_plan(layers, unit_bytes, consumers ? kConsumeAll : 0u);

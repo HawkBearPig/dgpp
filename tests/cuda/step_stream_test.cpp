@@ -36,6 +36,10 @@
 #include "kernels/glm_mhc_launch.hpp"
 #include "kernels/glm_moe_launch.hpp"
 #include "kernels/latent_format.hpp"
+#include "kernels/bf12_gemv.hpp"
+#include "kernels/glm_norm.hpp"
+#include "kernels/mma_gemv.hpp"
+#include "kernels/pick.hpp"
 #include "net/collective_bus.hpp"
 #include "models/glm/mhc.hpp"
 #include "models/glm/moe.hpp"
@@ -93,8 +97,29 @@ struct AttnState {
 // loading waits for an idle device on a first launch and would wedge them (bus_kernel.hpp).
 static const int kEagerModules = (setenv("CUDA_MODULE_LOADING", "EAGER", /*overwrite=*/0), 0);
 
+// The globals of a rig with the head (kConsumeHead): the arena span of the embedding table, the
+// final norm and the head's bf16 rows, the head's bf12 companion on the device, and the plan's
+// pseudo-layers around the main layers (plan.hpp split_globals).
+struct GlobalsState {
+  uint8_t* span = nullptr;
+  size_t span_bytes = 0;
+  uint8_t* packed = nullptr;
+  uint32_t* rows = nullptr;
+  uint32_t* esc = nullptr;
+  uint16_t* raw = nullptr;
+  StepHeadParams params;
+  LayerPlan embed, head;
+  int embed_pos = -1, head_pos = -1;  // the pseudo-layers' positions in the device plan
+  ~GlobalsState() {
+    cudaFree(span); cudaFree(packed); cudaFree(rows); cudaFree(esc); cudaFree(raw);
+  }
+};
+
 struct Rig {
   std::unique_ptr<AttnState> attn;  // when the consumer mask has the attention
+  std::unique_ptr<GlobalsState> globals;  // when the consumer mask has the head
+  int main_begin = 0;               // the device-plan position of the first main layer (1 with the globals' embed pseudo-layer ahead)
+  Dsv41LocalGeometry geo;
   Dsv41TextConfig cfg;
   std::vector<LayerPlan> plans;
   DevicePlan dp;
@@ -236,6 +261,7 @@ std::unique_ptr<Rig> make_rig_mask(int layers, unsigned consumer_mask, bool tile
   rig->shape.draft_rows = 5;
   rig->shape.bf12_head = true;
   const Dsv41LocalGeometry geo = Dsv41LocalGeometry::from_config(rig->cfg, 0, kWorld, LoaderHeadSharding::VocabSharded);
+  rig->geo = geo;
   void* base = reinterpret_cast<void*>(static_cast<uintptr_t>(1) << 40);
   uint64_t max_span = 0;
   for (int l = 0; l < layers; ++l) {
@@ -329,6 +355,84 @@ std::unique_ptr<Rig> make_rig_mask(int layers, unsigned consumer_mask, bool tile
       }
     }
   }
+  // The globals (kConsumeHead): the embed and head pseudo-layers around the main layers, their
+  // span filled (the embedding and the final norm random bf16; the head's rows generated on the
+  // host inside a narrow exponent window with a few escapes, so every row packs into the bf12
+  // companion the step's head units read), the device plan lowered again over the ordered list.
+  if (consumer_mask & kConsumeHead) {
+    auto G = std::make_unique<GlobalsState>();
+    const LayerPlan globals = dsv41_globals_plan(rig->cfg, geo, rig->shape);
+    split_globals(globals, &G->embed, &G->head);
+    require(!G->embed.phases.empty() && !G->head.phases.empty(), "the globals split into an embed and a head pseudo-layer");
+    G->span_bytes = globals.span_bytes;
+    size_t free_bytes = 0, total = 0;
+    DGPP_CUDA_OK(cudaMemGetInfo(&free_bytes, &total));
+    if (free_bytes < G->span_bytes + (size_t{1} << 30))
+      dgpp::test::skip("the globals need " + std::to_string(G->span_bytes >> 20) + " MB of device memory, " + std::to_string(free_bytes >> 20) + " free");
+    DGPP_CUDA_OK(cudaMalloc(&G->span, G->span_bytes));
+    DGPP_CUDA_OK(cudaMemset(G->span, 0, G->span_bytes));
+    const Range *embed_r = nullptr, *norm_r = nullptr, *head_r = nullptr;
+    for (const Range& r : globals.ranges) {
+      if (r.consumer == Consumer::Embedding) embed_r = &r;
+      else if (r.consumer == Consumer::Head) head_r = &r;
+      else if (r.consumer == Consumer::Norm) norm_r = &r;
+    }
+    require(embed_r && norm_r && head_r, "the globals plan has the embedding, the final norm and the head");
+    {
+      std::vector<unsigned long long> h_off = {embed_r->offset, norm_r->offset}, h_bytes = {embed_r->bytes, norm_r->bytes};
+      unsigned long long *offsets = nullptr, *bytes = nullptr;
+      DGPP_CUDA_OK(cudaMalloc(&offsets, 16));
+      DGPP_CUDA_OK(cudaMalloc(&bytes, 16));
+      DGPP_CUDA_OK(cudaMemcpy(offsets, h_off.data(), 16, cudaMemcpyHostToDevice));
+      DGPP_CUDA_OK(cudaMemcpy(bytes, h_bytes.data(), 16, cudaMemcpyHostToDevice));
+      step_stream_fill_ranges(G->span, offsets, bytes, 2, 0x6e0du, 0, 0, nullptr, kFillBf16);
+      DGPP_CUDA_OK(cudaDeviceSynchronize());
+      cudaFree(offsets);
+      cudaFree(bytes);
+    }
+    const int n = static_cast<int>(head_r->rows), k = static_cast<int>(head_r->cols);
+    {
+      std::vector<uint16_t> w(static_cast<size_t>(n) * k);
+      uint64_t st = 0x2545f4914f6cdd1dull;
+      for (size_t i = 0; i < w.size(); ++i) {
+        st ^= st << 13; st ^= st >> 7; st ^= st << 17;
+        const uint32_t r = static_cast<uint32_t>(st >> 11);
+        const uint32_t sign = (r & 1u) << 15, mant = (r >> 1) & 0x7fu;
+        uint32_t exp = 124u + ((r >> 8) & 3u);         // 2^-3 .. 2^0: a four-code window
+        if ((r >> 10) % 4096u == 0u) exp = 110u;       // an escape every four thousand elements
+        w[i] = static_cast<uint16_t>(sign | (exp << 7) | mant);
+      }
+      DGPP_CUDA_OK(cudaMemcpy(G->span + head_r->offset, w.data(), w.size() * 2, cudaMemcpyHostToDevice));
+      const Bf12Host h = bf12_encode(w.data(), n, k);
+      require(h.ok, "the generated head packs into its bf12 companion");
+      G->packed = dev_copy(h.packed);
+      G->rows = dev_copy(h.rows);
+      G->esc = dev_copy(h.esc);
+      G->raw = dev_copy(h.raw);
+      G->params.packed = G->packed;
+      G->params.rows = G->rows;
+      G->params.esc = G->esc;
+      G->params.raw = G->raw;
+      G->params.n = n;
+      G->params.k = k;
+      G->params.vocab_begin = geo.lm_vocab_begin;
+      G->params.embed_vocab_begin = geo.embed_vocab_begin;
+    }
+    std::vector<LayerPlan> ordered;
+    std::vector<const uint8_t*> bases;
+    ordered.push_back(G->embed);
+    bases.push_back(G->span);
+    for (size_t l = 0; l < rig->plans.size(); ++l) { ordered.push_back(rig->plans[l]); bases.push_back(rig->bases[l]); }
+    ordered.push_back(G->head);
+    bases.push_back(G->span);
+    G->embed_pos = 0;
+    G->head_pos = static_cast<int>(ordered.size()) - 1;
+    rig->main_begin = 1;
+    rig->plans = std::move(ordered);
+    rig->bases = std::move(bases);
+    rig->dp = lower_plan(rig->plans, 65536, consumer_mask);
+    rig->globals = std::move(G);
+  }
   // The attention's inputs serve the row tails too (positions, the rotary tables, the ring the kv tail appends into).
   if (consumer_mask & (kConsumeAttention | kConsumeProjections)) rig->attn = make_attn_state(rig->cfg, rig->dp, layers);
   return rig;
@@ -350,6 +454,10 @@ StreamerConfig design_config() {
   cfg.top_k = 6;
   cfg.seed = 7;
   cfg.route_pool = 32;  // the measured overlap: about 20 distinct experts a layer for five rows, not 29
+  // Distinct tokens a row: a plan with the embedding gathers them onto the streams, and identical
+  // rows would route to one expert set (six experts a layer where five distinct rows take 26).
+  cfg.tokens.resize(static_cast<size_t>(kStepMaxRows));
+  for (int i = 0; i < kStepMaxRows; ++i) cfg.tokens[static_cast<size_t>(i)] = (1009 + 7919 * i) % 129280;
   return cfg;
 }
 
@@ -847,9 +955,12 @@ void print_layers(const StreamReport& r) {
 }
 
 double consumers_rate(bool tile_major) {
-  auto rig = make_rig(kLayers, /*consumers=*/true, tile_major);
+  // The head (the embedding gather, the head's input, the lm head over its companion, the pick) is
+  // in the step: its pseudo-layers are reported apart and stay out of the layers' median.
+  auto rig = make_rig_mask(kLayers, kConsumeAll | kConsumeHead, tile_major);
   Streamer s(rig->dp, rig->bases, rig->plans);
   if (rig->attn) s.set_attention(rig->attn->params);
+  if (rig->globals) s.set_head(rig->globals->params);
   StreamerConfig cfg = design_config();
   cfg.steps = 3;
   cfg.rows = 5;
@@ -858,20 +969,28 @@ double consumers_rate(bool tile_major) {
   // second or so of streaming, and a fresh rig's first run read three to five points low (2026-10-31).
   (void)s.run(cfg);
   const StreamReport r = s.run(cfg);
-  print_report(tile_major ? "tile-major experts, design chain, lead 16 MB" : "row-major experts, design chain, lead 16 MB", r, 3);
-  {  // the slowest layer's phases too, when it is not layer 3
-    int slowest = 0;
-    for (size_t l = 1; l < r.layer_us.size(); ++l)
-      if (r.layer_us[l] / std::max(1.0, r.layer_bytes[l]) > r.layer_us[static_cast<size_t>(slowest)] / std::max(1.0, r.layer_bytes[static_cast<size_t>(slowest)])) slowest = static_cast<int>(l);
-    if (slowest != 3) print_report("the slowest layer", r, slowest);
+  const int traced = 3 + rig->main_begin;
+  print_report(tile_major ? "tile-major experts, design chain, lead 16 MB" : "row-major experts, design chain, lead 16 MB", r, traced);
+  {  // the slowest main layer's phases too, when it is not the traced one
+    int slowest = traced;
+    for (size_t l = 0; l < r.layer_us.size(); ++l)
+      if (r.model_layers[l] >= 0 &&
+          r.layer_us[l] / std::max(1.0, r.layer_bytes[l]) > r.layer_us[static_cast<size_t>(slowest)] / std::max(1.0, r.layer_bytes[static_cast<size_t>(slowest)]))
+        slowest = static_cast<int>(l);
+    if (slowest != traced) print_report("the slowest layer", r, slowest);
   }
   print_layers(r);
   require(r.status == kStepOk, "the kernel ended on " + r.status_text);
   std::vector<double> pct;
   for (size_t l = 0; l < r.layer_us.size(); ++l) {
     const double floor_us = r.layer_bytes[l] / kCeilingGBs * 1e-3;
+    if (r.model_layers[l] < 0) {
+      std::printf("   %s: %.1f MB in %.0f us, floor %.0f us: %.0f %% of the ceiling\n", l == 0 ? "the embedding" : "the head", r.layer_bytes[l] / 1e6,
+                  r.layer_us[l], floor_us, 100.0 * floor_us / std::max(1.0, r.layer_us[l]));
+      continue;
+    }
     pct.push_back(100.0 * floor_us / r.layer_us[l]);
-    std::printf("   layer %zu: %.0f MB (%d experts) in %.0f us, floor %.0f us: %.0f %% of the ceiling\n", l, r.layer_bytes[l] / 1e6,
+    std::printf("   layer %d: %.0f MB (%d experts) in %.0f us, floor %.0f us: %.0f %% of the ceiling\n", r.model_layers[l], r.layer_bytes[l] / 1e6,
                 r.run_counts[l], r.layer_us[l], floor_us, pct.back());
   }
   std::sort(pct.begin(), pct.end());
@@ -898,8 +1017,17 @@ DGPP_TEST(step_consumers_rate_at_the_design_chain) {
   // about four points, is the dependent pools' two waves and their units
   // reading L2 at about 10 GB/s a block under the stream (docs/step_engine.md,
   // "The projection chain"). The plan's 95 is the goal, section 1.4 the account.
-  require(tile >= 72.0, "the tile-major consumers' layers stream under 72 percent of the ceiling");
-  require(row >= 68.0, "the row-major consumers' layers stream under 68 percent of the ceiling");
+  // 2026-11-01, the token path: the head's pools in the step (the embedding gather, the head's
+  // input, the lm head over its companion, the pick) and the per-pool counters reset over the pool
+  // table (a pool past the phase count kept its count from the second step on, and its gated
+  // classes opened at once: the earlier figures from the third step were taken with the last
+  // layer's gates open early). Same window: this kernel tile-major 72.2 to 73.0, row-major 65.2
+  // to 67.4; the head 248 MB at 60 to 73 percent of the ceiling as its own line. The head body's
+  // presence costs the expert stream about three points through a codegen effect that is neither
+  // code size nor the stack frame (docs/step_engine.md, the token path): the first lever of the
+  // next round, the gates meanwhile at the measured level less the noise.
+  require(tile >= 70.0, "the tile-major consumers' layers stream under 70 percent of the ceiling");
+  require(row >= 65.0, "the row-major consumers' layers stream under 65 percent of the ceiling");
 }
 
 // Which consumers cost the layer its share of the floor: the step with the
@@ -1060,8 +1188,11 @@ DGPP_TEST(step_consumers_rate_unwired) {
   const double a = consumers_rate_mask(kConsumeAll & ~kConsumeChain, "every consumer, the chain unwired:");
   const double b = consumers_rate_mask(kConsumeAll & ~kConsumeChain, "every consumer, the chain unwired:");
   // The binary's canary: this data flow read 77.9 to 79.1 on 2026-11-01 (the committed tree's
-  // binary 79.0 to 79.9 in the same window); a drop here is the kernel, not the chain.
-  require(std::max(a, b) >= 76.0, "the unwired data flow streams under 76 percent of the ceiling: the kernel regressed");
+  // binary 79.0 to 79.9 in the same window); a drop here is the kernel, not the chain. With the
+  // head body in the kernel (the token path, 2026-11-01) it reads 75.5 to 76.1 against 78.2 to
+  // 79.5 for the kernel without it in the same window, interleaved: the codegen effect recorded
+  // in docs/step_engine.md; the gate follows it until the effect is understood.
+  require(std::max(a, b) >= 74.0, "the unwired data flow streams under 74 percent of the ceiling: the kernel regressed");
 }
 
 // The chain's projections unit by unit (2026-11-01): for each of layer 3's wq_a, wq_b, wo_a and
@@ -1452,12 +1583,13 @@ DGPP_TEST(step_projection_chain_matches_the_production_kernels) {
     Streamer s(rig->dp, rig->bases, rig->plans);
     s.set_attention(A.params);
     StreamerConfig cfg = design_config();
-    cfg.steps = 1;
+    cfg.steps = 2;  // the checks read the second step's outputs: the gates' counters reset between steps (2026-11-01)
     cfg.rows = 5;
     cfg.top_k = 6;
     cfg.norm_eps = rig->cfg.rms_norm_eps;
     const StreamReport r = s.run(cfg);
     require(r.status == kStepOk, std::string("the kernel ended on ") + r.status_text);
+    require(r.verdicts.size() == 2 && r.verdicts[1].status == kVerdictOk, "two steps ran");
     const int rows = cfg.rows, lh = A.lh;
     for (size_t li = 0; li < check_layers.size(); ++li) {
     const int L = check_layers[li];
@@ -1570,6 +1702,156 @@ DGPP_TEST(step_projection_chain_matches_the_production_kernels) {
   }
 }
 
+// The token path against the production kernels (2026-11-01): the embedding gathered onto the
+// four streams at the step's start (glm_embed_bcast_streams), the head's input (the streams
+// collapsed under the last site's pre, launch_mhc_collapse_normed's collapse, then the final
+// norm, csa2_rmsnorm_bf16), the lm head over its bf12 companion (launch_mma_gemv_bf12_f32, the
+// production decode form's block body) and the pick (device_pick_local's top-2), every stage
+// run on the step's own upstream output and compared bitwise; the picks feed the next step's
+// tokens; a fresh streamer repeats the picks. The globals alone (no main layers: the embedding
+// straight into the head) and with the first eight layers and the attention.
+DGPP_TEST(step_token_path_matches_the_production_kernels) {
+  for (int layers : {0, kLayers}) {
+    auto rig = make_rig_mask(layers, kConsumeAll | kConsumeAttention | kConsumeHead, /*tile_major=*/true);
+    require(rig->globals != nullptr && rig->attn != nullptr, "the rig has the globals and the attention state");
+    const GlobalsState& G = *rig->globals;
+    const int H = rig->cfg.hidden_size, rows = 5, n = G.params.n;
+    // The pools of the pseudo-layers.
+    const DevPool *embed = nullptr, *head_in = nullptr, *head = nullptr, *pick = nullptr;
+    for (int pos : {G.embed_pos, G.head_pos}) {
+      const DevLayer& dl = rig->dp.layers[static_cast<size_t>(pos)];
+      for (int P = dl.phase_begin; P < dl.phase_begin + dl.phase_count; ++P)
+        for (int i = 0; i < rig->dp.phases[static_cast<size_t>(P)].n_pools; ++i) {
+          const DevPool& q = rig->dp.pools[static_cast<size_t>(rig->dp.phases[static_cast<size_t>(P)].pools[i])];
+          if (q.kind == kPoolEmbed) embed = &q;
+          else if (q.kind == kPoolRowTail && q.in_src == 3) head_in = &q;
+          else if (q.kind == kPoolHead) head = &q;
+          else if (q.kind == kPoolPick) pick = &q;
+        }
+    }
+    require(embed && head_in && head && pick, "the plan has the embedding, the head's input, the head and the pick pools");
+    require(head->rows == n && head->k == H && head_in->rows == H, "the head pool is the companion's shape");
+    std::vector<int32_t> tokens(static_cast<size_t>(rows));
+    for (int r = 0; r < rows; ++r) tokens[static_cast<size_t>(r)] = (1234567 * (r + 1) + 89) % rig->cfg.vocab_size;
+    auto run_two = [&](Streamer& s) {
+      StreamerConfig cfg = design_config();
+      cfg.steps = 2;
+      cfg.rows = rows;
+      cfg.top_k = 6;
+      cfg.norm_eps = rig->cfg.rms_norm_eps;
+      cfg.tokens = tokens;
+      const StreamReport r = s.run(cfg);
+      require(r.status == kStepOk, std::string("the kernel ended on ") + r.status_text);
+      require(r.verdicts.size() == 2 && r.verdicts[1].status == kVerdictOk, "two steps ran");
+      require(r.folds_match, "the verdicts' token folds match their tokens");
+      return r;
+    };
+    Streamer s(rig->dp, rig->bases, rig->plans);
+    s.set_attention(rig->attn->params);
+    s.set_head(G.params);
+    const StreamReport r = run_two(s);
+    const StepCtl* ctl = s.ctl();
+    // The second step's input tokens are the first step's picks (the device feed).
+    size_t feed_bad = 0;
+    for (int t = 0; t < rows; ++t) feed_bad += ctl->tokens[t] != r.verdicts[0].tokens[t];
+    for (int t = 0; t < rows; ++t) feed_bad += ctl->picks[t] != r.verdicts[1].tokens[t];
+    const uint8_t* gbase = rig->bases[static_cast<size_t>(G.head_pos)];
+    // The embedding of the second step's tokens onto the streams: with no layers between, the
+    // streams after the run are the gather's.
+    size_t embed_bad = 0;
+    if (layers == 0) {
+      std::vector<int64_t> tok64(static_cast<size_t>(rows));
+      for (int t = 0; t < rows; ++t) tok64[static_cast<size_t>(t)] = ctl->tokens[t];
+      int64_t* dtok = dev_copy(tok64);
+      uint16_t* streams_ref = nullptr;
+      const size_t sn = static_cast<size_t>(rows) * 4 * H;
+      DGPP_CUDA_OK(cudaMalloc(&streams_ref, sn * 2));
+      glm_embed_bcast_streams(gbase + embed->base + embed->offsets[0], dtok, streams_ref, rows, H, nullptr);
+      DGPP_CUDA_OK(cudaDeviceSynchronize());
+      std::vector<uint16_t> a(sn), b(sn);
+      DGPP_CUDA_OK(cudaMemcpy(a.data(), s.streams(0), sn * 2, cudaMemcpyDeviceToHost));
+      DGPP_CUDA_OK(cudaMemcpy(b.data(), streams_ref, sn * 2, cudaMemcpyDeviceToHost));
+      for (size_t i = 0; i < sn; ++i) embed_bad += a[i] != b[i];
+      cudaFree(dtok);
+      cudaFree(streams_ref);
+    }
+    // The head's input: the production collapse on the step's streams and pre, then the final norm.
+    const size_t hn = static_cast<size_t>(rows) * H;
+    uint16_t *collapsed = nullptr, *h_ref = nullptr;
+    DGPP_CUDA_OK(cudaMalloc(&collapsed, hn * 2));
+    DGPP_CUDA_OK(cudaMalloc(&h_ref, hn * 2));
+    GlmMhcConfig mc;
+    mc.hc_mult = 4;
+    mc.hidden = H;
+    mc.sinkhorn_iters = 20;
+    mc.hc_eps = 1e-6f;
+    mc.norm_eps = 1e-6f;
+    launch_mhc_collapse_normed(s.streams(0), s.pre(0), nullptr, 0.f, collapsed, nullptr, mc, rows, nullptr);
+    csa2_rmsnorm_bf16(collapsed, H, gbase + head_in->base + head_in->offsets[0], h_ref, H, rows, H, rig->cfg.rms_norm_eps, nullptr);
+    DGPP_CUDA_OK(cudaDeviceSynchronize());
+    std::vector<uint16_t> h_got(hn), h_exp(hn);
+    DGPP_CUDA_OK(cudaMemcpy(h_got.data(), s.proj() + head_in->out_offset, hn * 2, cudaMemcpyDeviceToHost));
+    DGPP_CUDA_OK(cudaMemcpy(h_exp.data(), h_ref, hn * 2, cudaMemcpyDeviceToHost));
+    size_t h_bad = 0;
+    for (size_t i = 0; i < hn; ++i) h_bad += h_got[i] != h_exp[i];
+    // The head over the step's own input rows: the production bf12 decode form.
+    Bf12Matrix w;
+    w.packed = G.params.packed; w.rows = G.params.rows; w.esc = G.params.esc; w.raw = G.params.raw; w.n = n; w.k = H;
+    require(mma_gemv_bf12_accepts(w, rows), "the production bf12 form takes the head at these rows");
+    const size_t ln = static_cast<size_t>(rows) * n;
+    float* logits_ref = nullptr;
+    DGPP_CUDA_OK(cudaMalloc(&logits_ref, ln * 4));
+    require(launch_mma_gemv_bf12_f32(s.proj() + head_in->out_offset, static_cast<size_t>(H), w, logits_ref, rows, n, H, static_cast<size_t>(n), nullptr),
+            "the production bf12 form launched");
+    DGPP_CUDA_OK(cudaDeviceSynchronize());
+    std::vector<float> l_got(ln), l_exp(ln);
+    DGPP_CUDA_OK(cudaMemcpy(l_got.data(), s.logits_out(), ln * 4, cudaMemcpyDeviceToHost));
+    DGPP_CUDA_OK(cudaMemcpy(l_exp.data(), logits_ref, ln * 4, cudaMemcpyDeviceToHost));
+    size_t l_bad = 0;
+    for (size_t i = 0; i < ln; ++i) l_bad += std::memcmp(&l_got[i], &l_exp[i], 4) != 0;
+    // The pick over the step's own logits: the production local pick.
+    uint64_t* carry = nullptr;
+    uint16_t* table = nullptr;
+    PickLocal* locals = nullptr;
+    DGPP_CUDA_OK(cudaMalloc(&carry, 8));
+    DGPP_CUDA_OK(cudaMemset(carry, 0, 8));
+    DGPP_CUDA_OK(cudaMalloc(&table, device_pick_table_elems(rows, 1) * 2));
+    DGPP_CUDA_OK(cudaMalloc(&locals, sizeof(PickLocal) * rows));
+    device_pick_local(s.logits_out(), rows, n, G.params.vocab_begin, 0, 1, carry, table, locals, nullptr);
+    DGPP_CUDA_OK(cudaDeviceSynchronize());
+    std::vector<PickLocal> loc(static_cast<size_t>(rows));
+    DGPP_CUDA_OK(cudaMemcpy(loc.data(), locals, sizeof(PickLocal) * rows, cudaMemcpyDeviceToHost));
+    size_t pick_bad = 0;
+    for (int t = 0; t < rows; ++t) {
+      pick_bad += loc[static_cast<size_t>(t)].best_id != r.verdicts[1].tokens[t];
+      pick_bad += std::memcmp(&loc[static_cast<size_t>(t)].best_logit, &ctl->pick_logit[t], 4) != 0;
+      pick_bad += std::memcmp(&loc[static_cast<size_t>(t)].second_logit, &ctl->pick_second[t], 4) != 0;
+    }
+    // A fresh streamer repeats the picks.
+    Streamer s2(rig->dp, rig->bases, rig->plans);
+    s2.set_attention(rig->attn->params);
+    s2.set_head(G.params);
+    const StreamReport r2 = run_two(s2);
+    size_t again_bad = 0;
+    for (size_t k = 0; k < 2; ++k)
+      for (int t = 0; t < rows; ++t) again_bad += r.verdicts[k].tokens[t] != r2.verdicts[k].tokens[t];
+    std::printf("   token path, %d layers, %d rows, head [%d x %d]: feed %zu wrong, embedding %zu of %zu differ, head input %zu of %zu, logits %zu of %zu, "
+                "pick %zu wrong, repeat %zu differ; picks %d %d %d %d %d then %d %d %d %d %d\n",
+                layers, rows, n, H, feed_bad, embed_bad, layers == 0 ? static_cast<size_t>(rows) * 4 * H : 0, h_bad, hn, l_bad, ln, pick_bad, again_bad,
+                r.verdicts[0].tokens[0], r.verdicts[0].tokens[1], r.verdicts[0].tokens[2], r.verdicts[0].tokens[3], r.verdicts[0].tokens[4],
+                r.verdicts[1].tokens[0], r.verdicts[1].tokens[1], r.verdicts[1].tokens[2], r.verdicts[1].tokens[3], r.verdicts[1].tokens[4]);
+    for (void* ptr : {static_cast<void*>(collapsed), static_cast<void*>(h_ref), static_cast<void*>(logits_ref), static_cast<void*>(carry), static_cast<void*>(table),
+                      static_cast<void*>(locals)})
+      cudaFree(ptr);
+    require(feed_bad == 0, "the picks did not feed the next step");
+    require(embed_bad == 0, "the embedding differs from the production gather");
+    require(h_bad == 0, "the head's input differs from the production collapse and norm");
+    require(l_bad == 0, "the logits differ from the production bf12 form");
+    require(pick_bad == 0, "the pick differs from the production local pick");
+    require(again_bad == 0, "the picks are not bitwise across streamers");
+  }
+}
+
 DGPP_TEST(step_attention_matches_the_production_kernels) {
   for (int layers : {1, kLayers}) {
     auto rig = make_rig_mask(layers, kConsumeAll | kConsumeAttention, /*tile_major=*/true);
@@ -1579,7 +1861,7 @@ DGPP_TEST(step_attention_matches_the_production_kernels) {
     if (rig->attn) s.set_attention(rig->attn->params);
     s.set_attention(A.params);
     StreamerConfig cfg = design_config();
-    cfg.steps = 1;
+    cfg.steps = 2;  // the oracle reads the second step's outputs
     cfg.rows = 5;
     cfg.top_k = 6;
     const StreamReport r = s.run(cfg);

@@ -85,6 +85,11 @@ struct alignas(128) StepCtl {
   unsigned fold_done[kStepMaxPhases];     // the chain spun the group's fold, by the group's published phase (the gate of the units behind it; a layer has two groups with folds, so not by layer: 2026-10-31)
   unsigned fold_staged[kStepMaxPhases];   // the fold's stage units complete (the fold units' gate), by the group's published phase
   unsigned fold_folded[kStepMaxPhases];   // its fold units complete: the last sets fold_done
+  int32_t tokens[32];                     // the step's input tokens (the embedding gathers them), written by the chain before the first phase
+  int32_t picks[32];                      // the pick units' winners, a row each (the step's output tokens; the chain folds them into the verdict)
+  float pick_logit[32];                   // and the winner's logit and the runner-up's (the sampler's candidate order, the pick fold's payload)
+  float pick_second[32];
+  unsigned feed_slot;                     // the step's slot of the device feed (seq & 1): the pick units write the other slot
   unsigned fold_slot;                     // the step's ring slot: its row of the fold table
   unsigned long long fold_epoch;          // the step's epoch (the descriptor's), mixed into every fold chunk's trailer hash
   unsigned open_gen;                      // bumped when a gate opens (a fold spun, a site's token finished, a pool's compute units complete): lead units yield to it
@@ -161,6 +166,22 @@ struct StepAttnParams {
   uint16_t* o = nullptr;
 };
 
+// The lm head's 12-bit companion (kernels/bf12_gemv.hpp Bf12Matrix) and the
+// rank's vocabulary slice (kPoolHead, kPoolPick): the step's logits are
+// fp32 [rows][n] (logits_out), the pick's ids vocab_begin + the slice's
+// column. embed_vocab_begin: the embedding table's first id (a replicated
+// table: 0).
+struct StepHeadParams {
+  const uint8_t* packed = nullptr;
+  const uint32_t* rows = nullptr;
+  const uint32_t* esc = nullptr;
+  const uint16_t* raw = nullptr;
+  int n = 0;
+  int k = 0;
+  int vocab_begin = 0;
+  int embed_vocab_begin = 0;
+};
+
 // The step's folds on the bus's one-sided write transport (net/bus_write.cuh;
 // MOONSHOT-1 phase 4): the host issues each fold's generation ahead
 // (CollectiveBus::step_prepare) into a pinned table by step slot and fold
@@ -198,6 +219,7 @@ struct StepStreamParams {
   const DevSegment* segments;
   const DevPool* pools;
   int n_layers = 0;
+  int n_pools = 0;   // the pool table's length: the per-pool counters (pool_done, reduce_done) are reset over it each step
   unsigned unit_bytes = 0;
   unsigned lead_units = 0;
   StepCtl* ctl = nullptr;
@@ -246,6 +268,11 @@ struct StepStreamParams {
   float hc_eps = 1e-6f;
   int sinkhorn_iters = 20;
   float norm_eps = 1e-6f;  // the row tails' RMSNorm epsilon (the family's rms_norm_eps)
+  // The head and the pick (kPoolHead, kPoolPick): the companion, the logits [kStepMaxRows][n] fp32,
+  // the pick pool's index (-1: none; the synthetic token path then feeds the next step).
+  StepHeadParams head;
+  float* logits_out = nullptr;
+  int pick_pool = -1;
   float mhc_norm_eps = 1e-6f;  // the coefficient norm's and the sublayer norm's epsilon
   unsigned consumer_smem = 0;  // dynamic shared memory the consumer units need
   int lookahead_layers = 2;
@@ -289,7 +316,7 @@ unsigned step_stream_mxfp4_smem(int inter);
 // The dynamic shared memory the consumer pools present need: the MXFP4 forms
 // when a routed pool at `inter` exists (0: none), the fp8 forms when `fp8`,
 // the hyper-connection units' scratch when `mhc`.
-unsigned step_stream_consumer_smem(int inter, bool fp8, bool mhc = false, bool attention = false);
+unsigned step_stream_consumer_smem(int inter, bool fp8, bool mhc = false, bool attention = false, bool head = false);
 // Whether the kernel has a router unit at this inner width.
 bool step_stream_has_router(int k);
 // The partials' index: token-major, the slots of one output element in one sector.

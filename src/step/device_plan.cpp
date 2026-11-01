@@ -22,6 +22,7 @@ uint64_t align_grant(uint64_t b) { return (b + kGrantAlign - 1) / kGrantAlign * 
 // evenly, so a unit is about 160 KB and the phase's tail a fraction of its
 // time. Slabbed pools reduce their fp32 partials in slab order afterwards.
 constexpr int32_t kProjectionUnitRows = 128;
+constexpr int32_t kHeadUnitRows = 64;  // the head unit: the step block's eight warps by the mma body's eight rows a warp (kernels/mma_gemv_body.cuh)
 // The slabs of a projection's inner width: the most that leave a slab of at
 // least 640 codes (two and a half windows). Units of 80 to 130 KB give a
 // phase of a few matrices four or more waves over the workers, so its tail
@@ -52,7 +53,7 @@ DevicePlan lower_plan(const std::vector<LayerPlan>& layers, uint32_t unit_bytes,
   const bool experts = (consumer_mask & kConsumeExperts) != 0, shared = (consumer_mask & kConsumeShared) != 0,
              projections = (consumer_mask & kConsumeProjections) != 0, router = (consumer_mask & kConsumeRouter) != 0,
              mhc = (consumer_mask & kConsumeMhc) != 0, attention = (consumer_mask & kConsumeAttention) != 0,
-             chain = (consumer_mask & kConsumeChain) != 0;
+             chain = (consumer_mask & kConsumeChain) != 0, head = (consumer_mask & kConsumeHead) != 0;
   const bool consumers = consumer_mask != 0;
   DevicePlan dp;
   dp.unit_bytes = unit_bytes;
@@ -74,6 +75,7 @@ DevicePlan lower_plan(const std::vector<LayerPlan>& layers, uint32_t unit_bytes,
     DevLayer dl;
     dl.phase_begin = static_cast<int32_t>(dp.phases.size());
     dl.phase_count = static_cast<int32_t>(lp.phases.size());
+    dl.model_layer = lp.layer;
     dl.span_bytes = lp.span_bytes;
     // The resident ranges by offset: the arena's order.
     std::vector<const Range*> by_offset;
@@ -98,6 +100,7 @@ DevicePlan lower_plan(const std::vector<LayerPlan>& layers, uint32_t unit_bytes,
       // consumer pools of one group: their ranges leave the fixed segments
       // and become lead-only segments.
       std::vector<const Range*> shared_pool;
+      std::vector<const Range*> consumed;  // ranges a pool reads by its own units, never streamed: a gather, the head
       uint32_t phase_part_elems = 0;
       if (consumers) {
         for (size_t ri = 0; projections && ri < lp.ranges.size(); ++ri) {
@@ -379,6 +382,107 @@ DevicePlan lower_plan(const std::vector<LayerPlan>& layers, uint32_t unit_bytes,
             }
           }
         }
+        // The globals' pools (2026-11-01): the embedding gather onto the streams, the head's input
+        // row (the streams collapsed under the last site's pre, then the final norm), the lm head
+        // over its bf12 companion (StepHeadParams, kernels/mma_gemv_body.cuh) and the pick. Their
+        // ranges leave the fixed segments: a gather's table and a matrix read by its own units
+        // are not the lead's to stream.
+        if (head) {
+          const Range* embed = nullptr;
+          const Range* norm = nullptr;
+          const Range* headw = nullptr;
+          for (const Range& r : lp.ranges) {
+            if (r.phase != static_cast<int>(ph) || r.source != Source::Resident || r.reads == 0) continue;
+            if (r.consumer == Consumer::Embedding && r.format == Format::Bf16) embed = &r;
+            else if (r.consumer == Consumer::Head && (r.format == Format::Bf12 || r.format == Format::Bf16)) headw = &r;
+            else if (r.consumer == Consumer::Norm && r.format == Format::Bf16) norm = &r;
+          }
+          if (embed) {
+            DevPool pool;
+            pool.kind = kPoolEmbed;
+            pool.group_kind = kGroupTokens;
+            pool.groups = 1;
+            pool.stride = 0;
+            pool.base = embed->offset;
+            pool.bytes = embed->bytes_per_read() * embed->reads;  // the rows a step gathers (the table itself is not streamed)
+            pool.offsets[0] = 0;
+            pool.rows = static_cast<int32_t>(embed->rows);  // the table's rows (this rank's slice)
+            pool.k = static_cast<int32_t>(embed->cols);     // hidden
+            pool.unit_rows = 1;
+            pool.units_per_group = 1;  // a row a unit; the kernel multiplies by the step's rows
+            pool.grab = 1;
+            dp.fixed_bytes += static_cast<double>(embed->bytes_per_read()) * embed->reads;
+            add_pool(dp, d, pool);
+            name_pool(embed->name);
+            consumed.push_back(embed);
+            d.kind = 1;  // real work in place of the modeled latency
+          }
+          if (headw && norm) {
+            if (norm->cols != headw->cols) throw std::logic_error("lower_plan: the final norm is not the head's inner width");
+            if (headw->rows % kHeadUnitRows != 0 && headw->rows < kHeadUnitRows) throw std::logic_error("lower_plan: the head has fewer rows than a unit");
+            // The head's input: one unit a row, collapse and norm into its own y.
+            DevPool tail;
+            tail.kind = kPoolRowTail;
+            tail.group_kind = kGroupTokens;
+            tail.groups = 1;
+            tail.stride = 0;
+            tail.base = norm->offset;
+            tail.bytes = align_grant(norm->offset + norm->bytes) - norm->offset;
+            tail.offsets[0] = 0;
+            tail.k = static_cast<int32_t>(norm->cols);
+            tail.rows = static_cast<int32_t>(norm->cols);
+            tail.unit_rows = 1;
+            tail.units_per_group = 1;
+            tail.grab = 1;
+            tail.in_src = 3;
+            tail.out_offset = dp.proj_elems;
+            dp.proj_elems += static_cast<uint32_t>(tail.rows) * kStepRows;
+            dp.fixed_bytes += static_cast<double>(norm->bytes_per_read()) * norm->reads;
+            const int tail_index = add_pool(dp, d, tail);
+            name_pool("head.input");
+            consumed.push_back(norm);
+            // The head: 64 vocab rows a unit (eight warps of the mma body's eight rows), gated on its input.
+            DevPool hp;
+            hp.kind = kPoolHead;
+            hp.group_kind = kGroupTokens;
+            hp.groups = 1;
+            hp.stride = 0;
+            hp.base = headw->offset;
+            hp.bytes = headw->bytes_per_read();  // the companion's bytes, read once a step
+            hp.offsets[0] = 0;
+            hp.rows = static_cast<int32_t>(headw->rows);
+            hp.k = static_cast<int32_t>(headw->cols);
+            hp.unit_rows = kHeadUnitRows;
+            hp.units_per_group = (hp.rows + kHeadUnitRows - 1) / kHeadUnitRows;
+            hp.grab = 4;  // a unit's 491 KB stream in 2 us at the ceiling, the hand-out's round trips about as long: four a grab
+            hp.in_src = 1;
+            hp.in_pool = tail_index;
+            hp.gate_kind = kGatePool;
+            dp.fixed_bytes += static_cast<double>(headw->bytes_per_read()) * headw->reads;
+            const int head_index = add_pool(dp, d, hp);
+            name_pool(headw->name);
+            consumed.push_back(headw);
+            // The pick: one unit a row over the rank's logits, gated on the head.
+            DevPool pick;
+            pick.kind = kPoolPick;
+            pick.group_kind = kGroupTokens;
+            pick.groups = 1;
+            pick.stride = 0;
+            pick.base = 0;
+            pick.bytes = 0;
+            pick.rows = hp.rows;
+            pick.k = hp.k;
+            pick.unit_rows = 1;
+            pick.units_per_group = 1;
+            pick.grab = 1;
+            pick.in_src = 1;
+            pick.in_pool = head_index;
+            pick.gate_kind = kGatePool;
+            add_pool(dp, d, pick);
+            name_pool("head.pick");
+            d.kind = 1;
+          }
+        }
         const Range* payload[3] = {nullptr, nullptr, nullptr};
         const Range* scales[3] = {nullptr, nullptr, nullptr};
         for (const Range* r : by_offset) {
@@ -417,6 +521,7 @@ DevicePlan lower_plan(const std::vector<LayerPlan>& layers, uint32_t unit_bytes,
       for (const Range* r : by_offset) {
         if (r->phase != static_cast<int>(ph) || r->dep == Dependency::Router || r->reads == 0) continue;
         if (std::find(shared_pool.begin(), shared_pool.end(), r) != shared_pool.end()) continue;
+        if (std::find(consumed.begin(), consumed.end(), r) != consumed.end()) continue;
         const uint64_t end = align_grant(r->offset + r->bytes);
         if (!dp.segments.empty() && static_cast<int32_t>(dp.segments.size()) > d.seg_begin &&
             align_grant(dp.segments.back().offset + dp.segments.back().bytes) == r->offset) {

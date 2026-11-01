@@ -2666,10 +2666,20 @@ area, untracked.
 
 - [x] The projection chain's data flow in the kernel (2026-11-01): the
       backbone the adapter's exact gather and oracle stand on; see the
-      attention item above and `docs/step_engine.md`. Still provided by
-      the rig: the selection (the indexer's scores and the select), the
-      main cache's compress path and entry positions, the Engram gathers,
-      the lm head and the pick.
+      attention item above and `docs/step_engine.md`.
+- [x] The token path (2026-11-01): the embedding gathered onto the streams
+      from the step's tokens, the head's input (the collapse under the last
+      site's pre and the final norm), the lm head over its bf12 companion
+      with the production tensor-core body, the pick into the next step's
+      feed and the verdict; two steps bitwise against the production
+      launches on the step's own outputs, which also found the per-pool
+      counters' reset covering the phase count only. The head's rate (60
+      to 73 percent of the ceiling) and the three points its body's
+      presence costs the expert stream are the open levers
+      (`docs/step_engine.md`, the token path). Still provided by the rig:
+      the selection (the indexer's scores and the select), the main cache's
+      compress path and entry positions, the Engram gathers, the draft
+      stages and the pick's fold past world 1.
 - [ ] `StepEngineAdapter` in `src/step/` beside the eager and graph
       adapters, selected by `engine.decode_engine`, implementing
       `SchedulerEngine` with the scheduler's existing paths unchanged.

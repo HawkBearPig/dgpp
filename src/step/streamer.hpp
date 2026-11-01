@@ -102,6 +102,7 @@ struct StreamReport {
   std::vector<double> bind_us;     // step k: from seeing execute to the first phase
   std::vector<double> step_us;     // step k: first phase begin to the verdict
   std::vector<PhaseTiming> phases;  // the last completed step
+  std::vector<int> model_layers;    // each device-plan layer's family layer (-1: a pseudo-layer of the globals)
   std::vector<double> layer_us;     // the last completed step, each layer's first begin to last end
   std::vector<double> layer_bytes;  // what the layer streamed at its run list
   std::vector<int> run_counts;
@@ -140,6 +141,11 @@ class Streamer {
   // positions, the state pool's planes and tables, the lists, the rotary tables, the scale) are
   // set before a run; the partials, the tickets and the output o are the streamer's.
   void set_attention(const StepAttnParams& inputs) { attn_in_ = inputs; }
+  // The lm head's companion and the vocabulary slice (a plan with the head's pools).
+  void set_head(const StepHeadParams& inputs) { head_in_ = inputs; }
+  const float* logits_out() const { return logits_out_; }  // [kStepMaxRows][head_n] fp32 after a run
+  int head_n() const { return head_n_; }
+  bool has_head() const { return head_n_ > 0; }
   // The folds on the bus (world > 1): the step engine issues each step's fold generations ahead
   // (CollectiveBus::step_prepare) into the kernel's fold table and settles them after the run; the
   // bus must be on the write transport. Without it (or at world 1) the fold is the chain's modeled
@@ -204,6 +210,11 @@ class Streamer {
   unsigned consumer_smem_ = 0;
   bool mhc_ = false;
   bool attention_ = false;
+  bool embed_ = false;      // the plan gathers the embedding onto the streams
+  int head_n_ = 0;          // the head pool's rows (0: no head in the plan)
+  int pick_pool_ = -1;      // the pick pool's index (-1: none; the synthetic token path)
+  StepHeadParams head_in_;
+  float* logits_out_ = nullptr;
   bool attn_needs_q_ = false;  // an attention pool reads the provided queries (none from the chain's q rotation)
   bool tails_ = false;         // row-tail pools that rotate or append: they need the attention inputs (positions, tables, the ring)
   StepAttnParams attn_in_;
