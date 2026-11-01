@@ -4390,6 +4390,52 @@ std::string post_legacy(ServiceRig& rig, const std::string& body,
              std::to_string(body.size()) + "\r\n\r\n" + body);
   return c.read_until(until, budget_ms);
 }
+DGPP_TEST(serve_promptLogprobs_rejectsUnsupportedScoringOnBothRoutes) {
+  ServiceRig rig(8, model_defaults(), true);
+  for (bool chat : {false, true}) {
+    for (bool stream : {false, true}) {
+      for (const std::string value :
+           {"0", "1", "-1", "1.5", "true", "false", "\"0\"", "[]", "{}"}) {
+        const std::string extra =
+            ",\"prompt_logprobs\":" + value + (stream ? ",\"stream\":true" : "");
+        const std::string body = chat ? chat_body("abcd", 2, extra)
+                                      : "{\"model\":\"" + kModel +
+                                            "\",\"prompt\":\"abcd\",\"max_tokens\":2" + extra + "}";
+        const auto response = chat ? post_chat(rig, body, "unsupported_parameter")
+                                   : post_legacy(rig, body, "unsupported_parameter");
+        expect_invalid_request(response, "prompt_logprobs");
+        require(response.find("\"code\":\"unsupported_parameter\"") != std::string::npos,
+                "prompt scoring is explicitly unsupported, not silently ignored");
+        require(response.find("text/event-stream") == std::string::npos,
+                "reject before starting a stream");
+      }
+    }
+  }
+  require(rig.engine.armed().empty(), "unsupported scoring never reaches generation");
+}
+
+DGPP_TEST(serve_promptLogprobs_nullAndOmissionPreserveGeneratedLogprobs) {
+  ServiceRig rig(8, model_defaults(), true);
+  for (bool chat : {false, true}) {
+    for (bool stream : {false, true}) {
+      for (bool explicit_null : {false, true}) {
+        const std::string extra = std::string(chat ? ",\"logprobs\":true" : ",\"logprobs\":1") +
+                                  (explicit_null ? ",\"prompt_logprobs\":null" : "") +
+                                  (stream ? ",\"stream\":true" : "");
+        const std::string body = chat ? chat_body("abcd", 2, extra)
+                                      : "{\"model\":\"" + kModel +
+                                            "\",\"prompt\":\"abcd\",\"max_tokens\":2" + extra + "}";
+        const std::string until = stream ? "[DONE]" : "usage";
+        const auto response = chat ? post_chat(rig, body, until) : post_legacy(rig, body, until);
+        require(response.starts_with("HTTP/1.1 200 OK"), "null is omission on both routes");
+        require(response.find(chat ? "\"logprob\":-0.25" : "\"token_logprobs\":[-0.25") !=
+                    std::string::npos,
+                "generated-token logprobs remain available");
+      }
+    }
+  }
+}
+
 // A one-shot chat read through the usage object's last key.
 std::string post_full(ServiceRig& rig, const std::string& body) {
   return post_chat(rig, body, "reasoning_tokens\":", 5000);

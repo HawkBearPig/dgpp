@@ -151,7 +151,10 @@ without graph decode uses the eager streaming path. Memory planning at
 startup checks whether the selected model and request capacity fit.
 
 The text API supports streaming, tools, supported JSON schemas, reasoning
-output, sampling controls, logprobs, stop strings and multiple chat choices.
+output, sampling controls, generated-token logprobs, stop strings and
+multiple chat choices.
+Prompt-token scoring remains pending; non-null `prompt_logprobs` requests
+are rejected explicitly on both completion endpoints.
 Unsupported fields are rejected by name. GLM-5.3-Flash and Qwen3.8-Flash-Next
 support PNG/JPEG/WebP image inputs with native vision encoders, journaled RGB
 pixels, streaming and MTP. Image requests support prefix caching and

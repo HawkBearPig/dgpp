@@ -2060,7 +2060,8 @@ bool GenerationService::validate_chat_parameters(const minijson::Value& body, Pr
   const std::unordered_set<std::string> unsupported = {
       "web_search_options", "functions", "function_call", "prompt_cache_options"};
   const std::unordered_set<std::string> nullable_unsupported = {
-      "audio", "prediction", "moderation", "prompt_cache_retention", "verbosity"};
+      "audio",     "prediction",     "moderation", "prompt_cache_retention",
+      "verbosity", "prompt_logprobs"};
   std::unordered_set<std::string> seen;
   for (const auto& m : body.members()) {
     if (!seen.insert(m.key).second) return refuse(m.key, "duplicate request parameter", "invalid_parameter");
@@ -2561,6 +2562,11 @@ void GenerationService::prepare_completions(const HttpRequest& req,
     sampling.logprobs = logprobs;
   }
 
+  if (optional_field(body, "prompt_logprobs")) {
+    respond_error(w, 400, "'prompt_logprobs' is not supported by this server",
+                  "invalid_request_error", "prompt_logprobs", "unsupported_parameter");
+    return;
+  }
   const char* unsupported[] = {"echo", "suffix", "top_logprobs",
                               "n",    "best_of", "user"};
   for (const char* param : unsupported) {

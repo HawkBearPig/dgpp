@@ -278,6 +278,10 @@ history forwarded through LiteLLM is accepted with its thinking parts.
 The [API profile](docs/openai-compatibility.md) has the full contract,
 the extensions and the model-dependent limits.
 
+Logprobs cover generated tokens. Prompt scoring is not implemented;
+non-null `prompt_logprobs` requests are rejected explicitly rather than
+accepted without scores. See the API profile for the null/omission behavior.
+
 ## Accuracy and correctness
 
 The default serving chain computes what the checkpoint specifies, the

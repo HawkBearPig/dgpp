@@ -57,6 +57,16 @@ values return HTTP 400 naming `ignore_eos`. When `true`, sampled EOS tokens
 still count toward usage but do not end generation. The token limit, stop
 strings, cancellation and resource limits still apply.
 
+Logprobs describe generated tokens, not prompt-token scores. Both completion
+endpoints reject a non-null `prompt_logprobs` field with HTTP 400,
+`error.code: "unsupported_parameter"` and `error.param: "prompt_logprobs"`.
+This includes `0`: requesting only the prompt tokens' own scores still
+requires prompt scoring. Omission and explicit null leave generation unchanged.
+The legacy `/v1/completions` route also does not support `echo` or
+`max_tokens: 0`; served perplexity/loglikelihood scoring is not implemented.
+Use the offline teacher-forced procedures in [numerics](numerics.md) for
+prompt scoring.
+
 ## Assistant thinking history (DGPP extension)
 
 Assistant content arrays accept Anthropic-style `thinking` and
