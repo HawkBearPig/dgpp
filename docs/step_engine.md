@@ -786,9 +786,12 @@ took 15). The rate gates stand at 72 and 68, the unwired case at 76 as the
 binary's canary. Open against the chain: the dependent pools' unit form
 (more bytes in flight a block, or K-slabs the attention or a row tail
 sums, so their waves fill 47 workers), and the class tables built once per
-kernel launch by the workers rather than by the chain before each group,
-which would take the table's latency off every short group (the empty
-attend phase of this rig, the accumulate, the latency phases).
+kernel launch by the workers rather than by the chain before each group.
+Building them two groups ahead was tried and reverted: the rate read 71.5
+to 73.3 against 76.7 to 76.9 and the empty attend phase was no shorter, so
+the 15 to 20 µs a short group costs is the chain's bookkeeping around a
+group (the publish, the cursor's atomics, the lead accounting, the stamps),
+each a dependent access under the stream, not the table.
 
 ## The fold
 

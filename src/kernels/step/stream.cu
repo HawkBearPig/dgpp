@@ -1262,7 +1262,10 @@ __global__ void __launch_bounds__(kStepThreads, 1) step_stream_kernel(StepStream
             st_rel(&ctl->phase_word, word(step, P, kStateIdle));
           }
           // The next group's classes, built while this group runs; the routed pools' counts are
-          // resolved by the workers against the run list when they load the table.
+          // resolved by the workers against the run list when they load the table. (Built two groups
+          // ahead, so a short group would not expose the build behind it, the rate read 71.5 to 73.3
+          // against 76.7 to 76.9 and the empty attend phase was no shorter, 2026-11-01: the phase's
+          // 15 to 20 µs is the chain's bookkeeping around a group, not the table.)
           if (!sm_fail && P_last + 1 < n_phases) build_class_table(p, P_last + 1);
           if (!sm_fail && ph.kind != 1) spin_us(ph.latency_us);
         }
