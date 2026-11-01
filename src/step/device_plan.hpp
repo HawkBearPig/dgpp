@@ -33,7 +33,13 @@ enum DevPoolKind : uint8_t {
   kPoolFp8Matrix = 7,       // one fp8 projection, row-major with F32 block scales: y = W x for every token
   kPoolRouter = 8,          // the router: bf16 [experts, hidden] with its F32 bias, units of 16 expert rows over every token, scores out
   kPoolMhc = 9,             // a hyper-connection site: the coefficient matrix bf16 [24, 4 hidden], its base and scale, the norm weight; a unit is kMhcUnitCoeffs logits of one token, the token's last unit the finish
+  kPoolAttention = 10,      // the CSA2 attention over one latent source of the state pool (site 0 the window ring, 1 the main cache): a unit is one block of the production flash kernel (kernels/dsa_attn_flash.cuh), the phase's last such pool's reduce class the finish (kernels/csa2_attn_finish.cuh)
 };
+// The attention pools' geometry (DeepSeek-V4.1's CSA2): the latent width, the
+// keys a flash tile spans and the split group (kernels/dsa.hpp kAttnSplitGroup).
+constexpr int kAttnLatent = 512;
+constexpr int kAttnTile = 16;
+constexpr int kAttnGroup = 8;
 // Whose slots a pool's group holds.
 enum DevGroupKind : uint8_t {
   kGroupRouted = 0,  // the run list's experts, each with its slots
@@ -64,16 +70,16 @@ struct DevPool {
   int32_t units_per_group = 0;
   uint8_t kind = kPoolBytes;
   uint8_t group_kind = kGroupRouted;
-  uint8_t site = 0;     // kPoolMhc: 0 the attention site, 1 the MoE site (the streams' and pre's buffer parity)
+  uint8_t site = 0;     // kPoolMhc: 0 the attention site, 1 the MoE site (the streams' and pre's buffer parity); kPoolAttention: 0 the window ring, 1 the main cache
   uint8_t update_site = 0;  // kPoolFp8Matrix: its reduce units follow with the attention site's stream update, this pool's y the h
   // The gate of the pool's compute units inside a merged group: the class is handed out only
   // once it opens. kGateNone; kGateFold: the chain spun the group's fold; kGateSite: the site
   // `gate_arg` of the unit's layer finished every token.
   uint8_t gate_kind = 0;
-  uint8_t gate_arg = 0;
+  uint8_t gate_arg = 0;  // kPoolAttention: 1 on the phase's last attention pool, whose reduce class is the finish over every source
   uint8_t pad3[2] = {0, 0};
-  int32_t rows = 0;     // a consumer pool: the matrix's output rows (gate and up: I; down: H)
-  int32_t k = 0;        // and its inner width (gate and up: H; down: I)
+  int32_t rows = 0;     // a consumer pool: the matrix's output rows (gate and up: I; down: H); kPoolAttention: the source's splits (one 16-key tile each)
+  int32_t k = 0;        // and its inner width (gate and up: H; down: I); kPoolAttention: the latent width
   int32_t grab = 1;     // units a worker takes at once: consecutive units of one group share their staged activations
   int32_t partner = -1; // a down pool: the pool whose gate and up units its group waits for
   uint32_t out_offset = 0;  // kPoolFp8Matrix: where its y [slots, rows] begins in the step's projection buffer (elements)
@@ -81,12 +87,13 @@ struct DevPool {
   // 128-row block over one slab; with more than one, units write fp32
   // partials at part_offset [slab][slot][rows] and reduce units, after the
   // pool's compute units, sum them in slab order into y.
-  int32_t slabs = 1;
+  int32_t slabs = 1;        // kPoolAttention: the split group (kAttnGroup, or 1 when the splits do not divide)
   uint32_t part_offset = 0;
-  int32_t unit_rows = 128;  // output rows a unit covers (a multiple of 16; warps past them idle): finer for the fixed matrices
+  int32_t unit_rows = 128;  // output rows a unit covers (a multiple of 16; warps past them idle): finer for the fixed matrices; kPoolAttention: local_heads
   // A consumer pool's matrices inside a group: gate payload, gate scales,
   // up payload, up scales (gate_up), or down payload, down scales (down),
-  // or the matrix's payload and scales (kPoolFp8Matrix).
+  // or the matrix's payload and scales (kPoolFp8Matrix), or the layer's attention sink
+  // (kPoolAttention, offsets[0]: F32 [local_heads], the finish's).
   uint64_t offsets[4] = {0, 0, 0, 0};
 };
 
@@ -170,7 +177,11 @@ struct DevicePlan {
 // accumulate phase becomes worker units; without, every pool is bytes. The
 // mask form picks the consumer classes one by one, for attribution: the
 // routed experts, the shared expert and the fp8 projections.
-constexpr unsigned kConsumeExperts = 1u, kConsumeShared = 2u, kConsumeProjections = 4u, kConsumeRouter = 8u, kConsumeMhc = 16u, kConsumeAll = 31u;
+// kConsumeAll is the set the rate gates run with; the attention (kConsumeAttention) is landed
+// bitwise and measured apart until its classes run inside a stream phase's drain (as its own
+// phase it cost the layer six points, 2026-11-01: docs/step_engine.md).
+constexpr unsigned kConsumeExperts = 1u, kConsumeShared = 2u, kConsumeProjections = 4u, kConsumeRouter = 8u, kConsumeMhc = 16u,
+                   kConsumeAttention = 32u, kConsumeAll = 31u;
 DevicePlan lower_plan(const std::vector<LayerPlan>& layers, uint32_t unit_bytes, unsigned consumer_mask);
 inline DevicePlan lower_plan(const std::vector<LayerPlan>& layers, uint32_t unit_bytes, bool consumers = false) {
   return lower_plan(layers, unit_bytes, consumers ? kConsumeAll : 0u);

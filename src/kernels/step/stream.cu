@@ -3,6 +3,9 @@
 
 #include "kernels/step/fp8_dense.cuh"
 #include "kernels/step/mhc.cuh"
+#include "kernels/csa2_attn_finish.cuh"
+#include "kernels/dsa.hpp"
+#include "kernels/dsa_attn_flash.cuh"
 #include "kernels/step/mxfp4_expert.cuh"
 #include "kernels/step/mxfp4_row.cuh"
 #include "kernels/step/router.cuh"
@@ -87,9 +90,16 @@ __device__ __forceinline__ void spin_us(float us) {
 // The units of phase P of `layer` at the current run list.
 // A pool's units this step: the run list's groups for the routed pool, one group otherwise.
 // A pool's compute units a group this step: the plan's, or the split form's for a small group.
+// The attention's (row, head) blocks of a step: 32 M-rows each (kernels/dsa_attn_flash.cuh dense::kM).
+static_assert(dgpp::dsa_flash::dense::kM == 32 && dgpp::dsa_flash::dense::kThreads == kStepThreads, "the flash body's block is the step kernel's");
+static_assert(kAttnGroup == kAttnSplitGroup && kAttnLatent == kCsa2Latent, "the attention pools' geometry is the production kernels'");
+__device__ __forceinline__ unsigned attn_blocks(const StepStreamParams& p) {
+  return (p.ctl->rows * static_cast<unsigned>(p.attn.local_heads) + 31u) / 32u;
+}
 __device__ __forceinline__ unsigned compute_units_per_group(const StepStreamParams& p, const DevPool& pool) {
   if (projection_split(p, pool)) return (static_cast<unsigned>(pool.rows) + kSplitUnitRows - 1) / kSplitUnitRows;
   if (pool.kind == kPoolMhc) return static_cast<unsigned>(pool.units_per_group) * p.ctl->rows;  // a token's units for every token
+  if (pool.kind == kPoolAttention) return static_cast<unsigned>(pool.rows) * attn_blocks(p);  // a split of every (row, head) block
   return static_cast<unsigned>(pool.units_per_group);
 }
 // A slabbed projection's reduce units: handed out after every pool's compute
@@ -99,6 +109,7 @@ __device__ __forceinline__ unsigned compute_units_per_group(const StepStreamPara
 // worker reducing as the pool's last arriver was worse: the largest pool's
 // reduce became the phase's tail.
 __device__ __forceinline__ unsigned reduce_units(const StepStreamParams& p, const DevPool& pool) {
+  if (pool.kind == kPoolAttention) return pool.gate_arg ? p.ctl->rows * static_cast<unsigned>(p.attn.local_heads) : 0u;  // the finish: one (row, head) a unit
   if (pool.kind != kPoolFp8Matrix || pool.slabs <= 1 || projection_split(p, pool)) return 0;
   return (static_cast<unsigned>(pool.rows) * static_cast<unsigned>(p.ctl->rows) + kStepAccChunk - 1) / kStepAccChunk;
 }
@@ -130,6 +141,7 @@ __device__ __forceinline__ unsigned pool_compute_units(const StepStreamParams& p
 constexpr uint8_t kClassCompute = 0, kClassReduce = 1, kClassFixed = 2, kClassAccumulate = 3, kClassStage = 4;
 constexpr uint8_t kGateOwnPool = 3;  // a reduce class: its pool's compute units complete
 constexpr uint8_t kGateTrigger = 4;  // a staging class: the group's fold trigger holds (the fold's idle window begins)
+constexpr uint8_t kGateAttnPools = 5;  // the attention finish: every attention pool of the phase has its blocks complete
 __device__ void build_class_table(const StepStreamParams& p, int P) {
   StepCtl* ctl = p.ctl;
   const unsigned rows = ctl->rows;
@@ -165,7 +177,7 @@ __device__ void build_class_table(const StepStreamParams& p, int P) {
           // Its reduce units, gated on its compute units: the update-carrying projection's y (and
           // the attention update) completes early in the group.
           const unsigned reduce = reduce_units(p, gp);
-          if (reduce) put(reduce, 1u, kClassReduce, ip, iph.pools[i], kGateOwnPool, 0, 0u);
+          if (reduce) put(reduce, 1u, kClassReduce, ip, iph.pools[i], gp.kind == kPoolAttention ? kGateAttnPools : kGateOwnPool, 0, 0u);
         }
       if (iph.fixed_units) put(iph.fixed_units, 1u, kClassFixed, ip, -1, kGateNone, 0, 0u);  // the shortest units, they fill the tail
     }
@@ -484,6 +496,101 @@ __device__ void mhc_unit(const StepStreamParams& p, int layer, const DevPool& po
   if (tr && threadIdx.x == 0) tr[kMhcTraceWords - 1] = gtimer();
 }
 
+// Whether every attention pool of a phase has its blocks complete (the finish's gate).
+__device__ __forceinline__ bool attn_pools_done(const StepStreamParams& p, int layer, int phase) {
+  const DevPhase& ph = p.phases[phase];
+  for (int i = 0; i < ph.n_pools; ++i) {
+    const DevPool& q = p.pools[ph.pools[i]];
+    if (q.kind != kPoolAttention) continue;
+    if (ld_acq(&p.ctl->pool_done[layer][ph.pools[i]]) < pool_compute_units(p, layer, q)) return false;
+  }
+  return true;
+}
+
+// The CSA2 attention's unit: one block of the production flash kernel over
+// the pool's latent source (kernels/dsa_attn_flash.cuh attn_flash_body): the
+// (row, head) block bx = unit % blocks, the split s = unit / blocks (a block's
+// units in sequence share its queries in L2). The window ring's rows are the
+// fp8_block form behind the identity table (request r's region r, bounded by
+// the request count); the main cache's the fp4_block form behind the paged
+// block table. The group merge's tickets and partials are the step's. Bitwise
+// the production kernel's partials: the same body at the same coordinates.
+__device__ void attention_unit(const StepStreamParams& p, int layer, const DevPool& pool, int rb, uint8_t* smem) {
+  const StepAttnParams& a = p.attn;
+  const int rows = static_cast<int>(p.ctl->rows);
+  const int blocks = static_cast<int>(attn_blocks(p));
+  const int bx = rb % blocks, s = rb / blocks;
+  const int n_split = pool.rows, src = pool.site;
+  const uint8_t* latent = nullptr;
+  const int32_t* tables = nullptr;
+  const int32_t* list = nullptr;
+  const int32_t* counts = nullptr;
+  int block_tokens = 0, bpr = 0, total = 0, stride = 0;
+  if (src == 0) {
+    latent = a.ring + static_cast<unsigned long long>(layer) * a.ring_layer_bytes;
+    block_tokens = a.ring_slots; tables = a.ring_table; bpr = 1; total = a.max_requests;
+    list = a.wlist; stride = a.window; counts = a.wcounts;
+  } else {
+    latent = a.main ? a.main[layer] : nullptr;
+    block_tokens = a.epb ? a.epb[layer] : 0; tables = a.block_tables; bpr = a.blocks_per_request; total = a.blocks_total;
+    list = a.topk; stride = a.index_topk; counts = a.counts;
+  }
+  if (latent == nullptr || a.q == nullptr || list == nullptr || counts == nullptr || block_tokens <= 0) {
+    if (threadIdx.x == 0) atomicCAS(&p.ctl->status, kStepOk, kStepBadUnit);
+    return;
+  }
+  const bool grouped = pool.slabs == kAttnSplitGroup;
+#define DGPP_STEP_ATTN_ARGS                                                                                                   \
+  bx, s, smem, a.q, latent, nullptr, a.req_ids, a.pos, list, stride, counts, rows, n_split, a.local_heads, block_tokens, tables, \
+      bpr, total, a.scale, a.m[src], a.l[src], a.c[src], a.tickets[src], a.mg[src], a.lg[src], a.cg[src]
+  using dgpp::dsa_flash::attn_flash_body;
+  if (src == 0) {
+    if (grouped) attn_flash_body<kAttnLatent, kAttnLatent, true, LatentFormat::kFp8Block, kAttnSplitGroup>(DGPP_STEP_ATTN_ARGS);
+    else attn_flash_body<kAttnLatent, kAttnLatent, true, LatentFormat::kFp8Block, 1>(DGPP_STEP_ATTN_ARGS);
+  } else {
+    if (grouped) attn_flash_body<kAttnLatent, kAttnLatent, true, LatentFormat::kFp4Block, kAttnSplitGroup>(DGPP_STEP_ATTN_ARGS);
+    else attn_flash_body<kAttnLatent, kAttnLatent, true, LatentFormat::kFp4Block, 1>(DGPP_STEP_ATTN_ARGS);
+  }
+#undef DGPP_STEP_ATTN_ARGS
+}
+
+// The attention's finish for one (row, head) (kernels/csa2_attn_finish.cuh
+// attn_finish_body): the main source's group partials, then the window's,
+// then the sink (the layer's attn_sink range), normalized, rounded, the
+// query's rotation removed from the last 64; o's row. The reduce class of the
+// phase's last attention pool, gated on every attention pool's blocks.
+__device__ void attention_finish_unit(const StepStreamParams& p, int layer, const DevPhase& ph, const DevPool& pool, unsigned unit,
+                                      uint8_t* smem) {
+  const StepAttnParams& a = p.attn;
+  const int lh = a.local_heads;
+  const int r = static_cast<int>(unit) / lh, h = static_cast<int>(unit) % lh;
+  const DevPool* src[kStepAttnSources] = {nullptr, nullptr};
+  for (int i = 0; i < ph.n_pools; ++i) {
+    const DevPool& q = p.pools[ph.pools[i]];
+    if (q.kind == kPoolAttention && q.site < kStepAttnSources) src[q.site] = &q;
+  }
+  const float* m[kStepAttnSources];
+  const float* l[kStepAttnSources];
+  const float* c[kStepAttnSources];
+  int n[kStepAttnSources];
+  for (int i = 0; i < kStepAttnSources; ++i) {
+    if (src[i] == nullptr) { m[i] = l[i] = c[i] = nullptr; n[i] = 0; continue; }
+    const bool grouped = src[i]->slabs == kAttnSplitGroup;
+    n[i] = grouped ? src[i]->rows / kAttnSplitGroup : src[i]->rows;
+    m[i] = grouped ? a.mg[i] : a.m[i];
+    l[i] = grouped ? a.lg[i] : a.l[i];
+    c[i] = grouped ? a.cg[i] : a.c[i];
+  }
+  csa2_finish::FinishSmem& sm = *reinterpret_cast<csa2_finish::FinishSmem*>(smem);
+  const float* sink = reinterpret_cast<const float*>(p.bases[layer] + pool.offsets[0]);
+  const float* inv_freq = a.inv_freq ? a.inv_freq[layer] : nullptr;
+  if (a.o == nullptr || inv_freq == nullptr || a.pos == nullptr) {
+    if (threadIdx.x == 0) atomicCAS(&p.ctl->status, kStepOk, kStepBadUnit);
+    return;
+  }
+  csa2_finish::attn_finish_body(r, h, sm, m[1], l[1], c[1], n[1], m[0], l[0], c[0], n[0], sink, lh, a.pos, inv_freq, a.o);
+}
+
 // A slabbed projection's reduce unit: chunk `unit` of its [slots, rows]
 // outputs as the sum of the slab partials in slab order, rounded once.
 // With `update_site`, the attention site's stream update follows on the
@@ -643,6 +750,10 @@ __device__ void consumer_unit(const StepStreamParams& p, int layer, const DevPoo
     grp.slots = p.ctl->token_slots;
     grp.tokens = p.ctl->token_slots;
     grp.count = static_cast<int>(p.ctl->rows);
+  }
+  if (pool.kind == kPoolAttention) {
+    attention_unit(p, layer, pool, rb, smem);
+    return;
   }
   if (pool.kind == kPoolMhc) {
     mhc_unit(p, layer, pool, base, rb, smem,
@@ -1052,6 +1163,7 @@ __global__ void __launch_bounds__(kStepThreads, 1) step_stream_kernel(StepStream
               if (gk == kGateFold) open = ld_acq(&ctl->fold_done[P]) != 0u;  // this group's fold
               else if (gk == kGateSite) open = ld_acq(&ctl->site_done[il][sm_cls_gate_arg[c] & 1u]) >= sm_rows;
               else if (gk == kGateTrigger) open = fold_trigger_holds(p, cur_layer, P);  // the fold's window begins
+              else if (gk == kGateAttnPools) open = attn_pools_done(p, il, sm_cls_phase[c]);  // every source's blocks: the finish
               else open = ld_acq(&ctl->pool_done[il][sm_cls_pool[c]]) >= pool_compute_units(p, il, p.pools[sm_cls_pool[c]]);
               if (!open) { any_pending = true; continue; }
             }
@@ -1190,7 +1302,8 @@ __global__ void __launch_bounds__(kStepThreads, 1) step_stream_kernel(StepStream
           }
         }
         __syncthreads();
-        reduce_unit(p, *upool, xunit);
+        if (upool->kind == kPoolAttention) attention_finish_unit(p, xlayer, uph, *upool, xunit, smem);
+        else reduce_unit(p, *upool, xunit);
         __syncthreads();
         if (threadIdx.x == 0) red_release(&ctl->reduce_done[xlayer][pool_id], 1u);
         last_group = -1;
@@ -1221,7 +1334,8 @@ __global__ void __launch_bounds__(kStepThreads, 1) step_stream_kernel(StepStream
         last_group = g;
         last_pool = pool_id;
         if (threadIdx.x == 0) sm_grab_bytes += upool->bytes / upg;
-        if ((upool->kind == kPoolFp8Matrix && upool->slabs > 1 && !projection_split(p, *upool)) || upool->kind == kPoolRouter) {
+        if ((upool->kind == kPoolFp8Matrix && upool->slabs > 1 && !projection_split(p, *upool)) || upool->kind == kPoolRouter ||
+            upool->kind == kPoolAttention) {
           __syncthreads();  // the pool's compute units complete: its reduce units' gate, or the chain's select
           if (threadIdx.x == 0) {
             const unsigned before = atom_add_acq_rel(&ctl->pool_done[xlayer][pool_id], 1u);
@@ -1359,8 +1473,12 @@ bool step_stream_has_fp8_matrix(int k, int rows) {
 }
 unsigned step_stream_mxfp4_smem(int inter) { return step_stream_consumer_smem(inter, true); }
 bool step_stream_has_router(int k) { return k == 5120; }
-unsigned step_stream_consumer_smem(int inter, bool fp8, bool mhc) {
+unsigned step_stream_consumer_smem(int inter, bool fp8, bool mhc, bool attention) {
   unsigned need = mhc ? kMhcUnitSmem + static_cast<unsigned>(kMhcFinishSmemFloats) * 4u : 0u;  // the hyper-connection unit's slice exchange and its finish's
+  if (attention) {  // the flash body's tile, exchange and scratch; the finish's block
+    const size_t flash = dgpp::dsa_flash::attn_flash_smem_bytes<kAttnLatent, kAttnLatent, true, kAttnSplitGroup>();
+    need = std::max(need, static_cast<unsigned>(std::max(flash, sizeof(csa2_finish::FinishSmem))) + 256u);
+  }
   if (inter == kConsumerI) need = static_cast<unsigned>(mxfp4_unit_smem_bytes<kConsumerI>());
   if (fp8) {  // the fp8 forms and the router unit (eight tokens by 5120 bf16 staged: 80 KB) fit the staged cap
     const unsigned split = static_cast<unsigned>(fp8_split_smem_bytes<kSplitMaxK, kSplitRowTiles>());

@@ -30,8 +30,11 @@
 #include "step/dsv41/arena.hpp"
 #include "step/dsv41/plan.hpp"
 #include "step/streamer.hpp"
+#include "kernels/csa2.hpp"
+#include "kernels/dsa.hpp"
 #include "kernels/glm_mhc_launch.hpp"
 #include "kernels/glm_moe_launch.hpp"
+#include "kernels/latent_format.hpp"
 #include "models/glm/mhc.hpp"
 #include "models/glm/moe.hpp"
 #include "step_reference_host.hpp"
@@ -50,7 +53,42 @@ void require(bool cond, const std::string& what) {
   if (!cond) throw std::runtime_error(what);
 }
 
+// The attention consumer's state for a rig (kPoolAttention): a step's queries after the decode
+// tail, the rows' requests and positions, each row's window slot list and selection, the window
+// rings of every layer (fp8_block rows), the main caches of the layers with a compress ratio
+// (fp4_block rows) behind one paged block table, and the rotary tables. Deterministic host
+// values: e4m3 codes with exponents in the middle of the range and e8m0 scales near one, so
+// every decoded key is finite; the lists are permutation prefixes, some rows' counts short of
+// the window and of index_topk so partial tiles and splits are exercised. The oracle (the
+// production kernels on the same inputs) reads the same buffers.
+struct AttnState {
+  int layers = 0, lh = 0, max_requests = kStepMaxRows, ring_slots = 160, window = 128, index_topk = 512, bpr = 8, blocks_total = 0;
+  size_t ring_row = 0, main_row = 0, ring_layer_bytes = 0;
+  uint8_t* ring = nullptr;
+  std::vector<uint8_t*> main;      // per layer (nullptr: window only)
+  std::vector<int> epb;            // per layer
+  std::vector<float*> inv_freq;    // per layer, device [32]
+  const uint8_t** main_d = nullptr;
+  int* epb_d = nullptr;
+  const float** inv_freq_d = nullptr;
+  int32_t* ring_table = nullptr;
+  int32_t* block_tables = nullptr;
+  uint16_t* q = nullptr;
+  int32_t* req_ids = nullptr;
+  int64_t* pos = nullptr;
+  int32_t *wlist = nullptr, *wcounts = nullptr, *topk = nullptr, *counts = nullptr;
+  StepAttnParams params;
+  ~AttnState() {
+    cudaFree(ring);
+    for (uint8_t* m : main) if (m) cudaFree(m);
+    for (float* f : inv_freq) cudaFree(f);
+    cudaFree(main_d); cudaFree(epb_d); cudaFree(inv_freq_d); cudaFree(ring_table); cudaFree(block_tables);
+    cudaFree(q); cudaFree(req_ids); cudaFree(pos); cudaFree(wlist); cudaFree(wcounts); cudaFree(topk); cudaFree(counts);
+  }
+};
+
 struct Rig {
+  std::unique_ptr<AttnState> attn;  // when the consumer mask has the attention
   Dsv41TextConfig cfg;
   std::vector<LayerPlan> plans;
   DevicePlan dp;
@@ -62,6 +100,123 @@ struct Rig {
     for (uint8_t* c : copies) cudaFree(c);
   }
 };
+
+template <typename T>
+T* dev_copy(const std::vector<T>& h) {
+  T* d = nullptr;
+  DGPP_CUDA_OK(cudaMalloc(&d, std::max<size_t>(h.size(), 1) * sizeof(T)));
+  if (!h.empty()) DGPP_CUDA_OK(cudaMemcpy(d, h.data(), h.size() * sizeof(T), cudaMemcpyHostToDevice));
+  return d;
+}
+std::unique_ptr<AttnState> make_attn_state(const Dsv41TextConfig& cfg, const DevicePlan& dp, int layers) {
+  auto A = std::make_unique<AttnState>();
+  A->layers = layers;
+  for (const DevPool& pool : dp.pools)
+    if (pool.kind == kPoolAttention) { A->lh = pool.unit_rows; break; }
+  if (A->lh <= 0) return nullptr;
+  A->window = cfg.sliding_window;
+  A->index_topk = cfg.index_topk;
+  A->ring_row = latent_row_bytes(LatentFormat::kFp8Block, kAttnLatent);
+  A->main_row = latent_row_bytes(LatentFormat::kFp4Block, kAttnLatent);
+  A->ring_layer_bytes = static_cast<size_t>(A->max_requests) * A->ring_slots * A->ring_row;
+  A->blocks_total = A->max_requests * A->bpr;
+  uint64_t st = 0x9e3779b97f4a7c15ull;
+  auto rnd = [&]() { st ^= st << 13; st ^= st >> 7; st ^= st << 17; return static_cast<uint32_t>(st >> 11); };
+  auto e4m3_mid = [&]() { return static_cast<uint8_t>(((rnd() & 1u) << 7) | ((4u + rnd() % 7u) << 3) | (rnd() & 7u)); };  // exponents 4..10
+  // The rings: codes then sixteen e8m0 scales a row (latent_fp8_block_scale_offset).
+  {
+    std::vector<uint8_t> h(static_cast<size_t>(layers) * A->ring_layer_bytes);
+    for (size_t row = 0; row < h.size() / A->ring_row; ++row) {
+      uint8_t* r = h.data() + row * A->ring_row;
+      for (int i = 0; i < kAttnLatent; ++i) r[i] = e4m3_mid();
+      for (size_t i = latent_fp8_block_scale_offset(kAttnLatent); i < A->ring_row; ++i) r[i] = static_cast<uint8_t>(124u + rnd() % 7u);
+    }
+    A->ring = dev_copy(h);
+  }
+  // The main caches: nibbles then 32 e4m3 block scales a row, for the layers with a ratio.
+  std::vector<const uint8_t*> main_h(static_cast<size_t>(layers), nullptr);
+  std::vector<int> epb_h(static_cast<size_t>(layers), 0);
+  std::vector<const float*> inv_h(static_cast<size_t>(layers), nullptr);
+  for (int l = 0; l < layers; ++l) {
+    const int ratio = cfg.compress_ratio(l);
+    if (ratio > 0) {
+      epb_h[static_cast<size_t>(l)] = 128 / ratio;
+      std::vector<uint8_t> h(static_cast<size_t>(A->blocks_total) * epb_h[static_cast<size_t>(l)] * A->main_row);
+      for (size_t row = 0; row < h.size() / A->main_row; ++row) {
+        uint8_t* r = h.data() + row * A->main_row;
+        for (size_t i = 0; i < latent_fp4_scale_offset(kAttnLatent); ++i) r[i] = static_cast<uint8_t>(rnd());
+        for (size_t i = latent_fp4_scale_offset(kAttnLatent); i < A->main_row; ++i) r[i] = e4m3_mid();
+      }
+      A->main.push_back(dev_copy(h));
+      main_h[static_cast<size_t>(l)] = A->main.back();
+    } else {
+      A->main.push_back(nullptr);
+    }
+    A->epb.push_back(epb_h[static_cast<size_t>(l)]);
+    std::vector<float> inv(32);
+    const double theta = ratio > 0 ? cfg.compress_rope_theta : cfg.rope_theta;
+    for (int i = 0; i < 32; ++i) inv[static_cast<size_t>(i)] = static_cast<float>(std::pow(theta, -static_cast<double>(i) / 32.0));
+    A->inv_freq.push_back(dev_copy(inv));
+    inv_h[static_cast<size_t>(l)] = A->inv_freq.back();
+  }
+  A->main_d = dev_copy(main_h);
+  A->epb_d = dev_copy(epb_h);
+  A->inv_freq_d = dev_copy(inv_h);
+  // The tables: the ring's identity over the requests; request r's blocks r * bpr + j.
+  {
+    std::vector<int32_t> ident(static_cast<size_t>(A->max_requests));
+    for (int r = 0; r < A->max_requests; ++r) ident[static_cast<size_t>(r)] = r;
+    A->ring_table = dev_copy(ident);
+    std::vector<int32_t> bt(static_cast<size_t>(A->max_requests) * A->bpr);
+    for (int r = 0; r < A->max_requests; ++r)
+      for (int j = 0; j < A->bpr; ++j) bt[static_cast<size_t>(r) * A->bpr + j] = r * A->bpr + j;
+    A->block_tables = dev_copy(bt);
+  }
+  // The rows: queries in [-1, 1), positions, requests, and the lists as permutation prefixes
+  // (the entries valid for the smallest cache: bpr blocks of 64 entries).
+  {
+    std::vector<uint16_t> q(static_cast<size_t>(kStepMaxRows) * A->lh * kAttnLatent);
+    for (uint16_t& v : q) {
+      const float f = static_cast<float>(rnd() & 0xffffu) / 32768.f - 1.f;
+      uint32_t bits;
+      std::memcpy(&bits, &f, 4);
+      v = static_cast<uint16_t>(bits >> 16);
+    }
+    A->q = dev_copy(q);
+    std::vector<int64_t> pos(static_cast<size_t>(kStepMaxRows));
+    std::vector<int32_t> req(static_cast<size_t>(kStepMaxRows));
+    for (int r = 0; r < kStepMaxRows; ++r) { pos[static_cast<size_t>(r)] = 700 + 37 * r; req[static_cast<size_t>(r)] = r; }
+    A->pos = dev_copy(pos);
+    A->req_ids = dev_copy(req);
+    std::vector<int32_t> wl(static_cast<size_t>(kStepMaxRows) * A->window), wc(static_cast<size_t>(kStepMaxRows));
+    std::vector<int32_t> tk(static_cast<size_t>(kStepMaxRows) * A->index_topk), tc(static_cast<size_t>(kStepMaxRows));
+    const int entries = A->bpr * 64;
+    for (int r = 0; r < kStepMaxRows; ++r) {
+      std::vector<int32_t> perm(static_cast<size_t>(A->ring_slots));
+      for (int i = 0; i < A->ring_slots; ++i) perm[static_cast<size_t>(i)] = i;
+      for (int i = A->ring_slots - 1; i > 0; --i) std::swap(perm[static_cast<size_t>(i)], perm[rnd() % static_cast<uint32_t>(i + 1)]);
+      wc[static_cast<size_t>(r)] = r % 5 == 1 ? 100 : r % 5 == 3 ? 17 : A->window;
+      for (int i = 0; i < A->window; ++i) wl[static_cast<size_t>(r) * A->window + i] = perm[static_cast<size_t>(i)];
+      std::vector<int32_t> ep(static_cast<size_t>(entries));
+      for (int i = 0; i < entries; ++i) ep[static_cast<size_t>(i)] = i;
+      for (int i = entries - 1; i > 0; --i) std::swap(ep[static_cast<size_t>(i)], ep[rnd() % static_cast<uint32_t>(i + 1)]);
+      tc[static_cast<size_t>(r)] = r % 5 == 2 ? 300 : r % 5 == 4 ? 40 : std::min(A->index_topk, entries);
+      for (int i = 0; i < A->index_topk; ++i) tk[static_cast<size_t>(r) * A->index_topk + i] = ep[static_cast<size_t>(i % entries)];
+    }
+    A->wlist = dev_copy(wl); A->wcounts = dev_copy(wc); A->topk = dev_copy(tk); A->counts = dev_copy(tc);
+  }
+  StepAttnParams& P = A->params;
+  P.q = A->q; P.req_ids = A->req_ids; P.pos = A->pos;
+  P.ring = A->ring; P.ring_layer_bytes = A->ring_layer_bytes; P.ring_table = A->ring_table; P.ring_slots = A->ring_slots; P.max_requests = A->max_requests;
+  P.wlist = A->wlist; P.wcounts = A->wcounts; P.window = A->window;
+  P.main = A->main_d; P.epb = A->epb_d; P.block_tables = A->block_tables; P.blocks_per_request = A->bpr; P.blocks_total = A->blocks_total;
+  P.topk = A->topk; P.counts = A->counts; P.index_topk = A->index_topk;
+  P.scale = static_cast<float>(std::pow(static_cast<double>(kAttnLatent), -0.5));
+  P.local_heads = A->lh;
+  P.inv_freq = A->inv_freq_d;
+  DGPP_CUDA_OK(cudaDeviceSynchronize());
+  return A;
+}
 
 // Builds the plan of the first kLayers main layers under the arena and the
 // device arena they stream from.
@@ -167,6 +322,7 @@ std::unique_ptr<Rig> make_rig_mask(int layers, unsigned consumer_mask, bool tile
       }
     }
   }
+  if (consumer_mask & kConsumeAttention) rig->attn = make_attn_state(rig->cfg, rig->dp, layers);
   return rig;
 }
 std::unique_ptr<Rig> make_rig(int layers = kLayers, bool consumers = false, bool tile_major = false) {
@@ -215,6 +371,7 @@ DGPP_TEST(step_stream_rate_at_the_design_chain) {
   auto rig = make_rig();
   std::printf("   %s", device_plan_summary(rig->dp).c_str());
   Streamer s(rig->dp, rig->bases, rig->plans);
+  if (rig->attn) s.set_attention(rig->attn->params);
   const StreamerConfig cfg = design_config();
   require(cfg.workers >= 16, "fewer than 16 worker blocks can be co-resident");
   const StreamReport r = s.run(cfg);
@@ -252,6 +409,7 @@ DGPP_TEST(step_stream_rate_at_the_design_chain) {
 DGPP_TEST(step_stream_governor_bounds_the_leaders) {
   auto rig = make_rig();
   Streamer s(rig->dp, rig->bases, rig->plans);
+  if (rig->attn) s.set_attention(rig->attn->params);
   StreamerConfig cfg = design_config();
   cfg.steps = 2;
   cfg.max_leaders = 4;
@@ -264,6 +422,7 @@ DGPP_TEST(step_stream_governor_bounds_the_leaders) {
 DGPP_TEST(step_stream_deadline_ends_the_kernel) {
   auto rig = make_rig();
   Streamer s(rig->dp, rig->bases, rig->plans);
+  if (rig->attn) s.set_attention(rig->attn->params);
   StreamerConfig cfg = design_config();
   cfg.steps = 1;
   cfg.deadline_s = 50e-6;  // a 190 MB phase takes 800 us at the ceiling
@@ -278,6 +437,7 @@ DGPP_TEST(step_stream_deadline_ends_the_kernel) {
 DGPP_TEST(step_stream_poison_ends_the_kernel) {
   auto rig = make_rig();
   Streamer s(rig->dp, rig->bases, rig->plans);
+  if (rig->attn) s.set_attention(rig->attn->params);
   StreamerConfig cfg = design_config();
   cfg.steps = 1000;  // seconds of work the poison cuts short
   cfg.deadline_s = 0;
@@ -299,6 +459,7 @@ DGPP_TEST(step_stream_poison_ends_the_kernel) {
 DGPP_TEST(step_protocol_soak_without_host_work) {
   auto rig = make_rig(2);
   Streamer s(rig->dp, rig->bases, rig->plans);
+  if (rig->attn) s.set_attention(rig->attn->params);
   StreamerConfig cfg = design_config();
   cfg.steps = 1000;
   cfg.tokens = {11, 22, 33, 44, 55};
@@ -322,6 +483,7 @@ DGPP_TEST(step_protocol_soak_without_host_work) {
 DGPP_TEST(step_protocol_skip_and_host_work_beside_a_pending_kernel) {
   auto rig = make_rig(2);
   Streamer s(rig->dp, rig->bases, rig->plans);
+  if (rig->attn) s.set_attention(rig->attn->params);
   cudaStream_t side = nullptr;
   DGPP_CUDA_OK(cudaStreamCreateWithFlags(&side, cudaStreamNonBlocking));
   uint8_t* scratch = nullptr;
@@ -358,6 +520,7 @@ DGPP_TEST(step_protocol_skip_and_host_work_beside_a_pending_kernel) {
 DGPP_TEST(step_protocol_sequence_crosses_the_epoch_boundaries) {
   auto rig = make_rig(1);
   Streamer s(rig->dp, rig->bases, rig->plans);
+  if (rig->attn) s.set_attention(rig->attn->params);
   for (const uint64_t first : {(uint64_t{1} << 32) - 2, ~uint64_t{0} - 2}) {
     StreamerConfig cfg = design_config();
     cfg.steps = 4;
@@ -377,6 +540,7 @@ DGPP_TEST(step_protocol_sequence_crosses_the_epoch_boundaries) {
 DGPP_TEST(step_protocol_gather_phase_waits_for_the_host_sequence) {
   auto rig = make_rig(2);  // layer 1 is an Engram layer: its first phase gathers host rows
   Streamer s(rig->dp, rig->bases, rig->plans);
+  if (rig->attn) s.set_attention(rig->attn->params);
   StreamerConfig cfg = design_config();
   cfg.steps = 2;
   const StreamReport prompt = s.run(cfg);
@@ -404,6 +568,7 @@ void consumers_match_the_reference(bool tile_major) {
   // (the sites' own case checks their rows and updates against the production kernels).
   auto rig = make_rig_mask(2, kConsumeAll & ~kConsumeMhc, tile_major);
   Streamer s(rig->dp, rig->bases, rig->plans);
+  if (rig->attn) s.set_attention(rig->attn->params);
   require(s.consumers(), "the plan's expert pools took the MXFP4 consumer");
   StreamerConfig cfg = design_config();
   cfg.steps = 1;
@@ -611,6 +776,7 @@ void print_layers(const StreamReport& r) {
 double consumers_rate(bool tile_major) {
   auto rig = make_rig(kLayers, /*consumers=*/true, tile_major);
   Streamer s(rig->dp, rig->bases, rig->plans);
+  if (rig->attn) s.set_attention(rig->attn->params);
   StreamerConfig cfg = design_config();
   cfg.steps = 3;
   cfg.rows = 5;
@@ -663,6 +829,7 @@ DGPP_TEST(step_consumers_rate_at_the_design_chain) {
 double consumers_rate_mask(unsigned mask, const char* title) {
   auto rig = make_rig_mask(kLayers, mask, /*tile_major=*/true);
   Streamer s(rig->dp, rig->bases, rig->plans);
+  if (rig->attn) s.set_attention(rig->attn->params);
   StreamerConfig cfg = design_config();
   cfg.steps = 3;
   cfg.rows = 5;
@@ -709,6 +876,7 @@ DGPP_TEST(step_consumers_lever_matrix) {
   };
   for (const Variant& v : variants) {
     Streamer s(rig->dp, rig->bases, rig->plans);
+    if (rig->attn) s.set_attention(rig->attn->params);
     StreamerConfig cfg = design_config();
     cfg.steps = 3;
     cfg.rows = 5;
@@ -767,6 +935,7 @@ DGPP_TEST(step_consumers_lever_matrix) {
 DGPP_TEST(step_router_class_alone) {
   auto rig = make_rig_mask(kLayers, kConsumeRouter, /*tile_major=*/true);
   Streamer s(rig->dp, rig->bases, rig->plans);
+  if (rig->attn) s.set_attention(rig->attn->params);
   StreamerConfig cfg = design_config();
   cfg.steps = 3;
   cfg.rows = 5;
@@ -802,6 +971,7 @@ DGPP_TEST(step_consumers_attribution) {
   consumers_rate_mask(kConsumeProjections, "the projections as consumers:");
   consumers_rate_mask(kConsumeAll & ~kConsumeMhc, "every consumer but the hyper-connection sites:");
   consumers_rate_mask(kConsumeAll, "every consumer:");
+  consumers_rate_mask(kConsumeAll | kConsumeAttention, "every consumer and the attention:");
 }
 
 // The step's routing against the production router kernel on the same
@@ -813,6 +983,7 @@ DGPP_TEST(step_router_matches_the_production_kernel) {
   // site rewrites x, and the sites have their own case against the production kernels below.
   auto rig = make_rig_mask(kLayers, kConsumeAll & ~kConsumeMhc, /*tile_major=*/true);
   Streamer s(rig->dp, rig->bases, rig->plans);
+  if (rig->attn) s.set_attention(rig->attn->params);
   require(s.n_experts() == 384, "the plan has a router pool of 384 experts");
   StreamerConfig cfg = design_config();
   cfg.steps = 1;
@@ -912,6 +1083,7 @@ DGPP_TEST(step_consumers_lead_sweep) {
   // The lead's cap against the consumers' own L2 use, with every consumer real (report only).
   auto rig = make_rig(kLayers, /*consumers=*/true, /*tile_major=*/true);
   Streamer s(rig->dp, rig->bases, rig->plans);
+  if (rig->attn) s.set_attention(rig->attn->params);
   for (const int mib : {4, 8, 12, 16, 20, 32, 64, 128}) {
     StreamerConfig cfg = design_config();
     cfg.steps = 3;
@@ -1080,6 +1252,87 @@ MhcSiteCheck check_mhc_layer(const Rig& rig, const Streamer& s, const StreamerCo
 // its fold, from the streams and pre a two-layer run leaves (the same copies
 // and fills): the chaining across layers and groups. Then two eight-layer
 // runs that must agree bitwise, and three steps on one.
+// The attention consumer against the production kernels: the step's o rows (the attend phase's
+// blocks and finish over the rig's state pool) must equal dsa_attn_listed over the window ring
+// and the main cache plus csa2_attn_finish on the same inputs, bitwise, on a window-only layer
+// (layer 0 alone) and on a layer with both sources (the last of kLayers), and repeat bitwise.
+DGPP_TEST(step_attention_matches_the_production_kernels) {
+  for (int layers : {1, kLayers}) {
+    auto rig = make_rig_mask(layers, kConsumeAll | kConsumeAttention, /*tile_major=*/true);
+    require(rig->attn != nullptr, "the rig has the attention state");
+    const AttnState& A = *rig->attn;
+    Streamer s(rig->dp, rig->bases, rig->plans);
+    if (rig->attn) s.set_attention(rig->attn->params);
+    s.set_attention(A.params);
+    StreamerConfig cfg = design_config();
+    cfg.steps = 1;
+    cfg.rows = 5;
+    cfg.top_k = 6;
+    const StreamReport r = s.run(cfg);
+    require(r.status == kStepOk, std::string("the kernel ended on ") + r.status_text);
+    const int L = layers - 1, rows = cfg.rows, lh = A.lh;
+    const size_t on = static_cast<size_t>(rows) * lh * kAttnLatent;
+    std::vector<uint16_t> got(on);
+    DGPP_CUDA_OK(cudaMemcpy(got.data(), s.attn_o(), on * 2, cudaMemcpyDeviceToHost));
+    int n_win = 0, n_main = 0;
+    uint64_t sink_off = 0;
+    const DevLayer& dl = rig->dp.layers[static_cast<size_t>(L)];
+    for (int P = dl.phase_begin; P < dl.phase_begin + dl.phase_count; ++P)
+      for (int i = 0; i < rig->dp.phases[static_cast<size_t>(P)].n_pools; ++i) {
+        const DevPool& q = rig->dp.pools[static_cast<size_t>(rig->dp.phases[static_cast<size_t>(P)].pools[i])];
+        if (q.kind != kPoolAttention) continue;
+        (q.site == 0 ? n_win : n_main) = q.rows;
+        sink_off = q.offsets[0];
+      }
+    require(n_win == 8, "the window source has eight splits");
+    require((n_main > 0) == (A.main[static_cast<size_t>(L)] != nullptr), "the main source follows the layer's ratio");
+    // The production kernels on the same inputs.
+    auto ws = [&](int n, float*& m, float*& l, float*& c, float*& mg, float*& lg, float*& cg, int32_t*& t) {
+      const size_t ml = static_cast<size_t>(rows) * n * lh;
+      DGPP_CUDA_OK(cudaMalloc(&m, ml * 4)); DGPP_CUDA_OK(cudaMalloc(&l, ml * 4)); DGPP_CUDA_OK(cudaMalloc(&c, ml * kAttnLatent * 4));
+      DGPP_CUDA_OK(cudaMalloc(&mg, ml / 8 * 4)); DGPP_CUDA_OK(cudaMalloc(&lg, ml / 8 * 4)); DGPP_CUDA_OK(cudaMalloc(&cg, ml / 8 * kAttnLatent * 4));
+      const size_t tickets = static_cast<size_t>((rows * lh + 31) / 32) * (n / 8);
+      DGPP_CUDA_OK(cudaMalloc(&t, tickets * 4)); DGPP_CUDA_OK(cudaMemset(t, 0, tickets * 4));
+    };
+    float *mw, *lw, *cw, *mgw, *lgw, *cgw, *mm = nullptr, *lm = nullptr, *cm = nullptr, *mgm = nullptr, *lgm = nullptr, *cgm = nullptr;
+    int32_t *tw, *tm = nullptr;
+    ws(n_win, mw, lw, cw, mgw, lgw, cgw, tw);
+    bool ok = dsa_attn_listed(A.q, A.ring + static_cast<size_t>(L) * A.ring_layer_bytes, A.req_ids, A.wlist, A.window, A.wcounts, rows, n_win, lh,
+                              kAttnLatent, A.ring_slots, A.ring_table, 1, A.params.scale, mw, lw, cw, nullptr, LatentFormat::kFp8Block, nullptr, 0,
+                              A.max_requests, kAttnSplitGroup, tw, mgw, lgw, cgw);
+    require(ok, "the production listed kernel took the window");
+    if (n_main) {
+      ws(n_main, mm, lm, cm, mgm, lgm, cgm, tm);
+      ok = dsa_attn_listed(A.q, A.main[static_cast<size_t>(L)], A.req_ids, A.topk, A.index_topk, A.counts, rows, n_main, lh, kAttnLatent,
+                           A.epb[static_cast<size_t>(L)], A.block_tables, A.bpr, A.params.scale, mm, lm, cm, nullptr, LatentFormat::kFp4Block, nullptr,
+                           0, A.blocks_total, kAttnSplitGroup, tm, mgm, lgm, cgm);
+      require(ok, "the production listed kernel took the main cache");
+    }
+    uint16_t* o_ref = nullptr;
+    DGPP_CUDA_OK(cudaMalloc(&o_ref, on * 2));
+    csa2_attn_finish(n_main ? mgm : nullptr, n_main ? lgm : nullptr, n_main ? cgm : nullptr, n_main / kAttnSplitGroup, mgw, lgw, cgw,
+                     n_win / kAttnSplitGroup, reinterpret_cast<const float*>(rig->bases[static_cast<size_t>(L)] + sink_off), rows, lh, A.pos,
+                     A.inv_freq[static_cast<size_t>(L)], o_ref, nullptr);
+    DGPP_CUDA_OK(cudaDeviceSynchronize());
+    std::vector<uint16_t> ref(on);
+    DGPP_CUDA_OK(cudaMemcpy(ref.data(), o_ref, on * 2, cudaMemcpyDeviceToHost));
+    size_t differ = 0;
+    for (size_t i = 0; i < on; ++i) differ += got[i] != ref[i];
+    const StreamReport r2 = s.run(cfg);
+    require(r2.status == kStepOk, std::string("the second run ended on ") + r2.status_text);
+    std::vector<uint16_t> again(on);
+    DGPP_CUDA_OK(cudaMemcpy(again.data(), s.attn_o(), on * 2, cudaMemcpyDeviceToHost));
+    size_t differ_again = 0;
+    for (size_t i = 0; i < on; ++i) differ_again += got[i] != again[i];
+    std::printf("   attention in the step, layer %d of %d (%s), %d rows x %d heads: %zu of %zu differ from the production kernels, %zu between runs\n", L,
+                layers, n_main ? "window and main cache" : "window only", rows, lh, differ, on, differ_again);
+    for (float* f : {mw, lw, cw, mgw, lgw, cgw, mm, lm, cm, mgm, lgm, cgm}) if (f) cudaFree(f);
+    cudaFree(tw); if (tm) cudaFree(tm); cudaFree(o_ref);
+    require(differ == 0, "the step's attention rows differ from the production kernels'");
+    require(differ_again == 0, "the step's attention rows are not bitwise across runs");
+  }
+}
+
 DGPP_TEST(step_mhc_sites_match_the_production_kernels) {
   StreamerConfig cfg = design_config();
   cfg.steps = 1;
@@ -1090,6 +1343,7 @@ DGPP_TEST(step_mhc_sites_match_the_production_kernels) {
   {
     auto rig = make_rig_mask(1, kConsumeAll, /*tile_major=*/true);
     Streamer s(rig->dp, rig->bases, rig->plans);
+    if (rig->attn) s.set_attention(rig->attn->params);
     require(s.mhc(), "the plan has the hyper-connection pools");
     const int H = rig->cfg.hidden_size;
     sn = static_cast<size_t>(rows) * 4 * H;
@@ -1124,6 +1378,7 @@ DGPP_TEST(step_mhc_sites_match_the_production_kernels) {
   {
     auto rig2 = make_rig_mask(2, kConsumeAll, /*tile_major=*/true);
     Streamer s2(rig2->dp, rig2->bases, rig2->plans);
+    if (rig2->attn) s2.set_attention(rig2->attn->params);
     const StreamReport r2 = s2.run(cfg);
     require(r2.status == kStepOk, std::string("the two-layer run ended on ") + r2.status_text);
     DGPP_CUDA_OK(cudaMemcpy(S0, s2.streams(0), sn * 2, cudaMemcpyDeviceToDevice));
@@ -1136,6 +1391,7 @@ DGPP_TEST(step_mhc_sites_match_the_production_kernels) {
       if (ph.accumulate && ph.merged && ph.layer == 1) merged_site = true;
     require(merged_site, "layer 2's attention site runs inside layer 1's accumulate group");
     Streamer s3(rig3->dp, rig3->bases, rig3->plans);
+    if (rig3->attn) s3.set_attention(rig3->attn->params);
     const StreamReport r3 = s3.run(cfg);
     require(r3.status == kStepOk, std::string("the three-layer run ended on ") + r3.status_text);
     const MhcSiteCheck c = check_mhc_layer(*rig3, s3, cfg, 2, S0, P0);
@@ -1151,8 +1407,10 @@ DGPP_TEST(step_mhc_sites_match_the_production_kernels) {
   // show; then three steps for the pre chain, the stream parity and the arrival counters.
   auto rig8 = make_rig_mask(kLayers, kConsumeAll, /*tile_major=*/true);
   Streamer s8(rig8->dp, rig8->bases, rig8->plans);
+  if (rig8->attn) s8.set_attention(rig8->attn->params);
   {
     Streamer s8b(rig8->dp, rig8->bases, rig8->plans);
+    if (rig8->attn) s8b.set_attention(rig8->attn->params);
     const StreamReport ra = s8.run(cfg), rb = s8b.run(cfg);
     require(ra.status == kStepOk && rb.status == kStepOk, "an eight-layer run ended on " + ra.status_text + " / " + rb.status_text);
     int same_counts = 0;

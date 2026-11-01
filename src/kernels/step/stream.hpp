@@ -108,6 +108,53 @@ struct alignas(128) StepCtl {
   unsigned route_pool;  // the synthetic router picks from this many experts of a layer (0: all), 32 reproduces the measured overlap
 };
 
+// The CSA2 attention consumer's operands (kPoolAttention): the queries after
+// the decode tail, q [rows][local_heads * 512] bf16 (a later latency unit
+// writes them in the kernel; the test provides them); the rows' requests and
+// positions; the window ring (layer l's rows at ring + l * ring_layer_bytes,
+// [max_requests][ring_slots] rows of the fp8_block form, the identity table)
+// with each row's slot list [rows][window] and counts; the main caches per
+// layer ([entries] rows of the fp4_block form, nullptr on a window-only
+// layer) with their entries a block, the paged block table and each row's
+// selection [rows][index_topk] and counts; the per-source split partials
+// (m, l [rows][n_split][local_heads], c [..][512]) and their group partials
+// and tickets (kernels/dsa.hpp kAttnSplitGroup); the rotary table per layer
+// for the finish's inverse rotation; the output o [rows][local_heads * 512]
+// bf16. The sink is the layer's arena range (the pool's offsets[0]).
+constexpr int kStepAttnSources = 2;  // 0 the window ring, 1 the main cache
+struct StepAttnParams {
+  const uint16_t* q = nullptr;
+  const int32_t* req_ids = nullptr;
+  const int64_t* pos = nullptr;
+  const uint8_t* ring = nullptr;
+  unsigned long long ring_layer_bytes = 0;
+  const int32_t* ring_table = nullptr;
+  int ring_slots = 0;
+  int max_requests = 0;
+  const int32_t* wlist = nullptr;
+  const int32_t* wcounts = nullptr;
+  int window = 0;
+  const uint8_t* const* main = nullptr;  // per layer
+  const int* epb = nullptr;              // per layer: the main cache's entries a block
+  const int32_t* block_tables = nullptr;
+  int blocks_per_request = 0;
+  int blocks_total = 0;
+  const int32_t* topk = nullptr;
+  const int32_t* counts = nullptr;
+  int index_topk = 0;
+  float scale = 0.f;
+  int local_heads = 0;
+  const float* const* inv_freq = nullptr;  // per layer: [32]
+  float* m[kStepAttnSources] = {nullptr, nullptr};
+  float* l[kStepAttnSources] = {nullptr, nullptr};
+  float* c[kStepAttnSources] = {nullptr, nullptr};
+  float* mg[kStepAttnSources] = {nullptr, nullptr};
+  float* lg[kStepAttnSources] = {nullptr, nullptr};
+  float* cg[kStepAttnSources] = {nullptr, nullptr};
+  int32_t* tickets[kStepAttnSources] = {nullptr, nullptr};
+  uint16_t* o = nullptr;
+};
+
 struct StepStreamParams {
   // The protocol (step/protocol.hpp): pinned rings of kStepRingSlots, the
   // device token feed [2][kStepMaxRows] by step parity, the host's sequence.
@@ -189,6 +236,7 @@ struct StepStreamParams {
   // fold's window (fewer bytes, or an earlier window). 0: unbounded.
   unsigned stage_workers = 0;
   unsigned stage_lead_pause = 0;
+  StepAttnParams attn;                         // the attention consumer's operands (kPoolAttention)
   unsigned long long deadline_ns = 0;          // every in-step spin's deadline (0: none)
   unsigned long long pending_deadline_ns = 0;  // how long the chain waits for the host's next descriptor (0: forever)
 };
@@ -207,7 +255,7 @@ unsigned step_stream_mxfp4_smem(int inter);
 // The dynamic shared memory the consumer pools present need: the MXFP4 forms
 // when a routed pool at `inter` exists (0: none), the fp8 forms when `fp8`,
 // the hyper-connection units' scratch when `mhc`.
-unsigned step_stream_consumer_smem(int inter, bool fp8, bool mhc = false);
+unsigned step_stream_consumer_smem(int inter, bool fp8, bool mhc = false, bool attention = false);
 // Whether the kernel has a router unit at this inner width.
 bool step_stream_has_router(int k);
 // The partials' index: token-major, the slots of one output element in one sector.

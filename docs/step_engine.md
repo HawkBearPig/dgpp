@@ -600,6 +600,74 @@ The rate case's band after this round, over four windows: tile-major 79.5
 to 80.7, row-major 73.3 to 75.4 (the better of two samples gates at 78 and
 73; the suites pass).
 
+## The attention consumer
+
+The attend phase's units are the production attention itself. DeepSeek-V4.1's
+CSA2 decode attention runs the flash listed kernel over two latent sources, the
+request's window ring (at most 128 keys of the fp8_block form, each row's slot
+list from the decode tail) and the main cache (the 512 selected entries of the
+fp4_block form behind the paged block table), in splits of one 16-key tile,
+merging each eight consecutive splits' partials in the last of their blocks,
+then a finish per (row, head) that merges the two sources' group partials with
+the sink, normalizes, rounds and removes the query's rotation from the last 64.
+A block of that kernel is 256 threads over 32 (row, head) M-rows (two one-row
+slabs of 16 heads) and one split, which is the step kernel's block. So the
+kernel's body moved into a header (`kernels/dsa_attn_flash.cuh`, with the
+latent tile loaders) as a device function taking the block's coordinates and
+its shared memory, the production kernel became a wrapper that passes its
+block index, and the step's attention unit calls the same body with the unit's
+coordinates (bx = unit % blocks, s = unit / blocks, so a block's units run in
+sequence and share its queries in L2); the finish the same way
+(`kernels/csa2_attn_finish.cuh`). The former static shared arrays of both
+bodies are carved from the dynamic shared memory, since the step kernel's
+static budget was spoken for. One body, two callers, so the step's rows are
+the production's bitwise by construction, and the DSA and CSA2 suites (69
+cases) passed unchanged on the wrapped kernels.
+
+In the plan the attend phase's two pool-sourced ranges become one attention
+pool each (`kPoolAttention`, the source in `site`, the splits in `rows`, the
+group in `slabs`, local_heads in `unit_rows`, the layer's sink range in
+`offsets[0]`): a pool's units are its splits times the step's (row, head)
+blocks, and the phase's last attention pool carries the finish as its reduce
+class, one (row, head) a unit, gated on every attention pool's blocks. The
+kernel's operands (`StepAttnParams`: the queries after the decode tail, the
+rows' requests and positions, the ring and its table, the slot lists, the
+main caches per layer with the block table and the selections, the rotary
+tables, the scale) are set on the streamer before a run; the partials, the
+group tickets and the output o are the streamer's. The upstream producers
+(the queries from the q projection through the decode tail's rope, the slot
+lists, the selection) are latency work the kernel does not do yet, so the
+rig and the adapter provide them; downstream, the output projection reads x
+in the rig where it will read o. `step_attention_matches_the_production_
+kernels` runs the step over a rig whose state pool holds deterministic rows
+(e4m3 codes with mid-range exponents, e8m0 scales near one, permutation
+prefixes for the lists with some rows' counts short of the window and of the
+selection) and compares o against `dsa_attn_listed` on both sources plus
+`csa2_attn_finish` on the same inputs: 0 of 40960 elements differ on a
+window-only layer and on a layer with both sources, and the rows repeat
+bitwise. The flash body in the kernel took its stack from 48 to 96 bytes a
+thread; with the attention off, the kernel carrying it read tile-major 78.7
+to 79.8 and row-major 72.8 to 74.0 on four samples (every consumer 79.2),
+the low edge of the band before it.
+
+Measured as its own phase the attention costs the layer six points (the
+attribution's every consumer and the attention 73.5 against 79.5 without
+it; tile-major 72.8 to 74.5 against 79.5 to 80.7, row-major 68.0 against
+73.3 to 75.4), so it is landed behind its mask bit and the rate gates keep
+the set they were measured with. The attend phase ran 87 µs at five rows:
+the window's 24 blocks handed out within 4 µs and complete at 35, the
+main's 96 by 67, the finish's 80 units to 87, so a flash block takes about
+30 µs in the kernel where the production's take 5 to 7, its dependent
+round trips (the queries, the list's resolve through the table, the two
+fetch passes, the publish, and for the group's last block the fold's 512
+KB of partials from L2) each at the L2's latency under the lead's stream.
+What the design budgets for attend is 2 µs of exposed latency, which means
+its classes inside a stream phase's drain, not a phase: the next change
+merges the attend phase into the qkv group behind the q projection (so
+the units run under the projections' drain and the output projection
+publishes when the finish ends, no phase boundary either side), and the
+unit form under the stream follows the router's and the site's lessons.
+
 ## The step protocol
 
 The kernel runs steps, not launches. The host and the kernel share two

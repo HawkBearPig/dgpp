@@ -133,6 +133,12 @@ class Streamer {
   const float* out() const { return out_; }
   const uint16_t* y() const { return y_; }
   const uint16_t* proj() const { return proj_; }  // the projections' outputs, bf16, at each pool's out_offset
+  // The attention consumer (kPoolAttention): its inputs (the queries, the rows' requests and
+  // positions, the state pool's planes and tables, the lists, the rotary tables, the scale) are
+  // set before a run; the partials, the tickets and the output o are the streamer's.
+  void set_attention(const StepAttnParams& inputs) { attn_in_ = inputs; }
+  bool attention() const { return attention_; }
+  const uint16_t* attn_o() const { return attn_o_; }  // [kStepMaxRows][local_heads * 512] bf16
   const float* scores() const { return scores_; }  // the router pool's scores [kStepMaxRows][n_experts]
   // The hyper-connection sites' operands when the plan has their pools (null otherwise): the
   // residual streams [kStepMaxRows][4][hidden] bf16 by site parity (0: the attention site's input,
@@ -188,6 +194,19 @@ class Streamer {
   int n_experts_ = 0;
   unsigned consumer_smem_ = 0;
   bool mhc_ = false;
+  bool attention_ = false;
+  StepAttnParams attn_in_;
+  int attn_local_heads_ = 0;
+  int attn_n_split_[kStepAttnSources] = {0, 0};
+  int attn_group_[kStepAttnSources] = {1, 1};
+  float* attn_m_[kStepAttnSources] = {nullptr, nullptr};
+  float* attn_l_[kStepAttnSources] = {nullptr, nullptr};
+  float* attn_c_[kStepAttnSources] = {nullptr, nullptr};
+  float* attn_mg_[kStepAttnSources] = {nullptr, nullptr};
+  float* attn_lg_[kStepAttnSources] = {nullptr, nullptr};
+  float* attn_cg_[kStepAttnSources] = {nullptr, nullptr};
+  int32_t* attn_tickets_[kStepAttnSources] = {nullptr, nullptr};
+  uint16_t* attn_o_ = nullptr;
   uint16_t* streams_[2] = {nullptr, nullptr};
   float* pre_[2] = {nullptr, nullptr};
   float* post_ = nullptr;

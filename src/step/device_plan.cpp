@@ -49,7 +49,7 @@ DevicePlan lower_plan(const std::vector<LayerPlan>& layers, uint32_t unit_bytes,
   if (unit_bytes == 0 || unit_bytes % 512 != 0) throw std::invalid_argument("lower_plan: unit_bytes must be a multiple of 512");
   const bool experts = (consumer_mask & kConsumeExperts) != 0, shared = (consumer_mask & kConsumeShared) != 0,
              projections = (consumer_mask & kConsumeProjections) != 0, router = (consumer_mask & kConsumeRouter) != 0,
-             mhc = (consumer_mask & kConsumeMhc) != 0;
+             mhc = (consumer_mask & kConsumeMhc) != 0, attention = (consumer_mask & kConsumeAttention) != 0;
   const bool consumers = consumer_mask != 0;
   DevicePlan dp;
   dp.unit_bytes = unit_bytes;
@@ -199,6 +199,45 @@ DevicePlan lower_plan(const std::vector<LayerPlan>& layers, uint32_t unit_bytes,
             shared_pool.push_back(weights);
             shared_pool.push_back(bias);
           }
+        }
+        // The CSA2 attention as consumer pools, one per latent source the phase reads from the
+        // state pool (the window ring's fp8_block rows, the main cache's fp4_block selected
+        // entries): a unit is one block of the production flash kernel, 32 (row, head) M-rows
+        // over one split of 16 keys (kernels/dsa_attn_flash.cuh), so a source's splits are its
+        // keys a read over the tile; the phase's last attention pool carries the finish as its
+        // reduce class, one (row, head) a unit, merging every source's group partials with the
+        // layer's sink (its attn_sink range) and the rotary table (kernels/csa2_attn_finish.cuh).
+        // The pools' bytes are the state pool's, not the arena's: no segment, no lead.
+        if (attention) {
+          const Range* sink = nullptr;
+          for (const Range& r : lp.ranges)
+            if (r.source == Source::Resident && r.consumer == Consumer::Attention && r.format == Format::F32 && r.name == "attn.attn_sink") sink = &r;
+          int last_attention = -1;
+          for (const Range& r : lp.ranges) {
+            if (r.phase != static_cast<int>(ph) || r.source != Source::Pool || r.consumer != Consumer::Attention || r.reads == 0) continue;
+            if (r.format != Format::KvFp8Block && r.format != Format::KvFp4Block) continue;
+            if (!sink) throw std::logic_error("lower_plan: the attention consumer needs the layer's attn_sink range");
+            if (r.rows <= 0 || r.rows % kAttnTile != 0)
+              throw std::logic_error("lower_plan: an attention source's keys a read (" + r.name + ") must be whole 16-key tiles");
+            DevPool pool;
+            pool.kind = kPoolAttention;
+            pool.group_kind = kGroupTokens;
+            pool.groups = 1;
+            pool.stride = 0;
+            pool.base = 0;
+            pool.bytes = 0;
+            pool.site = r.format == Format::KvFp8Block ? 0 : 1;
+            pool.rows = static_cast<int32_t>(r.rows / kAttnTile);
+            pool.k = kAttnLatent;
+            pool.slabs = pool.rows % kAttnGroup == 0 ? kAttnGroup : 1;
+            pool.unit_rows = static_cast<int32_t>(sink->cols);  // local_heads
+            pool.units_per_group = pool.rows;  // times the step's (row, head) blocks, at run time
+            pool.grab = 1;
+            pool.offsets[0] = sink->offset;
+            last_attention = d.n_pools;
+            add_pool(dp, d, pool);
+          }
+          if (last_attention >= 0) dp.pools[static_cast<size_t>(d.pools[last_attention])].gate_arg = 1;
         }
         const Range* payload[3] = {nullptr, nullptr, nullptr};
         const Range* scales[3] = {nullptr, nullptr, nullptr};

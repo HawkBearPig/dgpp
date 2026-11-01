@@ -2529,7 +2529,28 @@ area, untracked.
       site units meanwhile, so the router's rows are not all hot at its
       gate; fewer bytes (the bf12 rows) or an earlier staging window under
       a cache policy the stream does not evict are the levers.
-      Owed here: the attention consumer, the folds and the select as
+      The attention consumer landed next (2026-11-01, night): the
+      production flash listed kernel's block body and the CSA2 finish's
+      moved into headers as device functions taking a block's coordinates
+      (the production kernels wrappers over them; 69 DSA and CSA2 cases
+      unchanged), and the step's attend phase runs them as units: one pool
+      per latent source (the window ring's fp8_block rows, the main
+      cache's fp4_block selected entries), a unit one block of 32 (row,
+      head) M-rows over a 16-key split with the eight-split group merge,
+      the finish the last pool's reduce class, one (row, head) a unit.
+      Bitwise the production kernels on a rig state pool (0 of 40960 on
+      a window-only layer and on a layer with both sources, repeat
+      bitwise). The queries after the decode tail, the slot lists and the
+      selection are provided (the latency producers come with the latency
+      warps item); the output projection still reads x where it will read
+      o. The kernel's stack 48 to 96 bytes. As its own phase it costs six
+      points (73.5 against 79.5; a flash block 30 µs in the kernel against
+      5 to 7 in production, the fold's 512 KB of partials on the last
+      block), so it is behind its mask bit (`kConsumeAttention`, outside
+      `kConsumeAll`) until its classes run inside the qkv group's drain
+      with the output projection published off the finish; that merge and
+      the unit's form under the stream are the next step of this item.
+      Owed here: the folds and the select as
       consumers, and the chain's critical path after the attention-output
       fold, now about 60 µs against the budget's 34: the site's class
       about 12 to the last row's release (its hand-out and units of 8), the
