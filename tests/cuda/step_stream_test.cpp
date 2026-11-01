@@ -688,16 +688,24 @@ double consumers_rate_mask(unsigned mask, const char* title) {
 // site and router class windows and tail.
 DGPP_TEST(step_consumers_lever_matrix) {
   auto rig = make_rig_mask(kLayers, kConsumeAll, /*tile_major=*/true);
-  // The second set (2026-11-01): the latency-bound classes run two to three times their standalone
-  // time in the kernel whether or not the memory is saturated; the lead runs in every case, so the
-  // variants take it away (no lead at all; one leader while a site's or the router's units run).
-  struct Variant { const char* name; bool gated_first; unsigned critical_leaders; int chunk; bool pipeline; bool yield; uint64_t lead_cap; bool router_pause; };
+  // The scheduling levers as a set, two samples each, with the attention-output group's site and
+  // router windows (the knobs that lost were retired 2026-11-01: gated classes first, a leader
+  // bound while critical units run, the 2048 chunk, the pipelined router, the lead paused for the
+  // router; the yield on an opened gate won and is the kernel's). The lead itself remains the
+  // variable: with it, and without it at all.
+  // The staging class as a set with the lead (2026-11-01): its workers capped at what saturates the
+  // memory, and the lead paused while it has units left, against each alone and against neither
+  // (the kernel's default: the set measured 80.6 and 80.7 here against 79.7 and 80.0, but six rate
+  // samples with it on sat at 79.1 to 80.1 against 80.2 to 80.7, the lead's lost staging of the
+  // expert phase; it pays once the staging fits the fold's window).
+  struct Variant { const char* name; uint64_t lead_cap; unsigned stage_workers; bool stage_lead_pause; };
   const uint64_t kCap = uint64_t{16} << 20;
   const Variant variants[] = {
-      {"baseline (phase order, chunk 512, lead 16 MB)", false, 0, 512, false, true, kCap, false},
-      {"the lead paused while the router's units run", false, 0, 512, false, true, kCap, true},
-      {"one leader while critical", false, 1, 512, false, true, kCap, false},
-      {"no lead", false, 0, 512, false, true, 0, false},
+      {"baseline: staging unbounded, lead not paused", kCap, 0, false},
+      {"staging capped at 16 workers, lead paused for it", kCap, 16, true},
+      {"staging capped at 16 workers, lead not paused", kCap, 16, false},
+      {"staging unbounded, lead paused for it", kCap, 0, true},
+      {"no lead", 0, 0, false},
   };
   for (const Variant& v : variants) {
     Streamer s(rig->dp, rig->bases, rig->plans);
@@ -705,13 +713,9 @@ DGPP_TEST(step_consumers_lever_matrix) {
     cfg.steps = 3;
     cfg.rows = 5;
     cfg.top_k = 6;
-    cfg.gated_first = v.gated_first;
-    cfg.critical_leaders = v.critical_leaders;
-    cfg.acc_chunk = v.chunk;
-    cfg.router_pipeline = v.pipeline;
-    cfg.lead_yield_on_gate = v.yield;
     cfg.lead_cap_bytes = v.lead_cap;
-    cfg.router_pause_lead = v.router_pause;
+    cfg.stage_workers = v.stage_workers;
+    cfg.stage_lead_pause = v.stage_lead_pause;
     (void)s.run(cfg);  // warm-up
     for (int sample = 0; sample < 2; ++sample) {
       const StreamReport r = s.run(cfg);
@@ -719,21 +723,39 @@ DGPP_TEST(step_consumers_lever_matrix) {
       std::vector<double> pct;
       for (size_t l = 0; l < r.layer_us.size(); ++l) pct.push_back(r.layer_bytes[l] / 240e3 / r.layer_us[l] * 100.0);
       std::sort(pct.begin(), pct.end());
-      double site_a = 0, site_b = 0, router_a = 0, router_b = 0, group_end = 0, next_begin = 0;
+      double site_a = 0, site_b = 0, router_a = 0, router_b = 0, group_end = 0, next_begin = 0, stage_a = 0, stage_b = 0;
       for (size_t i = 0; i < r.phases.size(); ++i) {
         const PhaseTiming& t = r.phases[i];
         if (t.layer != 3 || t.name != "attn_out") continue;
         for (const ClassTiming& c : t.classes) {
+          if (c.kind == 4) { if (c.phase_name == "ffn_in") stage_a = c.first_us - t.begin_us; if (c.phase_name == "router") stage_b = c.last_us - t.begin_us; continue; }
           if (c.phase_name == "ffn_in") { site_a = c.first_us - t.begin_us; site_b = c.last_us - t.begin_us; }
-          if (c.phase_name == "router") { router_a = c.first_us - t.begin_us; router_b = c.last_us - t.begin_us; }
+          if (c.phase_name == "router") { router_a = c.last_grab_us - t.begin_us; router_b = c.last_us - t.begin_us; }
         }
         for (size_t j = i; j < r.phases.size(); ++j) {
           if (r.phases[j].layer == 3 && r.phases[j].name == "router") group_end = r.phases[j].end_us - t.begin_us;
           if (r.phases[j].layer == 3 && r.phases[j].name == "gate_up") next_begin = r.phases[j].begin_us - t.begin_us;
         }
       }
-      std::printf("   %-56s sample %d: median %.1f %%, attn_out group: site %+.0f..%+.0f, router %+.0f..%+.0f, end %+.0f, experts at %+.0f us\n",
-                  v.name, sample + 1, pct[pct.size() / 2], site_a, site_b, router_a, router_b, group_end, next_begin);
+      std::printf("   %-50s sample %d: median %.1f %%, attn_out group: staging %+.0f..%+.0f, site %+.0f..%+.0f, router (last hand-out) %+.0f..%+.0f, end %+.0f, experts at %+.0f us\n",
+                  v.name, sample + 1, pct[pct.size() / 2], stage_a, stage_b, site_a, site_b, router_a, router_b, group_end, next_begin);
+    }
+    // Workers' last site units, stage by stage (the second trace bank): dots and slice, the ticket, and for the units that
+    // completed their token the finish's stages (the norm's barrier, the row stored and released, then warp 0 through the Sinkhorn).
+    std::vector<unsigned long long> tr(static_cast<size_t>(2 * kStepMaxWorkers) * 8);
+    DGPP_CUDA_OK(cudaMemcpy(tr.data(), s.unit_trace(), tr.size() * 8, cudaMemcpyDeviceToHost));
+    int plain = 0, finished = 0;
+    for (int w = 1; w < kStepMaxWorkers && (plain < 2 || finished < 3); ++w) {
+      const unsigned long long* u = tr.data() + static_cast<size_t>(kStepMaxWorkers + w) * 8;
+      if (!u[0] || !u[2]) continue;
+      const bool fin = u[7] > u[0];
+      if (fin ? finished >= 3 : plain >= 2) continue;
+      if (fin)
+        std::printf("      worker %2d site unit: dots and slice %+.1f, ticket %+.1f, norm barrier %+.1f, row stored %+.1f, released %+.1f, Sinkhorn %+.1f, done %+.1f us\n", w,
+                    (u[1] - u[0]) / 1e3, (u[2] - u[0]) / 1e3, (u[4] - u[0]) / 1e3, (u[5] - u[0]) / 1e3, (u[6] - u[0]) / 1e3, (u[3] - u[0]) / 1e3, (u[7] - u[0]) / 1e3);
+      else
+        std::printf("      worker %2d site unit: dots and slice %+.1f, ticket %+.1f us\n", w, (u[1] - u[0]) / 1e3, (u[2] - u[0]) / 1e3);
+      (fin ? finished : plain)++;
     }
   }
 }

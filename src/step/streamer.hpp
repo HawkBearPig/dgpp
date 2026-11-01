@@ -25,6 +25,8 @@ struct StreamerConfig {
   int lookahead_layers = 2;      // how far ahead the lead may run
   uint64_t lead_cap_bytes = uint64_t{8} << 20;  // engine.l2_staging_mib
   unsigned max_leaders = 0;      // engine.stream_governor: 0 unbounded
+  unsigned stage_workers = 0;     // workers streaming a merged phase's staging units at once (0: unbounded; off, see kernels/step/stream.hpp)
+  bool stage_lead_pause = false;  // no lead units while a staging class of the group has units left (off, as above)
   float lead_bytes_per_us = 0.f; // the lead's idle budget rate (bytes a microsecond; 0: the cap alone)
   double deadline_s = 5.0;       // every in-step spin's deadline
   double pending_deadline_s = 30.0;  // the kernel's wait for the next descriptor
@@ -40,13 +42,6 @@ struct StreamerConfig {
   float hc_eps = 1e-6f;
   int sinkhorn_iters = 20;
   float mhc_norm_eps = 1e-6f;
-  // The levers measured as a set (see kernels/step/stream.hpp): off by default.
-  bool gated_first = false;
-  unsigned critical_leaders = 0;
-  int acc_chunk = 512;
-  bool router_pipeline = false;
-  bool lead_yield_on_gate = true;
-  bool router_pause_lead = false;
   uint64_t first_seq = 0;        // the first step's sequence number; steps count up from it
   uint64_t epoch = 0;            // echoed by every verdict
   int skip_at_step = -1;         // publish skip instead of this step (-1: never)
@@ -192,8 +187,6 @@ class Streamer {
   float* cand_biased_ = nullptr;
   int n_experts_ = 0;
   unsigned consumer_smem_ = 0;
-  int acc_chunk_ = 512;  // the last run's accumulation chunk, for the report's class table
-  bool gated_first_ = false;  // and its class order
   bool mhc_ = false;
   uint16_t* streams_[2] = {nullptr, nullptr};
   float* pre_[2] = {nullptr, nullptr};

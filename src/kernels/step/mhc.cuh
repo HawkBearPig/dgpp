@@ -28,6 +28,15 @@ static_assert(kMhcCoeffs % kMhcUnitCoeffs == 0, "a site's coefficients split int
 constexpr int kMhcThreads = 256;
 
 __device__ __forceinline__ float mhc_sigmoid(float x) { return 1.0f / (1.0f + expf(-x)); }
+__device__ __forceinline__ unsigned long long mhc_timer() {
+  unsigned long long t;
+  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+  return t;
+}
+// The site unit's stage stamps (the kernel's trace bank, the probe's): [0] start, [1] dots and
+// slice done, [2] ticket taken, [4] the norm's barrier passed, [5] the row stored (thread 0),
+// [6] the row released to the router, [3] warp 0 through the Sinkhorn, [7] the unit done.
+constexpr int kMhcTraceWords = 8;
 __device__ __forceinline__ float mhc_warp_sum(float v) {
 #pragma unroll
   for (int off = 16; off > 0; off >>= 1) v += __shfl_xor_sync(0xFFFFFFFFu, v, off);
@@ -55,32 +64,104 @@ __device__ __forceinline__ void mhc_unpack8(uint4 q, float (&f)[8]) {
   }
 }
 
+// One token's collapse under the previous site's pre for the vectors [v0, v1)
+// of its row (eight elements each): bf16 of p0 s0 + p1 s1 + p2 s2 + p3 s3 in
+// that order, as mhc_finish rounds it, into `row` (the token's row of x) for
+// mhc_finish_normed to norm in place. Split over a token's units, it leaves
+// the finishing block the norm alone.
+__device__ inline void mhc_collapse_slice(const uint16_t* __restrict__ x, const float* __restrict__ pre_in, int hidden, int v0, int v1,
+                                          uint16_t* __restrict__ row) {
+  const float p0 = pre_in[0], p1 = pre_in[1], p2 = pre_in[2], p3 = pre_in[3];
+  for (int v = v0 + static_cast<int>(threadIdx.x); v < v1; v += kMhcThreads) {
+    uint4 q[kMhcN];
+#pragma unroll
+    for (int j = 0; j < kMhcN; ++j) q[j] = reinterpret_cast<const uint4*>(x + static_cast<size_t>(j) * hidden)[v];
+    float s0[8], s1[8], s2[8], s3[8];
+    mhc_unpack8(q[0], s0);
+    mhc_unpack8(q[1], s1);
+    mhc_unpack8(q[2], s2);
+    mhc_unpack8(q[3], s3);
+    uint32_t packed[4];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      const float val = p0 * s0[j] + p1 * s1[j] + p2 * s2[j] + p3 * s3[j];
+      const uint16_t cb = float_to_bf16_bits(val);
+      if (j % 2 == 0) packed[j / 2] = cb;
+      else packed[j / 2] |= static_cast<uint32_t>(cb) << 16;
+    }
+    reinterpret_cast<uint4*>(row)[v] = make_uint4(packed[0], packed[1], packed[2], packed[3]);
+  }
+}
+
+// Shared memory the site unit's dots and collapse use: the reductions'
+// scratch (8 warps for the norm, 8 x N for the dots) then the unit's slice of
+// the four streams, kMhcSliceVecs vectors a stream, exchanged between the
+// threads that loaded them and the threads that collapse them.
+constexpr int kMhcSliceVecs = 128;  // vectors of eight a unit collapses at most (hidden 5120 / 8 / 8 units = 80)
+constexpr int kMhcScratchFloats = 8 + 8 * kMhcUnitCoeffs;
+constexpr unsigned kMhcUnitSmem = 128u + static_cast<unsigned>(kMhcN) * kMhcSliceVecs * 16u;
+template <int N>
+struct MhcUnitSmem {
+  float scratch[kMhcScratchFloats];
+  float pad[32 - kMhcScratchFloats];  // the slice at 128 bytes
+  uint4 slice[kMhcN][kMhcSliceVecs];
+};
+static_assert(kMhcScratchFloats <= 32, "the scratch fits before the slice");
+static_assert(sizeof(MhcUnitSmem<kMhcUnitCoeffs>) == kMhcUnitSmem, "the unit's shared memory layout");
+
 // N coefficients' logits for one token in one pass over its streams: the
 // token's streams [4][hidden] bf16 at `x`, the coefficient rows [N][4 hidden]
 // bf16 at `fn_rows`. Each logit's fma chain (thread t over v = t, t + 256,
 // ... ascending) and its reduction are mhc_dot's, so the N logits equal N
-// calls of it bitwise, for the streams read once. The thread's vectors of
-// the streams stay in registers between the norm and the dots, and every
-// load of a pass is issued before its first use: at one block an SM the
-// unit is latency-bound, so bytes in flight set its time (2026-10-31: 12.6
-// µs a unit at two vectors in flight, for 160 KB).
+// calls of it bitwise, for the streams read once. The register form (every
+// vector of the thread in registers, DeepSeek-V4.1's 4 x 5120) issues every
+// load of the unit, the streams and the N rows, before any is used: at one
+// block an SM the unit is latency-bound, so the loads' round trips set its
+// time (one here, four when each row's followed the previous row's chain),
+// and the N dots reduce in one pass (one barrier where each had its two).
+// With `row` set, the unit's slice [v0, v1) of the token's collapsed row
+// under `pre_in` (mhc_collapse_slice's values) is written from the stream
+// vectors already in registers, exchanged through `sm->slice`, so the
+// collapse costs no load of its own.
 template <int N>
 __device__ inline void mhc_dot_n(const uint16_t* __restrict__ x, const uint16_t* __restrict__ fn_rows, int hidden, float norm_eps,
-                                 float* scratch, float (&out)[N]) {
-  constexpr int kInFlight = 10;  // vectors a thread holds: 4 x 5120 / 8 / 256 exactly for DeepSeek-V4.1
+                                 MhcUnitSmem<N>* sm, float (&out)[N], uint16_t* __restrict__ row = nullptr,
+                                 const float* __restrict__ pre_in = nullptr, int v0 = 0, int v1 = 0) {
+  constexpr int kInFlight = 10;  // vectors a thread holds of the streams: 4 x 5120 / 8 / 256 exactly for DeepSeek-V4.1
   const int K = kMhcN * hidden, vecs = K / 8;
   const uint4* xv = reinterpret_cast<const uint4*>(x);
+  float* scratch = sm->scratch;
+  const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
   float ssq = 0.f;
   float dot[N];
 #pragma unroll
   for (int c = 0; c < N; ++c) dot[c] = 0.f;
   if (vecs <= kInFlight * kMhcThreads) {
-    // Every vector of the thread in registers: the norm, then the dots from them.
     uint4 q[kInFlight];
+    uint4 g[N][kInFlight];
 #pragma unroll
     for (int i = 0; i < kInFlight; ++i) {
       const int v = i * kMhcThreads + static_cast<int>(threadIdx.x);
       q[i] = v < vecs ? xv[v] : make_uint4(0u, 0u, 0u, 0u);
+    }
+#pragma unroll
+    for (int c = 0; c < N; ++c) {
+      const uint4* wv = reinterpret_cast<const uint4*>(fn_rows + static_cast<size_t>(c) * K);
+#pragma unroll
+      for (int i = 0; i < kInFlight; ++i) {
+        const int v = i * kMhcThreads + static_cast<int>(threadIdx.x);
+        g[c][i] = v < vecs ? wv[v] : make_uint4(0u, 0u, 0u, 0u);
+      }
+    }
+    // The slice's vectors to the threads that collapse them (read after the norm's barrier).
+    if (row != nullptr) {
+      const int hv = hidden / 8;
+#pragma unroll
+      for (int i = 0; i < kInFlight; ++i) {
+        const int v = i * kMhcThreads + static_cast<int>(threadIdx.x);
+        const int j = v / hv, d = v - j * hv;
+        if (v < vecs && d >= v0 && d < v1) sm->slice[j][d - v0] = q[i];
+      }
     }
 #pragma unroll
     for (int i = 0; i < kInFlight; ++i) {
@@ -89,24 +170,41 @@ __device__ inline void mhc_dot_n(const uint16_t* __restrict__ x, const uint16_t*
 #pragma unroll
       for (int j = 0; j < 8; ++j) ssq = __fmaf_rn(f[j], f[j], ssq);
     }
-    const float r = rsqrtf(mhc_block_sum(ssq, scratch) / static_cast<float>(K) + norm_eps);
+    ssq = mhc_warp_sum(ssq);
+    if (lane == 0) scratch[warp] = ssq;
+    __syncthreads();
+    float total = scratch[0];
+#pragma unroll
+    for (int w = 1; w < kMhcThreads / 32; ++w) total += scratch[w];
+    const float r = rsqrtf(total / static_cast<float>(K) + norm_eps);
 #pragma unroll
     for (int c = 0; c < N; ++c) {
-      const uint4* wv = reinterpret_cast<const uint4*>(fn_rows + static_cast<size_t>(c) * K);
-      uint4 g[kInFlight];
-#pragma unroll
-      for (int i = 0; i < kInFlight; ++i) {
-        const int v = i * kMhcThreads + static_cast<int>(threadIdx.x);
-        g[i] = v < vecs ? wv[v] : make_uint4(0u, 0u, 0u, 0u);
-      }
 #pragma unroll
       for (int i = 0; i < kInFlight; ++i) {
         float f[8], w[8];
         mhc_unpack8(q[i], f);
-        mhc_unpack8(g[i], w);
+        mhc_unpack8(g[c][i], w);
 #pragma unroll
         for (int j = 0; j < 8; ++j) dot[c] = __fmaf_rn(f[j] * r, w[j], dot[c]);  // zero past vecs: no change
       }
+    }
+    if (row != nullptr && v0 + static_cast<int>(threadIdx.x) < v1) {
+      const int d = static_cast<int>(threadIdx.x);
+      const float p0 = pre_in[0], p1 = pre_in[1], p2 = pre_in[2], p3 = pre_in[3];
+      float s0[8], s1[8], s2[8], s3[8];
+      mhc_unpack8(sm->slice[0][d], s0);
+      mhc_unpack8(sm->slice[1][d], s1);
+      mhc_unpack8(sm->slice[2][d], s2);
+      mhc_unpack8(sm->slice[3][d], s3);
+      uint32_t packed[4];
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        const float val = p0 * s0[j] + p1 * s1[j] + p2 * s2[j] + p3 * s3[j];
+        const uint16_t cb = float_to_bf16_bits(val);
+        if (j % 2 == 0) packed[j / 2] = cb;
+        else packed[j / 2] |= static_cast<uint32_t>(cb) << 16;
+      }
+      reinterpret_cast<uint4*>(row)[v0 + d] = make_uint4(packed[0], packed[1], packed[2], packed[3]);
     }
   } else {
     // A hidden wider than the registers hold: two passes, the streams read again.
@@ -117,7 +215,13 @@ __device__ inline void mhc_dot_n(const uint16_t* __restrict__ x, const uint16_t*
 #pragma unroll
       for (int j = 0; j < 8; ++j) ssq = __fmaf_rn(f[j], f[j], ssq);
     }
-    const float r = rsqrtf(mhc_block_sum(ssq, scratch) / static_cast<float>(K) + norm_eps);
+    ssq = mhc_warp_sum(ssq);
+    if (lane == 0) scratch[warp] = ssq;
+    __syncthreads();
+    float total = scratch[0];
+#pragma unroll
+    for (int w = 1; w < kMhcThreads / 32; ++w) total += scratch[w];
+    const float r = rsqrtf(total / static_cast<float>(K) + norm_eps);
 #pragma unroll 2
     for (int v = threadIdx.x; v < vecs; v += kMhcThreads) {
       float f[8];
@@ -130,11 +234,21 @@ __device__ inline void mhc_dot_n(const uint16_t* __restrict__ x, const uint16_t*
         for (int j = 0; j < 8; ++j) dot[c] = __fmaf_rn(f[j] * r, w[j], dot[c]);
       }
     }
+    if (row != nullptr) mhc_collapse_slice(x, pre_in, hidden, v0, v1, row);
   }
+  // The N reductions in one pass: each warp's xor tree, the partials added in warp order (mhc_block_sum's values).
 #pragma unroll
   for (int c = 0; c < N; ++c) {
-    __syncthreads();  // the scratch is reused by every reduction
-    out[c] = mhc_block_sum(dot[c], scratch);
+    dot[c] = mhc_warp_sum(dot[c]);
+    if (lane == 0) scratch[8 + c * 8 + warp] = dot[c];
+  }
+  __syncthreads();
+#pragma unroll
+  for (int c = 0; c < N; ++c) {
+    float total = scratch[8 + c * 8];
+#pragma unroll
+    for (int w = 1; w < kMhcThreads / 32; ++w) total += scratch[8 + c * 8 + w];
+    out[c] = total;
   }
 }
 
@@ -299,85 +413,123 @@ __device__ inline void mhc_finish(const uint16_t* __restrict__ x, const float* _
   }
 }
 
-// One token's collapse under the previous site's pre for the vectors [v0, v1)
-// of its row (eight elements each): bf16 of p0 s0 + p1 s1 + p2 s2 + p3 s3 in
-// that order, as mhc_finish rounds it, into `row` (the token's row of x) for
-// mhc_finish_normed to norm in place. Split over a token's units, it leaves
-// the finishing block the norm alone.
-__device__ inline void mhc_collapse_slice(const uint16_t* __restrict__ x, const float* __restrict__ pre_in, int hidden, int v0, int v1,
-                                          uint16_t* __restrict__ row) {
-  const float p0 = pre_in[0], p1 = pre_in[1], p2 = pre_in[2], p3 = pre_in[3];
-  for (int v = v0 + static_cast<int>(threadIdx.x); v < v1; v += kMhcThreads) {
-    uint4 q[kMhcN];
-#pragma unroll
-    for (int j = 0; j < kMhcN; ++j) q[j] = reinterpret_cast<const uint4*>(x + static_cast<size_t>(j) * hidden)[v];
-    float s0[8], s1[8], s2[8], s3[8];
-    mhc_unpack8(q[0], s0);
-    mhc_unpack8(q[1], s1);
-    mhc_unpack8(q[2], s2);
-    mhc_unpack8(q[3], s3);
-    uint32_t packed[4];
-#pragma unroll
-    for (int j = 0; j < 8; ++j) {
-      const float val = p0 * s0[j] + p1 * s1[j] + p2 * s2[j] + p3 * s3[j];
-      const uint16_t cb = float_to_bf16_bits(val);
-      if (j % 2 == 0) packed[j / 2] = cb;
-      else packed[j / 2] |= static_cast<uint32_t>(cb) << 16;
-    }
-    reinterpret_cast<uint4*>(row)[v] = make_uint4(packed[0], packed[1], packed[2], packed[3]);
-  }
-}
-
-// The finish over a collapsed row other blocks wrote (read past L1): the
-// coefficients from the logits as mhc_finish, then the one-rounding norm of
-// the row in place. Bitwise mhc_finish: the sum of squares walks the same
-// rounded values in the same thread order.
-__device__ inline void mhc_finish_normed(uint16_t* __restrict__ row, const float* __restrict__ lg, const MhcSite& site, int hidden,
-                                         float* __restrict__ pre_out, float* __restrict__ post_f32, float* __restrict__ comb_f32, float* smem) {
-  float* comb_seed = smem + kMhcN;      // [16]
-  float* scratch = smem + kMhcN + kMhcN * kMhcN;  // [8]
-  const float* base = site.base;
-  const float* scale = site.scale;
-  if (threadIdx.x < kMhcN) {
-    const int i = threadIdx.x;
-    pre_out[i] = mhc_sigmoid(lg[i] * scale[0] + base[i]) + site.hc_eps;
-  } else if (threadIdx.x < 2 * kMhcN) {
-    const int i = threadIdx.x - kMhcN;
-    post_f32[i] = 2.f * mhc_sigmoid(lg[kMhcN + i] * scale[1] + base[kMhcN + i]);
-  } else if (threadIdx.x < 3 * kMhcN) {
-    mhc_comb_seed_row(lg, base, scale, site.hc_eps, threadIdx.x - 2 * kMhcN, comb_seed);
-  }
-  __syncthreads();
-  if (threadIdx.x < 32) mhc_sinkhorn_warp(comb_seed, site.hc_eps, site.sinkhorn_iters, comb_f32, threadIdx.x);
+// The finishing block's norm of a collapsed row other blocks wrote: the
+// token's 24 logits at `lg_global` (its units wrote them) into `lg_smem`,
+// threads 0 to 5 a vector each, and the row's vectors and the norm weight's
+// into registers, every load issued together past L1 after the ticket's
+// acquire; the row's sum of squares, one barrier (which publishes the logits
+// too), the one-rounding norm stored in place. Bitwise mhc_finish's row: the
+// sum walks the same rounded values in the same thread order. `scratch`: 8
+// floats. Stamps [4] the barrier passed, [5] the row stored (thread 0).
+constexpr int kMhcFinishVecs = 3;  // 16-byte vectors a thread holds of the row: hidden 5120 / 8 / 256 rounded up
+constexpr int kMhcFinishSmemFloats = kMhcCoeffs + kMhcN * kMhcN + 8;  // the logits, the comb seed, the scratch
+__device__ inline void mhc_finish_norm(uint16_t* __restrict__ row, const float* __restrict__ lg_global, float* __restrict__ lg_smem,
+                                       const MhcSite& site, int hidden, float* scratch, unsigned long long* tr = nullptr) {
   const int vecs = hidden / 8;
-  const int runs = (vecs + kMhcThreads - 1) / kMhcThreads;
-  float ssq = 0.f;
-  for (int i = 0; i < runs; ++i) {
-    const int v = threadIdx.x + i * kMhcThreads;
-    if (v >= vecs) continue;
-    float cv[8];
-    mhc_unpack8(__ldcg(reinterpret_cast<const uint4*>(row) + v), cv);
+  const bool wide = vecs > kMhcFinishVecs * kMhcThreads;
+  uint4 kept[kMhcFinishVecs], lw[kMhcFinishVecs];
 #pragma unroll
-    for (int j = 0; j < 8; ++j) ssq = __fmaf_rn(cv[j], cv[j], ssq);
+  for (int i = 0; i < kMhcFinishVecs; ++i) kept[i] = lw[i] = make_uint4(0u, 0u, 0u, 0u);
+  if (threadIdx.x < static_cast<unsigned>(kMhcCoeffs / 4))
+    reinterpret_cast<uint4*>(lg_smem)[threadIdx.x] = __ldcg(reinterpret_cast<const uint4*>(lg_global) + threadIdx.x);
+  if (!wide) {
+#pragma unroll
+    for (int i = 0; i < kMhcFinishVecs; ++i) {
+      const int v = static_cast<int>(threadIdx.x) + i * kMhcThreads;
+      kept[i] = v < vecs ? __ldcg(reinterpret_cast<const uint4*>(row) + v) : make_uint4(0u, 0u, 0u, 0u);
+      lw[i] = v < vecs ? reinterpret_cast<const uint4*>(site.ln)[v] : make_uint4(0u, 0u, 0u, 0u);
+    }
   }
-  const float total = mhc_block_sum(ssq, scratch);
+  float ssq = 0.f;
+  if (!wide) {
+#pragma unroll
+    for (int i = 0; i < kMhcFinishVecs; ++i) {
+      float cv[8];
+      mhc_unpack8(kept[i], cv);  // zero past vecs: no change
+#pragma unroll
+      for (int j = 0; j < 8; ++j) ssq = __fmaf_rn(cv[j], cv[j], ssq);
+    }
+  } else {
+    for (int v = static_cast<int>(threadIdx.x); v < vecs; v += kMhcThreads) {
+      float cv[8];
+      mhc_unpack8(__ldcg(reinterpret_cast<const uint4*>(row) + v), cv);
+#pragma unroll
+      for (int j = 0; j < 8; ++j) ssq = __fmaf_rn(cv[j], cv[j], ssq);
+    }
+  }
+  ssq = mhc_warp_sum(ssq);
+  const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+  if (lane == 0) scratch[warp] = ssq;
+  __syncthreads();
+  if (tr && threadIdx.x == 0) tr[4] = mhc_timer();
+  float total = scratch[0];
+#pragma unroll
+  for (int w = 1; w < kMhcThreads / 32; ++w) total += scratch[w];
   const float rstd = rsqrtf(total / static_cast<float>(hidden) + site.ln_eps);
-  for (int i = 0; i < runs; ++i) {
-    const int v = threadIdx.x + i * kMhcThreads;
-    if (v >= vecs) continue;
-    float kept[8], lw[8];
-    mhc_unpack8(__ldcg(reinterpret_cast<const uint4*>(row) + v), kept);
-    mhc_unpack8(reinterpret_cast<const uint4*>(site.ln)[v], lw);
+  auto norm_store = [&](int v, uint4 kq, uint4 lq) {
+    float k8[8], l8[8];
+    mhc_unpack8(kq, k8);
+    mhc_unpack8(lq, l8);
     uint32_t packed[4];
 #pragma unroll
     for (int j = 0; j < 8; ++j) {
-      const float xn = kept[j] * rstd;
-      const uint16_t y = float_to_bf16_bits(__fmul_rn(lw[j], xn));
+      const float xn = k8[j] * rstd;
+      const uint16_t y = float_to_bf16_bits(__fmul_rn(l8[j], xn));
       if (j % 2 == 0) packed[j / 2] = y;
       else packed[j / 2] |= static_cast<uint32_t>(y) << 16;
     }
     reinterpret_cast<uint4*>(row)[v] = make_uint4(packed[0], packed[1], packed[2], packed[3]);
+  };
+  if (!wide) {
+#pragma unroll
+    for (int i = 0; i < kMhcFinishVecs; ++i) {
+      const int v = static_cast<int>(threadIdx.x) + i * kMhcThreads;
+      if (v < vecs) norm_store(v, kept[i], lw[i]);
+    }
+  } else {
+    for (int v = static_cast<int>(threadIdx.x); v < vecs; v += kMhcThreads)
+      norm_store(v, __ldcg(reinterpret_cast<const uint4*>(row) + v), reinterpret_cast<const uint4*>(site.ln)[v]);
   }
+  if (tr && threadIdx.x == 0) tr[5] = mhc_timer();
+}
+
+// The token's coefficients from its logits in shared memory, on warp 0 (the
+// other warps return at once): pre into `pre_out`, post, the comb seed rows
+// on lanes 0 to 11 (mhc_finish's values), then the Sinkhorn from the seed.
+// The Sinkhorn's twenty dependent rounds of division are about 6 µs on one
+// warp, so the kernel runs this after it has released the normed row: the
+// router needs the row, only the next update needs these. `comb_seed`: 16
+// floats of shared memory. Stamp [3] the Sinkhorn done.
+__device__ inline void mhc_finish_coefficients(const float* __restrict__ lg, const MhcSite& site, float* __restrict__ pre_out,
+                                               float* __restrict__ post_f32, float* __restrict__ comb_f32, float* comb_seed,
+                                               unsigned long long* tr = nullptr) {
+  if (threadIdx.x >= 32) return;
+  const int lane = static_cast<int>(threadIdx.x);
+  const float* base = site.base;
+  const float* scale = site.scale;
+  if (lane < kMhcN) {
+    pre_out[lane] = mhc_sigmoid(lg[lane] * scale[0] + base[lane]) + site.hc_eps;
+  } else if (lane < 2 * kMhcN) {
+    const int i = lane - kMhcN;
+    post_f32[i] = 2.f * mhc_sigmoid(lg[kMhcN + i] * scale[1] + base[kMhcN + i]);
+  } else if (lane < 3 * kMhcN) {
+    mhc_comb_seed_row(lg, base, scale, site.hc_eps, lane - 2 * kMhcN, comb_seed);
+  }
+  __syncwarp();
+  mhc_sinkhorn_warp(comb_seed, site.hc_eps, site.sinkhorn_iters, comb_f32, lane);
+  __syncwarp();
+  if (tr && lane == 0) tr[3] = mhc_timer();
+}
+
+// The finish over a collapsed row other blocks wrote: the norm, then the
+// coefficients (the probe's form; the kernel releases the row between the
+// two). `smem`: kMhcFinishSmemFloats, 16-byte aligned.
+__device__ inline void mhc_finish_normed(uint16_t* __restrict__ row, const float* __restrict__ lg_global, const MhcSite& site, int hidden,
+                                         float* __restrict__ pre_out, float* __restrict__ post_f32, float* __restrict__ comb_f32, float* smem,
+                                         unsigned long long* tr = nullptr) {
+  mhc_finish_norm(row, lg_global, smem, site, hidden, smem + kMhcCoeffs + kMhcN * kMhcN, tr);
+  __syncthreads();  // the logits are in shared memory (the norm's barrier published them); the row is stored
+  mhc_finish_coefficients(smem, site, pre_out, post_f32, comb_f32, smem + kMhcCoeffs, tr);
 }
 
 // The one-rounding stream update for a chunk of (token, d) outputs

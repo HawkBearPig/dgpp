@@ -1086,13 +1086,33 @@ template <typename T> size_t count_diff(const T* a, const T* b, size_t n) {
 // coefficients), each over 40 KB of streams and 120 KB of coefficient rows,
 // cold after a 150 MB stream and with the rows in L2 as the lead stages them.
 namespace {
-__global__ void mhc_unit_rate_kernel(const uint16_t* streams, const uint16_t* fn, float* logits, int hidden, float eps, int units_per_token) {
-  __shared__ float scratch[8];
+// The kernel's unit without its ticket: the dots of three coefficients and the unit's slice of the
+// token's collapsed row under `pre_in` into `rows` (nullptr: the dots alone).
+__global__ void mhc_unit_rate_kernel(const uint16_t* streams, const uint16_t* fn, float* logits, int hidden, float eps, int units_per_token,
+                                     const float* pre_in, uint16_t* rows) {
+  __shared__ MhcUnitSmem<kMhcUnitCoeffs> sm;
   const int t = blockIdx.x / units_per_token, u = blockIdx.x % units_per_token, c0 = u * kMhcUnitCoeffs;
+  const int vecs = hidden / 8, per = (vecs + units_per_token - 1) / units_per_token;
   float lg[kMhcUnitCoeffs];
-  mhc_dot_n<kMhcUnitCoeffs>(streams + static_cast<size_t>(t) * 4 * hidden, fn + static_cast<size_t>(c0) * 4 * hidden, hidden, eps, scratch, lg);
+  if (rows)
+    mhc_dot_n<kMhcUnitCoeffs>(streams + static_cast<size_t>(t) * 4 * hidden, fn + static_cast<size_t>(c0) * 4 * hidden, hidden, eps, &sm, lg,
+                              rows + static_cast<size_t>(t) * hidden, pre_in + t * 4, u * per, min(vecs, (u + 1) * per));
+  else
+    mhc_dot_n<kMhcUnitCoeffs>(streams + static_cast<size_t>(t) * 4 * hidden, fn + static_cast<size_t>(c0) * 4 * hidden, hidden, eps, &sm, lg);
   if (threadIdx.x < kMhcUnitCoeffs) logits[t * kMhcCoeffs + c0 + threadIdx.x] = lg[threadIdx.x];
 }
+// The kernel's finish on a row the units collapsed: mhc_finish_normed over the token's row, its stages stamped a block.
+__device__ unsigned long long g_finish_trace[kMhcT * kMhcTraceWords];
+__global__ void mhc_finish_normed_probe_kernel(uint16_t* rows, const float* logits, MhcSite site, int hidden, float* pre_out, float* post, float* comb) {
+  __shared__ __align__(16) float smem[kMhcFinishSmemFloats];
+  const int t = blockIdx.x;
+  unsigned long long* tr = g_finish_trace + t * kMhcTraceWords;
+  if (threadIdx.x == 0) tr[0] = mhc_timer();
+  mhc_finish_normed(rows + static_cast<size_t>(t) * hidden, logits + t * kMhcCoeffs, site, hidden, pre_out + t * 4, post + t * 4, comb + t * 16, smem, tr);
+  __syncthreads();
+  if (threadIdx.x == 0) tr[kMhcTraceWords - 1] = mhc_timer();
+}
+__global__ void empty_probe_kernel(unsigned* sink) { if (threadIdx.x == 0 && blockIdx.x == 0 && sink[0] == 12345u) sink[0] = 1u; }
 }  // namespace
 
 DGPP_TEST(mhc_unit_rate) {
@@ -1114,7 +1134,12 @@ DGPP_TEST(mhc_unit_rate) {
   cudaEvent_t e0 = nullptr, e1 = nullptr;
   DGPP_CUDA_OK(cudaEventCreate(&e0));
   DGPP_CUDA_OK(cudaEventCreate(&e1));
-  mhc_unit_rate_kernel<<<T * units, kMhcThreads>>>(streams, fn, lg, H, 1e-6f, units);  // the first launch's costs
+  float* pre_unit = nullptr;
+  uint16_t* rows_unit = nullptr;
+  DGPP_CUDA_OK(cudaMalloc(&pre_unit, T * 4 * 4));
+  DGPP_CUDA_OK(cudaMalloc(&rows_unit, static_cast<size_t>(T) * H * 2));
+  init_f32<<<1, 32>>>(pre_unit, T * 4, 0.2f, 1.f, 17u);
+  mhc_unit_rate_kernel<<<T * units, kMhcThreads>>>(streams, fn, lg, H, 1e-6f, units, pre_unit, rows_unit);  // the first launch's costs
   DGPP_CUDA_OK(cudaDeviceSynchronize());
   const double unit_kb = (4.0 * H * 2 + kMhcUnitCoeffs * 4.0 * H * 2) / 1e3;
   for (int mode = 0; mode < 3; ++mode) {
@@ -1126,13 +1151,13 @@ DGPP_TEST(mhc_unit_rate) {
       if (mode == 2) { stage_cg_kernel<<<47, 256>>>(reinterpret_cast<const uint4*>(fn), fnn * 2 / 16, sink); stage_cg_kernel<<<47, 256>>>(reinterpret_cast<const uint4*>(streams), sn * 2 / 16, sink); }
       DGPP_CUDA_OK(cudaDeviceSynchronize());
       DGPP_CUDA_OK(cudaEventRecord(e0));
-      mhc_unit_rate_kernel<<<T * units, kMhcThreads>>>(streams, fn, lg, H, 1e-6f, units);
+      mhc_unit_rate_kernel<<<T * units, kMhcThreads>>>(streams, fn, lg, H, 1e-6f, units, pre_unit, rows_unit);
       DGPP_CUDA_OK(cudaEventRecord(e1));
       DGPP_CUDA_OK(cudaDeviceSynchronize());
       DGPP_CUDA_OK(cudaEventElapsedTime(&m, e0, e1));
     }
     std::sort(ms.begin(), ms.end());
-    std::printf("   mhc unit (3 coefficients, 160 KB), %d blocks, %s: %5.1f us (median of 3) = %5.1f GB/s a block\n", T * units,
+    std::printf("   mhc unit (3 coefficients and the slice, 160 KB), %d blocks, %s: %5.1f us (median of 3) = %5.1f GB/s a block\n", T * units,
                 mode == 0 ? "cold after a 150 MB stream" : mode == 1 ? "coefficient rows staged in L2" : "rows and streams staged in L2", ms[1] * 1e3,
                 unit_kb / ms[1] / 1e3);
   }
@@ -1166,11 +1191,53 @@ DGPP_TEST(mhc_unit_rate) {
       }
       std::sort(ms.begin(), ms.end());
       if (which == 0) std::printf("   mhc unit (1 coefficient, 80 KB), %d blocks, rows and streams staged in L2: %5.1f us (median of 3)\n", kMhcCoeffs * T, ms[1] * 1e3);
-      else std::printf("   mhc finish alone, %d blocks, streams staged in L2: %5.1f us (median of 3)\n", T, ms[1] * 1e3);
+      else std::printf("   mhc finish alone (collapse, Sinkhorn and norm on one block), %d blocks, streams staged in L2: %5.1f us (median of 3)\n", T, ms[1] * 1e3);
+    }
+    // The kernel's finish (the row collapsed by the units' slices, mhc_finish_normed on it) against
+    // mhc_finish's values, bitwise, and its time alone with the row in L2.
+    {
+      float *pre_n = nullptr, *post_n = nullptr, *comb_n = nullptr;
+      DGPP_CUDA_OK(cudaMalloc(&pre_n, T * 4 * 4)); DGPP_CUDA_OK(cudaMalloc(&post_n, T * 4 * 4)); DGPP_CUDA_OK(cudaMalloc(&comb_n, T * 16 * 4));
+      init_f32<<<1, 32>>>(pre_in, T * 4, 0.2f, 1.f, 17u);
+      DGPP_CUDA_OK(cudaDeviceSynchronize());
+      mhc_finish_test_kernel<<<T, kMhcThreads>>>(streams, lg, site, H, pre_in, pre_out, post, comb, normed);
+      std::vector<float> ms(3);
+      for (float& m : ms) {
+        mhc_unit_rate_kernel<<<T * units, kMhcThreads>>>(streams, fn, lg, H, 1e-6f, units, pre_in, rows_unit);  // the slices collapsed, the row in L2
+        DGPP_CUDA_OK(cudaDeviceSynchronize());
+        DGPP_CUDA_OK(cudaEventRecord(e0));
+        mhc_finish_normed_probe_kernel<<<T, kMhcThreads>>>(rows_unit, lg, site, H, pre_n, post_n, comb_n);
+        DGPP_CUDA_OK(cudaEventRecord(e1));
+        DGPP_CUDA_OK(cudaDeviceSynchronize());
+        DGPP_CUDA_OK(cudaEventElapsedTime(&m, e0, e1));
+      }
+      std::sort(ms.begin(), ms.end());
+      const size_t d_row = count_diff(rows_unit, normed, static_cast<size_t>(T) * H), d_pre = count_diff(pre_n, pre_out, T * 4),
+                   d_post = count_diff(post_n, post, T * 4), d_comb = count_diff(comb_n, comb, T * 16);
+      std::vector<float> ms0(3);
+      for (float& m : ms0) {
+        DGPP_CUDA_OK(cudaEventRecord(e0));
+        empty_probe_kernel<<<T, kMhcThreads>>>(sink);
+        DGPP_CUDA_OK(cudaEventRecord(e1));
+        DGPP_CUDA_OK(cudaDeviceSynchronize());
+        DGPP_CUDA_OK(cudaEventElapsedTime(&m, e0, e1));
+      }
+      std::sort(ms0.begin(), ms0.end());
+      std::printf("   mhc finish in the kernel's form (the norm of the units' slices), %d blocks, row in L2: %5.1f us (median of 3; an empty kernel of %d blocks %4.1f); "
+                  "vs mhc_finish: %zu normed differ of %d, pre %zu, post %zu, comb %zu\n", T, ms[1] * 1e3, T, ms0[1] * 1e3, d_row, T * H, d_pre, d_post, d_comb);
+      std::vector<unsigned long long> ft(static_cast<size_t>(T) * kMhcTraceWords);
+      DGPP_CUDA_OK(cudaMemcpyFromSymbol(ft.data(), g_finish_trace, ft.size() * 8));
+      for (int t = 0; t < 2; ++t) {
+        const unsigned long long* u = ft.data() + static_cast<size_t>(t) * kMhcTraceWords;
+        std::printf("      block %d finish: norm barrier %+.1f, row stored %+.1f, then the Sinkhorn done %+.1f, end %+.1f us\n", t, (u[4] - u[0]) / 1e3,
+                    (u[5] - u[0]) / 1e3, (u[3] - u[0]) / 1e3, (u[7] - u[0]) / 1e3);
+      }
+      cudaFree(pre_n); cudaFree(post_n); cudaFree(comb_n);
+      require(d_row == 0 && d_pre == 0 && d_post == 0 && d_comb == 0, "the kernel's finish differs from mhc_finish");
     }
     cudaFree(pre_in); cudaFree(pre_out); cudaFree(post); cudaFree(comb); cudaFree(base); cudaFree(scale); cudaFree(ln); cudaFree(normed);
   }
-  cudaFree(streams); cudaFree(fn); cudaFree(lg); cudaFree(flushbuf); cudaFree(sink);
+  cudaFree(streams); cudaFree(fn); cudaFree(lg); cudaFree(flushbuf); cudaFree(sink); cudaFree(pre_unit); cudaFree(rows_unit);
 }
 
 // The router unit on its own: 24 blocks of 16 expert rows (384 experts, 5120

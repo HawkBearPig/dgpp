@@ -45,7 +45,8 @@ struct alignas(128) StepCtl {
   unsigned pad1[30];
   unsigned pf_next;   // the lead's cursor over the global fixed-unit sequence
   unsigned leaders;   // workers streaming the lead now
-  unsigned pad2[30];
+  unsigned stage_active;  // workers streaming a merged phase's staging units now
+  unsigned pad2[29];
   unsigned long long pf_bytes;           // bytes the lead has read
   unsigned long long consumed_pf_bytes;  // of them, the bytes of phases now complete
   unsigned pad3[28];
@@ -177,15 +178,17 @@ struct StepStreamParams {
   float lead_bytes_per_us = 0.f;
   unsigned route_pool = 0;  // the synthetic router's window of experts a layer (0: all)
   unsigned max_leaders = 0;               // 0: unbounded
-  // The levers under evaluation as a set (MOONSHOT-1.md phase 3, the fused chain): gated classes
-  // first in the hand-out; leaders bounded to critical_leaders while an open gated class has its
-  // units out running; the accumulation and reduce chunk; the router's pipelined row batches.
-  unsigned gated_first = 0;
-  unsigned critical_leaders = 0;
-  int acc_chunk = 512;
-  unsigned router_pipeline = 0;  // not compiled into the kernel (see consumer_unit); the probe's form
-  unsigned yield_on_gate = 1;  // lead units yield when a gate opens, not only when a phase is published
-  unsigned router_pause_lead = 0;  // no worker leads while the router's units are out running (its row batches took twice their standalone time under the lead's fills)
+  // A merged phase's staging class (its rows into L2 at the fold's trigger) as a set with the
+  // lead: at most stage_workers blocks stream staging units at once (one block streams at 10 to
+  // 18 GB/s, so 16 would saturate the memory and leave the other workers free for the gated
+  // classes behind the fold), and with stage_lead_pause no worker takes a lead unit while a
+  // staging class of the group has units left. Off (2026-11-01): the staging takes 50 to 55 µs
+  // from the trigger at any worker count (L2-bound beside the site units), so the pause costs
+  // the expert phase that much of the lead's staging, and six rate samples with the set on sat
+  // at 79.1 to 80.1 against 80.2 to 80.7 without it; the set pays once the staging fits the
+  // fold's window (fewer bytes, or an earlier window). 0: unbounded.
+  unsigned stage_workers = 0;
+  unsigned stage_lead_pause = 0;
   unsigned long long deadline_ns = 0;          // every in-step spin's deadline (0: none)
   unsigned long long pending_deadline_ns = 0;  // how long the chain waits for the host's next descriptor (0: forever)
 };

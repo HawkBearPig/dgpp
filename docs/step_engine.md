@@ -506,9 +506,81 @@ group by about 15 µs and costs the layer about five points: the lead's
 staging of the expert phase during that tail is worth more than the tail.
 The 2048-output chunk and the pipelined router batches sit inside the band
 alone and on top of the others. The kernel keeps phase order, the yield,
-the 512-output chunk and the plain batches; the knobs stay on the streamer
-for the next set. The class windows of `attn_out` (tile-major, layer 3, from the
-group's publish): the output projection's compute units 2 to 64 µs, its
+the 512-output chunk and the plain batches. The knobs that lost (gated
+classes first, the leader bound while critical units run, the chunk, the
+pipelined batches, the lead paused for the router) were retired from the
+streamer and the kernel on 2026-11-01 once the set had been measured, and
+the yield became the kernel's behaviour rather than a knob; the matrix
+keeps the lead and the staging class as its variables and prints the site
+units' stage stamps.
+
+The site unit took the router's treatment the same day. Its dots issue
+every load of the unit, the token's 40 KB of streams and the three
+coefficient rows, before any is used, where each row's loads had followed
+the previous row's chain (four round trips for one); the three dots reduce
+in one pass (one barrier where each had two); the unit's slice of the
+collapsed row is written from the stream vectors already in registers,
+exchanged through shared memory, so the collapse has no loads of its own.
+The finish is split: the finishing block issues the token's logits, the
+row and the norm weight together after the ticket's acquire, norms the row
+in place and releases it to the router, and only then computes the
+coefficients and runs the Sinkhorn on warp 0, because the twenty dependent
+rounds of IEEE division are 6.8 µs on one warp (the standalone probe stamps
+them) and only the next update needs them, not the router. Everything
+stays bitwise against the production kernels
+(`step_mhc_sites_match_the_production_kernels`, and the finish against
+`mhc_finish` in the probe). The unit's stamps in the kernel: the dots and
+the slice at 4.4 to 4.8 µs, the ticket at 5.2 to 5.7, the norm's barrier at
+6.0 to 6.7, the row stored at 6.5 to 7.3 and released at 7.2 to 8.0, the
+Sinkhorn done at 14.0 to 15.3; before, the dots alone took 14 and the
+release came at 17 to 20. Twenty barriers became five.
+
+The class did not shorten with the unit, which is where the dependencies
+came in. A site's units are handed out as workers come free, and at the
+fold the workers are in the second projection's compute units and in the
+merged phases' staging units: the router's 61 units of 64 KB at the
+memory's share take about 13 µs each, and they were still being handed out
+when the router's gate opened, so its own 24 units waited 10 µs for
+workers. Three changes followed, measured as a set and in halves by
+`step_consumers_lever_matrix`. Each merged phase's own classes now precede
+its staging class in the table, so an open gated class gets a free worker
+first and the staging takes what the gated classes leave. The chain bumps
+the yield generation when it sees the fold's trigger, before the fold
+itself, so lead units give the staging the fold's window rather than
+finishing first (the staging had started 10 to 20 µs late); with it the
+rate case read 80.2 and 80.7. The third is on the config and off: the
+staging class under a worker cap with the lead paused while it has units
+left (`stage_workers`, `stage_lead_pause`). One block streams at 10 to 18
+GB/s, so sixteen would saturate the memory and leave the other workers
+free for the gates, while the lead's bytes, the next phase's, waited for
+the staged rows, which are on the chain's path. In the matrix the set
+measured 80.6 and 80.7 against 79.6 and 79.8 with the cap alone, 79.4 and
+80.2 with the pause alone and 79.7 and 80.0 with neither, with the
+router's units all out within 4 to 6 µs of their gate; but six rate
+samples with the set as the default sat at 79.1 to 80.1 against 80.2 to
+80.7 without it, because the pause costs the expert phase the lead's
+staging for as long as the staging class runs, and that is 50 to 55 µs
+(below). The set pays once the staging fits the fold's window. A staging
+unit that yields in pieces when a gate opens, as a lead unit does, was
+measured and rejected too: the router's units then read the rows the
+yield left unstaged from DRAM, their class 23 µs where it had been 18, and
+the layer lost a point; it needs the same thing.
+
+What the stamps show now is the staging itself: 4.9 MB of coefficient and
+router rows take 50 to 55 µs from the trigger whether 16 or 47 workers
+stream them and whether the lead runs or not, about 90 GB/s, because
+through the site's window the L2 is feeding 40 site units their 160 KB
+each and the fills compete with the reads. The rows cannot all be hot by
+the router's gate from a staging that starts at the trigger, and the
+router's units run 25 µs in the kernel against 8 standalone. The levers
+are fewer bytes (the bf12 router rows, a quarter off the 3.9 MB) and a
+staging window that begins earlier in the group under a cache policy the
+stream's traffic does not evict; both are owed, and the cap and the pause
+are measured again with them.
+
+The class windows of `attn_out` before the site unit's form (tile-major,
+layer 3, from the group's publish): the output projection's compute units
+2 to 64 µs, its
 reduce units 62 to 74, the other projection 40 to 85 with its reduce to 89,
 the fold, the MoE site 88 to 111, the router 109 to 132, the select and
 finish to the group's end at 157, the expert phase published at 161. The
@@ -517,7 +589,16 @@ site to 32. The chain's critical path after the attention-output fold is
 now about 70 µs against the budget's 34: the site's class 24 (a hand-out
 stagger, units of about 9 and the finish of about 10), the router's 23, the
 select and finish about 25 under the saturated memory where they take 12
-quiet. Those three are the next items.
+quiet. After the site unit's form and the staging set (above), on the
+tile-major rig at layer 0: the output projection's compute units 2 to 62,
+its reduce 60 to 72 (the trigger), the second projection 31 to 87 with its
+reduce to 91, the site's staging 75 to 93, the site 90 to 114 with its
+units all out by 94 (the last token's row released about 102, the class's
+end the finishing blocks' Sinkhorns), the router's staging 84 to 128, the
+router 103 to 133 with its units out by 107, the group's end 146 to 155.
+The rate case's band after this round, over four windows: tile-major 79.5
+to 80.7, row-major 73.3 to 75.4 (the better of two samples gates at 78 and
+73; the suites pass).
 
 ## The step protocol
 

@@ -99,8 +99,8 @@ Streamer::Streamer(const DevicePlan& dp, const std::vector<const uint8_t*>& base
       DGPP_CUDA_OK(cudaMalloc(&biased_, static_cast<size_t>(kStepMaxRows) * n_experts_ * 4));
       DGPP_CUDA_OK(cudaMemset(scores_, 0, static_cast<size_t>(kStepMaxRows) * n_experts_ * 4));
       DGPP_CUDA_OK(cudaMemset(biased_, 0, static_cast<size_t>(kStepMaxRows) * n_experts_ * 4));
-      DGPP_CUDA_OK(cudaMalloc(&unit_trace_, static_cast<size_t>(kStepMaxWorkers) * 8 * 8));
-      DGPP_CUDA_OK(cudaMemset(unit_trace_, 0, static_cast<size_t>(kStepMaxWorkers) * 8 * 8));
+      DGPP_CUDA_OK(cudaMalloc(&unit_trace_, static_cast<size_t>(2 * kStepMaxWorkers) * 8 * 8));  // a worker's last router unit, then its last site unit
+      DGPP_CUDA_OK(cudaMemset(unit_trace_, 0, static_cast<size_t>(2 * kStepMaxWorkers) * 8 * 8));
       DGPP_CUDA_OK(cudaMalloc(&cand_id_, static_cast<size_t>(kStepMaxRows) * n_experts_ * 4));
       DGPP_CUDA_OK(cudaMalloc(&cand_score_, static_cast<size_t>(kStepMaxRows) * n_experts_ * 4));
       DGPP_CUDA_OK(cudaMalloc(&cand_biased_, static_cast<size_t>(kStepMaxRows) * n_experts_ * 4));
@@ -221,14 +221,8 @@ StreamReport Streamer::run(const StreamerConfig& cfg) {
   p.norm_topk = cfg.norm_topk ? 1 : 0;
   p.lead_cap_bytes = cfg.lead_cap_bytes;
   p.max_leaders = cfg.max_leaders;
-  p.gated_first = cfg.gated_first ? 1u : 0u;
-  p.critical_leaders = cfg.critical_leaders;
-  p.acc_chunk = cfg.acc_chunk > 0 ? cfg.acc_chunk : kStepAccChunk;
-  p.router_pipeline = cfg.router_pipeline ? 1u : 0u;
-  p.yield_on_gate = cfg.lead_yield_on_gate ? 1u : 0u;
-  p.router_pause_lead = cfg.router_pause_lead ? 1u : 0u;
-  acc_chunk_ = p.acc_chunk;
-  gated_first_ = cfg.gated_first;
+  p.stage_workers = cfg.stage_workers;
+  p.stage_lead_pause = cfg.stage_lead_pause ? 1u : 0u;
   p.deadline_ns = static_cast<unsigned long long>(cfg.deadline_s * 1e9);
   p.pending_deadline_ns = static_cast<unsigned long long>(cfg.pending_deadline_s * 1e9);
   p.x = x_;
@@ -409,35 +403,27 @@ StreamReport Streamer::run(const StreamerConfig& cfg) {
           t.classes.push_back(c);
           ++n;
         };
-        // The kernel's order (build_class_table): phase order, or with gated_first the gated
-        // classes of every phase first, then the rest.
-        const int passes = gated_first_ ? 2 : 1;
-        for (int pass = 0; pass < passes; ++pass)
-          for (int ip = P; ip <= P + ph.merged; ++ip) {
-            const DevPhase& iph = dp_.phases[static_cast<size_t>(ip)];
-            const int il = iph.layer;
-            const bool want_gated = passes == 2 && pass == 0, want_ungated = passes == 1 || pass == 1;
-            if (ip > P && iph.lead_units > iph.fixed_units) {  // the staging class, gated when the group has a fold trigger
-              const bool gated = ph.fold_trigger != kTriggerEnd;
-              if (passes == 1 || gated == want_gated) add(ip, 4, -1, iph.lead_units - iph.fixed_units);
-            }
-            if (iph.accumulate) {
-              if (want_ungated) add(ip, 3, -1, (rows * static_cast<unsigned>(hidden_) + acc_chunk_ - 1) / acc_chunk_);
-              continue;
-            }
+        // The kernel's order (build_class_table): phase order; a phase's pools' compute then
+        // reduce classes, its fixed units, and for a merged phase its staging class last.
+        for (int ip = P; ip <= P + ph.merged; ++ip) {
+          const DevPhase& iph = dp_.phases[static_cast<size_t>(ip)];
+          const int il = iph.layer;
+          if (iph.accumulate) {
+            add(ip, 3, -1, (rows * static_cast<unsigned>(hidden_) + kStepAccChunk - 1) / kStepAccChunk);
+          } else {
             for (int rp = 0; rp < 2; ++rp)
               for (int i = 0; i < iph.n_pools; ++i) {
                 if ((rp == 0) == (i == iph.routed)) continue;
                 const DevPool& gp = dp_.pools[static_cast<size_t>(iph.pools[i])];
                 const unsigned groups = gp.group_kind == kGroupRouted ? static_cast<unsigned>(ctl_->run_count[il]) : 1u;
                 const unsigned per_group = gp.kind == kPoolMhc ? static_cast<unsigned>(gp.units_per_group) * rows : static_cast<unsigned>(gp.units_per_group);
-                const bool gated = gp.gate_kind != kGateNone;
-                if (groups * per_group != 0u && (passes == 1 || gated == want_gated)) add(ip, 0, iph.pools[i], groups * per_group);
-                if (gp.kind == kPoolFp8Matrix && gp.slabs > 1 && (passes == 1 || want_gated))
-                  add(ip, 1, iph.pools[i], (static_cast<unsigned>(gp.rows) * rows + acc_chunk_ - 1) / acc_chunk_);
+                if (groups * per_group != 0u) add(ip, 0, iph.pools[i], groups * per_group);
+                if (gp.kind == kPoolFp8Matrix && gp.slabs > 1) add(ip, 1, iph.pools[i], (static_cast<unsigned>(gp.rows) * rows + kStepAccChunk - 1) / kStepAccChunk);
               }
-            if (iph.fixed_units && want_ungated) add(ip, 2, -1, iph.fixed_units);
+            if (iph.fixed_units) add(ip, 2, -1, iph.fixed_units);
           }
+          if (ip > P && iph.lead_units > iph.fixed_units) add(ip, 4, -1, iph.lead_units - iph.fixed_units);  // the staging class
+        }
       }
       first = std::min(first, ctl_->stamp_begin[P]);
       last = std::max(last, ctl_->stamp_end[P]);

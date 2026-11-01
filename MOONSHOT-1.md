@@ -2499,12 +2499,43 @@ area, untracked.
       the chain stays bitwise. The expert and projection units lost their
       local-memory re-reads of the group struct on the way (stack 80 to
       48).
+      The site unit next (2026-11-01, later): every load of the unit
+      issued together, the three dots reduced in one pass, the slice
+      collapsed from the registers, and the finish split so the row is
+      normed and released before the coefficients and the Sinkhorn (6.8
+      µs of dependent division on one warp, needed only by the next
+      update); the unit releases its row at 7.2 to 8.0 µs in the kernel
+      where it had taken 17 to 20, bitwise throughout, twenty barriers
+      down to five. The class did not shorten with the unit: at the fold
+      the workers were in the merged phases' staging units, so each
+      merged phase's own classes now precede its staging class, the chain
+      bumps the yield generation at the fold's trigger so lead units give
+      the staging the fold's window (80.2 and 80.7 on the rate case). A
+      staging worker cap with the lead paused while the staging has units
+      left (`stage_workers`, `stage_lead_pause`) is on the config and off:
+      the set measured 80.6 and 80.7 in the matrix against 79.4 to 80.2
+      for its halves and neither, but six rate samples with it on sat at
+      79.1 to 80.1 against 80.2 to 80.7, the pause costing the expert
+      phase the lead's staging for the 50 µs the staging class runs; it
+      pays once the staging fits the fold's window. A staging unit that
+      yields when a gate opens was measured and rejected (the router's
+      units then read unstaged rows, a point lost). The knobs that lost
+      earlier (gated
+      classes first, the leader bound while critical, the 2048 chunk, the
+      pipelined router, the lead paused for the router) are retired from
+      the streamer and the kernel; the yield on an opened gate is the
+      kernel's. The staging itself is the finding: 4.9 MB of rows take 50
+      to 55 µs from the trigger at any worker count, the L2 feeding the
+      site units meanwhile, so the router's rows are not all hot at its
+      gate; fewer bytes (the bf12 rows) or an earlier staging window under
+      a cache policy the stream does not evict are the levers.
       Owed here: the attention consumer, the folds and the select as
       consumers, and the chain's critical path after the attention-output
-      fold, about 70 µs against the budget's 34: the MoE site's class 24
-      (hand-out stagger, units of 9, the finish of 10), the router's 23
-      (its unit 9 standalone, `router_unit_rate`), the select and finish
-      about 25 under the saturated memory. Lessons kept in
+      fold, now about 60 µs against the budget's 34: the site's class
+      about 12 to the last row's release (its hand-out and units of 8), the
+      router's 30 (its units out within 4 to 6 µs, running 25 against 8
+      standalone with their rows still being staged), the select and
+      finish about 15. Lessons kept in
       `docs/step_engine.md`: gated classes first lost 3.6 points, merged
       phases first deadlocked, the fold gate must be per group, a
       dependent token-id load per staged 16-byte piece cost the projection
