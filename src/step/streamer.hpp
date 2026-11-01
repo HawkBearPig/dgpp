@@ -14,6 +14,7 @@
 #include <cuda_runtime.h>
 
 #include "kernels/step/stream.hpp"
+#include "net/collective_bus.hpp"
 #include "step/device_plan.hpp"
 #include "step/protocol.hpp"
 
@@ -137,6 +138,12 @@ class Streamer {
   // positions, the state pool's planes and tables, the lists, the rotary tables, the scale) are
   // set before a run; the partials, the tickets and the output o are the streamer's.
   void set_attention(const StepAttnParams& inputs) { attn_in_ = inputs; }
+  // The folds on the bus (world > 1): the step engine issues each step's fold generations ahead
+  // (CollectiveBus::step_prepare) into the kernel's fold table and settles them after the run; the
+  // bus must be on the write transport. Without it (or at world 1) the fold is the chain's modeled
+  // spin and the identity.
+  void set_fold(net::CollectiveBus* bus, int world, int my_rank) { bus_ = bus; fold_world_ = world; fold_rank_ = my_rank; }
+  int fold_count() const { return dp_.fold_count; }
   bool attention() const { return attention_; }
   const uint16_t* attn_o() const { return attn_o_; }  // [kStepMaxRows][local_heads * 512] bf16
   const float* scores() const { return scores_; }  // the router pool's scores [kStepMaxRows][n_experts]
@@ -196,6 +203,11 @@ class Streamer {
   bool mhc_ = false;
   bool attention_ = false;
   StepAttnParams attn_in_;
+  net::CollectiveBus* bus_ = nullptr;
+  int fold_world_ = 1;
+  int fold_rank_ = 0;
+  StepFoldDev* fold_table_ = nullptr;      // pinned [kStepRingSlots][kStepMaxFolds]
+  StepFoldDev* fold_table_dev_ = nullptr;
   int attn_local_heads_ = 0;
   int attn_n_split_[kStepAttnSources] = {0, 0};
   int attn_group_[kStepAttnSources] = {1, 1};

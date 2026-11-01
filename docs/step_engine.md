@@ -732,15 +732,52 @@ proving and folding, at five rows of DeepSeek-V4.1's hidden (25600 elements,
 104 chunks, 13 blocks), three passes so the staging ring and the write ring
 are reused many times over. On worlds of two and four every fold is bitwise
 the canonical chain and the completion epoch advances once per fold; the
-transport's own scenarios pass unchanged on the wrapped kernel. What
-remains of the fold item: the step kernel's fold classes at the group's
-trigger (the stage units writing the partial's chunks from the reduce
-units' output, the fold units replacing the chain's spin and carrying the
-residual update that today rides on the reduce units, since the update needs
-the folded row), the step ring of 256 cells with the 64-bit step epoch mixed
-into the chunk hash, the deadline, poison and injected-delay scenarios
-against the driver, world 1 as the identity, and the in-situ distribution
-inside a real step on the fabric.
+transport's own scenarios pass unchanged on the wrapped kernel.
+
+The step kernel then took the fold as two classes of the group (world 2 and
+up). Every group head with a fold inside it (the attention-output phase on
+its projection's reduce, the accumulate on its own units) carries a fold
+index in the step's fold order; before each step the streamer issues that
+many generations through `step_prepare` into a pinned fold table by step
+slot and index, and settles them after the run. At the trigger the chain
+no longer spins: the stage class (one unit a block of the transport's
+grid, gated on the trigger) lays the group's partial, the update-carrying
+projection's y or the accumulation's, out in the generation's staging row
+and publishes its records; the fold class (gated on every stage unit) polls
+the peers' rows, proves and folds each chunk in rank order into the partial
+in place, then applies the residual update those elements' reduce or
+accumulate units carried at world 1 (the attention site's mix of streams
+under the site's post and comb with the folded h; the MoE site's with the
+folded y), since the update needs the folded row; the last fold unit sets
+the group's fold gate and the stamps. The reduce and accumulate units keep
+their fused update only when the group's fold is not carried, so world 1
+and the modeled spin are unchanged. One defect surfaced on the way: the
+lowering's merge loop stopped one phase short of the end, so the plan's
+last accumulate never took its trigger, its fold stayed the modeled spin
+and the update went missing past world 1; the trigger is set on every
+accumulate with a fold now.
+
+`step_fold_matches_the_production_fold_on_two_ranks` runs two streamers
+over one rig in one process, each a rank with its own bus on a loopback
+world of two, 23 workers each so both kernels are resident at once. The
+attention fold's result on both ranks is bitwise bf16(y1 + y1) of a
+world-1 run of the same rig (both ranks hold the same partial); past that
+fold the activations differ from world 1 by construction, so the MoE fold
+is checked by the two ranks' bitwise agreement on the folded partials and
+on the output streams, and the production hyper-connection kernels run on
+the folded partials reproduce the step's attention update, normed rows and
+MoE update exactly. (The oracle's output-projection envelope recomputes
+one rank's projection and reads a folded h as beyond it; it does not apply
+there.) The attention and fold bodies inlined took the kernel's stack from
+48 to 176 bytes a thread and about a point off the rate band on paths that
+never reach them (tile-major 78.5 to 79.4); out of line the band is back at
+79.6 to 80.4 tile-major and 72.4 to 74.5 row-major, with the stack at 160.
+
+What remains of the fold item: the step ring of 256 cells with the 64-bit
+step epoch mixed into the chunk hash (a step of DeepSeek-V4.1's 40 layers
+issues 80 generations against the stream ring's 64), the deadline, poison
+and injected-delay scenarios against the driver and the step, and the
+in-situ distribution inside a real step on the fabric.
 
 ## The step protocol
 

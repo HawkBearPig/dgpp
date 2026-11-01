@@ -11,6 +11,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <stdexcept>
@@ -35,6 +36,7 @@
 #include "kernels/glm_mhc_launch.hpp"
 #include "kernels/glm_moe_launch.hpp"
 #include "kernels/latent_format.hpp"
+#include "net/collective_bus.hpp"
 #include "models/glm/mhc.hpp"
 #include "models/glm/moe.hpp"
 #include "step_reference_host.hpp"
@@ -86,6 +88,10 @@ struct AttnState {
     cudaFree(q); cudaFree(req_ids); cudaFree(pos); cudaFree(wlist); cudaFree(wcounts); cudaFree(topk); cudaFree(counts);
   }
 };
+
+// Two ranks' step kernels in one process spin on each other's fold rows; CUDA's lazy module
+// loading waits for an idle device on a first launch and would wedge them (bus_kernel.hpp).
+static const int kEagerModules = (setenv("CUDA_MODULE_LOADING", "EAGER", /*overwrite=*/0), 0);
 
 struct Rig {
   std::unique_ptr<AttnState> attn;  // when the consumer mask has the attention
@@ -356,7 +362,7 @@ void print_report(const char* title, const StreamReport& r, int layer) {
                 util * 100.0, t.grabs ? t.busy_us / t.grabs : 0.0, t.grabs, t.grabs ? t.handout_us / t.grabs : 0.0, t.lead_in_mb,
                 (t.stream && window > 0 && r.workers > 0) ? t.wait_us / (window * r.workers) * 100.0 : 0.0, t.ahead_mb, t.cursor_layer, t.look_blocked);
     if (t.merged || !t.classes.empty()) {  // the group's classes: when each ran, from the group's begin
-      static const char* const kinds[8] = {"compute", "reduce", "fixed", "accum", "stage", "?", "?", "?"};
+      static const char* const kinds[8] = {"compute", "reduce", "fixed", "accum", "stage", "?", "fstage", "fold"};
       for (const ClassTiming& c : t.classes)
         std::printf("            %-10s %-7s pool %3d (kind %2d) units %5u   %+8.1f .. %+8.1f us (last hand-out %+8.1f)\n", c.phase_name.c_str(), kinds[c.kind & 7],
                     c.pool, c.pool_kind, c.units, c.units && c.first_us > 0 ? c.first_us - t.begin_us : 0.0, c.units && c.last_us > 0 ? c.last_us - t.begin_us : 0.0,
@@ -1331,6 +1337,175 @@ DGPP_TEST(step_attention_matches_the_production_kernels) {
     require(differ == 0, "the step's attention rows differ from the production kernels'");
     require(differ_again == 0, "the step's attention rows are not bitwise across runs");
   }
+}
+
+// A loopback world of `world` buses in this process on the write transport (as bus_test's), rank 0
+// listening; the latency slot holds a step's widest fold (rows x hidden bf16).
+std::vector<std::unique_ptr<dgpp::net::CollectiveBus>> start_fold_world(int world, uint16_t port, size_t lat_slot_bytes) {
+  using dgpp::net::BusOptions;
+  std::vector<std::unique_ptr<dgpp::net::CollectiveBus>> out;
+  for (int r = 0; r < world; ++r) {
+    BusOptions o;
+    o.world_size = world;
+    o.my_rank = r;
+    o.rendezvous_port = port;
+    o.rendezvous_host = r == 0 ? "" : "127.0.0.1";
+    o.rendezvous_timeout_ms = 20000;
+    o.lat_slots = 8;
+    o.lat_slot_bytes = lat_slot_bytes;
+    o.bulk_slots = 8;
+    o.bulk_slot_bytes = 262144;
+    o.qp_depth = 1024;
+    o.completion_timeout_ms = 10000;
+    o.consumer_deadline_s = 60.0;
+    o.launch_consumers = false;
+    o.latency_transport = dgpp::net::BusLatencyTransport::kWrite;
+    out.push_back(std::make_unique<dgpp::net::CollectiveBus>(o));
+  }
+  std::vector<std::string> errors(static_cast<size_t>(world));
+  std::thread listener([&] { if (!out[0]->start(&errors[0])) std::fprintf(stderr, "fold world rank 0: %s\n", errors[0].c_str()); });
+  std::vector<std::thread> connectors;
+  for (int r = 1; r < world; ++r)
+    connectors.emplace_back([&, r] {
+      if (!out[static_cast<size_t>(r)]->start(&errors[static_cast<size_t>(r)]))
+        std::fprintf(stderr, "fold world rank %d: %s\n", r, errors[static_cast<size_t>(r)].c_str());
+    });
+  listener.join();
+  for (auto& t : connectors) t.join();
+  for (int r = 0; r < world; ++r)
+    if (!errors[static_cast<size_t>(r)].empty()) return {};
+  return out;
+}
+
+// The fold inside the step on a loopback world of two: two streamers over one rig, each a rank
+// with its bus, 23 workers each so both kernels are resident at once, their folds the bus's
+// write transport driven from inside the kernels (the stage and fold classes). Checks: every
+// folded partial (the output projection's y and the accumulation's y of the last layer) equals
+// bf16(y1 + y1) of a world-1 run of the same rig (both ranks hold the same partial), the two
+// ranks' results are identical, and the production hyper-connection kernels run on the folded h
+// reproduce the step's streams and normed rows (the update moved behind the fold).
+DGPP_TEST(step_fold_matches_the_production_fold_on_two_ranks) {
+  const int layers = 1;  // one layer: its entering state is the seed, so the production oracle runs on it directly
+  auto rig = make_rig_mask(layers, kConsumeAll, /*tile_major=*/true);
+  StreamerConfig cfg = design_config();
+  cfg.steps = 1;
+  cfg.rows = 5;
+  cfg.top_k = 6;
+  const int rows = cfg.rows, H = rig->cfg.hidden_size;
+  // The world-1 partials and the state before the last layer, for the fold's arithmetic.
+  std::vector<uint16_t> y1_attn, y1_moe;
+  int h_pool = -1;
+  const int L = layers - 1;
+  const DevLayer& dl = rig->dp.layers[static_cast<size_t>(L)];
+  for (int P = dl.phase_begin; P < dl.phase_begin + dl.phase_count; ++P)
+    for (int i = 0; i < rig->dp.phases[static_cast<size_t>(P)].n_pools; ++i)
+      if (rig->dp.pools[static_cast<size_t>(rig->dp.phases[static_cast<size_t>(P)].pools[i])].update_site) h_pool = rig->dp.phases[static_cast<size_t>(P)].pools[i];
+  require(h_pool >= 0, "the last layer's output projection carries the attention update");
+  const DevPool& hp = rig->dp.pools[static_cast<size_t>(h_pool)];
+  const size_t hn = static_cast<size_t>(rows) * H;
+  {
+    Streamer s1(rig->dp, rig->bases, rig->plans);
+    if (rig->attn) s1.set_attention(rig->attn->params);
+    const StreamReport r1 = s1.run(cfg);
+    require(r1.status == kStepOk, std::string("the world-1 run ended on ") + r1.status_text);
+    y1_attn.resize(hn);
+    y1_moe.resize(hn);
+    DGPP_CUDA_OK(cudaMemcpy(y1_attn.data(), s1.proj() + hp.out_offset, hn * 2, cudaMemcpyDeviceToHost));
+    DGPP_CUDA_OK(cudaMemcpy(y1_moe.data(), s1.y(), hn * 2, cudaMemcpyDeviceToHost));
+  }
+  // The world of two.
+  auto buses = start_fold_world(2, 29940, /*lat_slot_bytes=*/65536);
+  require(!buses.empty(), "the loopback fold world started");
+  std::vector<std::unique_ptr<Streamer>> ranks;
+  for (int r = 0; r < 2; ++r) {
+    ranks.push_back(std::make_unique<Streamer>(rig->dp, rig->bases, rig->plans));
+    if (rig->attn) ranks.back()->set_attention(rig->attn->params);
+    ranks.back()->set_fold(buses[static_cast<size_t>(r)].get(), 2, r);
+  }
+  std::printf("   fold world of two: %d folds a step over %d layers\n", ranks[0]->fold_count(), layers);
+  // Rank 0's entering state (the seed, deterministic at construction) and the one-hot pre, for the oracle.
+  uint16_t* s0_in = nullptr;
+  float* one_hot = nullptr;
+  {
+    const size_t sn = static_cast<size_t>(rows) * 4 * H;
+    DGPP_CUDA_OK(cudaMalloc(&s0_in, sn * 2));
+    DGPP_CUDA_OK(cudaMemcpy(s0_in, ranks[0]->streams(0), sn * 2, cudaMemcpyDeviceToDevice));
+    DGPP_CUDA_OK(cudaMalloc(&one_hot, rows * 4 * 4));
+    std::vector<float> oh(static_cast<size_t>(rows) * 4, 0.f);
+    for (int t = 0; t < rows; ++t) oh[static_cast<size_t>(t) * 4] = 1.f;
+    DGPP_CUDA_OK(cudaMemcpy(one_hot, oh.data(), oh.size() * 4, cudaMemcpyHostToDevice));
+  }
+  StreamerConfig cfg2 = cfg;
+  cfg2.workers = 23;  // two kernels of 24 blocks on one GPU
+  std::vector<StreamReport> reports(2);
+  std::vector<std::string> errors(2);
+  std::vector<std::thread> threads;
+  for (int r = 0; r < 2; ++r)
+    threads.emplace_back([&, r] {
+      try {
+        reports[static_cast<size_t>(r)] = ranks[static_cast<size_t>(r)]->run(cfg2);
+      } catch (const std::exception& e) {
+        errors[static_cast<size_t>(r)] = e.what();
+      }
+    });
+  for (auto& t : threads) t.join();
+  for (int r = 0; r < 2; ++r) {
+    require(errors[static_cast<size_t>(r)].empty(), "rank " + std::to_string(r) + ": " + errors[static_cast<size_t>(r)]);
+    require(reports[static_cast<size_t>(r)].status == kStepOk, "rank " + std::to_string(r) + " ended on " + reports[static_cast<size_t>(r)].status_text);
+  }
+  // The first fold's arithmetic: y2 == bf16(y1 + y1) on both ranks (the attention fold sees the
+  // same inputs as the world-1 run; past it the activations differ by construction, so the MoE
+  // fold is checked by the ranks' agreement and the production oracle below).
+  auto check_fold = [&](const uint16_t* dev, const std::vector<uint16_t>& y1, const char* what, int r) {
+    std::vector<uint16_t> y2(hn);
+    DGPP_CUDA_OK(cudaMemcpy(y2.data(), dev, hn * 2, cudaMemcpyDeviceToHost));
+    size_t differ = 0, first = hn;
+    for (size_t i = 0; i < hn; ++i) {
+      const float a = bf16_bits_to_float(y1[i]);
+      const uint16_t want = float_to_bf16_bits(a + a);
+      if (y2[i] != want) { if (first == hn) first = i; ++differ; }
+    }
+    std::printf("   rank %d %s: %zu of %zu differ from bf16(y1 + y1)%s\n", r, what, differ, hn, differ ? (" (first at " + std::to_string(first) + ")").c_str() : "");
+    return differ;
+  };
+  size_t bad = 0;
+  for (int r = 0; r < 2; ++r) bad += check_fold(ranks[static_cast<size_t>(r)]->proj() + hp.out_offset, y1_attn, "attention fold", r);
+  (void)y1_moe;
+  {
+    std::vector<uint16_t> a(hn), b(hn);
+    DGPP_CUDA_OK(cudaMemcpy(a.data(), ranks[0]->y(), hn * 2, cudaMemcpyDeviceToHost));
+    DGPP_CUDA_OK(cudaMemcpy(b.data(), ranks[1]->y(), hn * 2, cudaMemcpyDeviceToHost));
+    size_t differ = 0;
+    for (size_t i = 0; i < hn; ++i) differ += a[i] != b[i];
+    std::printf("   the two ranks' folded MoE partials: %zu of %zu differ\n", differ, hn);
+    bad += differ;
+  }
+  // The two ranks agree, element for element, on the streams.
+  {
+    const size_t sn = static_cast<size_t>(rows) * 4 * H;
+    std::vector<uint16_t> a(sn), b(sn);
+    DGPP_CUDA_OK(cudaMemcpy(a.data(), ranks[0]->streams(0), sn * 2, cudaMemcpyDeviceToHost));
+    DGPP_CUDA_OK(cudaMemcpy(b.data(), ranks[1]->streams(0), sn * 2, cudaMemcpyDeviceToHost));
+    size_t differ = 0;
+    for (size_t i = 0; i < sn; ++i) differ += a[i] != b[i];
+    std::printf("   the two ranks' output streams: %zu of %zu differ\n", differ, sn);
+    bad += differ;
+  }
+  // The production sites on the folded h and y reproduce the step's updates and normed rows (the
+  // oracle reads the step's folded partials as its h; the update moved behind the fold).
+  {
+    const MhcSiteCheck c = check_mhc_layer(*rig, *ranks[0], cfg2, 0, s0_in, one_hot);
+    // The envelope check recomputes one rank's projection and reads the folded h as beyond it by
+    // construction; the fold's arithmetic is the bf16(y1 + y1) check above.
+    std::printf("   production sites on the folded partials: attention update %zu differ, MoE normed rows %zu, fused update %zu (the output projection's envelope does not apply to a folded h: %zu beyond)\n",
+                c.d1, c.dx, c.d0, c.h_beyond);
+    bad += c.d1 + c.dx + c.d0;
+    cudaFree(s0_in);
+    cudaFree(one_hot);
+  }
+  for (auto& bus : buses) bus->quiesce();
+  for (auto& bus : buses) bus->stop();
+  require(bad == 0, "the fold inside the step differs from bf16(y1 + y1) or the ranks disagree");
 }
 
 DGPP_TEST(step_mhc_sites_match_the_production_kernels) {

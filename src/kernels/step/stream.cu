@@ -6,6 +6,7 @@
 #include "kernels/csa2_attn_finish.cuh"
 #include "kernels/dsa.hpp"
 #include "kernels/dsa_attn_flash.cuh"
+#include "net/bus_write.cuh"
 #include "kernels/step/mxfp4_expert.cuh"
 #include "kernels/step/mxfp4_row.cuh"
 #include "kernels/step/router.cuh"
@@ -117,10 +118,43 @@ __device__ __forceinline__ unsigned pool_units(const StepStreamParams& p, int la
   const unsigned groups = pool.group_kind == kGroupRouted ? static_cast<unsigned>(p.ctl->run_count[layer]) : 1u;
   return groups * compute_units_per_group(p, pool) + reduce_units(p, pool);
 }
+// The ordered accumulation's chunks (the accumulate phase's own units, and its fold's trigger).
+__device__ __forceinline__ unsigned accumulate_units(const StepStreamParams& p) {
+  return (static_cast<unsigned>(p.ctl->rows) * static_cast<unsigned>(p.hidden) + kStepAccChunk - 1) / kStepAccChunk;
+}
+// The group's fold on the bus (world > 1): its source rows, the partial the update-carrying
+// projection's reduce units (attn_out: its y) or the accumulation (its y) complete, [rows][N]
+// bf16 contiguous; and its unit count, the write transport's grid for that many elements.
+__device__ __forceinline__ bool fold_source(const StepStreamParams& p, int P, uint16_t** y, unsigned* elems) {
+  const DevPhase& ph = p.phases[P];
+  if (ph.accumulate) {
+    *y = p.y;
+    *elems = p.ctl->rows * static_cast<unsigned>(p.hidden);
+    return p.y != nullptr;
+  }
+  for (int i = 0; i < ph.n_pools; ++i) {
+    const DevPool& pool = p.pools[ph.pools[i]];
+    if (pool.kind == kPoolFp8Matrix && pool.update_site) {
+      *y = p.proj + pool.out_offset;
+      *elems = p.ctl->rows * static_cast<unsigned>(pool.rows);
+      return p.proj != nullptr;
+    }
+  }
+  return false;
+}
+__device__ __forceinline__ unsigned fold_units(const StepStreamParams& p, int P) {
+  const DevPhase& ph = p.phases[P];
+  if (p.fold.world <= 1 || ph.fold_index < 0 || ph.fold_trigger == kTriggerEnd) return 0u;
+  uint16_t* y = nullptr;
+  unsigned elems = 0;
+  if (!fold_source(p, P, &y, &elems)) return 0u;
+  return net::bus_write_blocks((elems + net::kBusWriteChunkElems - 1) / net::kBusWriteChunkElems);  // bus_write_chunks is host-side
+}
 __device__ __forceinline__ unsigned own_units(const StepStreamParams& p, int layer, int P) {
   const DevPhase& ph = p.phases[P];
-  if (ph.accumulate) return (static_cast<unsigned>(p.ctl->rows) * static_cast<unsigned>(p.hidden) + kStepAccChunk - 1) / kStepAccChunk;
-  unsigned n = ph.fixed_units;
+  const unsigned fold = 2u * fold_units(p, P);  // the stage class and the fold class of the group's fold
+  if (ph.accumulate) return accumulate_units(p) + fold;
+  unsigned n = ph.fixed_units + fold;
   for (int i = 0; i < ph.n_pools; ++i) n += pool_units(p, layer, p.pools[ph.pools[i]]);
   return n;
 }
@@ -138,10 +172,11 @@ __device__ __forceinline__ unsigned pool_compute_units(const StepStreamParams& p
 // saturated stream their latency-bound units ran slower than in the drain, and every grab paid
 // their gate loads. Merged phases first deadlocked: the down units, waited per expert group
 // inside the unit, held every worker ahead of the gate and up units.)
-constexpr uint8_t kClassCompute = 0, kClassReduce = 1, kClassFixed = 2, kClassAccumulate = 3, kClassStage = 4;
+constexpr uint8_t kClassCompute = 0, kClassReduce = 1, kClassFixed = 2, kClassAccumulate = 3, kClassStage = 4, kClassFoldStage = 6, kClassFold = 7;
 constexpr uint8_t kGateOwnPool = 3;  // a reduce class: its pool's compute units complete
 constexpr uint8_t kGateTrigger = 4;  // a staging class: the group's fold trigger holds (the fold's idle window begins)
 constexpr uint8_t kGateAttnPools = 5;  // the attention finish: every attention pool of the phase has its blocks complete
+constexpr uint8_t kGateFoldStaged = 6;  // the fold units: every stage unit of the group's fold published its row
 __device__ void build_class_table(const StepStreamParams& p, int P) {
   StepCtl* ctl = p.ctl;
   const unsigned rows = ctl->rows;
@@ -161,9 +196,8 @@ __device__ void build_class_table(const StepStreamParams& p, int P) {
   // docs/step_engine.md); within a merged phase its own classes before its staging class.
   for (int ip = P; ip <= P + static_cast<int>(p.phases[P].merged); ++ip) {
     const DevPhase& iph = p.phases[ip];
-    const int il = iph.layer;
-    if (iph.accumulate) {  // the ordered accumulation's chunks are the phase's only units
-      put(own_units(p, il, ip), 1u, kClassAccumulate, ip, -1, kGateNone, 0, 0u);
+    if (iph.accumulate) {  // the ordered accumulation's chunks are the phase's own units
+      put(accumulate_units(p), 1u, kClassAccumulate, ip, -1, kGateNone, 0, 0u);
     } else {
       for (int rp = 0; rp < 2; ++rp)
         for (int i = 0; i < iph.n_pools; ++i) {
@@ -180,6 +214,17 @@ __device__ void build_class_table(const StepStreamParams& p, int P) {
           if (reduce) put(reduce, 1u, kClassReduce, ip, iph.pools[i], gp.kind == kPoolAttention ? kGateAttnPools : kGateOwnPool, 0, 0u);
         }
       if (iph.fixed_units) put(iph.fixed_units, 1u, kClassFixed, ip, -1, kGateNone, 0, 0u);  // the shortest units, they fill the tail
+    }
+    // The group's fold on the bus (world > 1): the stage units open on the trigger (the partial
+    // complete) and lay it out in the generation's staging row; the fold units open when every
+    // stage unit has published, poll the peers' rows, fold in rank order and apply the update;
+    // the last sets fold_done, the gate of the merged classes behind the fold.
+    if (ip == P) {
+      const unsigned fu = fold_units(p, P);
+      if (fu) {
+        put(fu, 1u, kClassFoldStage, ip, -1, kGateTrigger, 0, 0u);
+        put(fu, 1u, kClassFold, ip, -1, kGateFoldStaged, 0, 0u);
+      }
     }
     // A merged phase's lead-only bytes (a site's coefficient rows, the router's rows) are staged
     // into L2 by a class of the group that opens on the fold's trigger, so they are read during
@@ -214,7 +259,7 @@ __device__ __forceinline__ bool fold_trigger_holds(const StepStreamParams& p, in
   const DevPhase& ph = p.phases[P];
   if (ph.fold_trigger == kTriggerReduce && ph.trigger_pool >= 0)
     return ld_acq(&p.ctl->reduce_done[layer][ph.trigger_pool]) >= reduce_units(p, p.pools[ph.trigger_pool]);
-  if (ph.fold_trigger == kTriggerAccumulate) return ld_acq(&p.ctl->acc_done[layer]) >= own_units(p, layer, P);
+  if (ph.fold_trigger == kTriggerAccumulate) return ld_acq(&p.ctl->acc_done[layer]) >= accumulate_units(p);
   return false;
 }
 
@@ -434,7 +479,7 @@ __device__ void accumulate_chunk(const StepStreamParams& p, int layer, unsigned 
       y[ir] = f32_to_bf16(a);
     }
   }
-  if (fused) mhc_update_chunk(p.post, p.comb, p.y, p.streams[1], p.streams[0], H, i0, i1);  // the same thread owns the same elements
+  if (fused) mhc_update_chunk(p.post, p.comb, p.y, p.streams[1], p.streams[0], H, i0, i1);  // the same thread owns the same elements (the caller withholds it when the group's fold units carry it)
 }
 
 // A hyper-connection site's unit: kMhcUnitCoeffs logits of one token (unit
@@ -515,7 +560,11 @@ __device__ __forceinline__ bool attn_pools_done(const StepStreamParams& p, int l
 // the request count); the main cache's the fp4_block form behind the paged
 // block table. The group merge's tickets and partials are the step's. Bitwise
 // the production kernel's partials: the same body at the same coordinates.
-__device__ void attention_unit(const StepStreamParams& p, int layer, const DevPool& pool, int rb, uint8_t* smem) {
+// Out of line (2026-11-01): the attention and fold bodies run on a few units a layer, or not at
+// all at world 1, and inlined they took the kernel's stack from 48 to 176 bytes and the rate band
+// down about a point on the paths that never reach them; the expert units' hot loops stay inlined
+// (out of line they lost 2.5 points, consumer_unit above).
+__device__ __noinline__ void attention_unit(const StepStreamParams& p, int layer, const DevPool& pool, int rb, uint8_t* smem) {
   const StepAttnParams& a = p.attn;
   const int rows = static_cast<int>(p.ctl->rows);
   const int blocks = static_cast<int>(attn_blocks(p));
@@ -559,13 +608,105 @@ __device__ void attention_unit(const StepStreamParams& p, int layer, const DevPo
 #undef DGPP_STEP_ATTN_ARGS
 }
 
+// The group's fold on the bus (world > 1; net/bus_write.cuh). The stage unit: block `unit` of the
+// write transport's grid lays its chunks of the group's partial (the update-carrying projection's
+// y, or the accumulation's) out in the generation's staging row with their trailers and publishes
+// its record's ready; the host's engine posts the row to every peer when every block has. The
+// generation comes from the fold table the host filled for this step (its slot) at the group's
+// fold index. Bitwise the production fold: the same body as the stream collective's kernel.
+__device__ __forceinline__ StepFoldDev fold_handle(const StepStreamParams& p, int P) {
+  const volatile StepFoldDev* f = p.fold.table + static_cast<size_t>(p.ctl->fold_slot) * kStepMaxFolds + p.phases[P].fold_index;
+  StepFoldDev h;
+  h.gen = f->gen;
+  h.elems = f->elems;
+  h.cell = f->cell;
+  h.recs = f->recs;
+  return h;
+}
+__device__ __noinline__ void fold_stage_unit(const StepStreamParams& p, int P, unsigned unit) {
+  uint16_t* y = nullptr;
+  unsigned elems = 0;
+  const unsigned n = fold_units(p, P);
+  const StepFoldDev f = fold_handle(p, P);
+  if (!fold_source(p, P, &y, &elems) || n == 0 || f.gen == 0 || f.recs == nullptr || f.elems != elems) {
+    if (threadIdx.x == 0) atomicCAS(&p.ctl->status, kStepOk, kStepBadUnit);
+    return;
+  }
+  net::bus_write::stage_block(static_cast<int>(unit), static_cast<int>(n), p.fold.view, f.gen, y, elems, f.recs[unit]);
+  if (threadIdx.x == 0) red_release(&p.ctl->fold_staged[P], 1u);  // after stage_block's barrier and release of ready
+}
+// The fold unit: its chunks of every peer's row polled, proven and folded in rank order into the
+// group's partial in place, then the residual update those elements' reduce or accumulate units
+// carried at world 1, on the folded values (the attention site: streams[0] into streams[1] under
+// the site's post and comb with h the projection's y; the MoE site: streams[1] into streams[0]
+// with the accumulation's y). The last fold unit of the group sets fold_done and the group's
+// stamps. A unit that gives up (deadline, poison) fails the step.
+__device__ __noinline__ void fold_unit(const StepStreamParams& p, int layer, int P, unsigned unit, uint8_t* smem) {
+  const DevPhase& ph = p.phases[P];
+  uint16_t* y = nullptr;
+  unsigned elems = 0;
+  const unsigned n = fold_units(p, P);
+  const StepFoldDev f = fold_handle(p, P);
+  if (!fold_source(p, P, &y, &elems) || n == 0 || f.gen == 0 || f.cell == nullptr || f.recs == nullptr) {
+    if (threadIdx.x == 0) atomicCAS(&p.ctl->status, kStepOk, kStepBadUnit);
+    return;
+  }
+  net::bus_write::FoldSmem& sm = *reinterpret_cast<net::bus_write::FoldSmem*>(smem);
+  if (threadIdx.x == 0) {
+    for (int q = 0; q < static_cast<int>(net::kBusMaxPeers); ++q) sm.peer_done[q] = 0;
+    sm.abort = 0;
+    sm.gate_waits = 0;
+    sm.gate_spins = 0;
+  }
+  __syncthreads();
+  const unsigned long long start = clock64();
+  const bool ok = net::bus_write::fold_block(static_cast<int>(unit), static_cast<int>(n), p.fold.view, p.fold.my_rank, f.gen, y, y, elems,
+                                            f.cell, f.recs[unit], p.fold.deadline_cycles, start, sm);
+  if (!ok) {
+    if (threadIdx.x == 0) atomicCAS(&p.ctl->status, kStepOk, kStepDeadline | (static_cast<unsigned>(P) << 8));
+    return;
+  }
+  // The update on the folded elements of this unit's chunks (the write grid's warp decomposition:
+  // chunk c = gwarp + k * nwarps), eight elements a lane.
+  {
+    constexpr int kWarps = net::bus_write::kThreads / 32;
+    const int warp = static_cast<int>(threadIdx.x) / 32;
+    const uint32_t lane = threadIdx.x & 31;
+    const uint32_t gwarp = unit * kWarps + warp;
+    const uint32_t nwarps = n * kWarps;
+    const uint32_t chunks = (elems + net::kBusWriteChunkElems - 1) / net::kBusWriteChunkElems;
+    const int H = p.hidden;
+    const uint16_t* in = ph.accumulate ? p.streams[1] : p.streams[0];
+    uint16_t* out = ph.accumulate ? p.streams[0] : p.streams[1];
+    if (lane < net::kBusWriteDataLanes)
+      for (uint32_t c = gwarp; c < chunks; c += nwarps) {
+        const uint32_t e0 = c * net::kBusWriteChunkElems + lane * 8;
+        for (uint32_t e = e0; e < e0 + 8 && e < elems; ++e) {
+          const int t = static_cast<int>(e / static_cast<unsigned>(H)), d = static_cast<int>(e % static_cast<unsigned>(H));
+          mhc_update_elem(p.post, p.comb, bf16_bits_to_float(y[e]), in, out, H, static_cast<size_t>(t), d);
+        }
+      }
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    const unsigned before = atom_add_acq_rel(&p.ctl->fold_folded[P], 1u);
+    if (before + 1 == n) {
+      st_rel(&p.ctl->fold_done[P], 1u);  // this group's gate
+      red_release(&p.ctl->open_gen, 1u);  // lead units yield: the classes behind the fold want the workers
+      p.ctl->stamp_end[P] = gtimer();
+      for (int Q = P + 1; Q <= P + static_cast<int>(ph.merged); ++Q) p.ctl->stamp_begin[Q] = p.ctl->stamp_end[P];
+    }
+  }
+  (void)layer;
+}
+
 // The attention's finish for one (row, head) (kernels/csa2_attn_finish.cuh
 // attn_finish_body): the main source's group partials, then the window's,
 // then the sink (the layer's attn_sink range), normalized, rounded, the
 // query's rotation removed from the last 64; o's row. The reduce class of the
 // phase's last attention pool, gated on every attention pool's blocks.
-__device__ void attention_finish_unit(const StepStreamParams& p, int layer, const DevPhase& ph, const DevPool& pool, unsigned unit,
-                                      uint8_t* smem) {
+__device__ __noinline__ void attention_finish_unit(const StepStreamParams& p, int layer, const DevPhase& ph, const DevPool& pool, unsigned unit,
+                                                   uint8_t* smem) {
   const StepAttnParams& a = p.attn;
   const int lh = a.local_heads;
   const int r = static_cast<int>(unit) / lh, h = static_cast<int>(unit) % lh;
@@ -601,7 +742,7 @@ __device__ void attention_finish_unit(const StepStreamParams& p, int layer, cons
 // With `update_site`, the attention site's stream update follows on the
 // chunk: the pool's y (the output projection, [token][hidden]) is h, and
 // streams[0] mix into streams[1] under the site's post and comb.
-__device__ void reduce_unit(const StepStreamParams& p, const DevPool& pool, unsigned unit) {
+__device__ void reduce_unit(const StepStreamParams& p, const DevPool& pool, unsigned unit, bool update) {
   const int rows = static_cast<int>(p.ctl->rows), N = pool.rows;
   const int i0 = static_cast<int>(unit) * kStepAccChunk, i1 = min(i0 + kStepAccChunk, rows * N);
   const float* __restrict__ part = p.proj_part + pool.part_offset;
@@ -628,7 +769,7 @@ __device__ void reduce_unit(const StepStreamParams& p, const DevPool& pool, unsi
       y[ir] = f32_to_bf16(a);
     }
   }
-  if (pool.update_site) mhc_update_chunk(p.post, p.comb, y, p.streams[0], p.streams[1], N, i0, i1);
+  if (pool.update_site && update) mhc_update_chunk(p.post, p.comb, y, p.streams[0], p.streams[1], N, i0, i1);  // the caller withholds it when the group's fold units carry it
 }
 
 // A consumer pool's unit: group g's 128-row block rb of the expert's pair or
@@ -865,6 +1006,7 @@ __global__ void __launch_bounds__(kStepThreads, 1) step_stream_kernel(StepStream
         published = gtimer();
         if (!sm_fail && !sm_skip) {
           ctl->rows = d->rows;
+          ctl->fold_slot = static_cast<unsigned>(slot);  // the step's row of the fold table
           ctl->top_k = d->top_k;
           // The token group's slots are the step's rows from the start: the first layer's router reads them before any route ran.
           for (int i = 0; i < 32; ++i) ctl->token_slots[i] = i;
@@ -880,7 +1022,7 @@ __global__ void __launch_bounds__(kStepThreads, 1) step_stream_kernel(StepStream
       if (!sm_skip && !sm_fail) {
         // The step's counters and trace, reset by the whole block (one thread took tens of microseconds).
         for (int i = static_cast<int>(threadIdx.x); i < n_phases; i += kStepThreads) {
-          ctl->done[i] = 0; ctl->pf_units[i] = 0; ctl->idle_first[i] = 0; ctl->fold_done[i] = 0;
+          ctl->done[i] = 0; ctl->pf_units[i] = 0; ctl->idle_first[i] = 0; ctl->fold_done[i] = 0; ctl->fold_staged[i] = 0; ctl->fold_folded[i] = 0;
           ctl->busy_ns[i] = 0; ctl->grabs[i] = 0; ctl->handout_ns[i] = 0; ctl->lead_in_bytes[i] = 0; ctl->pf_credit[i] = 0; ctl->pf_staged[i] = 0;
           ctl->wait_ns[i] = 0;
           for (int c = 0; c < kStepMaxClasses; ++c) { ctl->cls_next[i][c] = 0; ctl->cls_first[i][c] = ~0ull; ctl->cls_last[i][c] = 0; ctl->cls_last_grab[i][c] = 0; }
@@ -999,12 +1141,18 @@ __global__ void __launch_bounds__(kStepThreads, 1) step_stream_kernel(StepStream
                   // finish their lead units, the workers reached the staging 10 to 20 µs late and it
                   // was still running when the router's gate opened, 2026-11-01).
                   red_release(&ctl->open_gen, 1u);
-                  spin_us(fold_us);
-                  st_rel(&ctl->fold_done[P], 1u);  // this group's gate (per group, not per layer: a layer has two groups with folds)
-                  red_release(&ctl->open_gen, 1u);  // lead units yield: the classes behind the fold want the workers
-                  ctl->stamp_end[P] = gtimer();  // the first phase's trace: its own units and the fold
-                  for (int Q = P + 1; Q <= P_last; ++Q) ctl->stamp_begin[Q] = ctl->stamp_end[P];
-                  sm_first_stamped = 1;
+                  if (fold_units(p, P)) {
+                    // Past world 1 the fold is the stage and fold classes' (net/bus_write.cuh): the last
+                    // fold unit sets fold_done and the stamps; the chain only stops waiting for it.
+                    sm_first_stamped = 1;
+                  } else {
+                    spin_us(fold_us);
+                    st_rel(&ctl->fold_done[P], 1u);  // this group's gate (per group, not per layer: a layer has two groups with folds)
+                    red_release(&ctl->open_gen, 1u);  // lead units yield: the classes behind the fold want the workers
+                    ctl->stamp_end[P] = gtimer();  // the first phase's trace: its own units and the fold
+                    for (int Q = P + 1; Q <= P_last; ++Q) ctl->stamp_begin[Q] = ctl->stamp_end[P];
+                    sm_first_stamped = 1;
+                  }
                   sm_fold_pending = 0;
                 }
                 if (router_units && !sm_selected && ld_acq(&ctl->pool_done[l][router_pool]) >= router_units) { sm_event = 1; break; }
@@ -1169,6 +1317,7 @@ __global__ void __launch_bounds__(kStepThreads, 1) step_stream_kernel(StepStream
               else if (gk == kGateSite) open = ld_acq(&ctl->site_done[il][sm_cls_gate_arg[c] & 1u]) >= sm_rows;
               else if (gk == kGateTrigger) open = fold_trigger_holds(p, cur_layer, P);  // the fold's window begins
               else if (gk == kGateAttnPools) open = attn_pools_done(p, il, sm_cls_phase[c]);  // every source's blocks: the finish
+              else if (gk == kGateFoldStaged) open = ld_acq(&ctl->fold_staged[P]) >= fold_units(p, P);  // the fold's row staged
               else open = ld_acq(&ctl->pool_done[il][sm_cls_pool[c]]) >= pool_compute_units(p, il, p.pools[sm_cls_pool[c]]);
               if (!open) { any_pending = true; continue; }
             }
@@ -1289,8 +1438,16 @@ __global__ void __launch_bounds__(kStepThreads, 1) step_stream_kernel(StepStream
         if (threadIdx.x == 0 && q + 1 == sm_count && p.stage_workers) atomicSub(&ctl->stage_active, 1u);  // the grab's last unit: the cap's slot back
         continue;
       }
+      if (kind == 1 && ckind == kClassFoldStage) {
+        fold_stage_unit(p, xphase, xunit);
+        continue;
+      }
+      if (kind == 1 && ckind == kClassFold) {
+        fold_unit(p, xlayer, xphase, xunit, smem);
+        continue;
+      }
       if (kind == 1 && ckind == kClassAccumulate) {
-        accumulate_chunk(p, xlayer, xunit, uph.update != 0);
+        accumulate_chunk(p, xlayer, xunit, uph.update != 0 && fold_units(p, xphase) == 0u);  // the group's fold units apply the update past world 1
         __syncthreads();
         if (threadIdx.x == 0) red_release(&ctl->acc_done[xlayer], 1u);
         continue;
@@ -1308,7 +1465,7 @@ __global__ void __launch_bounds__(kStepThreads, 1) step_stream_kernel(StepStream
         }
         __syncthreads();
         if (upool->kind == kPoolAttention) attention_finish_unit(p, xlayer, uph, *upool, xunit, smem);
-        else reduce_unit(p, *upool, xunit);
+        else reduce_unit(p, *upool, xunit, fold_units(p, xphase) == 0u);  // the group's fold units apply the update past world 1
         __syncthreads();
         if (threadIdx.x == 0) red_release(&ctl->reduce_done[xlayer][pool_id], 1u);
         last_group = -1;

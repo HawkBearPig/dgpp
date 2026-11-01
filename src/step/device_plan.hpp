@@ -115,6 +115,7 @@ struct DevPhase {
   // reduce units complete), kTriggerAccumulate (this phase's units complete).
   uint8_t fold_trigger = 0;
   int32_t trigger_pool = -1;
+  int32_t fold_index = -1;  // the group's fold in the step's fold order (the host issues its generation ahead), -1 none
   // The group's facts the chain needs at its start, resolved by the lowering so the chain reads
   // one phase record rather than walking the phase and pool tables under a saturated memory:
   // the fold to spin (the group's largest fold_after_us), the phase in the group that resolves
@@ -152,6 +153,7 @@ struct DevLayer {
 };
 
 struct DevicePlan {
+  int32_t fold_count = 0;  // groups with a fold the step engine's kernel carries (DevPhase::fold_index)
   uint32_t unit_bytes = 0;
   std::vector<DevLayer> layers;
   std::vector<DevPhase> phases;

@@ -535,6 +535,23 @@ __device__ inline void mhc_finish_normed(uint16_t* __restrict__ row, const float
 // The one-rounding stream update for a chunk of (token, d) outputs
 // [i0, i1) of tokens * hidden: streams_out[t][i][d] = bf16(post[t][i] * h[t][d] +
 // sum_j comb[t][j][i] * streams_in[t][j][d]) (glm_mhc.cu mhc_stream_update_f32_kernel).
+// One (token, d) output of the update: the four streams in from `streams_in`, the four out.
+__device__ __forceinline__ void mhc_update_elem(const float* __restrict__ post, const float* __restrict__ comb, float hv,
+                                                const uint16_t* __restrict__ streams_in, uint16_t* __restrict__ streams_out, int hidden,
+                                                size_t t, int d) {
+  const uint16_t* res = streams_in + t * kMhcN * hidden;
+  float rv[kMhcN];
+#pragma unroll
+  for (int j = 0; j < kMhcN; ++j) rv[j] = bf16_bits_to_float(res[j * hidden + d]);
+#pragma unroll
+  for (int i = 0; i < kMhcN; ++i) {
+    float mix = 0.f;
+#pragma unroll
+    for (int j = 0; j < kMhcN; ++j) mix = __fmaf_rn(comb[t * kMhcN * kMhcN + j * kMhcN + i], rv[j], mix);
+    const float v = __fmaf_rn(post[t * kMhcN + i], hv, mix);
+    streams_out[t * kMhcN * hidden + static_cast<size_t>(i) * hidden + d] = float_to_bf16_bits(v);
+  }
+}
 __device__ inline void mhc_update_chunk(const float* __restrict__ post, const float* __restrict__ comb, const uint16_t* __restrict__ h,
                                         const uint16_t* __restrict__ streams_in, uint16_t* __restrict__ streams_out, int hidden, int i0,
                                         int i1) {
@@ -542,19 +559,7 @@ __device__ inline void mhc_update_chunk(const float* __restrict__ post, const fl
   for (int idx = i0 + static_cast<int>(threadIdx.x); idx < i1; idx += kMhcThreads) {
     const int d = idx % hidden;
     const size_t t = static_cast<size_t>(idx / hidden);
-    const float hv = bf16_bits_to_float(h[t * hidden + d]);
-    const uint16_t* res = streams_in + t * kMhcN * hidden;
-    float rv[kMhcN];
-#pragma unroll
-    for (int j = 0; j < kMhcN; ++j) rv[j] = bf16_bits_to_float(res[j * hidden + d]);
-#pragma unroll
-    for (int i = 0; i < kMhcN; ++i) {
-      float mix = 0.f;
-#pragma unroll
-      for (int j = 0; j < kMhcN; ++j) mix = __fmaf_rn(comb[t * kMhcN * kMhcN + j * kMhcN + i], rv[j], mix);
-      const float v = __fmaf_rn(post[t * kMhcN + i], hv, mix);
-      streams_out[t * kMhcN * hidden + static_cast<size_t>(i) * hidden + d] = float_to_bf16_bits(v);
-    }
+    mhc_update_elem(post, comb, bf16_bits_to_float(h[t * hidden + d]), streams_in, streams_out, hidden, t, d);
   }
 }
 

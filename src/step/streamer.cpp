@@ -60,6 +60,8 @@ Streamer::Streamer(const DevicePlan& dp, const std::vector<const uint8_t*>& base
   pinned(&desc_, &desc_dev_, static_cast<size_t>(kStepRingSlots));
   pinned(&verdict_, &verdict_dev_, static_cast<size_t>(kStepRingSlots));
   pinned(&host_seq_, &host_seq_dev_, 1);
+  pinned(&fold_table_, &fold_table_dev_, static_cast<size_t>(kStepRingSlots) * kStepMaxFolds);
+  for (size_t i = 0; i < static_cast<size_t>(kStepRingSlots) * kStepMaxFolds; ++i) fold_table_[i] = StepFoldDev{};
   DGPP_CUDA_OK(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking));
   // The consumers' operands, when the plan has consumer pools of any class:
   // the routed experts (the MXFP4 forms), the shared expert and the fp8
@@ -285,6 +287,16 @@ StreamReport Streamer::run(const StreamerConfig& cfg) {
   p.post = post_;
   p.comb = comb_;
   p.logits = logits_;
+  if (fold_world_ > 1) {
+    if (bus_ == nullptr) throw std::invalid_argument("Streamer: folds past world 1 need the bus (set_fold)");
+    if (!bus_->write_view(&p.fold.view)) throw std::invalid_argument("Streamer: the folds need the bus on the write transport, past world 1");
+    if (dp_.fold_count > static_cast<int>(net::kBusStreamRing))
+      throw std::invalid_argument("Streamer: a step's folds (" + std::to_string(dp_.fold_count) + ") exceed the stream ring the host issues ahead into");
+    p.fold.world = fold_world_;
+    p.fold.my_rank = fold_rank_;
+    p.fold.table = fold_table_dev_;
+    p.fold.deadline_cycles = bus_->collective_deadline_cycles();
+  }
   if (attention_) {
     if (attn_in_.q == nullptr || attn_in_.req_ids == nullptr || attn_in_.pos == nullptr || attn_in_.ring == nullptr || attn_in_.inv_freq == nullptr)
       throw std::invalid_argument("Streamer: the attention consumer needs its inputs (set_attention) before a run");
@@ -336,6 +348,32 @@ StreamReport Streamer::run(const StreamerConfig& cfg) {
     if (step == 0)
       for (int i = 0; i < cfg.rows; ++i) d.tokens[i] = feed[static_cast<size_t>(i)];
     const bool skip = step == cfg.skip_at_step;
+    if (fold_world_ > 1 && !skip) {
+      // The step's fold generations, in fold order, into this slot's row of the table (the kernel
+      // reads them after it acquires the descriptor): the stream pass posts and completes them.
+      for (size_t P = 0; P < dp_.phases.size(); ++P) {
+        const DevPhase& ph = dp_.phases[P];
+        if (ph.fold_index < 0) continue;
+        unsigned n = 0;
+        if (ph.accumulate) {
+          n = static_cast<unsigned>(hidden_);
+        } else {
+          for (int i = 0; i < ph.n_pools; ++i) {
+            const DevPool& pool = dp_.pools[static_cast<size_t>(ph.pools[i])];
+            if (pool.kind == kPoolFp8Matrix && pool.update_site) n = static_cast<unsigned>(pool.rows);
+          }
+        }
+        if (n == 0) continue;  // no partial to fold in this group (the kernel's fold_units is zero too)
+        net::CollectiveBus::StepFold f;
+        std::string err;
+        if (bus_->step_prepare(static_cast<size_t>(cfg.rows) * n, &f, &err) == 0) throw std::runtime_error("Streamer: step_prepare: " + err);
+        StepFoldDev& e = fold_table_[static_cast<size_t>(slot) * kStepMaxFolds + static_cast<size_t>(ph.fold_index)];
+        e.gen = static_cast<uint32_t>(f.gen);
+        e.elems = f.elems;
+        e.cell = f.cell;
+        e.recs = f.recs;
+      }
+    }
     std::atomic_thread_fence(std::memory_order_seq_cst);
     store_release(&d.state, skip ? kStepSkip : kStepExecute);
     std::thread gather;
@@ -377,6 +415,11 @@ StreamReport Streamer::run(const StreamerConfig& cfg) {
     r.verdicts.push_back(v);
     // The slot returns to the host; reset its state for the next use.
     store_release(&d.state, kStepPending);
+  }
+  if (fold_world_ > 1 && bus_) {
+    // Every fold generation issued walked (or the era failed): the verdict of the bus side.
+    std::string err;
+    if (!bus_->allreduce_settle(60000, &err)) throw std::runtime_error("Streamer: the folds did not settle: " + err);
   }
   DGPP_CUDA_OK(cudaStreamSynchronize(stream_));
   DGPP_CUDA_OK(cudaEventElapsedTime(&r.kernel_ms, e0, e1));
@@ -483,6 +526,20 @@ StreamReport Streamer::run(const StreamerConfig& cfg) {
             if (iph.fixed_units) add(ip, 2, -1, iph.fixed_units);
           }
           if (ip > P && iph.lead_units > iph.fixed_units) add(ip, 4, -1, iph.lead_units - iph.fixed_units);  // the staging class
+          if (ip == P && fold_world_ > 1 && iph.fold_index >= 0 && iph.fold_trigger != kTriggerEnd) {
+            unsigned n = 0;
+            if (iph.accumulate) n = static_cast<unsigned>(hidden_);
+            else
+              for (int i = 0; i < iph.n_pools; ++i) {
+                const DevPool& gp = dp_.pools[static_cast<size_t>(iph.pools[i])];
+                if (gp.kind == kPoolFp8Matrix && gp.update_site) n = static_cast<unsigned>(gp.rows);
+              }
+            if (n) {
+              const unsigned fu = net::bus_write_blocks(net::bus_write_chunks(static_cast<size_t>(rows) * n));
+              add(ip, 6, -1, fu);
+              add(ip, 7, -1, fu);
+            }
+          }
         }
       }
       first = std::min(first, ctl_->stamp_begin[P]);

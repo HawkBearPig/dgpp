@@ -449,6 +449,14 @@ DevicePlan lower_plan(const std::vector<LayerPlan>& layers, uint32_t unit_bytes,
         }
       }
     }
+  // The last phase of the plan is an accumulate with a fold too (the loop above stops one short
+  // of it, having nothing to merge behind it): its trigger is its own units, so the step engine's
+  // fold carries it as every other layer's (2026-11-01: the last layer's MoE fold was the modeled
+  // spin and its update went missing past world 1).
+  if (mhc && !dp.phases.empty()) {
+    DevPhase& z = dp.phases.back();
+    if (z.accumulate && z.fold_after_us > 0.f && z.fold_trigger == kTriggerEnd) z.fold_trigger = kTriggerAccumulate;
+  }
   // The attention behind the stream phase before it, where they are consecutive (the layers
   // without an index source; a selection latency phase between them keeps the attention a phase
   // of its own until the selection is units too): its classes follow the projections' in the
@@ -488,10 +496,16 @@ DevicePlan lower_plan(const std::vector<LayerPlan>& layers, uint32_t unit_bytes,
         if (down.partner < 0) throw std::logic_error("lower_plan: a down pool without its gate and up pool");
       }
     }
-  // The groups' facts for the chain (device_plan.hpp DevPhase::group_*), after the merges.
+  // The groups' facts for the chain (device_plan.hpp DevPhase::group_*), after the merges, and
+  // the step's fold order: every group head with a fold the kernel can carry (a trigger inside
+  // the group) takes the next fold index; the host issues that many generations a step.
+  size_t member_until = 0;
   for (size_t i = 0; i < dp.phases.size(); ++i) {
     DevPhase& a = dp.phases[i];
     const size_t last = std::min(dp.phases.size() - 1, i + a.merged);
+    const bool head = i >= member_until;
+    if (head) member_until = last + 1;
+    a.fold_index = (head && a.fold_after_us > 0.f && a.fold_trigger != kTriggerEnd) ? dp.fold_count++ : -1;
     a.group_fold_us = 0.f;
     for (size_t q = i; q <= last; ++q) {
       const DevPhase& b = dp.phases[q];

@@ -492,7 +492,7 @@ add_library(dgpp_step_stream STATIC
   src/step/streamer.cpp
   src/kernels/step/stream.cu)
 target_include_directories(dgpp_step_stream PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(dgpp_step_stream PUBLIC dgpp_step CUDA::cudart)
+target_link_libraries(dgpp_step_stream PUBLIC dgpp_step dgpp_bus CUDA::cudart)
 dgpp_set_common(dgpp_step_stream)
 
 # DeepSeek-V4-Flash (the 0731 release, 2026-10-01): the host-side model

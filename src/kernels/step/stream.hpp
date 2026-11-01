@@ -17,6 +17,7 @@
 
 #include <cuda_runtime.h>
 
+#include "net/bus_kernel.hpp"
 #include "step/device_plan.hpp"
 #include "step/protocol.hpp"
 
@@ -82,6 +83,9 @@ struct alignas(128) StepCtl {
   unsigned acc_done[kStepMaxLayers];      // the accumulate units completed, by layer (the fold trigger of its group)
   unsigned site_done[kStepMaxLayers][2];  // a hyper-connection site's tokens finished, by layer and site (the router's gate)
   unsigned fold_done[kStepMaxPhases];     // the chain spun the group's fold, by the group's published phase (the gate of the units behind it; a layer has two groups with folds, so not by layer: 2026-10-31)
+  unsigned fold_staged[kStepMaxPhases];   // the fold's stage units complete (the fold units' gate), by the group's published phase
+  unsigned fold_folded[kStepMaxPhases];   // its fold units complete: the last sets fold_done
+  unsigned fold_slot;                     // the step's ring slot: its row of the fold table
   unsigned open_gen;                      // bumped when a gate opens (a fold spun, a site's token finished, a pool's compute units complete): lead units yield to it
   unsigned long long stamp_begin[kStepMaxPhases];  // the last pass: the phase's publish or latency start
   unsigned long long stamp_end[kStepMaxPhases];    // the last pass: its units done, the fold after it included
@@ -153,6 +157,29 @@ struct StepAttnParams {
   float* cg[kStepAttnSources] = {nullptr, nullptr};
   int32_t* tickets[kStepAttnSources] = {nullptr, nullptr};
   uint16_t* o = nullptr;
+};
+
+// The step's folds on the bus's one-sided write transport (net/bus_write.cuh;
+// MOONSHOT-1 phase 4): the host issues each fold's generation ahead
+// (CollectiveBus::step_prepare) into a pinned table by step slot and fold
+// index (DevPhase::fold_index); the kernel's stage units lay the group's
+// partial out in the generation's staging row and the fold units poll, prove
+// and fold the peers' rows in rank order, then apply the residual update the
+// reduce or accumulate units carried at world 1. World 1: no table, the fold
+// is the identity and the updates stay where they were.
+constexpr int kStepMaxFolds = 256;
+struct StepFoldDev {
+  uint32_t gen = 0;
+  uint32_t elems = 0;
+  net::BusAllReduceCtl* cell = nullptr;
+  net::BusWriteBlockRecord* recs = nullptr;
+};
+struct StepFoldParams {
+  net::BusAllReduceGraphView view;
+  int world = 1;
+  int my_rank = 0;
+  const StepFoldDev* table = nullptr;  // pinned [kStepRingSlots][kStepMaxFolds]
+  unsigned long long deadline_cycles = 0;
 };
 
 struct StepStreamParams {
@@ -237,6 +264,7 @@ struct StepStreamParams {
   unsigned stage_workers = 0;
   unsigned stage_lead_pause = 0;
   StepAttnParams attn;                         // the attention consumer's operands (kPoolAttention)
+  StepFoldParams fold;                         // the folds on the bus (world > 1)
   unsigned long long deadline_ns = 0;          // every in-step spin's deadline (0: none)
   unsigned long long pending_deadline_ns = 0;  // how long the chain waits for the host's next descriptor (0: forever)
 };

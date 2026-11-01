@@ -2602,10 +2602,22 @@ area, untracked.
       stream pass as they are. `bus_test` `step_fold`: a persistent driver
       kernel runs 40 folds a pass over the handles, three passes, worlds 2
       and 4, 25600 elements in 13 blocks: bitwise the canonical chain,
-      the completion epoch once per fold. Left: the step kernel's fold
-      classes at the trigger with the residual update moved after the
-      fold, the 256-cell step ring with the epoch mixed into the hash,
-      the fault scenarios, world 1, the in-situ distribution.
+      the completion epoch once per fold. Then the step kernel's fold
+      classes (same night): the group's stage units at the trigger lay the
+      partial out in the generation's row, the fold units poll, prove and
+      fold the peers' rows in rank order in place and apply the residual
+      update behind the fold (the reduce and accumulate units keep it only
+      when the fold is not carried), the last sets the fold gate; the
+      streamer issues a step's generations ahead into a pinned fold table
+      and settles after. A two-rank loopback rig (two streamers over one
+      rig, 23 workers each) folds bitwise bf16(y1 + y1) on the attention
+      fold, the ranks agree bitwise on the MoE fold and the streams, and
+      the production sites reproduce the updates from the folded partials.
+      Fixed on the way: the plan's last accumulate never took its trigger
+      (the merge loop stopped a phase short). The cold bodies are out of
+      line (inlined they cost a point of the rate band at world 1). Left:
+      the 256-cell step ring with the epoch in the hash, the fault
+      scenarios against the step, the in-situ distribution.
 - [ ] Fabric warps: one sentinel lane per peer, staging by the consumer's
       epilogue, GPU-published hash with the epoch mixed in, trailers checked
       in the fold's own pass.
