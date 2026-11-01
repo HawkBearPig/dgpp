@@ -3995,6 +3995,61 @@ uint64_t CollectiveBus::allreduce_bulk(const void* device_src, void* device_dst,
   return id;
 }
 
+// The stream generation's issue (allreduce_stream's first half, and the
+// step engine's whole: step_prepare): the gates, the ring's bound, the
+// generation from the shared counter, the cell reset and the FIFO push.
+// Returns the generation (0 = rejected) and the cell, its index and the
+// generation's block records.
+uint64_t CollectiveBus::step_prepare(size_t bf16_elems, StepFold* out, std::string* error) {
+  *out = StepFold{};
+  if (impl_->world1) {
+    Impl& w = *impl_;
+    std::lock_guard<std::mutex> lock(w.w1_mu);
+    if (w.stopping.load(std::memory_order_relaxed)) { *error = "bus is stopped"; return 0; }
+    if (bf16_elems == 0) { *error = "allreduce element count must be positive"; return 0; }
+    out->gen = w.w1_next_id++;
+    out->elems = static_cast<uint32_t>(bf16_elems);
+    return out->gen;
+  }
+  Impl& impl = *impl_;
+  if (!impl.write_transport()) {
+    *error = "the step engine's folds need the write transport (engine.collective_transport write)";
+    return 0;
+  }
+  BusAllReduceCtl* cell = nullptr;
+  int cell_idx = 0;
+  const uint64_t gen = stream_issue(bf16_elems, &cell, &cell_idx, error);
+  if (gen == 0) return 0;
+  out->gen = gen;
+  out->elems = static_cast<uint32_t>(bf16_elems);
+  out->cell = cell;
+  out->recs = impl.write_recs_of_stream(cell_idx);
+  return gen;
+}
+
+bool CollectiveBus::write_view(BusAllReduceGraphView* out) const {
+  *out = BusAllReduceGraphView{};
+  const Impl& impl = *impl_;
+  if (impl.world1 || !impl.write_transport()) return false;
+  int vi = 0;
+  for (size_t p = 0; p < impl.peer_ranks.size(); ++p)
+    for (const Impl::LaneState& lane : impl.peers[p]) out->recv[vi++] = impl.recv_view_of(lane);
+  out->recv_views = vi;
+  out->lanes_per_peer = static_cast<int>(impl.lane_count());
+  out->stage_row_base = reinterpret_cast<uint16_t*>(impl.stage_buf(0, 0));
+  out->send_peers = static_cast<int>(impl.peer_ranks.size());
+  out->stage_ring = Impl::kStageRing;
+  out->stage_row_bytes = static_cast<uint32_t>(impl.stage_pitch());
+  return true;
+}
+
+uint64_t CollectiveBus::collective_deadline_cycles() const {
+  const Impl& impl = *impl_;
+  if (impl.strm.deadline_cycles) return impl.strm.deadline_cycles;
+  if (impl.graph.deadline_cycles) return impl.graph.deadline_cycles;
+  return bus_consumer_deadline_cycles(options_.consumer_deadline_s);
+}
+
 uint64_t CollectiveBus::allreduce_stream(cudaStream_t stream, const void* device_src,
                                          void* device_dst, size_t bf16_elems,
                                          std::string* error) {
@@ -4012,6 +4067,43 @@ uint64_t CollectiveBus::allreduce_stream(cudaStream_t stream, const void* device
     }
     return w.w1_next_id++;
   }
+  Impl& impl = *impl_;
+  BusAllReduceCtl* cell = nullptr;
+  int cell_idx = 0;
+  const uint64_t gen = stream_issue(bf16_elems, &cell, &cell_idx, error);
+  if (gen == 0) return 0;
+  BusAllReduceGraphView v{};
+  int vi = 0;
+  for (size_t p = 0; p < impl.peer_ranks.size(); ++p)
+    for (const Impl::LaneState& lane : impl.peers[p])
+      v.recv[vi++] = impl.recv_view_of(lane);
+  v.recv_views = vi;
+  v.lanes_per_peer = static_cast<int>(impl.lane_count());
+  v.stage_row_base = reinterpret_cast<uint16_t*>(impl.stage_buf(0, 0));
+  v.send_peers = static_cast<int>(impl.peer_ranks.size());
+  v.stage_ring = Impl::kStageRing;
+  v.stage_row_bytes = static_cast<uint32_t>(impl.stage_pitch());
+  const cudaError_t launch =
+      impl.write_transport()
+          ? launch_bus_allreduce_write(
+                v, options_.my_rank, static_cast<const __nv_bfloat16*>(device_src),
+                static_cast<__nv_bfloat16*>(device_dst), static_cast<uint32_t>(bf16_elems), cell,
+                impl.write_recs_of_stream(cell_idx), impl.strm.deadline_cycles, stream)
+          : launch_bus_allreduce_graph(
+                v, options_.my_rank, static_cast<const __nv_bfloat16*>(device_src),
+                static_cast<__nv_bfloat16*>(device_dst), static_cast<uint32_t>(bf16_elems), cell,
+                impl.strm.deadline_cycles, stream);
+  if (launch != cudaSuccess) {
+    // No kernel will stamp this generation: fail the era (the walk's
+    // drain-fail poisons the queue) — the numbering cannot be given back.
+    impl.graph_fail(std::string("stream collective kernel launch failed: ") + cudaGetErrorString(launch));
+    *error = impl.graph.error;
+    return 0;
+  }
+  return gen;
+}
+
+uint64_t CollectiveBus::stream_issue(size_t bf16_elems, BusAllReduceCtl** cell_out, int* cell_idx_out, std::string* error) {
   Impl& impl = *impl_;
   if (impl.stopping.load(std::memory_order_relaxed)) {
     *error = "bus is stopped";
@@ -4120,34 +4212,8 @@ uint64_t CollectiveBus::allreduce_stream(cudaStream_t stream, const void* device
     impl.strm.fifo.push_back(Impl::StreamState::Gen{gen, cell_idx, static_cast<uint32_t>(bf16_elems)});
     impl.strm.issued.store(gen, std::memory_order_release);
   }
-  BusAllReduceGraphView v{};
-  int vi = 0;
-  for (size_t p = 0; p < impl.peer_ranks.size(); ++p)
-    for (const Impl::LaneState& lane : impl.peers[p])
-      v.recv[vi++] = impl.recv_view_of(lane);
-  v.recv_views = vi;
-  v.lanes_per_peer = static_cast<int>(impl.lane_count());
-  v.stage_row_base = reinterpret_cast<uint16_t*>(impl.stage_buf(0, 0));
-  v.send_peers = static_cast<int>(impl.peer_ranks.size());
-  v.stage_ring = Impl::kStageRing;
-  v.stage_row_bytes = static_cast<uint32_t>(impl.stage_pitch());
-  const cudaError_t launch =
-      impl.write_transport()
-          ? launch_bus_allreduce_write(
-                v, options_.my_rank, static_cast<const __nv_bfloat16*>(device_src),
-                static_cast<__nv_bfloat16*>(device_dst), static_cast<uint32_t>(bf16_elems), cell,
-                impl.write_recs_of_stream(cell_idx), impl.strm.deadline_cycles, stream)
-          : launch_bus_allreduce_graph(
-                v, options_.my_rank, static_cast<const __nv_bfloat16*>(device_src),
-                static_cast<__nv_bfloat16*>(device_dst), static_cast<uint32_t>(bf16_elems), cell,
-                impl.strm.deadline_cycles, stream);
-  if (launch != cudaSuccess) {
-    // No kernel will stamp this generation: fail the era (the walk's
-    // drain-fail poisons the queue) — the numbering cannot be given back.
-    impl.graph_fail(std::string("stream collective kernel launch failed: ") + cudaGetErrorString(launch));
-    *error = impl.graph.error;
-    return 0;
-  }
+  *cell_out = cell;
+  *cell_idx_out = cell_idx;
   return gen;
 }
 

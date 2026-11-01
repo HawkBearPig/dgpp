@@ -703,6 +703,45 @@ run (the lead paused, which cost the expert phase its staging when the
 staging class was the reason), measured as a set; its remaining cost is
 recorded against the item rather than hidden behind the mask alone.
 
+## The fold
+
+The fold is the TP all-reduce at each layer's two boundaries. The bus
+engine's one-sided latency transport already has the shape the step needs:
+a row of self-describing 512-byte chunks (31 data lanes and a trailer lane
+carrying a 64-bit hash, the generation and the chunk index) that a kernel
+stages into the generation's pinned row, the engine RDMA-writes into every
+peer's write ring when each block of the kernel has published its ready
+record, and every warp then polls its own chunks in the peers' rings, proves
+each by its trailer, folds in canonical rank order with its own and stores
+the result. So the transport's two block phases moved into a header
+(`net/bus_write.cuh`, with the lane helpers) as device functions taking the
+block's index in the row's grid, the production kernel became a wrapper over
+them, and the bus got `step_prepare`: a stream generation issued without a
+kernel, returning the generation, its pinned cell and its block records, so
+a step's folds are issued ahead in walk order and the engine's stream pass
+posts each on the kernel's ready records and completes it on its done
+records exactly as it does a stream collective (the walk, the gates, the
+ring's bound and the completion epoch unchanged). The step engine's folds
+are therefore the fourth user of one wire format and one walk, not a fourth
+protocol.
+
+`bus_test`'s `step_fold` scenario stands a persistent driver kernel in for
+the step kernel: one launch per rank runs forty folds in sequence over the
+handles the host prepared, every block staging its chunks then polling,
+proving and folding, at five rows of DeepSeek-V4.1's hidden (25600 elements,
+104 chunks, 13 blocks), three passes so the staging ring and the write ring
+are reused many times over. On worlds of two and four every fold is bitwise
+the canonical chain and the completion epoch advances once per fold; the
+transport's own scenarios pass unchanged on the wrapped kernel. What
+remains of the fold item: the step kernel's fold classes at the group's
+trigger (the stage units writing the partial's chunks from the reduce
+units' output, the fold units replacing the chain's spin and carrying the
+residual update that today rides on the reduce units, since the update needs
+the folded row), the step ring of 256 cells with the 64-bit step epoch mixed
+into the chunk hash, the deadline, poison and injected-delay scenarios
+against the driver, world 1 as the identity, and the in-situ distribution
+inside a real step on the fabric.
+
 ## The step protocol
 
 The kernel runs steps, not launches. The host and the kernel share two

@@ -340,6 +340,32 @@ class CollectiveBus {
                             std::string* error);
   bool allreduce_settle(int timeout_ms, std::string* error);
 
+  // ---- the step engine's folds (2026-11-01, MOONSHOT-1 phase 4) ------------
+  //
+  // A stream generation issued without a kernel: the step engine's persistent
+  // kernel runs the write transport's two block phases itself
+  // (net/bus_write.cuh) when its walk reaches the fold, so the host issues a
+  // step's folds ahead, in walk order, and the engine's stream pass posts
+  // each on the kernel's ready records and completes it on its done records,
+  // exactly as for a stream collective. The handle names the generation,
+  // its pinned cell and block records; the kernel takes the generation from
+  // the handle (not the cell) and the fold's grid is bus_write_blocks of its
+  // chunks. Gates and rejections as allreduce_stream's; the ring bounds the
+  // generations in flight. A world of one: gen advances, cell null (the
+  // fold is the identity, done by the kernel).
+  struct StepFold {
+    uint64_t gen = 0;
+    uint32_t elems = 0;
+    BusAllReduceCtl* cell = nullptr;
+    BusWriteBlockRecord* recs = nullptr;
+  };
+  uint64_t step_prepare(size_t bf16_elems, StepFold* out, std::string* error);
+  // The device view of the write transport (the staging rows and every
+  // peer's ring), constant for the bus's life; false when the bus is not on
+  // the write transport (the step engine requires it) or is a world of one.
+  bool write_view(BusAllReduceGraphView* out) const;
+  uint64_t collective_deadline_cycles() const;
+
   // TEMP bring-up microscope: the per-gen cells' gen/ready/done/status,
   // failure-only observability for the graph walk.
   void dump_graph_cells(const char* why);
@@ -379,6 +405,8 @@ class CollectiveBus {
 
  private:
   struct Impl;
+  // The stream generation's issue (allreduce_stream's first half and step_prepare's whole).
+  uint64_t stream_issue(size_t bf16_elems, BusAllReduceCtl** cell, int* cell_idx, std::string* error);
   std::unique_ptr<Impl> impl_;
   BusOptions options_;
 };

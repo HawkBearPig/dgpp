@@ -2592,6 +2592,20 @@ area, untracked.
 - [ ] The step walk as a fourth bus machine with its generation walk,
       posting mask, credits in ring order, quiescence at adopt and flights,
       the eager, graph and bulk machines untouched.
+      Begun 2026-11-01: the one-sided write transport's two block phases
+      (stage into the generation's pinned row with trailers; poll, prove
+      and fold every peer's ring row in rank order) moved into
+      `net/bus_write.cuh` as device functions taking the block's index,
+      the production kernel a wrapper over them (its scenarios unchanged),
+      and `CollectiveBus::step_prepare` issues a stream generation without
+      a kernel so a step's folds are issued ahead and walked by the
+      stream pass as they are. `bus_test` `step_fold`: a persistent driver
+      kernel runs 40 folds a pass over the handles, three passes, worlds 2
+      and 4, 25600 elements in 13 blocks: bitwise the canonical chain,
+      the completion epoch once per fold. Left: the step kernel's fold
+      classes at the trigger with the residual update moved after the
+      fold, the 256-cell step ring with the epoch mixed into the hash,
+      the fault scenarios, world 1, the in-situ distribution.
 - [ ] Fabric warps: one sentinel lane per peer, staging by the consumer's
       epilogue, GPU-published hash with the epoch mixed in, trailers checked
       in the fold's own pass.
