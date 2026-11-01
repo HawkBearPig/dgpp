@@ -406,7 +406,7 @@ class CollectiveBus {
  private:
   struct Impl;
   // The stream generation's issue (allreduce_stream's first half and step_prepare's whole).
-  uint64_t stream_issue(size_t bf16_elems, BusAllReduceCtl** cell, int* cell_idx, std::string* error);
+  uint64_t stream_issue(size_t bf16_elems, BusAllReduceCtl** cell, BusWriteBlockRecord** recs, std::string* error, bool step);
   std::unique_ptr<Impl> impl_;
   BusOptions options_;
 };

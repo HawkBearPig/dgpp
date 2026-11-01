@@ -57,8 +57,12 @@ __device__ __forceinline__ uint64_t warp_xor_u64(uint64_t h) {
   for (int o = 16; o > 0; o >>= 1) h ^= __shfl_xor_sync(0xffffffffu, h, o);
   return h;
 }
-__device__ __forceinline__ uint64_t chunk_hash(uint64_t lanes_xor, uint32_t gen, uint32_t chunk) {
-  return lanes_xor ^ (((static_cast<uint64_t>(gen) << 32) | chunk) * kFoldMultiplier);
+// The trailer's hash: the lanes' positional fold, the (generation, chunk) pair, and the step
+// engine's 64-bit epoch (MOONSHOT-1 item 14: a stale chunk of an earlier step with the same
+// 32-bit generation and index fails the proof; zero for the production kernel, whose hash is then
+// the 2026-10-19 one unchanged).
+__device__ __forceinline__ uint64_t chunk_hash(uint64_t lanes_xor, uint32_t gen, uint32_t chunk, uint64_t epoch = 0) {
+  return lanes_xor ^ (((static_cast<uint64_t>(gen) << 32) | chunk) * kFoldMultiplier) ^ (epoch * kFoldMultiplier);
 }
 // A data lane's 16 bytes of chunk `chunk` from an `elems`-long bf16 vector
 // (zero past the end; lane 31, the trailer lane, reads nothing).
@@ -83,8 +87,8 @@ __device__ __forceinline__ void store_lane(uint16_t* dst, uint32_t elems, uint32
 // A chunk as read: 2 = proven (its trailer carries (gen, chunk) and the data
 // lanes fold to its hash), 1 = the trailer is here but the data is not yet (a
 // torn read), 0 = not landed.
-__device__ __forceinline__ int chunk_state(const uint4& val, uint32_t lane, uint32_t gen, uint32_t c) {
-  const uint64_t h = chunk_hash(warp_xor_u64(lane < kBusWriteDataLanes ? lane_mix(val, lane) : 0), gen, c);
+__device__ __forceinline__ int chunk_state(const uint4& val, uint32_t lane, uint32_t gen, uint32_t c, uint64_t epoch = 0) {
+  const uint64_t h = chunk_hash(warp_xor_u64(lane < kBusWriteDataLanes ? lane_mix(val, lane) : 0), gen, c, epoch);
   const uint32_t t_lo = __shfl_sync(0xffffffffu, val.x, kBusWriteDataLanes);
   const uint32_t t_hi = __shfl_sync(0xffffffffu, val.y, kBusWriteDataLanes);
   const uint32_t t_gen = __shfl_sync(0xffffffffu, val.z, kBusWriteDataLanes);
@@ -110,7 +114,7 @@ __device__ __forceinline__ int block_chunks(int bx, int nblocks, uint32_t chunks
 // fences once and publishes its record's ready (the engine posts on every
 // block's). Call from every thread of a kThreads block.
 __device__ inline void stage_block(int bx, int nblocks, const BusAllReduceGraphView& v, uint32_t gen, const uint16_t* src,
-                                   uint32_t elems, BusWriteBlockRecord& rec) {
+                                   uint32_t elems, BusWriteBlockRecord& rec, uint64_t epoch = 0) {
   constexpr int kWarps = kThreads / 32;
   const int warp = threadIdx.x / 32;
   const uint32_t lane = threadIdx.x & 31;
@@ -122,7 +126,7 @@ __device__ inline void stage_block(int bx, int nblocks, const BusAllReduceGraphV
   uint8_t* stage = reinterpret_cast<uint8_t*>(v.stage_row_base) + static_cast<size_t>(row) * v.stage_row_bytes;
   for (uint32_t c = gwarp; c < chunks; c += nwarps) {
     uint4 val = load_lane(src, elems, c, lane, vec);
-    const uint64_t h = chunk_hash(warp_xor_u64(lane < kBusWriteDataLanes ? lane_mix(val, lane) : 0), gen, c);
+    const uint64_t h = chunk_hash(warp_xor_u64(lane < kBusWriteDataLanes ? lane_mix(val, lane) : 0), gen, c, epoch);
     if (lane == kBusWriteDataLanes) val = make_uint4(static_cast<uint32_t>(h), static_cast<uint32_t>(h >> 32), gen, c);
     reinterpret_cast<uint4*>(stage + static_cast<size_t>(c) * kBusWriteChunkBytes)[lane] = val;
   }
@@ -150,7 +154,7 @@ struct FoldSmem {
 // thread of a kThreads block, `sm` zeroed by the caller.
 __device__ inline bool fold_block(int bx, int nblocks, const BusAllReduceGraphView& v, int my_rank, uint32_t gen, const uint16_t* src,
                                   uint16_t* dst, uint32_t elems, BusAllReduceCtl* cell, BusWriteBlockRecord& rec,
-                                  uint64_t deadline_cycles, uint64_t start_clock, FoldSmem& sm) {
+                                  uint64_t deadline_cycles, uint64_t start_clock, FoldSmem& sm, uint64_t epoch = 0) {
   constexpr int kWarps = kThreads / 32;
   const int warp = threadIdx.x / 32;
   const uint32_t lane = threadIdx.x & 31;
@@ -196,7 +200,7 @@ __device__ inline bool fold_block(int bx, int nblocks, const BusAllReduceGraphVi
       bool torn = false;
       for (int p = 0; p < static_cast<int>(kBusMaxPeers); ++p) {
         if (proven[p]) continue;
-        const int state = chunk_state(in[p], lane, gen, c);
+        const int state = chunk_state(in[p], lane, gen, c, epoch);
         if (state == 1) torn = true;
         if (state == 2) {
           proven[p] = true;

@@ -2615,9 +2615,19 @@ area, untracked.
       the production sites reproduce the updates from the folded partials.
       Fixed on the way: the plan's last accumulate never took its trigger
       (the merge loop stopped a phase short). The cold bodies are out of
-      line (inlined they cost a point of the rate band at world 1). Left:
-      the 256-cell step ring with the epoch in the hash, the fault
-      scenarios against the step, the in-situ distribution.
+      line (inlined they cost a point of the rate band at world 1). Then
+      the step ring of 256 cells with its own bound (a step of 40 layers
+      issues 80; the shared issue path's wait on the stream ring blocked
+      the host against its own walk and is skipped for step issues), the
+      64-bit epoch mixed into every chunk's trailer hash on both sides
+      (production's hash unchanged at epoch zero), and the fault
+      scenarios: a hundred folds a pass on worlds 2 and 4 with the epoch
+      just below the 64-bit top, an injected 200 µs engine delay, and a
+      skipped stage after which every driver gives up at the deadline, the
+      era fails and the buses stop. Left: the in-situ distribution inside
+      a real step on the fabric, the 5H Engram width, staging by the
+      consumers' epilogue, and generations numbered within a step (the
+      32-bit counter still fails the era at its top).
 - [ ] Fabric warps: one sentinel lane per peer, staging by the consumer's
       epilogue, GPU-published hash with the epoch mixed in, trailers checked
       in the fold's own pass.
@@ -2628,6 +2638,11 @@ area, untracked.
       quiescence, deadline and poison, injected delays, the epoch
       boundaries, two and four ranks. Gate: all green, and the fold's
       in-situ distribution inside a real step matching phase 1's.
+      2026-11-01: `step_fold` and `step_fold_faults` green (quiescence
+      and stop, the deadline on a skipped stage with the era's failure,
+      an injected delay, the epoch just below 2^64, worlds 2 and 4, a
+      hundred generations a pass through the step ring); the in-situ
+      distribution awaits the adapter's real step on the fabric.
 
 ### Phase 5: the step engine adapter
 

@@ -86,6 +86,7 @@ struct alignas(128) StepCtl {
   unsigned fold_staged[kStepMaxPhases];   // the fold's stage units complete (the fold units' gate), by the group's published phase
   unsigned fold_folded[kStepMaxPhases];   // its fold units complete: the last sets fold_done
   unsigned fold_slot;                     // the step's ring slot: its row of the fold table
+  unsigned long long fold_epoch;          // the step's epoch (the descriptor's), mixed into every fold chunk's trailer hash
   unsigned open_gen;                      // bumped when a gate opens (a fold spun, a site's token finished, a pool's compute units complete): lead units yield to it
   unsigned long long stamp_begin[kStepMaxPhases];  // the last pass: the phase's publish or latency start
   unsigned long long stamp_end[kStepMaxPhases];    // the last pass: its units done, the fold after it included

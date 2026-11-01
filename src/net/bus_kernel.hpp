@@ -242,6 +242,10 @@ static_assert(static_cast<int>(kBusWriteRing) == kBusMaxGraphStageRing,
 // flight between the forward thread's issue and the engine's walk — a
 // prefill pass issues ~93 folds, the ring lets the host run this far ahead.
 constexpr int kBusStreamRing = 64;
+// The step engine's folds (MOONSHOT-1 phase 4): generations issued ahead of a step through
+// step_prepare, walked by the stream pass in order; a step of DeepSeek-V4.1's 40 layers issues 80,
+// so the step ring is its own, deeper than the stream's.
+constexpr int kBusStepRing = 256;
 
 // The graph twin of BusAllReduceView: the staging row is a base, not a
 // precomputed row — the kernel picks the row at runtime from its
@@ -322,7 +326,7 @@ cudaError_t launch_bus_allreduce_write(const BusAllReduceGraphView& v,
 // The host mirror of a chunk's trailer hash: over the 31 data lanes' 496
 // bytes (as laid out in the row) and the (generation, chunk) pair — the
 // tests pin the row format with it.
-uint64_t bus_write_chunk_hash(uint32_t gen, uint32_t chunk, const void* lanes496);
+uint64_t bus_write_chunk_hash(uint32_t gen, uint32_t chunk, const void* lanes496, uint64_t epoch = 0);
 
 // ---- segment-quantized reduce-scatter/allgather (the prefill class) ------
 //

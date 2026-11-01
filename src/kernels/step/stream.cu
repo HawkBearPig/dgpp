@@ -632,7 +632,7 @@ __device__ __noinline__ void fold_stage_unit(const StepStreamParams& p, int P, u
     if (threadIdx.x == 0) atomicCAS(&p.ctl->status, kStepOk, kStepBadUnit);
     return;
   }
-  net::bus_write::stage_block(static_cast<int>(unit), static_cast<int>(n), p.fold.view, f.gen, y, elems, f.recs[unit]);
+  net::bus_write::stage_block(static_cast<int>(unit), static_cast<int>(n), p.fold.view, f.gen, y, elems, f.recs[unit], p.ctl->fold_epoch);
   if (threadIdx.x == 0) red_release(&p.ctl->fold_staged[P], 1u);  // after stage_block's barrier and release of ready
 }
 // The fold unit: its chunks of every peer's row polled, proven and folded in rank order into the
@@ -661,7 +661,7 @@ __device__ __noinline__ void fold_unit(const StepStreamParams& p, int layer, int
   __syncthreads();
   const unsigned long long start = clock64();
   const bool ok = net::bus_write::fold_block(static_cast<int>(unit), static_cast<int>(n), p.fold.view, p.fold.my_rank, f.gen, y, y, elems,
-                                            f.cell, f.recs[unit], p.fold.deadline_cycles, start, sm);
+                                            f.cell, f.recs[unit], p.fold.deadline_cycles, start, sm, p.ctl->fold_epoch);
   if (!ok) {
     if (threadIdx.x == 0) atomicCAS(&p.ctl->status, kStepOk, kStepDeadline | (static_cast<unsigned>(P) << 8));
     return;
@@ -1007,6 +1007,7 @@ __global__ void __launch_bounds__(kStepThreads, 1) step_stream_kernel(StepStream
         if (!sm_fail && !sm_skip) {
           ctl->rows = d->rows;
           ctl->fold_slot = static_cast<unsigned>(slot);  // the step's row of the fold table
+          ctl->fold_epoch = d->epoch;                    // into every fold chunk's trailer hash (a stale chunk of an earlier step fails the proof)
           ctl->top_k = d->top_k;
           // The token group's slots are the step's rows from the start: the first layer's router reads them before any route ran.
           for (int i = 0; i < 32; ++i) ctl->token_slots[i] = i;

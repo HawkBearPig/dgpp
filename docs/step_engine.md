@@ -773,11 +773,33 @@ there.) The attention and fold bodies inlined took the kernel's stack from
 never reach them (tile-major 78.5 to 79.4); out of line the band is back at
 79.6 to 80.4 tile-major and 72.4 to 74.5 row-major, with the stack at 160.
 
-What remains of the fold item: the step ring of 256 cells with the 64-bit
-step epoch mixed into the chunk hash (a step of DeepSeek-V4.1's 40 layers
-issues 80 generations against the stream ring's 64), the deadline, poison
-and injected-delay scenarios against the driver and the step, and the
-in-situ distribution inside a real step on the fabric.
+The step's folds then got their own ring and the epoch. A step of
+DeepSeek-V4.1's 40 layers issues 80 generations ahead of its kernel, so
+`step_prepare` takes its cell and block records from a step ring of 256
+(`kBusStepRing`) beside the stream ring's 64, bounded by its own count in
+flight; the generations still go through the one FIFO and walk, each
+carrying its cell and records. The first run of a hundred folds found the
+shared issue path still waiting on the stream ring's bound, which blocked
+the host issuing a step's folds against its own walk until the flight
+watchdog failed the era; step issues skip that wait. The step's 64-bit
+epoch (the descriptor's) is mixed into every fold chunk's trailer hash on
+both sides, so a stale chunk of an earlier step with the same 32-bit
+generation and index fails the proof; with epoch zero the production
+kernel's hash is the 2026-10-19 one unchanged, and its scenarios say so.
+The 32-bit generation counter itself still fails the era at its top (31
+days of serving at eighty folds a step and twenty steps a second), as it
+does for the graph machine; numbering generations within a step would lift
+it and is owed.
+
+`bus_test`'s step scenarios now run a hundred folds a pass over three
+passes on worlds of two and four with the epoch just below the 64-bit top,
+and the faults: rank 0's engine delayed 200 µs between passes and the
+folds stay bitwise; one rank never staging a fold, after which every
+rank's driver gives up at the deadline, settle reports the era's failure
+and the buses quiesce and stop cleanly. What remains of the fold item: the
+in-situ distribution inside a real step on the fabric, the Engram folds'
+5H width, and the staging by the consumers' epilogue in place of the stage
+class.
 
 ## The step protocol
 

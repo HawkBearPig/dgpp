@@ -281,10 +281,12 @@ struct CollectiveBus::Impl {
   BusWriteBlockRecord* write_recs_of_stream(int cell) const {
     return write_recs + (static_cast<size_t>(kBusMaxGraphVariants) * kBusMaxGraphGens + static_cast<size_t>(cell)) * kBusWriteMaxBlocks;
   }
-  // The records of a cell, graph or stream (the cell arrays are contiguous).
+  // The records of a cell: graph, stream or the step engine's (each array contiguous).
   BusWriteBlockRecord* write_recs_of_cell(const BusAllReduceCtl* cell) const {
     if (cell >= graph_cells && cell < graph_cells + static_cast<size_t>(kBusMaxGraphVariants) * kBusMaxGraphGens)
       return write_recs + static_cast<size_t>(cell - graph_cells) * kBusWriteMaxBlocks;
+    if (strm.step_cells && cell >= strm.step_cells && cell < strm.step_cells + kBusStepRing)
+      return strm.step_recs + static_cast<size_t>(cell - strm.step_cells) * kBusWriteMaxBlocks;
     return write_recs_of_stream(static_cast<int>(cell - strm.cells));
   }
   // The write transport's aggregate of a generation's block records: every
@@ -587,10 +589,18 @@ struct CollectiveBus::Impl {
   //                    release), the era failure flag.
   struct StreamState {
     BusAllReduceCtl* cells = nullptr;  // pinned [kBusStreamRing]
+    // The step engine's ring (kBusStepRing cells and their block records): its generations go
+    // through the same FIFO and walk, bounded by their own count in flight.
+    BusAllReduceCtl* step_cells = nullptr;
+    BusWriteBlockRecord* step_recs = nullptr;
+    std::atomic<uint64_t> step_issued{0};  // step generations issued
+    std::atomic<uint64_t> step_walked{0};  // and walked (or failed)
     struct Gen {
       uint64_t gen = 0;
-      int cell = 0;
+      BusAllReduceCtl* cell = nullptr;
+      BusWriteBlockRecord* recs = nullptr;
       uint32_t elems = 0;
+      bool step = false;
     };
     std::deque<Gen> fifo;             // coll_mu: issued, not yet adopted
     std::atomic<uint64_t> issued{0};  // the last generation issued (0: none)
@@ -1251,17 +1261,18 @@ struct CollectiveBus::Impl {
     // generation's cell gets its done stamp so the stream's kernels exit.
     bool poisoned = false;
     if (strm.active) {
-      __atomic_store_n(&strm.cells[strm.cur.cell].done_seq, strm.cur.gen, __ATOMIC_RELEASE);
+      __atomic_store_n(&strm.cur.cell->done_seq, strm.cur.gen, __ATOMIC_RELEASE);
       poisoned = true;
     }
     {
       std::lock_guard<std::mutex> lock(coll_mu);
       for (const StreamState::Gen& g : strm.fifo) {
-        __atomic_store_n(&strm.cells[g.cell].done_seq, g.gen, __ATOMIC_RELEASE);
+        __atomic_store_n(&g.cell->done_seq, g.gen, __ATOMIC_RELEASE);
         poisoned = true;
       }
       strm.fifo.clear();
     }
+    strm.step_walked.store(strm.step_issued.load(std::memory_order_acquire), std::memory_order_release);
     strm.walked.store(strm.issued.load(std::memory_order_acquire), std::memory_order_release);
     strm.active = false;
     if (poisoned) graph_fail("bus stopped with stream collectives in flight");
@@ -1873,7 +1884,7 @@ struct CollectiveBus::Impl {
       }
     }
     const uint64_t gen = strm.cur.gen;
-    BusAllReduceCtl* const cell = &strm.cells[strm.cur.cell];
+    BusAllReduceCtl* const cell = strm.cur.cell;
     if (graph.failed.load(std::memory_order_relaxed)) {
       // Drain-fail: poison this generation and every queued one so the
       // stream's kernels exit; everything issued counts as walked (settle
@@ -1882,13 +1893,14 @@ struct CollectiveBus::Impl {
       {
         std::lock_guard<std::mutex> lock(coll_mu);
         for (const StreamState::Gen& g : strm.fifo)
-          __atomic_store_n(&strm.cells[g.cell].done_seq, g.gen, __ATOMIC_RELEASE);
+          __atomic_store_n(&g.cell->done_seq, g.gen, __ATOMIC_RELEASE);
         strm.fifo.clear();
       }
       graph.walk_seq = std::max(graph.walk_seq, gen + 1);
       graph.walk_pub.store(graph.walk_seq, std::memory_order_release);
       strm.walked.store(strm.issued.load(std::memory_order_acquire),
                         std::memory_order_release);
+      strm.step_walked.store(strm.step_issued.load(std::memory_order_acquire), std::memory_order_release);
       strm.active = false;
       graph.flight = {};
       return true;
@@ -1903,6 +1915,7 @@ struct CollectiveBus::Impl {
       graph.walk_seq = gen + 1;
       graph.walk_pub.store(graph.walk_seq, std::memory_order_release);
       strm.walked.store(gen, std::memory_order_release);
+      if (strm.cur.step) strm.step_walked.fetch_add(1, std::memory_order_release);
       strm.active = false;
       return true;
     }
@@ -3471,6 +3484,23 @@ bool CollectiveBus::start(std::string* error) {
       return false;
     }
     for (int i = 0; i < kBusStreamRing; ++i) impl.strm.cells[i] = BusAllReduceCtl{};
+    if (cudaMallocHost(reinterpret_cast<void**>(&impl.strm.step_cells), kBusStepRing * sizeof(BusAllReduceCtl)) != cudaSuccess ||
+        impl.strm.step_cells == nullptr ||
+        cudaMallocHost(reinterpret_cast<void**>(&impl.strm.step_recs), static_cast<size_t>(kBusStepRing) * kBusWriteMaxBlocks * sizeof(BusWriteBlockRecord)) != cudaSuccess ||
+        impl.strm.step_recs == nullptr) {
+      if (impl.strm.step_cells) cudaFreeHost(impl.strm.step_cells);
+      impl.strm.step_cells = nullptr;
+      cudaFreeHost(impl.strm.cells);
+      impl.strm.cells = nullptr;
+      cudaFreeHost(impl.graph_cells);
+      impl.graph_cells = nullptr;
+      cudaFreeHost(impl.ar_ctl);
+      impl.ar_ctl = nullptr;
+      *error = "step fold cells alloc failed";
+      return false;
+    }
+    for (int i = 0; i < kBusStepRing; ++i) impl.strm.step_cells[i] = BusAllReduceCtl{};
+    for (size_t i = 0; i < static_cast<size_t>(kBusStepRing) * kBusWriteMaxBlocks; ++i) impl.strm.step_recs[i] = BusWriteBlockRecord{};
     // The bulk grid's records live in device memory (atomics and every
     // block's reads). No memset: the kernel resets what it uses at entry,
     // and a synchronous memset here is a device-wide barrier against a
@@ -4016,14 +4046,29 @@ uint64_t CollectiveBus::step_prepare(size_t bf16_elems, StepFold* out, std::stri
     *error = "the step engine's folds need the write transport (engine.collective_transport write)";
     return 0;
   }
+  // The step ring's bound: at most kBusStepRing step generations between issue and walk.
+  {
+    const auto deadline = Clock::now() + std::chrono::milliseconds(std::max(options_.completion_timeout_ms + 5000, 30000));
+    while (impl.strm.step_issued.load(std::memory_order_relaxed) - impl.strm.step_walked.load(std::memory_order_acquire) >=
+           static_cast<uint64_t>(kBusStepRing)) {
+      if (impl.graph.failed.load(std::memory_order_relaxed)) {
+        std::lock_guard<std::mutex> lock(impl.coll_mu);
+        *error = "graph era failed: " + impl.graph.error;
+        return 0;
+      }
+      if (impl.stopping.load(std::memory_order_relaxed)) { *error = "bus stopped while a step fold waited for the ring"; return 0; }
+      if (Clock::now() > deadline) { *error = "step ring backstop: the engine did not walk the ring's oldest generation"; return 0; }
+      cpu_relax();
+    }
+  }
   BusAllReduceCtl* cell = nullptr;
-  int cell_idx = 0;
-  const uint64_t gen = stream_issue(bf16_elems, &cell, &cell_idx, error);
+  BusWriteBlockRecord* recs = nullptr;
+  const uint64_t gen = stream_issue(bf16_elems, &cell, &recs, error, /*step=*/true);
   if (gen == 0) return 0;
   out->gen = gen;
   out->elems = static_cast<uint32_t>(bf16_elems);
   out->cell = cell;
-  out->recs = impl.write_recs_of_stream(cell_idx);
+  out->recs = recs;
   return gen;
 }
 
@@ -4069,8 +4114,8 @@ uint64_t CollectiveBus::allreduce_stream(cudaStream_t stream, const void* device
   }
   Impl& impl = *impl_;
   BusAllReduceCtl* cell = nullptr;
-  int cell_idx = 0;
-  const uint64_t gen = stream_issue(bf16_elems, &cell, &cell_idx, error);
+  BusWriteBlockRecord* recs = nullptr;
+  const uint64_t gen = stream_issue(bf16_elems, &cell, &recs, error, /*step=*/false);
   if (gen == 0) return 0;
   BusAllReduceGraphView v{};
   int vi = 0;
@@ -4088,7 +4133,7 @@ uint64_t CollectiveBus::allreduce_stream(cudaStream_t stream, const void* device
           ? launch_bus_allreduce_write(
                 v, options_.my_rank, static_cast<const __nv_bfloat16*>(device_src),
                 static_cast<__nv_bfloat16*>(device_dst), static_cast<uint32_t>(bf16_elems), cell,
-                impl.write_recs_of_stream(cell_idx), impl.strm.deadline_cycles, stream)
+                recs, impl.strm.deadline_cycles, stream)
           : launch_bus_allreduce_graph(
                 v, options_.my_rank, static_cast<const __nv_bfloat16*>(device_src),
                 static_cast<__nv_bfloat16*>(device_dst), static_cast<uint32_t>(bf16_elems), cell,
@@ -4103,7 +4148,8 @@ uint64_t CollectiveBus::allreduce_stream(cudaStream_t stream, const void* device
   return gen;
 }
 
-uint64_t CollectiveBus::stream_issue(size_t bf16_elems, BusAllReduceCtl** cell_out, int* cell_idx_out, std::string* error) {
+uint64_t CollectiveBus::stream_issue(size_t bf16_elems, BusAllReduceCtl** cell_out, BusWriteBlockRecord** recs_out, std::string* error,
+                                     bool step) {
   Impl& impl = *impl_;
   if (impl.stopping.load(std::memory_order_relaxed)) {
     *error = "bus is stopped";
@@ -4123,8 +4169,10 @@ uint64_t CollectiveBus::stream_issue(size_t bf16_elems, BusAllReduceCtl** cell_o
   }
   // The ring: at most kBusStreamRing generations between issue and walk
   // (the walk frees them in order; the wait is bounded by the flight
-  // watchdog's era failure).
-  {
+  // watchdog's era failure). A step issue has its own ring and bound
+  // (step_prepare); waiting here on the stream ring blocked a host issuing
+  // a step's folds ahead of its kernel against its own walk (2026-11-01).
+  if (!step) {
     const auto deadline =
         Clock::now() + std::chrono::milliseconds(std::max(options_.completion_timeout_ms + 5000, 30000));
     while (impl.strm.issued.load(std::memory_order_relaxed) -
@@ -4190,8 +4238,13 @@ uint64_t CollectiveBus::stream_issue(size_t bf16_elems, BusAllReduceCtl** cell_o
       return 0;
     }
     gen = static_cast<uint64_t>(impl.ctl_seq_counter.fetch_add(1, std::memory_order_relaxed)) + 1;
-    cell_idx = static_cast<int>(gen % static_cast<uint64_t>(kBusStreamRing));
-    cell = &impl.strm.cells[cell_idx];
+    if (step) {
+      cell_idx = static_cast<int>(gen % static_cast<uint64_t>(kBusStepRing));
+      cell = &impl.strm.step_cells[cell_idx];
+    } else {
+      cell_idx = static_cast<int>(gen % static_cast<uint64_t>(kBusStreamRing));
+      cell = &impl.strm.cells[cell_idx];
+    }
     // The cell reset, gen_seq last with release (the kernel's acquire read
     // orders the resets ahead of its execution).
     __atomic_store_n(&cell->ready_bits, 0, __ATOMIC_RELAXED);
@@ -4209,11 +4262,14 @@ uint64_t CollectiveBus::stream_issue(size_t bf16_elems, BusAllReduceCtl** cell_o
     __atomic_store_n(&cell->gen_seq, gen, __ATOMIC_RELEASE);
     // Issued before the launch: the engine adopts from the FIFO, so a
     // launch that fails is withdrawn below before the walk can see it.
-    impl.strm.fifo.push_back(Impl::StreamState::Gen{gen, cell_idx, static_cast<uint32_t>(bf16_elems)});
+    BusWriteBlockRecord* recs = step ? impl.strm.step_recs + static_cast<size_t>(cell_idx) * kBusWriteMaxBlocks
+                                     : impl.write_recs_of_stream(cell_idx);
+    impl.strm.fifo.push_back(Impl::StreamState::Gen{gen, cell, recs, static_cast<uint32_t>(bf16_elems), step});
     impl.strm.issued.store(gen, std::memory_order_release);
+    if (step) impl.strm.step_issued.fetch_add(1, std::memory_order_release);
+    *recs_out = recs;
   }
   *cell_out = cell;
-  *cell_idx_out = cell_idx;
   return gen;
 }
 
@@ -4924,6 +4980,10 @@ void CollectiveBus::stop() {
   }
   if (impl.strm.cells) {
     cudaFreeHost(impl.strm.cells);
+    if (impl.strm.step_cells) cudaFreeHost(impl.strm.step_cells);
+    if (impl.strm.step_recs) cudaFreeHost(impl.strm.step_recs);
+    impl.strm.step_cells = nullptr;
+    impl.strm.step_recs = nullptr;
     impl.strm.cells = nullptr;
   }
   if (impl.bulk_scratch) {

@@ -1385,7 +1385,7 @@ cudaError_t launch_bus_allreduce_write(const BusAllReduceGraphView& v, int my_ra
   return cudaGetLastError();
 }
 
-uint64_t bus_write_chunk_hash(uint32_t gen, uint32_t chunk, const void* lanes496) {
+uint64_t bus_write_chunk_hash(uint32_t gen, uint32_t chunk, const void* lanes496, uint64_t epoch) {
   const uint8_t* b = static_cast<const uint8_t*>(lanes496);
   uint64_t h = 0;
   for (uint32_t lane = 0; lane < kBusWriteDataLanes; ++lane) {
@@ -1394,7 +1394,7 @@ uint64_t bus_write_chunk_hash(uint32_t gen, uint32_t chunk, const void* lanes496
     std::memcpy(&w1, b + lane * 16 + 8, 8);
     h ^= ((w0 + 2 * lane + 1) * kFoldMultiplier) ^ ((w1 + 2 * lane + 2) * kFoldMultiplier);
   }
-  return h ^ (((static_cast<uint64_t>(gen) << 32) | chunk) * kFoldMultiplier);
+  return h ^ (((static_cast<uint64_t>(gen) << 32) | chunk) * kFoldMultiplier) ^ (epoch * kFoldMultiplier);
 }
 
 // ---- segment-quantized bulk collective (DESIGN §6.3, prefill class) ----

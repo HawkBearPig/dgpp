@@ -290,8 +290,8 @@ StreamReport Streamer::run(const StreamerConfig& cfg) {
   if (fold_world_ > 1) {
     if (bus_ == nullptr) throw std::invalid_argument("Streamer: folds past world 1 need the bus (set_fold)");
     if (!bus_->write_view(&p.fold.view)) throw std::invalid_argument("Streamer: the folds need the bus on the write transport, past world 1");
-    if (dp_.fold_count > static_cast<int>(net::kBusStreamRing))
-      throw std::invalid_argument("Streamer: a step's folds (" + std::to_string(dp_.fold_count) + ") exceed the stream ring the host issues ahead into");
+    if (dp_.fold_count > static_cast<int>(net::kBusStepRing) || dp_.fold_count > kStepMaxFolds)
+      throw std::invalid_argument("Streamer: a step's folds (" + std::to_string(dp_.fold_count) + ") exceed the step ring the host issues ahead into");
     p.fold.world = fold_world_;
     p.fold.my_rank = fold_rank_;
     p.fold.table = fold_table_dev_;

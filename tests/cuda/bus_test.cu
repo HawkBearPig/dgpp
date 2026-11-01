@@ -2035,9 +2035,13 @@ struct StepFoldDev {
   const uint16_t* src = nullptr;
   uint16_t* dst = nullptr;
 };
+// `epoch` goes into every chunk's trailer hash as the step engine's does; `skip_fold` (-1 none)
+// is a fold this rank never stages, the peers' fold blocks then giving up at the deadline (the
+// fault scenario); `status` takes 1 when a fold gave up.
 __global__ __launch_bounds__(dgpp::net::bus_write::kThreads) void step_fold_driver_kernel(dgpp::net::BusAllReduceGraphView v, int my_rank,
                                                                                              const StepFoldDev* folds, int n,
-                                                                                             uint64_t deadline_cycles, int* status) {
+                                                                                             uint64_t deadline_cycles, uint64_t epoch,
+                                                                                             int skip_fold, int* status) {
   __shared__ dgpp::net::bus_write::FoldSmem sm;
   for (int g = 0; g < n; ++g) {
     const StepFoldDev f = folds[g];
@@ -2049,10 +2053,11 @@ __global__ __launch_bounds__(dgpp::net::bus_write::kThreads) void step_fold_driv
     }
     __syncthreads();
     const uint64_t start = clock64();
-    dgpp::net::bus_write::stage_block(static_cast<int>(blockIdx.x), static_cast<int>(gridDim.x), v, f.gen, f.src, f.elems,
-                                      f.recs[blockIdx.x]);
+    if (g != skip_fold)
+      dgpp::net::bus_write::stage_block(static_cast<int>(blockIdx.x), static_cast<int>(gridDim.x), v, f.gen, f.src, f.elems,
+                                        f.recs[blockIdx.x], epoch);
     const bool ok = dgpp::net::bus_write::fold_block(static_cast<int>(blockIdx.x), static_cast<int>(gridDim.x), v, my_rank, f.gen, f.src,
-                                                     f.dst, f.elems, f.cell, f.recs[blockIdx.x], deadline_cycles, start, sm);
+                                                     f.dst, f.elems, f.cell, f.recs[blockIdx.x], deadline_cycles, start, sm, epoch);
     __syncthreads();
     if (!ok) {
       if (threadIdx.x == 0) atomicExch(status, 1);
@@ -2061,7 +2066,11 @@ __global__ __launch_bounds__(dgpp::net::bus_write::kThreads) void step_fold_driv
   }
 }
 
-int step_fold_rank_work(CollectiveBus& bus, int world, int my_rank, size_t elems, int gens, int passes) {
+// `skip_rank`/`skip_fold`: that rank never stages that fold, every rank's driver must then give
+// up at the deadline, settle must report the era's failure, and the buses must still stop cleanly.
+int step_fold_rank_work(CollectiveBus& bus, int world, int my_rank, size_t elems, int gens, int passes, uint64_t epoch = 0,
+                        int skip_rank = -1, int skip_fold = -1) {
+  const bool fault = skip_rank >= 0 && skip_fold >= 0;
   cudaStream_t stream = nullptr;
   if (cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) != cudaSuccess) {
     DGPP_LOG_ERROR("rank {}: stream create failed", my_rank);
@@ -2122,12 +2131,22 @@ int step_fold_rank_work(CollectiveBus& bus, int world, int my_rank, size_t elems
     if (failures) break;
     if (cudaMemcpy(table, h_table.data(), sizeof(StepFoldDev) * static_cast<size_t>(gens), cudaMemcpyHostToDevice) != cudaSuccess ||
         cudaMemset(status, 0, sizeof(int)) != cudaSuccess) { fail("table upload failed"); break; }
-    step_fold_driver_kernel<<<blocks, dgpp::net::bus_write::kThreads, 0, stream>>>(view, my_rank, table, gens, bus.collective_deadline_cycles(), status);
+    step_fold_driver_kernel<<<blocks, dgpp::net::bus_write::kThreads, 0, stream>>>(view, my_rank, table, gens, bus.collective_deadline_cycles(), epoch,
+                                                                                    my_rank == skip_rank ? skip_fold : -1, status);
     if (cudaGetLastError() != cudaSuccess) { fail("driver launch failed"); break; }
-    if (!bus.allreduce_settle(30000, &error)) { fail("settle failed: " + error); break; }
+    const bool settled = bus.allreduce_settle(60000, &error);
     if (cudaStreamSynchronize(stream) != cudaSuccess) { fail("stream sync failed"); break; }
     int h_status = 0;
-    if (cudaMemcpy(&h_status, status, sizeof(int), cudaMemcpyDeviceToHost) != cudaSuccess || h_status != 0) { fail("the driver gave up on a fold"); break; }
+    if (cudaMemcpy(&h_status, status, sizeof(int), cudaMemcpyDeviceToHost) != cudaSuccess) { fail("status read failed"); break; }
+    if (fault) {
+      // Every rank gives up (the skipping rank waits on peers that never complete the fold after
+      // theirs; its peers wait on its row), settle reports the failure, and the walk is drained.
+      if (h_status != 1) fail("the driver did not give up on the skipped fold");
+      if (settled) fail("settle did not report the era's failure after a skipped fold");
+      break;
+    }
+    if (!settled) { fail("settle failed: " + error); break; }
+    if (h_status != 0) { fail("the driver gave up on a fold"); break; }
     if (bus.completion_epoch().load() != completions_before + static_cast<uint64_t>(gens)) { fail("completions did not advance once per fold"); break; }
     for (int g = 0; g < gens; ++g) {
       if (cudaMemcpy(got.data(), dev[static_cast<size_t>(g)], elems * 2, cudaMemcpyDeviceToHost) != cudaSuccess) { fail("D2H failed"); break; }
@@ -2148,8 +2167,9 @@ int step_fold_rank_work(CollectiveBus& bus, int world, int my_rank, size_t elems
 
 void scenario_step_fold() {
   const size_t elems = 5 * 5120;  // five rows of DeepSeek-V4.1's hidden: 104 chunks, 13 blocks
-  const int gens = 40;            // past the staging ring (8), within the stream ring (64): issued ahead in one batch
+  const int gens = 100;           // past the staging ring (8) and the stream ring (64), within the step ring (256): issued ahead in one batch
   const int passes = 3;
+  const uint64_t epoch = 0xFFFFFFFFFFFFFFF0ull;  // just below the 64-bit top (MOONSHOT-1 item 14)
   int failures = 0;
   for (const int world : {2, 4}) {
     const uint16_t port = world == 2 ? 29930 : 29931;
@@ -2163,7 +2183,7 @@ void scenario_step_fold() {
     std::vector<int> rank_failures(static_cast<size_t>(world), 0);
     for (int r = 0; r < world; ++r)
       workers.emplace_back([&, r] {
-        rank_failures[static_cast<size_t>(r)] = step_fold_rank_work(*world_buses[static_cast<size_t>(r)], world, r, elems, gens, passes);
+        rank_failures[static_cast<size_t>(r)] = step_fold_rank_work(*world_buses[static_cast<size_t>(r)], world, r, elems, gens, passes, epoch);
       });
     for (auto& t : workers) t.join();
     int world_failures = 0;
@@ -2171,8 +2191,78 @@ void scenario_step_fold() {
     CHECK(world_failures == 0, "step fold world " + std::to_string(world) + " had " + std::to_string(world_failures) + " failures");
     for (auto& bus : world_buses) bus->quiesce();
     for (auto& bus : world_buses) bus->stop();
-    DGPP_LOG_INFO("scenario step_fold: world {} clean ({} folds x {} passes, {} elems, {} blocks)", world, gens, passes, elems,
-                  dgpp::net::bus_write_blocks(dgpp::net::bus_write_chunks(elems)));
+    if (world_failures == 0)
+      DGPP_LOG_INFO("scenario step_fold: world {} clean ({} folds x {} passes, {} elems, {} blocks, epoch {:#x})", world, gens, passes, elems,
+                    dgpp::net::bus_write_blocks(dgpp::net::bus_write_chunks(elems)), epoch);
+  }
+  g_failures += failures;
+}
+
+// The step fold's faults (MOONSHOT-1 phase 4): rank 0's engine dawdles between its passes (the
+// injected delay) and the folds stay bitwise; then one rank never stages a fold, every rank's
+// driver gives up at the deadline, settle reports the era's failure and the buses stop cleanly.
+void scenario_step_fold_faults() {
+  const size_t elems = 5 * 5120;
+  int failures = 0;
+  {
+    const int world = 2;
+    std::vector<std::unique_ptr<CollectiveBus>> world_buses =
+        start_world(world, 29932, /*one_lane=*/false, /*rank0_pass_delay_us=*/200, /*lat_slot_bytes=*/65536);
+    if (world_buses.empty()) {
+      DGPP_LOG_ERROR("step fold delay world failed to start");
+      ++failures;
+    } else {
+      std::vector<std::thread> workers;
+      std::vector<int> rank_failures(static_cast<size_t>(world), 0);
+      for (int r = 0; r < world; ++r)
+        workers.emplace_back([&, r] {
+          rank_failures[static_cast<size_t>(r)] = step_fold_rank_work(*world_buses[static_cast<size_t>(r)], world, r, elems, 24, 2, 7ull);
+        });
+      for (auto& t : workers) t.join();
+      int world_failures = 0;
+      for (int r = 0; r < world; ++r) world_failures += rank_failures[static_cast<size_t>(r)];
+      CHECK(world_failures == 0, "step fold under an injected engine delay had " + std::to_string(world_failures) + " failures");
+      for (auto& bus : world_buses) bus->quiesce();
+      for (auto& bus : world_buses) bus->stop();
+      DGPP_LOG_INFO("scenario step_fold_faults: injected delay clean");
+    }
+  }
+  {
+    const int world = 2;
+    std::vector<std::unique_ptr<CollectiveBus>> world_buses;
+    for (int r = 0; r < world; ++r) {
+      BusOptions o = base_options(r, 29933);
+      o.world_size = world;
+      o.launch_consumers = false;
+      o.lat_slot_bytes = 65536;
+      o.consumer_deadline_s = 2.0;      // the drivers give up two seconds after the skipped fold
+      o.completion_timeout_ms = 3000;   // the engine's flight fails the era behind them
+      o.latency_transport = BusLatencyTransport::kWrite;
+      world_buses.push_back(std::make_unique<CollectiveBus>(o));
+    }
+    std::vector<std::string> errors(static_cast<size_t>(world));
+    std::thread listener([&] { if (!world_buses[0]->start(&errors[0])) DGPP_LOG_ERROR("fault world rank 0: {}", errors[0]); });
+    const bool b_ok = world_buses[1]->start(&errors[1]);
+    listener.join();
+    if (!errors[0].empty() || !b_ok) {
+      DGPP_LOG_ERROR("step fold fault world failed to start");
+      ++failures;
+    } else {
+      std::vector<std::thread> workers;
+      std::vector<int> rank_failures(static_cast<size_t>(world), 0);
+      for (int r = 0; r < world; ++r)
+        workers.emplace_back([&, r] {
+          rank_failures[static_cast<size_t>(r)] =
+              step_fold_rank_work(*world_buses[static_cast<size_t>(r)], world, r, elems, 6, 1, 11ull, /*skip_rank=*/1, /*skip_fold=*/3);
+        });
+      for (auto& t : workers) t.join();
+      int world_failures = 0;
+      for (int r = 0; r < world; ++r) world_failures += rank_failures[static_cast<size_t>(r)];
+      CHECK(world_failures == 0, "step fold with a skipped stage had " + std::to_string(world_failures) + " failures");
+      for (auto& bus : world_buses) bus->quiesce();
+      for (auto& bus : world_buses) bus->stop();
+      DGPP_LOG_INFO("scenario step_fold_faults: skipped stage gave up, the era failed and the buses stopped");
+    }
   }
   g_failures += failures;
 }
@@ -2429,6 +2519,7 @@ int main(int argc, char** argv) {
   if (const char* f = std::getenv("DGPP_TEST_FILTER"); f && std::string(f) == "step_fold") {
     g_transport = BusLatencyTransport::kWrite;
     scenario_step_fold();
+    scenario_step_fold_faults();
     return g_failures == 0 ? 0 : 1;
   }
   if (const char* f = std::getenv("DGPP_TEST_FILTER");
@@ -2468,6 +2559,7 @@ int main(int argc, char** argv) {
   scenario_allreduce_graph_rows();
   scenario_allreduce_stream();
   scenario_step_fold();
+  scenario_step_fold_faults();
   g_transport = BusLatencyTransport::kSend;
   scenario_idle_gap_collective();
   scenario_geometry_mismatch();
