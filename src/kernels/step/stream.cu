@@ -8,8 +8,8 @@
 #include "kernels/dsa.hpp"
 #include "kernels/dsa_attn_flash.cuh"
 #include "kernels/dsa_latent_append.cuh"
-#include "kernels/mma_gemv_body.cuh"
 #include "kernels/pick_body.cuh"
+#include "kernels/step/bf12_rows.cuh"
 #include "net/bus_write.cuh"
 #include "kernels/step/mxfp4_expert.cuh"
 #include "kernels/step/mxfp4_row.cuh"
@@ -1027,30 +1027,28 @@ __device__ __forceinline__ void embed_unit(const StepStreamParams& p, const DevP
 }
 
 // The lm head (kPoolHead): unit rb's 64 vocab rows of the bf12 companion over the head's input
-// rows, the production tensor-core bf12 form's block body (kernels/mma_gemv_body.cuh) at the
-// step block's eight warps, the logits fp32 [rows][n]: a row's chain is the production launch's.
-// Out of line on its own call (2026-11-01): the body's presence in the kernel costs the expert
-// stream about three points whether it runs or not, and neither its code size nor the stack
-// frame it adds reproduces the effect alone (docs/step_engine.md, the token path); behind the
-// latency units' call it read another 0.6 lower.
-constexpr int kHeadWarps = kStepThreads / 32;
-static_assert(kHeadWarps * mma_gemv_body::kRowsPerWarp == 64, "a head unit is 64 vocab rows (device_plan.cpp kHeadUnitRows)");
+// rows, the step's bf16-row consumer (kernels/step/bf12_rows.cuh: bf12_gemv_wide_kernel's form
+// and bodies), the logits fp32 [rows][n]: a logit is bitwise launch_bf12_gemv's. The production
+// tensor-core form was tried first (2026-11-01): its block body takes the kernel's whole register
+// budget and its presence behind the latency units' call cost the expert stream three points
+// whether it ran or not (docs/step_engine.md, the token path).
+static_assert(kBf12RowsUnit == 64, "a head unit is 64 vocab rows (device_plan.cpp kHeadUnitRows)");
 __device__ __noinline__ void head_unit(const StepStreamParams& p, const DevPool& pool, int rb, uint8_t* smem) {
   const StepHeadParams& h = p.head;
   const DevPool& sp = p.pools[pool.in_pool];
   const int rows = static_cast<int>(p.ctl->rows);
   if (h.packed == nullptr || h.rows == nullptr || h.esc == nullptr || h.raw == nullptr || p.logits_out == nullptr || h.n != pool.rows ||
-      h.k != pool.k || sp.rows != pool.k || rows > kMmaGemvMaxRows) {
+      h.k != pool.k || sp.rows != pool.k || rows > kBf12RowsMaxRows || h.k % kBf12Super != 0) {
     if (threadIdx.x == 0) atomicCAS(&p.ctl->status, kStepOk, kStepBadUnit);
     return;
   }
-  const uint16_t* act = p.proj + sp.out_offset;  // the head's input rows at the row width k
-  // The two-tile form at every row count (the forms are bitwise each other's: a row's chain is a
-  // function of k and the window layout): one instantiation in the kernel, since the body's code
-  // beside the expert units' cost them points on 2026-11-01 (docs/step_engine.md, the token path).
-  mma_gemv_body::mma_gemv_block<2, false, kHeadWarps, float, float, true>(rb, 0, 1, smem, act, static_cast<size_t>(sp.rows), h.packed, nullptr, p.logits_out,
-                                                                          rows, h.n, h.k, static_cast<size_t>(h.n), 0, 0, nullptr, nullptr, 0.f, nullptr, nullptr,
-                                                                          nullptr, nullptr, 0, 0, 0, h.rows, h.esc, h.raw);
+  const uint16_t* act = p.proj + sp.out_offset;
+  if (rows <= 8)
+    bf12_rows_unit<8>(h.packed, h.rows, h.esc, h.raw, h.n, h.k, act, static_cast<size_t>(sp.rows), rows, rb * kBf12RowsUnit, p.logits_out, static_cast<size_t>(h.n), smem);
+  else if (rows <= 16)
+    bf12_rows_unit<16>(h.packed, h.rows, h.esc, h.raw, h.n, h.k, act, static_cast<size_t>(sp.rows), rows, rb * kBf12RowsUnit, p.logits_out, static_cast<size_t>(h.n), smem);
+  else
+    bf12_rows_unit<32>(h.packed, h.rows, h.esc, h.raw, h.n, h.k, act, static_cast<size_t>(sp.rows), rows, rb * kBf12RowsUnit, p.logits_out, static_cast<size_t>(h.n), smem);
 }
 
 // The pick (kPoolPick): row `row`'s top-2 over this rank's logits under the canonical order
@@ -1922,8 +1920,8 @@ unsigned step_stream_mxfp4_smem(int inter) { return step_stream_consumer_smem(in
 bool step_stream_has_router(int k) { return k == 5120; }
 unsigned step_stream_consumer_smem(int inter, bool fp8, bool mhc, bool attention, bool head) {
   unsigned need = mhc ? kMhcUnitSmem + static_cast<unsigned>(kMhcFinishSmemFloats) * 4u : 0u;  // the hyper-connection unit's slice exchange and its finish's
-  if (head) {  // the head unit's activation windows (the mma body's two buffers at two tiles), the pick's warp slots
-    need = std::max(need, static_cast<unsigned>(mma_gemv_body::WarpLoads<2, false, kHeadWarps, true>::kSmemBytes));
+  if (head) {  // the head unit's activation window, the pick's warp slots
+    need = std::max(need, bf12_rows_smem_bytes());
     need = std::max(need, static_cast<unsigned>(sizeof(pick_body::Top2) * (kStepThreads / 32)));
   }
   if (attention) {  // the flash body's tile, exchange and scratch; the finish's block

@@ -348,26 +348,12 @@ StreamReport Streamer::run(const StreamerConfig& cfg) {
   DGPP_CUDA_OK(cudaEventCreate(&e0));
   DGPP_CUDA_OK(cudaEventCreate(&e1));
   DGPP_CUDA_OK(cudaEventRecord(e0, stream_));
-  const cudaError_t launch = launch_step_stream(p, cfg.workers, stream_);
-  if (launch != cudaSuccess) {
-    cudaEventDestroy(e0);
-    cudaEventDestroy(e1);
-    throw std::runtime_error(std::string("Streamer: launch failed: ") + cudaGetErrorString(launch) +
-                             " (workers " + std::to_string(cfg.workers) + ", capacity " + std::to_string(step_stream_capacity(p.consumer_smem)) + ")");
-  }
-  DGPP_CUDA_OK(cudaEventRecord(e1, stream_));
-
-  // ---- the host's side of the protocol: one descriptor at a time, in order
-  StreamReport r;
-  uint64_t fold_seed = 0x9e3779b97f4a7c15ull;
-  (void)fold_seed;
-  uint64_t last_end_ns = 0;
-  bool ended = false;
-  for (int step = 0; step < cfg.steps && !ended; ++step) {
+  // A step's descriptor: its slot of the ring filled and published (the fold generations of a
+  // world past one issued into the slot's row of the fold table first).
+  auto fill = [&](int step) {
     const uint64_t seq = cfg.first_seq + static_cast<uint64_t>(step);
     const int slot = step & 1;
     StepDescriptor& d = desc_[slot];
-    // The slot is the host's: its previous verdict was read two steps ago.
     store_release(&d.seq, seq);
     if (cfg.between_steps) cfg.between_steps(step);
     d.rows = static_cast<uint32_t>(cfg.rows);
@@ -407,6 +393,34 @@ StreamReport Streamer::run(const StreamerConfig& cfg) {
     }
     std::atomic_thread_fence(std::memory_order_seq_cst);
     store_release(&d.state, skip ? kStepSkip : kStepExecute);
+    return skip;
+  };
+  if (cfg.prepublish) {
+    if (cfg.steps > kStepRingSlots || fold_world_ > 1 || cfg.gather_delay_us > 0 || cfg.skip_at_step >= 0)
+      throw std::invalid_argument("Streamer: prepublish takes at most the ring's steps at world 1, without gathers or skips");
+    for (int s = 0; s < cfg.steps; ++s) (void)fill(s);
+  }
+  const cudaError_t launch = launch_step_stream(p, cfg.workers, stream_);
+  if (launch != cudaSuccess) {
+    cudaEventDestroy(e0);
+    cudaEventDestroy(e1);
+    throw std::runtime_error(std::string("Streamer: launch failed: ") + cudaGetErrorString(launch) +
+                             " (workers " + std::to_string(cfg.workers) + ", capacity " + std::to_string(step_stream_capacity(p.consumer_smem)) + ")");
+  }
+  DGPP_CUDA_OK(cudaEventRecord(e1, stream_));
+
+  // ---- the host's side of the protocol: one descriptor at a time, in order
+  StreamReport r;
+  uint64_t fold_seed = 0x9e3779b97f4a7c15ull;
+  (void)fold_seed;
+  uint64_t last_end_ns = 0;
+  bool ended = false;
+  for (int step = 0; step < cfg.steps && !ended; ++step) {
+    const uint64_t seq = cfg.first_seq + static_cast<uint64_t>(step);
+    const int slot = step & 1;
+    StepDescriptor& d = desc_[slot];
+    // The slot is the host's: its previous verdict was read two steps ago.
+    const bool skip = cfg.prepublish ? false : fill(step);
     std::thread gather;
     if (!skip && cfg.gather_delay_us > 0) {
       const uint64_t publish = seq + 1;

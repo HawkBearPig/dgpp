@@ -47,6 +47,7 @@ struct StreamerConfig {
   uint64_t first_seq = 0;        // the first step's sequence number; steps count up from it
   uint64_t epoch = 0;            // echoed by every verdict
   int skip_at_step = -1;         // publish skip instead of this step (-1: never)
+  bool prepublish = false;       // the ring's descriptors (steps <= kStepRingSlots) written before the launch, at world 1 without gathers or skips: the kernel runs without the host, so a profiler that holds the launch sees a whole run
   int trace_pool = -1;           // the pool whose compute units the workers time (Streamer::unit_trace bank 2), -1 none
   double gather_delay_us = 0;    // > 0: the host publishes the gather sequence this long after each descriptor
   std::vector<int32_t> tokens;   // the first step's tokens (empty: zeros); later steps read the device feed

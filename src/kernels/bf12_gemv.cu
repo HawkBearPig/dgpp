@@ -52,34 +52,8 @@ __global__ void bf12_gemv_kernel(const uint16_t* __restrict__ act, size_t act_st
   }
 }
 
-// One window of a row kept bf16 (the wide kernel's raw rows): the
-// production chain over columns [col0, col0 + cols) — bf16_gemv::row_dots'
-// steps of it, in its order, into the running accumulators. sk: the staged
-// window's row stride.
-template <int kRows>
-__device__ __forceinline__ void raw_window(const uint16_t* __restrict__ w_row, int col0, int cols,
-                                           const uint16_t* __restrict__ sx, int sk, int lane,
-                                           float (&acc)[kRows]) {
-  uint4 wv[4];
-#pragma unroll
-  for (int t = 0; t < 4; ++t) {
-    const int c = t * 256 + lane * 8;
-    wv[t] = c < cols ? *reinterpret_cast<const uint4*>(w_row + col0 + c) : make_uint4(0u, 0u, 0u, 0u);
-  }
-#pragma unroll
-  for (int t = 0; t < 4; ++t) {
-    const int c = t * 256 + lane * 8;
-    if (c >= cols) break;  // per lane: its later chunks are past the window too
-#pragma unroll
-    for (int r = 0; r < kRows; ++r) {
-      const uint4 xv = *reinterpret_cast<const uint4*>(sx + static_cast<size_t>(r) * sk + c);
-      bf16_gemv::fma_pair(wv[t].x, xv.x, acc[r]);
-      bf16_gemv::fma_pair(wv[t].y, xv.y, acc[r]);
-      bf16_gemv::fma_pair(wv[t].z, xv.z, acc[r]);
-      bf16_gemv::fma_pair(wv[t].w, xv.w, acc[r]);
-    }
-  }
-}
+// A raw row's window chain: bf12_gemv::raw_window (kernels/bf12_gemv.cuh; the step kernel runs it too).
+using bf12_gemv::raw_window;
 
 // The WIDE form (2026-09-19): five to eight activation rows — the batch the
 // bf16 sites hand to cuBLASLt today, which reads the bf16 bytes once at

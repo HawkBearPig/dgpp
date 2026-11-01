@@ -811,22 +811,26 @@ sharded table's slice leaves zeros for a fold to complete. The head's input
 pre (`mhc_collapse_slice`, the production collapse's values and rounding)
 then the final norm in place (`csa2_norm::rmsnorm_row`), the walk's
 `launch_mhc_collapse_normed` without its norm followed by
-`csa2_rmsnorm_bf16`. The lm head (`kPoolHead`): the production tensor-core
-bf12 form's block body, moved from `kernels/mma_gemv.cu` into
-`kernels/mma_gemv_body.cuh` so the production kernels and the step call one
-body, at the step block's eight warps over the 12-bit companion the model
-packs at boot (`StepHeadParams`, outside the arena), 64 vocab rows a unit,
-four a grab, the logits fp32 [rows][n]; the two-tile form at every row count
-(the forms are bitwise each other's). The pick (`kPoolPick`): one row's top-2
-under the canonical order, `pick_local_kernel`'s scan moved into
+`csa2_rmsnorm_bf16`. The lm head (`kPoolHead`): the step's bf16-row consumer
+over the 12-bit companion the model packs at boot (`StepHeadParams`, outside
+the arena; `kernels/step/bf12_rows.cuh`), 64 vocab rows a unit and four a
+grab: `bf12_gemv_wide_kernel`'s form with its bodies, `consume_step` and
+`raw_window` (the latter moved into `kernels/bf12_gemv.cuh`), a warp two
+rows at once over the activation rows staged a super-block at a time, the
+window and the accumulators sized to the step's rows (8, 16 or 32), the
+next row group's packed rows prefetched into L2 while the current one
+streams, the logits fp32 [rows][n]; a logit is bitwise `launch_bf12_gemv`'s
+and the bf16 GEMV launch's. The pick (`kPoolPick`): one row's top-2 under
+the canonical order, `pick_local_kernel`'s scan moved into
 `kernels/pick_body.cuh`, the winner into the next step's device feed and the
 verdict, which carries the step's tokens (`StepVerdict::tokens`). The test
 (`step_token_path_matches_the_production_kernels`) runs two steps on the
 globals alone and with the first eight layers and the attention, and checks
 every stage against the production launch on the step's own upstream output,
 bitwise: the embedding of the second step's tokens (the first step's picks),
-the head's input, the logits (`launch_mma_gemv_bf12_f32`), the picks
-(`device_pick_local`), and a fresh streamer's repeat.
+the head's input, the logits (`launch_bf12_gemv` eight rows a launch; the
+tensor-core form beside it differs by a few bf16 ulps, printed, not gated),
+the picks (`device_pick_local`), and a fresh streamer's repeat.
 
 The second step found a defect the one-step tests could not: the per-pool
 counters (`pool_done`, `reduce_done`) are indexed by the pool table, which
@@ -838,27 +842,41 @@ had the last layer's reduce, fold and chain gates open early. The reset now
 covers the pool table (`StepStreamParams::n_pools`), and the chain,
 attention and token-path tests run two steps.
 
-The cost, measured in one window with the committed kernel rebuilt with the
-reset fix alone beside it, interleaved: the head streams its 248 MB at 60
-to 73 percent of the ceiling (1.4 to 1.7 ms, a unit about 2 µs of bytes
-against a hand-out of about as long: four units a grab); the embedding's
-group costs about 45 µs of the chain's bookkeeping for five rows of 10 KB.
-And the head body's presence in the kernel costs the expert stream about
-three points whether or not a head unit runs: the unwired canary (no head
-in its plan) read 75.5 to 76.1 against 78.2 to 79.5, the rate case
-tile-major 72.2 to 73.0 and row-major 65.2 to 67.4 against 73.4 to 76.0 and
-70.1 to 71.1 before. Neither code size nor the stack frame reproduces it:
-the same kernel with the head body replaced by a stub read 78.1 to 79.0, and
-with a never-run body of 21 thousand instructions added, or a never-run
-local array that grew the frame to 1136 bytes, 77.6 to 78.7. One
-instantiation of the body (the two-tile form) instead of two took the gap
-from 4.5 points to 3.3, and its own call site rather than the latency
-units' another 0.6. The profiler cannot see it yet: `ncu` holds the launch
-until the kernel ends and the chain's wait for the host's descriptor
-deadlines, so a profile needs a run whose descriptors are published before
-the launch. That is the first lever of the next round, with the gates
-meanwhile at the measured level less the noise (tile 70, row 65, the canary
-74).
+The head's first form was the production tensor-core bf12 body
+(`mma_gemv.cu`'s block, called at eight warps a unit), bitwise the graph
+engine's logits. It cost the expert stream about three points whether or not
+a head unit ran: in one window, interleaved with the committed kernel
+rebuilt with the reset fix alone, the unwired canary (no head in its plan)
+read 75.5 to 76.1 against 78.2 to 79.5. Neither code size nor the stack
+frame reproduces it (a never-run body of 21 thousand instructions, or a
+never-run local array growing the frame to 1136 bytes: 77.6 to 78.7); `ncu`
+on two pre-published steps (`StreamerConfig::prepublish`, below) showed the
+mechanism: the same instructions, 55 percent more local loads and 36 percent
+more local stores, the warp's long-scoreboard stall up half a cycle per
+issued instruction, the no-instruction stall unchanged. A callee that needs
+the kernel's whole register budget behind the latency units' call makes the
+hot loop spill around the call, and ptxas's static spill count (60 to 64
+bytes) does not show where. The bf16-row consumer in its place keeps about
+120 registers a lane and the canary reads as the committed kernel's (78.4 to
+78.5 against 78.4 to 78.9). The rule for every unit body added from here:
+compare the unwired canary against the previous commit's binary in one
+window before trusting the rate, and keep a body's registers well under the
+budget. With the row consumer the head streams its 248 MB in 1.35 ms (76 to
+77 percent of the ceiling; its accumulators stored with static indices only,
+a lane-indexed read had put them in local memory and the head at 24
+percent); the embedding's group costs about 45 µs of the chain's
+bookkeeping for five rows of 10 KB; the rate case reads tile-major 75.9 to
+76.4 and row-major 70.1 to 70.4 with the head in the step, the band of the
+chain round.
+
+Profiling the persistent kernel: `ncu` holds a launch until the kernel ends,
+and the chain's wait for the host's descriptor then deadlines. With
+`StreamerConfig::prepublish` the ring's descriptors (two steps, world 1,
+no gathers or skips) are written before the launch and the kernel runs
+without the host; `step_profile_two_steps` is that run, and
+`ncu --replay-mode application --kernel-name regex:step_stream_kernel
+--launch-count 1 --metrics ...` on it (under sudo, production down) gives
+the kernel's counters.
 
 ## The fold
 

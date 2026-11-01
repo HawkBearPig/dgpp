@@ -999,6 +999,25 @@ double consumers_rate(bool tile_major) {
   return pct[pct.size() / 2];
 }
 
+// Two pre-published steps in one launch with no host hand-offs: a run a profiler can hold (ncu
+// holds the launch until the kernel ends, and the chain's wait for the host's descriptor would
+// deadline). Prints the report; no gate.
+DGPP_TEST(step_profile_two_steps) {
+  auto rig = make_rig(kLayers, /*consumers=*/true, /*tile_major=*/true);
+  Streamer s(rig->dp, rig->bases, rig->plans);
+  if (rig->attn) s.set_attention(rig->attn->params);
+  StreamerConfig cfg = design_config();
+  cfg.steps = 2;
+  cfg.rows = 5;
+  cfg.top_k = 6;
+  cfg.prepublish = true;
+  const StreamReport r = s.run(cfg);
+  print_report("two pre-published steps, design chain, lead 16 MB", r, 3);
+  print_layers(r);
+  require(r.status == kStepOk, "the kernel ended on " + r.status_text);
+  require(r.verdicts.size() == 2 && r.verdicts[1].status == kVerdictOk, "two steps ran");
+}
+
 DGPP_TEST(step_consumers_rate_at_the_design_chain) {
   // Two samples a form, the better one gated: one clean run's band is about 1.5 points on the
   // median, and one run in four lands an outlier (a late fold in one layer, 2026-11-01).
@@ -1018,16 +1037,17 @@ DGPP_TEST(step_consumers_rate_at_the_design_chain) {
   // reading L2 at about 10 GB/s a block under the stream (docs/step_engine.md,
   // "The projection chain"). The plan's 95 is the goal, section 1.4 the account.
   // 2026-11-01, the token path: the head's pools in the step (the embedding gather, the head's
-  // input, the lm head over its companion, the pick) and the per-pool counters reset over the pool
-  // table (a pool past the phase count kept its count from the second step on, and its gated
-  // classes opened at once: the earlier figures from the third step were taken with the last
-  // layer's gates open early). Same window: this kernel tile-major 72.2 to 73.0, row-major 65.2
-  // to 67.4; the head 248 MB at 60 to 73 percent of the ceiling as its own line. The head body's
-  // presence costs the expert stream about three points through a codegen effect that is neither
-  // code size nor the stack frame (docs/step_engine.md, the token path): the first lever of the
-  // next round, the gates meanwhile at the measured level less the noise.
-  require(tile >= 70.0, "the tile-major consumers' layers stream under 70 percent of the ceiling");
-  require(row >= 65.0, "the row-major consumers' layers stream under 65 percent of the ceiling");
+  // input, the lm head over its companion as the step's bf16-row consumer, the pick) and the
+  // per-pool counters reset over the pool table (a pool past the phase count kept its count from
+  // the second step on, and its gated classes opened at once: the figures read from the third
+  // step before had the last layer's gates open early). Same window, interleaved with the
+  // committed kernel plus that fix: tile-major 75.9 to 76.4, row-major 70.1 to 70.4, the head's
+  // 248 MB at 76 to 77 percent of the ceiling as its own line. (The production tensor-core body
+  // as the head unit cost the expert stream three points whether it ran or not: the hot loop
+  // spilled around the call to a callee needing the kernel's whole register budget;
+  // docs/step_engine.md, the token path.)
+  require(tile >= 72.0, "the tile-major consumers' layers stream under 72 percent of the ceiling");
+  require(row >= 68.0, "the row-major consumers' layers stream under 68 percent of the ceiling");
 }
 
 // Which consumers cost the layer its share of the floor: the step with the
@@ -1188,11 +1208,13 @@ DGPP_TEST(step_consumers_rate_unwired) {
   const double a = consumers_rate_mask(kConsumeAll & ~kConsumeChain, "every consumer, the chain unwired:");
   const double b = consumers_rate_mask(kConsumeAll & ~kConsumeChain, "every consumer, the chain unwired:");
   // The binary's canary: this data flow read 77.9 to 79.1 on 2026-11-01 (the committed tree's
-  // binary 79.0 to 79.9 in the same window); a drop here is the kernel, not the chain. With the
-  // head body in the kernel (the token path, 2026-11-01) it reads 75.5 to 76.1 against 78.2 to
-  // 79.5 for the kernel without it in the same window, interleaved: the codegen effect recorded
-  // in docs/step_engine.md; the gate follows it until the effect is understood.
-  require(std::max(a, b) >= 74.0, "the unwired data flow streams under 74 percent of the ceiling: the kernel regressed");
+  // binary 79.0 to 79.9 in the same window); a drop here is the kernel, not the chain. It caught
+  // the production tensor-core body as the head unit (75.5 to 76.1 against 78.2 to 79.5 for the
+  // kernel without it, interleaved, 2026-11-01): a callee needing the kernel's whole register
+  // budget made the hot loop spill around the call. With the bf16-row consumer in its place the
+  // two kernels read alike (78.4 to 78.5 against 78.4 to 78.9). Compare any new unit body here
+  // against the previous commit's binary in one window before trusting the rate.
+  require(std::max(a, b) >= 76.0, "the unwired data flow streams under 76 percent of the ceiling: the kernel regressed");
 }
 
 // The chain's projections unit by unit (2026-11-01): for each of layer 3's wq_a, wq_b, wo_a and
@@ -1794,21 +1816,33 @@ DGPP_TEST(step_token_path_matches_the_production_kernels) {
     DGPP_CUDA_OK(cudaMemcpy(h_exp.data(), h_ref, hn * 2, cudaMemcpyDeviceToHost));
     size_t h_bad = 0;
     for (size_t i = 0; i < hn; ++i) h_bad += h_got[i] != h_exp[i];
-    // The head over the step's own input rows: the production bf12 decode form.
+    // The head over the step's own input rows: the production bf12 GEMV launch (eight rows at most
+    // a launch: the step's rows in groups), bitwise; the tensor-core form beside it for the record
+    // (its chain rounds differently: the deviation is printed, not gated).
     Bf12Matrix w;
     w.packed = G.params.packed; w.rows = G.params.rows; w.esc = G.params.esc; w.raw = G.params.raw; w.n = n; w.k = H;
-    require(mma_gemv_bf12_accepts(w, rows), "the production bf12 form takes the head at these rows");
+    require(bf12_gemv_accepts(w, std::min(rows, kBf12MaxRows)), "the production bf12 GEMV takes the head");
     const size_t ln = static_cast<size_t>(rows) * n;
-    float* logits_ref = nullptr;
+    float *logits_ref = nullptr, *logits_mma = nullptr;
     DGPP_CUDA_OK(cudaMalloc(&logits_ref, ln * 4));
-    require(launch_mma_gemv_bf12_f32(s.proj() + head_in->out_offset, static_cast<size_t>(H), w, logits_ref, rows, n, H, static_cast<size_t>(n), nullptr),
-            "the production bf12 form launched");
+    DGPP_CUDA_OK(cudaMalloc(&logits_mma, ln * 4));
+    for (int r0 = 0; r0 < rows; r0 += kBf12MaxRows)
+      launch_bf12_gemv(s.proj() + head_in->out_offset + static_cast<size_t>(r0) * H, static_cast<size_t>(H), w, logits_ref + static_cast<size_t>(r0) * n,
+                       /*out_f32=*/true, std::min(kBf12MaxRows, rows - r0), nullptr);
+    const bool mma_ok = mma_gemv_bf12_accepts(w, rows) &&
+                        launch_mma_gemv_bf12_f32(s.proj() + head_in->out_offset, static_cast<size_t>(H), w, logits_mma, rows, n, H, static_cast<size_t>(n), nullptr);
     DGPP_CUDA_OK(cudaDeviceSynchronize());
-    std::vector<float> l_got(ln), l_exp(ln);
+    std::vector<float> l_got(ln), l_exp(ln), l_mma(ln);
     DGPP_CUDA_OK(cudaMemcpy(l_got.data(), s.logits_out(), ln * 4, cudaMemcpyDeviceToHost));
     DGPP_CUDA_OK(cudaMemcpy(l_exp.data(), logits_ref, ln * 4, cudaMemcpyDeviceToHost));
-    size_t l_bad = 0;
-    for (size_t i = 0; i < ln; ++i) l_bad += std::memcmp(&l_got[i], &l_exp[i], 4) != 0;
+    if (mma_ok) DGPP_CUDA_OK(cudaMemcpy(l_mma.data(), logits_mma, ln * 4, cudaMemcpyDeviceToHost));
+    size_t l_bad = 0, mma_differ = 0;
+    double mma_max = 0.0;
+    for (size_t i = 0; i < ln; ++i) {
+      l_bad += std::memcmp(&l_got[i], &l_exp[i], 4) != 0;
+      if (mma_ok) { mma_differ += std::memcmp(&l_got[i], &l_mma[i], 4) != 0; mma_max = std::max(mma_max, static_cast<double>(std::fabs(l_got[i] - l_mma[i]))); }
+    }
+    cudaFree(logits_mma);
     // The pick over the step's own logits: the production local pick.
     uint64_t* carry = nullptr;
     uint16_t* table = nullptr;
@@ -1835,9 +1869,9 @@ DGPP_TEST(step_token_path_matches_the_production_kernels) {
     size_t again_bad = 0;
     for (size_t k = 0; k < 2; ++k)
       for (int t = 0; t < rows; ++t) again_bad += r.verdicts[k].tokens[t] != r2.verdicts[k].tokens[t];
-    std::printf("   token path, %d layers, %d rows, head [%d x %d]: feed %zu wrong, embedding %zu of %zu differ, head input %zu of %zu, logits %zu of %zu, "
-                "pick %zu wrong, repeat %zu differ; picks %d %d %d %d %d then %d %d %d %d %d\n",
-                layers, rows, n, H, feed_bad, embed_bad, layers == 0 ? static_cast<size_t>(rows) * 4 * H : 0, h_bad, hn, l_bad, ln, pick_bad, again_bad,
+    std::printf("   token path, %d layers, %d rows, head [%d x %d]: feed %zu wrong, embedding %zu of %zu differ, head input %zu of %zu, logits %zu of %zu "
+                "(the tensor-core form %zu differ, at most %.3g), pick %zu wrong, repeat %zu differ; picks %d %d %d %d %d then %d %d %d %d %d\n",
+                layers, rows, n, H, feed_bad, embed_bad, layers == 0 ? static_cast<size_t>(rows) * 4 * H : 0, h_bad, hn, l_bad, ln, mma_differ, mma_max, pick_bad, again_bad,
                 r.verdicts[0].tokens[0], r.verdicts[0].tokens[1], r.verdicts[0].tokens[2], r.verdicts[0].tokens[3], r.verdicts[0].tokens[4],
                 r.verdicts[1].tokens[0], r.verdicts[1].tokens[1], r.verdicts[1].tokens[2], r.verdicts[1].tokens[3], r.verdicts[1].tokens[4]);
     for (void* ptr : {static_cast<void*>(collapsed), static_cast<void*>(h_ref), static_cast<void*>(logits_ref), static_cast<void*>(carry), static_cast<void*>(table),
@@ -1846,7 +1880,7 @@ DGPP_TEST(step_token_path_matches_the_production_kernels) {
     require(feed_bad == 0, "the picks did not feed the next step");
     require(embed_bad == 0, "the embedding differs from the production gather");
     require(h_bad == 0, "the head's input differs from the production collapse and norm");
-    require(l_bad == 0, "the logits differ from the production bf12 form");
+    require(l_bad == 0, "the logits differ from the production bf12 GEMV");
     require(pick_bad == 0, "the pick differs from the production local pick");
     require(again_bad == 0, "the picks are not bitwise across streamers");
   }
