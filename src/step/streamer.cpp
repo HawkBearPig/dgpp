@@ -77,12 +77,17 @@ Streamer::Streamer(const DevicePlan& dp, const std::vector<const uint8_t*>& base
     if (pool.kind == kPoolAttention) {
       attention_ = true;
       attn_local_heads_ = pool.unit_rows;
+      if (pool.in_src == 0) attn_needs_q_ = true;
       if (pool.site < kStepAttnSources) { attn_n_split_[pool.site] = std::max(attn_n_split_[pool.site], pool.rows); attn_group_[pool.site] = pool.slabs; }
+      continue;
+    }
+    if (pool.kind == kPoolRowTail) {
+      if (pool.rope_heads || pool.append) tails_ = true;
       continue;
     }
     if (pool_is_gate_up(pool.kind) && pool.kind != kPoolFp8GateUp) { hidden_ = pool.k; inter_ = pool.rows; mxfp4 = true; }
     else if (pool.kind == kPoolFp8GateUp) { if (!hidden_) hidden_ = pool.k; if (!inter_) inter_ = pool.rows; fp8 = true; }
-    else if (pool.kind == kPoolFp8Matrix || pool.kind == kPoolFp8Down) fp8 = true;
+    else if (pool.kind == kPoolFp8Matrix || pool.kind == kPoolFp8Down) { fp8 = true; if (pool.rope_heads) tails_ = true; }
     else if (pool.kind == kPoolRouter) { fp8 = true; n_experts_ = pool.rows; if (!step_stream_has_router(pool.k)) throw std::invalid_argument("Streamer: the kernel has no router unit for width " + std::to_string(pool.k)); }
   }
   if (consumers_) {
@@ -122,6 +127,10 @@ Streamer::Streamer(const DevicePlan& dp, const std::vector<const uint8_t*>& base
       DGPP_CUDA_OK(cudaMalloc(&attn_o_, static_cast<size_t>(kStepMaxRows) * attn_local_heads_ * kAttnLatent * 2));
       DGPP_CUDA_OK(cudaMemset(attn_o_, 0, static_cast<size_t>(kStepMaxRows) * attn_local_heads_ * kAttnLatent * 2));
     }
+    if (attention_ || tails_) {
+      DGPP_CUDA_OK(cudaMalloc(&attn_slots_, static_cast<size_t>(kStepMaxRows) * sizeof(int64_t)));
+      DGPP_CUDA_OK(cudaMemset(attn_slots_, 0xff, static_cast<size_t>(kStepMaxRows) * sizeof(int64_t)));
+    }
     if (!hidden_ && mhc_hidden) hidden_ = mhc_hidden;  // the sites' streams are four rows of hidden
     if (!hidden_) hidden_ = dp.max_k;  // projections only: the activations' width is the widest inner width
     if (!inter_) inter_ = 1;
@@ -135,8 +144,8 @@ Streamer::Streamer(const DevicePlan& dp, const std::vector<const uint8_t*>& base
       DGPP_CUDA_OK(cudaMalloc(&biased_, static_cast<size_t>(kStepMaxRows) * n_experts_ * 4));
       DGPP_CUDA_OK(cudaMemset(scores_, 0, static_cast<size_t>(kStepMaxRows) * n_experts_ * 4));
       DGPP_CUDA_OK(cudaMemset(biased_, 0, static_cast<size_t>(kStepMaxRows) * n_experts_ * 4));
-      DGPP_CUDA_OK(cudaMalloc(&unit_trace_, static_cast<size_t>(2 * kStepMaxWorkers) * 8 * 8));  // a worker's last router unit, then its last site unit
-      DGPP_CUDA_OK(cudaMemset(unit_trace_, 0, static_cast<size_t>(2 * kStepMaxWorkers) * 8 * 8));
+      DGPP_CUDA_OK(cudaMalloc(&unit_trace_, static_cast<size_t>(3 * kStepMaxWorkers) * 8 * 8));  // a worker's last router unit, its last site unit, the traced pool's units
+      DGPP_CUDA_OK(cudaMemset(unit_trace_, 0, static_cast<size_t>(3 * kStepMaxWorkers) * 8 * 8));
       DGPP_CUDA_OK(cudaMalloc(&cand_id_, static_cast<size_t>(kStepMaxRows) * n_experts_ * 4));
       DGPP_CUDA_OK(cudaMalloc(&cand_score_, static_cast<size_t>(kStepMaxRows) * n_experts_ * 4));
       DGPP_CUDA_OK(cudaMalloc(&cand_biased_, static_cast<size_t>(kStepMaxRows) * n_experts_ * 4));
@@ -198,6 +207,7 @@ Streamer::~Streamer() {
     if (attn_tickets_[i]) cudaFree(attn_tickets_[i]);
   }
   if (attn_o_) cudaFree(attn_o_);
+  if (attn_slots_) cudaFree(attn_slots_);
   if (cand_id_) cudaFree(cand_id_);
   if (cand_score_) cudaFree(cand_score_);
   if (cand_biased_) cudaFree(cand_biased_);
@@ -258,6 +268,8 @@ StreamReport Streamer::run(const StreamerConfig& cfg) {
   p.scores = scores_;
   p.biased = biased_;
   p.unit_trace = unit_trace_;
+  p.trace_pool = cfg.trace_pool;
+  if (unit_trace_) DGPP_CUDA_OK(cudaMemsetAsync(unit_trace_, 0, static_cast<size_t>(3 * kStepMaxWorkers) * 8 * 8, stream_));  // a run's own traces
   p.cand_id = cand_id_;
   p.cand_score = cand_score_;
   p.cand_biased = cand_biased_;
@@ -297,9 +309,10 @@ StreamReport Streamer::run(const StreamerConfig& cfg) {
     p.fold.table = fold_table_dev_;
     p.fold.deadline_cycles = bus_->collective_deadline_cycles();
   }
-  if (attention_) {
-    if (attn_in_.q == nullptr || attn_in_.req_ids == nullptr || attn_in_.pos == nullptr || attn_in_.ring == nullptr || attn_in_.inv_freq == nullptr)
-      throw std::invalid_argument("Streamer: the attention consumer needs its inputs (set_attention) before a run");
+  if (attention_ || tails_) {
+    if ((attn_needs_q_ && attn_in_.q == nullptr) || attn_in_.req_ids == nullptr || attn_in_.pos == nullptr || attn_in_.ring == nullptr ||
+        attn_in_.inv_freq == nullptr)
+      throw std::invalid_argument("Streamer: the attention consumer and the row tails need their inputs (set_attention) before a run");
     p.attn = attn_in_;
     p.attn.local_heads = attn_local_heads_;
     for (int i = 0; i < kStepAttnSources; ++i) {
@@ -308,7 +321,9 @@ StreamReport Streamer::run(const StreamerConfig& cfg) {
       p.attn.tickets[i] = attn_tickets_[i];
     }
     p.attn.o = attn_o_;
+    p.attn.slots = attn_slots_;
   }
+  p.norm_eps = cfg.norm_eps;
   p.hc_eps = cfg.hc_eps;
   p.sinkhorn_iters = cfg.sinkhorn_iters;
   p.mhc_norm_eps = cfg.mhc_norm_eps;
@@ -517,13 +532,18 @@ StreamReport Streamer::run(const StreamerConfig& cfg) {
                 const unsigned groups = gp.group_kind == kGroupRouted ? static_cast<unsigned>(ctl_->run_count[il]) : 1u;
                 const unsigned attn_blocks = (rows * static_cast<unsigned>(attn_local_heads_) + 31u) / 32u;
                 const unsigned per_group = gp.kind == kPoolMhc         ? static_cast<unsigned>(gp.units_per_group) * rows
+                                           : gp.kind == kPoolRowTail   ? rows
                                            : gp.kind == kPoolAttention ? static_cast<unsigned>(gp.units_per_group) * attn_blocks
                                                                        : static_cast<unsigned>(gp.units_per_group);
                 if (groups * per_group != 0u) add(ip, 0, iph.pools[i], groups * per_group);
-                if (gp.kind == kPoolFp8Matrix && gp.slabs > 1) add(ip, 1, iph.pools[i], (static_cast<unsigned>(gp.rows) * rows + kStepAccChunk - 1) / kStepAccChunk);
+                if (gp.kind == kPoolFp8Matrix && gp.slabs > 1 && !gp.reduce_by_tail) add(ip, 1, iph.pools[i], (static_cast<unsigned>(gp.rows) * rows + kStepAccChunk - 1) / kStepAccChunk);
                 if (gp.kind == kPoolAttention && gp.gate_arg) add(ip, 1, iph.pools[i], rows * static_cast<unsigned>(attn_local_heads_));
               }
             if (iph.fixed_units) add(ip, 2, -1, iph.fixed_units);
+            for (int i = 0; i < iph.n_pools; ++i) {
+              const DevPool& gp = dp_.pools[static_cast<size_t>(iph.pools[i])];
+              if (gp.gate_kind == kGatePool && gp.stage_units) add(ip, 4, iph.pools[i], gp.stage_units);  // a gated pool's staging
+            }
           }
           if (ip > P && iph.lead_units > iph.fixed_units) add(ip, 4, -1, iph.lead_units - iph.fixed_units);  // the staging class
           if (ip == P && fold_world_ > 1 && iph.fold_index >= 0 && iph.fold_trigger != kTriggerEnd) {

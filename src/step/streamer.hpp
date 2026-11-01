@@ -43,9 +43,11 @@ struct StreamerConfig {
   float hc_eps = 1e-6f;
   int sinkhorn_iters = 20;
   float mhc_norm_eps = 1e-6f;
+  float norm_eps = 1e-6f;        // the row tails' RMSNorm epsilon (the family's rms_norm_eps)
   uint64_t first_seq = 0;        // the first step's sequence number; steps count up from it
   uint64_t epoch = 0;            // echoed by every verdict
   int skip_at_step = -1;         // publish skip instead of this step (-1: never)
+  int trace_pool = -1;           // the pool whose compute units the workers time (Streamer::unit_trace bank 2), -1 none
   double gather_delay_us = 0;    // > 0: the host publishes the gather sequence this long after each descriptor
   std::vector<int32_t> tokens;   // the first step's tokens (empty: zeros); later steps read the device feed
   std::function<void(int step)> between_steps;  // host work done while the kernel waits for step `step`
@@ -202,6 +204,8 @@ class Streamer {
   unsigned consumer_smem_ = 0;
   bool mhc_ = false;
   bool attention_ = false;
+  bool attn_needs_q_ = false;  // an attention pool reads the provided queries (none from the chain's q rotation)
+  bool tails_ = false;         // row-tail pools that rotate or append: they need the attention inputs (positions, tables, the ring)
   StepAttnParams attn_in_;
   net::CollectiveBus* bus_ = nullptr;
   int fold_world_ = 1;
@@ -219,6 +223,7 @@ class Streamer {
   float* attn_cg_[kStepAttnSources] = {nullptr, nullptr};
   int32_t* attn_tickets_[kStepAttnSources] = {nullptr, nullptr};
   uint16_t* attn_o_ = nullptr;
+  int64_t* attn_slots_ = nullptr;  // [kStepMaxRows]: the rows' ring slots, written by the kv row tail
   uint16_t* streams_[2] = {nullptr, nullptr};
   float* pre_[2] = {nullptr, nullptr};
   float* post_ = nullptr;

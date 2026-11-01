@@ -4,8 +4,10 @@
 #include "kernels/step/fp8_dense.cuh"
 #include "kernels/step/mhc.cuh"
 #include "kernels/csa2_attn_finish.cuh"
+#include "kernels/csa2_norm.cuh"
 #include "kernels/dsa.hpp"
 #include "kernels/dsa_attn_flash.cuh"
+#include "kernels/dsa_latent_append.cuh"
 #include "net/bus_write.cuh"
 #include "kernels/step/mxfp4_expert.cuh"
 #include "kernels/step/mxfp4_row.cuh"
@@ -93,13 +95,15 @@ __device__ __forceinline__ void spin_us(float us) {
 // A pool's compute units a group this step: the plan's, or the split form's for a small group.
 // The attention's (row, head) blocks of a step: 32 M-rows each (kernels/dsa_attn_flash.cuh dense::kM).
 static_assert(dgpp::dsa_flash::dense::kM == 32 && dgpp::dsa_flash::dense::kThreads == kStepThreads, "the flash body's block is the step kernel's");
-static_assert(kAttnGroup == kAttnSplitGroup && kAttnLatent == kCsa2Latent, "the attention pools' geometry is the production kernels'");
+static_assert(kAttnGroup == kAttnSplitGroup && kAttnLatent == kCsa2Latent && kAttnRope == kCsa2Rope && kAttnIndexDim == kCsa2IndexDim,
+              "the attention pools' geometry is the production kernels'");
 __device__ __forceinline__ unsigned attn_blocks(const StepStreamParams& p) {
   return (p.ctl->rows * static_cast<unsigned>(p.attn.local_heads) + 31u) / 32u;
 }
 __device__ __forceinline__ unsigned compute_units_per_group(const StepStreamParams& p, const DevPool& pool) {
   if (projection_split(p, pool)) return (static_cast<unsigned>(pool.rows) + kSplitUnitRows - 1) / kSplitUnitRows;
   if (pool.kind == kPoolMhc) return static_cast<unsigned>(pool.units_per_group) * p.ctl->rows;  // a token's units for every token
+  if (pool.kind == kPoolRowTail) return p.ctl->rows;  // a row a unit
   if (pool.kind == kPoolAttention) return static_cast<unsigned>(pool.rows) * attn_blocks(p);  // a split of every (row, head) block
   return static_cast<unsigned>(pool.units_per_group);
 }
@@ -111,7 +115,7 @@ __device__ __forceinline__ unsigned compute_units_per_group(const StepStreamPara
 // reduce became the phase's tail.
 __device__ __forceinline__ unsigned reduce_units(const StepStreamParams& p, const DevPool& pool) {
   if (pool.kind == kPoolAttention) return pool.gate_arg ? p.ctl->rows * static_cast<unsigned>(p.attn.local_heads) : 0u;  // the finish: one (row, head) a unit
-  if (pool.kind != kPoolFp8Matrix || pool.slabs <= 1 || projection_split(p, pool)) return 0;
+  if (pool.kind != kPoolFp8Matrix || pool.slabs <= 1 || projection_split(p, pool) || pool.reduce_by_tail) return 0;
   return (static_cast<unsigned>(pool.rows) * static_cast<unsigned>(p.ctl->rows) + kStepAccChunk - 1) / kStepAccChunk;
 }
 __device__ __forceinline__ unsigned pool_units(const StepStreamParams& p, int layer, const DevPool& pool) {
@@ -155,12 +159,35 @@ __device__ __forceinline__ unsigned own_units(const StepStreamParams& p, int lay
   const unsigned fold = 2u * fold_units(p, P);  // the stage class and the fold class of the group's fold
   if (ph.accumulate) return accumulate_units(p) + fold;
   unsigned n = ph.fixed_units + fold;
-  for (int i = 0; i < ph.n_pools; ++i) n += pool_units(p, layer, p.pools[ph.pools[i]]);
+  for (int i = 0; i < ph.n_pools; ++i) {
+    const DevPool& pool = p.pools[ph.pools[i]];
+    n += pool_units(p, layer, pool);
+    if (pool.gate_kind == kGatePool) n += pool.stage_units;  // its staging class (closed early, its rest is credited as done)
+  }
   return n;
 }
 __device__ __forceinline__ unsigned pool_compute_units(const StepStreamParams& p, int layer, const DevPool& pool) {
   const unsigned groups = pool.group_kind == kGroupRouted ? static_cast<unsigned>(p.ctl->run_count[layer]) : 1u;
   return groups * compute_units_per_group(p, pool);
+}
+// A pool's y complete this step: its compute units, and its reduce units when it is slabbed (they
+// sum the slabs into y). The gate of the classes that read it (kGatePool).
+__device__ __forceinline__ bool pool_complete(const StepStreamParams& p, int layer, int pool_id) {
+  const DevPool& q = p.pools[pool_id];
+  if (q.kind == kPoolFp8Matrix && q.slabs > 1 && !projection_split(p, q) && !q.reduce_by_tail)
+    return ld_acq(&p.ctl->reduce_done[layer][pool_id]) >= reduce_units(p, q);
+  return ld_acq(&p.ctl->pool_done[layer][pool_id]) >= pool_compute_units(p, layer, q);
+}
+// A kGatePool class's gate: the pool whose y it reads is complete, and its other gate.
+__device__ __forceinline__ bool pool_gate_open(const StepStreamParams& p, int layer, const DevPool& q) {
+  return pool_complete(p, layer, q.in_pool) && (q.gate_pool < 0 || pool_complete(p, layer, q.gate_pool));
+}
+// A block-diagonal projection's head group of unit rb (device_plan.hpp in_group_rows): the
+// group whose columns the unit's rows read, and the key of its staged activations.
+__device__ __forceinline__ int projection_diag_group(const StepStreamParams& p, const DevPool& pool, int rb) {
+  const bool split = projection_split(p, pool);
+  const int block = split ? rb : rb / pool.slabs;
+  return (block * (split ? kSplitUnitRows : pool.unit_rows)) / pool.in_group_rows;
 }
 // The published group's unit classes, built once by the chain into the control block before the
 // group is published and read by each worker in one round trip (built by every worker from the
@@ -181,6 +208,12 @@ __device__ void build_class_table(const StepStreamParams& p, int P) {
   StepCtl* ctl = p.ctl;
   const unsigned rows = ctl->rows;
   unsigned n = 0;
+  // The gated pools' staging classes, gathered while the pools are walked once (a second walk of
+  // the pool records cost the chain about 9 µs a group under the stream, 2026-11-01) and emitted
+  // behind the phase's own classes.
+  __shared__ int sm_stage_pool[kMaxPhasePools];
+  __shared__ unsigned sm_stage_units[kMaxPhasePools], sm_stage_base[kMaxPhasePools];
+  int n_stage = 0;
   // w = 1: the count is a group's units, the worker multiplies by the layer's run count when it
   // loads the table, so the table is built once before the select and never waits on it.
   auto put = [&](unsigned count, unsigned grab, uint8_t kind, int phase, int pool, uint8_t gate_kind, uint8_t gate_arg, unsigned per_run) {
@@ -208,12 +241,25 @@ __device__ void build_class_table(const StepStreamParams& p, int P) {
           if (per_group)
             put(per_group, gp.kind == kPoolBytes ? 1u : (projection_split(p, gp) ? 4u : static_cast<unsigned>(gp.grab)), kClassCompute, ip, iph.pools[i],
                 gp.gate_kind, gp.gate_arg, routed ? 1u : 0u);
+          if (gp.gate_kind == kGatePool && gp.stage_units && n_stage < kMaxPhasePools) {
+            sm_stage_pool[n_stage] = iph.pools[i];
+            sm_stage_units[n_stage] = gp.stage_units;
+            sm_stage_base[n_stage] = gp.stage_unit_begin;
+            ++n_stage;
+          }
           // Its reduce units, gated on its compute units: the update-carrying projection's y (and
           // the attention update) completes early in the group.
           const unsigned reduce = reduce_units(p, gp);
           if (reduce) put(reduce, 1u, kClassReduce, ip, iph.pools[i], gp.kind == kPoolAttention ? kGateAttnPools : kGateOwnPool, 0, 0u);
         }
       if (iph.fixed_units) put(iph.fixed_units, 1u, kClassFixed, ip, -1, kGateNone, 0, 0u);  // the shortest units, they fill the tail
+      // A gated pool's bytes staged into L2 while its gate is closed (the chain's dependent
+      // projections: wq_b behind the q norm, wo_b behind wo_a): the workers the producer's tail
+      // leaves idle stream them with the evict-last policy, so the pool's units read hot lines when
+      // the gate opens; the class closes when it does (its rest credited as done). Read by the
+      // pool's own units alone, wq_b's 10.5 MB took 46-57 µs behind the norm (2026-11-01).
+      for (int i = 0; i < n_stage; ++i) put(sm_stage_units[i], 1u, kClassStage, ip, sm_stage_pool[i], kGateNone, 0, sm_stage_base[i] << 8);
+      n_stage = 0;
     }
     // The group's fold on the bus (world > 1): the stage units open on the trigger (the partial
     // complete) and lay it out in the generation's staging row; the fold units open when every
@@ -239,7 +285,7 @@ __device__ void build_class_table(const StepStreamParams& p, int P) {
       // Gated on the fold's trigger when the group has one; a group without (the expert pair)
       // stages at once, while its first phase streams.
       const uint8_t gate = p.phases[P].fold_trigger != kTriggerEnd ? kGateTrigger : kGateNone;
-      put(iph.lead_units - iph.fixed_units, 1u, kClassStage, ip, -1, gate, 0, 0u);
+      put(iph.lead_units - iph.fixed_units, 1u, kClassStage, ip, -1, gate, 0, static_cast<unsigned>(iph.fixed_units) << 8);
     }
   }
   (void)rows;
@@ -564,7 +610,7 @@ __device__ __forceinline__ bool attn_pools_done(const StepStreamParams& p, int l
 // all at world 1, and inlined they took the kernel's stack from 48 to 176 bytes and the rate band
 // down about a point on the paths that never reach them; the expert units' hot loops stay inlined
 // (out of line they lost 2.5 points, consumer_unit above).
-__device__ __noinline__ void attention_unit(const StepStreamParams& p, int layer, const DevPool& pool, int rb, uint8_t* smem) {
+__device__ __forceinline__ void attention_unit(const StepStreamParams& p, int layer, const DevPool& pool, int rb, uint8_t* smem, const uint16_t* q) {
   const StepAttnParams& a = p.attn;
   const int rows = static_cast<int>(p.ctl->rows);
   const int blocks = static_cast<int>(attn_blocks(p));
@@ -584,13 +630,13 @@ __device__ __noinline__ void attention_unit(const StepStreamParams& p, int layer
     block_tokens = a.epb ? a.epb[layer] : 0; tables = a.block_tables; bpr = a.blocks_per_request; total = a.blocks_total;
     list = a.topk; stride = a.index_topk; counts = a.counts;
   }
-  if (latent == nullptr || a.q == nullptr || list == nullptr || counts == nullptr || block_tokens <= 0) {
+  if (latent == nullptr || q == nullptr || list == nullptr || counts == nullptr || block_tokens <= 0) {
     if (threadIdx.x == 0) atomicCAS(&p.ctl->status, kStepOk, kStepBadUnit);
     return;
   }
   const bool grouped = pool.slabs == kAttnSplitGroup;
 #define DGPP_STEP_ATTN_ARGS                                                                                                   \
-  bx, s, smem, a.q, latent, nullptr, a.req_ids, a.pos, list, stride, counts, rows, n_split, a.local_heads, block_tokens, tables, \
+  bx, s, smem, q, latent, nullptr, a.req_ids, a.pos, list, stride, counts, rows, n_split, a.local_heads, block_tokens, tables, \
       bpr, total, a.scale, a.m[src], a.l[src], a.c[src], a.tickets[src], a.mg[src], a.lg[src], a.cg[src]
   // The step's form of the body (kernels/dsa_attn_flash.cuh): a tile's rows fetched in one pass,
   // four fold outputs a thread, the ring's identity table resolved without the table load; the
@@ -878,6 +924,90 @@ __device__ void route_select(const StepStreamParams& p, int layer, int* keys, ui
 // loops paying the call frames and the ABI's register reservation; the router class in the kernel
 // was unchanged, so its inflation over the standalone probe (13 µs a wave with the candidate scan)
 // is the stream's contention and the hand-out's stagger, not register pressure.
+// A row tail (kPoolRowTail): row `row` of its source pool's y through the bodies the production
+// decode walk runs one block a row (kernels/csa2_norm.cuh rmsnorm_row and rope_row,
+// dsa_latent_append.cuh): the norm with the pool's weight, the rotation of its heads at the row's
+// position, and for the kv row its slot list and fp8-block append into the window ring. The
+// result goes to this pool's own y (the production writes in place; here each stage's output
+// stays for the checks, and the pools behind read this pool's y).
+__device__ __forceinline__ void row_tail_unit(const StepStreamParams& p, int layer, const DevPool& pool, const uint8_t* base, int row, uint8_t* smem) {
+  const DevPool& sp = p.pools[pool.in_pool];
+  const uint16_t* in = p.proj + sp.out_offset + static_cast<size_t>(row) * sp.rows;
+  uint16_t* out = p.proj + pool.out_offset + static_cast<size_t>(row) * pool.rows;
+  const StepAttnParams& a = p.attn;
+  const bool rope = pool.rope_heads > 0;
+  if (((rope || pool.append) && a.pos == nullptr) || (rope && (a.inv_freq == nullptr || a.inv_freq[layer] == nullptr)) ||
+      (pool.append && (a.ring == nullptr || a.slots == nullptr || a.wlist == nullptr || a.wcounts == nullptr || a.ring_table == nullptr ||
+                       a.req_ids == nullptr || a.ring_slots <= 0 || a.window <= 0))) {
+    if (threadIdx.x == 0) atomicCAS(&p.ctl->status, kStepOk, kStepBadUnit);
+    return;
+  }
+  if (sp.kind == kPoolFp8Matrix && sp.reduce_by_tail && sp.slabs > 1 && !projection_split(p, sp)) {
+    // The source's slab partials summed in slab order (reduce_unit's) into its y, which the norm reads.
+    const float* __restrict__ part = p.proj_part + sp.part_offset + static_cast<size_t>(row) * sp.rows;
+    const size_t slab_stride = static_cast<size_t>(kStepMaxRows) * sp.rows;
+    uint16_t* sy = p.proj + sp.out_offset + static_cast<size_t>(row) * sp.rows;
+    for (int i = threadIdx.x; i < sp.rows; i += kStepThreads) {
+      float a = 0.f;
+      for (int sl = 0; sl < sp.slabs; ++sl) a += part[static_cast<size_t>(sl) * slab_stride + i];
+      sy[i] = f32_to_bf16(a);
+    }
+    __syncthreads();
+  }
+  if (pool.k > 0) csa2_norm::rmsnorm_row(in, reinterpret_cast<const uint16_t*>(base + pool.offsets[0]), out, pool.k, p.norm_eps, reinterpret_cast<float*>(smem));
+  else
+    for (int i = threadIdx.x; i < pool.rows; i += kStepThreads) out[i] = in[i];
+  if (rope) {
+    __syncthreads();  // the row is written before its rotation
+    csa2_norm::rope_row(out, out, pool.rope_heads, pool.rope_head_stride, pool.rope_off, kAttnRope / 2, a.pos[row], a.inv_freq[layer]);
+  }
+  if (pool.append) {
+    dsa_tail::decode_tail_slots(row, a.pos[row], a.slots, a.ring_slots, a.window, a.wlist, a.wcounts, nullptr, 0);
+    __syncthreads();  // the rotated row and its slot are written for the append
+    dsa_tail::latent_append_fp8block_row(p.proj + pool.out_offset, a.req_ids, a.slots, a.ring_table, 1, a.ring_slots,
+                                         a.ring + static_cast<unsigned long long>(layer) * a.ring_layer_bytes, kAttnLatent,
+                                         latent_row_bytes(LatentFormat::kFp8Block, kAttnLatent), nullptr, 0, row);
+  }
+}
+
+// A q projection unit's epilogue: the rows' heads rotated over the unit's own output block (the
+// decode tail's q rope; the lowering gives the pool one slab, so the block's y is final once every
+// warp has written it). Out of line: the production pair math's cosf and sinf keep a local array
+// for their range reduction, which inlined grew the kernel's frame (160 to 192 bytes, 2026-11-01).
+__device__ __forceinline__ void projection_epilogue_rope(const StepStreamParams& p, int layer, const DevPool& pool, int rows, int block, bool split) {
+  if (p.attn.pos == nullptr || p.attn.inv_freq == nullptr || p.attn.inv_freq[layer] == nullptr) {
+    if (threadIdx.x == 0) atomicCAS(&p.ctl->status, kStepOk, kStepBadUnit);
+    return;
+  }
+  __syncthreads();
+  const int unit_rows = split ? kSplitUnitRows : pool.unit_rows;
+  const int n0 = block * unit_rows, n1 = min(n0 + unit_rows, pool.rows);
+  csa2_norm::rope_block(p.proj + pool.out_offset, pool.rows, rows, n0, n1, pool.rope_head_stride, pool.rope_off, kAttnRope / 2, p.attn.pos, p.attn.inv_freq[layer]);
+}
+
+// The latency units and the q projections' epilogue behind one call: out of line, so their code
+// and the production bodies they run (the flash body, the site, the norms and rotation, the
+// append) stay out of the worker loop's register allocation, and through one call site, since
+// each out-of-line call site adds its own spill and restore code to the loop (three sites: 160 to
+// 192 bytes of frame and 42 to 60 local loads, 2026-11-01; the expert units pay for every spill).
+__device__ __noinline__ void out_of_line_unit(const StepStreamParams& p, int layer, const DevPool& pool, const uint8_t* base, int rb, uint8_t* smem,
+                                              bool epilogue) {
+  if (epilogue) {
+    projection_epilogue_rope(p, layer, pool, static_cast<int>(p.ctl->rows), projection_split(p, pool) ? rb : rb / pool.slabs, projection_split(p, pool));
+    return;
+  }
+  if (pool.kind == kPoolAttention) {
+    attention_unit(p, layer, pool, rb, smem, pool.in_src == 1 ? p.proj + p.pools[pool.in_pool].out_offset : p.attn.q);
+    return;
+  }
+  if (pool.kind == kPoolMhc) {
+    mhc_unit(p, layer, pool, base, rb, smem,
+             p.unit_trace ? p.unit_trace + (static_cast<size_t>(kStepMaxWorkers) + blockIdx.x % kStepMaxWorkers) * kMhcTraceWords : nullptr);
+    return;
+  }
+  row_tail_unit(p, layer, pool, base, rb, smem);
+}
+
 __device__ void consumer_unit(const StepStreamParams& p, int layer, const DevPool& pool, int g, int rb, uint8_t* smem, bool stage) {
   const bool routed = pool.group_kind == kGroupRouted;
   const int expert = routed ? p.ctl->run_list[layer][g] : 0;
@@ -897,13 +1027,8 @@ __device__ void consumer_unit(const StepStreamParams& p, int layer, const DevPoo
     grp.tokens = p.ctl->token_slots;
     grp.count = static_cast<int>(p.ctl->rows);
   }
-  if (pool.kind == kPoolAttention) {
-    attention_unit(p, layer, pool, rb, smem);
-    return;
-  }
-  if (pool.kind == kPoolMhc) {
-    mhc_unit(p, layer, pool, base, rb, smem,
-             p.unit_trace ? p.unit_trace + (static_cast<size_t>(kStepMaxWorkers) + blockIdx.x % kStepMaxWorkers) * kMhcTraceWords : nullptr);
+  if (pool.kind == kPoolAttention || pool.kind == kPoolRowTail || pool.kind == kPoolMhc) {
+    out_of_line_unit(p, layer, pool, base, rb, smem, false);
     return;
   }
   if (pool.kind == kPoolRouter) {
@@ -926,10 +1051,24 @@ __device__ void consumer_unit(const StepStreamParams& p, int layer, const DevPoo
     const int slab = split ? 0 : rb % pool.slabs, block = split ? rb : rb / pool.slabs;
     const int w0 = slab * per_slab, w1 = w0 + per_slab;
     float* partial = (!split && pool.slabs > 1) ? p.proj_part + pool.part_offset + static_cast<size_t>(slab) * kStepMaxRows * pool.rows : nullptr;
+    // The chain's activations (device_plan.hpp in_src): the step's x rows, a pool's y at its row
+    // width, or the attention's o; a block-diagonal matrix reads its head group's columns.
+    const uint16_t* xin = p.x;
+    if (pool.in_src == 1) {
+      const DevPool& sp = p.pools[pool.in_pool];
+      xin = p.proj + sp.out_offset;
+      grp.x_stride = sp.rows;
+    } else if (pool.in_src == 2) {
+      xin = p.attn.o;
+      grp.x_stride = p.attn.local_heads * kAttnLatent;
+    }
+    if (pool.in_group_rows) xin += static_cast<size_t>(projection_diag_group(p, pool, rb)) * pool.in_group_cols;
     if (!fp8_matrix_dispatch(pool.k, pool.rows, base + pool.offsets[0], reinterpret_cast<const float*>(base + pool.offsets[1]), grp, block,
-                             p.x, p.proj + pool.out_offset, partial, smem, w0, w1, pool.unit_rows, split, stage) &&
-        threadIdx.x == 0)
-      atomicCAS(&p.ctl->status, kStepOk, kStepBadUnit);
+                             xin, p.proj + pool.out_offset, partial, smem, w0, w1, pool.unit_rows, split, stage)) {
+      if (threadIdx.x == 0) atomicCAS(&p.ctl->status, kStepOk, kStepBadUnit);
+      return;
+    }
+    if (pool.rope_heads) out_of_line_unit(p, layer, pool, base, rb, smem, true);
     return;
   }
   if (pool.kind == kPoolFp8GateUp) {
@@ -1263,6 +1402,7 @@ __global__ void __launch_bounds__(kStepThreads, 1) step_stream_kernel(StepStream
   __shared__ unsigned sm_cls_count[kStepMaxClasses], sm_cls_grab[kStepMaxClasses];
   __shared__ int sm_cls_phase[kStepMaxClasses], sm_cls_pool[kStepMaxClasses];
   __shared__ uint8_t sm_cls_kind[kStepMaxClasses], sm_cls_gate[kStepMaxClasses], sm_cls_gate_arg[kStepMaxClasses];
+  __shared__ unsigned sm_cls_base[kStepMaxClasses];  // a staging class: its first lead unit in the phase's sequence
   if (threadIdx.x == 0) { sm_cache_word = ~0u; sm_word = ~0u; sm_look_blocked = 0; }
   for (int i = static_cast<int>(threadIdx.x); i < n_phases; i += kStepThreads) sm_lead_begin[i] = p.phases[i].lead_begin;
   __syncthreads();
@@ -1292,7 +1432,8 @@ __global__ void __launch_bounds__(kStepThreads, 1) step_stream_kernel(StepStream
 #pragma unroll
             for (int c = 0; c < kStepMaxClasses; ++c) {
               const int cphase = static_cast<int>(e[c].z & 0xffffu);
-              sm_cls_count[c] = e[c].w ? e[c].x * static_cast<unsigned>(ld_acq(reinterpret_cast<unsigned*>(&ctl->run_count[p.phases[cphase].layer]))) : e[c].x;
+              sm_cls_count[c] = (e[c].w & 0xffu) ? e[c].x * static_cast<unsigned>(ld_acq(reinterpret_cast<unsigned*>(&ctl->run_count[p.phases[cphase].layer]))) : e[c].x;
+              sm_cls_base[c] = e[c].w >> 8;
               sm_cls_grab[c] = e[c].y & 0xffu;
               sm_cls_kind[c] = static_cast<uint8_t>((e[c].y >> 8) & 0xffu);
               sm_cls_gate[c] = static_cast<uint8_t>((e[c].y >> 16) & 0xffu);
@@ -1319,10 +1460,22 @@ __global__ void __launch_bounds__(kStepThreads, 1) step_stream_kernel(StepStream
               else if (gk == kGateTrigger) open = fold_trigger_holds(p, cur_layer, P);  // the fold's window begins
               else if (gk == kGateAttnPools) open = attn_pools_done(p, il, sm_cls_phase[c]);  // every source's blocks: the finish
               else if (gk == kGateFoldStaged) open = ld_acq(&ctl->fold_staged[P]) >= fold_units(p, P);  // the fold's row staged
+              else if (gk == kGatePool) open = pool_gate_open(p, il, p.pools[sm_cls_pool[c]]);  // the chain: the pool whose y the class reads is complete (and its other gate)
               else open = ld_acq(&ctl->pool_done[il][sm_cls_pool[c]]) >= pool_compute_units(p, il, p.pools[sm_cls_pool[c]]);
               if (!open) { any_pending = true; continue; }
             }
             const unsigned count = sm_cls_count[c];
+            if (sm_cls_kind[c] == kClassStage && sm_cls_pool[c] >= 0) {
+              // A gated pool's staging: once its gate is open its own units read the bytes, so the
+              // class closes; the units never handed out are credited as done for the chain's count.
+              const int il = p.phases[sm_cls_phase[c]].layer;
+              if (pool_gate_open(p, il, p.pools[sm_cls_pool[c]])) {
+                const unsigned u = atomicAdd(&ctl->cls_next[P][c], count);
+                if (u < count) red_release(&ctl->done[P], count - u);
+                sm_cls_exhausted |= 1u << c;
+                continue;
+              }
+            }
             const unsigned at = ld_acq(&ctl->cls_next[P][c]);
             if (at >= count) {
               sm_cls_exhausted |= 1u << c;
@@ -1432,7 +1585,7 @@ __global__ void __launch_bounds__(kStepThreads, 1) step_stream_kernel(StepStream
         const uint8_t* ptr = nullptr;
         unsigned bytes = 0;
         unsigned acc = 0;
-        if (locate_lead(p, xlayer, xphase, uph.fixed_units + xunit, &ptr, &bytes)) acc = stream_unit<false>(ptr, bytes);
+        if (locate_lead(p, xlayer, xphase, sm_cls_base[cls] + xunit, &ptr, &bytes)) acc = stream_unit<false>(ptr, bytes);
         else if (threadIdx.x == 0) atomicCAS(&ctl->status, kStepOk, kStepBadUnit);
         for (int o = 16; o; o >>= 1) acc ^= __shfl_xor_sync(0xffffffffu, acc, o);
         if ((threadIdx.x & 31) == 0) p.sink[(blockIdx.x % kStepMaxWorkers) * 8 + (threadIdx.x >> 5)] ^= acc;
@@ -1493,16 +1646,29 @@ __global__ void __launch_bounds__(kStepThreads, 1) step_stream_kernel(StepStream
           }
           __syncthreads();
         }
-        consumer_unit(p, xlayer, *upool, g, rb, smem, pool_id != last_pool || g != last_group);
-        last_group = g;
+        // Consecutive units of one group share their staged activations; a block-diagonal
+        // projection's units share them within a head group.
+        const int key = (upool->kind == kPoolFp8Matrix && upool->in_group_rows) ? projection_diag_group(p, *upool, rb) : g;
+        const unsigned long long t_unit = gtimer();
+        consumer_unit(p, xlayer, *upool, g, rb, smem, pool_id != last_pool || key != last_group);
+        last_group = key;
         last_pool = pool_id;
         if (threadIdx.x == 0) sm_grab_bytes += upool->bytes / upg;
-        if ((upool->kind == kPoolFp8Matrix && upool->slabs > 1 && !projection_split(p, *upool)) || upool->kind == kPoolRouter ||
-            upool->kind == kPoolAttention) {
-          __syncthreads();  // the pool's compute units complete: its reduce units' gate, or the chain's select
+        if (upool->kind == kPoolFp8Matrix || upool->kind == kPoolRouter || upool->kind == kPoolAttention || upool->kind == kPoolRowTail) {
+          __syncthreads();  // the pool's compute units complete: its reduce units' gate, the chain's select, or the pools behind it (kGatePool)
           if (threadIdx.x == 0) {
             const unsigned before = atom_add_acq_rel(&ctl->pool_done[xlayer][pool_id], 1u);
             if (before + 1 == pool_compute_units(p, xlayer, *upool)) red_release(&ctl->open_gen, 1u);  // the last: a gate opens, lead units yield
+            if (p.unit_trace && pool_id == p.trace_pool) {  // the traced pool: this worker's unit durations (bank 2)
+              unsigned long long* tr = p.unit_trace + (2u * kStepMaxWorkers + blockIdx.x % kStepMaxWorkers) * 8;
+              const unsigned long long now = gtimer(), d = now - t_unit;
+              tr[0] += 1;
+              tr[1] += d;
+              tr[2] = d > tr[2] ? d : tr[2];
+              tr[3] = tr[3] == 0 || d < tr[3] ? d : tr[3];
+              if (tr[4] == 0) tr[4] = t_unit;
+              tr[5] = now;
+            }
           }
         }
         if (pool_is_gate_up(upool->kind)) {

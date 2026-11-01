@@ -1,5 +1,6 @@
 #include "kernels/csa2.hpp"
 #include "kernels/csa2_attn_finish.cuh"
+#include "kernels/csa2_norm.cuh"
 #include "kernels/pdl.cuh"
 
 #include <cuda_bf16.h>
@@ -28,26 +29,11 @@ __device__ __forceinline__ float2 e4m3x2_to_float2(uint16_t v) {
   return __half22float2(__half2(h));
 }
 
-// Block-wide sum in a fixed order (warp shuffles then one warp over the
-// warp sums): deterministic, launch-shape independent for a given
-// blockDim.
-__device__ __forceinline__ float block_sum_256(float v, float* red /*[8]*/) {
-  for (int off = 16; off > 0; off >>= 1) v += __shfl_xor_sync(0xffffffffu, v, off);
-  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-  __syncthreads();
-  if (lane == 0) red[warp] = v;
-  __syncthreads();
-  float t = 0.0f;
-  if (warp == 0) {
-    t = lane < (int(blockDim.x) >> 5) ? red[lane] : 0.0f;
-    for (int off = 4; off > 0; off >>= 1) t += __shfl_xor_sync(0xffffffffu, t, off);
-    if (lane == 0) red[0] = t;
-  }
-  __syncthreads();
-  t = red[0];
-  __syncthreads();
-  return t;
-}
+// The row norms' and rotation's bodies (kernels/csa2_norm.cuh): the step kernel runs the same.
+using csa2_norm::block_sum_256;
+using csa2_norm::rmsnorm_row;
+using csa2_norm::rope_row;
+
 // ---- RMSNorm ----------------------------------------------------------------------
 // One block per row; each thread owns the elements t, t + 256, ...; the
 // weight is applied in fp32 after the fp32 normalization (two fp32
@@ -58,19 +44,7 @@ __global__ void rmsnorm_kernel(const uint16_t* x, int64_t x_stride, const uint16
   dgpp_pdl_wait();
   __shared__ float red[8];
   const int64_t r = blockIdx.x;
-  const uint16_t* xr = x + r * x_stride;
-  uint16_t* yr = y + r * y_stride;
-  float ss = 0.0f;
-  for (int i = threadIdx.x; i < dim; i += blockDim.x) {
-    const float v = bf16_bits_to_float(xr[i]);
-    ss = __fmaf_rn(v, v, ss);
-  }
-  const float total = block_sum_256(ss, red);
-  const float rs = rsqrtf(__fadd_rn(__fdiv_rn(total, float(dim)), eps));
-  for (int i = threadIdx.x; i < dim; i += blockDim.x) {
-    const float v = __fmul_rn(bf16_bits_to_float(xr[i]), rs);
-    yr[i] = float_to_bf16_bits(__fmul_rn(bf16_bits_to_float(w[i]), v));
-  }
+  rmsnorm_row(x + r * x_stride, w, y + r * y_stride, dim, eps, red);
 }
 
 // The two norms behind the paired q/kv projection and the kv rope in one
@@ -84,46 +58,11 @@ __global__ void __launch_bounds__(kCsa2Threads) norms_rope_kernel(
   dgpp_pdl_wait();
   __shared__ float red[8];
   const int64_t r = blockIdx.x;
-  {
-    uint16_t* xr = q + r * q_stride;
-    float ss = 0.0f;
-    for (int i = threadIdx.x; i < q_dim; i += blockDim.x) {
-      const float v = bf16_bits_to_float(xr[i]);
-      ss = __fmaf_rn(v, v, ss);
-    }
-    const float total = block_sum_256(ss, red);
-    const float rs = rsqrtf(__fadd_rn(__fdiv_rn(total, float(q_dim)), eps));
-    for (int i = threadIdx.x; i < q_dim; i += blockDim.x) {
-      const float v = __fmul_rn(bf16_bits_to_float(xr[i]), rs);
-      xr[i] = float_to_bf16_bits(__fmul_rn(bf16_bits_to_float(q_w[i]), v));
-    }
-  }
-  {
-    uint16_t* xr = kv + r * kv_stride;
-    float ss = 0.0f;
-    for (int i = threadIdx.x; i < kv_dim; i += blockDim.x) {
-      const float v = bf16_bits_to_float(xr[i]);
-      ss = __fmaf_rn(v, v, ss);
-    }
-    const float total = block_sum_256(ss, red);
-    const float rs = rsqrtf(__fadd_rn(__fdiv_rn(total, float(kv_dim)), eps));
-    for (int i = threadIdx.x; i < kv_dim; i += blockDim.x) {
-      const float v = __fmul_rn(bf16_bits_to_float(xr[i]), rs);
-      xr[i] = float_to_bf16_bits(__fmul_rn(bf16_bits_to_float(kv_w[i]), v));
-    }
-  }
+  rmsnorm_row(q + r * q_stride, q_w, q + r * q_stride, q_dim, eps, red);
+  uint16_t* kvr = kv + r * kv_stride;
+  rmsnorm_row(kvr, kv_w, kvr, kv_dim, eps, red);
   __syncthreads();  // the normed kv row is written before its rope
-  const int64_t p = pos[r];
-  if (p < 0) return;
-  for (int i = threadIdx.x; i < half; i += blockDim.x) {
-    uint16_t* v = kv + r * kv_stride + rope_off + 2 * i;
-    const float ang = __fmul_rn(float(p), inv_freq[i]);
-    const float c = cosf(ang);
-    const float sn = sinf(ang);
-    const float x0 = bf16_bits_to_float(v[0]), x1 = bf16_bits_to_float(v[1]);
-    v[0] = float_to_bf16_bits(x0 * c - x1 * sn);
-    v[1] = float_to_bf16_bits(x1 * c + x0 * sn);
-  }
+  rope_row(kvr, kvr, 1, 0, rope_off, half, pos[r], inv_freq);
 }
 
 // ---- rotation ------------------------------------------------------------------------

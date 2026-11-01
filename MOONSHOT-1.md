@@ -2564,8 +2564,26 @@ area, untracked.
       latency under the stream on each of a block's dependent round
       trips, not the rows' residency. Open in this item: fewer round
       trips a block or a quieter memory while the blocks run, as a set;
-      the output projection reading o; the attention stays behind its
-      mask bit meanwhile, three to five points.
+      the attention stays behind its mask bit meanwhile, three to five
+      points. The projection chain landed after it (2026-11-01, day): the
+      pools read the y the production reads (wq_b and the indexer the q
+      norm's, wo_a the attention's o block-diagonally, wo_b wo_a's, the
+      attention wq_b's rotated q), gated on their producers' completion;
+      the row tails run the production norm, rotation, slot-list and ring
+      append bodies (`kernels/csa2_norm.cuh`, `dsa_latent_append.cuh`,
+      one body two callers) a row a unit, summing a slabbed source's
+      partials themselves; the q projections rotate their heads in their
+      epilogue. Bitwise against the production launches on the step's own
+      source y; the attention's o from the chain's q and the appended ring
+      bitwise. Cost about four points by the same-window A/B (wired 73.4
+      to 76.0 tile-major against 77.9 to 79.1 unwired on the same binary
+      and 79.0 to 79.9 on the committed tree's), with a gated pool's bytes
+      staged while it waits and the row tails absorbing their source's
+      slab reduce; the dependent pools' units read L2 no faster than DRAM
+      under the stream (9.8 GB/s a unit) and run in two waves, so the unit
+      form and the K-slab granularity are the levers, and the class tables
+      built once per launch rather than per group by the chain.
+      `docs/step_engine.md`, "The projection chain".
       Owed here: the folds and the select as
       consumers, and the chain's critical path after the attention-output
       fold, now about 60 µs against the budget's 34: the site's class
@@ -2646,6 +2664,12 @@ area, untracked.
 
 ### Phase 5: the step engine adapter
 
+- [x] The projection chain's data flow in the kernel (2026-11-01): the
+      backbone the adapter's exact gather and oracle stand on; see the
+      attention item above and `docs/step_engine.md`. Still provided by
+      the rig: the selection (the indexer's scores and the select), the
+      main cache's compress path and entry positions, the Engram gathers,
+      the lm head and the pick.
 - [ ] `StepEngineAdapter` in `src/step/` beside the eager and graph
       adapters, selected by `engine.decode_engine`, implementing
       `SchedulerEngine` with the scheduler's existing paths unchanged.

@@ -34,20 +34,25 @@ enum DevPoolKind : uint8_t {
   kPoolRouter = 8,          // the router: bf16 [experts, hidden] with its F32 bias, units of 16 expert rows over every token, scores out
   kPoolMhc = 9,             // a hyper-connection site: the coefficient matrix bf16 [24, 4 hidden], its base and scale, the norm weight; a unit is kMhcUnitCoeffs logits of one token, the token's last unit the finish
   kPoolAttention = 10,      // the CSA2 attention over one latent source of the state pool (site 0 the window ring, 1 the main cache): a unit is one block of the production flash kernel (kernels/dsa_attn_flash.cuh), the phase's last such pool's reduce class the finish (kernels/csa2_attn_finish.cuh)
+  kPoolRowTail = 11,        // a row's tail behind a projection (kernels/csa2_norm.cuh, dsa_latent_append.cuh): the norm with the pool's weight (k > 0), the rotation of rope_heads heads, the kv row's ring append; a unit is one row of the source pool's y, written to this pool's own y
 };
 // The attention pools' geometry (DeepSeek-V4.1's CSA2): the latent width, the
-// keys a flash tile spans and the split group (kernels/dsa.hpp kAttnSplitGroup).
+// keys a flash tile spans and the split group (kernels/dsa.hpp kAttnSplitGroup),
+// the rotated tail of a latent or index head and the index head's width.
 constexpr int kAttnLatent = 512;
 constexpr int kAttnTile = 16;
 constexpr int kAttnGroup = 8;
+constexpr int kAttnRope = 64;
+constexpr int kAttnIndexDim = 128;
 // Whose slots a pool's group holds.
 enum DevGroupKind : uint8_t {
   kGroupRouted = 0,  // the run list's experts, each with its slots
   kGroupShared = 1,  // every token's shared slot
   kGroupTokens = 2,  // every token, slot i = token i
 };
-constexpr int kMaxPhasePools = 8;
-enum DevGateKind : uint8_t { kGateNone = 0, kGateFold = 1, kGateSite = 2 };
+constexpr int kMaxPhasePools = 12;
+// A pool's compute class gate inside its group (the kernel holds further gates of its own classes).
+enum DevGateKind : uint8_t { kGateNone = 0, kGateFold = 1, kGateSite = 2, kGatePool = 7 };
 enum DevFoldTrigger : uint8_t { kTriggerEnd = 0, kTriggerReduce = 1, kTriggerAccumulate = 2 };
 // A hyper-connection unit's coefficients: one token's streams read once for
 // this many logits, so a step's units fit one wave of the workers.
@@ -77,7 +82,28 @@ struct DevPool {
   // `gate_arg` of the unit's layer finished every token.
   uint8_t gate_kind = 0;
   uint8_t gate_arg = 0;  // kPoolAttention: 1 on the phase's last attention pool, whose reduce class is the finish over every source
-  uint8_t pad3[2] = {0, 0};
+  // The projection chain's wiring (2026-11-01): where the pool's units read their activations
+  // (in_src 0: the step's x rows; 1: pool in_pool's y, at its out_offset and row width; 2: the
+  // attention's output o [rows][local_heads * 512]) and, with kGatePool, the pools whose completion
+  // (compute units, and reduce units when slabbed) opens its class: in_pool and gate_pool (-1 none).
+  // A block-diagonal matrix (wo_a: group g's rows read the heads of group g) reads columns
+  // [g * in_group_cols, + k) for output rows [g * in_group_rows, + in_group_rows) (0: dense).
+  uint8_t in_src = 0;
+  uint8_t append = 0;  // kPoolRowTail: the row (the kv latent, kAttnLatent wide) goes into the window ring at its position's slot, with the row's slot list
+  uint8_t reduce_by_tail = 0;  // kPoolFp8Matrix with slabs: its row tail's units sum the slab partials into y (no reduce class of its own)
+  uint8_t pad4 = 0;
+  // A gated pool's bytes as lead units of its phase (fixed units first, as locate_lead counts
+  // them): a staging class streams them into L2 while the pool waits for its gate, and closes
+  // when the gate opens.
+  uint32_t stage_unit_begin = 0;
+  uint32_t stage_units = 0;
+  int32_t in_pool = -1;
+  int32_t gate_pool = -1;
+  int32_t in_group_rows = 0;
+  int32_t in_group_cols = 0;
+  int32_t rope_heads = 0;        // kPoolRowTail: heads rotated (0: none), each at rope_head_stride, its pairs from rope_off, kAttnRope / 2 pairs; kPoolFp8Matrix (one slab): the rotation in the unit's epilogue over its output block (the q projections)
+  int32_t rope_head_stride = 0;
+  int32_t rope_off = 0;
   int32_t rows = 0;     // a consumer pool: the matrix's output rows (gate and up: I; down: H); kPoolAttention: the source's splits (one 16-key tile each)
   int32_t k = 0;        // and its inner width (gate and up: H; down: I); kPoolAttention: the latent width
   int32_t grab = 1;     // units a worker takes at once: consecutive units of one group share their staged activations
@@ -138,7 +164,7 @@ struct DevPhase {
   // The phase's pools: units are handed out fixed segments first, then the
   // pools in order with the routed pool (`routed`, a slot in `pools`) last,
   // since its units depend on the router and the others' are the longest.
-  int32_t pools[kMaxPhasePools] = {-1, -1, -1, -1, -1, -1, -1, -1};
+  int32_t pools[kMaxPhasePools] = {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1};
   uint8_t n_pools = 0;
   int8_t routed = -1;
   uint8_t pad2[2] = {0, 0};
@@ -183,7 +209,11 @@ struct DevicePlan {
 // bitwise and measured apart until its classes run inside a stream phase's drain (as its own
 // phase it cost the layer six points, 2026-11-01: docs/step_engine.md).
 constexpr unsigned kConsumeExperts = 1u, kConsumeShared = 2u, kConsumeProjections = 4u, kConsumeRouter = 8u, kConsumeMhc = 16u,
-                   kConsumeAttention = 32u, kConsumeAll = 31u;
+                   kConsumeAttention = 32u, kConsumeChain = 64u, kConsumeAll = 31u | 64u;
+// kConsumeChain: the projection chain's wiring (the row tails, the pools reading another's y, the
+// attention behind the rotated q); without it every projection reads x, the data flow before
+// 2026-11-01, kept for the attribution's A/B. kConsumeAttention stays outside kConsumeAll (the
+// rate gates' set): the attention costs 3-5 points of its own.
 DevicePlan lower_plan(const std::vector<LayerPlan>& layers, uint32_t unit_bytes, unsigned consumer_mask);
 inline DevicePlan lower_plan(const std::vector<LayerPlan>& layers, uint32_t unit_bytes, bool consumers = false) {
   return lower_plan(layers, unit_bytes, consumers ? kConsumeAll : 0u);

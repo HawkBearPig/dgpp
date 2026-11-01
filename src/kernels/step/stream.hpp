@@ -131,13 +131,14 @@ struct StepAttnParams {
   const uint16_t* q = nullptr;
   const int32_t* req_ids = nullptr;
   const int64_t* pos = nullptr;
-  const uint8_t* ring = nullptr;
+  uint8_t* ring = nullptr;  // written by the kv row tail (the step's rows appended at their slots)
   unsigned long long ring_layer_bytes = 0;
   const int32_t* ring_table = nullptr;
   int ring_slots = 0;
   int max_requests = 0;
-  const int32_t* wlist = nullptr;
-  const int32_t* wcounts = nullptr;
+  int32_t* wlist = nullptr;    // written by the kv row tail: each row's window slot list and count
+  int32_t* wcounts = nullptr;
+  int64_t* slots = nullptr;    // [kStepMaxRows]: each row's ring slot (the Streamer's)
   int window = 0;
   const uint8_t* const* main = nullptr;  // per layer
   const int* epb = nullptr;              // per layer: the main cache's entries a block
@@ -225,7 +226,10 @@ struct StepStreamParams {
   int32_t* cand_id = nullptr;
   float* cand_score = nullptr;
   float* cand_biased = nullptr;
-  unsigned long long* unit_trace = nullptr;  // [kStepMaxWorkers][8]: a router unit's stage stamps, the last unit a worker ran (null: off)
+  unsigned long long* unit_trace = nullptr;  // [3][kStepMaxWorkers][8]: a worker's last router unit's stage stamps, its last site unit's, and the traced pool's units (null: off)
+  // The pool whose compute units every worker times (bank 2 of unit_trace: count, summed ns, max
+  // ns, min ns, first start, last end), -1 none.
+  int trace_pool = -1;
   int router_mode = 2;
   float routed_scaling = 1.f;
   int norm_topk = 1;
@@ -241,6 +245,7 @@ struct StepStreamParams {
   float* logits = nullptr;
   float hc_eps = 1e-6f;
   int sinkhorn_iters = 20;
+  float norm_eps = 1e-6f;  // the row tails' RMSNorm epsilon (the family's rms_norm_eps)
   float mhc_norm_eps = 1e-6f;  // the coefficient norm's and the sublayer norm's epsilon
   unsigned consumer_smem = 0;  // dynamic shared memory the consumer units need
   int lookahead_layers = 2;

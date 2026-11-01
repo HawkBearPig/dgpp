@@ -117,8 +117,9 @@ T* dev_copy(const std::vector<T>& h) {
 std::unique_ptr<AttnState> make_attn_state(const Dsv41TextConfig& cfg, const DevicePlan& dp, int layers) {
   auto A = std::make_unique<AttnState>();
   A->layers = layers;
+  A->lh = cfg.num_attention_heads / kWorld;  // the row tails rotate the chain's q without attention pools in the plan
   for (const DevPool& pool : dp.pools)
-    if (pool.kind == kPoolAttention) { A->lh = pool.unit_rows; break; }
+    if (pool.kind == kPoolAttention) require(pool.unit_rows == A->lh, "the attention pools' heads are the config's local heads");
   if (A->lh <= 0) return nullptr;
   A->window = cfg.sliding_window;
   A->index_topk = cfg.index_topk;
@@ -328,7 +329,8 @@ std::unique_ptr<Rig> make_rig_mask(int layers, unsigned consumer_mask, bool tile
       }
     }
   }
-  if (consumer_mask & kConsumeAttention) rig->attn = make_attn_state(rig->cfg, rig->dp, layers);
+  // The attention's inputs serve the row tails too (positions, the rotary tables, the ring the kv tail appends into).
+  if (consumer_mask & (kConsumeAttention | kConsumeProjections)) rig->attn = make_attn_state(rig->cfg, rig->dp, layers);
   return rig;
 }
 std::unique_ptr<Rig> make_rig(int layers = kLayers, bool consumers = false, bool tile_major = false) {
@@ -569,6 +571,102 @@ DGPP_TEST(step_protocol_gather_phase_waits_for_the_host_sequence) {
 
 // ---- the consumers inside the stream (phase 3 items 1 and 2)
 
+// An fp8 projection pool's outputs against the reference matrix over the same bytes, from the
+// input the plan wired for it (device_plan.hpp in_src: the step's x rows, a pool's y at its row
+// width, or the attention's o, block-diagonally for wo_a): exact, within the envelope, beyond.
+struct ProjCheck {
+  size_t exact = 0, ok = 0, bad = 0, n = 0;
+  void add(const ProjCheck& o) { exact += o.exact; ok += o.ok; bad += o.bad; n += o.n; }
+};
+ProjCheck check_projection(const Rig& rig, const Streamer& s, const DevPool& pool, int L, int rows, bool last_layer = true) {
+  ProjCheck pc;
+  if (pool.in_src == 2 && !last_layer) {  // o is one buffer for every layer: after the run it holds the last layer's
+    std::printf("      projection [%d, %d] from the attention's o: not checked on layer %d (o holds the last layer's)\n", pool.rows, pool.k, L);
+    return pc;
+  }
+  const StepCtl* ctl = s.ctl();
+  const size_t elems = static_cast<size_t>(rows) * pool.rows;
+  std::vector<uint16_t> got(elems);
+  DGPP_CUDA_OK(cudaMemcpy(got.data(), s.proj() + pool.out_offset, elems * 2, cudaMemcpyDeviceToHost));
+  const uint16_t* xin = s.x();
+  int xs = s.x_stride();
+  if (pool.in_src == 1) {
+    const DevPool& sp = rig.dp.pools[static_cast<size_t>(pool.in_pool)];
+    xin = s.proj() + sp.out_offset;
+    xs = sp.rows;
+  } else if (pool.in_src == 2) {
+    xin = s.attn_o();
+    xs = rig.attn->lh * kAttnLatent;
+  }
+  const int groups = pool.in_group_rows ? pool.rows / pool.in_group_rows : 1;
+  const int gn = pool.rows / groups;
+  const size_t gelems = static_cast<size_t>(rows) * gn;
+  uint16_t* y_ref = nullptr;
+  float *yf = nullptr, *ymag = nullptr;
+  DGPP_CUDA_OK(cudaMalloc(&y_ref, gelems * 2));
+  DGPP_CUDA_OK(cudaMalloc(&yf, gelems * 4));
+  DGPP_CUDA_OK(cudaMalloc(&ymag, gelems * 4));
+  Mxfp4Group grp;
+  grp.slots = ctl->token_slots;
+  grp.tokens = ctl->token_slots;
+  grp.count = rows;
+  const uint8_t* b = rig.bases[static_cast<size_t>(L)] + pool.base;
+  std::vector<uint16_t> ref(gelems);
+  std::vector<float> exact_f(gelems), mag_f(gelems);
+  size_t pb = 0;
+  for (int g = 0; g < groups; ++g) {
+    const size_t row0 = static_cast<size_t>(g) * gn;
+    step_ref::launch_fp8_matrix(b + pool.offsets[0] + row0 * pool.k,
+                                reinterpret_cast<const float*>(b + pool.offsets[1]) + (row0 / 32) * (static_cast<size_t>(pool.k) / 32), grp,
+                                xin + static_cast<size_t>(g) * pool.in_group_cols, xs, pool.k, gn, 32, y_ref, yf, ymag, nullptr);
+    // A q projection rotates its heads in the unit's epilogue: the production rotation on the
+    // reference's bf16 rows, and the exact values and magnitudes rotated in fp32 for the envelope.
+    if (pool.rope_heads) {
+      require(groups == 1 && rig.attn != nullptr, "a rotated projection is dense and the rig has the positions");
+      csa2_rope_apply(y_ref + pool.rope_off, gn, pool.rope_head_stride, pool.rope_heads, kAttnRope, rig.attn->pos, rig.attn->inv_freq[static_cast<size_t>(L)],
+                      false, rows, nullptr);
+    }
+    DGPP_CUDA_OK(cudaDeviceSynchronize());
+    DGPP_CUDA_OK(cudaMemcpy(ref.data(), y_ref, gelems * 2, cudaMemcpyDeviceToHost));
+    DGPP_CUDA_OK(cudaMemcpy(exact_f.data(), yf, gelems * 4, cudaMemcpyDeviceToHost));
+    DGPP_CUDA_OK(cudaMemcpy(mag_f.data(), ymag, gelems * 4, cudaMemcpyDeviceToHost));
+    if (pool.rope_heads) {
+      std::vector<int64_t> pos_h(static_cast<size_t>(rows));
+      std::vector<float> inv_h(static_cast<size_t>(kAttnRope / 2));
+      DGPP_CUDA_OK(cudaMemcpy(pos_h.data(), rig.attn->pos, pos_h.size() * 8, cudaMemcpyDeviceToHost));
+      DGPP_CUDA_OK(cudaMemcpy(inv_h.data(), rig.attn->inv_freq[static_cast<size_t>(L)], inv_h.size() * 4, cudaMemcpyDeviceToHost));
+      for (int t = 0; t < rows; ++t) {
+        if (pos_h[static_cast<size_t>(t)] < 0) continue;
+        for (int h = 0; h < pool.rope_heads; ++h)
+          for (int i = 0; i < kAttnRope / 2; ++i) {
+            const size_t at = static_cast<size_t>(t) * gn + static_cast<size_t>(h) * pool.rope_head_stride + pool.rope_off + 2 * i;
+            const float ang = static_cast<float>(pos_h[static_cast<size_t>(t)]) * inv_h[static_cast<size_t>(i)];
+            const float c = std::cos(ang), sn = std::sin(ang);
+            const float e0 = exact_f[at], e1 = exact_f[at + 1], m0 = mag_f[at], m1 = mag_f[at + 1];
+            exact_f[at] = e0 * c - e1 * sn;
+            exact_f[at + 1] = e1 * c + e0 * sn;
+            mag_f[at] = std::fabs(m0 * c) + std::fabs(m1 * sn);
+            mag_f[at + 1] = std::fabs(m1 * c) + std::fabs(m0 * sn);
+          }
+      }
+    }
+    for (int t = 0; t < rows; ++t)
+      for (int c = 0; c < gn; ++c) {
+        const size_t i = static_cast<size_t>(t) * gn + c;
+        const uint16_t v = got[static_cast<size_t>(t) * pool.rows + row0 + c];
+        ++pc.n;
+        if (v == ref[i]) ++pc.exact;
+        else if (step_ref::value_ok(v, exact_f[i], mag_f[i])) ++pc.ok;
+        else { ++pc.bad; ++pb; }
+      }
+  }
+  cudaFree(y_ref); cudaFree(yf); cudaFree(ymag);
+  static const char* const sources[3] = {"x", "a pool's y", "the attention's o"};
+  std::printf("      projection [%d, %d] from %s%s%s: %zu outputs, %zu beyond\n", pool.rows, pool.k, sources[pool.in_src],
+              pool.in_group_rows ? " (block-diagonal)" : "", pool.rope_heads ? " (heads rotated)" : "", elems, pb);
+  return pc;
+}
+
 void consumers_match_the_reference(bool tile_major) {
   // Without the hyper-connection sites: the references read x after the run, and a site rewrites x
   // (the sites' own case checks their rows and updates against the production kernels).
@@ -714,42 +812,11 @@ void consumers_match_the_reference(bool tile_major) {
   require(bad == 0, "gate and up outputs beyond the reference's envelope inside the stream");
   require(out_bad == 0, "down partials beyond the fp32 bound inside the stream");
   require(y_bad == 0, "the accumulated output is not the ordered sum of the partials");
-  // The projections: every token through each fp8 matrix of the layer.
-  size_t proj_exact = 0, proj_ok = 0, proj_bad = 0, proj_n = 0;
-  for (const DevPool* pool : projections) {
-    const size_t elems = static_cast<size_t>(cfg.rows) * pool->rows;
-    std::vector<uint16_t> got(elems);
-    DGPP_CUDA_OK(cudaMemcpy(got.data(), s.proj() + pool->out_offset, elems * 2, cudaMemcpyDeviceToHost));
-    uint16_t* y_ref = nullptr;
-    float *yf = nullptr, *ymag = nullptr;
-    DGPP_CUDA_OK(cudaMalloc(&y_ref, elems * 2));
-    DGPP_CUDA_OK(cudaMalloc(&yf, elems * 4));
-    DGPP_CUDA_OK(cudaMalloc(&ymag, elems * 4));
-    Mxfp4Group grp;
-    grp.slots = ctl->token_slots;
-    grp.tokens = ctl->token_slots;
-    grp.count = cfg.rows;
-    const uint8_t* b = rig->bases[static_cast<size_t>(L)] + pool->base;
-    step_ref::launch_fp8_matrix(b + pool->offsets[0], reinterpret_cast<const float*>(b + pool->offsets[1]), grp, s.x(), s.x_stride(), pool->k,
-                                pool->rows, 32, y_ref, yf, ymag, nullptr);
-    DGPP_CUDA_OK(cudaDeviceSynchronize());
-    std::vector<uint16_t> ref(elems);
-    std::vector<float> exact_f(elems), mag_f(elems);
-    DGPP_CUDA_OK(cudaMemcpy(ref.data(), y_ref, elems * 2, cudaMemcpyDeviceToHost));
-    DGPP_CUDA_OK(cudaMemcpy(exact_f.data(), yf, elems * 4, cudaMemcpyDeviceToHost));
-    DGPP_CUDA_OK(cudaMemcpy(mag_f.data(), ymag, elems * 4, cudaMemcpyDeviceToHost));
-    cudaFree(y_ref); cudaFree(yf); cudaFree(ymag);
-    size_t pb = 0;
-    for (size_t i = 0; i < elems; ++i) {
-      ++proj_n;
-      if (got[i] == ref[i]) ++proj_exact;
-      else if (step_ref::value_ok(got[i], exact_f[i], mag_f[i])) ++proj_ok;
-      else { ++proj_bad; ++pb; }
-    }
-    std::printf("      projection [%d, %d]: %zu outputs, %zu beyond\n", pool->rows, pool->k, elems, pb);
-  }
-  std::printf("   projections of layer %d: %zu exact, %zu within the envelope, %zu beyond of %zu\n", L, proj_exact, proj_ok, proj_bad, proj_n);
-  require(proj_bad == 0, "projection outputs beyond the reference's envelope inside the stream");
+  // The projections: every token through each fp8 matrix of the layer, from the input the plan wired.
+  ProjCheck pc;
+  for (const DevPool* pool : projections) pc.add(check_projection(*rig, s, *pool, L, cfg.rows));
+  std::printf("   projections of layer %d: %zu exact, %zu within the envelope, %zu beyond of %zu\n", L, pc.exact, pc.ok, pc.bad, pc.n);
+  require(pc.bad == 0, "projection outputs beyond the reference's envelope inside the stream");
 }
 
 DGPP_TEST(step_consumers_in_the_stream_match_the_reference) {
@@ -820,13 +887,19 @@ DGPP_TEST(step_consumers_rate_at_the_design_chain) {
   const double tile = std::max(consumers_rate(/*tile_major=*/true), consumers_rate(/*tile_major=*/true));
 
   // Interim gates at the measured level less the run-to-run noise, clean
-  // (production down, the clock locked, a warm-up run): tile-major 80.5 to 83
-  // percent and row-major 74.5 to 77 over the night's samples with every
-  // weight computed, the real router and the hyper-connection sites as gated
-  // classes behind their group's fold (2026-10-31); the plan's 95 is the
-  // goal, section 1.4 the account.
-  require(tile >= 78.0, "the tile-major consumers' layers stream under 78 percent of the ceiling");
-  require(row >= 73.0, "the row-major consumers' layers stream under 73 percent of the ceiling");
+  // (production down, the clock locked, a warm-up run). With every weight
+  // computed, the real router and the hyper-connection sites as gated classes
+  // behind their group's fold the night's samples read tile-major 80.5 to 83
+  // and row-major 74.5 to 77 (2026-10-31); with the projection chain wired
+  // (2026-11-01, every projection reading the y the production reads, the row
+  // tails, the kv append) tile-major 73.4 to 76.0 and row-major 70.1 to 71.1
+  // in one window against 79.0 to 79.9 and 73.5 to 74.5 for the data flow
+  // before it (step_consumers_rate_unwired, same binary): the chain's cost,
+  // about four points, is the dependent pools' two waves and their units
+  // reading L2 at about 10 GB/s a block under the stream (docs/step_engine.md,
+  // "The projection chain"). The plan's 95 is the goal, section 1.4 the account.
+  require(tile >= 72.0, "the tile-major consumers' layers stream under 72 percent of the ceiling");
+  require(row >= 68.0, "the row-major consumers' layers stream under 68 percent of the ceiling");
 }
 
 // Which consumers cost the layer its share of the floor: the step with the
@@ -976,8 +1049,76 @@ DGPP_TEST(step_consumers_attribution) {
   consumers_rate_mask(kConsumeShared | kConsumeProjections, "the shared expert and projections as consumers:");
   consumers_rate_mask(kConsumeProjections, "the projections as consumers:");
   consumers_rate_mask(kConsumeAll & ~kConsumeMhc, "every consumer but the hyper-connection sites:");
+  consumers_rate_mask(kConsumeAll & ~kConsumeChain, "every consumer, the chain unwired:");
   consumers_rate_mask(kConsumeAll, "every consumer:");
   consumers_rate_mask(kConsumeAll | kConsumeAttention, "every consumer and the attention:");
+}
+
+// The rate case's rig with the chain unwired (the data flow before 2026-11-01, every projection
+// reading x), two samples: the chain's cost is this against the rate case in one window.
+DGPP_TEST(step_consumers_rate_unwired) {
+  const double a = consumers_rate_mask(kConsumeAll & ~kConsumeChain, "every consumer, the chain unwired:");
+  const double b = consumers_rate_mask(kConsumeAll & ~kConsumeChain, "every consumer, the chain unwired:");
+  // The binary's canary: this data flow read 77.9 to 79.1 on 2026-11-01 (the committed tree's
+  // binary 79.0 to 79.9 in the same window); a drop here is the kernel, not the chain.
+  require(std::max(a, b) >= 76.0, "the unwired data flow streams under 76 percent of the ceiling: the kernel regressed");
+}
+
+// The chain's projections unit by unit (2026-11-01): for each of layer 3's wq_a, wq_b, wo_a and
+// wo_b, every worker's unit durations over a run (Streamer::unit_trace bank 2) beside the pool's
+// class window, so a slow class is read as slow units, a late hand-out or a thin wave.
+DGPP_TEST(step_chain_unit_trace) {
+  auto rig = make_rig_mask(kLayers, kConsumeAll, /*tile_major=*/true);
+  Streamer s(rig->dp, rig->bases, rig->plans);
+  if (rig->attn) s.set_attention(rig->attn->params);
+  StreamerConfig cfg = design_config();
+  cfg.steps = 3;
+  cfg.rows = 5;
+  cfg.top_k = 6;
+  (void)s.run(cfg);
+  const int L = 3;
+  const DevLayer& dl = rig->dp.layers[static_cast<size_t>(L)];
+  struct Traced { const char* name; int pool; };
+  std::vector<Traced> traced;
+  for (int P = dl.phase_begin; P < dl.phase_begin + dl.phase_count; ++P)
+    for (int i = 0; i < rig->dp.phases[static_cast<size_t>(P)].n_pools; ++i) {
+      const int pi = rig->dp.phases[static_cast<size_t>(P)].pools[i];
+      const DevPool& q = rig->dp.pools[static_cast<size_t>(pi)];
+      if (q.kind != kPoolFp8Matrix) continue;
+      const char* name = q.rows == 2048 && q.k == 4096 ? "wo_a" : q.rows == 5120 && q.k == 2048 ? "wo_b" : q.rows == 8192 && q.k == 1280 ? "wq_b" : q.rows == 1280 && q.k == 5120 ? "wq_a" : nullptr;
+      if (name) traced.push_back({name, pi});
+    }
+  require(traced.size() == 4, "layer 3 has wq_a, wq_b, wo_a and wo_b");
+  for (const Traced& t : traced) {
+    cfg.trace_pool = t.pool;
+    const StreamReport r = s.run(cfg);
+    require(r.status == kStepOk, std::string("the kernel ended on ") + r.status_text);
+    std::vector<unsigned long long> tr(static_cast<size_t>(3 * kStepMaxWorkers) * 8);
+    DGPP_CUDA_OK(cudaMemcpy(tr.data(), s.unit_trace(), tr.size() * 8, cudaMemcpyDeviceToHost));
+    unsigned long long units = 0, sum = 0, mx = 0, mn = ~0ull;
+    int workers = 0;
+    for (int w = 0; w < kStepMaxWorkers; ++w) {
+      const unsigned long long* u = tr.data() + (static_cast<size_t>(2 * kStepMaxWorkers) + w) * 8;
+      if (!u[0]) continue;
+      ++workers;
+      units += u[0];
+      sum += u[1];
+      mx = std::max(mx, u[2]);
+      mn = std::min(mn, u[3]);
+    }
+    const DevPool& q = rig->dp.pools[static_cast<size_t>(t.pool)];
+    const double kb = static_cast<double>(q.bytes) / 1024.0 / (static_cast<double>(q.units_per_group) / q.slabs) / q.slabs;
+    std::printf("   %s [%d, %d] %d slabs, %d units of %.0f KB: over %d steps %llu units on %d workers, unit %.1f us mean, %.1f min, %.1f max (%.1f GB/s a unit at the mean)\n",
+                t.name, q.rows, q.k, q.slabs, q.units_per_group, kb, cfg.steps, units, workers, units ? sum / 1e3 / units : 0.0, mn == ~0ull ? 0.0 : mn / 1e3, mx / 1e3,
+                units ? kb * 1024.0 / (static_cast<double>(sum) / units) : 0.0);
+    for (const PhaseTiming& ph : r.phases) {
+      if (ph.layer != L) continue;
+      for (const ClassTiming& c : ph.classes)
+        if (c.pool == t.pool && c.kind == 0)
+          std::printf("      class: %u units, first hand-out %+.1f, last hand-out %+.1f, last completion %+.1f us from the phase's publish (phase %.1f us)\n", c.units,
+                      c.first_us - ph.begin_us, c.last_grab_us - ph.begin_us, c.last_us - ph.begin_us, ph.end_us - ph.begin_us);
+    }
+  }
 }
 
 // The step's routing against the production router kernel on the same
@@ -1117,7 +1258,7 @@ DGPP_TEST(step_consumers_lead_sweep) {
 // run whose last layer is `L`: `S0` and `P0` the streams and pre entering that layer. Returns the
 // four counts: attention update, MoE normed rows, fused update (bitwise differences) and output
 // projection outputs beyond the fp8 reference's envelope of the production's attention row.
-struct MhcSiteCheck { size_t d1 = 0, dx = 0, d0 = 0, h_beyond = 0; };
+struct MhcSiteCheck { size_t d1 = 0, dx = 0, d0 = 0, h_beyond = 0, h_n = 0; };
 MhcSiteCheck check_mhc_layer(const Rig& rig, const Streamer& s, const StreamerConfig& cfg, int L, const uint16_t* S0, const float* P0) {
   const int rows = cfg.rows, H = rig.cfg.hidden_size, kCoeffs = 24;
   const size_t sn = static_cast<size_t>(rows) * 4 * H, hn = static_cast<size_t>(rows) * H;
@@ -1205,7 +1346,19 @@ MhcSiteCheck check_mhc_layer(const Rig& rig, const Streamer& s, const StreamerCo
   c.d1 = differ(out1, s1_step, sn);
   c.dx = differ(normed_f, x_step, hn);
   c.d0 = differ(out0, s0_step, sn);
-  // The attention site's normed row through the projection that read it: the step's h against the fp8 reference on the production row.
+  // The attention site's normed row through the projection that read it (the layer's first fp8
+  // projection reading x, wq_a; the output projection reads wo_a's y since the chain was wired):
+  // the step's y against the fp8 reference on the production row.
+  int x_pool = -1;
+  for (int P = dl.phase_begin; P < dl.phase_begin + dl.phase_count && x_pool < 0; ++P)
+    for (int i = 0; i < rig.dp.phases[static_cast<size_t>(P)].n_pools && x_pool < 0; ++i) {
+      const int pi = rig.dp.phases[static_cast<size_t>(P)].pools[i];
+      const DevPool& q = rig.dp.pools[static_cast<size_t>(pi)];
+      if (q.kind == kPoolFp8Matrix && q.in_src == 0 && q.k == H && !q.update_site) x_pool = pi;
+    }
+  require(x_pool >= 0, "the layer has an fp8 projection reading the attention site's row");
+  const DevPool& xp = rig.dp.pools[static_cast<size_t>(x_pool)];
+  const size_t xn = static_cast<size_t>(rows) * xp.rows;
   int32_t* tokens = nullptr;
   DGPP_CUDA_OK(cudaMalloc(&tokens, rows * 4));
   {
@@ -1219,23 +1372,24 @@ MhcSiteCheck check_mhc_layer(const Rig& rig, const Streamer& s, const StreamerCo
   g.count = rows;
   uint16_t* h_ref = nullptr;
   float *h_exact = nullptr, *h_mag = nullptr;
-  DGPP_CUDA_OK(cudaMalloc(&h_ref, hn * 2));
-  DGPP_CUDA_OK(cudaMalloc(&h_exact, hn * 4));
-  DGPP_CUDA_OK(cudaMalloc(&h_mag, hn * 4));
-  const uint8_t* hbase = rig.bases[static_cast<size_t>(L)] + hp.base;
-  step_ref::launch_fp8_matrix(hbase + hp.offsets[0], reinterpret_cast<const float*>(hbase + hp.offsets[1]), g, normed_a, H, hp.k, hp.rows, 32, h_ref,
+  DGPP_CUDA_OK(cudaMalloc(&h_ref, xn * 2));
+  DGPP_CUDA_OK(cudaMalloc(&h_exact, xn * 4));
+  DGPP_CUDA_OK(cudaMalloc(&h_mag, xn * 4));
+  const uint8_t* xbase = rig.bases[static_cast<size_t>(L)] + xp.base;
+  step_ref::launch_fp8_matrix(xbase + xp.offsets[0], reinterpret_cast<const float*>(xbase + xp.offsets[1]), g, normed_a, H, xp.k, xp.rows, 32, h_ref,
                               h_exact, h_mag, nullptr);
   DGPP_CUDA_OK(cudaDeviceSynchronize());
   {
-    std::vector<uint16_t> got(hn), ref(hn);
-    std::vector<float> exact(hn), mag(hn);
-    DGPP_CUDA_OK(cudaMemcpy(got.data(), h1_step, hn * 2, cudaMemcpyDeviceToHost));
-    DGPP_CUDA_OK(cudaMemcpy(ref.data(), h_ref, hn * 2, cudaMemcpyDeviceToHost));
-    DGPP_CUDA_OK(cudaMemcpy(exact.data(), h_exact, hn * 4, cudaMemcpyDeviceToHost));
-    DGPP_CUDA_OK(cudaMemcpy(mag.data(), h_mag, hn * 4, cudaMemcpyDeviceToHost));
-    for (size_t i = 0; i < hn; ++i)
+    std::vector<uint16_t> got(xn), ref(xn);
+    std::vector<float> exact(xn), mag(xn);
+    DGPP_CUDA_OK(cudaMemcpy(got.data(), s.proj() + xp.out_offset, xn * 2, cudaMemcpyDeviceToHost));
+    DGPP_CUDA_OK(cudaMemcpy(ref.data(), h_ref, xn * 2, cudaMemcpyDeviceToHost));
+    DGPP_CUDA_OK(cudaMemcpy(exact.data(), h_exact, xn * 4, cudaMemcpyDeviceToHost));
+    DGPP_CUDA_OK(cudaMemcpy(mag.data(), h_mag, xn * 4, cudaMemcpyDeviceToHost));
+    for (size_t i = 0; i < xn; ++i)
       if (got[i] != ref[i] && !step_ref::value_ok(got[i], exact[i], mag[i])) ++c.h_beyond;
   }
+  c.h_n = xn;
   for (void* ptr : {static_cast<void*>(s1_step), static_cast<void*>(s0_step), static_cast<void*>(x_step), static_cast<void*>(h1_step), static_cast<void*>(y_step),
                     static_cast<void*>(pre_a), static_cast<void*>(pre_f), static_cast<void*>(post_a), static_cast<void*>(post_f), static_cast<void*>(comb_a),
                     static_cast<void*>(comb_f), static_cast<void*>(lg), static_cast<void*>(post16), static_cast<void*>(comb16), static_cast<void*>(normed_a),
@@ -1262,6 +1416,160 @@ MhcSiteCheck check_mhc_layer(const Rig& rig, const Streamer& s, const StreamerCo
 // blocks and finish over the rig's state pool) must equal dsa_attn_listed over the window ring
 // and the main cache plus csa2_attn_finish on the same inputs, bitwise, on a window-only layer
 // (layer 0 alone) and on a layer with both sources (the last of kLayers), and repeat bitwise.
+// The projection chain against the production kernels (2026-11-01): one step with every consumer
+// and the attention, the last layer checked. Each fp8 projection against the reference matrix
+// from the input the plan wired (x, a pool's y, the attention's o block-diagonally for wo_a), and
+// each row tail against the production launches run on the step's own source y: the q norm
+// (csa2_rmsnorm_bf16, and the paired form csa2_norms_rope), the kv norm with its rotation
+// (csa2_norms_rope), the q rotation, slot lists and ring append (dsa_decode_tail_fp8block on a
+// copy of the ring taken before the run), the index q rotation (csa2_rope_apply) — bitwise, the
+// bodies being the same (kernels/csa2_norm.cuh, dsa_latent_append.cuh). The attention case
+// checks o from the rotated q and the appended ring. Without the hyper-connection sites: a site
+// rewrites x after wq_a and wkv read it, and their references read x after the run (the sites'
+// own case checks their rows; the attention case runs the chain with them).
+DGPP_TEST(step_projection_chain_matches_the_production_kernels) {
+  for (int layers : {1, kLayers}) {
+    auto rig = make_rig_mask(layers, (kConsumeAll & ~kConsumeMhc) | kConsumeAttention, /*tile_major=*/true);
+    require(rig->attn != nullptr, "the rig has the attention state");
+    const AttnState& A = *rig->attn;
+    // The layers checked: the last, and the last index source (its indexer projection and rotation).
+    std::vector<int> check_layers{layers - 1};
+    for (int l = layers - 2; l >= 0; --l) {
+      const DevLayer& xl = rig->dp.layers[static_cast<size_t>(l)];
+      bool index_source = false;
+      for (int P = xl.phase_begin; P < xl.phase_begin + xl.phase_count; ++P)
+        for (int i = 0; i < rig->dp.phases[static_cast<size_t>(P)].n_pools; ++i) {
+          const DevPool& q = rig->dp.pools[static_cast<size_t>(rig->dp.phases[static_cast<size_t>(P)].pools[i])];
+          if (q.kind == kPoolFp8Matrix && q.rope_heads && q.rope_head_stride == kAttnIndexDim) index_source = true;
+        }
+      if (index_source) { check_layers.push_back(l); break; }
+    }
+    std::vector<std::vector<uint8_t>> rings_before;  // the oracle appends into these copies
+    for (int L : check_layers) {
+      rings_before.emplace_back(A.ring_layer_bytes);
+      DGPP_CUDA_OK(cudaMemcpy(rings_before.back().data(), A.ring + static_cast<size_t>(L) * A.ring_layer_bytes, A.ring_layer_bytes, cudaMemcpyDeviceToHost));
+    }
+    Streamer s(rig->dp, rig->bases, rig->plans);
+    s.set_attention(A.params);
+    StreamerConfig cfg = design_config();
+    cfg.steps = 1;
+    cfg.rows = 5;
+    cfg.top_k = 6;
+    cfg.norm_eps = rig->cfg.rms_norm_eps;
+    const StreamReport r = s.run(cfg);
+    require(r.status == kStepOk, std::string("the kernel ended on ") + r.status_text);
+    const int rows = cfg.rows, lh = A.lh;
+    for (size_t li = 0; li < check_layers.size(); ++li) {
+    const int L = check_layers[li];
+    const std::vector<uint8_t>& ring_before = rings_before[li];
+    const DevLayer& dl = rig->dp.layers[static_cast<size_t>(L)];
+    std::vector<const DevPool*> fp8;
+    const DevPool *q_norm = nullptr, *kv_tail = nullptr, *q_proj = nullptr, *idx_proj = nullptr;
+    int attention_pools = 0;
+    for (int P = dl.phase_begin; P < dl.phase_begin + dl.phase_count; ++P)
+      for (int i = 0; i < rig->dp.phases[static_cast<size_t>(P)].n_pools; ++i) {
+        const DevPool& q = rig->dp.pools[static_cast<size_t>(rig->dp.phases[static_cast<size_t>(P)].pools[i])];
+        if (q.kind == kPoolFp8Matrix) {
+          fp8.push_back(&q);
+          if (q.rope_heads && q.rope_head_stride == kAttnLatent) q_proj = &q;
+          if (q.rope_heads && q.rope_head_stride == kAttnIndexDim) idx_proj = &q;
+        }
+        if (q.kind == kPoolAttention) { ++attention_pools; require(q.in_src == 1 && q.gate_pool >= 0, "the attention reads the chain's rotated q behind the kv tail"); }
+        if (q.kind != kPoolRowTail) continue;
+        if (q.append) kv_tail = &q;
+        else if (q.k > 0) q_norm = &q;
+      }
+    require(q_norm && kv_tail && q_proj, "the layer has the q norm, the kv tail and the rotating q projection");
+    require(attention_pools > 0, "the layer has attention pools");
+    int wired = 0, rotated = 0;
+    for (const DevPool* q : fp8) { wired += q->in_src != 0; rotated += q->rope_heads != 0; }
+    require(wired >= 3, "wq_b, wo_a and wo_b read the chain's outputs");
+    ProjCheck pc;
+    for (const DevPool* q : fp8) pc.add(check_projection(*rig, s, *q, L, rows, L == layers - 1));
+    std::printf("   chain projections of layer %d: %zu exact, %zu within the envelope, %zu beyond of %zu (%d of %zu from the chain, %d rotated)\n", L, pc.exact,
+                pc.ok, pc.bad, pc.n, wired, fp8.size(), rotated);
+    require(pc.bad == 0, "projection outputs beyond the reference's envelope inside the chain");
+    (void)idx_proj;
+    // The row tails: the production launches on the step's own source y.
+    auto src_of = [&](const DevPool& t) { return s.proj() + rig->dp.pools[static_cast<size_t>(t.in_pool)].out_offset; };
+    auto src_width = [&](const DevPool& t) { return rig->dp.pools[static_cast<size_t>(t.in_pool)].rows; };
+    auto device_copy = [&](const uint16_t* src, size_t n) {
+      uint16_t* d = nullptr;
+      DGPP_CUDA_OK(cudaMalloc(&d, n * 2));
+      DGPP_CUDA_OK(cudaMemcpy(d, src, n * 2, cudaMemcpyDeviceToDevice));
+      return d;
+    };
+    auto differ = [&](const DevPool& t, const uint16_t* oracle) {
+      const size_t n = static_cast<size_t>(rows) * t.rows;
+      std::vector<uint16_t> got(n), ref(n);
+      DGPP_CUDA_OK(cudaMemcpy(got.data(), s.proj() + t.out_offset, n * 2, cudaMemcpyDeviceToHost));
+      DGPP_CUDA_OK(cudaMemcpy(ref.data(), oracle, n * 2, cudaMemcpyDeviceToHost));
+      size_t d = 0;
+      for (size_t i = 0; i < n; ++i) d += got[i] != ref[i];
+      return d;
+    };
+    const uint8_t* lbase = rig->bases[static_cast<size_t>(L)];
+    const uint16_t* q_w = reinterpret_cast<const uint16_t*>(lbase + q_norm->base + q_norm->offsets[0]);
+    const uint16_t* kv_w = reinterpret_cast<const uint16_t*>(lbase + kv_tail->base + kv_tail->offsets[0]);
+    require(src_width(*q_norm) == q_norm->k && src_width(*kv_tail) == kv_tail->k && kv_tail->k == kAttnLatent, "the norms span their rows");
+    const size_t qn_n = static_cast<size_t>(rows) * q_norm->rows, kv_n = static_cast<size_t>(rows) * kv_tail->rows;
+    // The q norm alone (project_q_kv's unpaired path).
+    uint16_t* qn_ref = nullptr;
+    DGPP_CUDA_OK(cudaMalloc(&qn_ref, qn_n * 2));
+    csa2_rmsnorm_bf16(src_of(*q_norm), q_norm->rows, q_w, qn_ref, q_norm->rows, rows, q_norm->k, cfg.norm_eps, nullptr);
+    // The paired form: both norms and the kv rotation in one launch, on copies of the raw q and kv.
+    uint16_t* qn_pair = device_copy(src_of(*q_norm), qn_n);
+    uint16_t* kv_ref = device_copy(src_of(*kv_tail), kv_n);
+    csa2_norms_rope(qn_pair, q_norm->rows, q_w, q_norm->k, kv_ref, kv_tail->rows, kv_w, kv_tail->k, cfg.norm_eps, kAttnLatent - kAttnRope, kAttnRope, A.pos,
+                    A.inv_freq[static_cast<size_t>(L)], rows, nullptr);
+    // The decode tail: the slot lists and the kv append into the ring's copy (its q rotation runs on
+    // a scratch copy of the rotated q; the projection check above covers the epilogue rotation).
+    require(q_proj->rows == lh * kAttnLatent && q_proj->rope_heads == lh, "the q rotation covers the local heads");
+    uint16_t* q_ref = device_copy(s.proj() + q_proj->out_offset, static_cast<size_t>(rows) * q_proj->rows);
+    uint8_t* ring2 = nullptr;
+    int64_t* slots2 = nullptr;
+    int32_t *wl2 = nullptr, *wc2 = nullptr;
+    DGPP_CUDA_OK(cudaMalloc(&ring2, A.ring_layer_bytes));
+    DGPP_CUDA_OK(cudaMemcpy(ring2, ring_before.data(), A.ring_layer_bytes, cudaMemcpyHostToDevice));
+    DGPP_CUDA_OK(cudaMalloc(&slots2, static_cast<size_t>(rows) * 8));
+    DGPP_CUDA_OK(cudaMalloc(&wl2, static_cast<size_t>(rows) * A.window * 4));
+    DGPP_CUDA_OK(cudaMalloc(&wc2, static_cast<size_t>(rows) * 4));
+    dsa_decode_tail_fp8block(q_ref + (kAttnLatent - kAttnRope), q_proj->rows, kAttnLatent, lh, kAttnRope, A.pos, A.inv_freq[static_cast<size_t>(L)], slots2,
+                             A.ring_slots, A.window, wl2,
+                             wc2, nullptr, 0, kv_ref, A.req_ids, A.ring_table, ring2, kAttnLatent, rows, nullptr);
+    DGPP_CUDA_OK(cudaDeviceSynchronize());
+    const size_t d_qn = differ(*q_norm, qn_ref), d_qn_pair = differ(*q_norm, qn_pair), d_kv = differ(*kv_tail, kv_ref);
+    std::vector<uint8_t> ring_got(A.ring_layer_bytes), ring_ref(A.ring_layer_bytes);
+    DGPP_CUDA_OK(cudaMemcpy(ring_got.data(), A.ring + static_cast<size_t>(L) * A.ring_layer_bytes, A.ring_layer_bytes, cudaMemcpyDeviceToHost));
+    DGPP_CUDA_OK(cudaMemcpy(ring_ref.data(), ring2, A.ring_layer_bytes, cudaMemcpyDeviceToHost));
+    size_t d_ring = 0, changed = 0;
+    for (size_t i = 0; i < A.ring_layer_bytes; ++i) {
+      d_ring += ring_got[i] != ring_ref[i];
+      changed += ring_got[i] != ring_before[i];
+    }
+    std::vector<int32_t> wl_got(static_cast<size_t>(rows) * A.window), wl_ref(wl_got.size()), wc_got(static_cast<size_t>(rows)), wc_ref(static_cast<size_t>(rows));
+    DGPP_CUDA_OK(cudaMemcpy(wl_got.data(), A.wlist, wl_got.size() * 4, cudaMemcpyDeviceToHost));
+    DGPP_CUDA_OK(cudaMemcpy(wl_ref.data(), wl2, wl_ref.size() * 4, cudaMemcpyDeviceToHost));
+    DGPP_CUDA_OK(cudaMemcpy(wc_got.data(), A.wcounts, wc_got.size() * 4, cudaMemcpyDeviceToHost));
+    DGPP_CUDA_OK(cudaMemcpy(wc_ref.data(), wc2, wc_ref.size() * 4, cudaMemcpyDeviceToHost));
+    size_t d_lists = 0;
+    for (size_t i = 0; i < wl_got.size(); ++i) d_lists += wl_got[i] != wl_ref[i];
+    for (size_t i = 0; i < wc_got.size(); ++i) d_lists += wc_got[i] != wc_ref[i];
+    std::printf("   chain row tails of layer %d of %d, %d rows: q norm %zu (paired form %zu) of %zu differ, kv tail %zu of %zu; "
+                "ring %zu bytes differ from the decode tail's (%zu changed), slot lists %zu differ\n",
+                L, layers, rows, d_qn, d_qn_pair, qn_n, d_kv, kv_n, d_ring, changed, d_lists);
+    for (void* ptr : {static_cast<void*>(qn_ref), static_cast<void*>(qn_pair), static_cast<void*>(kv_ref), static_cast<void*>(q_ref), static_cast<void*>(ring2),
+                      static_cast<void*>(slots2), static_cast<void*>(wl2), static_cast<void*>(wc2)})
+      if (ptr) cudaFree(ptr);
+    require(d_qn == 0 && d_qn_pair == 0, "the q norm differs from the production norm");
+    require(d_kv == 0, "the kv tail differs from the production norm and rotation");
+    require(changed > 0, "the step appended nothing into the ring");
+    require(d_ring == 0, "the ring differs from the decode tail's append");
+    require(d_lists == 0, "the slot lists differ from the decode tail's");
+    }
+  }
+}
+
 DGPP_TEST(step_attention_matches_the_production_kernels) {
   for (int layers : {1, kLayers}) {
     auto rig = make_rig_mask(layers, kConsumeAll | kConsumeAttention, /*tile_major=*/true);
@@ -1292,6 +1600,13 @@ DGPP_TEST(step_attention_matches_the_production_kernels) {
       }
     require(n_win == 8, "the window source has eight splits");
     require((n_main > 0) == (A.main[static_cast<size_t>(L)] != nullptr), "the main source follows the layer's ratio");
+    // The queries: the chain's rotated q when the plan wired it (the row tail's y), else the rig's.
+    const uint16_t* q_in = A.q;
+    for (int P = dl.phase_begin; P < dl.phase_begin + dl.phase_count; ++P)
+      for (int i = 0; i < rig->dp.phases[static_cast<size_t>(P)].n_pools; ++i) {
+        const DevPool& q = rig->dp.pools[static_cast<size_t>(rig->dp.phases[static_cast<size_t>(P)].pools[i])];
+        if (q.kind == kPoolAttention && q.in_src == 1) q_in = s.proj() + rig->dp.pools[static_cast<size_t>(q.in_pool)].out_offset;
+      }
     // The production kernels on the same inputs.
     auto ws = [&](int n, float*& m, float*& l, float*& c, float*& mg, float*& lg, float*& cg, int32_t*& t) {
       const size_t ml = static_cast<size_t>(rows) * n * lh;
@@ -1303,13 +1618,13 @@ DGPP_TEST(step_attention_matches_the_production_kernels) {
     float *mw, *lw, *cw, *mgw, *lgw, *cgw, *mm = nullptr, *lm = nullptr, *cm = nullptr, *mgm = nullptr, *lgm = nullptr, *cgm = nullptr;
     int32_t *tw, *tm = nullptr;
     ws(n_win, mw, lw, cw, mgw, lgw, cgw, tw);
-    bool ok = dsa_attn_listed(A.q, A.ring + static_cast<size_t>(L) * A.ring_layer_bytes, A.req_ids, A.wlist, A.window, A.wcounts, rows, n_win, lh,
+    bool ok = dsa_attn_listed(q_in, A.ring + static_cast<size_t>(L) * A.ring_layer_bytes, A.req_ids, A.wlist, A.window, A.wcounts, rows, n_win, lh,
                               kAttnLatent, A.ring_slots, A.ring_table, 1, A.params.scale, mw, lw, cw, nullptr, LatentFormat::kFp8Block, nullptr, 0,
                               A.max_requests, kAttnSplitGroup, tw, mgw, lgw, cgw);
     require(ok, "the production listed kernel took the window");
     if (n_main) {
       ws(n_main, mm, lm, cm, mgm, lgm, cgm, tm);
-      ok = dsa_attn_listed(A.q, A.main[static_cast<size_t>(L)], A.req_ids, A.topk, A.index_topk, A.counts, rows, n_main, lh, kAttnLatent,
+      ok = dsa_attn_listed(q_in, A.main[static_cast<size_t>(L)], A.req_ids, A.topk, A.index_topk, A.counts, rows, n_main, lh, kAttnLatent,
                            A.epb[static_cast<size_t>(L)], A.block_tables, A.bpr, A.params.scale, mm, lm, cm, nullptr, LatentFormat::kFp4Block, nullptr,
                            0, A.blocks_total, kAttnSplitGroup, tm, mgm, lgm, cgm);
       require(ok, "the production listed kernel took the main cache");
@@ -1324,10 +1639,14 @@ DGPP_TEST(step_attention_matches_the_production_kernels) {
     DGPP_CUDA_OK(cudaMemcpy(ref.data(), o_ref, on * 2, cudaMemcpyDeviceToHost));
     size_t differ = 0;
     for (size_t i = 0; i < on; ++i) differ += got[i] != ref[i];
-    const StreamReport r2 = s.run(cfg);
+    // The same step again from a fresh streamer: one streamer's state (x, the streams) moves on
+    // between runs, and the queries come from it through the chain.
+    Streamer s2(rig->dp, rig->bases, rig->plans);
+    s2.set_attention(A.params);
+    const StreamReport r2 = s2.run(cfg);
     require(r2.status == kStepOk, std::string("the second run ended on ") + r2.status_text);
     std::vector<uint16_t> again(on);
-    DGPP_CUDA_OK(cudaMemcpy(again.data(), s.attn_o(), on * 2, cudaMemcpyDeviceToHost));
+    DGPP_CUDA_OK(cudaMemcpy(again.data(), s2.attn_o(), on * 2, cudaMemcpyDeviceToHost));
     size_t differ_again = 0;
     for (size_t i = 0; i < on; ++i) differ_again += got[i] != again[i];
     std::printf("   attention in the step, layer %d of %d (%s), %d rows x %d heads: %zu of %zu differ from the production kernels, %zu between runs\n", L,
@@ -1495,11 +1814,10 @@ DGPP_TEST(step_fold_matches_the_production_fold_on_two_ranks) {
   // oracle reads the step's folded partials as its h; the update moved behind the fold).
   {
     const MhcSiteCheck c = check_mhc_layer(*rig, *ranks[0], cfg2, 0, s0_in, one_hot);
-    // The envelope check recomputes one rank's projection and reads the folded h as beyond it by
-    // construction; the fold's arithmetic is the bf16(y1 + y1) check above.
-    std::printf("   production sites on the folded partials: attention update %zu differ, MoE normed rows %zu, fused update %zu (the output projection's envelope does not apply to a folded h: %zu beyond)\n",
-                c.d1, c.dx, c.d0, c.h_beyond);
-    bad += c.d1 + c.dx + c.d0;
+    // The fold's arithmetic is the bf16(y1 + y1) check above; the q projection on the site's row is rank 0's own.
+    std::printf("   production sites on the folded partials: attention update %zu differ, MoE normed rows %zu, fused update %zu, q projection on the site's row %zu beyond of %zu\n",
+                c.d1, c.dx, c.d0, c.h_beyond, c.h_n);
+    bad += c.d1 + c.dx + c.d0 + c.h_beyond;
     cudaFree(s0_in);
     cudaFree(one_hot);
   }
@@ -1536,14 +1854,14 @@ DGPP_TEST(step_mhc_sites_match_the_production_kernels) {
     require(r.status == kStepOk, std::string("the kernel ended on ") + r.status_text);
     const MhcSiteCheck c = check_mhc_layer(*rig, s, cfg, 0, s0_in, one_hot);
     std::printf("   mhc sites in the step, one layer, %d rows: attention update %zu differ of %zu, MoE normed rows %zu of %zu, fused update %zu of %zu, "
-                "output projection on the attention row %zu beyond the envelope of %zu\n",
-                rows, c.d1, sn, c.dx, sn / 4, c.d0, sn, c.h_beyond, sn / 4);
+                "q projection on the attention site's row %zu beyond the envelope of %zu\n",
+                rows, c.d1, sn, c.dx, sn / 4, c.d0, sn, c.h_beyond, c.h_n);
     cudaFree(s0_in);
     cudaFree(one_hot);
     require(c.d1 == 0, "the attention site's update differs from the production kernels'");
     require(c.dx == 0, "the MoE site's normed rows differ from the production kernels'");
     require(c.d0 == 0, "the fused update differs from the production kernel's");
-    require(c.h_beyond == 0, "the output projection did not read the attention site's row");
+    require(c.h_beyond == 0, "the q projection did not read the attention site's row");
   }
   // Three layers: the state entering layer 2 from a two-layer run, then layer 2 replayed.
   uint16_t* S0 = nullptr;

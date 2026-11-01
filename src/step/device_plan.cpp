@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <cstdio>
 #include <stdexcept>
+#include <string>
+#include <vector>
 
 namespace dgpp::step {
 
@@ -49,12 +51,26 @@ DevicePlan lower_plan(const std::vector<LayerPlan>& layers, uint32_t unit_bytes,
   if (unit_bytes == 0 || unit_bytes % 512 != 0) throw std::invalid_argument("lower_plan: unit_bytes must be a multiple of 512");
   const bool experts = (consumer_mask & kConsumeExperts) != 0, shared = (consumer_mask & kConsumeShared) != 0,
              projections = (consumer_mask & kConsumeProjections) != 0, router = (consumer_mask & kConsumeRouter) != 0,
-             mhc = (consumer_mask & kConsumeMhc) != 0, attention = (consumer_mask & kConsumeAttention) != 0;
+             mhc = (consumer_mask & kConsumeMhc) != 0, attention = (consumer_mask & kConsumeAttention) != 0,
+             chain = (consumer_mask & kConsumeChain) != 0;
   const bool consumers = consumer_mask != 0;
   DevicePlan dp;
   dp.unit_bytes = unit_bytes;
   uint32_t lead = 0;
+  // The pools by the range they were lowered from, for the chain's wiring (a layer's pools only).
+  std::vector<std::string> pool_names;
+  auto name_pool = [&](const std::string& name) {
+    pool_names.resize(dp.pools.size());
+    pool_names.back() = name;
+  };
+  size_t layer_pool_begin = 0;
+  auto find_pool = [&](const char* name) -> int {
+    for (size_t i = layer_pool_begin; i < pool_names.size(); ++i)
+      if (pool_names[i] == name) return static_cast<int>(i);
+    return -1;
+  };
   for (const LayerPlan& lp : layers) {
+    layer_pool_begin = dp.pools.size();
     DevLayer dl;
     dl.phase_begin = static_cast<int32_t>(dp.phases.size());
     dl.phase_count = static_cast<int32_t>(lp.phases.size());
@@ -123,8 +139,115 @@ DevicePlan lower_plan(const std::vector<LayerPlan>& layers, uint32_t unit_bytes,
             pool.update_site = 1;
           }
           add_pool(dp, d, pool);
+          name_pool(r.name);
           shared_pool.push_back(&r);
           shared_pool.push_back(scales);
+        }
+        // The projection chain's wiring (2026-11-01): the data flow of models/dsv41/csa2_layer.cu
+        // (project_q_kv, the decode tail, project_out). A dependent pool names the pool whose y
+        // it reads (in_pool) and its class opens on that pool's completion. Behind wq_a and wkv
+        // the row tails: the q norm, the kv norm with its rotation and ring append, the q and
+        // index-q rotations, each a pool of one unit a row writing its own y, so every stage's
+        // output stays for the production kernels to check it against.
+        if (projections && chain) {
+          auto find_range = [&](const char* name) -> const Range* {
+            for (const Range& c : lp.ranges)
+              if (c.phase == static_cast<int>(ph) && c.source == Source::Resident && c.consumer == Consumer::Norm && c.name == name) return &c;
+            return nullptr;
+          };
+          auto chain = [&](int pool, int src) {
+            DevPool& q = dp.pools[static_cast<size_t>(pool)];
+            if (q.k != dp.pools[static_cast<size_t>(src)].rows)
+              throw std::logic_error("lower_plan: " + pool_names[static_cast<size_t>(pool)] + " reads " + pool_names[static_cast<size_t>(src)] +
+                                     "'s y, whose width is not its inner width");
+            q.in_src = 1;
+            q.in_pool = src;
+            q.gate_kind = kGatePool;
+          };
+          auto tail_pool = [&](const std::string& name, const Range* norm, int src, int rope_heads, int rope_head_stride, int rope_off, bool append,
+                               int gate_pool) -> int {
+            const DevPool& sp = dp.pools[static_cast<size_t>(src)];
+            DevPool pool;
+            pool.kind = kPoolRowTail;
+            pool.group_kind = kGroupTokens;
+            pool.groups = 1;
+            pool.stride = 0;
+            if (norm) {
+              if (norm->cols != sp.rows)
+                throw std::logic_error("lower_plan: the norm " + norm->name + " is not the width of " + pool_names[static_cast<size_t>(src)] + "'s rows");
+              pool.base = norm->offset;
+              pool.bytes = align_grant(norm->offset + norm->bytes) - norm->offset;
+              pool.offsets[0] = 0;
+              pool.k = static_cast<int32_t>(norm->cols);
+              dp.fixed_bytes += static_cast<double>(norm->bytes_per_read()) * norm->reads;
+              shared_pool.push_back(norm);
+            }
+            if (rope_heads && rope_heads * rope_head_stride != sp.rows)
+              throw std::logic_error("lower_plan: the rotation of " + name + " does not cover its source's rows");
+            if (append && sp.rows != kAttnLatent) throw std::logic_error("lower_plan: the appended kv row of " + name + " is not the latent width");
+            pool.rows = sp.rows;  // the row width: its source's
+            pool.units_per_group = 1;  // a row a unit; the kernel multiplies by the step's rows
+            // A slabbed source's partials are summed by the tail's units (a row each, in slab order),
+            // not by a reduce class between the two: one dependent stage fewer on the chain.
+            if (sp.kind == kPoolFp8Matrix && sp.slabs > 1) dp.pools[static_cast<size_t>(src)].reduce_by_tail = 1;
+            pool.grab = 1;
+            pool.in_src = 1;
+            pool.in_pool = src;
+            pool.gate_pool = gate_pool;
+            pool.gate_kind = kGatePool;
+            pool.rope_heads = rope_heads;
+            pool.rope_head_stride = rope_head_stride;
+            pool.rope_off = rope_off;
+            pool.append = append ? 1 : 0;
+            pool.out_offset = dp.proj_elems;
+            dp.proj_elems += static_cast<uint32_t>(pool.rows) * kStepRows;
+            const int index = add_pool(dp, d, pool);
+            name_pool(name);
+            return index;
+          };
+          const int wq_a = find_pool("attn.wq_a.payload"), wq_b = find_pool("attn.wq_b.payload"), wkv = find_pool("attn.wkv.payload");
+          const int idx_wq_b = find_pool("attn.indexer.wq_b.payload");
+          const Range* q_norm = find_range("attn.q_norm");
+          const Range* kv_norm = find_range("attn.kv_norm");
+          // The q projections rotate their heads in the unit's epilogue (the decode tail's q rope and
+          // the indexer's: a class of its own at the phase's end cost 12-17 µs a layer, 2026-11-01).
+          auto epilogue_rope = [&](int pool, int head) {
+            DevPool& q = dp.pools[static_cast<size_t>(pool)];
+            if (q.rows % head != 0) throw std::logic_error("lower_plan: " + pool_names[static_cast<size_t>(pool)] + "'s rows are not whole heads");
+            if (q.slabs != 1) throw std::logic_error("lower_plan: the epilogue rotation of " + pool_names[static_cast<size_t>(pool)] + " needs the whole row in the unit (one slab)");
+            q.rope_heads = q.rows / head;
+            q.rope_head_stride = head;
+            q.rope_off = head - kAttnRope;
+          };
+          if (wq_a >= 0 && wq_b >= 0 && wkv >= 0 && q_norm && kv_norm) {
+            const int qn = tail_pool("attn.q_norm", q_norm, wq_a, 0, 0, 0, false, -1);
+            tail_pool("attn.kv_tail", kv_norm, wkv, 1, kAttnLatent, kAttnLatent - kAttnRope, true, -1);
+            chain(wq_b, qn);
+            epilogue_rope(wq_b, kAttnLatent);
+            if (idx_wq_b >= 0) {
+              chain(idx_wq_b, qn);
+              epilogue_rope(idx_wq_b, kAttnIndexDim);
+            }
+          }
+          // The output projections: wo_a reads the attention's o block-diagonally (group g's rows
+          // read the heads of group g), wo_b reads wo_a's y. The attention's units are the group
+          // before, so o is complete when the phase opens; wo_b's class opens on wo_a.
+          const int wo_a = find_pool("attn.wo_a.payload"), wo_b = find_pool("attn.wo_b.payload");
+          int attn_heads = 0;
+          for (size_t i = layer_pool_begin; i < dp.pools.size(); ++i)
+            if (dp.pools[i].kind == kPoolAttention) attn_heads = dp.pools[i].unit_rows;
+          if (wo_a >= 0 && attn_heads > 0) {
+            DevPool& q = dp.pools[static_cast<size_t>(wo_a)];
+            const int o_width = attn_heads * kAttnLatent;
+            if (q.k <= 0 || o_width % q.k != 0) throw std::logic_error("lower_plan: wo_a's inner width does not divide the attention output's");
+            const int groups = o_width / q.k;
+            if (q.rows % groups != 0 || (q.rows / groups) % kProjectionUnitRows != 0)
+              throw std::logic_error("lower_plan: wo_a's rows do not cut into whole unit blocks a head group");
+            q.in_src = 2;
+            q.in_group_rows = q.rows / groups;
+            q.in_group_cols = q.k;
+          }
+          if (wo_a >= 0 && wo_b >= 0) chain(wo_b, wo_a);
         }
         // A hyper-connection site as a consumer pool: the coefficient matrix, its
         // base and scale, and the sublayer's norm weight; a unit is one
@@ -236,8 +359,25 @@ DevicePlan lower_plan(const std::vector<LayerPlan>& layers, uint32_t unit_bytes,
             pool.offsets[0] = sink->offset;
             last_attention = d.n_pools;
             add_pool(dp, d, pool);
+            name_pool(r.name);
           }
           if (last_attention >= 0) dp.pools[static_cast<size_t>(d.pools[last_attention])].gate_arg = 1;
+          // The queries from the chain: wq_b's y, rotated in its units' epilogue; the class opens on
+          // the kv tail too (the ring holds the step's rows and their slot lists when the attention
+          // reads them).
+          const int wq_b = find_pool("attn.wq_b.payload"), kv_tail = find_pool("attn.kv_tail");
+          if (wq_b >= 0 && kv_tail >= 0 && last_attention >= 0 && dp.pools[static_cast<size_t>(wq_b)].rope_heads > 0) {
+            if (dp.pools[static_cast<size_t>(wq_b)].rows != static_cast<int32_t>(sink->cols) * kAttnLatent)
+              throw std::logic_error("lower_plan: the q rows are not the attention's local heads by the latent width");
+            for (int i = 0; i < d.n_pools; ++i) {
+              DevPool& q = dp.pools[static_cast<size_t>(d.pools[i])];
+              if (q.kind != kPoolAttention) continue;
+              q.in_src = 1;
+              q.in_pool = wq_b;
+              q.gate_pool = kv_tail;
+              q.gate_kind = kGatePool;
+            }
+          }
         }
         const Range* payload[3] = {nullptr, nullptr, nullptr};
         const Range* scales[3] = {nullptr, nullptr, nullptr};
@@ -323,6 +463,23 @@ DevicePlan lower_plan(const std::vector<LayerPlan>& layers, uint32_t unit_bytes,
         }
       }
       d.lead_seg_count = static_cast<int32_t>(dp.segments.size()) - d.lead_seg_begin;
+      // A gated pool's bytes as lead units: the units of the lead-only segments that cover its span
+      // (unit boundaries may take a neighbour's bytes; the units are numbered across the segments).
+      for (int i = 0; i < d.n_pools; ++i) {
+        DevPool& q = dp.pools[static_cast<size_t>(d.pools[i])];
+        if (q.gate_kind != kGatePool || q.kind != kPoolFp8Matrix || q.bytes == 0) continue;
+        uint32_t first = UINT32_MAX, last = 0;
+        for (int32_t si = d.lead_seg_begin; si < static_cast<int32_t>(dp.segments.size()); ++si) {
+          const DevSegment& sg = dp.segments[static_cast<size_t>(si)];
+          const uint64_t lo = std::max(sg.offset, q.base), hi = std::min(sg.offset + sg.bytes, q.base + q.bytes);
+          if (lo >= hi) continue;
+          first = std::min<uint32_t>(first, sg.unit_begin + static_cast<uint32_t>((lo - sg.offset) / unit_bytes));
+          last = std::max<uint32_t>(last, sg.unit_begin + static_cast<uint32_t>((hi - 1 - sg.offset) / unit_bytes) + 1);
+        }
+        if (first == UINT32_MAX) throw std::logic_error("lower_plan: a gated pool's bytes are not in its phase's lead-only segments");
+        q.stage_unit_begin = first;
+        q.stage_units = last - first;
+      }
       d.lead_units = lead_units;
       lead += lead_units;
       dp.part_elems = std::max(dp.part_elems, phase_part_elems);

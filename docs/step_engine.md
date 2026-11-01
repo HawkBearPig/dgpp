@@ -703,6 +703,93 @@ run (the lead paused, which cost the expert phase its staging when the
 staging class was the reason), measured as a set; its remaining cost is
 recorded against the item rather than hidden behind the mask alone.
 
+## The projection chain
+
+Until 2026-11-01 every fp8 projection of the step read the step's x rows,
+so the attention block's data flow was not the production's: wq_b read x
+where it reads the normed q, the output projections read x where they read
+the attention's o and wo_a's y, and the attention's queries, slot lists and
+ring rows were the rig's. The chain is now wired as the production layer
+computes it (`models/dsv41/csa2_layer.cu`: project_q_kv, the decode tail,
+project_out). A pool names the pool whose y it reads (`in_src`, `in_pool`:
+the step's x, a pool's y at its own row width, or the attention's o), and
+its compute class opens when that pool is complete (`kGatePool`: the compute
+units, and the reduce units when the pool is slabbed, plus a second gate
+`gate_pool` where one is needed). wq_b and the indexer's projection read the
+q norm's y; wo_a reads o block-diagonally (group g's rows read the heads of
+group g: `in_group_rows` rows of output per `in_group_cols` columns of input,
+so a unit's rows always fall in one group and its staged activations are keyed
+by the group); wo_b reads wo_a's y; the attention pools read wq_b's y and open
+when wq_b and the kv tail are complete.
+
+Between the projections run the row tails (`kPoolRowTail`, one unit a row,
+writing a y of their own so each stage's output stays for the checks): the q
+norm behind wq_a and the kv tail behind wkv, which norms the latent, rotates
+its last 64 and appends it into the window ring at the row's slot with the
+row's slot list and count, the decode tail's work. A row tail whose source is
+slabbed sums the source's slab partials itself, a row at a time in the
+reduce's slab order, so the source has no reduce class and the chain has one
+dependent stage fewer. The q projections rotate their heads in the unit's
+epilogue over its own output block (the decode tail's q rope; the lowering
+gives those pools one slab), which took a 12 to 17 µs class off the end of
+the qkv phase. The bodies are the production's: the row norm and the
+rotation's pair math moved from `kernels/csa2.cu` into
+`kernels/csa2_norm.cuh` (rmsnorm_kernel, norms_rope_kernel and the decode
+tail call them one block a row), the slot work and the fp8-block row append
+from `kernels/dsa.cu` into `kernels/dsa_latent_append.cuh`. The chain's
+test (`step_projection_chain_matches_the_production_kernels`) runs one step
+and checks, on the last layer and the last index source, every projection
+against the reference matrix from the input the plan wired, every row tail
+against the production launches run on the step's own source y
+(`csa2_rmsnorm_bf16` and the paired `csa2_norms_rope` for the norms,
+`dsa_decode_tail_fp8block` on a copy of the ring taken before the run for
+the rotation, the slot lists and the append): the norms, the kv tail, the
+ring and the lists bitwise, the projections exact or inside the envelope
+with the rotated references rotated in fp32 for the envelope; the
+attention case checks o from the chain's q and the appended ring, bitwise,
+and repeats bitwise from a fresh streamer (one streamer's state moves on
+between runs now that the queries come from it).
+
+The cost. A dependent pool cannot start until its producer's last unit is
+done, so the group's bytes stream in two waves where they interleaved
+before, and the hand-out of a gated class waits on the gate besides. Layer
+3's qkv phase at five rows: wq_a's 50 units to 49 µs (a unit 30 µs mean,
+the wave DRAM-bound), the q norm to 62, wq_b's 64 units handed out from 59
+and complete at 104 to 128 before its bytes were staged; the attention
+output's group wo_a to 43 and its reduce to 50, wo_b from 49 to 95 and its
+reduce to 110, the fold's trigger 15 to 20 µs later than before. Two
+levers landed with the chain. A gated pool's bytes are staged into L2 by
+the workers the producer's tail leaves idle (a staging class per gated
+pool, after the phase's own classes, closed when the gate opens with its
+rest credited as done): wq_b's 10.5 MB are hot when its gate opens, yet
+its units run 16.7 µs mean for 161 KB (9.8 GB/s a unit), about the rate a
+one-block projection unit reads at from DRAM, because under the stream an
+L2 hit's latency is the saturated L2's and the unit is bound by its bytes
+in flight, not their source; the class still shortened from 55 to 45 µs
+through the first wave. The row tails sum their source's slabs, which took
+wq_a's and wkv's reduce classes (13 and 5 units, 6 to 13 µs) off the
+chain. What remains for the dependent pools is the unit form: more bytes
+in flight a block from L2 (a deeper ring, which the kernel's 255 registers
+do not leave room for today), or finer K-slabs for the gated pools whose
+reduce a row tail absorbs, so their waves fill 47 workers. The
+chain's cost was measured in one window three ways (production down, the
+clock locked): the rate case wired (`kConsumeChain` is in the rate gates'
+set, since the chain is what ships) tile-major 73.4 to 76.0 and row-major
+70.1 to 71.1; the same binary with the chain unwired
+(`step_consumers_rate_unwired`, every projection reading x as before)
+77.9 to 79.1; the committed tree's binary from before the chain 79.0 to
+79.9 and 73.5 to 74.5. So the chain costs about four points and the binary
+none, once the class table was built in one pass over the pools (a second
+walk for the staging classes had cost the chain about 9 µs a group, seen
+as the empty attend phase of the no-attention rig taking 24 µs where it
+took 15). The rate gates stand at 72 and 68, the unwired case at 76 as the
+binary's canary. Open against the chain: the dependent pools' unit form
+(more bytes in flight a block, or K-slabs the attention or a row tail
+sums, so their waves fill 47 workers), and the class tables built once per
+kernel launch by the workers rather than by the chain before each group,
+which would take the table's latency off every short group (the empty
+attend phase of this rig, the accumulate, the latency phases).
+
 ## The fold
 
 The fold is the TP all-reduce at each layer's two boundaries. The bus
