@@ -16,6 +16,9 @@ void minimax_add_norm(uint16_t* residual, const uint16_t* add, const uint16_t* w
                       uint16_t* out, int rows, int hidden, float eps, cudaStream_t);
 void minimax_swiglu(const uint16_t* gate, const uint16_t* up, uint16_t* out, int64_t count,
                     float alpha, float limit, cudaStream_t);
+// Upstream CUDA's FP32 power and reciprocal, without a double intermediate.
+// count may include unused tail frequencies in a partial-rotary draft table.
+void minimax_rope_inv_freq(float* out, int count, int rotary_dim, float theta, cudaStream_t);
 // x and y are [rows,heads,128], in-place allowed. Gemma norm rounds before
 // the partial rotation; cos/sin and the rotation arithmetic stay FP32.
 void minimax_norm_rope(const uint16_t* x, const uint16_t* weight, uint16_t* y, const int64_t* pos,

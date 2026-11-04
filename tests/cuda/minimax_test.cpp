@@ -1,6 +1,7 @@
 #include "kernels/minimax.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
@@ -372,7 +373,29 @@ void dspark_kernels() {
                            QR, QH, KH, HD, 1 / std::sqrt(128.0f), partial.p, out.p, nullptr, true);
   near(out.get(), expected, .0002, "DSpark FP32-P 16:1 block attention");
 }
+void rotary_frequencies() {
+  // Independent CUDA PyTorch float32 recipe at the published theta.
+  // Double pow -> float differs in 14 of these 32 entries and drifts by
+  // up to 0.03125 radians at the million-token position limit.
+  constexpr uint32_t expected[] = {
+      0x3f800000u, 0x3f1ab32bu, 0x3ebaf81bu, 0x3e61f835u, 0x3e088d77u, 0x3da50956u, 0x3d47763fu,
+      0x3cf11177u, 0x3c91ad39u, 0x3c301052u, 0x3bd4ca15u, 0x3b80967du, 0x3b1b690du, 0x3abbd3edu,
+      0x3a6301e2u, 0x3a092e02u, 0x39a5cb60u, 0x394860c1u, 0x38f22ce2u, 0x3892587eu, 0x3830df52u,
+      0x37d5c441u, 0x37812dabu, 0x371c1fc4u, 0x36bcb0c1u, 0x36640cc6u, 0x3609cf4au, 0x35a68e4cu,
+      0x35494c56u, 0x34f3499du, 0x3493048eu, 0x3431af44u};
+  // Exercise both the target's half table and the draft's overallocated
+  // full-head table. The used frequencies must be identical.
+  for (int count : {32, 64}) {
+    Device<float> table(count);
+    minimax_rope_inv_freq(table.p, count, 64, 10000000, nullptr);
+    const auto values = table.get();
+    for (int i = 0; i < 32; ++i)
+      require(std::bit_cast<uint32_t>(values[i]) == expected[i],
+              "MiniMax CUDA rotary frequency rounding");
+  }
+}
 void kernels() {
+  rotary_frequencies();
   minimax_pdl_test();
   dspark_kernels();
   {

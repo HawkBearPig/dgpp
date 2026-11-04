@@ -65,12 +65,8 @@ struct MinimaxAttentionLayer::Impl : Scratch {
     l = alloc<float>(partial);
     c = alloc<float>(partial * 128);
     inv = alloc<float>(cfg.rotary_dim / 2);
-    std::vector<float> table(static_cast<size_t>(cfg.rotary_dim / 2));
-    for (int i = 0; i < cfg.rotary_dim / 2; ++i)
-      table[i] = static_cast<float>(
-          1.0 / std::pow(cfg.rope_theta, static_cast<double>(2 * i) / cfg.rotary_dim));
-    DGPP_CUDA_OK(
-        cudaMemcpy(inv, table.data(), table.size() * sizeof(float), cudaMemcpyHostToDevice));
+    minimax_rope_inv_freq(inv, cfg.rotary_dim / 2, cfg.rotary_dim, cfg.rope_theta, nullptr);
+    DGPP_CUDA_OK(cudaStreamSynchronize(nullptr));
   }
 };
 MinimaxAttentionLayer::MinimaxAttentionLayer(const MinimaxConfig& c, const MinimaxLocalGeometry& g,

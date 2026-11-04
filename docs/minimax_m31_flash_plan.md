@@ -856,3 +856,25 @@ same executable hash. Operation streams match at
 `e22f0665393a2178ab90e4a3c5b63dca` (plain) and
 `e11d9bbe2a3a386e5f3a029e735f9103` (DSpark). These are correctness probes,
 not published throughput measurements.
+
+### Text and draft rotary frequency precision
+
+The vision precision investigation exposed a related target/draft issue:
+both initially built inverse frequencies with double-precision powers and
+then cast to FP32. The independent CUDA text reference also explicitly used
+FP64 for that operation. The pinned SGLang CUDA recipe computes the power
+and reciprocal in FP32 and retains FP32 cosine/sine tables. At theta 1e7,
+the two constructions differ in 14 of 32 frequencies. At position 1,048,575
+the largest angle difference is 0.03125 radians, with a cosine difference
+of 0.0167959. The earlier numerical results therefore describe the initial
+frequency recipe rather than exact upstream rotary arithmetic.
+[SGLang rotary construction](https://github.com/sgl-project/sglang/blob/58484246d26523eaf1a7f16ab524deee288d2120/python/sglang/srt/layers/rotary_embedding/base.py).
+
+Target and MiniMax DSpark now build frequencies with the CUDA FP32 recipe;
+other draft families keep their existing construction. The text oracle is
+corrected independently and records the recipe in its metadata. A fixed
+CUDA-reference vector rejects the old construction for both target and
+draft table sizes. All 27 selected CTest gates pass, including the image
+session tests and all 21 shared drafter cases; CUDA memcheck reports zero
+errors and the PDL audit covers 398 kernels. Full-checkpoint teacher scoring
+is repeated after this arithmetic correction.

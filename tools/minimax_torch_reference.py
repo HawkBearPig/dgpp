@@ -109,8 +109,11 @@ class Reference:
 
     def rotary(self, x):
         d = self.c['rotary_dim']
-        inv = (1 / torch.pow(torch.tensor(self.c['rope_theta'], device='cuda', dtype=torch.float64),
-                            torch.arange(0,d,2,device='cuda',dtype=torch.float64)/d)).float()
+        # Published CUDA recipe: FP32 exponent, power and reciprocal. A
+        # double intermediate changes 14/32 frequencies at theta=1e7 and
+        # causes material phase drift near the million-token limit.
+        inv = 1 / torch.pow(self.c['rope_theta'],
+                            torch.arange(0,d,2,device='cuda',dtype=torch.float32)/d)
         angle = torch.arange(x.shape[0],device='cuda',dtype=torch.float32)[:,None]*inv[None,:]
         cs, sn = angle.cos()[:,None,:], angle.sin()[:,None,:]
         lo, hi = x[...,:d//2].float(), x[...,d//2:d].float()
@@ -194,6 +197,8 @@ class Reference:
             raise ValueError('engine/reference TP worlds differ')
         if metadata.get('residual_norm', 'bf16') != ('bf16' if self.rounded_residual else 'fp32'):
             raise ValueError('engine/reference residual-normalization recipes differ')
+        if metadata.get('rope_inv_freq') != 'cuda-fp32':
+            raise ValueError('engine/reference rotary frequency recipes differ; collect a new trace')
         rows, hidden = len(metadata['tokens']), self.c['hidden_size']
         metrics, failures = [], []
 
@@ -282,7 +287,7 @@ class Reference:
             folder.mkdir(parents=True,exist_ok=True)
             (folder/'metadata.json').write_text(json.dumps(dict(world=self.world,ids=case['ids'],rounded_residual=self.rounded_residual,
                 projection_rows=self.projection_rows,
-                projection_backend=self.projection_backend,
+                projection_backend=self.projection_backend,rope_inv_freq='cuda-fp32',
                 score_from=score_from,
                 backend='pytorch independent FP32 attention', torch_version=torch.__version__,
                 checkpoint=self.checkpoint,config_sha256=self.config_sha256),indent=2)+'\n')

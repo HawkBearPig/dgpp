@@ -225,8 +225,9 @@ int main(int argc, char** argv) {
             write(path / ("routes-" + std::to_string(l) + ".i32"), out.route_ids[moe++]);
         }
         std::ofstream meta(path / "metadata.json");
-        meta << "{\"residual_norm\":\"fp32\",\"world\":" << world << ",\"rank\":" << rank
-             << ",\"score_from\":" << score_from << ",\"vocab_begin\":" << out.lm_vocab_begin
+        meta << "{\"residual_norm\":\"fp32\",\"rope_inv_freq\":\"cuda-fp32\",\"world\":" << world
+             << ",\"rank\":" << rank << ",\"score_from\":" << score_from
+             << ",\"vocab_begin\":" << out.lm_vocab_begin
              << ",\"vocab_count\":" << out.lm_vocab_count << ",\"tokens\":[";
         for (size_t t = 0; t < ids.size(); ++t) meta << (t ? "," : "") << ids[t];
         meta << "]}\n";

@@ -22,6 +22,14 @@ __device__ float max_warp(float x) {
 __device__ float rb(float x) {
   return bf16_bits_to_float(float_to_bf16_bits(x));
 }
+__global__ void rope_inv_freq_kernel(float* out, int count, int rotary, float theta) {
+  dgpp_pdl_wait();
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < count) {
+    const float exponent = __fmul_rn(float(2 * i), __fdiv_rn(1.0f, float(rotary)));
+    out[i] = __fdiv_rn(1.0f, powf(theta, exponent));
+  }
+}
 __global__ void compact_segments_kernel(const MoeSegment* input, MoeSegment* output, int experts,
                                         int capacity) {
   dgpp_pdl_wait();
@@ -304,6 +312,13 @@ __global__ void router_select_kernel(const float* scores, const float* bias, int
 }
 }  // namespace
 
+void minimax_rope_inv_freq(float* out, int count, int rotary, float theta, cudaStream_t stream) {
+  if (count <= 0 || count > 64 || rotary <= 0 || rotary > 128 || rotary % 2 ||
+      !std::isfinite(theta) || theta <= 0)
+    throw std::invalid_argument("MiniMax rotary frequency geometry");
+  rope_inv_freq_kernel<<<1, 64, 0, stream>>>(out, count, rotary, theta);
+  DGPP_CUDA_OK(cudaGetLastError());
+}
 void minimax_compact_segments(const MoeSegment* input, MoeSegment* output, int experts,
                               int capacity, cudaStream_t stream) {
   if (!input || !output || input == output || experts < 1 || experts > 1024 || capacity < 1 ||

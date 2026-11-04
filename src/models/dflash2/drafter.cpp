@@ -95,7 +95,10 @@ void DFlash2Drafter::init(const DFlash2Host& h, const DFlash2Config& cfg, DFlash
             std::pow(theta, -static_cast<double>(2 * i) / static_cast<double>(cfg_.rotary_dim)));
     }
     DGPP_CUDA_OK(cudaMalloc(&df_inv_freq_, host.size() * 4));
-    DGPP_CUDA_OK(cudaMemcpy(df_inv_freq_, host.data(), host.size() * 4, cudaMemcpyHostToDevice));
+    if (cfg_.backbone == DFlash2Config::Backbone::MiniMaxM3)
+      minimax_rope_inv_freq(df_inv_freq_, host.size(), cfg_.rotary_dim, cfg_.rope_theta, h.stream);
+    else
+      DGPP_CUDA_OK(cudaMemcpy(df_inv_freq_, host.data(), host.size() * 4, cudaMemcpyHostToDevice));
   }
   // Feature path at rows_cap rows; the block forward at BR = df_batch_ *
   // query_rows stacked rows (the stacked draft batch widens the row-wise
