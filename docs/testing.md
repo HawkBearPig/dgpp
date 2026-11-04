@@ -1,5 +1,27 @@
 # Tests
 
+`scheduler_prefixCache_cancelledHistoryRandomizedReplay` replays 512 fixed
+seeds twice across speculative batch cuts, delivered-tail truncation, edited
+histories, lookahead identity and small arenas. The NVMe cancellation tests
+check that retained snapshots stay reclaimable during another request's
+growth, remain reusable in memory and leave normal completion spills intact.
+`serve_cancel_prefix_check_test` tests the diagnostic client's SSE transport,
+Unicode/whitespace preservation, disconnect retirement and cold controls.
+Run `scripts/serve_cancel_prefix_check.py` on an idle serving world to compare
+actual rerendered interrupted histories with cold replies; pass the source
+revision, binary hash and an output path for its detailed JSON report.
+`--thinking` uses the template's native reasoning mode, including always-on
+templates, and `--require-answer-hit` requires at least one cancelled reply
+to produce a deeper hit. The report distinguishes
+answer-prefix hits from earlier prompt hits; retained state may sit at no
+cut of the resubmitted history, especially with one-token snapshot alignment.
+The probe requires exact cached/cold text, finish reasons and completion-token
+counts, and retains its partial report on failure. DSA models can differ when
+cached decode state and cold prefill use different arithmetic shapes; see
+[greedy transcripts and chunk shape](numerics.md#greedy-transcripts-and-chunk-shape).
+Pin admission budgets for comparisons and use a base-revision normal-completion
+control to distinguish existing numerical differences from a retention regression.
+
 `nvme_cache_test` checks reuse of an existing binding after build/settings
 changes, adoption and exact-token lookup through the host disk index, legacy
 index encoding, and non-destructive refusal of missing or incompatible files.

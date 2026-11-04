@@ -2135,6 +2135,32 @@ int main() {
     }
     std::puts("ok 10 - the NVMe cold tier: spill, evict, restore and attach through the "
               "journal's return path, identical on every rank");
+    {
+      g_fake_arena_slots = 4;
+      g_fake_disk_pages = 64;
+      FabricRig rig;
+      test_disconnect_cancel(rig);
+      require(rig.oplog.text().find("X close ") != std::string::npos,
+              "disconnect retains its committed snapshot on every rank");
+      require(rig.oplog.text().find("X spill ") == std::string::npos,
+              "disconnect does not start an NVMe spill");
+      Client next(rig.port());
+      next.send_all(post_request("/v1/chat/completions",
+          R"({"model":"glm-5.3-flash-fp8","messages":[{"role":"user","content":"abcdefgh-more"}],"max_tokens":1})"));
+      const std::string reply = next.read_until("\"cached_tokens\":8", 5000);
+      require(reply.find("200 OK") != std::string::npos &&
+                  reply.find("\"cached_tokens\":8") != std::string::npos,
+              "the follow-up reports the reused prefix");
+      wait_metrics(rig, "\"tokens_saved\":8");
+      rig.stop();
+      rig.require_oplogs_agree("cancelled snapshot reuse");
+      require(rig.oplog.text().find("X attach ") != std::string::npos,
+              "the follow-up reuses the cancelled snapshot through the journal");
+      for (const auto& peer : rig.peers) require(peer->error.empty(), peer->error);
+      g_fake_arena_slots = 0;
+      g_fake_disk_pages = 0;
+    }
+    std::puts("ok 11 - cancelled snapshots retain, reuse and stay out of spills identically on every rank");
     std::puts("fabric_serve_test: ALL PASS");
     return 0;
   } catch (const std::exception& e) {
