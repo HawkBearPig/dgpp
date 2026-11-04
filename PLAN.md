@@ -7,7 +7,8 @@ text corpus checks pass across 28,329 scored positions with no argmax changes;
 distributed media, cache and batch-isolation checks pass. Tested activation
 quantization recipes fail the unchanged numerical gates and are rejected.
 Release validation still requires the large-pool, task-quality, long-context
-and full-suite checks, followed by the final tuned-template campaign. See
+checks, followed by the final tuned-template campaign. The full local test
+suite and video-enabled/disabled build checks pass. See
 the [implementation record](docs/minimax_m31_flash_plan.md) and
 [deployment notes](docs/model_cards/MiniMax-M3.1-Flash.md).
 
@@ -140,12 +141,13 @@ preserving Qwen PLE padding and segmentation. The correction passes host tests
 and was exercised in a real TP2 replay. It does not resolve the near-limit
 retrieval failure in issue #4.
 
-The server uses a shared scheduler, text frontend and decode engine for
-three model families. Rank 0 accepts HTTP requests and journals scheduler
+The server uses a shared scheduler, text frontend and decode engine across
+the model families below. Rank 0 accepts HTTP requests and journals scheduler
 operations to its peers. Every rank checks the operation-stream digest.
 
 | family | implemented paths | deployment constraints |
 |---|---|---|
+| MiniMax M3.1 Flash | Native NVFP4 experts and MXFP8 dense weights, BF16 activations and K/V, FP32 routers, block-sparse attention with an exact per-token index, seven-proposal DSpark, graph decode, prefix cache, recursive tools, images and MP4/WebM video | Four nodes, eight request slots and a 768K shared token pool. The learned draft block stays at seven proposals; verification may use fewer. Release measurements and long-context validation are pending; see [the model card](docs/model_cards/MiniMax-M3.1-Flash.md). |
 | GLM-5.3-Flash | KDA and DSA attention, mHC, FP8 and hybrid NVFP4 experts, resident loading, graph decode, prefix cache and MTP | The full model needs four Sparks for resident serving. Batched decode has an eight-row limit; MTP depths 2–3 use scalar graphs |
 | Qwen3.8-Flash-Next | GDN, QSA, gated residuals, PLE n-gram embeddings, FP8, NVFP4 and AutoRound int4 (GPTQ g128) experts with the int8 g128 head, optional FP8 dense projections, graph decode, prefix cache and MTP | FP8 deployment templates use two or four nodes. Single-node NVFP4 serving maps the n-gram table from NVMe. Batched decode supports 64 rows, including sixteen slots at MTP depth 3 with scheduled verification disabled; default fixed-depth compaction reduces wide graphs within their numerical dispatch range, with scalar fallback when no physical family fits. Shared prefill continuation gives decode a turn between chunks, with early text admission enabled by default |
 | GLM-4.7 | Paged GQA, partial RoPE, NVFP4 dense and expert weights, draft-layer requantization, graph decode, prefix cache and MTP | Four-node serving is measured. The engine supports up to 32 batched decode rows, including deeper MTP; the supplied default recipe uses depth 1 |
@@ -166,11 +168,12 @@ output, sampling controls, generated-token logprobs, stop strings and
 multiple chat choices.
 Prompt-token scoring remains pending; non-null `prompt_logprobs` requests
 are rejected explicitly on both completion endpoints.
-Unsupported fields are rejected by name. GLM-5.3-Flash and Qwen3.8-Flash-Next
-support PNG/JPEG/WebP image inputs with native vision encoders, journaled RGB
+Unsupported fields are rejected by name. GLM-5.3-Flash, Qwen3.8-Flash-Next,
+Qwen3.8-27B and MiniMax M3.1 Flash support PNG/JPEG/WebP image inputs with native vision encoders, journaled RGB
 pixels, streaming and MTP. Image requests support prefix caching and
 resumable prefill, and bypass grouped prefill; see
-[image inputs](docs/vision.md). Audio and video inputs are unsupported.
+[image inputs](docs/vision.md). MiniMax also accepts native MP4/WebM video.
+Audio inputs are unsupported.
 Vision arithmetic now follows the CUDA BF16 eager reference, with fixed
 full-encoder and isolated-operation gates. The
 numerical investigation
@@ -336,9 +339,8 @@ silent-node-loss detection, wider batching for GLM-5.3-Flash, arbitrary
 slot subsets for oversized batches, and
 model-specific performance experiments. See
 [next steps](docs/next_steps.md) for the scope and validation needed for
-each. Failover, data-parallel routing, cross-instance prefix sharing and
-image-aware prefix identities, additional vision backends, audio and video
-execution remain future work.
+each. Failover, data-parallel routing, cross-instance prefix sharing, additional
+vision backends and audio execution remain future work.
 
 The DeepSeek inference study
 adds payload-dependent graph consumer widths and uses 4,096-token

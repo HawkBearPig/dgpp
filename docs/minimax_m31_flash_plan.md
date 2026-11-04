@@ -1,7 +1,10 @@
 # MiniMax M3.1 Flash implementation and optimization plan
 
 Investigated 2026-11-04 against dgpp `403d3f987964f6cd548348316c86520fb700ec71`.
-Status: implementation in progress on the feature branch; real-checkpoint text validation underway.
+Status: text, tools, DSpark, image and video support implemented on the feature
+branch. Numerical and local regression gates pass; deployment tuning, task
+quality and long-context release validation remain in progress. The initial
+plan below is followed by the implementation and measurement record.
 
 Implement `MiniMaxAI/MiniMax-M3.1-Flash` as a new model family on the shared
 engine, initially at TP4. Keep its published NVFP4 experts and MXFP8 dense
@@ -1207,11 +1210,47 @@ selected integration/reference targets also pass. Graph microbenchmarks use
 recorded normalized activations and actual TP4 rank-zero checkpoint weights
 at layers 3, 17 and 59, with five interleaved timing trials per shape.
 
-The 16-row ring improves the single-row MoE by 8.5%, 8.5% and 12.3% in these
-three layers. Four-row gains are 1.6%, 3.8% and 3.5%; two-row changes range
+The initial 16-row ring gives single-row MoE speedups of 1.085×, 1.085× and
+1.123× in these three layers. Four-row speedups are 1.016×, 1.038× and 1.035×;
+two-row changes range
 from a 0.6% regression to a 2.3% gain. Eight-row results are mixed, including
 a 6.0% regression in layer 3, and all three 16-row cases regress. A 32-row
 ring brings no material gain and is removed. The retained dispatch selects
 16 only for one to four rows, and 64 otherwise. These are isolated MoE
 latencies, not serving throughput; final dispatch and end-to-end validation
 follow before release.
+
+
+### Final kernel and local regression gates
+
+The clean native release from `7386ec340afba7f19733ac26b11f3bef38bc83d3`
+produces server SHA-256
+`ac9ec90442f5b776e75081e277994dabaa5f059eb89259a7de3da2b0b19e74ec`.
+The full native build also passes with warnings treated as errors.
+
+The final expert dispatch is re-measured at layers 3, 17 and 59 on ten row
+counts from 1 through 64, five interleaved trials each. Outputs are bit-exact
+against the existing 64-row ring for every shape. Single-row speedups are
+1.089×, 1.081× and 1.089×; two-row speedups are 1.026×, 1.022× and 1.022×;
+four-row speedups are 1.015×, 1.038× and 1.035×. Wider rows select the original
+kernel. All four default NVFP4/MXFP4, BF16/FP32-output variants retain identical
+machine-code words. Final MXFP4 ragged-segment checks also pass the FP64 oracle,
+with zero memcheck errors and zero racecheck hazards for both tile sizes.
+These remain isolated kernel timings, not deployment throughput.
+
+The serial CTest run covers 381 entries: 364 pass and 17 initially skip for
+missing optional checkpoint metadata. All 17 subsequently pass with pinned
+metadata downloaded into an isolated test cache: eight tokenizer suites,
+two DeepSeek prompt renderers, six chat-template suites and the GLM vision
+frontend. The template suites cover seven cached Jinja families, including
+MiniMax. This exposed stale MiMo test inputs that used newline-separated XML
+although its production grammar already uses compact XML; the fixtures now
+exercise the existing compact dialect and retain the negative constraints.
+The release binary's service, full grouped-MoE and MiniMax video suites pass
+separately. The production decoder and grammar are unchanged by that fixture
+correction.
+
+Both `DGPP_ENABLE_VIDEO=OFF` and the restored `ON` build pass their frontend
+and service checks. With video disabled, real-checkpoint still images work,
+the capability declaration omits video, and video requests fail by field
+name with the build-option reason. With video enabled, both media paths work.

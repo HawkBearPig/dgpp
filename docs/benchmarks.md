@@ -317,7 +317,7 @@ a row exactly.
 | Repetitions | Three per class and concurrency | One cold request, then two identical requests |
 | Sampling | Greedy, temperature zero | Greedy, temperature zero |
 | Thinking | Disabled where supported; full GLM-5.3 uses its reasoning mode | Server default |
-| Cold-prefill thinking | GLM probes use the server default; other families disable thinking | Server default |
+| Cold-prefill thinking | Disabled where supported; GLM and MiniMax probes use the recorded server default | Server default |
 | Prefix cache | Enabled; repetitions reuse prompts | Enabled; first request must report zero cached tokens |
 | Concurrency | C1/C2/C4/C8; mode comparisons use C1 | C1 |
 | Summary | Range across five class medians | Median across three requests; cold prefill is the first request |
@@ -339,7 +339,15 @@ One template, measured as shipped on the bench port, yields every row the tables
 | Long context (decode at context, prefill per bucket) | 0 / 32K / 64K / 128K / 256K / 512K parcel documents: one cold request, two identical | `serve_context_matrix.py` |
 | Quality | the 300-item HumanEval / GSM8K / extraction set at the deployment's slot count; a response cut at the standard cap is asked once more at the 8,192 retry cap (counted in its own column, never scored) | `serve_eval.py` |
 | Transcript checks | the API check; five classes × three greedy transcripts in the shipped mode and again in a second boot without the drafter (the plain/default match); prompt 0 alone against beside slots−1 others (the isolation check) | `serve_api_check.py`, `serve_load.py` |
-| Decode modes | a boot per extra mode (`--mode NAME="<knobs>"`): the C1 sweep; the DSpark columns boot with `--mtp-depth N --no-mtp-schedule` (a fixed verify depth; a scheduled template refuses a fixed depth without the second flag) and the plain column with `--no-mtp` | `timed_load.py` |
+| Decode modes | a boot per extra mode (`--mode NAME="<knobs>"`): the C1 sweep; DeepSeek DSpark columns boot with `--mtp-depth N --no-mtp-schedule` (a fixed verify depth; a scheduled template refuses a fixed depth without the second flag) and the plain column with `--no-mtp` | `timed_load.py` |
+
+MiniMax keeps its learned DSpark block at `--mtp-depth 7`. To measure a
+fixed smaller verification depth N, use `--mtp-schedule
+--mtp-schedule-min-depth N --mtp-schedule-options 2
+--mtp-schedule-lambda 1000000 --mtp-schedule-fixed-lambda`; the large fixed
+penalty selects the smaller option. `--no-mtp-schedule` verifies all seven,
+and `--no-mtp` is plain decode. Do not change the learned block length to
+produce these controls.
 
 ### Validity
 

@@ -134,7 +134,8 @@ other HTTP work. PNG/JPEG/WebP decoding does not apply EXIF orientation or color
 profiles. WebP supports lossy and lossless still images; alpha is composited
 on white before resizing, and animated WebP is unsupported. PDF file inputs
 still extract text only; page rasterization is not part of this feature.
-Video and audio inputs are unsupported.
+Audio inputs are unsupported. Video inputs are supported by MiniMax as
+described above; other families reject them.
 
 Images of the same dimensions have identical placeholder token IDs but
 different embeddings. Cache lookups compare processed RGB pixels, geometry

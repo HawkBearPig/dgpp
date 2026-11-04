@@ -12,6 +12,13 @@ source and local fixes are recorded in `third_party/simplewebp/README.md`; the
 BSD license and WebM patent grant ship in
 [licenses/simplewebp.md](licenses/simplewebp.md).
 
+Native MP4/WebM video input links FFmpeg libraries when
+`DGPP_ENABLE_VIDEO=ON` (the default). Source builds need `libavformat-dev`,
+`libavcodec-dev`, `libavutil-dev` and `libswscale-dev`; Ubuntu 24.04 serving
+peers need the corresponding FFmpeg 6 runtime libraries. No FFmpeg CLI
+process is used for requests. `DGPP_ENABLE_VIDEO=OFF` keeps still-image
+support and rejects video inputs explicitly. See [build setup](getting-started.md).
+
 The vision LayerNorm reduction schedule adapts PyTorch CUDA arithmetic under
 the [PyTorch license](licenses/pytorch.md). PyTorch is only needed for optional
 reference checks; it is not a serving dependency.
