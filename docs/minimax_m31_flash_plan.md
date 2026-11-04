@@ -2,8 +2,10 @@
 
 Investigated 2026-11-04 against dgpp `403d3f987964f6cd548348316c86520fb700ec71`.
 Status: text, tools, DSpark, image and video support implemented on the feature
-branch. Numerical and local regression gates pass; deployment tuning, task
-quality and long-context release validation remain in progress. The initial
+branch. BF16 control and local regression gates pass; native precision is
+integrated and passes synthetic checks. Real-weight native fidelity,
+deployment tuning, task quality and long-context release validation remain
+in progress. The initial
 plan below is followed by the implementation and measurement record.
 
 Implement `MiniMaxAI/MiniMax-M3.1-Flash` as a new model family on the shared
@@ -1369,8 +1371,10 @@ contiguous Q8KV4 oracle matches the pinned MSA CPU references exactly at
 1, 129, 270 and 2,057 keys, including permuted physical pages and sparse
 selections. All 16 FP4 codes crossed with all 127 nonnegative finite FP8
 scales also match the upstream cache conversion. These checks validate the
-reference formulas; native DGPP GPU kernels and full-model fidelity remain
-pending.
+reference formulas. Native DGPP GPU kernels now pass isolated quantizer,
+product and attention checks and are connected to the target-model path;
+real-checkpoint native fidelity remains pending. The precision contract
+records the implementation and synthetic integration evidence.
 
 The publisher's [model card](https://huggingface.co/MiniMaxAI/MiniMax-M3.1-Flash)
 recommends SGLang, vLLM and TokenSpeed. Their Blackwell paths execute the
@@ -1392,10 +1396,10 @@ it does not show whether DGPP faithfully implements the publisher's native
 quantization, and does not measure native task quality. Exceeding BF16 parity
 alone is insufficient grounds to reject the published inference recipe.
 
-The remaining native work must pin the exact reference backend, quantizer
-rounding and scale conventions, fusion boundaries, cache precision and
-attention-query precision. Validate quantizers and matrix products against
-independent matching-precision references, then full-model likelihood,
+The pinned reference now specifies quantizer rounding and scale conventions,
+fusion boundaries, cache precision and attention-query precision. Quantizers
+and matrix products pass independent matching-precision checks. Remaining
+work includes full-model likelihood,
 routing/index decisions, repeats and batch geometry under the existing
 numerical limits. Compare BF16 and native task quality separately. Measure
 native and BF16 deployment throughput after those checks, then select and

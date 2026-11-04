@@ -280,6 +280,10 @@ ClusterConfig parse_cluster_config(const std::string& json, const std::string& w
           e.prefill_activations = text(x, ek, what);
           if (e.prefill_activations != "bf16" && e.prefill_activations != "native")
             fail(what, "'" + ek + "' must be \"bf16\" or \"native\"");
+        } else if (p.key == "activations") {
+          e.activations = text(x, ek, what);
+          if (e.activations != "bf16" && e.activations != "native")
+            fail(what, "'" + ek + "' must be \"bf16\" or \"native\"");
         } else if (p.key == "prefill_attention") {
           e.prefill_attention = text(x, ek, what);
           if (e.prefill_attention != "bf16" && e.prefill_attention != "fp8")

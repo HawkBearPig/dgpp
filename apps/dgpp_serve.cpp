@@ -1158,15 +1158,13 @@ struct MinimaxFamily final : ServeFamily {
   dgpp::MinimaxConfig cfg;
   std::string ckpt;
   dgpp::LatentFormat kv_format = dgpp::LatentFormat::kBf16;
+  bool native_activations = false;
   std::unique_ptr<dgpp::MinimaxModel> model;
-  MinimaxFamily(const std::string& checkpoint, dgpp::LatentFormat fmt)
+  MinimaxFamily(const std::string& checkpoint, dgpp::LatentFormat fmt, bool native)
       : cfg(dgpp::MinimaxConfig::from_json_file((fs::path(checkpoint) / "config.json").string())),
         ckpt(checkpoint),
-        kv_format(fmt) {
-    if (kv_format != dgpp::LatentFormat::kBf16)
-      throw std::invalid_argument(std::string("engine.kv_dtype ") +
-                                  dgpp::latent_format_name(kv_format) +
-                                  " is not implemented for the Minimax K/V cache (bf16 baseline)");
+        kv_format(fmt), native_activations(native) {
+    (void)dgpp::MinimaxKvPool::head_bytes(fmt);
   }
   const char* name() const override { return "minimax_m3"; }
   // The shipped template leaves adaptive <mm:think> emission to the model.
@@ -1198,7 +1196,7 @@ struct MinimaxFamily final : ServeFamily {
     return dgpp::MinimaxModel::plan_memory(
         cfg, forward_rows, context, fabric ? rank : 0, fabric ? world_ : 1,
         fabric ? dgpp::LoaderResidency::Resident : dgpp::LoaderResidency::Streaming, slots, mtp,
-        decode_rows, kv_format, /*serving_logits=*/true);
+        decode_rows, kv_format, /*serving_logits=*/true, native_activations);
   }
   size_t snapshot_bytes(int world_, bool mtp) const override {
     return dgpp::MinimaxModel::session_snapshot_bytes(cfg, world_, mtp);
@@ -1214,7 +1212,7 @@ struct MinimaxFamily final : ServeFamily {
         cfg, ckpt, forward_rows, pool_tokens,
         fabric ? dgpp::LoaderResidency::Resident : dgpp::LoaderResidency::Streaming, reducer,
         fabric ? rank : 0, fabric ? world_ : 1, slots, mtp, decode_rows, kv_format,
-        /*serving_logits=*/true);
+        /*serving_logits=*/true, native_activations);
   }
   void destroy_model() override { model.reset(); }
   size_t model_snapshot_bytes() const override {
@@ -1364,9 +1362,13 @@ std::unique_ptr<ServeFamily> make_family(const std::string& ckpt, int world,
                                          dgpp::LatentFormat kv_format,
                                          const std::optional<dgpp::RopeScaling>& rope_scaling,
                                          bool fp8_head_mma, int index_topk, int candidate_topk_blocks,
-                                         int candidate_block_size) {
+                                         int candidate_block_size, const std::string& activations) {
   const dgpp::ModelArchitecture arch =
       dgpp::detect_architecture_file((fs::path(ckpt) / "config.json").string());
+  if (activations != "bf16" && activations != "native")
+    throw std::invalid_argument("engine.activations must be bf16 or native");
+  if (activations == "native" && arch != dgpp::ModelArchitecture::MinimaxM3)
+    throw std::invalid_argument("engine.activations native is currently supported only for MiniMax");
   if (arch == dgpp::ModelArchitecture::DeepseekV41)
     return std::make_unique<Dsv41Family>(ckpt, index_topk, candidate_topk_blocks, candidate_block_size);
   // The index budget is the DeepSeek-V4.1 indexer's: no other family has a
@@ -1380,7 +1382,7 @@ std::unique_ptr<ServeFamily> make_family(const std::string& ckpt, int world,
   if (arch == dgpp::ModelArchitecture::Dory) return std::make_unique<DoryFamily>(ckpt, world);
   if (arch == dgpp::ModelArchitecture::Flint) return std::make_unique<FlintFamily>(ckpt, kv_format);
   if (arch == dgpp::ModelArchitecture::MinimaxM3)
-    return std::make_unique<MinimaxFamily>(ckpt, kv_format);
+    return std::make_unique<MinimaxFamily>(ckpt, kv_format, activations == "native");
   if (arch == dgpp::ModelArchitecture::Qwen4Exp)
     return std::make_unique<QwenFamily>(ckpt, rope_scaling, fp8_head_mma, kv_format);
   if (arch == dgpp::ModelArchitecture::Qwen3_5)
@@ -1938,6 +1940,7 @@ int main(int argc, char** argv) {
   bool prefill_fp8_gemm = false;
   bool prefill_fp8_per_tensor = false;  // the Qwen3.8-27B per-tensor prefill recipe (opt-in)
   std::string prefill_activations = "bf16";  // "native": the checkpoint's activation recipe on prefill rows
+  std::string activations = "bf16";  // MiniMax target: every row, including decode
   std::string prefill_attention = "bf16";    // Qwen3.5 / Flash-Next attention over an fp8 pool
   std::string decode_attention = "bf16";     // Flash-Next QSA: bf16 or native fp8 compute
   std::string expert_gemm = "wide";         // the packed expert GEMM's form and companions (engine.expert_*)
@@ -2095,6 +2098,7 @@ int main(int argc, char** argv) {
     prefill_fp8_gemm = e.prefill_fp8_gemm;
     prefill_fp8_per_tensor = e.prefill_fp8_per_tensor;
     prefill_activations = e.prefill_activations;
+    activations = e.activations;
     prefill_attention = e.prefill_attention;
     decode_attention = e.decode_attention;
     expert_gemm = e.expert_gemm;
@@ -2549,7 +2553,7 @@ int main(int argc, char** argv) {
     const int effective_batch_min_live =
         graph_batch_min_live == 0 ? std::min(2, max_concurrency) : graph_batch_min_live;
     return std::format(
-        "model={} world={} fabric={} journal={} conc={} kv={} kvdt={} pfattn={} dcattn={} ngt={} dw={} mtpef={} bfw={} "
+        "model={} world={} fabric={} journal={} conc={} kv={} kvdt={} act={} pfattn={} dcattn={} ngt={} dw={} mtpef={} bfw={} "
         "fp8head={} dh={} dhb={} mtph={} attw={} itopk={} ctb={} cbs={} pf={} pfd={} pfo={} pfw={} dcw={} ctr={} pdl={} dlp={} dkv={} "
         "emsh={} maxtok={} queue={} "
         "eos={} graph={} compact={} mtp={} mtpd={} mss={} msrow={} msbase={} mslam={} msmin={} msopt={} "
@@ -2559,7 +2563,7 @@ int main(int argc, char** argv) {
         "reasoning_in_content={} "
         "rs={} dflash={} dfw={} lk={} lkn={} lks={} lka={} lkt={} nvme={}",
         model_id.empty() ? ckpt : model_id, world, fabric_port, journal_port, max_concurrency,
-        kv_capacity, kv_dtype, prefill_attention, decode_attention, ngram_table, dense_weights, mtp_expert_format, bf16_weights, fp8_head,
+        kv_capacity, kv_dtype, activations, prefill_attention, decode_attention, ngram_table, dense_weights, mtp_expert_format, bf16_weights, fp8_head,
         draft_head,
         draft_head_blocks, mtp_head,
         attention_weights, index_topk, candidate_topk_blocks, candidate_block_size, prefill, prefill_dense,
@@ -2651,6 +2655,7 @@ int main(int argc, char** argv) {
         ws.prefill_fp8_gemm = prefill_fp8_gemm;
         ws.prefill_fp8_per_tensor = prefill_fp8_per_tensor;
         ws.prefill_activations = prefill_activations;
+        ws.activations = activations;
         ws.prefill_attention = prefill_attention;
         ws.decode_attention = decode_attention;
         ws.dflash_model = dflash_model;
@@ -2773,6 +2778,7 @@ int main(int argc, char** argv) {
         prefill_fold_scales = ws.prefill_fold_scales;
         prefill_fp8_gemm = ws.prefill_fp8_gemm;
         prefill_fp8_per_tensor = ws.prefill_fp8_per_tensor;
+        activations = ws.activations;
         prefill_attention = ws.prefill_attention;
         decode_attention = ws.decode_attention;
         dflash_model = ws.dflash_model;
@@ -3316,7 +3322,7 @@ int main(int argc, char** argv) {
     // everything below the engine interface comes from it.
     std::unique_ptr<ServeFamily> family =
         make_family(ckpt, world, kv_format, rope_scaling, fp8_head == "mma", index_topk, candidate_topk_blocks,
-                    candidate_block_size);
+                    candidate_block_size, activations);
     if (!dflash_dir.empty()) {
       try {
         family->set_draft_model(dflash_dir);

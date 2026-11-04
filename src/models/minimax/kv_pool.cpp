@@ -5,6 +5,7 @@
 #include <string>
 
 #include "common/cuda_check.hpp"
+#include "kernels/minimax_native_attention.hpp"
 
 namespace dgpp {
 
@@ -15,6 +16,7 @@ void validate(const MinimaxKvPoolShape& s) {
     throw std::invalid_argument("MinimaxKvPool: every shape field must be positive");
   if (s.token_slots % s.block_tokens != 0)
     throw std::invalid_argument("MinimaxKvPool: token_slots must be a multiple of block_tokens");
+  (void)MinimaxKvPool::head_bytes(s.format);
 }
 }  // namespace
 
@@ -24,11 +26,16 @@ MinimaxKvPool::~MinimaxKvPool() {
   cudaFree(index_base_);
 }
 
+size_t MinimaxKvPool::head_bytes(LatentFormat format) {
+  if (format == LatentFormat::kBf16) return 128 * 2;
+  if (format == LatentFormat::kFp4) return kMinimaxNvfp4HeadBytes;
+  throw std::invalid_argument("MinimaxKvPool: requires bf16 or native nvfp4 storage");
+}
 size_t MinimaxKvPool::cache_bytes(const MinimaxKvPoolShape& s) {
   validate(s);
   const size_t L = static_cast<size_t>(s.layers);
-  const size_t kv = static_cast<size_t>(s.token_slots) * s.kv_heads * s.dim * 2;
-  return L * (2 * kv + static_cast<size_t>(s.token_slots) * 128 * 2) +
+  const size_t kv = static_cast<size_t>(s.token_slots) * s.kv_heads * head_bytes(s.format);
+  return L * (2 * kv + static_cast<size_t>(s.token_slots) * head_bytes(s.format)) +
          PagedBlockTable::table_bytes(s.max_requests, s.token_slots / s.block_tokens) +
          DraftKvPlanes::bytes(s.draft_layers, s.draft_kv_heads, s.draft_dim, s.token_slots);
 }
@@ -41,10 +48,9 @@ void MinimaxKvPool::init(const MinimaxKvPoolShape& shape) {
   auto alloc = [](void** p, size_t bytes) {
     DGPP_CUDA_OK(cudaMalloc(p, std::max<size_t>(bytes, 1)));
   };
-  alloc(reinterpret_cast<void**>(&k_base_), L * layer_kv_elems() * 2);
-  alloc(reinterpret_cast<void**>(&v_base_), L * layer_kv_elems() * 2);
-  alloc(reinterpret_cast<void**>(&index_base_),
-        L * static_cast<size_t>(shape_.token_slots) * 128 * 2);
+  alloc(reinterpret_cast<void**>(&k_base_), L * layer_kv_bytes());
+  alloc(reinterpret_cast<void**>(&v_base_), L * layer_kv_bytes());
+  alloc(reinterpret_cast<void**>(&index_base_), L * layer_index_bytes());
   draft_.init(shape_.draft_layers, shape_.draft_kv_heads, shape_.draft_dim, shape_.token_slots,
               shape_.block_tokens);
   table_.init(shape_.max_requests, shape_.block_tokens, shape_.token_slots / shape_.block_tokens);
@@ -59,9 +65,16 @@ MinimaxKvCache MinimaxKvPool::view(int layer) const {
     throw std::out_of_range("MinimaxKvPool: layer " + std::to_string(layer));
   MinimaxKvCache c;
   const size_t l = static_cast<size_t>(layer);
-  c.k_cache = k_base_ + l * layer_kv_elems();
-  c.v_cache = v_base_ + l * layer_kv_elems();
-  c.index_cache = index_base_ + l * static_cast<size_t>(shape_.token_slots) * 128;
+  c.format = shape_.format;
+  if (shape_.format == LatentFormat::kBf16) {
+    c.k_cache = reinterpret_cast<uint16_t*>(k_base_ + l * layer_kv_bytes());
+    c.v_cache = reinterpret_cast<uint16_t*>(v_base_ + l * layer_kv_bytes());
+    c.index_cache = reinterpret_cast<uint16_t*>(index_base_ + l * layer_index_bytes());
+  } else {
+    c.k_nvfp4 = k_base_ + l * layer_kv_bytes();
+    c.v_nvfp4 = v_base_ + l * layer_kv_bytes();
+    c.index_nvfp4 = index_base_ + l * layer_index_bytes();
+  }
   c.block_tables = table_.device_tables();
   c.block_tokens = shape_.block_tokens;
   c.blocks_per_request = static_cast<int>(table_.total_blocks());
@@ -71,10 +84,9 @@ MinimaxKvCache MinimaxKvPool::view(int layer) const {
 void MinimaxKvPool::reset_all(cudaStream_t stream) {
   if (!initialized_) throw std::logic_error("MinimaxKvPool: reset_all before init");
   const size_t L = static_cast<size_t>(shape_.layers);
-  DGPP_CUDA_OK(cudaMemsetAsync(k_base_, 0, L * layer_kv_elems() * 2, stream));
-  DGPP_CUDA_OK(cudaMemsetAsync(v_base_, 0, L * layer_kv_elems() * 2, stream));
-  DGPP_CUDA_OK(cudaMemsetAsync(index_base_, 0,
-                               L * static_cast<size_t>(shape_.token_slots) * 128 * 2, stream));
+  DGPP_CUDA_OK(cudaMemsetAsync(k_base_, 0, L * layer_kv_bytes(), stream));
+  DGPP_CUDA_OK(cudaMemsetAsync(v_base_, 0, L * layer_kv_bytes(), stream));
+  DGPP_CUDA_OK(cudaMemsetAsync(index_base_, 0, L * layer_index_bytes(), stream));
   draft_.reset(stream);
   table_.reset_all(stream);
 }
@@ -82,13 +94,12 @@ void MinimaxKvPool::reset_all(cudaStream_t stream) {
 std::vector<CachePlane> MinimaxKvPool::planes() const {
   std::vector<CachePlane> out;
   if (!initialized_) return out;
-  const size_t blk = static_cast<size_t>(shape_.block_tokens) * kv_row_elems() * 2;
+  const size_t blk = static_cast<size_t>(shape_.block_tokens) * kv_row_bytes();
   for (int l = 0; l < shape_.layers; ++l) {
-    const MinimaxKvCache c = view(l);
-    out.push_back({reinterpret_cast<uint8_t*>(c.k_cache), blk});
-    out.push_back({reinterpret_cast<uint8_t*>(c.v_cache), blk});
-    out.push_back({reinterpret_cast<uint8_t*>(c.index_cache),
-                   static_cast<size_t>(shape_.block_tokens) * 128 * 2});
+    out.push_back({k_base_ + l * layer_kv_bytes(), blk});
+    out.push_back({v_base_ + l * layer_kv_bytes(), blk});
+    out.push_back({index_base_ + l * layer_index_bytes(),
+                   static_cast<size_t>(shape_.block_tokens) * head_bytes(shape_.format)});
   }
   draft_.append_planes(out);
   return out;

@@ -504,6 +504,8 @@ std::string encode_journal_settings(const WorldSettings& s) {
                      s.prefill_fp8_per_tensor ? 1 : 0);
   out += ",\"pfact\":";
   append_json_string(&out, s.prefill_activations);
+  out += ",\"act\":";
+  append_json_string(&out, s.activations);
   out += ",\"pfattn\":";
   append_json_string(&out, s.prefill_attention);
   out += ",\"dcattn\":";
@@ -833,6 +835,9 @@ JournalRecord decode_journal_line(std::string_view line) {
     if (v.find("pffp8")) s.prefill_fp8_gemm = flag("pffp8");
     if (v.find("pfpt")) s.prefill_fp8_per_tensor = flag("pfpt");  // 2026-10-03: the 27B recipe
     if (const dgpp::minijson::Value* pa = v.find("pfact")) s.prefill_activations = std::string(pa->as_string());
+    if (const dgpp::minijson::Value* a = v.find("act")) s.activations = std::string(a->as_string());
+    if (s.activations != "bf16" && s.activations != "native")
+      throw std::runtime_error("journal: settings record with invalid activation recipe");
     // The prefill attention's arithmetic (2026-10-16): records before it carry none (bf16).
     if (const dgpp::minijson::Value* pt = v.find("pfattn")) s.prefill_attention = std::string(pt->as_string());
     if (const dgpp::minijson::Value* dt = v.find("dcattn")) s.decode_attention = std::string(dt->as_string());

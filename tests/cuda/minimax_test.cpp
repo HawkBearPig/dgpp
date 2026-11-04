@@ -725,13 +725,22 @@ void dspark_oracle(const std::string& path, const std::string& dump) {
   }
   model.session_close(0);
 }
-void smoke(const std::string& path, const std::string& dump) {
+void smoke(const std::string& path, const std::string& dump, bool native, LatentFormat format) {
   const auto cfg = MinimaxConfig::from_json_file(path + "/config.json");
   loader_slices(cfg, path);
   require(cfg.hidden_size <= 1024, "smoke is a synthetic-fixture gate");
   std::vector<int64_t> tokens(385);
   for (size_t i = 0; i < tokens.size(); ++i) tokens[i] = (i * 17 + 3) % cfg.vocab_size;
-  MinimaxModel m(cfg, path, 512, 1536, LoaderResidency::Resident, nullptr, 0, 1, 3);
+  MinimaxModel m(cfg, path, 512, 1536, LoaderResidency::Resident, nullptr, 0, 1, 3, false, 0,
+                   format, false, native);
+  require(m.kv_format() == format, "model reports its actual cache format");
+  size_t block_bytes = 0;
+  for (const auto& plane : m.kv_pool().planes()) block_bytes += plane.block_bytes;
+  require(block_bytes == MinimaxModel::kv_block_bytes_static(cfg, 0, 1, format),
+          "native cache plane sizes match the NVMe/prefix memory plan");
+  const auto cache = m.kv_pool().view(0);
+  require(format == LatentFormat::kBf16 ? cache.k_cache && !cache.k_nvfp4 : cache.k_nvfp4 && !cache.k_cache,
+          "only the configured cache pointers are exposed");
   m.graph_prepare();
   m.set_decode_row_traces(true);
   if (!dump.empty()) {
@@ -766,6 +775,31 @@ void smoke(const std::string& path, const std::string& dump) {
     }
     m.session_close(0);
   }
+  // Reuse the complete target graph while feeds and positions change across
+  // cache pages. This also exercises both grouped expert GEMMs under capture.
+  {
+    (void)m.session_prefill(0, {tokens.front()});
+    m.session_reserve_blocks(0, tokens.size());
+    m.session_graph_prepare();
+    cudaGraph_t graph;
+    cudaGraphExec_t exec;
+    DGPP_CUDA_OK(cudaStreamBeginCapture(m.stream(), cudaStreamCaptureModeThreadLocal));
+    m.session_graph_capture_step(0, std::vector<int64_t>(tokens.begin() + 1, tokens.begin() + 9));
+    DGPP_CUDA_OK(cudaStreamEndCapture(m.stream(), &graph));
+    DGPP_CUDA_OK(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
+    for (size_t at = 1; at < tokens.size(); at += 8) {
+      m.session_graph_stage(0, std::vector<int64_t>(tokens.begin() + at, tokens.begin() + at + 8));
+      DGPP_CUDA_OK(cudaGraphLaunch(exec, m.stream()));
+      DGPP_CUDA_OK(cudaStreamSynchronize(m.stream()));
+      const auto replay = m.session_graph_collect(0);
+      require(std::equal(replay.final_hidden_bits.begin(), replay.final_hidden_bits.end(),
+                         first.final_hidden_bits.begin() + at * cfg.hidden_size),
+              "target graph hidden differs from full prefill at " + std::to_string(at));
+    }
+    DGPP_CUDA_OK(cudaGraphExecDestroy(exec));
+    DGPP_CUDA_OK(cudaGraphDestroy(graph));
+    m.session_close(0);
+  }
   for (float x : first.logits) require(std::isfinite(x), "finite logits");
   if (!dump.empty()) {
     std::filesystem::create_directories(dump);
@@ -779,7 +813,8 @@ void smoke(const std::string& path, const std::string& dump) {
               first.route_ids[ordinal++]);
     }
     std::ofstream meta(std::filesystem::path(dump) / "metadata.json");
-    meta << "{\"residual_norm\":\"fp32\",\"tokens\":[";
+    meta << "{\"residual_norm\":\"fp32\",\"rope_inv_freq\":\"cuda-fp32\",\"activations\":\"" << (native ? "native" : "bf16")
+         << "\",\"kv_dtype\":\"" << latent_format_name(format) << "\",\"tokens\":[";
     for (size_t i = 0; i < tokens.size(); ++i) {
       if (i) meta << ',';
       meta << tokens[i];
@@ -834,11 +869,16 @@ void smoke(const std::string& path, const std::string& dump) {
 int main(int argc, char** argv) {
   try {
     std::string checkpoint, dump, fixture, config, dspark, dspark_model;
-    bool run_kernels = false;
+    bool run_kernels = false, native = false;
+    LatentFormat format = LatentFormat::kBf16;
     for (int i = 1; i < argc; ++i) {
       std::string a = argv[i];
       if (a == "--kernels")
         run_kernels = true;
+      else if (a == "--native-activations")
+        native = true;
+      else if (a == "--native-cache")
+        format = LatentFormat::kFp4;
       else if (a == "--dspark-model-dir" && i + 1 < argc)
         dspark_model = argv[++i];
       else if (a == "--dspark-dir" && i + 1 < argc)
@@ -864,7 +904,7 @@ int main(int argc, char** argv) {
     if (!dspark_model.empty()) dspark_oracle(dspark_model, dump);
     if (!dspark.empty()) dspark_loader(dspark);
     if (run_kernels) kernels();
-    if (!checkpoint.empty()) smoke(checkpoint, dump);
+    if (!checkpoint.empty()) smoke(checkpoint, dump, native, format);
     if (!run_kernels && checkpoint.empty() && dspark.empty() && dspark_model.empty())
       throw std::runtime_error("use --kernels or --checkpoint-dir");
     return 0;

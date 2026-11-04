@@ -641,6 +641,7 @@ void test_journal_codec() {
     ws.kv_dtype = "fp8";
     ws.prefill_attention = "fp8";
     ws.decode_attention = "fp8";
+    ws.activations = "native";
     ws.bf16_weights = "bf12";
     ws.compact_batches = true;
     ws.fp8_head = "mma";
@@ -738,6 +739,28 @@ void test_journal_codec() {
           dgpp::serve::encode_journal_settings(settings));
       require(decoded.world_settings.prefill_budget_tokens == budget,
               "automatic, disabled and explicit prefill budgets survive the settings handshake");
+    }
+    for (const std::string mode : {"bf16", "native"}) {
+      auto recipe = ws;
+      recipe.activations = mode;
+      const auto line = dgpp::serve::encode_journal_settings(recipe);
+      require(dgpp::serve::decode_journal_line(line).world_settings.activations == mode,
+              "target activation recipe survives the rank handshake");
+      auto legacy = line;
+      const auto key = std::string(",\"act\":\"") + mode + "\"";
+      const size_t at = legacy.find(key);
+      require(at != std::string::npos, "target activation recipe encoded");
+      legacy.erase(at, key.size());
+      require(dgpp::serve::decode_journal_line(legacy).world_settings.activations == "bf16",
+              "legacy settings preserve BF16 target activations");
+    }
+    {
+      auto bad = ws;
+      bad.activations = "fp4";
+      bool refused = false;
+      try { (void)dgpp::serve::decode_journal_line(dgpp::serve::encode_journal_settings(bad)); }
+      catch (const std::runtime_error&) { refused = true; }
+      require(refused, "bad activation recipe rejected before joining the world");
     }
     for (const std::string mode : {"gemv", "mma"}) {
       auto head = ws;

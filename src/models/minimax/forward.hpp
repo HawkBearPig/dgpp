@@ -28,13 +28,14 @@ class MinimaxModel : public SessionModel<MinimaxModel> {
                int64_t cache_tokens, LoaderResidency = LoaderResidency::Streaming,
                BoundaryReducer* = nullptr, int rank = 0, int world = 1, int slots = 1,
                bool mtp = false, int decode_rows = 0, LatentFormat = LatentFormat::kBf16,
-               bool serving_logits = false);
+               bool serving_logits = false, bool native_activations = false);
   ~MinimaxModel();
   static MemoryPlan plan_memory(const MinimaxConfig&, int max_tokens, int64_t cache_tokens,
                                 int rank = 0, int world = 1,
                                 LoaderResidency = LoaderResidency::Streaming, int slots = 1,
                                 bool mtp = false, int decode_rows = 0,
-                                LatentFormat = LatentFormat::kBf16, bool serving_logits = false);
+                                LatentFormat = LatentFormat::kBf16, bool serving_logits = false,
+                                bool native_activations = false);
   static constexpr int decode_rows_cap() { return 64; }
   static constexpr int prefill_chunk_tokens() { return 512; }
   static constexpr int kv_block_tokens_static() { return 128; }
@@ -75,7 +76,7 @@ class MinimaxModel : public SessionModel<MinimaxModel> {
       throw std::invalid_argument("MiniMax: image spans require their own prefill walk");
   }
   const MinimaxKvPool& kv_pool() const { return pool_; }
-  LatentFormat kv_format() const { return LatentFormat::kBf16; }
+  LatentFormat kv_format() const { return pool_.shape().format; }
   void set_decode_row_traces(bool on) { decode_row_traces_ = on; }
   // Optional diagnostics at replicated BF16 sublayer boundaries. The
   // observer receives device memory and orders any reads on the stream.

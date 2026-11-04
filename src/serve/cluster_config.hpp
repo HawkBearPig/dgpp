@@ -190,6 +190,9 @@ struct ClusterConfig {
     bool prefill_fp8_gemm = false;
     bool prefill_fp8_per_tensor = false;
     std::string prefill_activations = "bf16";
+    // MiniMax: the activation recipe on every target row, including decode.
+    // Independent of kv_dtype, so both precision controls can be measured.
+    std::string activations = "bf16";
     std::string prefill_attention = "bf16";
     // Flash-Next QSA decode arithmetic over its fp8 pool. Independent of
     // prefill_attention so either phase can retain bf16 compute.

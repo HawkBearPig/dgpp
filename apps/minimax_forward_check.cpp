@@ -68,7 +68,8 @@ int main(int argc, char** argv) {
   try {
     std::string model, checkpoint, text, teacher, ids_text, dump, peer, images;
     int rank = 0, world = 1, port = 29950, rows = 1, score_from = 1;
-    bool resident = false;
+    bool resident = false, native = false;
+    dgpp::LatentFormat format = dgpp::LatentFormat::kBf16;
     const auto next = [&](int& i) {
       if (++i >= argc) throw std::runtime_error("missing option value");
       return std::string(argv[i]);
@@ -103,6 +104,16 @@ int main(int argc, char** argv) {
         score_from = std::stoi(next(i));
       else if (a == "--resident")
         resident = true;
+      else if (a == "--activations") {
+        const auto value = next(i);
+        if (value != "bf16" && value != "native") throw std::runtime_error("--activations requires bf16 or native");
+        native = value == "native";
+      } else if (a == "--kv-dtype") {
+        const auto value = dgpp::latent_format_from_string(next(i));
+        if (!value || (*value != dgpp::LatentFormat::kBf16 && *value != dgpp::LatentFormat::kFp4))
+          throw std::runtime_error("--kv-dtype requires bf16 or nvfp4");
+        format = *value;
+      }
       else
         throw std::runtime_error("unknown option " + a);
     }
@@ -137,6 +148,8 @@ int main(int argc, char** argv) {
     for (auto id : ids) input_hash = (input_hash ^ static_cast<uint64_t>(id)) * 1099511628211ull;
     std::printf("[minimax_protocol] world %d tokens %zu score_from %d input %016llx\n", world,
                 ids.size(), score_from, static_cast<unsigned long long>(input_hash));
+    std::printf("[minimax_precision] activations %s kv %s\n", native ? "native" : "bf16",
+                  dgpp::latent_format_name(format));
     const auto score_row = [&](const auto& out, int row, size_t position) {
       if (position + 1 >= static_cast<size_t>(score_from))
         score(out, row, position + 1 - score_from, ids[position + 1], rank);
@@ -160,7 +173,7 @@ int main(int argc, char** argv) {
     dgpp::MinimaxModel engine(
         cfg, checkpoint, forward_rows, ids.size() + 128,
         resident ? dgpp::LoaderResidency::Resident : dgpp::LoaderResidency::Streaming,
-        boundary.get(), rank, world, 1, false, std::max(rows, 8));
+        boundary.get(), rank, world, 1, false, std::max(rows, 8), format, false, native);
     if (resident) engine.graph_prepare();
     if (!teacher.empty()) {
       std::vector<uint64_t> hashes;
@@ -226,6 +239,8 @@ int main(int argc, char** argv) {
         }
         std::ofstream meta(path / "metadata.json");
         meta << "{\"residual_norm\":\"fp32\",\"rope_inv_freq\":\"cuda-fp32\",\"world\":" << world
+             << ",\"activations\":\"" << (native ? "native" : "bf16")
+             << "\",\"kv_dtype\":\"" << dgpp::latent_format_name(format) << "\""
              << ",\"rank\":" << rank << ",\"score_from\":" << score_from
              << ",\"vocab_begin\":" << out.lm_vocab_begin
              << ",\"vocab_count\":" << out.lm_vocab_count << ",\"tokens\":[";

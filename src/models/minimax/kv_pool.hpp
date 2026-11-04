@@ -7,6 +7,7 @@
 
 #include "engine/cache_planes.hpp"
 #include "engine/paged_blocks.hpp"
+#include "kernels/latent_format.hpp"
 #include "models/dflash2/draft_planes.hpp"
 
 namespace dgpp {
@@ -19,6 +20,7 @@ struct MinimaxKvPoolShape {
   int max_requests = 0;
   int64_t token_slots = 0;  // pool capacity in tokens, a multiple of block_tokens
   int draft_layers = 0, draft_kv_heads = 0, draft_dim = 128;
+  LatentFormat format = LatentFormat::kBf16;
 };
 
 // One layer's caches as the kernels see them.
@@ -29,6 +31,10 @@ struct MinimaxKvCache {
   const int32_t* block_tables = nullptr;  // int32 [max_requests, blocks_per_request]
   int block_tokens = 0;
   int blocks_per_request = 0;
+  // Native Q8KV4: each head stores 64 E2M1 bytes followed by eight E4M3
+  // scales, with unit outer scale. BF16 pointers above are null in this mode.
+  uint8_t *k_nvfp4 = nullptr, *v_nvfp4 = nullptr, *index_nvfp4 = nullptr;
+  LatentFormat format = LatentFormat::kBf16;
 };
 
 class MinimaxKvPool {
@@ -41,6 +47,7 @@ class MinimaxKvPool {
   void init(const MinimaxKvPoolShape& shape);
   bool initialized() const { return initialized_; }
   static size_t cache_bytes(const MinimaxKvPoolShape& shape);
+  static size_t head_bytes(LatentFormat);
 
   const MinimaxKvPoolShape& shape() const { return shape_; }
   int64_t total_blocks() const { return table_.total_blocks(); }
@@ -84,11 +91,16 @@ class MinimaxKvPool {
   bool initialized_ = false;
   PagedBlockTable table_;
   DraftKvPlanes draft_;
-  uint16_t* k_base_ = nullptr;  // [layers][token_slots][kv_heads * dim]
-  uint16_t* v_base_ = nullptr;
-  uint16_t* index_base_ = nullptr;
-  size_t kv_row_elems() const { return static_cast<size_t>(shape_.kv_heads) * shape_.dim; }
-  size_t layer_kv_elems() const { return static_cast<size_t>(shape_.token_slots) * kv_row_elems(); }
+  uint8_t* k_base_ = nullptr;  // [layers][token_slots][kv_heads * head_bytes]
+  uint8_t* v_base_ = nullptr;
+  uint8_t* index_base_ = nullptr;
+  size_t kv_row_bytes() const {
+    return static_cast<size_t>(shape_.kv_heads) * head_bytes(shape_.format);
+  }
+  size_t layer_kv_bytes() const { return static_cast<size_t>(shape_.token_slots) * kv_row_bytes(); }
+  size_t layer_index_bytes() const {
+    return static_cast<size_t>(shape_.token_slots) * head_bytes(shape_.format);
+  }
 };
 
 }  // namespace dgpp

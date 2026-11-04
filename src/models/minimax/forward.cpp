@@ -43,15 +43,15 @@ void validate_run(const MinimaxConfig& c, int t, int rank, int world, int slots,
     if (t < c.dspark->query_rows())
       throw std::invalid_argument("MiniMax DSpark: max_tokens must cover the query block");
   }
-  if (format != LatentFormat::kBf16)
-    throw std::invalid_argument("MiniMax: this baseline requires BF16 KV and index caches");
+  (void)MinimaxKvPool::head_bytes(format);
 }
 int64_t capacity(int64_t cache, int tokens) {
   return ((std::max<int64_t>(cache, tokens) + 127) / 128) * 128;
 }
 MinimaxKvPoolShape pool_shape(const MinimaxConfig& c, const MinimaxLocalGeometry& g, int slots,
-                              int64_t cache, bool draft = false) {
+                              int64_t cache, bool draft, LatentFormat format) {
   MinimaxKvPoolShape shape{c.num_hidden_layers, g.local_kv_heads, 128, 128, slots, cache};
+  shape.format = format;
   if (draft) {
     shape.draft_layers = c.dspark->num_hidden_layers;
     shape.draft_kv_heads = c.dspark->local_kv_heads(g.world);
@@ -63,7 +63,7 @@ MinimaxKvPoolShape pool_shape(const MinimaxConfig& c, const MinimaxLocalGeometry
 MinimaxModel::MinimaxModel(const MinimaxConfig& c, const std::string& checkpoint, int max_tokens,
                            int64_t cache, LoaderResidency residency, BoundaryReducer* boundary,
                            int rank, int world, int slots, bool mtp, int decode_rows,
-                           LatentFormat format, bool serving_logits)
+                           LatentFormat format, bool serving_logits, bool native)
     : cfg_(c),
       loader_(c, checkpoint, rank, world, residency,
               world > 1 ? LoaderHeadSharding::VocabSharded : LoaderHeadSharding::Full) {
@@ -94,7 +94,7 @@ MinimaxModel::MinimaxModel(const MinimaxConfig& c, const std::string& checkpoint
   p.eos = static_cast<int32_t>(c.eos_token_ids.at(0));
   init_session(p);
   const auto& g = loader_.geometry();
-  pool_.init(pool_shape(c, g, slots, max_cache_tokens_, mtp));
+  pool_.init(pool_shape(c, g, slots, max_cache_tokens_, mtp, format));
   const size_t elements = static_cast<size_t>(max_tokens_) * c.hidden_size;
   resid_ = device<uint16_t>(elements);
   x_ = device<uint16_t>(elements);
@@ -104,10 +104,12 @@ MinimaxModel::MinimaxModel(const MinimaxConfig& c, const std::string& checkpoint
       gemm_.query_workspace_bytes(max_tokens_, lm_vocab_count_, c.hidden_size, DType::BF16));
   gemm_ws_ = device<char>(gemm_ws_bytes_);
   gemm_.set_decode_rows(std::min(max_decode_rows_, dense_gemv_rows()));
-  attn_ = std::make_unique<MinimaxAttentionLayer>(c, g, max_tokens_, max_cache_tokens_);
+  attn_ =
+      std::make_unique<MinimaxAttentionLayer>(c, g, max_tokens_, max_cache_tokens_, native, format);
   if (c.num_moe_layers() < c.num_hidden_layers)
-    dense_ = std::make_unique<MinimaxMlp>(c, static_cast<int>(g.local_dense_inter), max_tokens_);
-  if (c.num_moe_layers()) moe_ = std::make_unique<MinimaxMoeLayer>(c, g, max_tokens_);
+    dense_ =
+        std::make_unique<MinimaxMlp>(c, static_cast<int>(g.local_dense_inter), max_tokens_, native);
+  if (c.num_moe_layers()) moe_ = std::make_unique<MinimaxMoeLayer>(c, g, max_tokens_, native);
   const size_t routes =
       static_cast<size_t>(c.num_moe_layers()) * max_tokens_ * c.num_experts_per_tok;
   trace_ids_ = pinned<int32_t>(routes);
@@ -169,7 +171,7 @@ size_t MinimaxModel::kv_block_bytes_static(const MinimaxConfig& c, int rank, int
                                            LatentFormat format, bool mtp) {
   validate_run(c, mtp && c.dspark ? c.dspark->query_rows() : 1, rank, world, 1, mtp, 0, format);
   return static_cast<size_t>(c.num_hidden_layers) * 128 *
-             (2 * (c.num_key_value_heads / world) * 128 + 128) * 2 +
+             (2 * (c.num_key_value_heads / world) + 1) * MinimaxKvPool::head_bytes(format) +
          (mtp ? DraftKvPlanes::bytes(c.dspark->num_hidden_layers, c.dspark->local_kv_heads(world),
                                      c.dspark->head_dim, 128)
               : 0);
@@ -177,10 +179,12 @@ size_t MinimaxModel::kv_block_bytes_static(const MinimaxConfig& c, int rank, int
 MinimaxModel::MemoryPlan MinimaxModel::plan_memory(const MinimaxConfig& c, int t, int64_t cache,
                                                    int rank, int world, LoaderResidency residency,
                                                    int slots, bool mtp, int decode,
-                                                   LatentFormat format, bool serving) {
+                                                   LatentFormat format, bool serving, bool native) {
   validate_run(c, t, rank, world, slots, mtp, decode, format);
   const auto head = world > 1 ? LoaderHeadSharding::VocabSharded : LoaderHeadSharding::Full;
   const auto g = MinimaxLocalGeometry::from_config(c, rank, world, head);
+  if (native && (c.hidden_size % 128 || g.local_inter % 128))
+    throw std::invalid_argument("MiniMax native experts require 128-aligned TP slices");
   const int64_t cap = capacity(cache, t);
   const size_t H = c.hidden_size, V = g.lm_vocab_count, T = t;
   MemoryPlan plan;
@@ -211,18 +215,19 @@ MinimaxModel::MemoryPlan MinimaxModel::plan_memory(const MinimaxConfig& c, int t
   }
   plan.add("GEMM workspace (at least)", size_t{64} << 20);
   plan.add("main KV and unpooled index K",
-           MinimaxKvPool::cache_bytes(pool_shape(c, g, slots, cap, mtp)));
+           MinimaxKvPool::cache_bytes(pool_shape(c, g, slots, cap, mtp, format)));
   size_t core = 0, pin = 0;
   session_core_plan_bytes(t, slots, c.hidden_size, g.lm_vocab_count, false, c.hidden_size, &core,
                           &pin, std::max({kDecodeRows, decode, slots}), serving);
   plan.add("session and residual buffers", core + T * H * 6,
            pin + static_cast<size_t>(c.num_moe_layers()) * T * c.num_experts_per_tok * 8);
-  plan.add("sparse attention workspace", MinimaxAttentionLayer::scratch_bytes(c, g, t, cap));
+  plan.add("sparse attention workspace",
+           MinimaxAttentionLayer::scratch_bytes(c, g, t, cap, native, format));
   if (c.num_moe_layers() < c.num_hidden_layers)
     plan.add("dense MLP workspace",
-             MinimaxMlp::scratch_bytes(static_cast<int>(g.local_dense_inter), t));
+             MinimaxMlp::scratch_bytes(c, static_cast<int>(g.local_dense_inter), t, native));
   if (c.num_moe_layers())
-    plan.add("routed and shared expert workspace", MinimaxMoeLayer::scratch_bytes(c, g, t));
+    plan.add("routed and shared expert workspace", MinimaxMoeLayer::scratch_bytes(c, g, t, native));
   if (mtp) {
     std::vector<std::pair<std::string, size_t>> entries;
     DFlash2Drafter::plan_entries(*c.dspark, world, decode, t, slots, V, false, &entries,

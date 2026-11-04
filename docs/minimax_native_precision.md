@@ -123,9 +123,9 @@ the rounding of FP32 outputs. Splitting the same queries into 1-, 8- and
 17-row calls preserves every FP32 output bit. The warnings-as-errors build,
 CUDA memcheck and racecheck pass, with zero errors or hazards.
 
-These are isolated kernel checks. The kernels are not yet connected to the
-model's serving path, and full-model native fidelity, throughput and final
-deployment selection remain pending. Reproduce the upstream quantizer check
+These are isolated kernel checks. The kernels are now connected to the
+target model's serving path; real-checkpoint native fidelity, throughput and
+final deployment selection remain pending. Reproduce the upstream quantizer check
 with `tools/minimax_mxfp8_quantization_check.py`, providing the built
 `mxfp8_gemm_test`, the pinned SGLang source and an untracked output directory.
 
@@ -174,3 +174,53 @@ For the additional upstream GPU comparison, run
 environment containing the pinned FlashInfer source and its CuTe dependency.
 The checker verifies the quantizer source hashes before execution. This is
 not a full upstream MoE or full-model comparison.
+
+## Target-model integration
+
+`engine.activations: "native"` selects MXFP8 dense/shared projections and
+dynamic NVFP4 routed experts for every target-model row, including decode.
+`engine.kv_dtype: "nvfp4"` independently selects the Q8KV4 attention path.
+Both settings default to `bf16`; the provisional deployment remains the
+BF16 control while real-checkpoint native validation is in progress. The
+vision encoder and optional DSpark drafter retain their existing precision.
+
+The cache pool exposes format-specific planes, and its memory planner,
+partial-block prefix copies and NVMe byte counts use the actual storage
+format. Activation precision travels in the fabric settings and contributes
+to the effective configuration digest, preventing reuse across recipes.
+
+Synthetic model checks cover native activations with native cache and each
+mixed BF16 control. Repeated forwards, layer capture, incremental eight-row
+verification and partial-block prefix restore preserve their expected
+outputs exactly. Full-model CUDA graph replay also preserves hidden states
+across changing eight-token feeds and cache-page boundaries in all four
+precision combinations. The native integration passes CUDA memcheck and
+racecheck with zero errors or hazards. A separate layer-by-layer reference executes the pinned
+SGLang and FlashInfer GPU quantizers, decodes their operands independently,
+and computes matrix products with FP32 accumulation. Its four-layer fixture
+comparison passes the existing 1% sublayer gate (maximum relative RMS
+`0.000714405`), with exact router selections. These checks are distinct from
+full-trajectory likelihood, task quality and a complete upstream runtime.
+
+The initial unrestricted FP32-product reference does **not** pass the full
+synthetic trajectory gate: over 384 scored positions, absolute mean NLL
+difference is `0.00100` nat, but 105 positions (27.34%) differ by more than
+1 nat and 97 argmax choices differ. Small first-layer differences grow
+through the fixture's attention and routed experts. This comparison uses
+native quantization on both sides; it is not the earlier BF16-relative
+prescreen. The mismatch remains under investigation, and isolated stage
+passes must not be presented as an end-to-end native accuracy pass.
+
+Run the diagnostic with:
+
+```sh
+python tools/minimax_native_reference.py \
+  --checkpoint-dir /path/to/checkpoint --sglang-source /path/to/sglang \
+  --check-engine-dir /path/to/engine-trace --world 4 --output /path/to/results
+```
+
+The environment must contain the pinned FlashInfer quantizer and its CuTe
+dependencies. Source hashes are checked before execution. `--manifest`
+instead of `--check-engine-dir` runs full trajectories; `--attention-phase`
+selects the prefill or decode formula explicitly. Reference output records
+these choices and does not claim to execute the full upstream serving stack.

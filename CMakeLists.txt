@@ -3036,6 +3036,13 @@ set_tests_properties(minimax_scoring_probe PROPERTIES FIXTURES_REQUIRED minimax_
 set_tests_properties(shared_prefill_test PROPERTIES FIXTURES_REQUIRED minimax_fixture)
 add_test(NAME minimax_forward_smoke COMMAND minimax_test --checkpoint-dir ${CMAKE_BINARY_DIR}/minimax_fixture --dump ${CMAKE_BINARY_DIR}/minimax_oracle)
 set_tests_properties(minimax_forward_smoke PROPERTIES FIXTURES_REQUIRED minimax_fixture FIXTURES_SETUP minimax_output LABELS "cuda")
+add_test(NAME minimax_native_forward_smoke COMMAND minimax_test --checkpoint-dir ${CMAKE_BINARY_DIR}/minimax_fixture
+  --native-activations --native-cache --dump ${CMAKE_BINARY_DIR}/minimax_native_oracle)
+set_tests_properties(minimax_native_forward_smoke PROPERTIES FIXTURES_REQUIRED minimax_fixture LABELS "cuda")
+add_test(NAME minimax_native_activations_smoke COMMAND minimax_test --checkpoint-dir ${CMAKE_BINARY_DIR}/minimax_fixture --native-activations)
+set_tests_properties(minimax_native_activations_smoke PROPERTIES FIXTURES_REQUIRED minimax_fixture LABELS "cuda")
+add_test(NAME minimax_native_cache_smoke COMMAND minimax_test --checkpoint-dir ${CMAKE_BINARY_DIR}/minimax_fixture --native-cache)
+set_tests_properties(minimax_native_cache_smoke PROPERTIES FIXTURES_REQUIRED minimax_fixture LABELS "cuda")
 add_test(NAME minimax_forward_reference COMMAND ${DSV41_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/tools/minimax_reference_dump.py --checkpoint-dir ${CMAKE_BINARY_DIR}/minimax_fixture --check-engine-dir ${CMAKE_BINARY_DIR}/minimax_oracle)
 set_tests_properties(minimax_forward_reference PROPERTIES FIXTURES_REQUIRED minimax_output LABELS "cuda" ENVIRONMENT "OPENBLAS_NUM_THREADS=2")
 add_test(NAME minimax_binding_fixture COMMAND minimax_test --write-fixture ${CMAKE_BINARY_DIR}/minimax_binding_fixture --config ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/minimax/tiny_config.json)
