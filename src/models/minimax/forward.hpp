@@ -35,7 +35,7 @@ class MinimaxModel : public SessionModel<MinimaxModel> {
                                 LoaderResidency = LoaderResidency::Streaming, int slots = 1,
                                 bool mtp = false, int decode_rows = 0,
                                 LatentFormat = LatentFormat::kBf16, bool serving_logits = false);
-  static constexpr int decode_rows_cap() { return 32; }
+  static constexpr int decode_rows_cap() { return 64; }
   static constexpr int prefill_chunk_tokens() { return 512; }
   static constexpr int kv_block_tokens_static() { return 128; }
   static size_t session_snapshot_bytes(const MinimaxConfig&, int, bool) { return 16; }
@@ -157,6 +157,7 @@ class MinimaxModel : public SessionModel<MinimaxModel> {
   CublasLtGemm gemm_;
   Bf12Companions bf12_;
   bool bf12_built_ = false, decode_row_traces_ = false;
+  void project_head(const uint16_t* hidden, float* out, int rows, bool decode);
   MinimaxKvPool pool_;
   std::unique_ptr<MinimaxAttentionLayer> attn_;
   std::unique_ptr<MinimaxMlp> dense_;

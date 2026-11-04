@@ -147,8 +147,7 @@ MinimaxModel::MinimaxModel(const MinimaxConfig& c, const std::string& checkpoint
     host.gemm_rows = [](int, bool) {};
     host.boundary = [this] { return boundary_; };
     host.head = [this](const uint16_t* hidden, float* out, int rows) {
-      gemm_.matmul(hidden, globals_.lm_head, out, rows, lm_vocab_count_, cfg_.hidden_size,
-                   DType::BF16, GemmOut::F32, cfg_.hidden_size, gemm_ws_, gemm_ws_bytes_, stream_);
+      project_head(hidden, out, rows, true);
     };
     df_.init(host, *c.dspark,
              load_minimax_dspark(*c.dspark, checkpoint + "/dspark", stream_, rank, world));
@@ -349,10 +348,9 @@ MinimaxModel::Outputs MinimaxModel::run_rows(const RowRun& run) {
   // final_norm has saved its updated residual, before normalization, too.
   accumulate_draft_tap(cfg_.num_hidden_layers - 1, T);
   const bool packed = project_head_rows(run, [&](int input, int output, int n) {
-    gemm_.set_bf12_wide(run.decode || input < run.decode_rows());
-    gemm_.matmul(h_ + static_cast<size_t>(input) * H, globals_.lm_head,
-                 logits_ + static_cast<size_t>(output) * lm_vocab_count_, n, lm_vocab_count_, H,
-                 DType::BF16, GemmOut::F32, H, gemm_ws_, gemm_ws_bytes_, stream_);
+    project_head(h_ + static_cast<size_t>(input) * H,
+                 logits_ + static_cast<size_t>(output) * lm_vocab_count_, n,
+                 run.decode || input < run.decode_rows());
   });
   if (df_.on()) df_.store_features(T, in.req_ids, in.pos);
   out = finish_run(run, std::move(out), packed);
@@ -364,6 +362,17 @@ MinimaxModel::Outputs MinimaxModel::run_rows(const RowRun& run) {
                                      trace_weights_ + at + static_cast<size_t>(T) * K);
     }
   return out;
+}
+void MinimaxModel::project_head(const uint16_t* hidden, float* out, int rows, bool decode) {
+  // Keep every verification width on the same FP32 reduction chain, including
+  // checkpoint BF16 weights and shapes the lossless BF12 packer declines.
+  // A cuBLAS dispatch here changes logits as occupancy changes and can insert
+  // non-kernel graph nodes. The drafter shares this head and GEMM object.
+  gemm_.set_bf12_wide(decode);
+  gemm_.set_kernel_only_rows(decode ? 1 : 0, decode ? max_decode_rows_ : 0);
+  gemm_.matmul(hidden, globals_.lm_head, out, rows, lm_vocab_count_, cfg_.hidden_size, DType::BF16,
+               GemmOut::F32, cfg_.hidden_size, gemm_ws_, gemm_ws_bytes_, stream_);
+  gemm_.set_kernel_only_rows(0, 0);
 }
 MinimaxModel::Outputs MinimaxModel::forward(const std::vector<int64_t>& ids, bool layers) {
   const int T = static_cast<int>(ids.size());

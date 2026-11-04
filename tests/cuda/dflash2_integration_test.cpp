@@ -378,8 +378,41 @@ DGPP_TEST(minimax_dspark_four_slot_graph_tp) {
 DGPP_TEST(minimax_dspark_four_slot_sampled_graph_tp) {
   check_graph<dgpp::MinimaxModel>(minimax_factory(true, 4), 29978, true, false, nullptr, 4);
 }
+DGPP_TEST(minimax_dspark_eight_slot_graph_tp) {
+  check_graph<dgpp::MinimaxModel>(minimax_factory(true, 8), 29978, false, false, nullptr, 8);
+}
+DGPP_TEST(minimax_dspark_eight_slot_sampled_graph_tp) {
+  check_graph<dgpp::MinimaxModel>(minimax_factory(true, 8), 29978, true, false, nullptr, 8);
+}
+DGPP_TEST(minimax_dspark_eight_slot_verify_logits) {
+  auto model = minimax_factory(true, 8)(nullptr, 0, 1);
+  model->graph_prepare();
+  const int vocab = model->config().vocab_size;
+  std::vector<dgpp::MinimaxModel::Outputs> expected;
+  std::vector<std::vector<int64_t>> feeds;
+  std::vector<int> requests;
+  for (int req = 0; req < 8; ++req) {
+    feeds.push_back(prompt(8, req + 37));
+    model->session_prefill(0, prompt(48 + req * 4, req));
+    expected.push_back(model->session_verify(0, feeds.back()));
+    model->session_close(0);
+    requests.push_back(req);
+  }
+  for (int req : requests) model->session_prefill(req, prompt(48 + req * 4, req));
+  const auto together = model->session_verify_batch(requests, feeds);
+  require(together.size() == 8, "eight-slot verification lost requests");
+  for (int req : requests) {
+    require(together[req].final_hidden_bits == expected[req].final_hidden_bits,
+            "64-row verification changed an isolated request's hidden state");
+    require(expected[req].logits.size() == size_t(8) * vocab &&
+                together[req].logits == expected[req].logits,
+            "64-row verification changed an isolated request's logits");
+    model->session_close(req);
+  }
+  require(model->kv_blocks_in_use() == 0, "eight-slot verification leaked KV blocks");
+}
 DGPP_TEST(minimax_dspark_features_independent_of_row_count) {
-  auto model = minimax_factory(true, 4)(nullptr, 0, 1);
+  auto model = minimax_factory(true, 8)(nullptr, 0, 1);
   const auto ids = prompt(129, 19);
   const int h = model->config().hidden_size;
   auto features = [&](int rows) {
@@ -392,7 +425,7 @@ DGPP_TEST(minimax_dspark_features_independent_of_row_count) {
   model->session_prefill(0, ids);
   const auto reference = features(ids.size());
   model->session_close(0);
-  for (int rows : {1, 8, 16, 24, 32}) {
+  for (int rows : {1, 8, 16, 24, 32, 40, 48, 56, 64}) {
     model->session_prefill(0, {ids.front()});
     const auto first = features(1);
     require(std::equal(first.begin(), first.end(), reference.begin()),
@@ -412,7 +445,7 @@ DGPP_TEST(minimax_dspark_features_independent_of_row_count) {
     }
     model->session_close(0);
   }
-  for (int slots = 2; slots <= 4; ++slots) {
+  for (int slots = 2; slots <= 8; ++slots) {
     std::vector<int> reqs;
     std::vector<std::vector<int64_t>> feeds;
     for (int req = 0; req < slots; ++req) {

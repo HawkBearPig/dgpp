@@ -921,7 +921,7 @@ NLL difference 0.00685 nat and zero changes exceeding 1 nat. Same-binary
 repeats are exact. This quick case does not replace the longer technical
 corpus, near-tie certification or task-quality gates.
 
-### Long technical continuation: unresolved accuracy failure
+### Long technical continuation: arithmetic-order investigation
 
 The corrected CUDA RoPE build was also tested on the complete technical
 teacher text after a 208-token chat prompt. All four ranks completed 7,220
@@ -1009,6 +1009,33 @@ arithmetic makes those stages bit-exact at all six diagnostic layers; attention
 still differs. Fixing attention order then makes **every recorded value in all
 four sublayer stages bit-exact** at these six layers, with exact expert choices.
 This identifies rounding order as the source of those local discrepancies.
-The unrestricted PyTorch reference is retained unchanged as the default;
-the full-corpus fixed-order comparison and task-quality gates remain required.
+The unrestricted PyTorch reference is retained unchanged as the default.
 Partial checks record `complete: false` and never produce trajectory scores.
+
+The complete 60-layer fixed-order reference (`111ec7eb`) passes against the
+unchanged native technical-corpus run above: all 7,220 scored positions keep
+the same argmax, none moves by over 1 nat, and absolute mean NLL difference is
+**0.0000000046 nat**. Of these log probabilities, 7,216 are exactly equal at
+the logged precision; the maximum absolute difference is 0.000034920 nat and
+the maximum target-logit difference is 0.0000973. This establishes agreement
+with an independently implemented reference when arithmetic order is fixed.
+The unrestricted failures remain recorded: changing those reduction orders
+is not within the numerical budget on this corpus. Further optimizations
+must preserve the frozen baseline or independently pass the unchanged gates.
+Broader corpus, greedy-margin and task-quality checks remain required.
+
+### Eight concurrent requests
+
+The decode capacity is extended to 64 rows, enough for eight requests with
+seven DSpark proposals each. Tests cover greedy and sampled graph replay,
+changing occupancy, exact target features at 1/8/16/24/32/40/48/56/64 rows,
+and the logits and hidden states of eight different prefixes verified
+together versus alone. All 24 drafter integration cases and the shared
+prefill suite pass.
+
+The new isolated-logit test exposed a head-only discrepancy: checkpoint
+BF16 heads could dispatch to different cuBLAS reductions at eight and 64
+rows, despite identical hidden states. Verification now uses the same
+FP32 reduction chain at every width, including heads that are not packed
+as BF12. The target and proposal head share this path. Real-checkpoint
+likelihood checks are required for this head change before release.
