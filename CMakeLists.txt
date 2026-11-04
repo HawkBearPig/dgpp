@@ -268,6 +268,7 @@ add_library(dgpp_text STATIC
   src/text/dsv4_prompt.cpp
   src/text/tool_parser.cpp
   src/text/tool_grammar.cpp
+  src/text/minimax_tool_grammar.cpp
   src/text/string_constraint.cpp
   src/text/json_grammar.cpp)
 target_link_libraries(dgpp_text PUBLIC dgpp_loaders dgpp_pcre2)
@@ -1018,6 +1019,7 @@ add_executable(unit_tests
   tests/unit/glm_route_audit_test.cpp
   tests/unit/sampler_test.cpp
   tests/unit/tool_parser_test.cpp
+  tests/unit/minimax_tool_test.cpp
   tests/unit/tool_grammar_test.cpp
   tests/unit/json_grammar_test.cpp
   tests/unit/net_test.cpp

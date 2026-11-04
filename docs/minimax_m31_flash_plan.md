@@ -468,10 +468,9 @@ all four cluster nodes. The initial text implementation binds all 89,109
 text tensors, retains FP32 routing weights, runs MXFP8 weights with BF16
 activations and NVFP4 experts with BF16 activations, and implements paged
 MSA including the independent per-head block selection. It uses the shared
-session, prefix-cache and graph interfaces. DSpark, vision and the MiniMax
-tool-call parser/grammar remain under development; this is a feature-branch
-baseline, not a completed model release. Tool calls are refused until their
-own dialect is wired rather than being interpreted as Qwen XML.
+session, prefix-cache and graph interfaces. The recursive tool-call parser
+and grammar are implemented. DSpark and vision remain under development;
+this is a feature-branch baseline, not a completed model release.
 
 The synthetic four-layer checkpoint passes repeated forward, partial-block
 prefix restore, continuation and request-isolation smoke tests. An
@@ -589,3 +588,31 @@ zero positions moving by over 1 nat). Twelve argmax choices differ; this
 likelihood result does not establish the separate greedy-flip limit, broad
 task quality, or resolve the failed raw-text control. The branch remains
 under development.
+
+### Recursive tool calls
+
+MiniMax uses its own namespaced XML parser and grammar. The parser retains
+recursive parameter schemas, preserves raw scalar strings, handles arrays
+and empty containers, and emits all invokes in a block atomically. Invalid
+or truncated blocks retain their literal bytes and token provenance.
+The grammar translates XML into the existing JSON schema machine, keeps
+its cursor isolated across speculative copies, and supports tools alongside
+structured JSON output and adaptive reasoning. Scalar masks reuse the JSON
+vocabulary tables; structural masks visit only possible leading bytes.
+
+Tests cover token splits across every tag, schema references, nullable
+types, enums, required keys, numeric bounds, array limits, extra properties,
+duplicate keys, literal JSON punctuation inside scalars, malformed fallback
+and speculative cursor isolation. The pinned tokenizer/template corpus
+round-trips recursive tool histories; real-vocabulary masks are checked
+against independent per-token simulation. The existing tool and serving
+regressions remain required alongside these family-specific checks.
+
+The template omits null object fields and gives scalar strings no escaping
+for its own structural delimiters. The grammar refuses required schemas
+without a finite non-null XML spelling. It supports nullable `anyOf` with
+one non-null alternative; multiple non-null alternatives and container
+`enum`/`const` are refused by field at request preparation because their
+ambiguous XML value typing is not implemented. Scalar enums, nested typed
+objects/arrays and local references are supported. These are tool-format
+constraints; JSON response schemas continue to use the existing JSON path.

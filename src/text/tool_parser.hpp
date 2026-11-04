@@ -77,7 +77,7 @@ struct ChatMarker {
 // tag token is an id (a special one: the service's decode skips it) and
 // every bracket and tag name is text; the block opens at the tag token
 // after a "<" and closes at the text "</｜DSML｜ calls>", parsed then.
-enum class ToolFormat { kNone, kGlmMarkers, kQwenXml, kDsml };
+enum class ToolFormat { kNone, kGlmMarkers, kQwenXml, kDsml, kMiniMax };
 
 // The DSML dialect (kDsml): the two DeepSeek encoders share the ｜DSML｜ tag
 // token and the block's grammar but not its spelling, so the tokenizer
@@ -185,12 +185,10 @@ struct ChatMarkers {
   // markers, the two Qwen ones, or DeepSeek's tag token.
   bool reasoning_available() const { return think_close.available(); }
   ToolFormat tool_format() const {
-    // Its namespaced recursive XML needs a distinct parser and grammar.
-    // Do not accidentally advertise the Qwen dialect from shared tokens.
-    if (minimax_namespace.available()) return ToolFormat::kNone;
-    if (tool_call_open.available() && tool_call_close.available() &&
-        arg_key_open.available() && arg_key_close.available() &&
-        arg_value_open.available() && arg_value_close.available())
+    if (minimax_namespace.available() && tool_call_open.available() && tool_call_close.available())
+      return ToolFormat::kMiniMax;
+    if (tool_call_open.available() && tool_call_close.available() && arg_key_open.available() &&
+        arg_key_close.available() && arg_value_open.available() && arg_value_close.available())
       return ToolFormat::kGlmMarkers;
     if (tool_call_open.available() && tool_call_close.available())
       return ToolFormat::kQwenXml;
@@ -226,9 +224,12 @@ class ToolSchemas {
     return types_.count(function) != 0;
   }
   Type type_of(const std::string& function, const std::string& key) const;
+  // Owned recursive schema for formats whose containers are not JSON text.
+  const std::string& parameters(const std::string& function) const;
 
  private:
   std::map<std::string, std::map<std::string, Type>> types_;
+  std::map<std::string, std::string> parameters_;
 };
 
 class ToolCallParser {
@@ -329,6 +330,9 @@ class ToolCallParser {
   bool parse_dsml_block(const std::string& text);
   void complete_dsml_block(std::vector<Event>* out);
   void abort_dsml_block(std::vector<Event>* out);
+  void minimax_append(int64_t id, std::vector<Event>* out);
+  void minimax_flush(size_t bytes, std::vector<Event>* out);
+  bool parse_minimax_block(const std::string& text, std::vector<Call>* calls) const;
   std::string typed_value(const std::string& function, const std::string& key,
                           const std::string& text) const;
 
@@ -338,7 +342,8 @@ class ToolCallParser {
   Options options_;
 
   State state_ = State::kContent;
-  Run run_;  // the current DSML content run
+  Run run_;          // the current DSML content run
+  Run minimax_run_;  // held namespace prefix or complete recursive XML block
 
   // The open block.
   Sub sub_ = Sub::kName;

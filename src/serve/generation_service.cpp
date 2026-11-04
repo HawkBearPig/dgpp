@@ -1,6 +1,7 @@
 #include "serve/generation_service.hpp"
 #include "serve/image_inputs.hpp"
 #include "text/dsv41_prompt.hpp"
+#include "text/minimax_tool_grammar.hpp"
 
 #include <mutex>
 #include <unordered_set>
@@ -1390,7 +1391,15 @@ bool GenerationService::parse_chat(const dgpp::minijson::Value& body,
         std::vector<std::string> warnings, notes;
         try {
           g.tools.push_back(
-              dgpp::text::grammar_tool_from_function(def, &warnings, &notes));
+              dgpp::text::grammar_tool_from_function(def, &warnings, &notes,
+                markers_.tool_format() == dgpp::text::ToolFormat::kMiniMax));
+          if (markers_.tool_format() == dgpp::text::ToolFormat::kMiniMax) {
+            GrammarSpec one;
+            one.tools.push_back(g.tools.back());
+            // Refuse unrepresentable XML schemas at the request boundary,
+            // before a worker or a peer rank configures its grammar.
+            dgpp::text::MiniMaxToolGrammar validate(nullptr, one);
+          }
         } catch (const std::invalid_argument& e) {
           const std::string prefix =
               "tools[" + std::to_string(i) + "]" + (fn != nullptr ? ".function." : ".");
