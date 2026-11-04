@@ -1129,4 +1129,14 @@ retains the scalar chain because wider tensor-core calls need raw weights.
 The integrated serving change passes all 11 selected regression targets,
 including eight-request greedy/sampled graph replay, exact isolated-versus-
 batched logits, shared prefill and the compact-head/kernel suites. Full-model
-likelihood checks remain required for the new head chain.
+likelihood checks then pass on all six corpora with the TP4 binary from
+`2e5f73a3`, SHA-256
+`589d5209c28923b9bcae225529b664364edaae121902c7d6e10cc9cbce72b7bf`.
+Across 28,329 scored positions there are no argmax changes or changes over
+1 nat against the independent fixed-order reference. The largest absolute
+mean NLL change among the six corpora is 0.000000218 nat; the largest
+per-position log-probability change is 0.00009857 nat. Both native trials
+repeat exactly. All 7,256 final-hidden-state hashes per rank match the
+previous scalar-head binary, and every rank reports zero process swap and
+the expected binary hash throughout each case. These checks use
+`bf12+bf16` storage, including the packed narrow projection.

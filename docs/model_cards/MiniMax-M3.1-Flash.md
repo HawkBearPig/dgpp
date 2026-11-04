@@ -81,13 +81,13 @@ explicit schema error. Numeric strings retain their string type.
 
 ## Validation
 
-The conservative baseline and exact index optimization pass the independent
+The exact index optimization and tensor-core vocabulary head pass the independent
 fixed-order reference on six raw/chat corpora: 28,329 scored positions, zero
-argmax changes, zero changes exceeding 1 nat, and a largest mean NLL difference
-of 0.0000212 nat against the 0.02-nat gate. Native repeats are exact. The
+argmax changes, zero changes exceeding 1 nat, and a largest absolute mean NLL
+difference below 0.00000022 nat against the 0.02-nat gate. Native repeats are exact. The
 unrestricted reference's arithmetic-order failures are retained in the
 [implementation record](../minimax_m31_flash_plan.md); thresholds were not
-relaxed. The newer tensor-core vocabulary head is undergoing the same checks.
+relaxed.
 
 Four-rank API, image, video, streaming and cache tests pass, including C8
 DSpark batch isolation. Independent vision checks retain the existing
