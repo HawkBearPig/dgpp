@@ -920,3 +920,25 @@ comparison against the independently corrected CUDA reference: absolute mean
 NLL difference 0.00685 nat and zero changes exceeding 1 nat. Same-binary
 repeats are exact. This quick case does not replace the longer technical
 corpus, near-tie certification or task-quality gates.
+
+### Long technical continuation: unresolved accuracy failure
+
+The corrected CUDA RoPE build was also tested on the complete technical
+teacher text after a 208-token chat prompt. All four ranks completed 7,220
+scored positions over 7,428 input tokens, and both native trials produced
+identical logits. The native mean NLL is 4.9253 versus 4.9905 for the independent
+PyTorch reference: absolute mean difference **0.06523 nat**, with **7.89%** of
+positions moving by over 1 nat. This fails both unchanged limits (0.02 nat
+and 1%). The native binary was built from `d443910f` and has SHA-256
+`e6547df5dfb58ec4c5462e3b51658cc69732bf59fa5eb1608f74bced9e6d93e5`;
+all ranks reported that hash and zero process swap at startup. This was an
+accuracy probe, not a deployment throughput measurement.
+
+The fixed-reduction Triton reference also fails against the native run:
+absolute mean difference **0.05675 nat**, with **7.29%** large changes.
+Comparing the two references to each other gives 0.00847 nat mean difference
+but **9.06%** large changes. Thus reference matrix reduction order alone can
+exceed the per-token budget on this corpus. This control does not waive the
+native failure or establish a release-quality baseline. Layer-by-layer
+investigation, greedy-margin certification and task-quality validation remain
+required before merge.

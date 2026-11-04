@@ -24,7 +24,8 @@ definition of record):
                and concurrency (the headline), the wall rate (prefill and
                queueing included) beside it.
   prefill      serve_prefill_probe at 512 / 2K / 8K / 32K, three distinct cold
-               prefixes each, thinking off: cold prefill seconds.
+               prefixes each, thinking off where supported (otherwise the
+               recorded template default): cold prefill seconds.
   context      serve_context_matrix at 0 / 32K / 64K / 128K / 256K / 512K: cold
                prefill per bucket, decode ms a pass and tok/s from three requests.
   quality      serve_eval on the 300-item HumanEval / GSM8K / extraction set at

@@ -335,7 +335,7 @@ One template, measured as shipped on the bench port, yields every row the tables
 | Table | Measurement | Client |
 |---|---|---|
 | Decode throughput by concurrency; request wall throughput; single-request decode by class | C1/C2/C4/C8 over the five prompt classes, three repetitions, 256 tokens; the engine's decode-only rate and the wall rate per phase | `timed_load.py` |
-| Cold prefill | 512 / 2K / 8K / 32K, three distinct uncached prefixes each, thinking off | `serve_prefill_probe.py` |
+| Cold prefill | 512 / 2K / 8K / 32K, three distinct uncached prefixes each, thinking off where supported; otherwise the recorded template default | `serve_prefill_probe.py` |
 | Long context (decode at context, prefill per bucket) | 0 / 32K / 64K / 128K / 256K / 512K parcel documents: one cold request, two identical | `serve_context_matrix.py` |
 | Quality | the 300-item HumanEval / GSM8K / extraction set at the deployment's slot count; a response cut at the standard cap is asked once more at the 8,192 retry cap (counted in its own column, never scored) | `serve_eval.py` |
 | Transcript checks | the API check; five classes × three greedy transcripts in the shipped mode and again in a second boot without the drafter (the plain/default match); prompt 0 alone against beside slots−1 others (the isolation check) | `serve_api_check.py`, `serve_load.py` |

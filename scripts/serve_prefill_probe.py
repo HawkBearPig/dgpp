@@ -4,7 +4,8 @@
 LEN is an approximate token count, calibrated from prepared GSM8K prose.
 Each request has a distinct prefix; JSON records actual prompt/computed/cache
 counts, engine prefill time and visible client TTFT. Use the same --tag and
---seed in matched fresh-server runs. --no-think fixes the template's mode.
+--seed in matched fresh-server runs. --no-think disables reasoning when the
+template supports that switch; otherwise the report records its default mode.
 
 Usage: serve_prefill_probe.py HOST PORT LEN... [--repeat N] [--json-out FILE]
 """
@@ -58,14 +59,14 @@ def prompt_of(words, n_words, nonce, rng):
         " ".join(words[start:start + n_words])
 
 
-ALWAYS_ON = {"seen": False}  # the template has no thinking switch (Flint): --no-think is moot
+UNSUPPORTED_THINKING_SWITCH = {"seen": False}
 
 
 def ask(host, port, model, prompt, no_think=False):
     payload = {"model": model, "messages": [{"role": "user", "content": prompt}],
                "max_tokens": 1, "temperature": 0, "stream": True,
                "stream_options": {"include_usage": True}}
-    if no_think and not ALWAYS_ON["seen"]:
+    if no_think and not UNSUPPORTED_THINKING_SWITCH["seen"]:
         payload["chat_template_kwargs"] = {"enable_thinking": False}
     conn = http.client.HTTPConnection(host, port, timeout=1200)
     t0 = time.perf_counter()
@@ -74,12 +75,13 @@ def ask(host, port, model, prompt, no_think=False):
                      {"Content-Type": "application/json"})
         response = conn.getresponse()
         if response.status == 400 and "chat_template_kwargs" in payload:
-            # An always-on template refuses the switch (unsupported_parameter):
-            # the probe measures the prefill alone, so ask again without it.
+            # A template without this switch may reason always or adaptively
+            # (MiniMax). The probe measures prefill alone; retry its default
+            # mode and record that mode without claiming reasoning is off/on.
             body = response.read(2048)
             if b"enable_thinking" not in body:
                 raise RuntimeError(f"HTTP 400: {body!r}")
-            ALWAYS_ON["seen"] = True
+            UNSUPPORTED_THINKING_SWITCH["seen"] = True
             conn.close()
             del payload["chat_template_kwargs"]
             conn = http.client.HTTPConnection(host, port, timeout=1200)
@@ -153,7 +155,8 @@ def main():
         raise RuntimeError("invalid token-to-word calibration")
     print(f"[calibrate] 400 words -> {tokens} prompt tokens ({per_word:.3f} tok/word)", flush=True)
     report = {"schema_version": 1, "model": model, "tag": args.tag, "seed": args.seed,
-              "thinking": "always_on" if ALWAYS_ON["seen"] else False if args.no_think else "server_default",
+              "thinking": "server_default" if UNSUPPORTED_THINKING_SWITCH["seen"] else False if args.no_think else "server_default",
+              "thinking_switch_unsupported": UNSUPPORTED_THINKING_SWITCH["seen"],
               "interval_s": args.interval,
               "data_sha256": hashlib.sha256(raw).hexdigest(), "calibration": calibration, "samples": []}
     for length in args.lengths:
