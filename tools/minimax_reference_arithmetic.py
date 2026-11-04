@@ -101,10 +101,10 @@ def norm(x, weight, eps):
     return out
 
 
-def activation(gate, up, alpha, limit):
+def activation(gate, up, alpha, limit, rounded=True):
     if gate.shape != up.shape:
         raise ValueError('activation shapes differ')
-    out = torch.empty(gate.shape, device=gate.device, dtype=torch.bfloat16)
+    out = torch.empty(gate.shape, device=gate.device, dtype=torch.bfloat16 if rounded else torch.float32)
     _activation[(triton.cdiv(gate.numel(), 256),)](
         gate.contiguous(), up.contiguous(), out, gate.numel(), alpha, limit, 256,
         enable_fp_fusion=False)
@@ -163,6 +163,10 @@ def self_test():
     rounded = expected.to(torch.bfloat16)
     ulp = torch.nextafter(rounded.abs(), torch.full_like(rounded, float('inf'))).double() - rounded.abs().double()
     assert torch.all((actual.double() - expected).abs() <= ulp), 'FP64 activation bound'
+    unrounded = activation(g, u, 1.702, 7, rounded=False)
+    assert unrounded.dtype == torch.float32
+    assert torch.equal(unrounded.to(torch.bfloat16), actual), 'fused quantization activation boundary'
+    assert torch.allclose(unrounded.double(), expected, rtol=1e-6, atol=2e-6), 'FP64 unrounded activation bound'
     extreme = torch.tensor([-100, -10000], device='cuda', dtype=torch.bfloat16)
     assert torch.equal(activation(extreme, torch.ones_like(extreme), 1.702, 7), torch.zeros_like(extreme))
     x = torch.randn((35, 6144), device='cuda', dtype=torch.bfloat16)

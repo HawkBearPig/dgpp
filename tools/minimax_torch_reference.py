@@ -2,8 +2,10 @@
 """Independent, layer-streamed MiniMax text reference using PyTorch operations.
 
 This is an accuracy instrument, not a serving implementation or benchmark.
-It decodes the published weights without activation quantization, accumulates
-projections in FP32, and uses FP32 attention probabilities. Simulated TP keeps
+By default it decodes the published weights without activation quantization,
+accumulates projections in FP32, and uses FP32 attention probabilities.
+Optional quantization controls isolate activation error with those reductions;
+they are not native low-precision GEMM implementations. Simulated TP keeps
 local BF16 projection/fold boundaries explicit. No dgpp kernels are loaded.
 Only the safetensors reader and format tables are shared with the NumPy oracle.
 
@@ -26,7 +28,7 @@ from minimax_reference_dump import FP4, FP8, Weights
 
 class Reference:
     def __init__(self, checkpoint, world, rounded_residual, projection_rows=0, projection_backend='cublas',
-                 elementwise_backend='torch', attention_backend='torch'):
+                 elementwise_backend='torch', attention_backend='torch', activation_quantization='bf16'):
         self.w = Weights(checkpoint)
         self.c = json.loads((checkpoint / 'config.json').read_text())['text_config']
         self.world = world
@@ -35,6 +37,7 @@ class Reference:
         self.projection_backend = projection_backend
         self.elementwise_backend = elementwise_backend
         self.attention_backend = attention_backend
+        self.activation_quantization = activation_quantization
         self.config_sha256 = hashlib.sha256((checkpoint/'config.json').read_bytes()).hexdigest()
         self.checkpoint = str(checkpoint.resolve())
         self.fp8 = torch.tensor(FP8, device='cuda')
@@ -85,15 +88,35 @@ class Reference:
             y = y / divisor
         return y.to(torch.bfloat16) if rounded else y
 
+    def quantization(self, base):
+        mode = self.activation_quantization
+        if mode in ('mxfp8', 'mixed') and base+'.weight_scale_inv' in self.w.header:
+            return 'mxfp8'
+        if mode in ('nvfp4', 'mixed') and base+'.weight_packed' in self.w.header:
+            return 'nvfp4'
+        return None
+
+    def project(self, x, weight, divisor, base, rounded=True):
+        mode = self.quantization(base)
+        scale = None
+        if mode:
+            from minimax_reference_quantization import quantize
+            x, scale = quantize(x, mode)
+        y = self.mm(x, weight, divisor, rounded=False,
+                    streaming_order=base+'.weight_scale_inv' in self.w.header)
+        if scale is not None:
+            y = y * scale
+        return y.to(torch.bfloat16) if rounded else y
+
     def linear(self, x, base):
-        return self.mm(x, *self.matrix(base), streaming_order=base+'.weight_scale_inv' in self.w.header)
+        return self.project(x, *self.matrix(base), base)
 
     def parts(self, x, base, rounded=True):
         weight, divisor = self.matrix(base)
         width = weight.shape[1] // self.world
-        return [self.mm(x[:, r*width:(r+1)*width].contiguous(),
-                        weight[:, r*width:(r+1)*width].contiguous(), divisor, rounded,
-                        streaming_order=base+'.weight_scale_inv' in self.w.header)
+        # Dynamic NVFP4 globals are per local TP row, so quantize after slicing.
+        return [self.project(x[:, r*width:(r+1)*width].contiguous(),
+                        weight[:, r*width:(r+1)*width].contiguous(), divisor, base, rounded)
                 for r in range(self.world)]
 
     @staticmethod
@@ -182,9 +205,12 @@ class Reference:
         u = self.linear(n,base+up).float().clamp(-c['swiglu_limit'],c['swiglu_limit'])
         if self.elementwise_backend == 'triton-fixed':
             from minimax_reference_arithmetic import activation
-            act = activation(g, u, c['swiglu_alpha'], c['swiglu_limit'])
+            act = activation(g, u, c['swiglu_alpha'], c['swiglu_limit'],
+                             rounded=not self.quantization(base+down))
         else:
-            act = (g*torch.sigmoid(c['swiglu_alpha']*g)*(u+1)).to(torch.bfloat16)
+            act = g*torch.sigmoid(c['swiglu_alpha']*g)*(u+1)
+            if not self.quantization(base+down):
+                act = act.to(torch.bfloat16)
         return self.parts(act,base+down,rounded=not expert)
 
     def ffn(self, n, layer):
@@ -282,7 +308,8 @@ class Reference:
         (output/'stages.json').write_text(json.dumps(dict(metrics=metrics, failures=failures,
             layers_checked=layers,layers_total=total_layers,complete=layers==total_layers,
             projection_backend=self.projection_backend,elementwise_backend=self.elementwise_backend,
-            attention_backend=self.attention_backend), indent=2)+'\n')
+            attention_backend=self.attention_backend,
+            activation_quantization=self.activation_quantization), indent=2)+'\n')
         if failures:
             raise AssertionError('\n'.join(failures))
         print(f'Isolated sublayer checks passed for {layers}/{total_layers} layers; this is not a full-trajectory quality verdict.', flush=True)
@@ -332,6 +359,7 @@ class Reference:
                 projection_rows=self.projection_rows,
                 projection_backend=self.projection_backend,elementwise_backend=self.elementwise_backend,
                 attention_backend=self.attention_backend,
+                activation_quantization=self.activation_quantization,
                 rope_inv_freq='cuda-fp32',
                 score_from=score_from,
                 backend='pytorch independent FP32 attention', torch_version=torch.__version__,
@@ -370,13 +398,15 @@ def main():
     p.add_argument('--projection-backend',choices=['cublas','triton-fixed'],default='cublas',help='fixed 16-term tensor-core reductions or cuBLAS algorithm dispatch')
     p.add_argument('--elementwise-backend',choices=['torch','triton-fixed'],default='torch',help='diagnostic: fixed FP32 norm/router reductions and activation arithmetic')
     p.add_argument('--attention-backend',choices=['torch','triton-fixed'],default='torch',help='diagnostic: fixed scalar QK/index dots, online softmax and FP32 PV accumulation')
+    p.add_argument('--activation-quantization',choices=['bf16','mxfp8','nvfp4','mixed'],default='bf16',
+                   help='diagnostic: isolate activation quantization with the existing reference reductions; not a native low-precision GEMM oracle')
     p.add_argument('--check-layers',type=int,default=0,help='diagnostic: check only the first N recorded layers (0: all); never produces trajectory scores')
     args = p.parse_args()
     if args.projection_rows < 0:
         p.error('--projection-rows must be nonnegative')
     if args.check_layers < 0 or (args.check_layers and not args.check_engine_dir):
         p.error('--check-layers must be nonnegative and requires --check-engine-dir')
-    reference = Reference(args.checkpoint_dir,args.world,args.rounded_residual,args.projection_rows,args.projection_backend,args.elementwise_backend,args.attention_backend)
+    reference = Reference(args.checkpoint_dir,args.world,args.rounded_residual,args.projection_rows,args.projection_backend,args.elementwise_backend,args.attention_backend,args.activation_quantization)
     if args.check_engine_dir:
         with torch.inference_mode():
             reference.check_stages(args.check_engine_dir,args.output,args.check_layers)
