@@ -41,6 +41,9 @@ to no entry and publishes none, in memory or on NVMe. It prefills along the
 same structural cuts a cached prompt does: opting out changes what is kept,
 not the arithmetic.
 
+Both completion endpoints reject duplicate top-level request fields with
+HTTP 400 naming the field, including repeated fields whose values are null.
+
 Both completion endpoints accept `prompt_cache_key` (OpenAI's field, DGPP's
 semantics): a string of 1 to 256 bytes that pins the prefix-cache entries the
 request creates or attaches to, in memory and in the NVMe cache: unpinned
@@ -56,6 +59,16 @@ Both completion endpoints accept the `ignore_eos` extension. It defaults to
 values return HTTP 400 naming `ignore_eos`. When `true`, sampled EOS tokens
 still count toward usage but do not end generation. The token limit, stop
 strings, cancellation and resource limits still apply.
+
+Logprobs describe generated tokens, not prompt-token scores. Both completion
+endpoints reject a non-null `prompt_logprobs` field with HTTP 400,
+`error.code: "unsupported_parameter"` and `error.param: "prompt_logprobs"`.
+This includes `0`: requesting only the prompt tokens' own scores still
+requires prompt scoring. Omission and explicit null leave generation unchanged.
+The legacy `/v1/completions` route also does not support `echo` or
+`max_tokens: 0`; served perplexity/loglikelihood scoring is not implemented.
+Use the offline teacher-forced procedures in [numerics](numerics.md) for
+prompt scoring.
 
 ## Assistant thinking history (DGPP extension)
 
