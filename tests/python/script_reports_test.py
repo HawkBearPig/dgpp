@@ -12,7 +12,7 @@ import sys
 import tempfile
 import unittest
 from contextlib import redirect_stdout
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -196,6 +196,29 @@ class ScriptReportsTest(unittest.TestCase):
         for prompts in [serve_load.PROMPTS, *serve_load.CLASSES.values()]:
             self.assertEqual(len(prompts), 16)
             self.assertEqual(len(set(prompts)), 16)
+
+    def test_load_reports_actual_thinking_mode_when_switch_is_unsupported(self):
+        first, second = Mock(), Mock()
+        first.getresponse.return_value = Mock(status=400, read=Mock(return_value=b'enable_thinking is unsupported'))
+        second.getresponse.return_value = Mock(status=200)
+        out = {}
+        with patch.object(serve_load.http.client, 'HTTPConnection', side_effect=[first, second]), \
+                patch.object(serve_load, 'read_completion', return_value={'tokens': 1, 'text': 'answer'}):
+            serve_load._stream_one('host', 1, 'model', 'prompt', 1, False, out, 0)
+        self.assertEqual(out['thinking'], 'server_default')
+        self.assertTrue(out['thinking_switch_unsupported'])
+        self.assertNotIn('chat_template_kwargs', json.loads(second.request.call_args.kwargs['body']))
+        first.close.assert_called_once()
+        second.close.assert_called_once()
+
+    def test_load_does_not_retry_an_unrelated_bad_request(self):
+        connection = Mock()
+        connection.getresponse.return_value = Mock(status=400, read=Mock(return_value=b'invalid max_tokens'))
+        with patch.object(serve_load.http.client, 'HTTPConnection', return_value=connection) as factory:
+            with self.assertRaisesRegex(RuntimeError, 'invalid max_tokens'):
+                serve_load._stream_one('host', 1, 'model', 'prompt', 1, False, {}, 0)
+        factory.assert_called_once()
+        connection.close.assert_called_once()
 
     def test_c1_comparison_rejects_regressions_and_unmatched_work(self):
         report = {"schema_version": 1, "model": "fixture", "max_tokens": 320,
