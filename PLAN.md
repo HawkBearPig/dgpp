@@ -316,6 +316,9 @@ Sampled MTP now preserves the drafts each request verified before settling
 another request's fallback. Live observer-based oracle checks cover grouped
 and staggered admission, reused slots, final transcripts and counters, with
 pipelining enabled and disabled.
+Reduced-depth fallbacks use the scheduled replay's width for RNG accounting
+and the final sample. Scalar and batched oracle checks cover both token
+and block verification at one draft within a maximum-depth-three graph.
 
 Other work includes request-level observability, additional API fields,
 silent-node-loss detection, wider batching for GLM-5.3-Flash, arbitrary

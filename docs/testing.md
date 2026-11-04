@@ -208,6 +208,16 @@ to cover the synchronous path. `scheduler_test` covers first-hop skips,
 preserved older snapshots and their later attachment, failed replacements,
 and inconsistent or missing outcomes releasing the rolling slot.
 
+The reduced-depth sampling regressions run with
+`DGPP_TEST_FILTER=scheduled_fallback` in `glm_tp_test`. A maximum-depth-three
+graph verifies one draft per replay, using both token and block verification.
+The two-rank scalar and batched runs force exact-gather fallbacks and compare
+live transcripts, RNG counters and acceptance counts with an independent
+depth-one sampled speculator. Run with `DGPP_PIPELINE=0` as well to cover
+the synchronous path. `DGPP_TEST_FILTER=sampled_` in `dsv4_engine_test`
+exercises both verification rules through every native confidence-scheduled
+depth, including two sampled slots and slot reuse.
+
 The long-document prefix-cache regression is covered by `scheduler_test`
 (changed tails, lookahead identity, small arenas and cleanup), `qwen_decode_test`
 and `glm_tp_test` (two snapshots, resumed target/draft logits and budget changes).
