@@ -33,24 +33,33 @@ The deployment template reserves sixteen request slots and a shared
 it is not a per-request allowance at every concurrency. The checkpoint's
 positional ceiling is 1,048,576, but this template does not reserve that many
 tokens. This pool has loaded successfully on all four nodes with zero
-process swap. Long-context quality is still pending.
+process swap. The BF16 control passes retrieval, prefix reuse and concurrent
+streams through 512K; validation at the template's maximum remains pending.
 
 ## Numerical recipe and drafting
 
 The published NVFP4 expert and MXFP8 dense weights remain compressed in memory.
-The current serving path uses BF16 activations, FP32 routing and attention
+The provisional deployment uses BF16 activations, FP32 routing and attention
 probabilities, and BF16 main K/V and index-key caches. Native activation
 quantization and compressed caches are separate precision choices and are not
 enabled by this template. Lossless BF12 vocabulary-head storage preserves the
 checkpoint's exact BF16 values; the template retains the BF16 copy as well for
 wider projections and prefill.
 
-The tested MXFP8-dense and NVFP4-expert activation controls exceed the
-BF16-relative parity limits. They are quantization prescreens, not fidelity
-checks against the publisher's native quantized execution. That execution
-requires its own matching reference and native-kernel validation before the
-performance work is complete. Their results and scope are recorded in the
-[activation precision prescreen](../minimax_m31_flash_plan.md#activation-precision-prescreen).
+Set `engine.activations: "native"` for MXFP8 W8A8 dense/shared projections
+and dynamic NVFP4 W4A4 experts. Independently, `engine.kv_dtype: "nvfp4"`
+selects Q8KV4 attention and compressed main/index caches. These paths are
+integrated but remain under release validation. They implement the native
+quantized recipe for which the model was trained; differences from the BF16
+control alone do not establish an accuracy regression. The provisional
+template will be selected after fidelity, task-quality and throughput tests.
+
+Native quantizers match the pinned SGLang/FlashInfer GPU producers byte for
+byte. DGPP uses the upstream per-page prefill attention formula at all query
+geometries for batch/chunk consistency; upstream's online decode formula has
+different rounding boundaries. Full upstream runtime equivalence has not
+been established. The [native precision contract](../minimax_native_precision.md)
+records these boundaries, independent controls and outstanding comparisons.
 
 BF12 support currently covers the main vocabulary head. The embedding,
 vision matrices and the drafter's BF16 matrices retain BF16 storage.
@@ -100,15 +109,16 @@ explicit schema error. Numeric strings retain their string type.
 
 ## Validation
 
-The exact index optimization and tensor-core vocabulary head pass the independent
+In the BF16 activation/cache control, the exact index optimization and
+tensor-core vocabulary head pass the independent
 fixed-order reference on six raw/chat corpora: 28,329 scored positions, zero
 argmax changes, zero changes exceeding 1 nat, and a largest absolute mean NLL
-difference below 0.00000022 nat against the 0.02-nat gate. Native repeats are exact. The
+difference below 0.00000022 nat against the 0.02-nat gate. Repeats are exact. The
 unrestricted reference's arithmetic-order failures are retained in the
 [implementation record](../minimax_m31_flash_plan.md); thresholds were not
 relaxed.
 
-Four-rank API, image, video, streaming and cache tests pass, including C8
+Four-rank BF16-control API, image, video, streaming and cache tests pass, including C8
 DSpark batch isolation. Independent vision checks retain the existing
 0.005 relative-RMS and 0.99998 cosine limits. The real video cases produce
 bit-exact final embeddings. Kernel diagnostics and microbenchmarks do not

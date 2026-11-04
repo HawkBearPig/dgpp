@@ -5,6 +5,8 @@ FP8 product chain, page BF16 boundary and FP32 accumulation order so their
 effects can be separated from the unrestricted mathematical oracle. It is
 not the upstream MSA GPU kernel; the default oracle remains available.
 """
+import math
+
 import torch
 import triton
 import triton.language as tl
@@ -139,7 +141,7 @@ def self_test():
         result = attention(q, k, v, selected, positions)
         expected = oracle.attention(q, k, v, selected, positions)
         rms = ((result.double()-expected.double()).norm()/expected.double().norm()).item()
-        if rms > .004:
+        if not math.isfinite(rms) or rms > .004:
             raise AssertionError(f'attention control exceeds the existing RMS gate: {rms}')
         for chunk in (1, 8, 17):
             split = torch.cat([attention(q[i:i+chunk], k, v, selected[i:i+chunk], positions[i:i+chunk])

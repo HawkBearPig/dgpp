@@ -279,3 +279,14 @@ the trajectory. These controls explain those short-probe discrepancies;
 they do not turn the unrestricted-reference failures into passes or certify
 full upstream runtime equivalence. Broader native corpus fidelity, task
 quality and the upstream decode-formula comparison remain required.
+
+The next real-checkpoint TP4 pilot covers complete raw-text and chat prompts:
+528 and 529 scored positions respectively. Both pass the unchanged
+likelihood gate against the three-control reference, with zero argmax
+changes and zero changes above 1 nat. Absolute mean NLL deltas are
+`4.42e-8` and `5.57e-7` nat; the largest per-position difference is
+`3.70e-5` nat. Input protocols match, both engine trials repeat exactly,
+and all four ranks agree on every recorded hidden-state hash. The binary
+and zero-swap checks pass on every rank. These pilot results extend the
+short-trace evidence; they do not replace the longer corpora or task-quality
+checks, and do not claim to run the complete upstream stack.
