@@ -653,10 +653,13 @@ come from the residual entering target layers 3, 17, 31, 45 and 59. Their
 FC result rounds to BF16 before normalization. Draft K/V planes share the
 target's block table, including prefix copies and the NVMe cache tier.
 
-The baseline proposal recipe considers the top 16 base-logit candidates
-per mask position, adds the predecessor's Markov bias, and records the
-actual truncated distribution for sampled verification. This is a draft
-recipe, not a claim of full-vocabulary proposal equivalence to upstream.
+The initial proposal recipe considered the top 16 base-logit candidates
+per mask position before adding the predecessor's Markov bias. After its
+first serving probes, the native path now applies the bias across the full
+vocabulary and gathers the corrected top 16 for each sequential proposal.
+Greedy selection therefore scans every token. Sampled verification records
+the actual truncated distribution, including request sampling settings;
+this proposal distribution is not upstream's full-vocabulary sample.
 The target verifier remains authoritative. Learned confidence drives the
 existing verification scheduler; proposal-width and schedule tuning need
 measured acceptance and complete serving campaigns.
@@ -721,3 +724,13 @@ task-quality tests. The initial base-logit shortlist draft is slower than
 plain decode on this battery; investigate the shortlist's effect on
 Markov-conditioned proposals and tune verification depth before choosing
 deployment defaults.
+
+The full-vocabulary Markov candidate path reuses the existing FP32 DSpark
+projection. It adds six small candidate gathers per draft block at TP4.
+Its regression forces successive winners outside the base-logit top 16
+and verifies the published predecessor and candidate records. The
+single-step sampler is bitwise the existing selector's proposal
+distribution and keyed draws for greedy and sampled requests, including
+top-k/top-p/min-p truncation. Nine selected CTest gates pass, including
+the independent draft oracle and all 21 shared drafter integration cases.
+Full-checkpoint acceptance and runtime comparisons follow this change.

@@ -17,6 +17,7 @@
 #include "common/dtypes.hpp"
 #include "engine/decode_outputs.hpp"
 #include "kernels/dflash2.hpp"
+#include "kernels/dsv41_dspark.hpp"
 #include "kernels/gemm.hpp"
 #include "kernels/kernels.hpp"
 #include "kernels/minimax.hpp"
@@ -137,9 +138,13 @@ void DFlash2Drafter::init(const DFlash2Host& h, const DFlash2Config& cfg, DFlash
   DGPP_CUDA_OK(cudaMalloc(&df_topk_ws_, df_topk_ws_bytes_));
   DGPP_CUDA_OK(cudaMalloc(&df_hidden32_, static_cast<size_t>(BR) * cfg_.selector_rank * 4));
   if (cfg_.backbone == DFlash2Config::Backbone::MiniMaxM3) {
-    // The vanilla Markov head is pred . succ, without a hidden projection.
-    const std::vector<float> ones(static_cast<size_t>(BR) * cfg_.selector_rank, 1.0f);
-    DGPP_CUDA_OK(cudaMemcpy(df_hidden32_, ones.data(), ones.size() * 4, cudaMemcpyHostToDevice));
+    DGPP_CUDA_OK(
+        cudaMalloc(&df_markov_logits_, static_cast<size_t>(df_batch_) * h.vocab_count * 4));
+    DGPP_CUDA_OK(
+        cudaMalloc(&df_markov_ids_, static_cast<size_t>(df_batch_) * cfg_.selector_top_k * 4));
+    DGPP_CUDA_OK(
+        cudaMalloc(&df_markov_scores_, static_cast<size_t>(df_batch_) * cfg_.selector_top_k * 4));
+    DGPP_CUDA_OK(cudaMalloc(&df_markov_prev_, static_cast<size_t>(df_batch_) * 8));
   }
   DGPP_CUDA_OK(cudaMalloc(&df_ids_, static_cast<size_t>(BR) * cfg_.selector_top_k * 4));
   DGPP_CUDA_OK(cudaMalloc(&df_sc_, static_cast<size_t>(BR) * cfg_.selector_top_k * 4));
@@ -185,6 +190,10 @@ void DFlash2Drafter::free() {
   cudaFree(df_logits_);
   cudaFree(df_topk_ws_);
   cudaFree(df_hidden32_);
+  cudaFree(df_markov_logits_);
+  cudaFree(df_markov_ids_);
+  cudaFree(df_markov_scores_);
+  cudaFree(df_markov_prev_);
   cudaFree(df_ids_);
   cudaFree(df_sc_);
   cudaFree(df_tok_);
@@ -219,6 +228,10 @@ void DFlash2Drafter::free() {
   df_topk_ws_ = nullptr;
   df_topk_ws_bytes_ = 0;
   df_hidden32_ = nullptr;
+  df_markov_logits_ = nullptr;
+  df_markov_ids_ = nullptr;
+  df_markov_scores_ = nullptr;
+  df_markov_prev_ = nullptr;
   df_ids_ = nullptr;
   df_sc_ = nullptr;
   df_tok_ = nullptr;
@@ -295,6 +308,8 @@ void DFlash2Drafter::plan_entries(const DFlash2Config& cfg, int world, int decod
   // proposals.
   out->push_back({"dflash2 candidate buffers",
                   dflash2_topk_ws_bytes(V, BR, K) + BR * (RANK * 4 + 2 * K * 4) + BD * 4});
+  if (cfg.backbone == DFlash2Config::Backbone::MiniMaxM3)
+    out->push_back({"MiniMax full-vocabulary Markov step", BW * (V * 4 + K * 8 + 8)});
   // The pinned readbacks and staging (the recorded drafts' mirrors, the
   // walked candidates) and the fold table at world > 1.
   out->push_back({"dflash2 pinned staging",
@@ -543,10 +558,32 @@ void DFlash2Drafter::block_select(int slots, const int* reqs, bool capture) {
   // unread).
   const int R = slots * QR;
   h_.head(df_h_, df_logits_, R);
+  if (cfg_.backbone == DFlash2Config::Backbone::MiniMaxM3) {
+    minimax_select(slots, reqs, capture);
+    return;
+  }
   dflash2_topk_f32(df_logits_, df_ids_, df_sc_, V, R, topk, h_.stream, df_topk_ws_, df_topk_ws_bytes_);
+  gather_candidates(R, df_ids_, df_sc_, capture);
+  h_.gemm->matmul(df_h_, w_.hidden_projection, df_hidden32_, R, rank, H, DType::BF16, GemmOut::F32,
+                  static_cast<size_t>(H), h_.gemm_ws, h_.gemm_ws_bytes, h_.stream);
+  for (int k = 0; k < slots; ++k) {
+    const size_t ro = static_cast<size_t>(k) * QR, co = static_cast<size_t>(k) * D, mo = ro + 1;
+    const size_t po =
+        sampled ? static_cast<size_t>(reqs[k]) * static_cast<size_t>(df_props_stride_) : 0;
+    dflash2_selector_walk(df_ids_ + mo * topk, df_sc_ + mo * topk, df_hidden32_ + mo * rank,
+                          w_.pred_codebook, w_.succ_codebook, df_tokens_ + ro, df_tok_ + co, D,
+                          topk, rank, h_.stream, sampled ? df_pos_ + ro : nullptr,
+                          sampled ? df_specs_ + reqs[k] : nullptr,
+                          sampled ? df_props_ + po : nullptr,
+                          sampled && df_props_h_ != nullptr ? df_props_h_ + po : nullptr,
+                          reqs != nullptr ? df_conf_ + static_cast<size_t>(reqs[k]) * D : nullptr);
+  }
+}
+
+void DFlash2Drafter::gather_candidates(int rows, int32_t* ids, float* scores, bool capture) {
+  const int topk = cfg_.selector_top_k;
   if (h_.world > 1) {
     BoundaryReducer* boundary = h_.boundary();
-    const int rows = R;
     const size_t elems = dflash2_topk_table_elems(rows, topk, h_.world);
     uint16_t* table = boundary->stage(1, static_cast<int>(elems));
     if (table == nullptr) {
@@ -554,24 +591,44 @@ void DFlash2Drafter::block_select(int slots, const int* reqs, bool capture) {
         throw std::runtime_error("dflash2 draft: the top-K gather does not fit the recorder's staged buffer");
       table = df_table_;
     }
-    dflash2_topk_stage(df_ids_, df_sc_, rows, topk, h_.vocab_begin, h_.rank, h_.world, table, h_.stream);
+    dflash2_topk_stage(ids, scores, rows, topk, h_.vocab_begin, h_.rank, h_.world, table,
+                       h_.stream);
     if (!capture) DGPP_CUDA_OK(cudaStreamSynchronize(h_.stream));  // the host-driven fold's contract
     boundary->reduce(table, 1, static_cast<int>(elems));
-    dflash2_topk_merge(table, rows, topk, h_.world, df_ids_, df_sc_, h_.stream);
+    dflash2_topk_merge(table, rows, topk, h_.world, ids, scores, h_.stream);
   }
-  if (cfg_.backbone == DFlash2Config::Backbone::Qwen3)
-    h_.gemm->matmul(df_h_, w_.hidden_projection, df_hidden32_, R, rank, H, DType::BF16,
-                    GemmOut::F32, static_cast<size_t>(H), h_.gemm_ws, h_.gemm_ws_bytes, h_.stream);
+}
+
+void DFlash2Drafter::minimax_select(int slots, const int* reqs, bool capture) {
+  const int H = h_.hidden, QR = cfg_.query_rows(), D = cfg_.drafts();
+  const int K = cfg_.selector_top_k, rank = cfg_.selector_rank, V = h_.vocab_count;
+  const bool sampled = capture && df_specs_ != nullptr && reqs != nullptr;
+  for (int step = 0; step < D; ++step) {
+    // The vanilla Markov bias is defined over the whole vocabulary.
+    // Shortlisting the base logits first can remove its winning token.
+    // Reuse the full-vocabulary FP32 projection and exchange the corrected
+    // top-K once per step; all ranks then choose the same predecessor.
+    dsv41_dspark_markov_bias(df_logits_, static_cast<int64_t>(QR) * V, step + 1, w_.pred_codebook,
+                             w_.succ_codebook, rank, h_.vocab_begin, V,
+                             step == 0 ? df_tokens_ : df_markov_prev_, step == 0 ? QR : 1, slots,
+                             df_markov_logits_, V, 1, h_.stream);
+    dflash2_topk_f32(df_markov_logits_, df_markov_ids_, df_markov_scores_, V, slots, K, h_.stream,
+                     df_topk_ws_, df_topk_ws_bytes_);
+    gather_candidates(slots, df_markov_ids_, df_markov_scores_, capture);
+    for (int k = 0; k < slots; ++k) {
+      const size_t ro = static_cast<size_t>(k) * QR;
+      const size_t po = sampled ? static_cast<size_t>(reqs[k]) * df_props_stride_ + step : 0;
+      dflash2_sample_candidates(
+          df_markov_ids_ + k * K, df_markov_scores_ + k * K, K, step, df_tok_ + k * D + step,
+          df_markov_prev_ + k, df_ids_ + (ro + step + 1) * K, h_.stream,
+          sampled ? df_pos_ + ro + step + 1 : nullptr, sampled ? df_specs_ + reqs[k] : nullptr,
+          sampled ? df_props_ + po : nullptr,
+          sampled && df_props_h_ != nullptr ? df_props_h_ + po : nullptr);
+    }
+  }
   for (int k = 0; k < slots; ++k) {
     const size_t ro = static_cast<size_t>(k) * QR, co = static_cast<size_t>(k) * D, mo = ro + 1;
-    const size_t po = sampled ? static_cast<size_t>(reqs[k]) * static_cast<size_t>(df_props_stride_) : 0;
-    dflash2_selector_walk(df_ids_ + mo * topk, df_sc_ + mo * topk, df_hidden32_ + mo * rank,
-                          w_.pred_codebook, w_.succ_codebook, df_tokens_ + ro, df_tok_ + co, D, topk,
-                          rank, h_.stream, sampled ? df_pos_ + ro : nullptr,
-                          sampled ? df_specs_ + reqs[k] : nullptr, sampled ? df_props_ + po : nullptr,
-                          sampled && df_props_h_ != nullptr ? df_props_h_ + po : nullptr,
-                          reqs != nullptr ? df_conf_ + static_cast<size_t>(reqs[k]) * D : nullptr);
-    if (cfg_.backbone == DFlash2Config::Backbone::MiniMaxM3 && reqs != nullptr)
+    if (reqs != nullptr)
       minimax_dspark_confidence(df_h_ + mo * H, w_.pred_codebook, df_tokens_ + ro, df_tok_ + co,
                                 w_.confidence_weight, w_.confidence_bias,
                                 df_conf_ + static_cast<size_t>(reqs[k]) * D, D, H, rank,

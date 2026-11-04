@@ -133,6 +133,17 @@ void dflash2_selector_walk(const int32_t* ids, const float* unary, const float* 
                            DraftProposal* proposal = nullptr, DraftProposal* proposal_host = nullptr,
                            float* conf = nullptr);
 
+// Draw from an already conditioned top-K row, or take its greedy maximum.
+// Uses the selector walk's truncation, keyed RNG and exact proposal masses.
+// `step` is the zero-based proposal position; `pos` points to that mask's
+// absolute position. Also publish the selected predecessor for a subsequent
+// Markov projection and retain the candidates for acceptance diagnostics.
+void dflash2_sample_candidates(const int32_t* ids, const float* scores, int k, int step,
+                               int32_t* token, int64_t* next_anchor, int32_t* record_ids,
+                               cudaStream_t stream, const int64_t* pos = nullptr,
+                               const SampleSpec* spec = nullptr, DraftProposal* proposal = nullptr,
+                               DraftProposal* proposal_host = nullptr);
+
 // ---- the recorded block draft (the graph engine's block proposal) -------------
 //
 // The block's row inputs off a verify verdict: tokens[0] = verdict->next

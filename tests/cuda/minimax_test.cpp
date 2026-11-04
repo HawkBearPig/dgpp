@@ -13,6 +13,7 @@
 #include "common/cuda_check.hpp"
 #include "common/dtypes.hpp"
 #include "kernels/dflash2.hpp"
+#include "kernels/dsv41_dspark.hpp"
 #include "kernels/glm_moe_launch.hpp"
 #include "kernels/sink_attn.hpp"
 #include "minimax_fixture.hpp"
@@ -254,7 +255,45 @@ void dspark_loader(const std::string& dir) {
       full.bytes);
 }
 
+void dspark_markov_candidates() {
+  constexpr int V = 64, M = 256, S = 2, QR = 8, K = 16;
+  std::vector<float> base(S * QR * V, -20.f);
+  for (int r = 0; r < S * QR; ++r)
+    for (int v = 0; v < K; ++v) base[r * V + v] = 8.f - .25f * v;
+  std::vector<uint16_t> pred(V * M, 0), succ(V * M, 0);
+  const int predecessors[] = {7, 11, 47, 55}, successors[] = {47, 55, 41, 57};
+  for (int i = 0; i < 4; ++i) {
+    pred[predecessors[i] * M + i] = b(1);
+    succ[successors[i] * M + i] = b(50);
+  }
+  Device<float> db(base), logits(S * V), scores(S * K);
+  Device<uint16_t> dp(pred), ds(succ);
+  Device<int64_t> anchors(std::vector<int64_t>{7, 11}), next(S);
+  Device<int32_t> ids(S * K), record(S * K), tokens(S);
+  for (int step = 0; step < 2; ++step) {
+    dsv41_dspark_markov_bias(db.p, QR * V, step + 1, dp.p, ds.p, M, 0, V, step ? next.p : anchors.p,
+                             1, S, logits.p, V, 1, nullptr);
+    const auto got = logits.get();
+    for (int slot = 0; slot < S; ++slot)
+      for (int v = 0; v < V; ++v) {
+        const int wanted = successors[step * S + slot];
+        require(got[slot * V + v] == base[(slot * QR + step + 1) * V + v] + (v == wanted ? 50 : 0),
+                "full-vocabulary Markov projection");
+      }
+    dflash2_topk_f32(logits.p, ids.p, scores.p, V, S, K, nullptr, nullptr, 0);
+    for (int slot = 0; slot < S; ++slot)
+      dflash2_sample_candidates(ids.p + slot * K, scores.p + slot * K, K, step, tokens.p + slot,
+                                next.p + slot, record.p + slot * K, nullptr);
+    const auto chosen = tokens.get();
+    const auto prev = next.get();
+    require(record.get() == ids.get(), "corrected candidates retained for diagnostics");
+    for (int slot = 0; slot < S; ++slot)
+      require(chosen[slot] == successors[step * S + slot] && prev[slot] == chosen[slot],
+              "Markov winner outside the base top-16 or chained predecessor was lost");
+  }
+}
 void dspark_kernels() {
+  dspark_markov_candidates();
   constexpr int R = 7, H = 640, M = 256, V = 32;
   std::vector<float> x(R * H), weight(H + M);
   std::vector<uint16_t> norm(H), rounded(x.size()), want(x.size()), hidden(x.size()), pred(V * M);

@@ -90,9 +90,8 @@ def check(path, dump):
     conf_b = float(w.tensor(p + 'confidence_head.proj.bias')[0])
     previous = 7
     for r in range(R - 1):
-        candidates = np.lexsort((np.arange(c['vocab_size']), -actual_logits[r + 1]))[:16]
-        corrected = actual_logits[r + 1, candidates].astype(np.float64) + succ[candidates] @ pred[previous]
-        chosen = candidates[np.lexsort((candidates, -corrected))[0]]
+        corrected = actual_logits[r + 1].astype(np.float64) + succ @ pred[previous]
+        chosen = np.lexsort((np.arange(c['vocab_size']), -corrected))[0]
         if chosen != proposals[r]:
             raise AssertionError(f'vanilla Markov selection at {r}: {chosen} != {proposals[r]}')
         expected = 1 / (1 + np.exp(-(np.concatenate([actual_hidden[r + 1], pred[previous]]) @ conf_w + conf_b)))

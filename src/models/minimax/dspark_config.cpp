@@ -117,7 +117,8 @@ DFlash2Config minimax_dspark_config(const V& root) {
   c.block_size = 1 + integer(d, "block_size", 1, kSpecRows - 1);
   c.mask_token_id = integer(d, "mask_token_id", 0, c.vocab_size - 1);
   c.selector_rank = integer(t, "dspark_markov_rank", 256, 256);
-  c.selector_top_k = 16;  // Proposal recipe; the target's exact verify remains authoritative.
+  c.selector_top_k =
+      16;  // Sample from the top 16 Markov-corrected logits; greedy scans all tokens.
   c.sliding_window = integer(d, "sliding_window", c.block_size + 1, c.max_position_embeddings);
   word(d, "context_source", "target_layers");
   const auto& taps = need(d, "target_layer_ids");

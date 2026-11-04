@@ -181,6 +181,8 @@ class DFlash2Drafter {
   // slice lists staged, folded and merged into the global top-K), the
   // hidden projection and the selector walk into df_tok_ (D per slot).
   void block_select(int slots, const int* reqs, bool capture);
+  void gather_candidates(int rows, int32_t* ids, float* scores, bool capture);
+  void minimax_select(int slots, const int* reqs, bool capture);
 
   DFlash2Host h_{};
   DFlash2CaptureCtx cap_{};  // bound per family at the capture calls
@@ -220,6 +222,10 @@ class DFlash2Drafter {
   int32_t* df_ids_ = nullptr;     // [BR, top_k]
   float* df_sc_ = nullptr;        // [BR, top_k]
   int32_t* df_tok_ = nullptr;     // [df_batch_ * drafts] the proposals
+  float* df_markov_logits_ = nullptr;  // MiniMax: [df_batch_, local_vocab]
+  int32_t* df_markov_ids_ = nullptr;   // MiniMax: [df_batch_, top_k]
+  float* df_markov_scores_ = nullptr;  // MiniMax: [df_batch_, top_k]
+  int64_t* df_markov_prev_ = nullptr;  // MiniMax: [df_batch_], sequential predecessors
   uint16_t* df_table_ = nullptr;  // world > 1: the slice top-K fold
   int32_t* df_mirror_h_ = nullptr;  // pinned [max_requests, drafts]: the recorded drafts
   int32_t* df_cands_h_ = nullptr;   // pinned [max_requests, drafts, top_k]: the walked candidates
