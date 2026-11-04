@@ -94,9 +94,10 @@ def check(path, dump):
         chosen = np.lexsort((np.arange(c['vocab_size']), -corrected))[0]
         if chosen != proposals[r]:
             raise AssertionError(f'vanilla Markov selection at {r}: {chosen} != {proposals[r]}')
-        expected = 1 / (1 + np.exp(-(np.concatenate([actual_hidden[r + 1], pred[previous]]) @ conf_w + conf_b)))
+        # DGPP's shared scheduler accepts logits and applies sigmoid itself.
+        expected = np.concatenate([actual_hidden[r + 1], pred[previous]]) @ conf_w + conf_b
         if abs(expected - confidence[r]) > 2e-6:
-            raise AssertionError(f'learned confidence at {r}: {expected} != {confidence[r]}')
+            raise AssertionError(f'learned confidence logit at {r}: {expected} != {confidence[r]}')
         previous = int(proposals[r])
     print('head, vanilla Markov walk and learned confidence: pass')
 

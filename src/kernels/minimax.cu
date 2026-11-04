@@ -145,7 +145,7 @@ __global__ void dspark_confidence_kernel(const uint16_t* hidden, const uint16_t*
   const int row = blockIdx.x, tid = threadIdx.x;
   const int64_t previous = row == 0 ? *anchor : proposals[row - 1];
   if (previous < 0 || previous >= vocab) {
-    if (tid == 0) out[row] = 0;
+    if (tid == 0) out[row] = -INFINITY;
     return;
   }
   float sum = 0;
@@ -159,7 +159,8 @@ __global__ void dspark_confidence_kernel(const uint16_t* hidden, const uint16_t*
   if (tid == 0) {
     sum = *bias;
     for (int w = 0; w < 8; ++w) sum += sums[w];
-    out[row] = 1.0f / (1.0f + expf(-sum));
+    // The shared verification schedule consumes logits and applies sigmoid.
+    out[row] = sum;
   }
 }
 __global__ void append_kernel(const uint16_t* x, uint16_t* cache, const int32_t* req,

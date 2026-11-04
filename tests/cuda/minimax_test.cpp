@@ -13,6 +13,7 @@
 
 #include "common/cuda_check.hpp"
 #include "common/dtypes.hpp"
+#include "engine/verify_schedule.hpp"
 #include "kernels/dflash2.hpp"
 #include "kernels/dsv41_dspark.hpp"
 #include "kernels/glm_moe_launch.hpp"
@@ -326,9 +327,24 @@ void dspark_kernels() {
     for (int i = 0; i < H; ++i) dot += double(f(hidden[r * H + i])) * weight[i];
     const int previous = r == 0 ? 9 : tokens[r - 1];
     for (int i = 0; i < M; ++i) dot += double(f(pred[previous * M + i])) * weight[H + i];
-    require(std::abs(confidence[r] - 1 / (1 + std::exp(-dot))) < 2e-6,
-            "DSpark learned predecessor confidence");
+    require(std::abs(confidence[r] - dot) < 2e-6, "DSpark learned predecessor confidence logit");
   }
+  // Exercise the producer/consumer boundary. Applying sigmoid in both places
+  // would turn a low-confidence draft into a roughly 50%-confidence one.
+  dw.upload(std::vector<float>(H + M, 0));
+  for (auto [bias, expected_depth] : {std::pair{-4.f, 0}, {0.f, 2}, {4.f, 7}}) {
+    db.upload(std::vector<float>{bias});
+    minimax_dspark_confidence(dh.p, dp.p, anchor.p, dt.p, dw.p, db.p, dc.p, R, H, M, V, nullptr);
+    const auto logits = dc.get();
+    require(scheduled_verify_depth(logits.data(), R, 1.f, .2f) == expected_depth,
+            "DSpark confidence must cross into the shared schedule as logits");
+  }
+  anchor.upload(std::vector<int64_t>{-1});
+  minimax_dspark_confidence(dh.p, dp.p, anchor.p, dt.p, dw.p, db.p, dc.p, R, H, M, V, nullptr);
+  const auto invalid = dc.get();
+  require(std::isinf(invalid[0]) && invalid[0] < 0 &&
+              scheduled_verify_depth(invalid.data(), R, 1.f, .2f) == 0,
+          "invalid DSpark predecessor has zero acceptance probability");
   // The native 16:1 GQA path, a noncontiguous page table, window and
   // padded query rows against a full FP64 softmax reference.
   constexpr int QH = 16, KH = 1, HD = 128, QR = 8, SLOTS = 384, BPR = 3;
