@@ -75,10 +75,11 @@ __global__ void swiglu_kernel(const uint16_t* gate, const uint16_t* up, uint16_t
 }
 __global__ void norm_rope_kernel(const uint16_t* x, const uint16_t* w, uint16_t* y,
                                  const int64_t* pos, const float* inv, int heads, int rotary,
-                                 float eps) {
+                                 float eps, int64_t x_stride, int64_t y_stride) {
   dgpp_pdl_wait();
   const int r = blockIdx.x, h = blockIdx.y, lane = threadIdx.x;
-  const int64_t at = (static_cast<int64_t>(r) * heads + h) * 128;
+  const int64_t at = static_cast<int64_t>(r) * x_stride + h * 128;
+  const int64_t to = static_cast<int64_t>(r) * y_stride + h * 128;
   float value[4];
   float sum = 0;
 #pragma unroll
@@ -104,7 +105,53 @@ __global__ void norm_rope_kernel(const uint16_t* x, const uint16_t* w, uint16_t*
       const float rotated = normed[pair] * sinf(angle);
       result = d < half ? __fsub_rn(product, rotated) : __fadd_rn(product, rotated);
     }
-    y[at + d] = float_to_bf16_bits(p < 0 ? 0 : result);
+    y[to + d] = float_to_bf16_bits(p < 0 ? 0 : result);
+  }
+}
+__global__ void context_norm_kernel(const float* x, const uint16_t* weight, uint16_t* out,
+                                    int hidden, float eps) {
+  dgpp_pdl_wait();
+  __shared__ float sums[8];
+  const int tid = threadIdx.x;
+  const int64_t at = static_cast<int64_t>(blockIdx.x) * hidden;
+  float sum = 0;
+  for (int d = tid; d < hidden; d += 256) {
+    const float v = rb(x[at + d]);
+    sum = fmaf(v, v, sum);
+  }
+  sum = sum_warp(sum);
+  if (tid % 32 == 0) sums[tid / 32] = sum;
+  __syncthreads();
+  sum = 0;
+  for (int w = 0; w < 8; ++w) sum += sums[w];
+  const float inv = rsqrtf(sum / hidden + eps);
+  for (int d = tid; d < hidden; d += 256)
+    out[at + d] = float_to_bf16_bits(rb(x[at + d]) * inv * (1 + bf16_bits_to_float(weight[d])));
+}
+__global__ void dspark_confidence_kernel(const uint16_t* hidden, const uint16_t* pred,
+                                         const int64_t* anchor, const int32_t* proposals,
+                                         const float* weight, const float* bias, float* out,
+                                         int width, int rank, int vocab) {
+  dgpp_pdl_wait();
+  __shared__ float sums[8];
+  const int row = blockIdx.x, tid = threadIdx.x;
+  const int64_t previous = row == 0 ? *anchor : proposals[row - 1];
+  if (previous < 0 || previous >= vocab) {
+    if (tid == 0) out[row] = 0;
+    return;
+  }
+  float sum = 0;
+  for (int d = tid; d < width; d += 256)
+    sum = fmaf(bf16_bits_to_float(hidden[static_cast<int64_t>(row) * width + d]), weight[d], sum);
+  for (int d = tid; d < rank; d += 256)
+    sum = fmaf(bf16_bits_to_float(pred[previous * rank + d]), weight[width + d], sum);
+  sum = sum_warp(sum);
+  if (tid % 32 == 0) sums[tid / 32] = sum;
+  __syncthreads();
+  if (tid == 0) {
+    sum = *bias;
+    for (int w = 0; w < 8; ++w) sum += sums[w];
+    out[row] = 1.0f / (1.0f + expf(-sum));
   }
 }
 __global__ void append_kernel(const uint16_t* x, uint16_t* cache, const int32_t* req,
@@ -284,12 +331,34 @@ void minimax_swiglu(const uint16_t* gate, const uint16_t* up, uint16_t* out, int
 }
 void minimax_norm_rope(const uint16_t* x, const uint16_t* weight, uint16_t* y, const int64_t* pos,
                        const float* inv_freq, int rows, int heads, int rotary_dim, float eps,
-                       cudaStream_t stream) {
+                       cudaStream_t stream, int64_t x_stride, int64_t y_stride) {
   if (rows <= 0) return;
+  if (x_stride == 0) x_stride = static_cast<int64_t>(heads) * 128;
+  if (y_stride == 0) y_stride = static_cast<int64_t>(heads) * 128;
+  if (x_stride < static_cast<int64_t>(heads) * 128 || y_stride < static_cast<int64_t>(heads) * 128)
+    throw std::invalid_argument("MiniMax norm/RoPE row stride");
   if (heads <= 0 || rotary_dim <= 0 || rotary_dim > 128 || rotary_dim % 2)
     throw std::invalid_argument("MiniMax norm/RoPE shape");
   norm_rope_kernel<<<dim3(rows, heads), 32, 0, stream>>>(x, weight, y, pos, inv_freq, heads,
-                                                         rotary_dim, eps);
+                                                         rotary_dim, eps, x_stride, y_stride);
+  DGPP_CUDA_OK(cudaGetLastError());
+}
+void minimax_context_norm(const float* x, const uint16_t* weight, uint16_t* out, int rows,
+                          int hidden, float eps, cudaStream_t stream) {
+  if (rows <= 0) return;
+  if (hidden <= 0) throw std::invalid_argument("MiniMax context norm hidden");
+  context_norm_kernel<<<rows, 256, 0, stream>>>(x, weight, out, hidden, eps);
+  DGPP_CUDA_OK(cudaGetLastError());
+}
+void minimax_dspark_confidence(const uint16_t* hidden, const uint16_t* pred, const int64_t* anchor,
+                               const int32_t* proposals, const float* weight, const float* bias,
+                               float* out, int drafts, int width, int rank, int vocab,
+                               cudaStream_t stream) {
+  if (drafts <= 0) return;
+  if (width <= 0 || rank <= 0 || vocab <= 0)
+    throw std::invalid_argument("MiniMax DSpark confidence shape");
+  dspark_confidence_kernel<<<drafts, 256, 0, stream>>>(hidden, pred, anchor, proposals, weight,
+                                                       bias, out, width, rank, vocab);
   DGPP_CUDA_OK(cudaGetLastError());
 }
 void minimax_index_append(const uint16_t* k, uint16_t* cache, const int32_t* req,

@@ -86,9 +86,10 @@ int dflash2_block_attn_splits();
 size_t dflash2_block_attn_partials_bytes(int rows, int heads);
 void dflash2_block_attn_split(const uint16_t* q, int64_t q_row_stride, const uint16_t* k_cache,
                               const uint16_t* v_cache, const int32_t* block_table, int block_tokens,
-                              int blocks_per_request, int block_rows, int64_t window, const int64_t* pos,
-                              int rows, int heads, int kv_heads, int dim, float scale, float* partials,
-                              uint16_t* out, cudaStream_t stream);
+                              int blocks_per_request, int block_rows, int64_t window,
+                              const int64_t* pos, int rows, int heads, int kv_heads, int dim,
+                              float scale, float* partials, uint16_t* out, cudaStream_t stream,
+                              bool fp32_p = false);
 
 // Per-row top-K of fp32 logits (descending by score, ties to the lower id):
 // the candidate sets the selector walks. K <= 32.

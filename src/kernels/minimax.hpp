@@ -20,7 +20,15 @@ void minimax_swiglu(const uint16_t* gate, const uint16_t* up, uint16_t* out, int
 // the partial rotation; cos/sin and the rotation arithmetic stay FP32.
 void minimax_norm_rope(const uint16_t* x, const uint16_t* weight, uint16_t* y, const int64_t* pos,
                        const float* inv_freq, int rows, int heads, int rotary_dim, float eps,
-                       cudaStream_t);
+                       cudaStream_t, int64_t x_stride = 0, int64_t y_stride = 0);
+// The context FC is rounded to BF16 before Gemma normalization.
+void minimax_context_norm(const float*, const uint16_t* weight, uint16_t* out, int rows, int hidden,
+                          float eps, cudaStream_t);
+// Learned confidence for each proposed token, conditioned on its predecessor.
+void minimax_dspark_confidence(const uint16_t* hidden, const uint16_t* predecessor,
+                               const int64_t* anchor, const int32_t* proposals, const float* weight,
+                               const float* bias, float* out, int drafts, int width, int rank,
+                               int vocab, cudaStream_t);
 void minimax_index_append(const uint16_t* index_k, uint16_t* cache, const int32_t* req_ids,
                           const int64_t* pos, const int32_t* tables, int table_stride, int rows,
                           cudaStream_t);

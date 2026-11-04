@@ -4,10 +4,12 @@
 #include <stdexcept>
 
 #include "common/cuda_check.hpp"
+#include "kernels/dflash2.hpp"
 #include "kernels/glm_norm.hpp"
 #include "kernels/kernels.hpp"
 #include "kernels/minimax.hpp"
 #include "kernels/qwen_norm.hpp"
+#include "models/minimax/dspark.hpp"
 
 namespace dgpp {
 namespace {
@@ -29,9 +31,16 @@ void validate_run(const MinimaxConfig& c, int t, int rank, int world, int slots,
   c.validate_tp(rank, world);
   if (t <= 0 || slots <= 0 || slots > kPickMaxRequests || decode > MinimaxModel::decode_rows_cap())
     throw std::invalid_argument("MiniMax: invalid forward/session capacity");
-  if (mtp)
-    throw std::invalid_argument(
-        "MiniMax: DSpark execution is not enabled yet; engine.mtp must be false");
+  if (mtp) {
+    if (!c.dspark)
+      throw std::invalid_argument("engine.mtp: MiniMax requires its bundled dspark/config.json");
+    c.dspark->validate_against(
+        {c.hidden_size, c.vocab_size, c.num_hidden_layers, c.max_position_embeddings});
+    if (!c.dspark->tp_divisible(world) || c.dspark->local_intermediate(world) % 32)
+      throw std::invalid_argument("MiniMax DSpark: TP world does not divide the draft geometry");
+    if (t < c.dspark->query_rows())
+      throw std::invalid_argument("MiniMax DSpark: max_tokens must cover the query block");
+  }
   if (format != LatentFormat::kBf16)
     throw std::invalid_argument("MiniMax: this baseline requires BF16 KV and index caches");
 }
@@ -39,8 +48,14 @@ int64_t capacity(int64_t cache, int tokens) {
   return ((std::max<int64_t>(cache, tokens) + 127) / 128) * 128;
 }
 MinimaxKvPoolShape pool_shape(const MinimaxConfig& c, const MinimaxLocalGeometry& g, int slots,
-                              int64_t cache) {
-  return {c.num_hidden_layers, g.local_kv_heads, 128, 128, slots, cache};
+                              int64_t cache, bool draft = false) {
+  MinimaxKvPoolShape shape{c.num_hidden_layers, g.local_kv_heads, 128, 128, slots, cache};
+  if (draft) {
+    shape.draft_layers = c.dspark->num_hidden_layers;
+    shape.draft_kv_heads = c.dspark->local_kv_heads(g.world);
+    shape.draft_dim = c.dspark->head_dim;
+  }
+  return shape;
 }
 }  // namespace
 MinimaxModel::MinimaxModel(const MinimaxConfig& c, const std::string& checkpoint, int max_tokens,
@@ -77,7 +92,7 @@ MinimaxModel::MinimaxModel(const MinimaxConfig& c, const std::string& checkpoint
   p.eos = static_cast<int32_t>(c.eos_token_ids.at(0));
   init_session(p);
   const auto& g = loader_.geometry();
-  pool_.init(pool_shape(c, g, slots, max_cache_tokens_));
+  pool_.init(pool_shape(c, g, slots, max_cache_tokens_, mtp));
   const size_t elements = static_cast<size_t>(max_tokens_) * c.hidden_size;
   resid_ = device<uint16_t>(elements);
   x_ = device<uint16_t>(elements);
@@ -95,9 +110,51 @@ MinimaxModel::MinimaxModel(const MinimaxConfig& c, const std::string& checkpoint
       static_cast<size_t>(c.num_moe_layers()) * max_tokens_ * c.num_experts_per_tok;
   trace_ids_ = pinned<int32_t>(routes);
   trace_weights_ = pinned<float>(routes);
+  if (mtp) {
+    DFlash2Host host;
+    host.hidden = c.hidden_size;
+    host.num_target_layers = c.num_hidden_layers;
+    host.target_vocab = c.vocab_size;
+    host.vocab_count = lm_vocab_count_;
+    host.vocab_begin = lm_vocab_begin_;
+    host.rank = rank;
+    host.world = world;
+    host.stream = stream_;
+    host.max_requests = max_requests_;
+    host.max_tokens = max_tokens_;
+    host.max_decode_rows = max_decode_rows_;
+    host.max_context = max_context();
+    host.position_limit = c.max_position_embeddings;
+    host.session_pos = d_session_pos_;
+    host.decode_tokens = d_tokens_;
+    host.device_tables = pool_.blocks().device_tables();
+    host.total_blocks = static_cast<int>(pool_.total_blocks());
+    host.block_tokens = 128;
+    host.ensure_request_blocks = [this](int req, int64_t pos, cudaStream_t st) {
+      return pool_.ensure_request_blocks(req, pos, st);
+    };
+    host.plane = [this](int l) {
+      const auto v = pool_.draft_view(l);
+      return DFlash2Host::Plane{v.k, v.v};
+    };
+    host.session_position = [this](int req) { return session_position(req); };
+    host.embed = globals_.embed;
+    host.gemm = &gemm_;
+    host.gemm_ws = gemm_ws_;
+    host.gemm_ws_bytes = gemm_ws_bytes_;
+    host.gemm_rows = [](int, bool) {};
+    host.boundary = [this] { return boundary_; };
+    host.head = [this](const uint16_t* hidden, float* out, int rows) {
+      gemm_.matmul(hidden, globals_.lm_head, out, rows, lm_vocab_count_, cfg_.hidden_size,
+                   DType::BF16, GemmOut::F32, cfg_.hidden_size, gemm_ws_, gemm_ws_bytes_, stream_);
+    };
+    df_.init(host, *c.dspark,
+             load_minimax_dspark(*c.dspark, checkpoint + "/dspark", stream_, rank, world));
+  }
   DGPP_CUDA_OK(cudaStreamSynchronize(stream_));
 }
 MinimaxModel::~MinimaxModel() {
+  df_.free();
   cudaFree(resid_);
   cudaFree(x_);
   cudaFree(y_);
@@ -106,10 +163,13 @@ MinimaxModel::~MinimaxModel() {
   cudaFreeHost(trace_weights_);
 }
 size_t MinimaxModel::kv_block_bytes_static(const MinimaxConfig& c, int rank, int world,
-                                           LatentFormat format) {
-  validate_run(c, 1, rank, world, 1, false, 0, format);
+                                           LatentFormat format, bool mtp) {
+  validate_run(c, mtp && c.dspark ? c.dspark->query_rows() : 1, rank, world, 1, mtp, 0, format);
   return static_cast<size_t>(c.num_hidden_layers) * 128 *
-         (2 * (c.num_key_value_heads / world) * 128 + 128) * 2;
+             (2 * (c.num_key_value_heads / world) * 128 + 128) * 2 +
+         (mtp ? DraftKvPlanes::bytes(c.dspark->num_hidden_layers, c.dspark->local_kv_heads(world),
+                                     c.dspark->head_dim, 128)
+              : 0);
 }
 MinimaxModel::MemoryPlan MinimaxModel::plan_memory(const MinimaxConfig& c, int t, int64_t cache,
                                                    int rank, int world, LoaderResidency residency,
@@ -143,7 +203,7 @@ MinimaxModel::MemoryPlan MinimaxModel::plan_memory(const MinimaxConfig& c, int t
   }
   plan.add("GEMM workspace (at least)", size_t{64} << 20);
   plan.add("main KV and unpooled index K",
-           MinimaxKvPool::cache_bytes(pool_shape(c, g, slots, cap)));
+           MinimaxKvPool::cache_bytes(pool_shape(c, g, slots, cap, mtp)));
   size_t core = 0, pin = 0;
   session_core_plan_bytes(t, slots, c.hidden_size, g.lm_vocab_count, false, c.hidden_size, &core,
                           &pin, std::max({kDecodeRows, decode, slots}), serving);
@@ -155,6 +215,12 @@ MinimaxModel::MemoryPlan MinimaxModel::plan_memory(const MinimaxConfig& c, int t
              MinimaxMlp::scratch_bytes(static_cast<int>(g.local_dense_inter), t));
   if (c.num_moe_layers())
     plan.add("routed and shared expert workspace", MinimaxMoeLayer::scratch_bytes(c, g, t));
+  if (mtp) {
+    std::vector<std::pair<std::string, size_t>> entries;
+    DFlash2Drafter::plan_entries(*c.dspark, world, decode, t, slots, V, false, &entries,
+                                 minimax_dspark_weights_bytes(*c.dspark, world));
+    for (const auto& [name, bytes] : entries) plan.add(name, bytes);
+  }
   return plan;
 }
 void MinimaxModel::reset_slot_state(int req) {
@@ -196,6 +262,19 @@ MinimaxModel::Outputs MinimaxModel::run_rows(const RowRun& run) {
     const auto& r = loader_.load_layer(layer);
     if (r.moe && !run.capture) moe_->prepare_table(layer, r.moe_w, stream_);
     norm(resid_, pending, r.input_norm, x_, T);
+    if (df_.on()) {
+      const int tap = df_.tap(layer);
+      if (tap >= 0) {
+        // Upstream captures the residual ENTERING this layer. The input
+        // norm has saved the preceding MLP sum with one BF16 rounding.
+        const auto* fc = df_.weights().fc + static_cast<size_t>(tap) * H * H;
+        gemm_.matmul(resid_, fc, df_.tap_gemm_out(), T, H, H, DType::BF16, GemmOut::F32, H,
+                     gemm_ws_, gemm_ws_bytes_, stream_);
+        const auto& taps = cfg_.dspark->target_layer_ids;
+        dflash2_acc_f32(df_.acc(), df_.tap_gemm_out(), static_cast<int64_t>(T) * H,
+                        layer == *std::min_element(taps.begin(), taps.end()) ? 0 : 1, stream_);
+      }
+    }
     if (observer_ && !run.capture) observer_(layer, "input_norm", x_, T, stream_);
     auto* attn = stage(T, run.capture);
     run.for_each_kernel_group([](int a, int b) { return a > 128 && b > 128; },
@@ -256,6 +335,7 @@ MinimaxModel::Outputs MinimaxModel::run_rows(const RowRun& run) {
                  logits_ + static_cast<size_t>(output) * lm_vocab_count_, n, lm_vocab_count_, H,
                  DType::BF16, GemmOut::F32, H, gemm_ws_, gemm_ws_bytes_, stream_);
   });
+  if (df_.on()) df_.store_features(T, in.req_ids, in.pos);
   out = finish_run(run, std::move(out), packed);
   if (traces)
     for (int l = 0; l < ordinal; ++l) {
@@ -301,5 +381,15 @@ void MinimaxModel::graph_prepare() {
     bf12_.finish(gemm_, 1);
     bf12_built_ = true;
   }
+}
+DFlash2CaptureCtx MinimaxModel::df_capture_ctx() const {
+  return {step_tokens_,
+          decode_rows_,
+          graph_feed_rows_,
+          graph_batch_requests_,
+          graph_rows_per_request_,
+          graph_batch_map_source_,
+          graph_device_positions_,
+          graph_device_tokens_};
 }
 }  // namespace dgpp

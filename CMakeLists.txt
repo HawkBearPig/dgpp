@@ -370,16 +370,17 @@ target_link_libraries(dgpp_models_flint PUBLIC dgpp_loaders dgpp_common)
 dgpp_set_common(dgpp_models_flint)
 
 add_library(dgpp_models_minimax STATIC
+  src/models/minimax/dspark_config.cpp
   src/models/minimax/config.cpp
   src/models/minimax/binding.cpp
   src/models/minimax/reference.cpp)
 target_include_directories(dgpp_models_minimax PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(dgpp_models_minimax PUBLIC dgpp_loaders dgpp_common)
+target_link_libraries(dgpp_models_minimax PUBLIC dgpp_models_dflash2 dgpp_loaders dgpp_common CUDA::cudart)
 dgpp_set_common(dgpp_models_minimax)
 
-add_library(dgpp_models_minimax_loader STATIC src/models/minimax/loader.cpp)
+add_library(dgpp_models_minimax_loader STATIC src/models/minimax/loader.cpp src/models/minimax/dspark_loader.cpp)
 target_include_directories(dgpp_models_minimax_loader PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(dgpp_models_minimax_loader PUBLIC dgpp_models_minimax dgpp_loaders CUDA::cudart dgpp_device_ranges)
+target_link_libraries(dgpp_models_minimax_loader PUBLIC dgpp_models_dflash2 dgpp_models_minimax dgpp_loaders CUDA::cudart dgpp_device_ranges)
 dgpp_set_common(dgpp_models_minimax_loader)
 
 add_library(dgpp_models_minimax_layers STATIC
@@ -1050,6 +1051,7 @@ add_executable(unit_tests
   tests/unit/dory_reference_test.cpp
   tests/unit/flint_config_test.cpp
   tests/unit/flint_binding_test.cpp
+  tests/unit/minimax_dspark_config_test.cpp
   tests/unit/minimax_config_test.cpp
   tests/unit/minimax_binding_test.cpp
   tests/unit/minimax_reference_test.cpp
@@ -1748,7 +1750,7 @@ set_tests_properties(qwen_dflash2_test PROPERTIES RUN_SERIAL TRUE LABELS "gpu")
 
 add_executable(dflash2_integration_test tests/cuda/dflash2_integration_test.cpp)
 target_include_directories(dflash2_integration_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
-target_link_libraries(dflash2_integration_test PRIVATE dgpp_models_qwen_layers dgpp_bus dgpp_sched dgpp_text CUDA::cudart Threads::Threads)
+target_link_libraries(dflash2_integration_test PRIVATE dgpp_models_minimax_layers dgpp_models_qwen_layers dgpp_bus dgpp_sched dgpp_text CUDA::cudart Threads::Threads)
 dgpp_set_common(dflash2_integration_test)
 add_test(NAME dflash2_integration_test COMMAND dflash2_integration_test)
 set_tests_properties(dflash2_integration_test PROPERTIES RUN_SERIAL TRUE LABELS "gpu")
@@ -2914,6 +2916,19 @@ add_executable(minimax_test tests/cuda/minimax_test.cpp tests/cuda/minimax_pdl_t
 target_link_libraries(minimax_test PRIVATE dgpp_models_minimax_layers dgpp_kernels dgpp_serve CUDA::cudart Threads::Threads)
 dgpp_set_common(minimax_test)
 add_test(NAME minimax_kernel_test COMMAND minimax_test --kernels)
+add_test(NAME minimax_dspark_fixture COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/minimax_dspark_fixture.py --output ${CMAKE_BINARY_DIR}/minimax_dspark_fixture)
+set_tests_properties(minimax_dspark_fixture PROPERTIES FIXTURES_SETUP minimax_dspark_fixture LABELS "host")
+add_test(NAME minimax_dspark_target_fixture COMMAND minimax_test --write-fixture ${CMAKE_BINARY_DIR}/minimax_dspark_target_fixture --config ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/minimax/tiny_config.json)
+set_tests_properties(minimax_dspark_target_fixture PROPERTIES FIXTURES_SETUP minimax_dspark_target_fixture LABELS "host")
+add_test(NAME minimax_dspark_model_fixture COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/minimax_dspark_fixture.py --output ${CMAKE_BINARY_DIR}/minimax_dspark_target_fixture/dspark)
+set_tests_properties(minimax_dspark_model_fixture PROPERTIES FIXTURES_REQUIRED minimax_dspark_target_fixture FIXTURES_SETUP minimax_dspark_model_fixture LABELS "host")
+set_tests_properties(dflash2_integration_test PROPERTIES FIXTURES_REQUIRED minimax_dspark_model_fixture)
+add_test(NAME minimax_dspark_forward COMMAND minimax_test --dspark-model-dir ${CMAKE_BINARY_DIR}/minimax_dspark_target_fixture --dump ${CMAKE_BINARY_DIR}/minimax_dspark_oracle)
+set_tests_properties(minimax_dspark_forward PROPERTIES FIXTURES_REQUIRED minimax_dspark_model_fixture FIXTURES_SETUP minimax_dspark_output RUN_SERIAL TRUE LABELS "gpu")
+add_test(NAME minimax_dspark_reference COMMAND ${DSV41_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/tools/minimax_dspark_reference.py --checkpoint-dir ${CMAKE_BINARY_DIR}/minimax_dspark_target_fixture --engine-dir ${CMAKE_BINARY_DIR}/minimax_dspark_oracle)
+set_tests_properties(minimax_dspark_reference PROPERTIES FIXTURES_REQUIRED minimax_dspark_output LABELS "host" ENVIRONMENT "OPENBLAS_NUM_THREADS=2")
+add_test(NAME minimax_dspark_loader COMMAND minimax_test --dspark-dir ${CMAKE_BINARY_DIR}/minimax_dspark_fixture)
+set_tests_properties(minimax_dspark_loader PROPERTIES FIXTURES_REQUIRED minimax_dspark_fixture RUN_SERIAL TRUE LABELS "gpu")
 set_tests_properties(minimax_kernel_test PROPERTIES LABELS "cuda")
 add_test(NAME minimax_forward_fixture COMMAND ${DSV41_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/tools/minimax_reference_dump.py --fixture ${CMAKE_BINARY_DIR}/minimax_fixture)
 set_tests_properties(minimax_forward_fixture PROPERTIES FIXTURES_SETUP minimax_fixture LABELS "host")

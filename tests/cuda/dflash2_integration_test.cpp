@@ -11,10 +11,12 @@
 #include <vector>
 
 #include "common/test.hpp"
+#include "engine/eager_engine.hpp"
 #include "engine/graph_engine.hpp"
 #include "engine/nvme_tier.hpp"
 #include "engine/prefix_arena.hpp"
 #include "engine/tp_bus.hpp"
+#include "models/minimax/forward.hpp"
 #include "models/qwen/forward.hpp"
 #include "models/qwen/model35.hpp"
 #include "qwen35_fixture.hpp"
@@ -43,7 +45,14 @@ struct ReplaySetting {
 
 template <class Model>
 auto draft_plane(Model& model, int layer) {
-  if constexpr (requires { model.pool().draft_view(layer); })
+  if constexpr (std::is_same_v<Model, dgpp::MinimaxModel>) {
+    const auto v = model.pool().draft_view(layer);
+    struct Plane {
+      uint16_t* k_cache;
+      uint16_t* v_cache;
+    };
+    return Plane{v.k, v.v};
+  } else if constexpr (requires { model.pool().draft_view(layer); })
     return model.pool().draft_view(layer);
   else
     return model.pool().view(1 + layer);  // the tiny Qwen35 target has one full layer
@@ -53,7 +62,7 @@ template <class Model>
 std::vector<uint16_t> context(Model& model, int req) {
   DGPP_CUDA_OK(cudaStreamSynchronize(model.stream()));
   const int rows = static_cast<int>(model.session_position(req));
-  constexpr int width = 2 * 128;  // the fixture's two draft KV heads
+  constexpr int width = std::is_same_v<Model, dgpp::MinimaxModel> ? 4 * 128 : 2 * 128;
   const auto* table = model.pool().request_table_row(req);
   const int block = model.kv_block_tokens();
   std::vector<uint16_t> out;
@@ -80,9 +89,9 @@ void check_prefix(Factory make) {
     // A neighboring live request owns physical block zero. The snapshot
     // includes both a shared full block and an independently copied tail.
     model->session_prefill(0, prompt(40, 1 + round));
-    model->session_prefill(1, prompt(80, 4 + round));
+    model->session_prefill(1, prompt(model->kv_block_tokens() + 16, 4 + round));
     const auto peer = context(*model, 0), original = context(*model, 1);
-    arena.snapshot(1, 0, 80);
+    arena.snapshot(1, 0, model->kv_block_tokens() + 16);
     require(context(*model, 0) == peer, "snapshot overwrote a neighboring request's draft context");
     require(context(*model, 1) == original, "snapshot overwrote the source draft context");
     model->session_close(1);
@@ -231,6 +240,14 @@ auto check_graph(Factory make, uint16_t port, bool sampled = false, bool screene
   return transcripts[0];
 }
 
+auto minimax_factory(bool draft = true) {
+  const std::string dir = "minimax_dspark_target_fixture";
+  const auto cfg = dgpp::MinimaxConfig::from_json_file(dir + "/config.json");
+  return [=](dgpp::BoundaryReducer* reducer, int rank, int world) {
+    return std::make_unique<dgpp::MinimaxModel>(
+        cfg, dir, 256, 1024, dgpp::LoaderResidency::Resident, reducer, rank, world, 2, draft, 16);
+  };
+}
 auto flash_factory() {
   const std::string dir = "qwen_dflash2_target_fixture", draft = "qwen_dflash2_draft_fixture";
   const auto cfg = qwenfx::tiny_config();
@@ -262,11 +279,12 @@ auto qwen35_factory() {
 template <class Model, class Factory>
 void check_prefix_tier(Factory make, const char* tag) {
   auto model = make(nullptr, 0, 1);
+  const int prefix_tokens = static_cast<int>(model->kv_block_tokens()) + 16;
   dgpp::PrefixArena<Model> arena(model.get(), 2);
   model->session_prefill(0, prompt(40, 1));
-  model->session_prefill(1, prompt(80, 4));
+  model->session_prefill(1, prompt(prefix_tokens, 4));
   const auto peer = context(*model, 0), original = context(*model, 1);
-  arena.snapshot(1, 0, 80);
+  arena.snapshot(1, 0, prefix_tokens);
   model->session_close(1);
   const int64_t blocks_before = model->kv_blocks_in_use();
   const std::string slab_dir =
@@ -276,6 +294,9 @@ void check_prefix_tier(Factory make, const char* tag) {
   en.slab_path = slab_dir + "/rank0.slab";
   en.capacity_bytes = size_t{64} << 20;
   en.chunk_bytes = size_t{1} << 20;
+  size_t cache_block_bytes = 0;
+  for (const auto& plane : model->pool().planes()) cache_block_bytes += plane.block_bytes;
+  while (en.chunk_bytes < cache_block_bytes) en.chunk_bytes *= 2;
   en.rank = 0;
   en.allow_buffered = true;  // a tmpfs temp directory refuses direct I/O
   auto tier = std::make_unique<dgpp::NvmeTier<Model>>(model.get(), &arena, en);
@@ -295,7 +316,7 @@ void check_prefix_tier(Factory make, const char* tag) {
     }
     throw std::runtime_error("tier: op " + std::to_string(op) + " never completed");
   };
-  // 80 tokens in 64-token blocks: one full block, one partial copy.
+  // One full block and a partial copy, at this family's physical block size.
   const dgpp::sched::SchedulerEngine::DiskBlocks ids = tier->entry_blocks(0);
   require(ids.identities.size() == 1 && ids.partial_identity != 0, "tier: the entry is one full block and a partial");
   dgpp::sched::SchedulerEngine::DiskSpill spill;
@@ -304,7 +325,7 @@ void check_prefix_tier(Factory make, const char* tag) {
   spill.blob_page = 0;
   spill.pages = {tier->blob_pages()};
   spill.partial_page = tier->blob_pages() + 1;
-  spill.ids = prompt(80, 4);
+  spill.ids = prompt(prefix_tokens, 4);
   spill.ids_page = tier->blob_pages() + 2;
   spill.ids_pages = 1;
   tier->spill_begin(spill);
@@ -312,7 +333,7 @@ void check_prefix_tier(Factory make, const char* tag) {
   dgpp::sched::SchedulerEngine::DiskRestore rs;
   rs.op = 2;
   rs.slot = 1;
-  rs.position = 80;
+  rs.position = prefix_tokens;
   rs.mtp_position = arena.meta(0).mtp_position;
   rs.blob_page = 0;
   rs.pages = {tier->blob_pages()};
@@ -333,6 +354,58 @@ void check_prefix_tier(Factory make, const char* tag) {
   tier.reset();
   require(model->kv_blocks_in_use() == 0, "tier: the round trip leaked blocks");
   std::filesystem::remove_all(slab_dir);
+}
+
+DGPP_TEST(minimax_dspark_prefix_snapshot) {
+  check_prefix<dgpp::MinimaxModel>(minimax_factory());
+}
+DGPP_TEST(minimax_dspark_prefix_tier) {
+  check_prefix_tier<dgpp::MinimaxModel>(minimax_factory(), "minimax");
+}
+DGPP_TEST(minimax_dspark_graph_reducer_tp) {
+  check_graph<dgpp::MinimaxModel>(minimax_factory(), 29978);
+}
+DGPP_TEST(minimax_dspark_sampled_graph_tp) {
+  check_graph<dgpp::MinimaxModel>(minimax_factory(), 29978, true);
+}
+DGPP_TEST(minimax_dspark_preserves_target_and_all_accept_lengths) {
+  auto plain = minimax_factory(false)(nullptr, 0, 1);
+  auto draft = minimax_factory()(nullptr, 0, 1);
+  for (int accepted = 1; accepted <= 8; ++accepted) {
+    const auto a = plain->session_prefill(0, prompt(129, accepted));
+    const auto b = draft->session_prefill(0, prompt(129, accepted));
+    require(a.logits == b.logits, "feature taps change target prefill logits");
+    std::vector<int32_t> proposals;
+    require(draft->dflash2_draft(0, 7, &proposals) && proposals.size() == 7,
+            "native block proposal");
+    const auto feeds = prompt(8, accepted + 10);
+    require(plain->session_verify(0, feeds).logits == draft->session_verify(0, feeds).logits,
+            "draft changes target verify logits");
+    plain->session_rollback(0, accepted, 8);
+    draft->session_rollback(0, accepted, 8);
+    require(plain->session_step(0, 117).logits == draft->session_step(0, 117).logits,
+            "draft rollback changes continuation");
+    require(draft->dflash2_draft(0, 117, &proposals), "draft after rollback");
+    plain->session_close(0);
+    draft->session_close(0);
+  }
+}
+DGPP_TEST(minimax_dspark_eager_transcripts_match_plain) {
+  auto transcript = [](bool draft) {
+    auto m = minimax_factory(draft)(nullptr, 0, 1);
+    dgpp::EagerEngineAdapter<dgpp::MinimaxModel> engine(m.get(), 2, dgpp::make_w1_pick(512));
+    std::vector<int32_t> out{engine.prefill(0, prompt(63, 1))};
+    while (out.size() < 24) {
+      engine.reserve(0, m->session_position(0) + 8);
+      const auto next = engine.step(0);
+      require(!next.empty(), "eager draft makes progress");
+      out.insert(out.end(), next.begin(), next.end());
+    }
+    engine.close(0);
+    out.resize(24);
+    return out;
+  };
+  require(transcript(true) == transcript(false), "DSpark changes the greedy transcript");
 }
 
 DGPP_TEST(dflash2_flash_next_prefix_snapshot) { check_prefix<dgpp::QwenModel>(flash_factory()); }

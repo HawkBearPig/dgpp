@@ -10,6 +10,7 @@
 #include "kernels/gemm.hpp"
 #include "kernels/glm_spec.hpp"
 #include "kernels/latent_format.hpp"
+#include "models/dflash2/drafter.hpp"
 #include "models/minimax/layers.hpp"
 
 namespace dgpp {
@@ -38,7 +39,8 @@ class MinimaxModel : public SessionModel<MinimaxModel> {
   static constexpr int kv_block_tokens_static() { return 128; }
   static size_t session_snapshot_bytes(const MinimaxConfig&, int, bool) { return 16; }
   using Base::session_snapshot_bytes;
-  static size_t kv_block_bytes_static(const MinimaxConfig&, int rank, int world, LatentFormat);
+  static size_t kv_block_bytes_static(const MinimaxConfig&, int rank, int world, LatentFormat,
+                                      bool mtp = false);
   int64_t prefill_group_span_limit() const { return max_tokens_; }
   const MinimaxConfig& config() const { return cfg_; }
   const MinimaxKvPool& kv_pool() const { return pool_; }
@@ -63,17 +65,51 @@ class MinimaxModel : public SessionModel<MinimaxModel> {
   const MinimaxKvPool& pool() const { return pool_; }
   void graph_prepare();
   [[noreturn]] void mtp_run_rows(int, const int64_t*, int64_t, int, bool, bool, int, int, int = 0) {
-    refuse_mtp("MiniMax DSpark is not enabled");
+    refuse_mtp("MiniMax DSpark requires the block-draft interface");
   }
   void snapshot_draft_state(int) {}
   void restore_draft_state(int) {}
-  static constexpr bool kDraftChain = false;
-  static constexpr bool kBatchedDraftChain = false;
+  static constexpr bool kDraftChain = true;
+  static constexpr bool kBatchedDraftChain = true;
   const uint16_t* draft_hidden_rows() const { return nullptr; }
   void snapshot_chain_state(int) {}
   void restore_chain_state(int) {}
 
+  const DFlash2Drafter& dspark_drafter() const { return df_; }
+  bool dflash2_enabled() const { return df_.on(); }
+  int dflash_depth() const { return 0; }
+  int dflash2_drafts() const { return df_.on() ? df_.drafts() : 0; }
+  int block_draft_rows() const { return df_.on() ? df_.query_rows() : 0; }
+  int dflash2_batch_slots() const { return df_.batch_slots(); }
+  bool dflash_graph_verify_available() const {
+    return df_.on() && max_decode_rows() >= df_.query_rows();
+  }
+  bool dflash2_draft(int req, int64_t bonus, std::vector<int32_t>* drafts) {
+    return df_.draft(req, bonus, drafts);
+  }
+  void dflash2_draft_batch(const std::vector<int>& reqs, const std::vector<int64_t>& bonuses,
+                           std::vector<std::vector<int32_t>>* drafts) {
+    df_.draft_batch(reqs, bonuses, drafts);
+  }
+  void session_graph_capture_block_draft(int req, const PickVerdict* v) {
+    df_.capture_block_draft(req, v, df_capture_ctx());
+  }
+  void session_graph_capture_block_draft_batch(const PickVerdict* v, int requests) {
+    df_.capture_block_draft_batch(v, requests, df_capture_ctx());
+  }
+  const int32_t* block_drafts_host(int req) const { return df_.drafts_host(req); }
+  int block_candidates() const { return df_.cfg().selector_top_k; }
+  const int32_t* block_candidates_host(int req) const { return df_.candidates_host(req); }
+  void dflash2_arm_proposals(const SampleSpec* specs, DraftProposal* proposals, DraftProposal* host,
+                             int stride) {
+    df_.arm_proposals(specs, proposals, host, stride);
+  }
+  bool dflash2_proposals_armed() const { return df_.proposals_armed(); }
+  const float* dflash2_confidence() const { return df_.confidence(); }
+
  private:
+  DFlash2CaptureCtx df_capture_ctx() const;
+  DFlash2Drafter df_;
   uint16_t* stage(int rows, bool capture);
   void fold(uint16_t*, int rows, bool capture);
   void norm(uint16_t* resid, const uint16_t* add, const uint16_t* weight, uint16_t* out, int rows);

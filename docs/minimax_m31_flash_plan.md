@@ -616,3 +616,68 @@ one non-null alternative; multiple non-null alternatives and container
 ambiguous XML value typing is not implemented. Scalar enums, nested typed
 objects/arrays and local references are supported. These are tool-format
 constraints; JSON response schemas continue to use the existing JSON path.
+
+### Four-rank API and graph checks
+
+Source `2c5de769`, server SHA-256
+`7bc941e22c28dadd625e01f9e3ff4e41eda9be99b13ad12debaff9bc88bccee2`,
+passed the general API checks with BF16 KV, graph decode, and no draft.
+The checks covered streaming stops, multiple completions, logit bias,
+invalid-request errors, cold and reused prefixes, reasoning accounting,
+and recursive tools with schema constraints. Nested object/array calls
+passed both streaming and non-streaming validation, including preservation
+of the string `"123"`, booleans, and integer arrays. Unsupported required
+null tool parameters returned a field-specific 400 error.
+
+Four deterministic 256-token transcripts (chat, code, arithmetic, JSON)
+matched exactly between graph and eager decode, including raw reasoning,
+content, finish reasons and token counts. Every rank was at zero process
+swap with the same binary during these API and parity checks. The graph
+world's operation streams matched at `ad363b2f8e421d3fa9be1f6e913f6a29`;
+the eager world's matched at `0522926a6595ea7446c17dfd108544e8`. These
+transcripts reached their token caps and establish execution parity, not
+task-quality completion.
+
+The separate maintained tool campaign also passed its structural checks
+with matching rank streams, but rank 0 had swapped pages. Its timings are
+excluded. These smoke tests supply no deployment throughput rows; those
+require the complete shipped-template campaign.
+
+### Bundled DSpark implementation
+
+The native draft loader retains MXFP8 projections and expands only the
+BF16 confidence weights to FP32. The shared block executor now supports
+MiniMax Gemma norms, partial rotary embeddings, dense SwiGLU-OAI, a
+vanilla Markov head, and learned acceptance confidence. Context features
+come from the residual entering target layers 3, 17, 31, 45 and 59. Their
+FC result rounds to BF16 before normalization. Draft K/V planes share the
+target's block table, including prefix copies and the NVMe cache tier.
+
+The baseline proposal recipe considers the top 16 base-logit candidates
+per mask position, adds the predecessor's Markov bias, and records the
+actual truncated distribution for sampled verification. This is a draft
+recipe, not a claim of full-vocabulary proposal equivalence to upstream.
+The target verifier remains authoritative. Learned confidence drives the
+existing verification scheduler; proposal-width and schedule tuning need
+measured acceptance and complete serving campaigns.
+
+The published 2.3 GB draft passed exact source-byte checks, FC column
+reordering checks, BF16-to-FP32 confidence checks, and all TP2/TP4 tensor
+slices. Synthetic tests additionally cover the 16:1 attention head ratio,
+strided norm/RoPE, FP32 attention probabilities, context rounding, and
+predecessor-conditioned confidence. The native fixture has an independent
+FP64 forward oracle; its input taps are checked against the target's
+completed prior-layer residuals. Release validation remains in progress.
+
+The fixture oracle reports FC relative RMS error `6.2e-8`, exact context
+normalization, draft K/V relative RMS errors at most `0.000822`, and final
+draft hidden-state relative RMS error `0.002163`. Output-head projections,
+vanilla Markov selections and learned confidence agree with the independent
+reference at the observed BF16 hidden boundary. Sixteen selected CTest
+gates pass, including all 18 shared drafter integration cases, plain versus
+speculative greedy transcripts, every acceptance length, two-rank greedy
+and sampled graph execution, prefix copy/restore and the NVMe tier.
+The tier harness sizes staging chunks and restore positions from the
+model's physical block size. Kernel and native draft-forward memchecks
+report zero errors; the MiniMax shared-prefill test passes. Four-node real
+model speculation and acceptance/throughput tuning remain separate gates.

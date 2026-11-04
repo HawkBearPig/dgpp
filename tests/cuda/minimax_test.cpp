@@ -12,9 +12,11 @@
 
 #include "common/cuda_check.hpp"
 #include "common/dtypes.hpp"
+#include "kernels/dflash2.hpp"
 #include "kernels/glm_moe_launch.hpp"
 #include "kernels/sink_attn.hpp"
 #include "minimax_fixture.hpp"
+#include "models/minimax/dspark.hpp"
 #include "models/minimax/forward.hpp"
 #include "models/minimax/reference.hpp"
 
@@ -147,8 +149,193 @@ void near(const std::vector<uint16_t>& got, const std::vector<uint16_t>& want, d
   std::printf("%s relative RMS %.8g\n", name, relative);
   require(relative <= limit, std::string(name) + " numerical mismatch");
 }
+void dspark_loader(const std::string& dir) {
+  const auto c = minimax_dspark_config_file(dir + "/config.json");
+  auto full = load_minimax_dspark(c, dir, nullptr, 0, 1);
+  require(full.bytes == minimax_dspark_weights_bytes(c, 1),
+          "DSpark memory plan reconciles full weights");
+  std::vector<std::unique_ptr<SafetensorsFile>> files;
+  for (const auto& e : std::filesystem::directory_iterator(dir))
+    if (e.path().extension() == ".safetensors")
+      files.push_back(SafetensorsFile::open(e.path().string()));
+  auto source = [&](const std::string& name) -> const TensorInfo& {
+    for (const auto& f : files)
+      if (auto* t = f->find("language_model.model.dspark." + name)) return *t;
+    throw std::runtime_error("missing source " + name);
+  };
+  auto verbatim = [&](const auto* data, const std::string& name) {
+    const auto& t = source(name);
+    const auto got = copy_device(reinterpret_cast<const uint8_t*>(data), t.nbytes());
+    require(std::memcmp(got.data(), t.data, t.nbytes()) == 0, "DSpark changed source " + name);
+  };
+  const int H = c.hidden_size, Q = c.q_row(), K = c.kv_row(), I = c.intermediate_size;
+  for (int l = 0; l < c.num_hidden_layers; ++l) {
+    const auto& w = full.layers[l];
+    const auto p = "layers." + std::to_string(l) + ".decoder_layer.";
+    verbatim(w.input_norm, p + "input_layernorm.weight");
+    verbatim(w.post_norm, p + "post_attention_layernorm.weight");
+    verbatim(w.q_norm, p + "self_attn.q_norm.weight");
+    verbatim(w.k_norm, p + "self_attn.k_norm.weight");
+    verbatim(w.qkv_fp8, p + "self_attn.q_proj.weight");
+    verbatim(w.qkv_e8m0, p + "self_attn.q_proj.weight_scale_inv");
+    verbatim(w.qkv_fp8 + size_t(Q) * H, p + "self_attn.k_proj.weight");
+    verbatim(w.qkv_e8m0 + size_t(Q) * H / 32, p + "self_attn.k_proj.weight_scale_inv");
+    verbatim(w.qkv_fp8 + size_t(Q + K) * H, p + "self_attn.v_proj.weight");
+    verbatim(w.qkv_e8m0 + size_t(Q + K) * H / 32, p + "self_attn.v_proj.weight_scale_inv");
+    for (const auto& [name, payload, scales] : {std::tuple{"self_attn.o_proj", w.o_fp8, w.o_e8m0},
+                                                {"mlp.gate_proj", w.gate_fp8, w.gate_e8m0},
+                                                {"mlp.up_proj", w.up_fp8, w.up_e8m0},
+                                                {"mlp.down_proj", w.down_fp8, w.down_e8m0}}) {
+      verbatim(payload, p + name + ".weight");
+      verbatim(scales, p + name + ".weight_scale_inv");
+    }
+  }
+  verbatim(full.hidden_norm, "hidden_norm.weight");
+  verbatim(full.norm, "final_norm.weight");
+  verbatim(full.pred_codebook, "markov_head.markov_w1.weight");
+  verbatim(full.succ_codebook, "markov_head.markov_w2.weight");
+  const auto fc = copy_device(full.fc, c.target_layer_ids.size() * H * H);
+  const auto* original = static_cast<const uint16_t*>(source("fc.weight").data);
+  for (size_t tap = 0; tap < c.target_layer_ids.size(); ++tap)
+    for (int r = 0; r < H; ++r)
+      require(std::memcmp(fc.data() + (tap * H + r) * H, original + size_t(r) * c.fc_in() + tap * H,
+                          H * 2) == 0,
+              "DSpark FC tap column order");
+  for (const auto& [ptr, name] : {std::pair{full.confidence_weight, "confidence_head.proj.weight"},
+                                  {full.confidence_bias, "confidence_head.proj.bias"}}) {
+    const auto& t = source(name);
+    const auto values = copy_device(ptr, t.numel());
+    for (size_t i = 0; i < t.numel(); ++i)
+      require(values[i] == f(static_cast<const uint16_t*>(t.data)[i]),
+              "DSpark confidence expands BF16 exactly to FP32");
+  }
+  files.clear();
+  for (int world : {2, 4})
+    for (int rank = 0; rank < world; ++rank) {
+      auto part = load_minimax_dspark(c, dir, nullptr, rank, world);
+      require(part.bytes == minimax_dspark_weights_bytes(c, world),
+              "DSpark memory plan reconciles sharded weights");
+      const int q = Q / world, k = K / world, i = I / world;
+      for (int l = 0; l < c.num_hidden_layers; ++l) {
+        const auto& a = part.layers[l];
+        const auto& b = full.layers[l];
+        int local = 0, global = 0;
+        for (auto [nr, fullrows] : {std::pair{q, Q}, {k, K}, {k, K}}) {
+          rectangular_slice(a.qkv_fp8 + size_t(local) * H, nr, H, b.qkv_fp8 + size_t(global) * H,
+                            fullrows, H, rank * nr, 0);
+          rectangular_slice(a.qkv_e8m0 + size_t(local) * H / 32, nr, H / 32,
+                            b.qkv_e8m0 + size_t(global) * H / 32, fullrows, H / 32, rank * nr, 0);
+          local += nr;
+          global += fullrows;
+        }
+        rectangular_slice(a.o_fp8, H, q, b.o_fp8, H, Q, 0, rank * q);
+        rectangular_slice(a.o_e8m0, H, q / 32, b.o_e8m0, H, Q / 32, 0, rank * q / 32);
+        for (auto [ap, as, bp, bs] : {std::tuple{a.gate_fp8, a.gate_e8m0, b.gate_fp8, b.gate_e8m0},
+                                      {a.up_fp8, a.up_e8m0, b.up_fp8, b.up_e8m0}}) {
+          rectangular_slice(ap, i, H, bp, I, H, rank * i, 0);
+          rectangular_slice(as, i, H / 32, bs, I, H / 32, rank * i, 0);
+        }
+        rectangular_slice(a.down_fp8, H, i, b.down_fp8, H, I, 0, rank * i);
+        rectangular_slice(a.down_e8m0, H, i / 32, b.down_e8m0, H, I / 32, 0, rank * i / 32);
+        require(copy_device(a.input_norm, H) == copy_device(b.input_norm, H),
+                "DSpark norm replication");
+      }
+      require(copy_device(part.fc, fc.size()) == fc, "DSpark FC replication");
+      require(copy_device(part.pred_codebook, size_t(c.vocab_size) * c.selector_rank) ==
+                  copy_device(full.pred_codebook, size_t(c.vocab_size) * c.selector_rank),
+              "DSpark predecessor replication");
+      require(copy_device(part.succ_codebook, size_t(c.vocab_size) * c.selector_rank) ==
+                  copy_device(full.succ_codebook, size_t(c.vocab_size) * c.selector_rank),
+              "DSpark successor replication");
+    }
+  std::printf(
+      "DSpark source bytes, FC columns, FP32 confidence and TP2/TP4 slices exact; full arena %zu "
+      "bytes\n",
+      full.bytes);
+}
+
+void dspark_kernels() {
+  constexpr int R = 7, H = 640, M = 256, V = 32;
+  std::vector<float> x(R * H), weight(H + M);
+  std::vector<uint16_t> norm(H), rounded(x.size()), want(x.size()), hidden(x.size()), pred(V * M);
+  for (size_t i = 0; i < x.size(); ++i) {
+    x[i] = std::sin(float(i) * .21f) * 2.017f;
+    rounded[i] = b(x[i]);
+    hidden[i] = b(std::cos(float(i) * .31f));
+  }
+  for (int i = 0; i < H; ++i) norm[i] = b(std::sin(float(i)) * .13f);
+  for (int i = 0; i < H + M; ++i) weight[i] = std::cos(float(i) * .13f) * .04f;
+  for (size_t i = 0; i < pred.size(); ++i) pred[i] = b(std::sin(float(i) * .11f));
+  for (int r = 0; r < R; ++r) {
+    double ss = 0;
+    for (int d = 0; d < H; ++d) ss += double(f(rounded[r * H + d])) * f(rounded[r * H + d]);
+    const float inv = 1 / std::sqrt(float(ss / H) + 1e-6f);
+    for (int d = 0; d < H; ++d) want[r * H + d] = b(f(rounded[r * H + d]) * inv * (1 + f(norm[d])));
+  }
+  Device<float> dx(x), dw(weight), db(std::vector<float>{.31f}), dc(R);
+  Device<uint16_t> dn(norm), dy(x.size()), dh(hidden), dp(pred);
+  Device<int64_t> anchor(std::vector<int64_t>{9});
+  const std::vector<int32_t> tokens{3, 8, 2, 13, 18, 1, 6};
+  Device<int32_t> dt(tokens);
+  minimax_context_norm(dx.p, dn.p, dy.p, R, H, 1e-6f, nullptr);
+  near(dy.get(), want, .0001, "DSpark FC rounds before Gemma norm");
+  minimax_dspark_confidence(dh.p, dp.p, anchor.p, dt.p, dw.p, db.p, dc.p, R, H, M, V, nullptr);
+  const auto confidence = dc.get();
+  for (int r = 0; r < R; ++r) {
+    double dot = .31f;
+    for (int i = 0; i < H; ++i) dot += double(f(hidden[r * H + i])) * weight[i];
+    const int previous = r == 0 ? 9 : tokens[r - 1];
+    for (int i = 0; i < M; ++i) dot += double(f(pred[previous * M + i])) * weight[H + i];
+    require(std::abs(confidence[r] - 1 / (1 + std::exp(-dot))) < 2e-6,
+            "DSpark learned predecessor confidence");
+  }
+  // The native 16:1 GQA path, a noncontiguous page table, window and
+  // padded query rows against a full FP64 softmax reference.
+  constexpr int QH = 16, KH = 1, HD = 128, QR = 8, SLOTS = 384, BPR = 3;
+  const int64_t start = 257, window = 129;
+  const std::vector<int32_t> table{2, 0, 1};
+  std::vector<int64_t> pos(QR);
+  std::vector<uint16_t> q(QR * QH * HD), k(SLOTS * KH * HD), v(k.size()), expected(q.size());
+  for (int r = 0; r < QR; ++r) pos[r] = r < 6 ? start + r : -1;
+  for (size_t i = 0; i < q.size(); ++i) q[i] = b(std::sin(float(i) * .18f));
+  for (size_t i = 0; i < k.size(); ++i) {
+    k[i] = b(std::cos(float(i) * .07f));
+    v[i] = b(std::sin(float(i) * .31f));
+  }
+  for (int r = 0; r < 6; ++r)
+    for (int h = 0; h < QH; ++h) {
+      std::vector<double> scores;
+      for (int64_t p = std::max<int64_t>(0, pos[r] - window + 1); p < start + 6; ++p) {
+        const auto at = (table[p / 128] * 128 + p % 128) * HD;
+        double dot = 0;
+        for (int d = 0; d < HD; ++d) dot += double(f(q[(r * QH + h) * HD + d])) * f(k[at + d]);
+        scores.push_back(dot / std::sqrt(128.0));
+      }
+      const double mx = *std::max_element(scores.begin(), scores.end());
+      double den = 0;
+      for (double& score : scores) {
+        score = std::exp(score - mx);
+        den += score;
+      }
+      for (int d = 0; d < HD; ++d) {
+        double value = 0;
+        size_t i = 0;
+        for (int64_t p = std::max<int64_t>(0, pos[r] - window + 1); p < start + 6; ++p)
+          value += scores[i++] * f(v[(table[p / 128] * 128 + p % 128) * HD + d]);
+        expected[(r * QH + h) * HD + d] = b(value / den);
+      }
+    }
+  Device<uint16_t> dq(q), dk(k), dv(v), out(q.size());
+  Device<int32_t> tables(table);
+  Device<int64_t> positions(pos);
+  Device<float> partial(dflash2_block_attn_partials_bytes(QR, QH) / sizeof(float));
+  dflash2_block_attn_split(dq.p, QH * HD, dk.p, dv.p, tables.p, 128, BPR, QR, window, positions.p,
+                           QR, QH, KH, HD, 1 / std::sqrt(128.0f), partial.p, out.p, nullptr, true);
+  near(out.get(), expected, .0002, "DSpark FP32-P 16:1 block attention");
+}
 void kernels() {
   minimax_pdl_test();
+  dspark_kernels();
   {
     std::vector<MoeSegment> segments(128);
     for (int e : {0, 7, 32, 127}) segments[e] = MoeSegment{e * 3, 1, e};
@@ -227,6 +414,25 @@ void kernels() {
   near(separate, gold, .002, "Gemma norm and partial RoPE");
   minimax_norm_rope(dx.p, dw.p, dx.p, dp.p, di.p, R, heads, 64, 1e-6f, nullptr);
   require(dx.get() == separate, "in-place norm/RoPE");
+  {
+    const int stride = (heads + 2) * 128;
+    std::vector<uint16_t> strided(R * stride, b(99));
+    for (int r = 0; r < R; ++r)
+      std::copy_n(x.data() + r * heads * 128, heads * 128, strided.data() + r * stride + 128);
+    Device<uint16_t> ds(strided);
+    minimax_norm_rope(ds.p + 128, dw.p, ds.p + 128, dp.p, di.p, R, heads, 64, 1e-6f, nullptr,
+                      stride, stride);
+    const auto got = ds.get();
+    for (int r = 0; r < R; ++r) {
+      require(
+          std::equal(got.begin() + r * stride + 128, got.begin() + r * stride + (heads + 1) * 128,
+                     separate.begin() + r * heads * 128),
+          "strided QKV norm/RoPE exact");
+      for (int d = 0; d < 128; ++d)
+        require(got[r * stride + d] == b(99) && got[(r + 1) * stride - 128 + d] == b(99),
+                "strided norm/RoPE guard rows");
+    }
+  }
 
   // Logical pages are deliberately noncontiguous; requests have different
   // permutations, four index heads choose different block lists.
@@ -327,6 +533,49 @@ void write(const std::filesystem::path& p, const std::vector<T>& x) {
   std::ofstream f(p, std::ios::binary);
   f.write(reinterpret_cast<const char*>(x.data()), x.size() * sizeof(T));
   if (!f) throw std::runtime_error("cannot write " + p.string());
+}
+void dspark_oracle(const std::string& path, const std::string& dump) {
+  const auto cfg = MinimaxConfig::from_json_file(path + "/config.json");
+  require(cfg.dspark != nullptr && !dump.empty(), "DSpark oracle needs model and dump directory");
+  std::vector<int64_t> ids{3, 12, 25, 7, 91, 17, 6, 7, 47, 3, 19, 83, 71, 8, 12, 9, 31};
+  MinimaxModel::Outputs plain;
+  {
+    MinimaxModel target(cfg, path, 256, 512, LoaderResidency::Resident);
+    plain = target.forward(ids, true);
+  }
+  MinimaxModel model(cfg, path, 256, 512, LoaderResidency::Resident, nullptr, 0, 1, 1, true, 16);
+  (void)model.session_prefill(0, ids);
+  std::vector<int32_t> proposals;
+  require(model.dflash2_draft(0, 7, &proposals), "DSpark oracle draft");
+  DGPP_CUDA_OK(cudaStreamSynchronize(model.stream()));
+  const auto& df = model.dspark_drafter();
+  const auto& c = df.cfg();
+  const size_t H = c.hidden_size, T = ids.size(), R = c.query_rows();
+  const std::filesystem::path dir(dump);
+  std::filesystem::create_directories(dir);
+  for (size_t l = 0; l < plain.layer_states.size(); ++l)
+    write(dir / ("target-layer-" + std::to_string(l) + ".bf16"), plain.layer_states[l]);
+  write(dir / "tokens.i64", ids);
+  write(dir / "features.f32", copy_device(df.acc(), T * H));
+  write(dir / "context.bf16", copy_device(df.context_norm(), T * H));
+  write(dir / "hidden.bf16", copy_device(df.block_hidden(), R * H));
+  write(dir / "logits.f32", copy_device(df.block_logits(), R * c.vocab_size));
+  write(dir / "proposals.i32", proposals);
+  write(dir / "confidence.f32", copy_device(df.confidence(), c.drafts()));
+  const auto* table = model.pool().request_table_row(0);
+  for (int l = 0; l < c.num_hidden_layers; ++l) {
+    const auto plane = model.pool().draft_view(l);
+    for (const auto& [ptr, name] : {std::pair{plane.k, "k"}, {plane.v, "v"}}) {
+      std::vector<uint16_t> logical((T + R) * c.kv_row());
+      for (size_t r = 0; r < T + R; ++r) {
+        const size_t physical = size_t(table[r / 128]) * 128 + r % 128;
+        DGPP_CUDA_OK(cudaMemcpy(logical.data() + r * c.kv_row(), ptr + physical * c.kv_row(),
+                                c.kv_row() * 2, cudaMemcpyDeviceToHost));
+      }
+      write(dir / (std::string(name) + "-" + std::to_string(l) + ".bf16"), logical);
+    }
+  }
+  model.session_close(0);
 }
 void smoke(const std::string& path, const std::string& dump) {
   const auto cfg = MinimaxConfig::from_json_file(path + "/config.json");
@@ -436,12 +685,16 @@ void smoke(const std::string& path, const std::string& dump) {
 }  // namespace
 int main(int argc, char** argv) {
   try {
-    std::string checkpoint, dump, fixture, config;
+    std::string checkpoint, dump, fixture, config, dspark, dspark_model;
     bool run_kernels = false;
     for (int i = 1; i < argc; ++i) {
       std::string a = argv[i];
       if (a == "--kernels")
         run_kernels = true;
+      else if (a == "--dspark-model-dir" && i + 1 < argc)
+        dspark_model = argv[++i];
+      else if (a == "--dspark-dir" && i + 1 < argc)
+        dspark = argv[++i];
       else if (a == "--write-fixture" && i + 1 < argc)
         fixture = argv[++i];
       else if (a == "--config" && i + 1 < argc)
@@ -460,9 +713,11 @@ int main(int argc, char** argv) {
       minimaxfx::write(fixture, config);
       return 0;
     }
+    if (!dspark_model.empty()) dspark_oracle(dspark_model, dump);
+    if (!dspark.empty()) dspark_loader(dspark);
     if (run_kernels) kernels();
     if (!checkpoint.empty()) smoke(checkpoint, dump);
-    if (!run_kernels && checkpoint.empty())
+    if (!run_kernels && checkpoint.empty() && dspark.empty() && dspark_model.empty())
       throw std::runtime_error("use --kernels or --checkpoint-dir");
     return 0;
   } catch (const std::exception& e) {

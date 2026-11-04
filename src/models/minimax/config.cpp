@@ -2,9 +2,12 @@
 
 #include <algorithm>
 #include <cmath>
+#include <filesystem>
 #include <fstream>
 #include <limits>
 #include <stdexcept>
+
+#include "models/minimax/dspark.hpp"
 
 namespace dgpp {
 namespace {
@@ -139,6 +142,12 @@ MinimaxConfig MinimaxConfig::from_json_file(const std::string& path) {
     if (json.root.find("eos_token_id")) c.eos_token_ids = {integer(json.root, "eos_token_id")};
   }
   c.validate();
+  const auto draft = std::filesystem::path(path).parent_path() / "dspark" / "config.json";
+  if (std::filesystem::exists(draft)) {
+    c.dspark = std::make_shared<DFlash2Config>(minimax_dspark_config_file(draft.string()));
+    c.dspark->validate_against(
+        {c.hidden_size, c.vocab_size, c.num_hidden_layers, c.max_position_embeddings});
+  }
   return c;
 }
 

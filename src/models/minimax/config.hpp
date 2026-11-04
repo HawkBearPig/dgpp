@@ -1,16 +1,19 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
 #include "loaders/minijson.hpp"
 
 namespace dgpp {
+struct DFlash2Config;
 
 // MiniMax M3.1's published MXFP8 dense / NVFP4 routed-expert checkpoint.
 // Dimensions remain configurable for binding-generated forward fixtures.
 struct MinimaxConfig {
+  std::shared_ptr<const DFlash2Config> dspark;
   int hidden_size = 6144;
   int vocab_size = 200064;
   std::vector<int64_t> eos_token_ids = {200020};

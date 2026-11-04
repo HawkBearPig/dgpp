@@ -7,16 +7,18 @@
 
 #include "engine/cache_planes.hpp"
 #include "engine/paged_blocks.hpp"
+#include "models/dflash2/draft_planes.hpp"
 
 namespace dgpp {
 
 struct MinimaxKvPoolShape {
-  int layers = 0;    // attention layers served (the draft's included)
+  int layers = 0;    // target attention layers
   int kv_heads = 0;  // the rank's kv heads
   int dim = 128;     // head_dim
   int block_tokens = 0;
   int max_requests = 0;
   int64_t token_slots = 0;  // pool capacity in tokens, a multiple of block_tokens
+  int draft_layers = 0, draft_kv_heads = 0, draft_dim = 128;
 };
 
 // One layer's caches as the kernels see them.
@@ -51,6 +53,7 @@ class MinimaxKvPool {
   const PagedBlockTable& blocks() const { return table_; }
 
   MinimaxKvCache view(int layer) const;
+  DraftKvPlanes::View draft_view(int layer) const { return draft_.view(layer); }
 
   bool ensure_request_blocks(int req, int64_t tokens, cudaStream_t stream) {
     return table_.ensure_request_blocks(req, tokens, stream);
@@ -80,6 +83,7 @@ class MinimaxKvPool {
   MinimaxKvPoolShape shape_;
   bool initialized_ = false;
   PagedBlockTable table_;
+  DraftKvPlanes draft_;
   uint16_t* k_base_ = nullptr;  // [layers][token_slots][kv_heads * dim]
   uint16_t* v_base_ = nullptr;
   uint16_t* index_base_ = nullptr;

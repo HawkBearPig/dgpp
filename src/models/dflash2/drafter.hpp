@@ -10,7 +10,7 @@
 // DFlash2Host (the pool's block table and draft planes, the session and
 // graph state, the embeddings, the head dispatch and the block GEMMs) and
 // reads the taps out of the feature accumulator (acc / tap_gemm_out) at
-// its own layer outputs.
+// the checkpoint's target tap sites (MiniMax uses layer inputs).
 //
 // The recorded walk may be ARMED to draw for the sampled requests
 // (arm_proposals, the Qwen35 family's rule): null specs keep every walk
@@ -109,6 +109,8 @@ class DFlash2Drafter {
   // head_dim over the pool's token slots and block size) must be ready —
   // the drafter addresses them through h.plane.
   void init(const DFlash2Host& h, const std::string& dir);
+  // Native family loaders supply an already validated checkpoint.
+  void init(const DFlash2Host&, const DFlash2Config&, DFlash2Weights);
   void free();
   bool on() const { return on_; }
   const DFlash2Config& cfg() const { return cfg_; }
@@ -118,6 +120,10 @@ class DFlash2Drafter {
   int tap(int layer) const;
   float* acc() const { return df_acc_; }
   float* tap_gemm_out() const { return df_t32_; }
+  // Read-only diagnostic views, valid until the next draft or feature run.
+  const uint16_t* block_hidden() const { return df_h_; }
+  const float* block_logits() const { return df_logits_; }
+  const uint16_t* context_norm() const { return df_norm_; }
   int drafts() const { return cfg_.drafts(); }
   int query_rows() const { return cfg_.query_rows(); }
   int batch_slots() const { return df_batch_; }
@@ -162,13 +168,15 @@ class DFlash2Drafter {
   // and the block scratch exactly as init allocates them.
   static void plan_entries(const DFlash2Config& cfg, int world, int decode_rows, int max_tokens,
                            int max_requests, int64_t vocab_count, bool weights_fp8,
-                           std::vector<std::pair<std::string, size_t>>* out);
+                           std::vector<std::pair<std::string, size_t>>* out,
+                           size_t native_weight_bytes = 0);
 
  private:
   // The block forward's layers over `slots` stacked [bonus, mask x D]
   // blocks (row-wise ops over every row at once; each slot's K/V appends
   // and attention at its row offset against its own block table).
   void block_layers(int slots, const int* reqs, bool capture);
+  void minimax_block_layers(int slots, const int* reqs, bool capture);
   // The mask rows' head rows and top-K per slot (world > 1: this rank's
   // slice lists staged, folded and merged into the global top-K), the
   // hidden projection and the selector walk into df_tok_ (D per slot).

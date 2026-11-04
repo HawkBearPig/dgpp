@@ -97,6 +97,7 @@
 #include "models/glm_dsa/model.hpp"
 #include "models/mimo/config.hpp"
 #include "models/mimo/forward.hpp"
+#include "models/minimax/dspark.hpp"
 #include "models/minimax/forward.hpp"
 #include "models/qwen/config.hpp"
 #include "models/qwen/forward.hpp"
@@ -1179,37 +1180,27 @@ struct MinimaxFamily final : ServeFamily {
   size_t lat_slot_bytes(int decode_rows) const override {
     return static_cast<size_t>(decode_rows) * static_cast<size_t>(cfg.hidden_size) * 2;
   }
-  static void refuse_mtp(bool mtp) {
-    if (mtp)
-      throw std::invalid_argument(
-          "engine.mtp: MiniMax DSpark execution is not enabled yet (set \"mtp\": false; the plain "
-          "world)");
-  }
   dgpp::MemoryPlan plan(int forward_rows, int64_t context, int rank, int world_, bool fabric,
                         int slots, bool mtp, int decode_rows) const override {
-    refuse_mtp(mtp);
     return dgpp::MinimaxModel::plan_memory(
         cfg, forward_rows, context, fabric ? rank : 0, fabric ? world_ : 1,
-        fabric ? dgpp::LoaderResidency::Resident : dgpp::LoaderResidency::Streaming, slots,
-        /*mtp=*/false, decode_rows, kv_format, /*serving_logits=*/true);
+        fabric ? dgpp::LoaderResidency::Resident : dgpp::LoaderResidency::Streaming, slots, mtp,
+        decode_rows, kv_format, /*serving_logits=*/true);
   }
   size_t snapshot_bytes(int world_, bool mtp) const override {
-    refuse_mtp(mtp);
-    return dgpp::MinimaxModel::session_snapshot_bytes(cfg, world_, false);
+    return dgpp::MinimaxModel::session_snapshot_bytes(cfg, world_, mtp);
   }
   size_t cache_block_bytes(int world_, bool mtp) const override {
-    refuse_mtp(mtp);
-    return dgpp::MinimaxModel::kv_block_bytes_static(cfg, 0, world_, kv_format);
+    return dgpp::MinimaxModel::kv_block_bytes_static(cfg, 0, world_, kv_format, mtp);
   }
   void build_model(dgpp::BoundaryReducer* reducer, int rank, int world_, bool fabric,
                    int forward_rows, int64_t pool_tokens, int slots, bool mtp,
                    int decode_rows) override {
-    refuse_mtp(mtp);
     dgpp::MinimaxLayerStream::set_resident_image_dir(dgpp::GlmLayerStream::resident_image_dir());
     model = std::make_unique<dgpp::MinimaxModel>(
         cfg, ckpt, forward_rows, pool_tokens,
         fabric ? dgpp::LoaderResidency::Resident : dgpp::LoaderResidency::Streaming, reducer,
-        fabric ? rank : 0, fabric ? world_ : 1, slots, /*mtp=*/false, decode_rows, kv_format,
+        fabric ? rank : 0, fabric ? world_ : 1, slots, mtp, decode_rows, kv_format,
         /*serving_logits=*/true);
   }
   void destroy_model() override { model.reset(); }
@@ -2512,7 +2503,12 @@ int main(int argc, char** argv) {
   if (mtp && !mtp_depth_explicit && !ckpt.empty()) {
     const dgpp::ModelArchitecture arch =
         dgpp::detect_architecture_file((fs::path(ckpt) / "config.json").string());
-    if (arch == dgpp::ModelArchitecture::DeepseekV41) {
+    if (arch == dgpp::ModelArchitecture::MinimaxM3) {
+      const auto draft =
+          dgpp::minimax_dspark_config_file((fs::path(ckpt) / "dspark" / "config.json").string());
+      mtp_depth = draft.drafts();
+      DGPP_LOG_INFO("serve: --mtp on MiniMax: the DSpark block's {} drafts", mtp_depth);
+    } else if (arch == dgpp::ModelArchitecture::DeepseekV41) {
       mtp_depth = dgpp::Dsv41TextConfig::from_json_file((fs::path(ckpt) / "config.json").string()).dspark_block_size;
       DGPP_LOG_INFO("serve: --mtp without --mtp-depth on DeepSeek-V4.1: the DSpark block's {} drafts", mtp_depth);
     } else if (arch == dgpp::ModelArchitecture::DeepseekV4) {
