@@ -4,13 +4,15 @@ MiniMax M3.1 Flash is implemented on the shared engine with its published
 NVFP4/MXFP8 weights, BF16 activations and caches, seven-proposal DSpark,
 recursive tools, images and native video. All six independent fixed-order
 text corpus checks pass across 28,329 scored positions with no argmax changes;
-distributed media, cache and batch-isolation checks pass. Tested activation
-quantization recipes fail the unchanged numerical gates and are rejected.
+distributed media, cache and batch-isolation checks pass. Activation
+quantization prescreens exceed the BF16-relative parity limits. These do not
+establish fidelity to the publisher's native quantized inference recipe,
+which still requires a matching reference and native-kernel validation.
 The 768K pool boots at zero swap and passes a 24-item task-quality pilot.
 The selected sixteen-slot plain template passes all 125 C1/C8/C16 output
 comparisons, and its idle prefill cap is 2,048 tokens.
-Release validation still requires full task-quality and long-context checks,
-followed by the final tuned-template campaign. The full local test
+Release validation still requires native-recipe fidelity, full task-quality
+and long-context checks, followed by the final tuned-template campaign. The full local test
 suite and video-enabled/disabled build checks pass. See
 the [implementation record](docs/minimax_m31_flash_plan.md) and
 [deployment notes](docs/model_cards/MiniMax-M3.1-Flash.md).

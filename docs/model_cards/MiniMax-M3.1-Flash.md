@@ -45,9 +45,15 @@ enabled by this template. Lossless BF12 vocabulary-head storage preserves the
 checkpoint's exact BF16 values; the template retains the BF16 copy as well for
 wider projections and prefill.
 
-The tested MXFP8-dense and NVFP4-expert activation controls fail the unchanged
-numerical limits. Their results and scope are recorded in the
+The tested MXFP8-dense and NVFP4-expert activation controls exceed the
+BF16-relative parity limits. They are quantization prescreens, not fidelity
+checks against the publisher's native quantized execution. That execution
+requires its own matching reference and native-kernel validation before the
+performance work is complete. Their results and scope are recorded in the
 [activation precision prescreen](../minimax_m31_flash_plan.md#activation-precision-prescreen).
+
+BF12 support currently covers the main vocabulary head. The embedding,
+vision matrices and the drafter's BF16 matrices retain BF16 storage.
 
 Every layer uses MiniMax sparse attention: 128-token blocks, independent
 selection per index head, and 16 selected blocks including the current block

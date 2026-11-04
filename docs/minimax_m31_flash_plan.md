@@ -1170,13 +1170,14 @@ at `47c71f13`; all projection, elementwise and attention backends are
 | NVFP4 routed experts | Raw prose | -0.02122 | 89/528 (16.86%) | 95 |
 | NVFP4 routed experts | Chat prose | +0.00641 | 31/529 (5.86%) | 48 |
 
-Both recipes are rejected under the unchanged 0.02-nat absolute mean-NLL
+Both recipes exceed the BF16-relative 0.02-nat absolute mean-NLL
 and 1% large-change limits. The MXFP8 chat case passes those two tests alone;
 its argmax changes have not been certified as near ties, and its raw case
 already rejects the recipe. Lower mean NLL on one NVFP4 case does not excuse
-its distribution changes. No native activation-quantized serving path is
-selected on this evidence. BF16 activations remain the deployment recipe;
-future selective or calibrated recipes need their own complete validation.
+its distribution changes. These results do not test fidelity to the
+publisher's native activation-quantized inference pipeline. BF16 activations
+remain the provisional deployment recipe; native execution needs a matching
+reference, implementation checks and separate task-quality measurements.
 
 ### Serving profiles
 
@@ -1357,3 +1358,51 @@ and at most eight slots. The final campaign includes C16 on sixteen-slot
 templates, retaining separate decode and wall-rate rows and the common
 C1/C2/C4/C8 comparison. The final media/cache checks use the selected larger
 prefill chunks; long-context quality and the complete campaign remain pending.
+
+
+### Native inference fidelity baseline
+
+The publisher's [model card](https://huggingface.co/MiniMaxAI/MiniMax-M3.1-Flash)
+recommends SGLang, vLLM and TokenSpeed. Their Blackwell paths execute the
+checkpoint's quantization-aware recipe. The pinned SGLang implementation
+selects MXFP8 W8A8 projections and dynamic NVFP4 W4A4 routed experts. Its
+expert adapter neutralizes the checkpoint's static input globals because
+the kernels quantize both GEMM inputs per token. Hopper has a different
+fallback using W4A16 experts. See the
+[quantization adapter](https://github.com/sgl-project/sglang/blob/58484246d26523eaf1a7f16ab524deee288d2120/python/sglang/srt/layers/quantization/minimax_m3_nvfp4.py)
+and [MXFP8 dispatch](https://github.com/sgl-project/sglang/blob/58484246d26523eaf1a7f16ab524deee288d2120/python/sglang/srt/layers/quantization/fp8_utils.py).
+The linked [vLLM recipe](https://recipes.vllm.ai/MiniMaxAI/MiniMax-M3.1-Flash)
+also specifies quantized main/index caches and prefill index-query
+quantization for its Blackwell deployment.
+
+The BF16 activation and cache implementation above is an alternative
+execution recipe. Its independent-reference passes establish correctness
+for that recipe. The activation prescreen isolates changes relative to BF16;
+it does not show whether DGPP faithfully implements the publisher's native
+quantization, and does not measure native task quality. Exceeding BF16 parity
+alone is insufficient grounds to reject the published inference recipe.
+
+The remaining native work must pin the exact reference backend, quantizer
+rounding and scale conventions, fusion boundaries, cache precision and
+attention-query precision. Validate quantizers and matrix products against
+independent matching-precision references, then full-model likelihood,
+routing/index decisions, repeats and batch geometry under the existing
+numerical limits. Compare BF16 and native task quality separately. Measure
+native and BF16 deployment throughput after those checks, then select and
+run the complete shipped-template campaign. The existing BF16 evidence
+remains a control; the performance work is not complete yet.
+
+BF12 is already integrated for the target vocabulary head, with exact
+BF16-value preservation. The selected `bf12+bf16` residency keeps both forms
+for narrow and wide projection dispatch. It does not pack the embedding,
+vision matrices or the drafter's BF16 matrices.
+
+The latest BF16 media/cache rerun passes eight video cases and six image
+cases against plain decoding, 24-image history cache checks and recursive
+streaming tools. All 24 completion/cancellation replay comparisons match
+explicit cold controls, and all six edited controls are cold. The original
+constant edited prompt was shared across cases and legitimately hit a
+cached prefix; the harness now preserves each case's unique early tag.
+NVMe eviction/restore preserves the memory-hit continuation with zero spill
+or restore failures. Both correctness boots retain the expected executable,
+zero swap on every rank and matching operation streams.
