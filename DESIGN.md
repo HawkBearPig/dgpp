@@ -2280,8 +2280,11 @@ At positive temperature, logprobs describe the final filtered and
 renormalized sampling distribution. At temperature zero they describe
 the raw distribution used by the greedy reporting path. Chat requests
 can ask for `logprobs` and up to 20 `top_logprobs`; the legacy
-route uses its integer logprobs field. Each returned token carries its
-corresponding report through scheduler events and the HTTP response.
+route uses its integer logprobs field. These reports cover generated tokens;
+prompt scoring is not implemented. Both routes reject non-null
+`prompt_logprobs` explicitly, while null is treated as omission.
+Each returned token carries its corresponding report through scheduler
+events and the HTTP response.
 
 The common greedy path avoids the full sampling calculation. Greedy
 requests needing penalties or logprobs use the reporting path while
