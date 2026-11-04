@@ -104,11 +104,12 @@ DGPP_TEST(cache_storage_mount_parser_refuses_unverifiable_assertions) {
 }
 
 DGPP_TEST(cache_storage_policy_distinguishes_ram_from_container_layers) {
-  for (const std::string type : {"tmpfs", "ramfs", "hugetlbfs", "overlay", "aufs", "fuse.overlayfs", "ext4"}) {
+  for (const std::string type : {"tmpfs", "ramfs", "hugetlbfs", "overlay", "aufs", "fuse.overlayfs",
+                                 "fuse.fuse-overlayfs", "ext4"}) {
     std::istringstream input("77 1 8:1 / / rw - " + type + " source rw\n");
     const auto storage = dgpp::read_cache_mount(input, 77);
     const bool ram = type == "tmpfs" || type == "ramfs" || type == "hugetlbfs";
-    const bool layer = type == "overlay" || type == "aufs" || type == "fuse.overlayfs";
+    const bool layer = type == "overlay" || type == "aufs" || type == "fuse.overlayfs" || type == "fuse.fuse-overlayfs";
     require(storage.ram_backed == ram && storage.container_layer == layer, "classification " + type);
     require(dgpp::check_cache_storage(storage, "", false).empty() == !ram, "RAM needs explicit allowance");
     require(dgpp::check_cache_storage(storage, "", true).empty(), "explicit test allowance");

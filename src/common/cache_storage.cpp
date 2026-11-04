@@ -45,7 +45,8 @@ bool unescape(const std::string& input, std::string* output) {
 void classify(CacheStorage* storage) {
   const auto& type = storage->filesystem;
   storage->ram_backed = type == "tmpfs" || type == "ramfs" || type == "hugetlbfs";
-  storage->container_layer = type == "overlay" || type == "aufs" || type == "fuse.overlayfs";
+  storage->container_layer = type == "overlay" || type == "aufs" || type == "fuse.overlayfs" ||
+                             type == "fuse.fuse-overlayfs";
 }
 }  // namespace
 

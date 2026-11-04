@@ -1102,6 +1102,25 @@ int run_fixture(const std::string& dir, bool fp8_head = false) {
           const auto placement = dgpp::inspect_cache_directory(shm);
           if (placement.ram_backed) {
             require(refused, "RAM-backed slab refused regardless of O_DIRECT support");
+            require(!fs::exists(pb.slab_path), "RAM refusal happens before creating a slab");
+            // A file symlink can escape a correctly placed parent directory.
+            // The descriptor check must refuse before truncating its target.
+            const std::string target = shm + "/redirect-target.slab";
+            const std::string redirect = cdir + "/redirect.slab";
+            std::ofstream(target) << "preserve these bytes";
+            fs::create_symlink(target, redirect);
+            auto redirected = pb;
+            redirected.slab_path = redirect;
+            refused = false;
+            try { Tier t(&m, &arena, redirected); }
+            catch (const std::runtime_error& e) {
+              refused = std::string(e.what()).find("RAM-backed") != std::string::npos;
+            }
+            std::ifstream input(target);
+            std::string retained;
+            std::getline(input, retained);
+            require(refused && retained == "preserve these bytes", "descriptor refusal preserves redirected slab");
+            fs::remove(redirect);
             pb.allow_buffered = true;
             Tier t(&m, &arena, pb);
             require(t.pages() > 0, "buffered: allowed when asked");
