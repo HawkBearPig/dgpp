@@ -242,3 +242,40 @@ dependencies. Source hashes are checked before execution. `--manifest`
 instead of `--check-engine-dir` runs full trajectories; `--attention-phase`
 selects the prefill or decode formula explicitly. Reference output records
 these choices and does not claim to execute the full upstream serving stack.
+
+## Independent native arithmetic controls
+
+The unrestricted decoded-operand reference is retained. Two additional
+controls separate matrix and attention accumulation order from quantization:
+
+- `tools/minimax_native_reference_gemm.py` uses Triton `dot_scaled` on the
+  published byte payloads and scales. It imports no DGPP kernel or layout.
+  MXFP8 and NVFP4 products satisfy FP64 forward-error bounds at reduction
+  widths through 6,144; the largest relative RMS error is `2.74e-6`.
+  Splitting into 1-, 8- and 17-row calls preserves every output bit.
+- `tools/minimax_native_reference_attention.py` independently expresses
+  FP8 index/product operations, the per-page BF16 boundary and ordered FP32
+  softmax/page combination. Four geometries through 2,057 keys agree with
+  the unrestricted mathematical oracle within `4.35e-5` relative RMS
+  (existing gate `0.004`), with exact selections and row-geometry invariance.
+
+Each file runs its own validation when executed directly. They are
+arithmetic-order controls, not the upstream serving kernels. Select them
+explicitly in the full reference with:
+
+```sh
+--projection-backend triton-native --elementwise-backend triton-fixed \
+--attention-arithmetic triton-fixed
+```
+
+With all three controls, the corrected native engine matches all 20
+synthetic sublayer/residual traces bit for bit over 384 positions. Its
+likelihood comparison has zero argmax changes and zero changes over 1 nat.
+The five-token real-checkpoint TP4 diagnostic likewise matches all 300
+sublayer/residual traces over its four scored positions, with zero argmax
+changes; all four engine ranks have matching layer hashes. Using only the
+matrix/elementwise controls left attention differences that grew through
+the trajectory. These controls explain those short-probe discrepancies;
+they do not turn the unrestricted-reference failures into passes or certify
+full upstream runtime equivalence. Broader native corpus fidelity, task
+quality and the upstream decode-formula comparison remain required.

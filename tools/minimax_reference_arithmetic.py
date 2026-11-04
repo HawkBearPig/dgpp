@@ -90,8 +90,8 @@ def _weighted_add(acc, part, weights, rows, count, width: tl.constexpr, block: t
 
 def norm(x, weight, eps):
     width = x.shape[-1]
-    if width not in (128, 6144):
-        raise ValueError('fixed norm control supports the checkpoint widths 128 and 6144')
+    if width not in (128, 256, 6144):
+        raise ValueError('fixed norm control supports widths 128, 256 (fixture) and 6144')
     if weight.numel() != width:
         raise ValueError('fixed norm weight width differs')
     out = torch.empty(x.shape, device=x.device, dtype=torch.bfloat16)
@@ -138,7 +138,7 @@ def weighted_add(acc, part, weights, rows):
 
 def self_test():
     torch.manual_seed(1741)
-    for width in (128, 6144):
+    for width in (128, 256, 6144):
         a = torch.randn((35, width), device='cuda', dtype=torch.bfloat16)
         b = torch.randn_like(a)
         weight = torch.randn((width,), device='cuda', dtype=torch.bfloat16)

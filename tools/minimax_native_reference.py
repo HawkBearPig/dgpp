@@ -13,6 +13,7 @@ import argparse
 import json
 from pathlib import Path
 
+import numpy as np
 import torch
 from tokenizers import Tokenizer
 
@@ -24,14 +25,17 @@ from minimax_torch_reference import Reference
 class NativeReference(Reference):
     def __init__(self, checkpoint, world, sglang_source, phase='prefill',
                  native_activations=True, native_cache=True, projection_backend='cublas',
-                 elementwise_backend='torch'):
+                 elementwise_backend='torch', attention_arithmetic='torch'):
         super().__init__(checkpoint, world, False, projection_backend=projection_backend,
                          elementwise_backend=elementwise_backend,
-                         attention_backend=f'native-{phase}' if native_cache else 'torch',
+                         attention_backend=f'native-{phase}-{attention_arithmetic}' if native_cache else 'torch',
                          activation_quantization='native' if native_activations else 'bf16')
         self.native_activations = native_activations
         self.native_cache = native_cache
         self.phase = phase
+        self.attention_arithmetic = attention_arithmetic
+        if attention_arithmetic == 'triton-fixed' and (phase != 'prefill' or not native_cache):
+            raise ValueError('the fixed native attention control requires the prefill formula and native cache')
         if native_activations:
             module, fused = load_producers(sglang_source)
             self.mx_quant = module.mxfp8_quantize_swizzled
@@ -44,13 +48,45 @@ class NativeReference(Reference):
             self.nv_global_inv = torch.tensor([1 / (6 * 448)], device='cuda', dtype=torch.float32)
 
     @staticmethod
-    def decode_mx(codes, scales):
+    def mx_scales(codes, scales):
         r = torch.arange(len(codes), device=codes.device)[:, None]
         c = torch.arange(codes.shape[1] // 32, device=codes.device)[None, :]
         blocks = (codes.shape[1] // 32 + 3) // 4
         offsets = ((r // 128) * blocks + c // 4) * 512 + (r % 32) * 16 + ((r % 128) // 32) * 4 + c % 4
-        scale = torch.exp2(scales[offsets].float() - 127).repeat_interleave(32, -1)
+        return scales[offsets].contiguous()
+
+    @classmethod
+    def decode_mx(cls, codes, scales):
+        scale = torch.exp2(cls.mx_scales(codes, scales).float() - 127).repeat_interleave(32, -1)
         return (codes.float() * scale).to(torch.bfloat16)
+
+    def mm(self, x, weight, divisor=1.0, rounded=True, streaming_order=False):
+        if self.projection_backend != 'triton-native':
+            return super().mm(x, weight, divisor, rounded, streaming_order)
+        # Unquantized matrices (notably the vocabulary head) use the existing
+        # independently checked BF16 fixed-order product in this control.
+        from minimax_reference_gemm import projection
+        value = projection(x, weight, streaming_order) / divisor
+        return value.to(torch.bfloat16) if rounded else value
+
+    def native_product(self, codes, scales, globals_, base, mode, column, divisor, rounded):
+        from minimax_native_reference_gemm import product
+        packed = mode == 'nvfp4'
+        inner = codes.shape[1] * (2 if packed else 1)
+        name = base + ('.weight_packed' if packed else '.weight')
+        start, width = (column // 2, inner // 2) if packed else (column, inner)
+        raw = self.w.raw(name)[:, start:start+width]
+        weight = torch.from_numpy(np.array(raw, copy=True)).cuda()
+        name = base + ('.weight_scale' if packed else '.weight_scale_inv')
+        group = 16 if packed else 32
+        raw = self.w.raw(name)[:, column // group:(column+inner) // group]
+        weight_scales = torch.from_numpy(np.array(raw, copy=True)).cuda()
+        value = product(codes.contiguous().view(torch.uint8), scales.contiguous().view(torch.uint8),
+                        weight, weight_scales, mode)
+        if globals_ is not None:
+            inverse = torch.tensor(divisor, device=value.device, dtype=torch.float32).reciprocal()
+            value = value * (globals_[:, None] * inverse)
+        return value.to(torch.bfloat16) if rounded else value
 
     def quantized(self, x, mode):
         if x.dtype != torch.bfloat16:
@@ -64,13 +100,22 @@ class NativeReference(Reference):
         decoded = self.fp4[codes.long()] * scales.view(torch.float8_e4m3fn).float().repeat_interleave(16, -1)
         return decoded.to(torch.bfloat16), globals_[:, None]
 
-    def project(self, x, weight, divisor, base, rounded=True):
+    def project(self, x, weight, divisor, base, rounded=True, column=0):
         if not self.native_activations:
             return super().project(x, weight, divisor, base, rounded)
         mode = ('mxfp8' if base + '.weight_scale_inv' in self.w.header else
                 'nvfp4' if base + '.weight_packed' in self.w.header else None)
         if mode is None:
             return self.mm(x, weight, divisor, rounded)
+        if self.projection_backend == 'triton-native':
+            x = x.contiguous()
+            if mode == 'mxfp8':
+                codes, scales = self.mx_quant(x)
+                scales, globals_ = self.mx_scales(codes, scales), None
+            else:
+                codes, scales, globals_ = self.nv_quant(
+                    x, self.nv_global_inv, sf_layout=2, enable_pdl=False, nvfp4_4over6=None)
+            return self.native_product(codes, scales, globals_, base, mode, column, divisor, rounded)
         x, scale = self.quantized(x, mode)
         # The native GEMM walks K in ordinary order. The BF16 control's
         # streaming-weight column permutation does not apply to this kernel.
@@ -81,6 +126,15 @@ class NativeReference(Reference):
             inverse = torch.tensor(divisor, device=x.device, dtype=torch.float32).reciprocal()
             y = y * (scale * inverse)
         return y.to(torch.bfloat16) if rounded else y
+
+    def parts(self, x, base, rounded=True):
+        if not self.native_activations or self.projection_backend != 'triton-native':
+            return super().parts(x, base, rounded)
+        weight, divisor = self.matrix(base)
+        width = weight.shape[1] // self.world
+        return [self.project(x[:, r*width:(r+1)*width].contiguous(),
+                             weight[:, r*width:(r+1)*width].contiguous(), divisor, base,
+                             rounded, column=r*width) for r in range(self.world)]
 
     def mlp(self, n, base, expert=False):
         if not self.native_activations:
@@ -93,12 +147,19 @@ class NativeReference(Reference):
             # Execute the actual upstream fusion, including its sigmoid
             # evaluation, BF16 boundary and MXFP8 rounding. Group scales are
             # local to 32 values, so slicing after quantization preserves TP.
-            act = self.decode_mx(*self.mx_swiglu(torch.cat((g, u), dim=1),
-                                                c['swiglu_alpha'], c['swiglu_limit']))
+            codes, scales = self.mx_swiglu(torch.cat((g, u), dim=1),
+                                           c['swiglu_alpha'], c['swiglu_limit'])
             weight, divisor = self.matrix(base + down)
             if divisor != 1.0:
                 raise ValueError('dense/shared down projection must be MXFP8')
             width = weight.shape[1] // self.world
+            if self.projection_backend == 'triton-native':
+                scales = self.mx_scales(codes, scales)
+                return [self.native_product(codes[:, r*width:(r+1)*width],
+                                             scales[:, r*width//32:(r+1)*width//32], None,
+                                             base+down, 'mxfp8', r*width, divisor, True)
+                        for r in range(self.world)]
+            act = self.decode_mx(codes, scales)
             return [self.mm(act[:, r*width:(r+1)*width].contiguous(),
                             weight[:, r*width:(r+1)*width].contiguous())
                     for r in range(self.world)]
@@ -127,8 +188,13 @@ class NativeReference(Reference):
         q, iq = msa.queries(q), msa.queries(iq)
         k, v, ik = (msa.unpack_cache(*msa.pack_cache(value)) for value in (k, v, ik))
         positions = torch.arange(rows, device=n.device, dtype=torch.int64)
-        selected = msa.select_blocks(iq, ik, positions, topk)
-        output = msa.attention(q, k, v, selected, positions, self.phase)
+        if self.attention_arithmetic == 'triton-fixed':
+            import minimax_native_reference_attention as fixed
+            selected = msa.select_blocks(iq, ik, positions, topk, score_fn=fixed.scores)
+            output = fixed.attention(q, k, v, selected, positions)
+        else:
+            selected = msa.select_blocks(iq, ik, positions, topk)
+            output = msa.attention(q, k, v, selected, positions, self.phase)
         return self.fold(self.parts(output.flatten(1), base + 'o_proj'))
 
     def check_stages(self, engine, output, layers=0):
@@ -145,10 +211,13 @@ class NativeReference(Reference):
             path = output / case['name'] / 'metadata.json'
             metadata = json.loads(path.read_text())
             metadata.update(
-                backend='independent decoded-operand products with pinned native GPU quantizers',
+                backend=('independent Triton native-product order control with pinned GPU quantizers'
+                         if self.projection_backend == 'triton-native' else
+                         'independent decoded-operand products with pinned native GPU quantizers'),
                 native_activations=self.native_activations,
                 native_cache=self.native_cache,
                 attention_phase=self.phase if self.native_cache else None,
+                attention_arithmetic=self.attention_arithmetic,
                 sglang_revision='58484246d26523eaf1a7f16ab524deee288d2120',
                 flashinfer_revision='d84335d8c54e0c8f9f7e22faa15c7e34a58abf94',
                 msa_revision='c8e1013a16a708d2a7656805d5fc26f2b87715d1',
@@ -166,16 +235,17 @@ def main():
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--world', type=int, choices=(1, 2, 4), default=4)
     parser.add_argument('--attention-phase', choices=('prefill', 'decode'), default='prefill')
+    parser.add_argument('--attention-arithmetic', choices=('torch', 'triton-fixed'), default='torch')
     parser.add_argument('--bf16-activations', action='store_true')
     parser.add_argument('--bf16-cache', action='store_true')
-    parser.add_argument('--projection-backend', choices=('cublas', 'triton-fixed'), default='cublas')
+    parser.add_argument('--projection-backend', choices=('cublas', 'triton-fixed', 'triton-native'), default='cublas')
     parser.add_argument('--elementwise-backend', choices=('torch', 'triton-fixed'), default='torch')
     parser.add_argument('--dump-states', action='store_true')
     parser.add_argument('--check-layers', type=int, default=0)
     args = parser.parse_args()
     reference = NativeReference(args.checkpoint_dir, args.world, args.sglang_source,
                                 args.attention_phase, not args.bf16_activations, not args.bf16_cache,
-                                args.projection_backend, args.elementwise_backend)
+                                args.projection_backend, args.elementwise_backend, args.attention_arithmetic)
     with torch.inference_mode():
         if args.check_engine_dir:
             reference.check_stages(args.check_engine_dir, args.output, args.check_layers)

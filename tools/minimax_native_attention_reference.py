@@ -59,7 +59,7 @@ def unpack_cache(packed, scales):
     return values.clamp(-448, 448).to(torch.float8_e4m3fn)
 
 
-def select_blocks(q, k, positions, topk=16, query_rows=32):
+def select_blocks(q, k, positions, topk=16, query_rows=32, score_fn=None):
     """FP32 index dots over FP8 queries/keys; causal page maxima and top-k.
 
     Force the current page into the selection. Equal page scores prefer the
@@ -75,7 +75,8 @@ def select_blocks(q, k, positions, topk=16, query_rows=32):
     key_positions = torch.arange(len(k), device=q.device)
     for start in range(0, len(q), query_rows):
         end = min(start + query_rows, len(q))
-        scores = torch.einsum('qhd,td->qht', q[start:end].float(), k[:, 0].float())
+        scores = (torch.einsum('qhd,td->qht', q[start:end].float(), k[:, 0].float())
+                  if score_fn is None else score_fn(q[start:end], k[:, 0]))
         visible = key_positions[None, :] <= positions[start:end, None]
         scores.masked_fill_(~visible[:, None, :], -torch.inf)
         scores = torch.nn.functional.pad(scores, (0, blocks * 128 - len(k)), value=-torch.inf)
