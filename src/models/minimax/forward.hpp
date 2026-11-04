@@ -113,6 +113,7 @@ class MinimaxModel : public SessionModel<MinimaxModel> {
   uint16_t* stage(int rows, bool capture);
   void fold(uint16_t*, int rows, bool capture);
   void norm(uint16_t* resid, const uint16_t* add, const uint16_t* weight, uint16_t* out, int rows);
+  void accumulate_draft_tap(int completed_layer, int rows);
   MinimaxConfig cfg_;
   MinimaxLayerStream loader_;
   MinimaxGlobalsResident globals_;

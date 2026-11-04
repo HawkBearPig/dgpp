@@ -249,6 +249,20 @@ void MinimaxModel::norm(uint16_t* resid, const uint16_t* add, const uint16_t* w,
   else
     qwen_rmsnorm_bf16(resid, w, out, rows, cfg_.hidden_size, cfg_.rms_norm_eps, stream_);
 }
+void MinimaxModel::accumulate_draft_tap(int completed_layer, int rows) {
+  if (!df_.on()) return;
+  const int tap = df_.tap(completed_layer);
+  if (tap < 0) return;
+  const int H = cfg_.hidden_size;
+  const auto* fc = df_.weights().fc + static_cast<size_t>(tap) * H * H;
+  // One accumulation chain across prefill, resume and every verification
+  // width. cuBLAS introduces memset graph nodes for this 6144-square FC
+  // at 24 rows; serving captures must remain kernel-only for RDMA.
+  launch_mma_gemv_bf16_f32(resid_, H, fc, df_.tap_gemm_out(), rows, H, H, H, stream_);
+  const auto& taps = cfg_.dspark->target_layer_ids;
+  dflash2_acc_f32(df_.acc(), df_.tap_gemm_out(), static_cast<int64_t>(rows) * H,
+                  completed_layer == *std::min_element(taps.begin(), taps.end()) ? 0 : 1, stream_);
+}
 MinimaxModel::Outputs MinimaxModel::run_rows(const RowRun& run) {
   if (run.capture && loader_.residency() != LoaderResidency::Resident)
     throw std::logic_error("MiniMax graph requires resident weights");
@@ -263,22 +277,11 @@ MinimaxModel::Outputs MinimaxModel::run_rows(const RowRun& run) {
     const auto& r = loader_.load_layer(layer);
     if (r.moe && !run.capture) moe_->prepare_table(layer, r.moe_w, stream_);
     norm(resid_, pending, r.input_norm, x_, T);
-    if (df_.on()) {
-      const int tap = df_.tap(layer);
-      if (tap >= 0) {
-        // Upstream captures the residual ENTERING this layer. The input
-        // norm has saved the preceding MLP sum with one BF16 rounding.
-        const auto* fc = df_.weights().fc + static_cast<size_t>(tap) * H * H;
-        // Keep one accumulation chain across prefill, resume and every
-        // verification width. cuBLAS also introduces memset graph nodes
-        // for the published 6144-square FC at 24 rows; serving captures
-        // must contain only kernels so the copy engine cannot stall RDMA.
-        launch_mma_gemv_bf16_f32(resid_, H, fc, df_.tap_gemm_out(), T, H, H, H, stream_);
-        const auto& taps = cfg_.dspark->target_layer_ids;
-        dflash2_acc_f32(df_.acc(), df_.tap_gemm_out(), static_cast<int64_t>(T) * H,
-                        layer == *std::min_element(taps.begin(), taps.end()) ? 0 : 1, stream_);
-      }
-    }
+    // Checkpoint tap L names the OUTPUT of layer L. The next input norm
+    // materializes that residual with one BF16 rounding while preserving
+    // its unrounded sum for the target's norm. Upstream converts L to L+1
+    // at its capture interface; it does not tap entry of layer L itself.
+    accumulate_draft_tap(layer - 1, T);
     if (observer_ && !run.capture) observer_(layer, "input_norm", x_, T, stream_);
     auto* attn = stage(T, run.capture);
     run.for_each_kernel_group([](int a, int b) { return a > 128 && b > 128; },
@@ -333,6 +336,9 @@ MinimaxModel::Outputs MinimaxModel::run_rows(const RowRun& run) {
     }
   }
   norm(resid_, pending, globals_.final_norm, h_, T);
+  // There is no next decoder layer for the final tap (59 in the release).
+  // final_norm has saved its updated residual, before normalization, too.
+  accumulate_draft_tap(cfg_.num_hidden_layers - 1, T);
   const bool packed = project_head_rows(run, [&](int input, int output, int n) {
     gemm_.set_bf12_wide(run.decode || input < run.decode_rows());
     gemm_.matmul(h_ + static_cast<size_t>(input) * H, globals_.lm_head,

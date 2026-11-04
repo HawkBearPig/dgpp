@@ -649,7 +649,7 @@ The native draft loader retains MXFP8 projections and expands only the
 BF16 confidence weights to FP32. The shared block executor now supports
 MiniMax Gemma norms, partial rotary embeddings, dense SwiGLU-OAI, a
 vanilla Markov head, and learned acceptance confidence. Context features
-come from the residual entering target layers 3, 17, 31, 45 and 59. Their
+come from the completed residual outputs of target layers 3, 17, 31, 45 and 59. Their
 FC result rounds to BF16 before normalization. Draft K/V planes share the
 target's block table, including prefix copies and the NVMe cache tier.
 
@@ -669,14 +669,18 @@ reordering checks, BF16-to-FP32 confidence checks, and all TP2/TP4 tensor
 slices. Synthetic tests additionally cover the 16:1 attention head ratio,
 strided norm/RoPE, FP32 attention probabilities, context rounding, and
 predecessor-conditioned confidence. The native fixture has an independent
-FP64 forward oracle; its input taps are checked against the target's
-completed prior-layer residuals. Release validation remains in progress.
+FP64 forward oracle; its taps are checked against the target's completed
+layer residuals, including the final layer before normalization. Release
+validation remains in progress.
 
-The fixture oracle reports FC relative RMS error `6.2e-8`, exact context
-normalization, draft K/V relative RMS errors at most `0.000822`, and final
-draft hidden-state relative RMS error `0.002163`. Output-head projections,
-vanilla Markov selections and learned confidence agree with the independent
-reference at the observed BF16 hidden boundary. Sixteen selected CTest
+The initial fixture oracle reported FC relative RMS error `6.2e-8`, exact
+context normalization, draft K/V relative RMS errors at most `0.000822`,
+and final draft hidden-state relative RMS error `0.002163`. That run used
+an incorrect feature-tap convention shared by the adapter and oracle;
+it does not establish fidelity to the trained input features. The corrected
+capture gate is described below. Output-head projections, vanilla Markov
+selections and learned confidence agreed with the independent reference
+at the observed BF16 hidden boundary. Sixteen selected CTest
 gates pass, including all 18 shared drafter integration cases, plain versus
 speculative greedy transcripts, every acceptance length, two-rank greedy
 and sampled graph execution, prefix copy/restore and the NVMe tier.
@@ -734,3 +738,31 @@ distribution and keyed draws for greedy and sampled requests, including
 top-k/top-p/min-p truncation. Nine selected CTest gates pass, including
 the independent draft oracle and all 21 shared drafter integration cases.
 Full-checkpoint acceptance and runtime comparisons follow this change.
+
+### Corrected target feature boundaries
+
+The first full-vocabulary draft run preserved all four greedy transcripts
+but still had weak acceptance. Tracing the capture configuration through
+both upstream implementations exposed an off-by-one error: checkpoint tap
+`L` means the output of target layer `L`, while the runtime captures the
+entry of layer `L+1`. Both adapters add one to the configured IDs. The
+initial dgpp adapter had read the entry of layer `L` directly. The final
+tap therefore belongs after the last FFN, before final normalization.
+[vLLM capture-ID conversion](https://github.com/vllm-project/vllm/blob/5225a1f17f9cf721efd5ad793e6b63798ca30306/vllm/v1/worker/gpu/spec_decode/eagle/eagle3_utils.py),
+[SGLang capture-ID conversion](https://github.com/sgl-project/sglang/blob/58484246d26523eaf1a7f16ab524deee288d2120/python/sglang/srt/models/minimax_m3_vl.py).
+
+The corrected oracle reads the named layers' completed residuals and
+rejects the old implementation with FC relative RMS error `0.684383`.
+The adapter now accumulates each tap after the next fused input norm has
+saved that completed residual; the final norm supplies the last tap's
+pre-normalization residual. This preserves the target's unrounded norm
+input and avoids an extra rounding in the target path. Earlier draft
+timings are excluded from release evidence.
+
+With the corrected boundaries, the independent FP64 oracle reports FC
+relative RMS error `1.6e-7`, context error `0.000119428`, draft K/V errors
+at most `0.00164452`, and final hidden-state error `0.00303526`. The
+output-head, full-vocabulary Markov walk and confidence checks pass.
+All nine selected CTest gates pass, including all 21 shared drafter
+integration cases and the row-invariant feature regression. Four-rank
+acceptance and same-binary plain/speculative tests follow this correction.

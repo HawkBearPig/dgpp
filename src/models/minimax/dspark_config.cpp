@@ -128,7 +128,7 @@ DFlash2Config minimax_dspark_config(const V& root) {
   for (const auto& v : taps.items()) {
     if (v.kind() != V::Kind::Int || v.as_int() < 0 || v.as_int() >= 256 ||
         !seen.insert(v.as_int()).second)
-      bad("target_layer_ids", "distinct target input layer indices required");
+      bad("target_layer_ids", "distinct target output layer indices required");
     c.target_layer_ids.push_back(
         static_cast<int>(v.as_int()));  // FC columns retain checkpoint order.
   }

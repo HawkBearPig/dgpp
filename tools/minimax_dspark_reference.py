@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Independent FP64 DSpark fixture oracle, including target input taps and Markov walk."""
+"""Independent FP64 DSpark fixture oracle, including target layer outputs and Markov walk."""
 import argparse
 import json
 from pathlib import Path
@@ -16,16 +16,16 @@ def check(path, dump):
     taps = c['dflash_config']['target_layer_ids']
     outputs = []
     for layer in taps:
-        if layer == 0:
-            outputs.append(target.tensor('language_model.model.embed_tokens.weight')[ids])
-        else:
-            outputs.append(f32(np.fromfile(dump / f'target-layer-{layer - 1}.bf16', dtype='<u2')).reshape(T, H))
+        # Pinned SGLang set_dspark_layers_to_capture and vLLM's
+        # get_eagle3_aux_layers_from_config convert checkpoint IDs by +1:
+        # entry of layer L+1 is the completed residual of layer L.
+        outputs.append(f32(np.fromfile(dump / f'target-layer-{layer}.bf16', dtype='<u2')).reshape(T, H))
     features = np.concatenate(outputs, axis=1).astype(np.float64) @ w.tensor(p + 'fc.weight').astype(np.float64).T
     got_features = np.fromfile(dump / 'features.f32', dtype='<f4').reshape(T, H)
     error = relative_rms(got_features, features)
     if error > 2e-6:
-        raise AssertionError(f'target input taps/FC mismatch {error}')
-    print(f'target input taps and FC relative RMS {error:.3g}')
+        raise AssertionError(f'target output taps/FC mismatch {error}')
+    print(f'target output taps and FC relative RMS {error:.3g}')
     context = norm(rounded(features), w.tensor(p + 'hidden_norm.weight'), c['rms_norm_eps'])
     def compare(name, expected, threshold=.004):
         actual = f32(np.fromfile(dump / (name + '.bf16'), dtype='<u2')).reshape(expected.shape)
