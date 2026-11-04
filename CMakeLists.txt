@@ -120,6 +120,7 @@ endif()
 # ---- libraries ------------------------------------------------------------
 
 add_library(dgpp_core STATIC
+  src/common/cache_storage.cpp
   src/common/log.cpp
   src/common/bf16_residency.cpp
   src/common/process_memory.cpp
@@ -1204,6 +1205,11 @@ add_executable(nvme_cache_test tests/host/nvme_cache_test.cpp)
 target_link_libraries(nvme_cache_test PRIVATE dgpp_serve)
 dgpp_set_common(nvme_cache_test)
 add_test(NAME nvme_cache_test COMMAND nvme_cache_test)
+
+add_executable(cache_storage_test tests/host/cache_storage_test.cpp)
+target_link_libraries(cache_storage_test PRIVATE dgpp_serve)
+dgpp_set_common(cache_storage_test)
+add_test(NAME cache_storage_test COMMAND cache_storage_test)
 
 # M6 Stage 4 service gate: the REAL HTTP/SSE service over a fake engine
 # + fake frontend — the OpenAI surface, host-only, always runs.
@@ -2753,7 +2759,7 @@ get_property(DGPP_ALL_TESTS DIRECTORY PROPERTY TESTS)
 foreach(_test IN LISTS DGPP_ALL_TESTS)
   set_tests_properties(${_test} PROPERTIES LABELS "gpu")
 endforeach()
-set_tests_properties(tokenizer_patterns_test word_cache_test bpe_test unit unit_tests http_server_test nvme_cache_test serve_test serve_test_wake fabric_serve_test fabric_serve_test_wake scheduler_test shutdown_watchdog_test engine_watchdog_test
+set_tests_properties(tokenizer_patterns_test word_cache_test bpe_test unit unit_tests http_server_test nvme_cache_test cache_storage_test serve_test serve_test_wake fabric_serve_test fabric_serve_test_wake scheduler_test shutdown_watchdog_test engine_watchdog_test
   qwen_yarn_fixture_test qwen_w4a4_plan_default qwen_w4a4_plan_mode_0 qwen_w4a4_plan_mode_1
   qwen_w4a4_plan_mode_empty qwen_w4a4_plan_mode_invalid PROPERTIES LABELS "host")
 set_tests_properties(checkpoint_audit_test chat_template_generator_test route_trace_test sampling_profile_test spec_ab_probe_test

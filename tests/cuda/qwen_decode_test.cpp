@@ -1084,7 +1084,7 @@ int run_fixture(const std::string& dir, bool fp8_head = false) {
           pf.io_hook = nullptr;
           t.reset();
         }
-        // (h) Buffered I/O: a tmpfs slab is refused unless allowed.
+        // (h) RAM-backed storage is refused even when tmpfs accepts O_DIRECT.
         if (fs::is_directory("/dev/shm")) {
           dgpp::sched::SchedulerEngine::DiskEnable pb = pc;
           const std::string shm = "/dev/shm/dgpp_nvme_tier_test";
@@ -1097,9 +1097,11 @@ int run_fixture(const std::string& dir, bool fp8_head = false) {
           try {
             Tier t(&m, &arena, pb);
           } catch (const std::runtime_error& e) {
-            refused = std::string(e.what()).find("refuses direct I/O") != std::string::npos;
+            refused = std::string(e.what()).find("RAM-backed") != std::string::npos;
           }
-          if (refused) {  // a tmpfs: allowed when asked
+          const auto placement = dgpp::inspect_cache_directory(shm);
+          if (placement.ram_backed) {
+            require(refused, "RAM-backed slab refused regardless of O_DIRECT support");
             pb.allow_buffered = true;
             Tier t(&m, &arena, pb);
             require(t.pages() > 0, "buffered: allowed when asked");

@@ -80,6 +80,7 @@
 #include <cuda_runtime.h>
 
 #include "common/crc32c.hpp"
+#include "common/cache_storage.hpp"
 #include "common/cuda_check.hpp"
 #include "common/log.hpp"
 #include "engine/cache_planes.hpp"
@@ -112,6 +113,10 @@ class NvmeTier {
       throw std::invalid_argument("NvmeTier: the chunk must be a positive 4 KiB multiple");
     if (cfg_.require_existing && (!cfg_.persist || cfg_.binding.empty()))
       throw std::invalid_argument("NvmeTier: explicit reuse requires persistence and a binding");
+    const auto parent = std::filesystem::path(cfg_.slab_path).parent_path();
+    const auto storage = inspect_cache_directory(parent.empty() ? "." : parent.string());
+    if (const auto error = check_cache_storage(storage, cfg_.required_mount, cfg_.allow_buffered); !error.empty())
+      throw std::runtime_error("NvmeTier: " + error);
     planes_ = model_->cache_planes();
     size_t off = 0;
     for (const CachePlane& p : planes_) {
@@ -790,8 +795,8 @@ class NvmeTier {
   }
 
   // The slab's descriptor: direct I/O first (the page cache would grow
-  // into the memory the model plans on); a filesystem that refuses it
-  // (tmpfs, the tests) gets buffered I/O, said out loud. A fresh slab is
+  // into the memory the model plans on); RAM-backed storage and filesystems
+  // that refuse it require the explicit test allowance. A fresh slab is
   // truncated and its whole capacity claimed now (unwritten extents): a
   // full disk is a startup error, never a torn write later.
   void open_fd(bool keep_contents) {
@@ -810,6 +815,14 @@ class NvmeTier {
     if (fd_ < 0 && errno == EINVAL) fd_ = ::open(cfg_.slab_path.c_str(), flags, 0600);
     if (fd_ < 0)
       throw std::runtime_error("NvmeTier: cannot create " + cfg_.slab_path + ": " + std::strerror(errno));
+    const auto storage = inspect_cache_storage_fd(fd_);
+    if (const auto error = check_cache_storage(storage, cfg_.required_mount, cfg_.allow_buffered); !error.empty()) {
+      ::close(fd_);
+      fd_ = -1;
+      throw std::runtime_error("NvmeTier: " + error);
+    }
+    // Modern tmpfs can accept O_DIRECT while still keeping all bytes in RAM.
+    if (storage.ram_backed) direct_ = false;
     // One world per slab: a second process on the same binding (a duplicate
     // deployment) would truncate and write under the first.
     if (::flock(fd_, LOCK_EX | LOCK_NB) != 0) {

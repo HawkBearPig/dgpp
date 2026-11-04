@@ -88,6 +88,19 @@ class PortabilityTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "nvme_cache.reuse_binding"):
                     site_env.resolve_config(self.config, self.values)
 
+    def test_nvme_required_mount_survives_resolution(self):
+        for mount in ("", "/", "/mnt/cache", "/mnt/space tab\tback\\line\n"):
+            cache = {"enabled": True, "capacity_gib": 64, "required_mount": mount}
+            self.config.write_text(json.dumps({"model": "org/model", "world_size": 1, "nvme_cache": cache}))
+            resolved = site_env.server_config(site_env.resolve_config(self.config, self.values))
+            self.assertEqual(resolved["nvme_cache"], cache)
+        for mount in (True, None, 1, [], "relative", "~/cache", "/cache\0suffix"):
+            with self.subTest(mount=mount):
+                self.config.write_text(json.dumps({"model": "org/model", "world_size": 1,
+                                                  "nvme_cache": {"required_mount": mount}}))
+                with self.assertRaisesRegex(ValueError, "nvme_cache.required_mount"):
+                    site_env.resolve_config(self.config, self.values)
+
     def test_http_types_and_ports_rejected(self):
         for http in ({"bind_host": 0}, {"bind_host": "localhost"}, {"port": True}, {"port": 0}, {"host": "a"}):
             with self.subTest(http=http):

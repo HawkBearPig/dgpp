@@ -840,7 +840,8 @@ DGPP_TEST(cluster_config_parses_nvme_cache) {
   const dgpp::serve::ClusterConfig off =
       dgpp::serve::parse_cluster_config(engine_json("{\"kv_capacity\":8192}"), "t");
   require(!off.nvme_cache.enabled && off.nvme_cache.capacity_gib == 0.0 &&
-              off.nvme_cache.path == "~/dgpp/nvme-cache" && off.nvme_cache.min_tokens == 0,
+              off.nvme_cache.path == "~/dgpp/nvme-cache" && off.nvme_cache.min_tokens == 0 &&
+              off.nvme_cache.required_mount.empty(),
           "off by default");
   // The top-level block: on, a path, a capacity, a minimum.
   const dgpp::serve::ClusterConfig on = dgpp::serve::parse_cluster_config(
@@ -871,6 +872,15 @@ DGPP_TEST(cluster_config_parses_nvme_cache) {
       "{\"model\":\"m\",\"nodes\":[\"h\"],\"nvme_cache\":{\"allow_buffered\":true,\"op_timeout_s\":30}}", "t");
   require(bounded.nvme_cache.allow_buffered && bounded.nvme_cache.op_timeout_s == 30,
           "allow_buffered and op_timeout_s parse");
+  require(dgpp::serve::parse_cluster_config(
+              R"({"model":"m","world_size":1,"nvme_cache":{"required_mount":"/mnt/cache"}})", "t")
+              .nvme_cache.required_mount == "/mnt/cache", "local required mount parses");
+  require(dgpp::serve::parse_cluster_config(
+              R"({"model":"m","world_size":1,"nvme_cache":{"required_mount":""}})", "t")
+              .nvme_cache.required_mount.empty(), "empty disables required mount");
+  for (const char* bad : {R"(true)", R"(null)", R"("relative")", R"("~/cache")", R"("/cache\u0000suffix")"})
+    require(refusal(std::string(R"({"model":"m","world_size":1,"nvme_cache":{"required_mount":)") + bad + "}}")
+                .find("nvme_cache.required_mount") != std::string::npos, "invalid required mount refused by name");
   for (const char* bad : {"\"allow_buffered\":1", "\"op_timeout_s\":-1", "\"op_timeout_s\":90000", "\"op_timeout_s\":1.5"})
     require(refusal(std::string("{\"model\":\"m\",\"nodes\":[\"h\"],\"nvme_cache\":{") + bad + "}}")
                     .find("nvme_cache.") != std::string::npos,

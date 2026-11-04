@@ -1922,6 +1922,7 @@ int main(int argc, char** argv) {
   // record, the path is each rank's own.
   bool nvme_cache = false;
   std::string nvme_cache_path = "~/dgpp/nvme-cache";
+  std::string nvme_cache_required_mount;
   double nvme_cache_gib = 0.0;
   int64_t nvme_cache_min_tokens = 0;
   int64_t nvme_cache_chunk_mib = 64;
@@ -2072,6 +2073,7 @@ int main(int argc, char** argv) {
     prefix_cache_gib = e.prefix_cache_gib;
     nvme_cache = c.nvme_cache.enabled;
     nvme_cache_path = c.nvme_cache.path;
+    nvme_cache_required_mount = c.nvme_cache.required_mount;
     nvme_cache_gib = c.nvme_cache.capacity_gib;
     nvme_cache_min_tokens = c.nvme_cache.min_tokens;
     nvme_cache_chunk_mib = c.nvme_cache.chunk_mib;
@@ -3541,7 +3543,8 @@ int main(int argc, char** argv) {
                                                snapshot_bytes, block_tokens, context_limit,
                                                /*create_directory=*/!memory_plan_only && nvme_cache_reuse_binding.empty(),
                                                static_cast<size_t>(nvme_cache_reserve_gib * 1024.0 * 1024.0 * 1024.0),
-                                               nvme_binding, kNvmeChunkBytes);
+                                               nvme_binding, kNvmeChunkBytes,
+                                               nvme_cache_required_mount, nvme_cache_allow_buffered);
       if (nvme_plan.error.empty() && !nvme_cache_reuse_binding.empty()) {
         nvme_plan.error = dgpp::serve::check_nvme_cache_reuse(nvme_plan, nvme_binding, rank, block_tokens);
         if (nvme_plan.error.empty())
@@ -3549,8 +3552,11 @@ int main(int argc, char** argv) {
                         "format, geometry, checksums and world agreement still checked", rank, nvme_binding);
       }
       DGPP_LOG_INFO("rank {}: {}", rank, nvme_plan.describe());
+      DGPP_LOG_INFO("rank {}: {}", rank, nvme_plan.storage.describe());
+      if (const auto warning = nvme_plan.storage.warning(nvme_cache_allow_buffered); !warning.empty())
+        DGPP_LOG_WARN("rank {}: {}", rank, warning);
       if (!nvme_plan.error.empty()) {
-        DGPP_LOG_ERROR("rank {}: the NVMe cache does not fit — {}", rank, nvme_plan.error);
+        DGPP_LOG_ERROR("rank {}: NVMe cache preflight refused — {}", rank, nvme_plan.error);
         return 1;
       }
       if (arena_slots <= 0) {
@@ -3569,6 +3575,7 @@ int main(int argc, char** argv) {
       if (!nvme_cache) return;
       dgpp::sched::SchedulerEngine::DiskEnable en;
       en.slab_path = nvme_plan.slab;
+      en.required_mount = nvme_cache_required_mount;
       en.capacity_bytes = nvme_plan.capacity_bytes;
       en.chunk_bytes = kNvmeChunkBytes;
       en.min_tokens = nvme_cache_min_tokens;  // 0: every entry memory keeps (engine.prefix_min_tokens floors them)

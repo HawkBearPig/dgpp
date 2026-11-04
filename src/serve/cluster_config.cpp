@@ -526,6 +526,11 @@ ClusterConfig parse_cluster_config(const std::string& json, const std::string& w
         else if (p.key == "path") {
           n.path = text(p.value, nk, what);
           if (n.path.empty()) fail(what, "'" + nk + "' must not be empty");
+        } else if (p.key == "required_mount") {
+          n.required_mount = text(p.value, nk, what);
+          if ((!n.required_mount.empty() && n.required_mount.front() != '/') ||
+              n.required_mount.find('\0') != std::string::npos)
+            fail(what, "'" + nk + "' must be empty or an absolute mountpoint path");
         } else if (p.key == "capacity_gib") {
           n.capacity_gib = number(p.value, nk, what);
           if (n.capacity_gib < 0.0) fail(what, "'" + nk + "' must be >= 0");
