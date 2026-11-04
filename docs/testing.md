@@ -1,5 +1,16 @@
 # Tests
 
+`scheduler_prefixCache_cancelledHistoryRandomizedReplay` replays 512 fixed
+seeds twice across speculative batch cuts, delivered-tail truncation, edited
+histories, lookahead identity and small arenas. The NVMe cancellation tests
+check that retained snapshots stay reclaimable during another request's
+growth, remain reusable in memory and leave normal completion spills intact.
+`serve_cancel_prefix_check_test` tests the diagnostic client's SSE transport,
+Unicode/whitespace preservation, disconnect retirement and cold controls.
+Run `scripts/serve_cancel_prefix_check.py` on an idle serving world to compare
+actual rerendered interrupted histories with cold replies; pass the source
+revision, binary hash and an output path for its detailed JSON report.
+
 `nvme_cache_test` checks reuse of an existing binding after build/settings
 changes, adoption and exact-token lookup through the host disk index, legacy
 index encoding, and non-destructive refusal of missing or incompatible files.

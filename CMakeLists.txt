@@ -1284,6 +1284,8 @@ add_test(NAME serve_campaign_test
   COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/python/serve_campaign_test.py)
 add_test(NAME serve_admission_bench_test
   COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/python/serve_admission_bench_test.py)
+add_test(NAME serve_cancel_prefix_check_test
+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/python/serve_cancel_prefix_check_test.py)
 add_test(NAME qwen_yarn_release_check_test
   COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/python/qwen_yarn_release_check_test.py)
 add_test(NAME qwen_head_compare_test
