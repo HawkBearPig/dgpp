@@ -8,6 +8,7 @@
 #include "kernels/glm_norm.hpp"
 #include "kernels/kernels.hpp"
 #include "kernels/minimax.hpp"
+#include "kernels/mma_gemv.hpp"
 #include "kernels/qwen_norm.hpp"
 #include "models/minimax/dspark.hpp"
 
@@ -268,8 +269,11 @@ MinimaxModel::Outputs MinimaxModel::run_rows(const RowRun& run) {
         // Upstream captures the residual ENTERING this layer. The input
         // norm has saved the preceding MLP sum with one BF16 rounding.
         const auto* fc = df_.weights().fc + static_cast<size_t>(tap) * H * H;
-        gemm_.matmul(resid_, fc, df_.tap_gemm_out(), T, H, H, DType::BF16, GemmOut::F32, H,
-                     gemm_ws_, gemm_ws_bytes_, stream_);
+        // Keep one accumulation chain across prefill, resume and every
+        // verification width. cuBLAS also introduces memset graph nodes
+        // for the published 6144-square FC at 24 rows; serving captures
+        // must contain only kernels so the copy engine cannot stall RDMA.
+        launch_mma_gemv_bf16_f32(resid_, H, fc, df_.tap_gemm_out(), T, H, H, H, stream_);
         const auto& taps = cfg_.dspark->target_layer_ids;
         dflash2_acc_f32(df_.acc(), df_.tap_gemm_out(), static_cast<int64_t>(T) * H,
                         layer == *std::min_element(taps.begin(), taps.end()) ? 0 : 1, stream_);

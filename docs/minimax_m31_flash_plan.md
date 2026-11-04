@@ -688,3 +688,15 @@ preserves the five-token ceiling for existing MTP chains and requires the
 checkpoint's full physical block width for MiniMax. A deployment regression
 test covers the seven-proposal configuration. MiniMax uses the verification
 scheduler to reduce verified rows without changing that physical block.
+
+The next real-model startup exposed five cuBLAS memset nodes in the
+24-row verification graph, one per target feature projection. Those FC
+projections now use the kernel-only streaming matrix multiply with one
+accumulation chain for every row count, including prefill and resume.
+A regression first failed on the previous dispatch and now requires
+bitwise feature equality between full prefill, incremental verification,
+short resumed readers, and two/three/four-request batches. All 21 shared
+drafter integration cases pass, including greedy and sampled captures at
+32/24/16/8 rows. The independent draft oracle and native kernel/loader
+gates also pass. The real 6144-wide graph is checked separately at startup;
+the tiny fixture alone cannot reproduce cuBLAS's shape-specific memset.

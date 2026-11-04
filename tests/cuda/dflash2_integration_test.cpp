@@ -110,8 +110,8 @@ void check_prefix(Factory make) {
 
 template <class Model, class Factory>
 auto check_graph(Factory make, uint16_t port, bool sampled = false, bool screened = false,
-                 std::vector<std::vector<uint8_t>>* states = nullptr) {
-  constexpr int world = 2, slots = 2;
+                 std::vector<std::vector<uint8_t>>* states = nullptr, int slots = 2) {
+  constexpr int world = 2;
   std::vector<std::unique_ptr<dgpp::net::CollectiveBus>> buses;
   for (int rank = 0; rank < world; ++rank) {
     dgpp::net::BusOptions o;
@@ -168,7 +168,8 @@ auto check_graph(Factory make, uint16_t port, bool sampled = false, bool screene
         ready.arrive_and_wait();
         engine.warm_captures(prompt(4, 0));
         transcripts[rank].resize(slots);
-        std::vector<int> live{0, 1};
+        std::vector<int> live;
+        for (int req = 0; req < slots; ++req) live.push_back(req);
         for (int req : live) {
           dgpp::sample::Params params;
           params.temperature = sampled ? .8f : 0.f;
@@ -215,8 +216,8 @@ auto check_graph(Factory make, uint16_t port, bool sampled = false, bool screene
                                     cudaMemcpyDeviceToHost));
             snapshots.release(0);
           }
-          if (step == 3) {
-            engine.close(0);
+          if (step >= 3 && live.size() > 1) {
+            engine.close(live.front());
             // Scalar replay after fixed-batch replays. A copy, not erase():
             // GCC 13's -Warray-bounds misreads the erase's move once the
             // TU's inlining changes (a one-element vector's end pointer).
@@ -240,12 +241,13 @@ auto check_graph(Factory make, uint16_t port, bool sampled = false, bool screene
   return transcripts[0];
 }
 
-auto minimax_factory(bool draft = true) {
+auto minimax_factory(bool draft = true, int slots = 2) {
   const std::string dir = "minimax_dspark_target_fixture";
   const auto cfg = dgpp::MinimaxConfig::from_json_file(dir + "/config.json");
   return [=](dgpp::BoundaryReducer* reducer, int rank, int world) {
-    return std::make_unique<dgpp::MinimaxModel>(
-        cfg, dir, 256, 1024, dgpp::LoaderResidency::Resident, reducer, rank, world, 2, draft, 16);
+    return std::make_unique<dgpp::MinimaxModel>(cfg, dir, 256, 1024,
+                                                dgpp::LoaderResidency::Resident, reducer, rank,
+                                                world, slots, draft, slots * 8);
   };
 }
 auto flash_factory() {
@@ -367,6 +369,66 @@ DGPP_TEST(minimax_dspark_graph_reducer_tp) {
 }
 DGPP_TEST(minimax_dspark_sampled_graph_tp) {
   check_graph<dgpp::MinimaxModel>(minimax_factory(), 29978, true);
+}
+DGPP_TEST(minimax_dspark_four_slot_graph_tp) {
+  // Capture and replay 32/24/16/8-row verification batches. The published
+  // FC shape previously introduced cuBLAS memset nodes at 24 rows.
+  check_graph<dgpp::MinimaxModel>(minimax_factory(true, 4), 29978, false, false, nullptr, 4);
+}
+DGPP_TEST(minimax_dspark_four_slot_sampled_graph_tp) {
+  check_graph<dgpp::MinimaxModel>(minimax_factory(true, 4), 29978, true, false, nullptr, 4);
+}
+DGPP_TEST(minimax_dspark_features_independent_of_row_count) {
+  auto model = minimax_factory(true, 4)(nullptr, 0, 1);
+  const auto ids = prompt(129, 19);
+  const int h = model->config().hidden_size;
+  auto features = [&](int rows) {
+    DGPP_CUDA_OK(cudaStreamSynchronize(model->stream()));
+    std::vector<float> out(rows * h);
+    DGPP_CUDA_OK(cudaMemcpy(out.data(), model->dspark_drafter().acc(), out.size() * sizeof(float),
+                            cudaMemcpyDeviceToHost));
+    return out;
+  };
+  model->session_prefill(0, ids);
+  const auto reference = features(ids.size());
+  model->session_close(0);
+  for (int rows : {1, 8, 16, 24, 32}) {
+    model->session_prefill(0, {ids.front()});
+    const auto first = features(1);
+    require(std::equal(first.begin(), first.end(), reference.begin()),
+            "DSpark first-row features differ from full prefill");
+    for (size_t at = 1; at < ids.size();) {
+      const int n = std::min<size_t>(rows, ids.size() - at);
+      const std::vector<int64_t> next{ids.begin() + at, ids.begin() + at + n};
+      if (rows <= 8)
+        model->session_verify(0, next);
+      else
+        model->session_prefill_resume(0, next, {});
+      const auto got = features(n);
+      require(std::equal(got.begin(), got.end(), reference.begin() + at * h),
+              "DSpark features depend on row count " + std::to_string(rows));
+      if (rows <= 8) model->session_rollback(0, n, n);
+      at += n;
+    }
+    model->session_close(0);
+  }
+  for (int slots = 2; slots <= 4; ++slots) {
+    std::vector<int> reqs;
+    std::vector<std::vector<int64_t>> feeds;
+    for (int req = 0; req < slots; ++req) {
+      model->session_prefill(req, {ids.front()});
+      reqs.push_back(req);
+      feeds.emplace_back(ids.begin() + 1, ids.begin() + 9);
+    }
+    model->session_verify_batch(reqs, feeds);
+    const auto got = features(slots * 8);
+    for (int req : reqs) {
+      require(std::equal(got.begin() + req * 8 * h, got.begin() + (req + 1) * 8 * h,
+                         reference.begin() + h),
+              "DSpark batched features differ from full prefill");
+      model->session_close(req);
+    }
+  }
 }
 DGPP_TEST(minimax_dspark_preserves_target_and_all_accept_lengths) {
   auto plain = minimax_factory(false)(nullptr, 0, 1);
