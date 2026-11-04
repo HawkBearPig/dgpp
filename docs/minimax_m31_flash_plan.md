@@ -1254,3 +1254,76 @@ Both `DGPP_ENABLE_VIDEO=OFF` and the restored `ON` build pass their frontend
 and service checks. With video disabled, real-checkpoint still images work,
 the capability declaration omits video, and video requests fail by field
 name with the build-option reason. With video enabled, both media paths work.
+
+
+The same release's TP4 numerical probe, SHA-256
+`d0586eacee2d427b21fd54052607bbe2a95f4e08c9d31cd58d36397001e02494`,
+passes the final row-geometry checks: 528 short-prose positions each at rows
+1 and 2, 7,219 technical positions at rows 4, and 529 chat positions at rows
+8. Every scored record, including local log-sum-exp, target logit and global
+argmax, is identical to the preceding eight-row native baseline. Both trials
+repeat exactly, with every rank at zero swap and the expected executable hash.
+
+### Large-pool quality pilot
+
+The frozen `7386ec34` server boots the development template's 786,432-token
+pool with eight request slots and seven-proposal DSpark. The final memory
+plan totals 103.43 GiB per rank plus 4 GiB headroom; the warm-captured peers
+retain about 10 GiB of host-available memory. All four executable hashes match
+and process swap remains zero before and after. The operation streams match.
+
+Eight HumanEval, eight GSM8K and eight structured-extraction items all pass
+at their standard 2,048/2,048/512-token caps, with no truncations or retries.
+This is a 24-item integration pilot, not the complete task-quality set or a
+throughput measurement. Final quality, long-context checks and deployment
+measurements still follow the tuning work.
+
+MiniMax's prefix snapshot is 16 bytes and its K/V blocks share the main pool.
+The 2-GiB snapshot budget already reaches the 4,096-entry limit and does not
+limit cached documents to 2 GiB of K/V. Retention is constrained by shared
+pool pressure; increasing this snapshot budget cannot add slots or token
+capacity.
+
+### Verification and prefill tuning controls
+
+The frozen `7386ec34` release compares verification depths 1, 3, 5 and 7
+against plain decoding, at C1 and C8 over all five serving classes. The
+physical DSpark block remains seven proposals in every draft run. Fresh or
+eager-redrafted slots require a full first verification before the reduced
+schedule can use their confidence. All 180 paired requests match plain text,
+finish reasons and completion-token counts exactly. Every boot has matching
+operation streams, the recorded executable on all four ranks and zero swap.
+Plain decoding wins all five C8 comparisons; shorter verification helps some
+C1 classes. These are single-repeat tuning controls, not final benchmark rows.
+
+Reviewing the adaptive schedule exposes a producer/consumer mismatch: the
+MiniMax confidence kernel applies sigmoid although the shared scheduler
+expects logits and applies sigmoid itself. The kernel now publishes the raw
+learned logit, with negative infinity for an invalid predecessor. The change
+leaves target logits and draft proposals unchanged. Fixed-depth controls above
+are unaffected because their deliberately high threshold always chooses the
+configured minimum; the full-depth and plain runs do not use this decision.
+A new boundary regression exercises negative, zero and positive logits through
+the shared scheduler. Adaptive performance must be measured after this fix.
+
+Idle prefill caps of 512, 2,048 and 4,096 use identical actual prompts and
+128-token continuations at 6,075 and 23,718 input tokens. All continuation
+choices, top-five logprobs and usage records are exact across the caps. The
+2,048-token cap improves cold prefill over 512; 4,096 adds little benefit on
+these prompts. Every rank remains at zero swap with matching operation streams.
+
+This sweep also exposes a measurement defect: the prefill probe assumes a
+30-token wrapper when estimating prose tokens per word. MiniMax's larger
+wrapper makes its nominal 8K and 32K requests only about 6.2K and 24.4K.
+The tuning controls retain the same actual prompts, but none are published as
+8K/32K benchmark rows. The probe now measures the instruction and wrapper
+separately on the endpoint. An offline end-to-end regression fails with the
+old calibration and passes with both large and small wrappers after the fix;
+the complete 38-test report-helper suite passes. The final campaign uses the
+corrected calibration and records actual input lengths.
+
+The confidence correction passes the warnings-as-errors build, all 18 targeted
+CTest entries (including the independent DSpark oracle and shared engine
+integration), and CUDA memcheck with zero errors. The saved pre-fix output
+fails the logit contract as expected. The complete Python host suites and
+400-kernel dependency audit pass after the probe correction.

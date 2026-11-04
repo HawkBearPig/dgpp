@@ -51,12 +51,15 @@ def idle_metrics(host, port, timeout=0, completed_after=None):
         time.sleep(0.01)
 
 
+def prompt_prefix(nonce):
+    return f"Reference {nonce}. Summarize the following in one sentence.\n\n"
+
+
 def prompt_of(words, n_words, nonce, rng):
     if n_words > len(words):
         raise ValueError(f"prompt needs {n_words} words but dataset contains only {len(words)}")
     start = rng.randrange(0, max(1, len(words) - n_words - 1))
-    return f"Reference {nonce}. Summarize the following in one sentence.\n\n" + \
-        " ".join(words[start:start + n_words])
+    return prompt_prefix(nonce) + " ".join(words[start:start + n_words])
 
 
 UNSUPPORTED_THINKING_SWITCH = {"seen": False}
@@ -99,6 +102,22 @@ def ask(host, port, model, prompt, no_think=False):
             "usage": result["usage"], "finish": result["finish"], "text": result["text"],
             "wall_ms": 1000 * (ended - t0),
             "ttft_ms": 1000 * (result["first"] - t0) if result["first"] is not None else None}
+
+
+def calibrate_words(host, port, model, words, nonce, rng, no_think=False):
+    """Measure wrapper/instruction overhead separately from the prose tokens."""
+    prompt = prompt_of(words, 400, nonce, rng)
+    before = idle_metrics(host, port)
+    empty = ask(host, port, model, prompt_prefix(nonce), no_think)
+    between = idle_metrics(host, port, timeout=5, completed_after=before["prompts_prefilled"])
+    full = ask(host, port, model, prompt, no_think)
+    idle_metrics(host, port, timeout=5, completed_after=between["prompts_prefilled"])
+    overhead = empty["usage"]["prompt_tokens"]
+    per_word = (full["usage"]["prompt_tokens"] - overhead) / 400
+    if overhead <= 0 or not math.isfinite(per_word) or per_word <= 0:
+        raise RuntimeError("invalid token-to-word calibration")
+    return {"calibration": full, "calibration_empty": empty,
+            "prompt_overhead_tokens": overhead, "tokens_per_word": per_word}
 
 
 def measured_prefill(before, after, response):
@@ -146,21 +165,19 @@ def main():
     rng = random.Random(args.seed)
     def nonce(value):
         return f"{args.tag}-{value}" if args.tag else value
-    initial = idle_metrics(args.host, args.port)
-    calibration = ask(args.host, args.port, model, prompt_of(words, 400, nonce("cal-0"), rng), args.no_think)
-    idle_metrics(args.host, args.port, timeout=5, completed_after=initial["prompts_prefilled"])
-    tokens = calibration["usage"]["prompt_tokens"]
-    per_word = (tokens - 30) / 400
-    if per_word <= 0:
-        raise RuntimeError("invalid token-to-word calibration")
-    print(f"[calibrate] 400 words -> {tokens} prompt tokens ({per_word:.3f} tok/word)", flush=True)
+    calibration = calibrate_words(args.host, args.port, model, words, nonce("cal-0"), rng, args.no_think)
+    tokens = calibration["calibration"]["usage"]["prompt_tokens"]
+    per_word = calibration["tokens_per_word"]
+    overhead = calibration["prompt_overhead_tokens"]
+    print(f"[calibrate] 400 words -> {tokens} prompt tokens, {overhead} overhead "
+          f"({per_word:.3f} tok/word)", flush=True)
     report = {"schema_version": 1, "model": model, "tag": args.tag, "seed": args.seed,
               "thinking": "server_default" if UNSUPPORTED_THINKING_SWITCH["seen"] else False if args.no_think else "server_default",
               "thinking_switch_unsupported": UNSUPPORTED_THINKING_SWITCH["seen"],
               "interval_s": args.interval,
-              "data_sha256": hashlib.sha256(raw).hexdigest(), "calibration": calibration, "samples": []}
+              "data_sha256": hashlib.sha256(raw).hexdigest(), **calibration, "samples": []}
     for length in args.lengths:
-        n_words = max(8, int((length - 30) / per_word))
+        n_words = max(8, int((length - overhead) / per_word))
         samples = []
         for repeat in range(args.repeat):
             if args.interval:

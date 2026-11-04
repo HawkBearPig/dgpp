@@ -32,7 +32,8 @@ The development template reserves eight request slots and a shared
 786,432-token BF16 pool. Pool capacity is shared by active and cached requests;
 it is not a per-request allowance at every concurrency. The checkpoint's
 positional ceiling is 1,048,576, but this template does not reserve that many
-tokens. Large-pool loading and long-context quality are still pending.
+tokens. This pool has loaded successfully on all four nodes with zero
+process swap. Long-context quality is still pending.
 
 ## Numerical recipe and drafting
 
@@ -56,7 +57,8 @@ implementation does not pool those keys, reduce top-k, or add RoPE scaling.
 `engine.mtp: true` enables the bundled five-layer DSpark model. Its learned
 block proposes seven tokens; `engine.mtp_depth` must remain seven. The common
 verification schedule can check fewer proposals without changing the draft
-block. Use `--no-mtp` for the plain-decode control. Sampled speculation uses
+block; fresh slots still verify the full block until confidence is available.
+Use `--no-mtp` for the plain-decode control. Sampled speculation uses
 the full proposal distribution and rejection correction.
 
 ## API and media
@@ -100,3 +102,10 @@ bit-exact final embeddings. Kernel diagnostics and microbenchmarks do not
 establish deployment throughput; final results belong in
 [the benchmark tables](../benchmarks.md) after the complete shipped-template
 campaign.
+
+The clean native release and warnings-as-errors builds pass. All 381 local
+CTest entries have passing runs, including the 17 optional checkpoint tests
+run separately with pinned metadata. Video-enabled and video-disabled builds
+pass their capability and request checks. A 24-item large-pool quality pilot
+passes eight each of HumanEval, GSM8K and extraction without truncation;
+the complete task-quality campaign remains pending.

@@ -347,7 +347,9 @@ fixed smaller verification depth N, use `--mtp-schedule
 --mtp-schedule-lambda 1000000 --mtp-schedule-fixed-lambda`; the large fixed
 penalty selects the smaller option. `--no-mtp-schedule` verifies all seven,
 and `--no-mtp` is plain decode. Do not change the learned block length to
-produce these controls.
+produce these controls. Fresh slots and slots requiring a new eager draft
+still take the scheduler's mandatory full-block verification; the smaller
+depth applies once their confidence is available.
 
 ### Validity
 

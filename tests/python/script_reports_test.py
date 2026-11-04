@@ -147,6 +147,36 @@ class ScriptReportsTest(unittest.TestCase):
             serve_prefill_probe.measured_prefill(before, {**after, "prompt_tokens_computed": 116},
                 {"usage": {"prompt_tokens": 20, "prompt_tokens_details": {"cached_tokens": 4}}})
 
+    def test_prefill_probe_calibrates_large_chat_wrappers(self):
+        for overhead in (230, 30):
+            with self.subTest(overhead=overhead), tempfile.TemporaryDirectory() as directory:
+                data = Path(directory) / "questions.jsonl"
+                output = Path(directory) / "result.json"
+                data.write_text(json.dumps({"question": "sample " * 10000}) + "\n")
+                state = {"active": 0, "queued": 0, "prompts_prefilled": 0,
+                         "prompt_tokens_computed": 0, "prefill_ms": 0}
+
+                def ask(host, port, model, prompt, no_think=False):
+                    # Two body tokens per word, with a separate chat wrapper.
+                    tokens = overhead + 2 * len(prompt.split("\n\n", 1)[1].split())
+                    state["prompts_prefilled"] += 1
+                    state["prompt_tokens_computed"] += tokens
+                    state["prefill_ms"] += 3 * tokens
+                    return {"usage": {"prompt_tokens": tokens,
+                                      "prompt_tokens_details": {"cached_tokens": 0}},
+                            "finish": "length", "text": "", "wall_ms": 3 * tokens, "ttft_ms": None}
+
+                argv = ["serve_prefill_probe.py", "host", "1", "8192", "--repeat", "1",
+                        "--data", str(data), "--model", "fixture", "--json-out", str(output)]
+                with patch.object(sys, "argv", argv), patch.object(serve_prefill_probe, "ask", side_effect=ask), \
+                        patch.object(serve_prefill_probe, "idle_metrics", side_effect=lambda *a, **k: dict(state)):
+                    capture(serve_prefill_probe.main)
+                report = json.loads(output.read_text())
+                self.assertEqual(report["samples"][0]["prompt_tokens"], 8192)
+                self.assertEqual(report["samples"][0]["cached_tokens"], 0)
+                self.assertEqual(report["prompt_overhead_tokens"], overhead)
+                self.assertEqual(report["tokens_per_word"], 2)
+
     def test_prefill_probe_waits_for_retired_metrics_but_rejects_busy_start(self):
         old = {"active": 0, "queued": 0, "prompts_prefilled": 2}
         busy = {"active": 1, "queued": 0, "prompts_prefilled": 2}

@@ -6,8 +6,9 @@ recursive tools, images and native video. All six independent fixed-order
 text corpus checks pass across 28,329 scored positions with no argmax changes;
 distributed media, cache and batch-isolation checks pass. Tested activation
 quantization recipes fail the unchanged numerical gates and are rejected.
-Release validation still requires the large-pool, task-quality, long-context
-checks, followed by the final tuned-template campaign. The full local test
+The 768K pool boots at zero swap and passes a 24-item task-quality pilot.
+Release validation still requires full task-quality and long-context checks,
+followed by the final tuned-template campaign. The full local test
 suite and video-enabled/disabled build checks pass. See
 the [implementation record](docs/minimax_m31_flash_plan.md) and
 [deployment notes](docs/model_cards/MiniMax-M3.1-Flash.md).
