@@ -2736,6 +2736,9 @@ if(DGPP_BUILD_BENCHMARKS)
   dgpp_add_benchmark(minimax_moe_bench
     SOURCES benchmarks/micro/minimax_moe_bench.cpp
     LIBRARIES dgpp_models_minimax_layers CUDA::cudart Threads::Threads)
+  dgpp_add_benchmark(minimax_index_bench
+    SOURCES benchmarks/micro/minimax_index_bench.cpp
+    LIBRARIES dgpp_kernels CUDA::cudart)
   dgpp_add_benchmark(moe_tile_bench
     SOURCES benchmarks/micro/moe_tile_bench.cu src/common/log.cpp
     LIBRARIES dgpp_models_glm_loader dgpp_models_glm CUDA::cudart CUDA::cublasLt)

@@ -992,7 +992,7 @@ The cache-enabled plain TP4 server (`db30ca46`, SHA-256
 passes the video cases at concurrency one and four, the cache/streaming checks
 and six still-image cases. Choices and token counts match the earlier binary
 exactly. All ranks report zero swap before and after and identical operation
-streams. The same check with DSpark is pending.
+streams. The eight-slot DSpark check below also covers this cache.
 
 ### Fixed-order reference controls
 
@@ -1039,3 +1039,40 @@ rows, despite identical hidden states. Verification now uses the same
 FP32 reduction chain at every width, including heads that are not packed
 as BF12. The target and proposal head share this path. Real-checkpoint
 likelihood checks are required for this head change before release.
+
+The TP4 server from `dfe39b4d` (SHA-256
+`7cfaa3850056ef3656747c8ca175e8afe98f8c49b167bc89274d70eb9cfab900`)
+passes the complete video/cache/streaming battery at concurrency eight, plus
+the still-image battery, with choices and token counts exactly matching
+the earlier plain-decode results. Request-field checks pass for streaming
+and non-streaming stops, multiple sampled choices, logit bias, named errors,
+prefix reuse and reasoning accounting. Text execution completes at C1/C8
+across five workload classes, and the separate isolation check produces
+identical text alone and beside seven other requests. All ranks report zero
+process swap before and after and matching operation streams. These are
+integration checks; their client wall rates are not deployment throughput rows.
+
+The eight-slot memory plan with DSpark, vision and a 786,432-token BF16 pool
+estimates 102.99 GiB per rank plus 4 GiB headroom. This larger pool has not
+yet been loaded or validated; the integration run above used 65,536 tokens.
+
+### Lossless sparse-index scheduling
+
+The original index scan launched one warp for every reserved logical block,
+including blocks beyond the current sequence. A bounded-grid control removes
+that empty work but slightly slows some long scans. The selected implementation
+also shares coalesced key loads across eight verification queries or sixteen
+prefill queries, preserving every ascending 128-term FP32 dot chain. Mixed
+request tiles use separate per-request key lookups. Fewer than eight rows
+retain the original scan, whose measured long-context latency was slightly
+better than the bounded control. Selection still uses the unchanged causal
+bound, top-16 budget, forced current block and stable tie rule.
+
+The optional `minimax_index_bench` target compares original, bounded and tiled
+scans with graph-event timing and requires bit-exact visible scores and block
+selection before timing. It covers 65,536/786,432-token reservations, up to
+524,288 visible tokens and 1/8/64/512 query rows. These are kernel diagnostics,
+not deployment throughput rows. The regression suite adds different physical
+page permutations and request identities, partial blocks, padding and replay
+after visibility grows or shrinks. CUDA memcheck reports zero errors and
+racecheck reports zero hazards. Full-model trajectory checks remain required.

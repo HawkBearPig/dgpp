@@ -37,9 +37,13 @@ void minimax_index_append(const uint16_t* index_k, uint16_t* cache, const int32_
                           cudaStream_t);
 // scores [rows,index_heads,max_blocks], selected [rows,index_heads,topk].
 // Every padding row produces -1 selections; no host reads or dynamic grids.
+// Optimized scans write only causally visible scores; selection never reads
+// the rest. Reference retains the original grid for numerical/perf controls.
+enum class MinimaxIndexScan { Reference, Bounded, Tiled };
 void minimax_index_score(const uint16_t* q, const uint16_t* index_cache, const int32_t* req_ids,
                          const int64_t* pos, const int32_t* tables, int table_stride, int rows,
-                         int index_heads, int max_blocks, float* scores, cudaStream_t);
+                         int index_heads, int max_blocks, float* scores, cudaStream_t,
+                         MinimaxIndexScan scan = MinimaxIndexScan::Tiled);
 void minimax_index_select(const float* scores, const int64_t* pos, int rows, int index_heads,
                           int max_blocks, int topk, int32_t* selected, cudaStream_t);
 // One partial per selected logical block. Workspace [rows,topk,heads],

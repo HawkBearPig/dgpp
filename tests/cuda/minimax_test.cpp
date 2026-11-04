@@ -394,8 +394,78 @@ void rotary_frequencies() {
               "MiniMax CUDA rotary frequency rounding");
   }
 }
+void index_score_schedule() {
+  constexpr int blocks = 257, heads = 4, requests = 3, topk = 16;
+  std::vector<int32_t> table(requests * blocks);
+  for (int req = 0; req < requests; ++req)
+    for (int i = 0; i < blocks; ++i) table[req * blocks + i] = req * blocks + (i * 29) % blocks;
+  std::vector<uint16_t> keys(size_t(requests) * blocks * 128 * 128);
+  for (size_t i = 0; i < keys.size(); ++i)
+    keys[i] = b(float(int((i * 17 + i / 131) % 131) - 65) / 32);
+  Device<uint16_t> dk(keys);
+  Device<int32_t> dt(table);
+  const int64_t boundaries[]{0, 1, 127, 128, 2047, 2048, 32767, 32895, -1};
+  for (bool mixed : {false, true})
+    for (int rows : {1, 8, 17, 64, 129}) {
+      std::vector<int64_t> pos(rows);
+      std::vector<int32_t> req(rows);
+      std::vector<uint16_t> query(size_t(rows) * heads * 128);
+      for (size_t i = 0; i < query.size(); ++i)
+        query[i] = b(float(int((i * 13 + i / 43) % 97) - 48) / 16);
+      for (int r = 0; r < rows; ++r) {
+        pos[r] = boundaries[r % 9];
+        req[r] = pos[r] < 0 ? -1 : mixed ? r % requests : 0;
+      }
+      Device<int64_t> dp(pos);
+      Device<int32_t> dr(req), selected(size_t(rows) * heads * topk);
+      Device<uint16_t> dq(query);
+      Device<float> original(size_t(rows) * heads * blocks), bounded(original.size);
+      cudaStream_t stream;
+      cudaGraph_t graph;
+      cudaGraphExec_t exec;
+      DGPP_CUDA_OK(cudaStreamCreate(&stream));
+      DGPP_CUDA_OK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
+      minimax_index_score(dq.p, dk.p, dr.p, dp.p, dt.p, blocks, rows, heads, blocks, bounded.p,
+                          stream);
+      minimax_index_select(bounded.p, dp.p, rows, heads, blocks, topk, selected.p, stream);
+      DGPP_CUDA_OK(cudaStreamEndCapture(stream, &graph));
+      DGPP_CUDA_OK(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
+      // Reuse the graph and score storage as visibility grows, shrinks and
+      // becomes padding. Previously visible future scores must never leak.
+      for (int pass = 0; pass < 4; ++pass) {
+        if (pass == 3) std::fill(pos.begin(), pos.end(), -1);
+        dp.upload(pos);
+        dr.upload(req);
+        DGPP_CUDA_OK(cudaGraphLaunch(exec, stream));
+        DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+        const auto got = bounded.get();
+        const auto got_ids = selected.get();
+        minimax_index_score(dq.p, dk.p, dr.p, dp.p, dt.p, blocks, rows, heads, blocks, original.p,
+                            stream, MinimaxIndexScan::Reference);
+        minimax_index_select(original.p, dp.p, rows, heads, blocks, topk, selected.p, stream);
+        DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+        const auto expected = original.get();
+        require(got_ids == selected.get(), "bounded index scan changed causal block selection");
+        for (int r = 0; r < rows; ++r)
+          for (int h = 0; h < heads; ++h)
+            for (int block = 0; block <= pos[r] / 128 && pos[r] >= 0; ++block) {
+              const size_t at = (size_t(r) * heads + h) * blocks + block;
+              require(std::bit_cast<uint32_t>(got[at]) == std::bit_cast<uint32_t>(expected[at]),
+                      "bounded index scan changed a visible FP32 score");
+            }
+        for (int r = 0; r < rows; ++r) {
+          pos[r] = boundaries[(r + pass * 3 + 2) % 9];
+          req[r] = pos[r] < 0 ? -1 : mixed ? (r + pass) % requests : pass % requests;
+        }
+      }
+      DGPP_CUDA_OK(cudaGraphExecDestroy(exec));
+      DGPP_CUDA_OK(cudaGraphDestroy(graph));
+      DGPP_CUDA_OK(cudaStreamDestroy(stream));
+    }
+}
 void kernels() {
   rotary_frequencies();
+  index_score_schedule();
   minimax_pdl_test();
   dspark_kernels();
   {

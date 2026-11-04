@@ -172,9 +172,10 @@ __global__ void append_kernel(const uint16_t* x, uint16_t* cache, const int32_t*
       static_cast<int64_t>(table[static_cast<int64_t>(req[r]) * stride + p / 128]) * 128 + p % 128;
   cache[physical * 128 + d] = x[static_cast<int64_t>(r) * 128 + d];
 }
-__global__ void index_score_kernel(const uint16_t* q, const uint16_t* cache, const int32_t* req,
-                                   const int64_t* pos, const int32_t* table, int stride, int heads,
-                                   int blocks, float* scores) {
+__global__ void index_score_reference_kernel(const uint16_t* q, const uint16_t* cache,
+                                             const int32_t* req, const int64_t* pos,
+                                             const int32_t* table, int stride, int heads,
+                                             int blocks, float* scores) {
   dgpp_pdl_wait();
   const int r = blockIdx.x, h = blockIdx.y, b = blockIdx.z;
   const int lane = threadIdx.x;
@@ -197,6 +198,139 @@ __global__ void index_score_kernel(const uint16_t* q, const uint16_t* cache, con
   }
   maximum = max_warp(maximum);
   if (lane == 0) scores[(static_cast<int64_t>(r) * heads + h) * blocks + b] = maximum;
+}
+__global__ void index_score_bounded_kernel(const uint16_t* q, const uint16_t* cache,
+                                           const int32_t* req, const int64_t* pos,
+                                           const int32_t* table, int stride, int heads, int blocks,
+                                           float* scores) {
+  dgpp_pdl_wait();
+  const int r = blockIdx.x, h = blockIdx.y;
+  const int lane = threadIdx.x;
+  const int64_t p = pos[r];
+  // A fixed-size graph grid walks only visible logical blocks. Future scores
+  // are not consumed by select_kernel, which uses this same causal bound.
+  // Keep each dot and maximum's arithmetic identical to the one-block grid.
+  const int end = p < 0 ? 0 : min(blocks, int(p / 128 + 1));
+  if (int(blockIdx.z) >= end) return;
+  __shared__ float query[128];
+  if (p >= static_cast<int64_t>(blockIdx.z) * 128) {
+    for (int d = lane; d < 128; d += 32)
+      query[d] = bf16_bits_to_float(q[(static_cast<int64_t>(r) * heads + h) * 128 + d]);
+    __syncwarp();
+  }
+  for (int b = blockIdx.z; b < end; b += gridDim.z) {
+    float maximum = -INFINITY;
+    if (p >= static_cast<int64_t>(b) * 128) {
+      const int physical = table[static_cast<int64_t>(req[r]) * stride + b];
+      for (int t = lane; t < 128; t += 32) {
+        if (static_cast<int64_t>(b) * 128 + t > p) break;
+        const uint16_t* key = cache + (static_cast<int64_t>(physical) * 128 + t) * 128;
+        float dot = 0;
+#pragma unroll 4
+        for (int d = 0; d < 128; ++d) dot = fmaf(query[d], bf16_bits_to_float(key[d]), dot);
+        maximum = fmaxf(maximum, dot);
+      }
+    }
+    maximum = max_warp(maximum);
+    if (lane == 0) scores[(static_cast<int64_t>(r) * heads + h) * blocks + b] = maximum;
+  }
+}
+// Eight or sixteen queries share a coalesced key load. Each thread evaluates
+// four or eight independent, ascending-128-term FP32 dot chains; there is no query
+// quantization or reassociation. A mixed-request tile uses one warp per query
+// and the original dot chain, avoiding any cross-request key reuse.
+template <int tile>
+__global__ void index_score_tiled_kernel(const uint16_t* q, const uint16_t* cache,
+                                         const int32_t* req, const int64_t* pos,
+                                         const int32_t* table, int stride, int rows, int heads,
+                                         int blocks, float* scores) {
+  dgpp_pdl_wait();
+  const int row0 = blockIdx.x * tile, h = blockIdx.y, tid = threadIdx.x;
+  const int warp = tid / 32, lane = tid % 32;
+  __shared__ int64_t positions[tile], last;
+  __shared__ int requests[tile], same_request, visible, owner;
+  __shared__ float query[tile][128], partial[tile][4];
+  // 130 halfwords per token gives successive tokens distinct shared banks
+  // when lanes walk the same channel of different keys.
+  __shared__ uint16_t keys[128][130];
+  if (tid == 0) {
+    last = -1;
+    owner = -1;
+    same_request = 1;
+    for (int i = 0; i < tile; ++i) {
+      positions[i] = row0 + i < rows ? pos[row0 + i] : -1;
+      requests[i] = positions[i] >= 0 ? req[row0 + i] : -1;
+      if (positions[i] < 0) continue;
+      last = max(last, positions[i]);
+      if (owner < 0) owner = requests[i];
+      same_request &= owner == requests[i];
+    }
+    visible = last < 0 ? 0 : min(blocks, int(last / 128 + 1));
+  }
+  __syncthreads();
+  if (int(blockIdx.z) >= visible) return;
+  for (int i = tid; i < tile * 128; i += blockDim.x) {
+    const int r = i / 128, d = i % 128;
+    query[r][d] =
+        positions[r] < 0
+            ? 0.f
+            : bf16_bits_to_float(q[(static_cast<int64_t>(row0 + r) * heads + h) * 128 + d]);
+  }
+  __syncthreads();
+  if (!same_request) {
+    for (int r = warp; r < tile; r += 8) {
+      const int64_t p = positions[r];
+      const int end = p < 0 ? 0 : min(blocks, int(p / 128 + 1));
+      for (int b = blockIdx.z; b < end; b += gridDim.z) {
+        const int physical = table[static_cast<int64_t>(requests[r]) * stride + b];
+        float maximum = -INFINITY;
+        for (int t = lane; t < 128; t += 32) {
+          if (static_cast<int64_t>(b) * 128 + t > p) break;
+          const uint16_t* key = cache + (static_cast<int64_t>(physical) * 128 + t) * 128;
+          float dot = 0;
+#pragma unroll 4
+          for (int d = 0; d < 128; ++d) dot = fmaf(query[r][d], bf16_bits_to_float(key[d]), dot);
+          maximum = fmaxf(maximum, dot);
+        }
+        maximum = max_warp(maximum);
+        if (lane == 0) scores[(static_cast<int64_t>(row0 + r) * heads + h) * blocks + b] = maximum;
+      }
+    }
+    return;
+  }
+  for (int b = blockIdx.z; b < visible; b += gridDim.z) {
+    const int physical = table[static_cast<int64_t>(owner) * stride + b];
+    for (int i = tid; i < 128 * 128; i += blockDim.x) {
+      const int t = i / 128, d = i % 128;
+      keys[t][d] = static_cast<int64_t>(b) * 128 + t > last
+                       ? 0
+                       : cache[static_cast<int64_t>(physical) * 128 * 128 + i];
+    }
+    __syncthreads();
+    const int token = tid % 128, group = tid / 128;
+    float dot[tile / 2]{};
+#pragma unroll 4
+    for (int d = 0; d < 128; ++d) {
+      const float k = bf16_bits_to_float(keys[token][d]);
+#pragma unroll
+      for (int j = 0; j < tile / 2; ++j) dot[j] = fmaf(query[group + j * 2][d], k, dot[j]);
+    }
+#pragma unroll
+    for (int j = 0; j < tile / 2; ++j) {
+      const int r = group + j * 2;
+      const float maximum =
+          max_warp(static_cast<int64_t>(b) * 128 + token <= positions[r] ? dot[j] : -INFINITY);
+      if (lane == 0) partial[r][warp % 4] = maximum;
+    }
+    __syncthreads();
+    if (tid < tile && row0 + tid < rows && positions[tid] >= static_cast<int64_t>(b) * 128) {
+      float maximum = partial[tid][0];
+#pragma unroll
+      for (int j = 1; j < 4; ++j) maximum = fmaxf(maximum, partial[tid][j]);
+      scores[(static_cast<int64_t>(row0 + tid) * heads + h) * blocks + b] = maximum;
+    }
+    __syncthreads();
+  }
 }
 // Deterministic score/id reduction. A tie retains the smaller logical id.
 __device__ void best_warp(float& score, int& id) {
@@ -385,12 +519,28 @@ void minimax_index_append(const uint16_t* k, uint16_t* cache, const int32_t* req
 }
 void minimax_index_score(const uint16_t* q, const uint16_t* cache, const int32_t* req,
                          const int64_t* pos, const int32_t* table, int stride, int rows, int heads,
-                         int blocks, float* scores, cudaStream_t stream) {
+                         int blocks, float* scores, cudaStream_t stream, MinimaxIndexScan scan) {
   if (rows <= 0) return;
   if (blocks <= 0 || blocks > stride || heads <= 0)
     throw std::invalid_argument("MiniMax index shape");
-  index_score_kernel<<<dim3(rows, heads, blocks), 32, 0, stream>>>(q, cache, req, pos, table,
-                                                                   stride, heads, blocks, scores);
+  if (scan == MinimaxIndexScan::Tiled && rows >= 8) {
+    const int tile = rows > 64 ? 16 : 8;
+    const int tiles = (rows + tile - 1) / tile;
+    const int groups = std::min(blocks, std::max(1, 128 / tiles / heads));
+    if (tile == 16)
+      index_score_tiled_kernel<16><<<dim3(tiles, heads, groups), 256, 0, stream>>>(
+          q, cache, req, pos, table, stride, rows, heads, blocks, scores);
+    else
+      index_score_tiled_kernel<8><<<dim3(tiles, heads, groups), 256, 0, stream>>>(
+          q, cache, req, pos, table, stride, rows, heads, blocks, scores);
+  } else if (scan == MinimaxIndexScan::Bounded) {
+    const int groups = std::min(blocks, std::max(1, 1024 / rows / heads));
+    index_score_bounded_kernel<<<dim3(rows, heads, groups), 32, 0, stream>>>(
+        q, cache, req, pos, table, stride, heads, blocks, scores);
+  } else {
+    index_score_reference_kernel<<<dim3(rows, heads, blocks), 32, 0, stream>>>(
+        q, cache, req, pos, table, stride, heads, blocks, scores);
+  }
   DGPP_CUDA_OK(cudaGetLastError());
 }
 void minimax_index_select(const float* scores, const int64_t* pos, int rows, int heads, int blocks,
