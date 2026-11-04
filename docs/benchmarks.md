@@ -319,7 +319,7 @@ a row exactly.
 | Thinking | Disabled where supported; full GLM-5.3 uses its reasoning mode | Server default |
 | Cold-prefill thinking | Disabled where supported; GLM and MiniMax probes use the recorded server default | Server default |
 | Prefix cache | Enabled; repetitions reuse prompts | Enabled; first request must report zero cached tokens |
-| Concurrency | C1/C2/C4/C8; mode comparisons use C1 | C1 |
+| Concurrency | C1/C2/C4/C8, plus C16 on 16-slot templates; mode comparisons use C1 | C1 |
 | Summary | Range across five class medians | Median across three requests; cold prefill is the first request |
 
 - Each concurrency phase uses distinct prompts. Different concurrency levels use different subsets of the same class corpus.
@@ -334,7 +334,7 @@ One template, measured as shipped on the bench port, yields every row the tables
 
 | Table | Measurement | Client |
 |---|---|---|
-| Decode throughput by concurrency; request wall throughput; single-request decode by class | C1/C2/C4/C8 over the five prompt classes, three repetitions, 256 tokens; the engine's decode-only rate and the wall rate per phase | `timed_load.py` |
+| Decode throughput by concurrency; request wall throughput; single-request decode by class | C1/C2/C4/C8, plus C16 on 16-slot templates, over the five prompt classes, three repetitions, 256 tokens; the engine's decode-only rate and the wall rate per phase | `timed_load.py` |
 | Cold prefill | 512 / 2K / 8K / 32K, three distinct uncached prefixes each, thinking off where supported; otherwise the recorded template default | `serve_prefill_probe.py` |
 | Long context (decode at context, prefill per bucket) | 0 / 32K / 64K / 128K / 256K / 512K parcel documents: one cold request, two identical | `serve_context_matrix.py` |
 | Quality | the 300-item HumanEval / GSM8K / extraction set at the deployment's slot count; a response cut at the standard cap is asked once more at the 8,192 retry cap (counted in its own column, never scored) | `serve_eval.py` |
