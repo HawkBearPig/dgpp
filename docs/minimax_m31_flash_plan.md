@@ -986,3 +986,29 @@ the tower again, while eviction, changed geometry and changed later frames
 recompute the correct results. All 21 selected CTest cases, the unit suite and
 CUDA memcheck pass. Distributed comparisons of this cache-enabled build remain
 required before publishing its performance.
+
+The cache-enabled plain TP4 server (`db30ca46`, SHA-256
+`9e599ae59e1558f882dd4db0a63d9753bcd409b26df67dac41b2b4b18723d162`)
+passes the video cases at concurrency one and four, the cache/streaming checks
+and six still-image cases. Choices and token counts match the earlier binary
+exactly. All ranks report zero swap before and after and identical operation
+streams. The same check with DSpark is pending.
+
+### Fixed-order reference controls
+
+The independent Triton controls now cover normalization, FP32 routing,
+activation, exact global-scale division, fused expert accumulation, index
+scoring and selected-block attention, in addition to matrix projections.
+They deliberately fix the native baseline's arithmetic order while using
+independently decoded contiguous checkpoint tensors. Separate self-tests check
+FP64 error bounds, causal and block boundaries, and exact invariance to query
+or matrix row batching. They load no dgpp kernels.
+
+On the recorded 1,601-token prefix, fixing normalization and feed-forward
+arithmetic makes those stages bit-exact at all six diagnostic layers; attention
+still differs. Fixing attention order then makes **every recorded value in all
+four sublayer stages bit-exact** at these six layers, with exact expert choices.
+This identifies rounding order as the source of those local discrepancies.
+The unrestricted PyTorch reference is retained unchanged as the default;
+the full-corpus fixed-order comparison and task-quality gates remain required.
+Partial checks record `complete: false` and never produce trajectory scores.

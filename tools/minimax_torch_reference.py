@@ -26,7 +26,7 @@ from minimax_reference_dump import FP4, FP8, Weights
 
 class Reference:
     def __init__(self, checkpoint, world, rounded_residual, projection_rows=0, projection_backend='cublas',
-                 elementwise_backend='torch'):
+                 elementwise_backend='torch', attention_backend='torch'):
         self.w = Weights(checkpoint)
         self.c = json.loads((checkpoint / 'config.json').read_text())['text_config']
         self.world = world
@@ -34,6 +34,7 @@ class Reference:
         self.projection_rows = projection_rows
         self.projection_backend = projection_backend
         self.elementwise_backend = elementwise_backend
+        self.attention_backend = attention_backend
         self.config_sha256 = hashlib.sha256((checkpoint/'config.json').read_bytes()).hexdigest()
         self.checkpoint = str(checkpoint.resolve())
         self.fp8 = torch.tensor(FP8, device='cuda')
@@ -140,6 +141,12 @@ class Reference:
             return self.rotary(self.norm(y,p+name+'_norm')) if normalized else y
         q,k,v = proj('q',qh),proj('k',kh),proj('v',kh,False)
         iq,ik = proj('index_q',ih),proj('index_k',1)
+        if self.attention_backend == 'triton-fixed':
+            from minimax_reference_attention import attention, select_blocks
+            positions = torch.arange(t, device='cuda', dtype=torch.int64)
+            selected = select_blocks(iq, ik, positions, topk)
+            out = attention(q, k, v, selected, positions)
+            return self.fold(self.parts(out.flatten(1),p+'o_proj'))
         out = torch.empty_like(q)
         blocks = (t+127)//128
         positions = torch.arange(t,device='cuda')
@@ -274,7 +281,8 @@ class Reference:
         output.mkdir(parents=True, exist_ok=True)
         (output/'stages.json').write_text(json.dumps(dict(metrics=metrics, failures=failures,
             layers_checked=layers,layers_total=total_layers,complete=layers==total_layers,
-            projection_backend=self.projection_backend,elementwise_backend=self.elementwise_backend), indent=2)+'\n')
+            projection_backend=self.projection_backend,elementwise_backend=self.elementwise_backend,
+            attention_backend=self.attention_backend), indent=2)+'\n')
         if failures:
             raise AssertionError('\n'.join(failures))
         print(f'Isolated sublayer checks passed for {layers}/{total_layers} layers; this is not a full-trajectory quality verdict.', flush=True)
@@ -323,6 +331,7 @@ class Reference:
             (folder/'metadata.json').write_text(json.dumps(dict(world=self.world,ids=case['ids'],rounded_residual=self.rounded_residual,
                 projection_rows=self.projection_rows,
                 projection_backend=self.projection_backend,elementwise_backend=self.elementwise_backend,
+                attention_backend=self.attention_backend,
                 rope_inv_freq='cuda-fp32',
                 score_from=score_from,
                 backend='pytorch independent FP32 attention', torch_version=torch.__version__,
@@ -360,13 +369,14 @@ def main():
     p.add_argument('--projection-rows',type=int,default=0,help='reference reduction control: cap rows per cuBLAS projection (0: full)')
     p.add_argument('--projection-backend',choices=['cublas','triton-fixed'],default='cublas',help='fixed 16-term tensor-core reductions or cuBLAS algorithm dispatch')
     p.add_argument('--elementwise-backend',choices=['torch','triton-fixed'],default='torch',help='diagnostic: fixed FP32 norm/router reductions and activation arithmetic')
+    p.add_argument('--attention-backend',choices=['torch','triton-fixed'],default='torch',help='diagnostic: fixed scalar QK/index dots, online softmax and FP32 PV accumulation')
     p.add_argument('--check-layers',type=int,default=0,help='diagnostic: check only the first N recorded layers (0: all); never produces trajectory scores')
     args = p.parse_args()
     if args.projection_rows < 0:
         p.error('--projection-rows must be nonnegative')
     if args.check_layers < 0 or (args.check_layers and not args.check_engine_dir):
         p.error('--check-layers must be nonnegative and requires --check-engine-dir')
-    reference = Reference(args.checkpoint_dir,args.world,args.rounded_residual,args.projection_rows,args.projection_backend,args.elementwise_backend)
+    reference = Reference(args.checkpoint_dir,args.world,args.rounded_residual,args.projection_rows,args.projection_backend,args.elementwise_backend,args.attention_backend)
     if args.check_engine_dir:
         with torch.inference_mode():
             reference.check_stages(args.check_engine_dir,args.output,args.check_layers)
