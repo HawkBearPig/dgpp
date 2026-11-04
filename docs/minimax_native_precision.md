@@ -102,3 +102,25 @@ invariance within each formula. At 1, 129, 270 and 2,057 keys, both formulas
 match their upstream CPU references exactly. They deliberately produce
 different outputs from each other. GPU quantizer/kernel and full-model
 validation are still pending.
+
+## Initial GB10 projection kernel validation
+
+The new `mxfp8_gemm` kernel uses SM121's block-scaled E4M3 tensor-core
+instruction with 32-value E8M0 groups. Its quantizer matches the actual
+pinned SGLang Triton producer byte for byte on all 65,280 finite BF16 bit
+patterns and another 18,528 inputs around scale-exponent boundaries, with
+padded row strides and a partial final quantizer tile. Both payloads and
+scales are compared; no tolerance is used for this check.
+
+Four matrix cases cover 1 through 65 rows, incomplete output tiles and
+reduction lengths through 6,144. They pass independent FP64 forward-error
+bounds; the largest relative RMS error is `3.09e-6`. BF16 outputs are exactly
+the rounding of FP32 outputs. Splitting the same queries into 1-, 8- and
+17-row calls preserves every FP32 output bit. The warnings-as-errors build,
+CUDA memcheck and racecheck pass, with zero errors or hazards.
+
+These are isolated kernel checks. The kernels are not yet connected to the
+model's serving path, and full-model native fidelity, throughput and final
+deployment selection remain pending. Reproduce the upstream quantizer check
+with `tools/minimax_mxfp8_quantization_check.py`, providing the built
+`mxfp8_gemm_test`, the pinned SGLang source and an untracked output directory.

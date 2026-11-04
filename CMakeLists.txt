@@ -167,6 +167,7 @@ add_library(dgpp_kernels STATIC
   src/kernels/dsa.cu
   src/kernels/fp8_dequant.cu
   src/kernels/fp8_gemm.cu
+  src/kernels/mxfp8_gemm.cu
   src/kernels/fp8w_gemm.cu
   src/kernels/fp4w_gemm.cu
   src/kernels/fp8_per_tensor.cu
@@ -2536,6 +2537,12 @@ set_tests_properties(glm_pick_test PROPERTIES SKIP_RETURN_CODE 2)
 
 # MoE module parity (M4): router vs oracle at real geometry, expert path on
 # small geometry, swiglu clamps, accumulation order, determinism.
+add_executable(mxfp8_gemm_test tests/cuda/mxfp8_gemm_test.cu)
+target_link_libraries(mxfp8_gemm_test PRIVATE dgpp_kernels CUDA::cudart)
+dgpp_set_common(mxfp8_gemm_test)
+add_test(NAME mxfp8_gemm_test COMMAND mxfp8_gemm_test)
+set_tests_properties(mxfp8_gemm_test PROPERTIES SKIP_RETURN_CODE 2 LABELS "cuda")
+
 add_executable(moe_w4a4_test tests/cuda/moe_w4a4_test.cu)
 target_include_directories(moe_w4a4_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(moe_w4a4_test PRIVATE dgpp_models_glm_loader dgpp_models_glm CUDA::cudart)
