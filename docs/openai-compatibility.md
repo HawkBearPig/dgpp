@@ -41,6 +41,9 @@ to no entry and publishes none, in memory or on NVMe. It prefills along the
 same structural cuts a cached prompt does: opting out changes what is kept,
 not the arithmetic.
 
+Both completion endpoints reject duplicate top-level request fields with
+HTTP 400 naming the field, including repeated fields whose values are null.
+
 Both completion endpoints accept `prompt_cache_key` (OpenAI's field, DGPP's
 semantics): a string of 1 to 256 bytes that pins the prefix-cache entries the
 request creates or attaches to, in memory and in the NVMe cache: unpinned

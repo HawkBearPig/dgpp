@@ -4436,6 +4436,54 @@ DGPP_TEST(serve_promptLogprobs_nullAndOmissionPreserveGeneratedLogprobs) {
   }
 }
 
+DGPP_TEST(serve_parameters_duplicateFieldsRejectBeforeGeneration) {
+  ServiceRig rig(8, model_defaults(), true);
+  for (bool chat : {false, true}) {
+    for (bool stream : {false, true}) {
+      Client client(rig.port());
+      const auto post = [&](const std::string& extra) {
+        const std::string options = extra + (stream ? ",\"stream\":true" : "");
+        const std::string body = chat ? chat_body("abcd", 2, options)
+                                      : "{\"model\":\"" + kModel +
+                                            "\",\"prompt\":\"abcd\",\"max_tokens\":2" + options +
+                                            "}";
+        client.send_all(
+            std::string("POST ") + (chat ? "/v1/chat/completions" : "/v1/completions") +
+            " HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\nContent-Length: " +
+            std::to_string(body.size()) + "\r\n\r\n" + body);
+        return client.read_response(5000);
+      };
+      const size_t armed = rig.engine.armed().size();
+      const auto admitted = rig.service.stats().requests_total;
+      for (const auto& [extra, param] :
+           {std::pair{R"(,"prompt_logprobs":null,"prompt_logprobs":0)", "prompt_logprobs"},
+            std::pair{R"(,"prompt_logprobs":0,"prompt_logprobs":null)", "prompt_logprobs"},
+            std::pair{R"(,"prompt_logprobs":null,"prompt_logprobs":null)", "prompt_logprobs"},
+            std::pair{R"(,"prompt_logprobs":null,"\u0070rompt_logprobs":1)", "prompt_logprobs"},
+            std::pair{R"(,"max_tokens":3)", "max_tokens"},
+            std::pair{R"(,"model":"glm-5.3-flash-fp8")", "model"},
+            std::pair{R"(,"logprobs":null,"logprobs":1)", "logprobs"},
+            std::pair{R"(,"client_extension":null,"client_extension":{})", "client_extension"}}) {
+        const auto response = post(extra);
+        expect_invalid_request(response, param);
+        require(response.find("text/event-stream") == std::string::npos,
+                "duplicate fields never start SSE");
+        if (!chat)
+          require(response.find("\"code\":\"invalid_parameter\"") != std::string::npos,
+                  "legacy duplicate fields use the invalid_parameter code");
+      }
+      require(rig.engine.armed().size() == armed && rig.service.stats().requests_total == admitted,
+              "duplicate fields never reach admission or generation");
+      const auto response =
+          post(std::string(R"(,"prompt_logprobs":null,"logprobs":)") + (chat ? "true" : "1"));
+      require(response.starts_with("HTTP/1.1 200 OK") &&
+                  response.find(chat ? "\"logprob\":-0.25" : "\"token_logprobs\":[-0.25") !=
+                      std::string::npos,
+              "the same connection still serves valid null and generated logprobs after refusals");
+    }
+  }
+}
+
 // A one-shot chat read through the usage object's last key.
 std::string post_full(ServiceRig& rig, const std::string& body) {
   return post_chat(rig, body, "reasoning_tokens\":", 5000);

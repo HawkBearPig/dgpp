@@ -2489,6 +2489,14 @@ void GenerationService::prepare_completions(const HttpRequest& req,
                   "invalid_request_error", "model", "model_not_found");
     return;
   }
+  std::unordered_set<std::string> seen;
+  for (const auto& m : body.members()) {
+    if (!seen.insert(m.key).second) {
+      respond_error(w, 400, "duplicate request parameter", "invalid_request_error", m.key,
+                    "invalid_parameter");
+      return;
+    }
+  }
   const dgpp::minijson::Value* prompt = body.find("prompt");
   if (prompt == nullptr || !prompt->is_string()) {
     respond_error(w, 400,
