@@ -197,7 +197,9 @@ def main():
                         field = "content" if submitted[-2]["content"] else "reasoning_content"
                         submitted[-2][field] = submitted[-2][field][:-96]
                     elif variant == "edited_prompt":
-                        submitted[0]["content"] = "A completely different system instruction."
+                        # Keep the early prefix unique across rounds and
+                        # completion/cancellation cases so this control is cold.
+                        submitted[0]["content"] = f"{tag}-edited. A completely different system instruction."
                     hot = probe.chat(submitted, 32)
                     cold = probe.chat(submitted, 32, cache=False)
                     case["replays"].append({"variant": variant, "messages": submitted, "hot": hot, "cold": cold})

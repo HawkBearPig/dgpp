@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
 """Check interrupted SSE delivery and drain accounting over real loopback HTTP."""
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stdout
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import io
 import json
 from pathlib import Path
 import sys
+import tempfile
 import threading
 import time
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 from serve_cancel_prefix_check import Probe, assistant, compare
+import serve_cancel_prefix_check as check
 
 
 @contextmanager
@@ -94,6 +98,48 @@ def fixture(always_on=False):
 
 
 class CancellationProbeTest(unittest.TestCase):
+    def test_edited_controls_stay_cold_across_completed_and_cancelled_rounds(self):
+        class PrefixProbe:
+            model = "fixture"
+
+            def __init__(self, *args, **kwargs):
+                self.prefixes = set()
+                self.close_entries = 0
+
+            def chat(self, messages, max_tokens, *, cache=True, cancel_deltas=0, ignore_eos=False):
+                # The cache legitimately shares the system and user prefix
+                # even when the delivered assistant answers differ.
+                key = json.dumps(messages[:2], sort_keys=True)
+                saved = 1500 if cache and key in self.prefixes else 0
+                before = self.close_entries
+                if cache:
+                    self.prefixes.add(key)
+                    self.close_entries += 1
+                return {"content": "Observation " * 64, "reasoning_content": "",
+                        "finish": "length", "cancelled": bool(cancel_deltas),
+                        "usage": {"prompt_tokens": 2000, "completion_tokens": 128,
+                                  "prompt_tokens_details": {"cached_tokens": saved}},
+                        "engine": {"prompt_tokens": 2000, "prompt_tokens_computed": 2000 - saved},
+                        "before": {"prefix_cache": {"close_entries": before}},
+                        "after": {"prefix_cache": {"close_entries": self.close_entries}}}
+
+        with tempfile.TemporaryDirectory() as temporary:
+            report_path = Path(temporary) / "report.json"
+            argv = ["serve_cancel_prefix_check.py", "--url", "http://fixture:18081",
+                    "--out", str(report_path), "--source-revision", "fixture",
+                    "--binary-sha256", "fixture", "--rounds", "2", "--thinking"]
+            with patch.object(check, "Probe", PrefixProbe), patch.object(sys, "argv", argv), \
+                    redirect_stdout(io.StringIO()):
+                check.main()
+            report = json.loads(report_path.read_text())
+        self.assertTrue(report["passed"])
+        self.assertEqual(len(report["cases"]), 4)
+        edited = [replay for case in report["cases"] for replay in case["replays"]
+                  if replay["variant"] == "edited_prompt"]
+        self.assertEqual(len({json.dumps(replay["messages"][:2]) for replay in edited}), 4)
+        self.assertTrue(all(replay["hot"]["usage"]["prompt_tokens_details"]["cached_tokens"] == 0
+                            for replay in edited))
+
     def test_disconnect_preserves_exact_delivered_history_and_waits_for_retirement(self):
         with fixture() as probe:
             result = probe.chat([{"role": "user", "content": "hello"}], 40, cancel_deltas=3)
