@@ -829,3 +829,30 @@ Compute Sanitizer reports zero memory errors for the new kernels and
 image-prefill/session regression, and zero race hazards for the tiled
 encoder fixture. The PDL audit covers all 397 kernels, and documentation
 checks pass.
+
+Source `e96ea4ec`, server SHA-256
+`d1499a8397b3fdb117c8072c45d5c912cfb7c039c602ff79483455b2f50b3d2b`,
+passes four-rank still-image integration with both plain decoding and the
+seven-proposal DSpark drafter. Six fixed cases cover color, image ordering,
+a chunk-crossing large image, four-digit OCR and left/right layout. Complete
+choices, including reasoning and finish reason, plus prompt/completion token
+counts match exactly across plain/speculative execution and C1/C4.
+The general vision API suite passes for streaming, multiple choices,
+large images and concurrent isolation.
+
+Both modes pass the full prefix-cache suite with a 65,536-token KV pool and
+2 GiB cache budget: changed pixels miss, continuations and appended images
+reuse the correct prefix, cached and cache-disabled answers agree, and
+24-image histories exceed 14,000 prompt tokens. The plain history reuses
+14,439 of 14,442 prompt tokens; the speculative run reuses 14,436 of 14,439
+(the cache-test UUID changes tokenization between runs). Earlier prompts
+remain reusable concurrently. A preliminary 32,768-token pool evicted those
+earlier entries during the long cache-disabled control and therefore failed
+the final retained-hit assertion; the 65,536-token rerun supplies the
+required working-set capacity without changing that assertion.
+
+All ranks have zero swap before and after both 65,536-token worlds and the
+same executable hash. Operation streams match at
+`e22f0665393a2178ab90e4a3c5b63dca` (plain) and
+`e11d9bbe2a3a386e5f3a029e735f9103` (DSpark). These are correctness probes,
+not published throughput measurements.
