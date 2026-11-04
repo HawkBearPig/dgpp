@@ -1572,8 +1572,7 @@ bool GenerationService::parse_chat(const dgpp::minijson::Value& body,
       // GLM-5.3-Flash's never does — thinking is always on there.
       if (!frontend_->template_reads("enable_thinking"))
         return refuse(
-            "this template has no enable_thinking knob — thinking is always "
-            "on (the generation prompt opens <think>); use reasoning_effort",
+            "this template has no enable_thinking knob; use reasoning_effort",
             where, "unsupported_parameter");
       if (!m.value.is_bool()) return refuse(where + " must be a boolean", where);
       extra.push_back(m);
@@ -1583,8 +1582,7 @@ bool GenerationService::parse_chat(const dgpp::minijson::Value& body,
       // for that stack turns thinking off here too.
       if (!frontend_->template_reads("enable_thinking"))
         return refuse(
-            "this template has no thinking knob — thinking is always on "
-            "(the generation prompt opens <think>); use reasoning_effort",
+            "this template has no thinking knob; use reasoning_effort",
             where, "unsupported_parameter");
       if (!m.value.is_bool()) return refuse(where + " must be a boolean", where);
       Member alias = m;

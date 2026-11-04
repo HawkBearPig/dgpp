@@ -8,7 +8,7 @@ The document/tool extensions follow the official guides for
 [custom tools](https://developers.openai.com/api/docs/guides/function-calling),
 and [Structured Outputs](https://developers.openai.com/api/docs/guides/structured-outputs).
 
-DGPP implements text, document and GLM-5.3-Flash image inputs, function tools
+DGPP implements text, document, image and supported video inputs, function tools
 and custom tools through Chat Completions.
 It is not an implementation of every OpenAI platform feature. Features depend
 on the checkpoint, tokenizer and engine; `/v1/models` reports DGPP capability
@@ -19,7 +19,7 @@ extensions. Model sampling defaults come from the checkpoint configuration.
 | Surface | DGPP behavior |
 | --- | --- |
 | `POST /v1/chat/completions` | One-shot JSON or SSE with stable completion ID, model, timestamp, indexed choices, finish reason and usage. |
-| Messages | Developer, system, user, assistant and tool roles; text strings, text parts and user file/image parts when supported; assistant function/custom-tool history and refusal text. Developer instructions map to the checkpoint's system role. Standard tool results require `tool_call_id`; text parts are joined in order. |
+| Messages | Developer, system, user, assistant and tool roles; text strings, text parts and user file/image/video parts when supported; assistant function/custom-tool history and refusal text. Roles are rendered through the checkpoint's template. Standard tool results require `tool_call_id`; text parts are joined in order. |
 | Limits | `max_completion_tokens` or legacy `max_tokens`, including generated reasoning tokens; send one. Positive integers up to the implementation's 32-bit bound, further limited by KV capacity. `n` accepts 1–128, subject to admission capacity. `/v1/models` reports the resulting number: `context.request_limit_tokens` (the lesser of the model's positional ceiling and the K/V pool), with `position_ceiling_tokens`, `kv_pool_tokens` and `limited_by` beside it, and `rope_scaling` while an `engine.rope_scaling` ramp is in force. |
 | Sampling | Temperature, top-p, presence/frequency penalties, signed 64-bit seed, logit bias, and logprobs when supported by the engine. `top_p: 0` selects the highest-probability candidate. Nullable standard options treat null as omitted. |
 | Stops | One to four nonempty stop strings, removed from visible content. Usage still counts the generated tokens that completed the match. |
@@ -28,8 +28,8 @@ extensions. Model sampling defaults come from the checkpoint configuration.
 | Logprobs | Content token entries with token text, original bytes, probability and requested alternatives (0–20); `refusal: null`. Hidden reasoning, successful tool-call syntax, EOS and wholly suppressed stop tokens are excluded. Malformed tool blocks that become visible text retain their logprobs. A token overlapping a stop boundary still describes the actual sampled token. |
 | Reasoning | `none/minimal/low/medium/high/xhigh/max` resolve through the model frontend into native effort and/or thinking switches. Unsupported settings and conflicting explicit switches return errors. `/v1/models` exposes `reasoning.effort_mapping`. `reasoning_content` and template switches are DGPP extensions. |
 | Request metadata | `store: false` (or omitted/null), text modality, bounded metadata, user and safety identifier accepted. Metadata is echoed on one-shot responses but not persisted. User/safety identifiers do not invoke an OpenAI safety or account service. `service_tier: auto/default` reports the actual `default` tier. |
-| Image inputs | GLM-5.3-Flash user messages accept `image_url` parts containing PNG/JPEG/WebP data URIs. `/v1/models` reports `input_modalities`. See [image inputs](vision.md) for budgets and caching behavior. |
-| Unsupported features | Stored-completion CRUD and `store: true`; remote image URLs, video/audio inputs and audio outputs; web search; predicted output; moderation configuration; explicit cache breakpoints/TTL/retention controls; verbosity; deprecated function-call API. Known unsupported API features return an error naming the field. |
+| Image and video inputs | Compatible frontends accept `image_url` parts containing PNG/JPEG/WebP data URIs. MiniMax M3.1 Flash also accepts inline MP4/WebM `video_url` parts when built with FFmpeg. `/v1/models` reports `input_modalities`. See [image and video inputs](vision.md) for families, budgets and caching behavior. |
+| Unsupported features | Stored-completion CRUD and `store: true`; remote media URLs, audio inputs and audio outputs; video on frontends without that modality; web search; predicted output; moderation configuration; explicit cache breakpoints/TTL/retention controls; verbosity; deprecated function-call API. Known unsupported API features return an error naming the field. |
 
 DGPP also accepts existing extensions: `top_k`, `min_p`,
 `repetition_penalty`, `prefix_cache`, `chat_template_kwargs`, object-valued
@@ -208,6 +208,7 @@ Grammar formats require an engine with constrained decoding.
 | GLM effort-aware templates | minimal/low → low; medium/high → high; xhigh/max → max. `none` requires a native thinking switch and is rejected when thinking is always on. |
 | Qwen effort-aware templates | minimal/low → low; medium → medium; high/xhigh/max → xhigh; none → `enable_thinking: false`. |
 | DeepSeek-V4.1 | none → chat mode; minimal/low/medium/high/xhigh/max → native budgets 25/50/62/75/100/100. |
+| MiniMax M3.1 | minimal/low → low; medium → medium; high → high; xhigh/max → max. Thinking is adaptive. `none` and explicit thinking switches are unsupported. |
 | Templates with only a thinking switch | none disables thinking; positive efforts enable it without inventing additional budget levels. |
 
 Explicit `thinking`/`enable_thinking` settings must agree with

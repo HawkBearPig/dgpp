@@ -440,7 +440,8 @@ ClusterConfig parse_cluster_config(const std::string& json, const std::string& w
         } else if (p.key == "mtp_schedule_lambda") {
           e.mtp_schedule_lambda = number(x, ek, what);
           if (!(e.mtp_schedule_lambda >= 0.0)) fail(what, "'" + ek + "' must be >= 0 (0: the reservation rate)");
-        } else if (p.key == "mtp_schedule_min_depth") e.mtp_schedule_min_depth = static_cast<int>(integer(x, ek, what, 1, 5));
+        } else if (p.key == "mtp_schedule_min_depth")
+          e.mtp_schedule_min_depth = static_cast<int>(integer(x, ek, what, 1, 7));
         else if (p.key == "mtp_schedule_options") e.mtp_schedule_options = static_cast<int>(integer(x, ek, what, 0, 6));
         else if (p.key == "mtp_schedule_adapt") e.mtp_schedule_adapt = boolean(x, ek, what);
         else if (p.key == "mtp_schedule_sampled_scale") {

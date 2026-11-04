@@ -1,5 +1,16 @@
 # DGPP implementation status
 
+MiniMax M3.1 Flash is implemented on the shared engine with its published
+NVFP4/MXFP8 weights, BF16 activations and caches, seven-proposal DSpark,
+recursive tools, images and native video. All six independent fixed-order
+text corpus checks pass across 28,329 scored positions with no argmax changes;
+distributed media, cache and batch-isolation checks pass. Tested activation
+quantization recipes fail the unchanged numerical gates and are rejected.
+Release validation still requires the large-pool, task-quality, long-context
+and full-suite checks, followed by the final tuned-template campaign. See
+the [implementation record](docs/minimax_m31_flash_plan.md) and
+[deployment notes](docs/model_cards/MiniMax-M3.1-Flash.md).
+
 NVMe slab startup acquires its exclusive lock before truncation. Duplicate-open
 regressions check size and content preservation for fresh persistent and
 nonpersistent slabs, then verify that both modes clear stale contents after

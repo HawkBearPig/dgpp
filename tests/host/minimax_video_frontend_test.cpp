@@ -41,8 +41,41 @@ void pixels(const dgpp::ImageInput& im, const std::vector<int>& selected) {
 }  // namespace
 int main(int argc, char** argv) {
   if (argc != 2) return 1;
-  if (!dgpp::serve::native_video_available()) return 2;
   try {
+    if (!dgpp::serve::native_video_available()) {
+      const auto unavailable = [](auto&& call, std::string_view param, std::string_view message) {
+        try {
+          call();
+        } catch (const dgpp::serve::ImageInputError& error) {
+          require(error.param == param &&
+                      std::string_view(error.what()).find(message) != std::string_view::npos,
+                  "disabled video must identify the unsupported field and build capability");
+          return;
+        }
+        throw std::runtime_error("video accepted without decoder support");
+      };
+      const auto clip = source("data:video/mp4;base64,AAAA", 1);
+      unavailable([&] { dgpp::serve::prepare_minimax_video(clip, "video_url"); }, "video_url",
+                  "DGPP_ENABLE_VIDEO");
+      std::string error;
+      const auto checkpoint = dgpp::hf::model_dir("MiniMaxAI/MiniMax-M3.1-Flash", &error);
+      if (!checkpoint.empty()) {
+        const auto tok = dgpp::text::Tokenizer::load(checkpoint + "/tokenizer.json");
+        const auto tpl = dgpp::text::ChatTemplate::load(checkpoint + "/chat_template.jinja");
+        dgpp::serve::MinimaxVisionFrontend frontend(&tok, &tpl, {200029, 200025, 200030});
+        require(!frontend.supports_video(), "disabled decoder must not advertise video");
+        const auto globals = V::make_object(
+            {{"messages",
+              V::make_array({V::make_object(
+                  {{"role", V::make_string("user")},
+                   {"content", V::make_array({V::make_object({{"type", V::make_string("video_url")},
+                                                              {"video_url", clip}})})}})})}});
+        unavailable([&] { frontend.prepare_chat(globals); }, "messages[0].content[0].video_url",
+                    "does not support video");
+      }
+      std::cout << "Disabled video decoder and capability checks passed\n";
+      return 0;
+    }
     std::string mp4;
     for (const auto* extension : {"mp4", "webm"}) {
       std::ifstream file(std::string(argv[1]) + "/minimax_video_10frames." + extension,

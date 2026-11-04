@@ -517,6 +517,8 @@ DGPP_TEST(cluster_config_refusesUnknownKeysAndBadValuesByName) {
        "'engine.mtp' must be true or false"},
       {R"({"model":"m","nodes":["h"],"engine":{"mtp_depth":8}})",
        "'engine.mtp_depth' must be in [1, 7]"},
+      {R"({"model":"m","nodes":["h"],"engine":{"mtp_schedule_min_depth":8}})",
+       "'engine.mtp_schedule_min_depth' must be in [1, 7]"},
       {R"({"model":"m","nodes":["h"],"engine":{"dflash_depth":8}})",
        "'engine.dflash_depth' must be in [0, 7]"},
       {R"({"model":"m","nodes":["h"],"engine":{"dflash_verify_graph":"yes"}})",
@@ -915,7 +917,11 @@ DGPP_TEST(cluster_config_parses_nvme_cache) {
 
 DGPP_TEST(cluster_config_accepts_seven_draft_block) {
   const auto c = dgpp::serve::parse_cluster_config(
-      engine_json(R"({"mtp":true,"decode_graph":true,"mtp_depth":7})"), "MiniMax DSpark");
+      engine_json(
+          R"({"mtp":true,"decode_graph":true,"mtp_depth":7,"mtp_schedule":true,"mtp_schedule_min_depth":6})"),
+      "MiniMax DSpark");
   require(c.engine.mtp && c.engine.mtp_depth_set && c.engine.mtp_depth == 7,
           "the seven-proposal MiniMax block must survive deployment parsing");
+  require(c.engine.mtp_schedule && c.engine.mtp_schedule_min_depth == 6,
+          "the MiniMax schedule must accept a six-draft minimum");
 }
