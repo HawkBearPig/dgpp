@@ -10,6 +10,7 @@
 #include "kernels/minimax.hpp"
 #include "kernels/mma_gemv.hpp"
 #include "kernels/qwen_norm.hpp"
+#include "kernels/qwen_vision.hpp"
 #include "models/minimax/dspark.hpp"
 
 namespace dgpp {
@@ -152,6 +153,8 @@ MinimaxModel::MinimaxModel(const MinimaxConfig& c, const std::string& checkpoint
     df_.init(host, *c.dspark,
              load_minimax_dspark(*c.dspark, checkpoint + "/dspark", stream_, rank, world));
   }
+  request_images_.resize(slots, nullptr);
+  if (c.vision) vision_ = std::make_unique<MinimaxVisionEncoder>(*c.vision, checkpoint, stream_);
   DGPP_CUDA_OK(cudaStreamSynchronize(stream_));
 }
 MinimaxModel::~MinimaxModel() {
@@ -183,6 +186,11 @@ MinimaxModel::MemoryPlan MinimaxModel::plan_memory(const MinimaxConfig& c, int t
   const size_t H = c.hidden_size, V = g.lm_vocab_count, T = t;
   MemoryPlan plan;
   plan.context_tokens = std::min<int64_t>(cap, c.max_position_embeddings);
+  if (c.vision) {
+    plan.add("vision tower weights (BF16 and FP32, replicated)", c.vision->weight_bytes());
+    plan.add("vision workspace (patches, attention tiles, projected rows)",
+             c.vision->workspace_bytes());
+  }
   if (residency == LoaderResidency::Resident) {
     size_t weights = MinimaxLayerStream::resident_bytes(c, rank, world, head, false);
     if (Bf12Companions::packed_only())
@@ -269,6 +277,7 @@ MinimaxModel::Outputs MinimaxModel::run_rows(const RowRun& run) {
   const int T = run.T, H = cfg_.hidden_size, K = cfg_.num_experts_per_tok;
   const auto in = begin_run(run);
   embed_gather_bf16(globals_.embed, in.tokens, resid_, T, H, stream_);
+  apply_image_embeddings(resid_, run);
   Outputs out;
   const uint16_t* pending = nullptr;
   const bool traces = route_traces_ && !run.capture && (!run.decode || decode_row_traces_);

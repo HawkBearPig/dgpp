@@ -21,7 +21,7 @@ struct VisionSpec {
 class VisionFrontend : public TextFrontend {
  public:
   VisionFrontend(const dgpp::text::Tokenizer* tok, const dgpp::text::ChatTemplate* tpl,
-                 VisionSpec spec);
+                 VisionSpec spec, bool model_opens_thinking = false);
   bool supports_images() const override { return true; }
   ChatInput prepare_chat(const minijson::Value& globals) const override;
   const VisionSpec& spec() const { return spec_; }

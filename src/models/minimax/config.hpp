@@ -2,10 +2,12 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
 #include "loaders/minijson.hpp"
+#include "models/minimax/vision_config.hpp"
 
 namespace dgpp {
 struct DFlash2Config;
@@ -14,6 +16,7 @@ struct DFlash2Config;
 // Dimensions remain configurable for binding-generated forward fixtures.
 struct MinimaxConfig {
   std::shared_ptr<const DFlash2Config> dspark;
+  std::optional<MinimaxVisionConfig> vision;
   int hidden_size = 6144;
   int vocab_size = 200064;
   std::vector<int64_t> eos_token_ids = {200020};

@@ -4,8 +4,9 @@
 
 namespace dgpp::serve {
 VisionFrontend::VisionFrontend(const dgpp::text::Tokenizer* tok,
-                               const dgpp::text::ChatTemplate* tpl, VisionSpec spec)
-    : TextFrontend(tok, tpl), spec_(std::move(spec)) {
+                               const dgpp::text::ChatTemplate* tpl, VisionSpec spec,
+                               bool model_opens_thinking)
+    : TextFrontend(tok, tpl, model_opens_thinking), spec_(std::move(spec)) {
   const auto single = [&](const std::string& text, int64_t id, const char* what) {
     const auto ids = encode_text(text);
     if (ids.size() != 1 || ids.front() != id)

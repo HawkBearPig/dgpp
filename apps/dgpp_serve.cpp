@@ -111,6 +111,7 @@
 #include "serve/generation_service.hpp"
 #include "serve/glm_vision_frontend.hpp"
 #include "serve/http_server.hpp"
+#include "serve/minimax_vision_frontend.hpp"
 #include "serve/nvme_cache_check.hpp"
 #include "serve/prefill_policy.hpp"
 #include "serve/qwen_vision_frontend.hpp"
@@ -1518,6 +1519,8 @@ int serve_openai(dgpp::sched::SchedulerEngine* engine, int64_t vocab_size,
         vision_frontend = std::make_unique<dgpp::serve::GlmVisionFrontend>(&tok, &*tpl, ids);
       else if (family_name == "qwen4_exp" || family_name == "qwen3_5")
         vision_frontend = std::make_unique<dgpp::serve::QwenVisionFrontend>(&tok, &*tpl, ids);
+      else if (family_name == "minimax_m3")
+        vision_frontend = std::make_unique<dgpp::serve::MinimaxVisionFrontend>(&tok, &*tpl, ids);
     }
     frontend = vision_frontend ? std::move(vision_frontend)
                                : std::make_unique<dgpp::serve::TextFrontend>(&tok, &*tpl, model_opens_thinking);

@@ -124,6 +124,8 @@ MinimaxConfig MinimaxConfig::parse(const V& root) {
       blocks.items()[0].as_int() != 1 || blocks.items()[1].as_int() != 32)
     bad("weight_block_size", "MXFP8 requires [1,32]");
   c.validate();
+  if (const auto* v = root.find("vision_config"); v && !v->is_null())
+    c.vision = MinimaxVisionConfig::parse(root, c.hidden_size, c.vocab_size);
   return c;
 }
 

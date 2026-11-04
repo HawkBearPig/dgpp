@@ -12,6 +12,7 @@
 #include "kernels/latent_format.hpp"
 #include "models/dflash2/drafter.hpp"
 #include "models/minimax/layers.hpp"
+#include "models/minimax/vision.hpp"
 
 namespace dgpp {
 class MinimaxModel : public SessionModel<MinimaxModel> {
@@ -43,6 +44,35 @@ class MinimaxModel : public SessionModel<MinimaxModel> {
                                       bool mtp = false);
   int64_t prefill_group_span_limit() const { return max_tokens_; }
   const MinimaxConfig& config() const { return cfg_; }
+  bool supports_images() const { return vision_ != nullptr; }
+  ImageTokens image_tokens() const { return cfg_.vision ? cfg_.vision->tokens : ImageTokens{}; }
+  uint64_t vision_digest() const { return vision_ ? vision_->digest() : 0; }
+  struct PrefillCursor : Base::PrefillCursor {
+    const std::vector<ImageInput>* images = nullptr;
+  };
+  Outputs session_prefill_images(int req, const std::vector<int64_t>& ids,
+                                 const std::vector<ImageInput>& images);
+  Outputs session_prefill_images(int req, const std::vector<int64_t>& ids,
+                                 const std::vector<ImageInput>& images,
+                                 const std::vector<int64_t>& boundaries, SnapshotRequest* snap);
+  Outputs session_prefill_resume_images(int req, const std::vector<int64_t>& ids,
+                                        const std::vector<ImageInput>& images,
+                                        const std::vector<int64_t>& boundaries,
+                                        SnapshotRequest* snap);
+  PrefillCursor session_prefill_begin(int req, const std::vector<int64_t>& prompt,
+                                      int64_t reserve_tokens, int64_t chunk_tokens,
+                                      const std::vector<int64_t>& boundaries = {},
+                                      SnapshotRequest* snap = nullptr, int64_t attach_position = 0,
+                                      const std::vector<ImageInput>* images = nullptr);
+  bool session_prefill_advance(PrefillCursor&, int64_t chunk_tokens = 0);
+  std::vector<bool> session_prefill_advance_group(const std::vector<PrefillCursor*>& cursors,
+                                                  const std::vector<int64_t>& budgets) {
+    return Base::session_prefill_advance_group(cursors, budgets);
+  }
+  void validate_mixed_prefill_cursor(const PrefillCursor& cursor) const {
+    if (cursor.images && !cursor.images->empty())
+      throw std::invalid_argument("MiniMax: image spans require their own prefill walk");
+  }
   const MinimaxKvPool& kv_pool() const { return pool_; }
   LatentFormat kv_format() const { return LatentFormat::kBf16; }
   void set_decode_row_traces(bool on) { decode_row_traces_ = on; }
@@ -108,6 +138,12 @@ class MinimaxModel : public SessionModel<MinimaxModel> {
   const float* dflash2_confidence() const { return df_.confidence(); }
 
  private:
+  class ImagePrefillScope;
+  std::unique_ptr<MinimaxVisionEncoder> vision_;
+  std::vector<const std::vector<ImageInput>*> request_images_;
+  void validate_images(const std::vector<int64_t>& ids, const std::vector<ImageInput>& images,
+                       int64_t start = 0) const;
+  void apply_image_embeddings(uint16_t* dst, const RowRun&);
   DFlash2CaptureCtx df_capture_ctx() const;
   DFlash2Drafter df_;
   uint16_t* stage(int rows, bool capture);

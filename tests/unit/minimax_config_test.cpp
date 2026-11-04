@@ -43,6 +43,11 @@ DGPP_TEST(minimax_config_release) {
               dgpp::ModelArchitecture::MinimaxM3,
           "model type fallback detection");
   const auto c = parse(source());
+  require(c.vision && c.vision->depth == 32 && c.vision->hidden == 1280 &&
+              c.vision->head_dim() == 80 && c.vision->rotary_dim() == 78 &&
+              c.vision->tokens.pad == 200025 && c.vision->tokens.start == 200029 &&
+              c.vision->tokens.end == 200030 && c.vision->video_token == 200026,
+          "vision geometry and delimiter contract");
   require(c.hidden_size == 6144 && c.vocab_size == 200064 && c.num_hidden_layers == 60,
           "text shape");
   require(c.num_moe_layers() == 57 && !c.is_moe_layer(2) && c.is_moe_layer(3), "dense/MoE pattern");
@@ -72,6 +77,10 @@ DGPP_TEST(minimax_config_release) {
 }
 
 DGPP_TEST(minimax_config_refuses_semantic_changes) {
+  rejects("\"rope_mode\": \"3d\"", "\"rope_mode\": \"2d\"", "rope_mode");
+  rejects("\"vision_feature_layer\": -1", "\"vision_feature_layer\": -2", "vision_feature_layer");
+  rejects("\"vision_segment_max_frames\": 4", "\"vision_segment_max_frames\": 8",
+          "vision_segment_max_frames");
   rejects("\"use_gemma_norm\": true", "\"use_gemma_norm\": false", "use_gemma_norm");
   rejects("\"use_qk_norm\": true", "\"use_qk_norm\": false", "use_qk_norm");
   rejects("\"hidden_act\": \"swigluoai\"", "\"hidden_act\": \"silu\"", "hidden_act");

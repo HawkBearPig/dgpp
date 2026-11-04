@@ -172,8 +172,10 @@ owners. At TP4 the expert slice is 768, dense-MLP slice 3072, main query
 count 16, main KV count 1 and index-query count 1. These slices align to
 the 16/32-wide quantization groups. Fold attention and FFN output
 partials with the existing boundary reducer and RoCE bus. Keep routers,
-norms and embedding replicated; shard the vocabulary head. Run vision
-on the frontend rank using the existing embedding-delivery protocol.
+norms and embedding replicated; shard the vocabulary head. The initial
+vision implementation replicates the encoder and broadcasts processed
+pixels through the existing image admission journal. A head-only encoder
+would need a new feature-delivery protocol and remains a measured follow-up.
 
 Use 128-token physical pages to match MSA blocks. Every snapshot and
 copy-on-write operation must cover the corresponding main KV and index-key
@@ -181,7 +183,7 @@ planes, plus their scales if quantized. Test partial-page copies and
 rejected speculative rows so stale keys cannot enter later selection.
 
 Estimated raw resident weights under that placement are 59.705 GiB per
-TP4 rank for the text target, plus 1.615 GiB on the vision rank. A
+TP4 rank for the text target, plus 1.615 GiB of vision weights on each rank. A
 conservative initially replicated draft adds 2.144 GiB per rank: about
 **61.85 GiB text / 63.47 GiB with vision**. Sharding the draft and using
 validated lossless BF12 storage can reduce this. These are calculated
@@ -289,9 +291,11 @@ Vision uses a 32-layer, 1280-wide encoder, 14-pixel patches, 3D RoPE and
 spatial/temporal patch merging. Port the published image normalization,
 dynamic resolution, frame segmentation, feature ordering and projector
 behavior; sharing an existing vision tower without these rules is
-incorrect. Use the processor's effective limits, including its 1008
-maximum resolution, instead of inferring them only from the model's
-672 image-size field. Video also needs native decoding/frame sampling
+incorrect. Use the processor's effective limits: instantiating the pinned
+fast image processor confirms `max_pixels=451584` (672²), or 576 merged
+tokens. A 1008-square input becomes a 672-square canvas. The nested
+`max_image_resolution=1008` metadata does not override this processor's
+pixel budget. Video also needs native decoding/frame sampling
 and API validation, beyond the existing image/PDF frontend.
 [Image processor](https://huggingface.co/MiniMaxAI/MiniMax-M3.1-Flash/blob/2f33a8b9ae49ce7b51c994df97166a7fd059bc2e/image_processor.py),
 [processor settings](https://huggingface.co/MiniMaxAI/MiniMax-M3.1-Flash/blob/2f33a8b9ae49ce7b51c994df97166a7fd059bc2e/preprocessor_config.json),
@@ -766,3 +770,62 @@ output-head, full-vocabulary Markov walk and confidence checks pass.
 All nine selected CTest gates pass, including all 21 shared drafter
 integration cases and the row-invariant feature regression. Four-rank
 acceptance and same-binary plain/speculative tests follow this correction.
+
+Source `7e92bba9`, server SHA-256
+`f3654de2c9a385cd2cfb43e46e6edcbaa2e71329dbd9ebae9a3396e88f397917`,
+passes the four-rank real target/draft smoke after correcting the taps.
+The four 256-token prompts match plain decoding exactly in raw content,
+reasoning, finish reason and token counts at both C1 and C4. API, cold/hot
+prefix usage and recursive one-shot/SSE tool checks pass. Every rank has
+zero swap before and after both worlds, with matching executable hashes.
+Operation streams match at `e59603ef596a35812ba71bfa45f172ab` for
+speculation and `566256b1b51d228f32c148fbb0520371` for plain decode.
+Acceptance remains too low to choose speculation as the deployment
+default; these probes provide no published throughput rows.
+
+### Native still-image encoder
+
+The encoder loads all 523 published visual tensors: one FP32 patch
+convolution and BF16 LayerNorm, attention, MLP, projector and merger weights.
+The final memory plan adds 1,734,145,024 weight bytes and 407,793,664 workspace
+bytes per rank. Buffers and BLAS handles are created before fabric execution;
+request-time encoding does not allocate device storage. Image features enter
+the target embedding stream before DSpark feature capture. Chunked and resumed
+prefill, snapshots inside image spans, interleaved requests and plain versus
+speculative decoding have dedicated synthetic-checkpoint regressions.
+
+The precision recipe preserves the FP32 convolution, FP32 attention scores,
+BF16 probabilities, exact GELU, and the 78 rotated dimensions of each 80-wide
+attention head. Three arithmetic differences initially failed the existing
+0.5% relative RMS / 0.99998 cosine gate and were corrected, without relaxing
+that gate:
+
+- FP32 patch projection uses SGEMM, matching the upstream CUDA linear
+  lowering for patch-sized Conv3d inputs. cuBLASLt's alternative accumulation
+  changes a few BF16 projections at larger patch counts.
+- BF16 projections use the CUDA reference's 1 MiB cuBLASLt workspace cap.
+  The 64 MiB alternative selects a different split-K/bias epilogue at the
+  published MLP shape. The separate SGEMM workspace is 32 MiB.
+- Rotary frequencies and trigonometry use the reference's FP32 device
+  operations. Computing the power in host double precision before casting
+  changes individual Q/K values; those differences accumulate over 32 layers.
+
+[Pinned upstream convolution lowering](https://github.com/vllm-project/vllm/blob/5225a1f17f9cf721efd5ad793e6b63798ca30306/vllm/model_executor/layers/conv.py),
+[PyTorch CUDA BLAS reference](https://github.com/pytorch/pytorch/blob/5c4886908584029761b579af026dcfb627c84070/aten/src/ATen/cuda/CUDABlas.cpp).
+
+`tools/minimax_vision_regression.py` runs the native harness followed by an
+independent PyTorch CUDA oracle, serially on an idle GPU. Eight cases cover
+28×28 through 896×896, rectangular images, noise and checkerboards, the
+128-query attention tile boundary, the processor's 576-token image budget
+and the encoder's 1,024-token allocation ceiling. All eight final embeddings
+are bitwise identical with the real checkpoint and PyTorch 2.14.1+cu130.
+The FP64 tiny-checkpoint oracle remains a separate structural check.
+These are encoder regressions; cluster API checks and media task accuracy
+are separate gates. Video decoding and temporal segmentation remain pending.
+
+All 28 selected CTest gates pass, including shared prefill and all 21
+shared drafter cases; the MiniMax unit filter passes all 19 cases.
+Compute Sanitizer reports zero memory errors for the new kernels and
+image-prefill/session regression, and zero race hazards for the tiled
+encoder fixture. The PDL audit covers all 397 kernels, and documentation
+checks pass.

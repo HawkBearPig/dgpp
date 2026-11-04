@@ -193,6 +193,8 @@ add_library(dgpp_kernels STATIC
   src/kernels/gdn_chunk.cu
   src/kernels/glm_vision.cu
   src/kernels/qwen_vision.cu
+  src/kernels/minimax_vision.cu
+  src/kernels/fp32_gemm.cpp
   src/kernels/glm_norm.cu
   src/kernels/pick.cu
   src/kernels/sample_pick.cu
@@ -221,7 +223,7 @@ add_library(dgpp_kernels STATIC
   src/kernels/dory_norm.cu
   src/kernels/dory_attn.cu
   src/kernels/dory_head.cu)
-target_link_libraries(dgpp_kernels PUBLIC CUDA::cudart CUDA::cublasLt CUDA::cuda_driver dgpp_core dgpp_rope_scaling)
+target_link_libraries(dgpp_kernels PUBLIC CUDA::cudart CUDA::cublas CUDA::cublasLt CUDA::cuda_driver dgpp_core dgpp_rope_scaling)
 dgpp_set_common(dgpp_kernels)
 # The device sampler mirrors the host oracle bit for bit: no contraction of
 # its multiplies and adds (the host builds with -ffp-contract=off).
@@ -378,14 +380,15 @@ target_include_directories(dgpp_models_minimax PUBLIC ${CMAKE_CURRENT_SOURCE_DIR
 target_link_libraries(dgpp_models_minimax PUBLIC dgpp_models_dflash2 dgpp_loaders dgpp_common CUDA::cudart)
 dgpp_set_common(dgpp_models_minimax)
 
-add_library(dgpp_models_minimax_loader STATIC src/models/minimax/loader.cpp src/models/minimax/dspark_loader.cpp)
+add_library(dgpp_models_minimax_loader STATIC src/models/minimax/loader.cpp src/models/minimax/dspark_loader.cpp src/models/minimax/vision.cpp)
 target_include_directories(dgpp_models_minimax_loader PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(dgpp_models_minimax_loader PUBLIC dgpp_models_dflash2 dgpp_models_minimax dgpp_loaders CUDA::cudart dgpp_device_ranges)
+target_link_libraries(dgpp_models_minimax_loader PUBLIC dgpp_models_dflash2 dgpp_models_minimax dgpp_loaders dgpp_kernels CUDA::cudart dgpp_device_ranges)
 dgpp_set_common(dgpp_models_minimax_loader)
 
 add_library(dgpp_models_minimax_layers STATIC
   src/models/minimax/kv_pool.cpp
   src/models/minimax/layers.cpp
+  src/models/minimax/image_prefill.cpp
   src/models/minimax/forward.cpp)
 target_include_directories(dgpp_models_minimax_layers PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(dgpp_models_minimax_layers PUBLIC dgpp_models_minimax dgpp_models_minimax_loader dgpp_kernels CUDA::cudart)
@@ -2841,6 +2844,42 @@ add_executable(qwen_vision_check apps/qwen_vision_check.cpp)
 target_link_libraries(qwen_vision_check PRIVATE dgpp_models_qwen_loader CUDA::cudart)
 dgpp_set_common(qwen_vision_check)
 
+add_executable(minimax_vision_check apps/minimax_vision_check.cpp)
+target_link_libraries(minimax_vision_check PRIVATE dgpp_models_minimax_loader CUDA::cudart)
+dgpp_set_common(minimax_vision_check)
+
+add_executable(minimax_vision_test tests/cuda/minimax_vision_test.cpp)
+target_link_libraries(minimax_vision_test PRIVATE dgpp_kernels CUDA::cudart)
+dgpp_set_common(minimax_vision_test)
+add_test(NAME minimax_vision_test COMMAND minimax_vision_test)
+set_tests_properties(minimax_vision_test PROPERTIES LABELS "gpu" SKIP_RETURN_CODE 2)
+add_executable(minimax_image_prefill_test tests/cuda/minimax_image_prefill_test.cpp)
+target_link_libraries(minimax_image_prefill_test PRIVATE dgpp_models_minimax_layers CUDA::cudart)
+dgpp_set_common(minimax_image_prefill_test)
+add_test(NAME minimax_image_model_fixture COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/minimax_vision_fixture.py --output ${CMAKE_BINARY_DIR}/minimax_image_model_fixture --target-checkpoint ${CMAKE_BINARY_DIR}/minimax_dspark_target_fixture)
+set_tests_properties(minimax_image_model_fixture PROPERTIES FIXTURES_REQUIRED minimax_dspark_model_fixture FIXTURES_SETUP minimax_image_model LABELS "host")
+add_test(NAME minimax_image_prefill_test COMMAND minimax_image_prefill_test ${CMAKE_BINARY_DIR}/minimax_image_model_fixture)
+set_tests_properties(minimax_image_prefill_test PROPERTIES FIXTURES_REQUIRED minimax_image_model LABELS "gpu")
+add_test(NAME minimax_vision_fixture COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/minimax_vision_fixture.py --output ${CMAKE_BINARY_DIR}/minimax_vision_fixture)
+set_tests_properties(minimax_vision_fixture PROPERTIES FIXTURES_SETUP minimax_vision_checkpoint LABELS "host")
+foreach(shape IN ITEMS rect tiled minimum)
+  if(shape STREQUAL "rect")
+    set(vw 84)
+    set(vh 56)
+  elseif(shape STREQUAL "tiled")
+    set(vw 196)
+    set(vh 196)
+  else()
+    set(vw 28)
+    set(vh 28)
+  endif()
+  set(vdump ${CMAKE_BINARY_DIR}/minimax_vision_${shape})
+  add_test(NAME minimax_vision_forward_${shape} COMMAND minimax_vision_check ${CMAKE_BINARY_DIR}/minimax_vision_fixture ${vw} ${vh} ${vdump}.bf16 ${vdump})
+  set_tests_properties(minimax_vision_forward_${shape} PROPERTIES FIXTURES_REQUIRED minimax_vision_checkpoint FIXTURES_SETUP minimax_vision_${shape}_output LABELS "gpu")
+  add_test(NAME minimax_vision_reference_${shape} COMMAND ${DSV41_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/tools/minimax_vision_reference.py --checkpoint-dir ${CMAKE_BINARY_DIR}/minimax_vision_fixture --engine-dir ${vdump} --width ${vw} --height ${vh})
+  set_tests_properties(minimax_vision_reference_${shape} PROPERTIES FIXTURES_REQUIRED minimax_vision_${shape}_output LABELS "host" ENVIRONMENT "OPENBLAS_NUM_THREADS=1")
+endforeach()
+
 add_executable(qwen_vision_test tests/cuda/qwen_vision_test.cpp)
 target_link_libraries(qwen_vision_test PRIVATE dgpp_kernels CUDA::cudart)
 dgpp_set_common(qwen_vision_test)
@@ -2864,6 +2903,11 @@ target_link_libraries(glm_vision_frontend_test PRIVATE dgpp_serve)
 dgpp_set_common(glm_vision_frontend_test)
 add_test(NAME glm_vision_frontend_test COMMAND glm_vision_frontend_test)
 set_tests_properties(glm_vision_frontend_test PROPERTIES LABELS "host;checkpoint" SKIP_RETURN_CODE 2)
+add_executable(minimax_vision_frontend_test tests/host/minimax_vision_frontend_test.cpp)
+target_link_libraries(minimax_vision_frontend_test PRIVATE dgpp_serve)
+dgpp_set_common(minimax_vision_frontend_test)
+add_test(NAME minimax_vision_frontend_test COMMAND minimax_vision_frontend_test)
+set_tests_properties(minimax_vision_frontend_test PROPERTIES LABELS "host;checkpoint" SKIP_RETURN_CODE 2)
 
 # Isolated upstream-port regression: paged BF16/FP8 history and head rows.
 add_executable(mimo_port_test tests/cuda/mimo_port_test.cpp)
