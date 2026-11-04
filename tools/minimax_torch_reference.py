@@ -25,13 +25,15 @@ from minimax_reference_dump import FP4, FP8, Weights
 
 
 class Reference:
-    def __init__(self, checkpoint, world, rounded_residual, projection_rows=0, projection_backend='cublas'):
+    def __init__(self, checkpoint, world, rounded_residual, projection_rows=0, projection_backend='cublas',
+                 elementwise_backend='torch'):
         self.w = Weights(checkpoint)
         self.c = json.loads((checkpoint / 'config.json').read_text())['text_config']
         self.world = world
         self.rounded_residual = rounded_residual
         self.projection_rows = projection_rows
         self.projection_backend = projection_backend
+        self.elementwise_backend = elementwise_backend
         self.config_sha256 = hashlib.sha256((checkpoint/'config.json').read_bytes()).hexdigest()
         self.checkpoint = str(checkpoint.resolve())
         self.fp8 = torch.tensor(FP8, device='cuda')
@@ -74,7 +76,12 @@ class Reference:
             parts = [projection(part,weight,streaming_order) for part in x.split(rows)]
         else:
             parts = [torch.mm(part, weight.T, out_dtype=torch.float32) for part in x.split(rows)]
-        y = torch.cat(parts) / divisor
+        y = torch.cat(parts)
+        if self.elementwise_backend == 'triton-fixed':
+            from minimax_reference_arithmetic import divide
+            y = divide(y, divisor) if divisor != 1.0 else y
+        else:
+            y = y / divisor
         return y.to(torch.bfloat16) if rounded else y
 
     def linear(self, x, base):
@@ -96,6 +103,9 @@ class Reference:
         return y.to(torch.bfloat16)
 
     def norm(self, x, base):
+        if self.elementwise_backend == 'triton-fixed':
+            from minimax_reference_arithmetic import norm
+            return norm(x, self.tensor(base+'.weight'), self.c['rms_norm_eps'])
         x = x.float()
         inv = torch.rsqrt(x.square().mean(dim=-1, keepdim=True)+self.c['rms_norm_eps'])
         return (x*inv*(1+self.tensor(base+'.weight').float())).to(torch.bfloat16)
@@ -163,7 +173,11 @@ class Reference:
         gate,up,down = ('w1','w3','w2') if expert else ('gate_proj','up_proj','down_proj')
         g = self.linear(n,base+gate).float().clamp(max=c['swiglu_limit'])
         u = self.linear(n,base+up).float().clamp(-c['swiglu_limit'],c['swiglu_limit'])
-        act = (g*torch.sigmoid(c['swiglu_alpha']*g)*(u+1)).to(torch.bfloat16)
+        if self.elementwise_backend == 'triton-fixed':
+            from minimax_reference_arithmetic import activation
+            act = activation(g, u, c['swiglu_alpha'], c['swiglu_limit'])
+        else:
+            act = (g*torch.sigmoid(c['swiglu_alpha']*g)*(u+1)).to(torch.bfloat16)
         return self.parts(act,base+down,rounded=not expert)
 
     def ffn(self, n, layer):
@@ -173,25 +187,43 @@ class Reference:
             self.last_routes = None
             return self.fold(self.mlp(n,p+'mlp.'))
         p += 'block_sparse_moe.'
-        scores = torch.sigmoid(torch.mm(n.float(),self.tensor(p+'gate.weight').T))
+        if self.elementwise_backend == 'triton-fixed':
+            from minimax_reference_arithmetic import router
+            scores, _ = router(n, self.tensor(p+'gate.weight'))
+        else:
+            scores = torch.sigmoid(torch.mm(n.float(),self.tensor(p+'gate.weight').T))
         biased = scores+self.tensor(p+'e_score_correction_bias')
         ids = biased.argsort(dim=-1,descending=True,stable=True)[:,:c['num_experts_per_tok']].sort(dim=-1).values
         self.last_routes = ids
         picked = scores.gather(1,ids)
-        weights = picked/picked.sum(dim=1,keepdim=True).clamp(min=1e-20)*c['routed_scaling_factor']
+        if self.elementwise_backend == 'triton-fixed':
+            denominator = torch.zeros_like(picked[:, :1])
+            for slot in range(picked.shape[1]):
+                denominator += picked[:, slot:slot+1]
+        else:
+            denominator = picked.sum(dim=1,keepdim=True)
+        weights = picked/denominator.clamp(min=1e-20)*c['routed_scaling_factor']
         routed = [torch.zeros_like(n,dtype=torch.float32) for _ in range(self.world)]
         for e in range(c['num_local_experts']):
             rows,slots = torch.where(ids==e)
             if rows.numel():
                 parts = self.mlp(n[rows],p+f'experts.{e}.',expert=True)
                 for r,y in enumerate(parts):
-                    routed[r][rows] += weights[rows,slots,None]*y
+                    if self.elementwise_backend == 'triton-fixed':
+                        from minimax_reference_arithmetic import weighted_add
+                        weighted_add(routed[r], y, weights[rows, slots], rows)
+                    else:
+                        routed[r][rows] += weights[rows,slots,None]*y
         shared = self.mlp(n,p+'shared_experts.')
         return self.fold([(r.to(torch.bfloat16).float()+s.float()).to(torch.bfloat16)
                           for r,s in zip(routed,shared)])
 
-    def check_stages(self, engine, output):
+    def check_stages(self, engine, output, layers=0):
         """Check each operation with recorded inputs, separately from trajectory quality."""
+        total_layers = self.c['num_hidden_layers']
+        if not 0 <= layers <= total_layers:
+            raise ValueError('diagnostic layer count outside the model')
+        layers = layers or total_layers
         metadata = json.loads((engine/'metadata.json').read_text())
         if metadata.get('world', 1) != self.world:
             raise ValueError('engine/reference TP worlds differ')
@@ -212,6 +244,7 @@ class Reference:
             rms = (error.norm()/expected.double().norm().clamp(min=1e-20)).item()
             per_row = error.norm(dim=1)/expected.double().norm(dim=1).clamp(min=1e-20)
             metrics.append(dict(layer=layer, stage=stage, rms=rms,
+                                changed_values=int(torch.count_nonzero(actual != expected)),
                                 max_row_rms=per_row.max().item(), worst_row=per_row.argmax().item()))
             print(f'Layer {layer} {stage}: relative RMS {rms:.6g}', flush=True)
             if not math.isfinite(rms) or rms > .01:
@@ -219,7 +252,7 @@ class Reference:
             return actual
 
         x = self.tensor('language_model.model.embed_tokens.weight', np.array(metadata['tokens']))
-        for layer in range(self.c['num_hidden_layers']):
+        for layer in range(layers):
             p = f'language_model.model.layers.{layer}.'
             n = compare('input_norm', layer, self.norm(x, p+'input_layernorm'))
             a = compare('attention', layer, self.attention(n, layer))
@@ -239,10 +272,12 @@ class Reference:
             if self.rounded_residual:
                 x = saved
         output.mkdir(parents=True, exist_ok=True)
-        (output/'stages.json').write_text(json.dumps(dict(metrics=metrics, failures=failures), indent=2)+'\n')
+        (output/'stages.json').write_text(json.dumps(dict(metrics=metrics, failures=failures,
+            layers_checked=layers,layers_total=total_layers,complete=layers==total_layers,
+            projection_backend=self.projection_backend,elementwise_backend=self.elementwise_backend), indent=2)+'\n')
         if failures:
             raise AssertionError('\n'.join(failures))
-        print('All isolated sublayer checks passed; this is not a full-trajectory quality verdict.', flush=True)
+        print(f'Isolated sublayer checks passed for {layers}/{total_layers} layers; this is not a full-trajectory quality verdict.', flush=True)
 
     def run(self, cases, output, dump_states=False):
         def record(case_index, stage, layer, tensor):
@@ -287,7 +322,8 @@ class Reference:
             folder.mkdir(parents=True,exist_ok=True)
             (folder/'metadata.json').write_text(json.dumps(dict(world=self.world,ids=case['ids'],rounded_residual=self.rounded_residual,
                 projection_rows=self.projection_rows,
-                projection_backend=self.projection_backend,rope_inv_freq='cuda-fp32',
+                projection_backend=self.projection_backend,elementwise_backend=self.elementwise_backend,
+                rope_inv_freq='cuda-fp32',
                 score_from=score_from,
                 backend='pytorch independent FP32 attention', torch_version=torch.__version__,
                 checkpoint=self.checkpoint,config_sha256=self.config_sha256),indent=2)+'\n')
@@ -323,13 +359,17 @@ def main():
     p.add_argument('--dump-states',action='store_true',help='save sublayer boundaries for discrepancy tracing')
     p.add_argument('--projection-rows',type=int,default=0,help='reference reduction control: cap rows per cuBLAS projection (0: full)')
     p.add_argument('--projection-backend',choices=['cublas','triton-fixed'],default='cublas',help='fixed 16-term tensor-core reductions or cuBLAS algorithm dispatch')
+    p.add_argument('--elementwise-backend',choices=['torch','triton-fixed'],default='torch',help='diagnostic: fixed FP32 norm/router reductions and activation arithmetic')
+    p.add_argument('--check-layers',type=int,default=0,help='diagnostic: check only the first N recorded layers (0: all); never produces trajectory scores')
     args = p.parse_args()
     if args.projection_rows < 0:
         p.error('--projection-rows must be nonnegative')
-    reference = Reference(args.checkpoint_dir,args.world,args.rounded_residual,args.projection_rows,args.projection_backend)
+    if args.check_layers < 0 or (args.check_layers and not args.check_engine_dir):
+        p.error('--check-layers must be nonnegative and requires --check-engine-dir')
+    reference = Reference(args.checkpoint_dir,args.world,args.rounded_residual,args.projection_rows,args.projection_backend,args.elementwise_backend)
     if args.check_engine_dir:
         with torch.inference_mode():
-            reference.check_stages(args.check_engine_dir,args.output)
+            reference.check_stages(args.check_engine_dir,args.output,args.check_layers)
         return
     cases = json.loads(args.manifest.read_text())
     tok = None
