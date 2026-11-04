@@ -10,6 +10,10 @@ Unicode/whitespace preservation, disconnect retirement and cold controls.
 Run `scripts/serve_cancel_prefix_check.py` on an idle serving world to compare
 actual rerendered interrupted histories with cold replies; pass the source
 revision, binary hash and an output path for its detailed JSON report.
+`--thinking` also exercises reasoning history, and `--require-answer-hit`
+requires a cancelled reply to produce a deeper hit. The report distinguishes
+answer-prefix hits from earlier prompt hits; retained state may sit at no
+cut of the resubmitted history, especially with one-token snapshot alignment.
 
 `nvme_cache_test` checks reuse of an existing binding after build/settings
 changes, adoption and exact-token lookup through the host disk index, legacy

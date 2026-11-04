@@ -19,11 +19,12 @@ from serve_client import default_url, model_at_url
 
 
 class Probe:
-    def __init__(self, url, timeout=600):
+    def __init__(self, url, timeout=600, thinking=False):
         parsed = urlsplit(url)
         if parsed.scheme != "http" or not parsed.hostname:
             raise ValueError("expected an http:// endpoint")
         self.host, self.port, self.timeout = parsed.hostname, parsed.port or 80, timeout
+        self.thinking = thinking
         self.model = model_at_url(url)
 
     def metrics(self):
@@ -59,7 +60,7 @@ class Probe:
         payload = {"model": self.model, "messages": messages, "temperature": 0, "seed": 157,
                    "max_tokens": max_tokens, "stream": True, "prefix_cache": cache,
                    "ignore_eos": ignore_eos, "stream_options": {"include_usage": True},
-                   "chat_template_kwargs": {"enable_thinking": False, "clear_thinking": False}}
+                   "chat_template_kwargs": {"enable_thinking": self.thinking, "clear_thinking": False}}
         connection = http.client.HTTPConnection(self.host, self.port, timeout=self.timeout)
         response = None
         started = time.monotonic()
@@ -151,11 +152,14 @@ def main():
     parser.add_argument("--rounds", type=int, default=3)
     parser.add_argument("--cancel-deltas", type=int, default=384)
     parser.add_argument("--prompt-lines", type=int, default=96)
+    parser.add_argument("--thinking", action="store_true", help="also preserve an interrupted reasoning stream")
+    parser.add_argument("--require-answer-hit", action="store_true",
+                        help="require at least one cancelled replay to reuse beyond its original prompt")
     parser.add_argument("--tag", default="cancel-prefix-157")
     args = parser.parse_args()
     if min(args.rounds, args.cancel_deltas, args.prompt_lines) < 1 or args.cancel_deltas >= 4096:
         parser.error("positive sizes required; cancel-deltas must be below 4096")
-    probe = Probe(args.url)
+    probe = Probe(args.url, thinking=args.thinking)
     report = {"model": probe.model, "source_revision": args.source_revision,
               "binary_sha256": args.binary_sha256, "args": vars(args) | {"out": str(args.out)},
               "cases": [], "passed": False}
@@ -175,6 +179,10 @@ def main():
                                    cancel_deltas=args.cancel_deltas if cancel else 0, ignore_eos=True)
                 case["first"] = first
                 initial_prompt = first["engine"]["prompt_tokens"]
+                if first["engine"]["prompt_tokens_computed"] != initial_prompt:
+                    raise RuntimeError("the initial probe was not cold; use a fresh --tag")
+                if first["after"]["prefix_cache"]["close_entries"] <= first["before"]["prefix_cache"]["close_entries"]:
+                    raise RuntimeError("the first answer retained no rolling snapshot")
                 history = messages + [assistant(first), {"role": "user", "content":
                     "Now reply with exactly the words: The observatory is ready."}]
                 # Test the exact delivered history before another request can
@@ -191,12 +199,30 @@ def main():
                     case["replays"].append({"variant": variant, "messages": submitted, "hot": hot, "cold": cold})
                     compare(hot, cold)
                     saved = hot["usage"]["prompt_tokens_details"]["cached_tokens"]
-                    if variant == "exact" and saved <= initial_prompt:
-                        raise RuntimeError(f"{tag}: no answer-prefix reuse ({saved} cached, {initial_prompt} original prompt)")
+                    if variant == "exact":
+                        case["answer_prefix_hit"] = saved > initial_prompt
+                        if not saved:
+                            raise RuntimeError(f"{tag}: unchanged history lost all prefix reuse")
                     if variant == "edited_prompt" and saved:
                         raise RuntimeError("edited prompt incorrectly attached a cached prefix")
                     print(f"{tag} {variant}: {saved} cached, "
                           f"{hot['engine']['prompt_tokens_computed']} computed; cold reply matches", flush=True)
+                    if variant == "exact":
+                        continued = submitted + [assistant(hot), {"role": "user", "content":
+                            "One more turn: reply with exactly the words Clear skies tonight."}]
+                        later = probe.chat(continued, 32)
+                        later_cold = probe.chat(continued, 32, cache=False)
+                        case["replays"].append({"variant": "following_turn", "messages": continued,
+                                                "hot": later, "cold": later_cold})
+                        compare(later, later_cold)
+                        later_saved = later["usage"]["prompt_tokens_details"]["cached_tokens"]
+                        if later_saved < saved:
+                            raise RuntimeError("the following conversation turn lost answer-prefix reuse")
+                        print(f"{tag} following_turn: {later_saved} cached; cold reply matches", flush=True)
+        report["cancelled_answer_hits"] = sum(
+            case["first"]["cancelled"] and case["answer_prefix_hit"] for case in report["cases"])
+        if args.require_answer_hit and not report["cancelled_answer_hits"]:
+            raise RuntimeError("no cancelled answer snapshot matched a cut; inspect the rendered history and arena")
         report["passed"] = True
     finally:
         args.out.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n")

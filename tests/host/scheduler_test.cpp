@@ -3056,8 +3056,9 @@ DGPP_TEST(scheduler_prefixCache_cancelledHistoryRandomizedReplay) {
   // no hit may extend past either the matching ids or the committed prefix.
   const auto run = [](uint32_t seed) {
     std::mt19937 rng(seed);
-    const int align = rng() % 2 ? 4 : 8;
-    FakeEngine engine(1, 128, align);
+    const int alignments[] = {1, 4, 8};
+    const int align = alignments[rng() % 3];
+    FakeEngine engine(1, 128, 4);
     engine.set_prefix_arena(1 + rng() % 4, align, 16);
     engine.prefill_lookahead_ = rng() % 2;
     engine.set_step_tokens_max(8);
@@ -3104,8 +3105,8 @@ DGPP_TEST(scheduler_prefixCache_cancelledHistoryRandomizedReplay) {
     require(saved % align == 0, "the reused cut is aligned");
     // An uncached request consumes the entire pool, forcing every retained
     // entry to relinquish its arena slot and blocks after the replay.
-    engine.arm(0, {kEos}, 128 * align - 4);
-    auto flush = make_request("flush", 4, 128 * align - 4);
+    engine.arm(0, {kEos}, 128 * 4 - 4);
+    auto flush = make_request("flush", 4, 128 * 4 - 4);
     flush.no_cache = true;
     sched.submit(flush);
     sched.run_to_completion();
@@ -3115,6 +3116,30 @@ DGPP_TEST(scheduler_prefixCache_cancelledHistoryRandomizedReplay) {
   };
   for (uint32_t seed = 0; seed < 512; ++seed)
     require(run(seed) == run(seed), "random cancellation replay agrees across ranks");
+}
+
+DGPP_TEST(scheduler_prefixCache_cancelledSingletonAlignmentStillRequiresAMatchingCut) {
+  for (const int boundary : {28, 30}) {
+    FakeEngine engine(1, 128, 4);
+    engine.set_prefix_arena(4, 1);
+    engine.arm(0, long_script(40), 40);
+    engine.arm(0, {90}, 1);
+    Scheduler sched(&engine, {kEos});
+    const auto prompt = counted_prompt(21);
+    sched.submit(make_cached_request("cancel", prompt, {5, 13}, 40));
+    for (int tick = 0; tick < 20 && sched.meters().tokens_generated < 9; ++tick) sched.tick();
+    require(sched.cancel("cancel"), "cancel after nine generated tokens");
+    sched.run_to_completion();
+    require(sched.meters().prefix_close_entries == 1, "the prior rolling snapshot is retained");
+    auto next = prompt;
+    const auto& generated = sched.find("cancel")->generated;
+    next.insert(next.end(), generated.begin(), generated.end());
+    next.push_back(9000);
+    sched.submit(make_cached_request("next", next, {5, 13, boundary}, 1));
+    sched.run_to_completion();
+    require(sched.meters().prefix_tokens_saved == (boundary == 28 ? 28 : 13),
+            "a boundary after the pending token does not match the older rolling position");
+  }
 }
 
 DGPP_TEST(scheduler_prefixCache_rollingSnapshotBecomesTheCloseEntryTheNextTurnAttachesTo) {

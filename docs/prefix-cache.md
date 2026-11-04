@@ -7,6 +7,23 @@ documents and live requests still need room in the KV pool.
 Entries evicted from memory are lost unless the
 [NVMe cold tier](nvme-cache.md) is enabled.
 
+## Interrupted answers
+
+Cancellation keeps an existing rolling snapshot only through the committed
+token prefix. It takes no fresh snapshot, and keeps the retained entry in
+memory without starting an NVMe spill, so live requests can reclaim its
+blocks immediately. Earlier prompt snapshots keep their ordinary disk policy.
+
+The next turn must match both the token prefix and a valid cold-prefill cut.
+Keep the delivered content and reasoning in the history; changed templates,
+trimmed whitespace, retokenization or undelivered tokens can shorten the match.
+Retention alone does not guarantee a deeper hit. With one-token snapshot
+alignment, for example, a saved position just before the final delivered
+token is not the next prompt's boundary after that token. A step-limited
+normal answer can have the same limitation. Earlier prompt entries can still
+serve the follow-up. The cache does not add cuts or relax matching to force
+an interrupted answer to attach.
+
 ## Changed questions after a long document
 
 For prompts at least four prefill chunks long, the cache keeps one earlier
