@@ -1076,3 +1076,40 @@ not deployment throughput rows. The regression suite adds different physical
 page permutations and request identities, partial blocks, padding and replay
 after visibility grows or shrinks. CUDA memcheck reports zero errors and
 racecheck reports zero hazards. Full-model trajectory checks remain required.
+
+The optimized TP4 numerical probe from `4a9726c0` (SHA-256
+`14541835d7359c5a75dc53b2ce7e398d78a6b87c9c9e659e78294d7ab5161556`)
+passes the complete technical continuation against the fixed-order reference:
+mean NLL increases by approximately **0.0000212 nat**, with no argmax changes
+or changes exceeding 1 nat across 7,220 positions. Both native trials have
+identical logit hashes. All 1,860 hidden-state hashes per rank, covering both
+trials through all 60 layers, match the earlier native run exactly; the small
+logit difference comes from the invariant scalar vocabulary head. Every rank
+reports zero process swap and the same binary hash throughout the run.
+This closes the long technical-corpus checks for these two changes; the
+other corpora and task-quality checks remain separate release gates.
+
+### Vocabulary-head experiment
+
+`minimax_head_bench` compares the scalar and unsplit tensor-core projections
+on rank 0's real 50,016-by-6,144 vocabulary shard and 64 recorded normalized
+activation rows. It requires finite outputs, a sampled FP64 forward-error
+bound, relative RMS below 0.00002, and exact row invariance at
+1/2/4/8/16/24/32/40/48/56/64 rows before timing captured launches. These are
+kernel diagnostics on recorded inputs, not full-model likelihood or serving
+throughput measurements.
+
+The tensor-core form passes these checks: FP64 relative RMS 0.000006765,
+maximum scalar-to-tensor-core logit change 0.00008393, and no local argmax
+changes among the 64 rows. Lossless BF12 storage gives exactly the same output
+hashes as BF16 storage in each arithmetic mode. At 64 rows, checkpoint BF16
+takes 2.764 ms with tensor cores versus 20.131 ms with scalar chunks. At eight
+rows, the tensor-core form takes 2.622 ms from BF16 and 2.017 ms from BF12.
+BF12's 32-row launch ceiling makes two packed launches slower than one BF16
+launch at wider batches, so keeping both copies lets the existing dispatch
+use packed weights through 32 rows and BF16 above that. Packed-only residency
+retains the scalar chain because wider tensor-core calls need raw weights.
+The integrated serving change passes all 11 selected regression targets,
+including eight-request greedy/sampled graph replay, exact isolated-versus-
+batched logits, shared prefill and the compact-head/kernel suites. Full-model
+likelihood checks remain required for the new head chain.

@@ -367,12 +367,17 @@ void MinimaxModel::project_head(const uint16_t* hidden, float* out, int rows, bo
   // Keep every verification width on the same FP32 reduction chain, including
   // checkpoint BF16 weights and shapes the lossless BF12 packer declines.
   // A cuBLAS dispatch here changes logits as occupancy changes and can insert
-  // non-kernel graph nodes. The drafter shares this head and GEMM object.
+  // non-kernel graph nodes. The tensor-core form reads the head once per batch;
+  // its BF12 and BF16 forms have identical chains at every supported width.
+  // Packed-only residency retains the scalar chain: wider tensor-core calls
+  // may need the raw weight. The drafter shares this head and GEMM object.
   gemm_.set_bf12_wide(decode);
+  gemm_.set_decode_mma(decode && !gemm_.bf12_raw_released(globals_.lm_head));
   gemm_.set_kernel_only_rows(decode ? 1 : 0, decode ? max_decode_rows_ : 0);
   gemm_.matmul(hidden, globals_.lm_head, out, rows, lm_vocab_count_, cfg_.hidden_size, DType::BF16,
                GemmOut::F32, cfg_.hidden_size, gemm_ws_, gemm_ws_bytes_, stream_);
   gemm_.set_kernel_only_rows(0, 0);
+  gemm_.set_decode_mma(false);
 }
 MinimaxModel::Outputs MinimaxModel::forward(const std::vector<int64_t>& ids, bool layers) {
   const int T = static_cast<int>(ids.size());
