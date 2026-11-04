@@ -10,10 +10,17 @@ Unicode/whitespace preservation, disconnect retirement and cold controls.
 Run `scripts/serve_cancel_prefix_check.py` on an idle serving world to compare
 actual rerendered interrupted histories with cold replies; pass the source
 revision, binary hash and an output path for its detailed JSON report.
-`--thinking` also exercises reasoning history, and `--require-answer-hit`
-requires a cancelled reply to produce a deeper hit. The report distinguishes
+`--thinking` uses the template's native reasoning mode, including always-on
+templates, and `--require-answer-hit` requires at least one cancelled reply
+to produce a deeper hit. The report distinguishes
 answer-prefix hits from earlier prompt hits; retained state may sit at no
 cut of the resubmitted history, especially with one-token snapshot alignment.
+The probe requires exact cached/cold text, finish reasons and completion-token
+counts, and retains its partial report on failure. DSA models can differ when
+cached decode state and cold prefill use different arithmetic shapes; see
+[greedy transcripts and chunk shape](numerics.md#greedy-transcripts-and-chunk-shape).
+Pin admission budgets for comparisons and use a base-revision normal-completion
+control to distinguish existing numerical differences from a retention regression.
 
 `nvme_cache_test` checks reuse of an existing binding after build/settings
 changes, adoption and exact-token lookup through the host disk index, legacy
