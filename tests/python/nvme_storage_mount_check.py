@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Real storage placement checks in a private mount namespace (Linux).
 
-Run: sudo python3 tests/python/nvme_storage_mount_test.py --binary build-ci/cache_storage_test
+Run: sudo python3 tests/python/nvme_storage_mount_check.py --binary build-ci/cache_storage_test
 No model or GPU is used. All mounts and files belong to a temporary fixture;
 the namespace disappears even if the driver is interrupted.
 """

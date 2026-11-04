@@ -168,7 +168,7 @@ DGPP_TEST(cache_storage_tmpfs_refusal_does_not_depend_on_direct_io_support) {
 
 DGPP_TEST(cache_storage_mount_namespace) {
   const char* fixture = std::getenv("DGPP_TEST_MOUNTS_ROOT");
-  if (!fixture) dgpp::test::skip("run tests/python/nvme_storage_mount_test.py for real mount coverage");
+  if (!fixture) dgpp::test::skip("run tests/python/nvme_storage_mount_check.py for real mount coverage");
   const fs::path root(fixture), mounted = root / "bind";
   const auto mount = dgpp::inspect_cache_directory(mounted.string());
   require(mount.mount_point == mounted.string(), "bind mount is visible despite identical st_dev");
@@ -207,7 +207,7 @@ DGPP_TEST(cache_storage_mount_namespace) {
 
 DGPP_TEST(cache_storage_unmounted_namespace) {
   const char* fixture = std::getenv("DGPP_TEST_UNMOUNTED_ROOT");
-  if (!fixture) dgpp::test::skip("run tests/python/nvme_storage_mount_test.py for unmount coverage");
+  if (!fixture) dgpp::test::skip("run tests/python/nvme_storage_mount_check.py for unmount coverage");
   const fs::path mount = fs::path(fixture) / "bind";
   seed(mount);
   require(!plan(mount, mount.string(), true).error.empty(), "previous mount now ordinary directory refused");

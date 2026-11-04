@@ -38,7 +38,7 @@ real mounts and are reported as skipped in the ordinary host run. Run them
 in a private mount namespace with:
 
 ```sh
-sudo python3 tests/python/nvme_storage_mount_test.py --binary build-ci/cache_storage_test
+sudo python3 tests/python/nvme_storage_mount_check.py --binary build-ci/cache_storage_test
 ```
 
 The driver creates temporary bind, read-only, nested, OverlayFS, tmpfs and
