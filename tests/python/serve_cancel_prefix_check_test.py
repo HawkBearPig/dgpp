@@ -129,6 +129,7 @@ class CancellationProbeTest(unittest.TestCase):
                     "--out", str(report_path), "--source-revision", "fixture",
                     "--binary-sha256", "fixture", "--rounds", "2", "--thinking"]
             with patch.object(check, "Probe", PrefixProbe), patch.object(sys, "argv", argv), \
+                    patch.object(check, "default_url", side_effect=AssertionError("explicit URL needs no site config")), \
                     redirect_stdout(io.StringIO()):
                 check.main()
             report = json.loads(report_path.read_text())

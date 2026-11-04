@@ -148,7 +148,7 @@ def compare(hot, cold):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--url", default=default_url())
+    parser.add_argument("--url", help="default: the selected deployment's endpoint")
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--source-revision", required=True)
     parser.add_argument("--binary-sha256", required=True)
@@ -163,6 +163,7 @@ def main():
     args = parser.parse_args()
     if min(args.rounds, args.cancel_deltas, args.prompt_lines) < 1 or args.cancel_deltas >= 4096:
         parser.error("positive sizes required; cancel-deltas must be below 4096")
+    args.url = args.url or default_url()
     probe = Probe(args.url, thinking=args.thinking)
     report = {"model": probe.model, "source_revision": args.source_revision,
               "binary_sha256": args.binary_sha256, "args": vars(args) | {"out": str(args.out)},
