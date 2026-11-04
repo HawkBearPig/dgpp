@@ -702,6 +702,18 @@ void ToolCallParser::feed(int64_t id, std::vector<Event>* out) {
       return;
 
     case State::kContent:
+      // MiniMax's adaptive no-thinking reply starts with </mm:think>
+      // without an opener. It is a mode delimiter, not answer text.
+      if (options_.model_may_open_thinking && !content_started_ &&
+          markers_.minimax_namespace.available() && is_marker(id, markers_.think_close)) {
+        content_started_ = true;
+        Event ev;
+        ev.kind = Event::Kind::kReasoningClosed;
+        if (options_.track_tokens)
+          ev.tokens.push_back({current_token_, 0, markers_.think_close.text.size()});
+        out->push_back(std::move(ev));
+        return;
+      }
       // The model's own opener (the prompt left it the choice): before any
       // content, <think> opens the reasoning.
       if (options_.model_may_open_thinking && !content_started_ && is_marker(id, markers_.think_open) &&

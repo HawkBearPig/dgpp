@@ -95,6 +95,15 @@ int main(int argc, char** argv) {
       if (event.kind == K::kContent) content += event.text;
     }
     require(reasoning == "Consider." && content == "Answer.", "reasoning/content split differs");
+    dgpp::text::ToolCallParser no_thought(
+        markers, [&](const std::vector<int64_t>& ids) { return tok.decode(ids); }, {}, options);
+    events.clear();
+    for (auto id : tok.encode("</mm:think>你好！")) no_thought.feed(id, &events);
+    no_thought.finish(&events);
+    content.clear();
+    for (const auto& event : events)
+      if (event.kind == dgpp::text::ToolCallParser::Event::Kind::kContent) content += event.text;
+    require(content == "你好！", "adaptive no-thinking delimiter must not leak into content");
     std::printf("MiniMax prompt: %zu Jinja/HF cases exact; adaptive reasoning PASS\n", count);
     return 0;
   } catch (const std::exception& error) {

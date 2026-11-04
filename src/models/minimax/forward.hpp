@@ -1,5 +1,7 @@
 #pragma once
+#include <functional>
 #include <memory>
+#include <string_view>
 
 #include "engine/boundary_reducer.hpp"
 #include "engine/memory_plan.hpp"
@@ -42,6 +44,10 @@ class MinimaxModel : public SessionModel<MinimaxModel> {
   const MinimaxKvPool& kv_pool() const { return pool_; }
   LatentFormat kv_format() const { return LatentFormat::kBf16; }
   void set_decode_row_traces(bool on) { decode_row_traces_ = on; }
+  // Optional diagnostics at replicated BF16 sublayer boundaries. The
+  // observer receives device memory and orders any reads on the stream.
+  using Observer = std::function<void(int, std::string_view, const uint16_t*, int, cudaStream_t)>;
+  void set_observer(Observer observer) { observer_ = std::move(observer); }
   Outputs forward(const std::vector<int64_t>& ids, bool capture_layers = false);
   Outputs run_rows(const RowRun&);
   void reset_slot_state(int req);
@@ -86,5 +92,6 @@ class MinimaxModel : public SessionModel<MinimaxModel> {
   uint16_t *resid_ = nullptr, *x_ = nullptr, *y_ = nullptr;
   int32_t* trace_ids_ = nullptr;
   float* trace_weights_ = nullptr;
+  Observer observer_;
 };
 }  // namespace dgpp

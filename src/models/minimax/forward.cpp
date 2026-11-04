@@ -195,6 +195,7 @@ MinimaxModel::Outputs MinimaxModel::run_rows(const RowRun& run) {
     const auto& r = loader_.load_layer(layer);
     if (r.moe && !run.capture) moe_->prepare_table(layer, r.moe_w, stream_);
     norm(resid_, pending, r.input_norm, x_, T);
+    if (observer_ && !run.capture) observer_(layer, "input_norm", x_, T, stream_);
     auto* attn = stage(T, run.capture);
     run.for_each_kernel_group([](int a, int b) { return a > 128 && b > 128; },
                               [&](int row0, int n, bool decode, int) {
@@ -207,7 +208,9 @@ MinimaxModel::Outputs MinimaxModel::run_rows(const RowRun& run) {
                                                attn + static_cast<size_t>(row0) * H, stream_);
                               });
     fold(attn, T, run.capture);
+    if (observer_ && !run.capture) observer_(layer, "attention", attn, T, stream_);
     norm(resid_, attn, r.post_norm, x_, T);
+    if (observer_ && !run.capture) observer_(layer, "ffn_norm", x_, T, stream_);
     auto* ffn = stage(T, run.capture);
     run.for_each_kernel_group(
         [&](int a, int b) { return r.moe || (a > 128 && b > 128); },
@@ -228,6 +231,7 @@ MinimaxModel::Outputs MinimaxModel::run_rows(const RowRun& run) {
             dense_->enqueue(r.dense, x_ + off, n, ffn + off, stream_);
         });
     fold(ffn, T, run.capture);
+    if (observer_ && !run.capture) observer_(layer, "ffn", ffn, T, stream_);
     pending = ffn;
     if (r.moe) ++ordinal;
     if (run.capture_layers) {

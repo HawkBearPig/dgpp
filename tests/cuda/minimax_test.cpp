@@ -13,6 +13,7 @@
 #include "common/cuda_check.hpp"
 #include "common/dtypes.hpp"
 #include "kernels/sink_attn.hpp"
+#include "minimax_fixture.hpp"
 #include "models/minimax/forward.hpp"
 #include "models/minimax/reference.hpp"
 
@@ -356,12 +357,16 @@ void smoke(const std::string& path, const std::string& dump) {
 }  // namespace
 int main(int argc, char** argv) {
   try {
-    std::string checkpoint, dump;
+    std::string checkpoint, dump, fixture, config;
     bool run_kernels = false;
     for (int i = 1; i < argc; ++i) {
       std::string a = argv[i];
       if (a == "--kernels")
         run_kernels = true;
+      else if (a == "--write-fixture" && i + 1 < argc)
+        fixture = argv[++i];
+      else if (a == "--config" && i + 1 < argc)
+        config = argv[++i];
       else if ((a == "--checkpoint-dir" || a == "--dump") && i + 1 < argc) {
         const auto v = std::string(argv[++i]);
         if (a == "--dump")
@@ -370,6 +375,11 @@ int main(int argc, char** argv) {
           checkpoint = v;
       } else
         throw std::runtime_error("invalid argument: " + a);
+    }
+    if (!fixture.empty()) {
+      require(!config.empty(), "--write-fixture requires --config");
+      minimaxfx::write(fixture, config);
+      return 0;
     }
     if (run_kernels) kernels();
     if (!checkpoint.empty()) smoke(checkpoint, dump);

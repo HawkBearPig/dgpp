@@ -1,7 +1,7 @@
 # MiniMax M3.1 Flash implementation and optimization plan
 
 Investigated 2026-11-04 against dgpp `403d3f987964f6cd548348316c86520fb700ec71`.
-Status: proposed implementation; checkpoint inventory and source study complete.
+Status: implementation in progress on the feature branch; real-checkpoint text validation underway.
 
 Implement `MiniMaxAI/MiniMax-M3.1-Flash` as a new model family on the shared
 engine, initially at TP4. Keep its published NVFP4 experts and MXFP8 dense
@@ -485,3 +485,40 @@ Prompt validation covers the shipped Jinja template and HF tokenizer,
 including recursive XML history, NFC, the case-sensitive split pattern,
 contractions, Unicode and adaptive `<mm:think>` reasoning. The native
 renderer adds the Jinja boolean test required by the shipped template.
+
+### Real-checkpoint baseline investigation
+
+The pinned target and bundled DSpark snapshot are downloaded and checksum-synced
+to all four nodes. A TP4 baseline boots with 59.72 GiB of text weights per rank
+and zero process swap on all ranks. Initial chat smoke tests run; throughput
+figures are withheld until the complete deployment campaign and accuracy gates.
+The smoke exposed an initial adaptive `</mm:think>` delimiter leaking into
+content; the parser now handles that delimiter, with a regression case.
+
+A five-token real-checkpoint probe records all 60 residuals and sublayer
+boundaries. Every rank has identical residuals and expert selections. An
+independent NumPy FP64 reference, with the same recorded sublayer inputs and
+explicit TP4 BF16 folds, reports maxima of 0.005070 relative RMS for attention
+and 0.000833 for the feed-forward outputs. All 57 routers select the same
+experts from the recorded inputs; the final vocabulary head has relative RMS
+6.37e-6. A whole-layer reference first diverges at layer 26 because a small
+attention difference crosses a near-tied expert boundary. That original
+whole-layer failure is retained as an investigation finding, not waived by
+the isolated checks. Full-model NLL validation remains required.
+
+`minimax_forward_check` records layer/substage outputs or scores a fixed
+teacher stream through session verification. `tools/minimax_reference_dump.py`
+checks independent whole-layer or isolated-stage math. The optional PyTorch
+reference streams the real checkpoint one layer at a time without loading
+dgpp kernels; it simulates TP folds and scores complete texts with FP32
+attention. Its default follows the published fused normalization of the
+unrounded residual sum. The explicit `--rounded-residual` diagnostic isolates
+the baseline's existing BF16 residual-normalization boundary. These tools
+provide numerical evidence; their elapsed times are not serving benchmarks.
+
+The first independent full-text check (529 tokens, 528 scored positions,
+quick teacher text) failed against the published normalization recipe:
+absolute mean NLL delta 0.10734 nat and 7.01% of positions moving by over
+1 nat. The baseline's NLL was lower, but the bidirectional numerical gate
+still fails. Normalization and attention arithmetic are under investigation;
+no quality or completion claim is made from the chat smoke.
