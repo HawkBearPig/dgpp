@@ -93,7 +93,7 @@ std::string NvmeCachePlan::describe() const {
 NvmeCachePlan plan_nvme_cache(const std::string& path, double capacity_gib, int rank, size_t block_bytes,
                               size_t blob_bytes, int64_t block_tokens, int64_t context_limit,
                               bool create_directory, size_t reserve_bytes, const std::string& binding,
-                              size_t chunk_bytes) {
+                              size_t chunk_bytes, const std::string& required_mount, bool allow_buffered) {
   NvmeCachePlan plan;
   plan.directory = expand_home(path) + (binding.empty() ? "" : "/" + binding);
   plan.slab = plan.directory + "/rank" + std::to_string(rank) + ".slab";
@@ -121,30 +121,14 @@ NvmeCachePlan plan_nvme_cache(const std::string& path, double capacity_gib, int 
       static_cast<int64_t>(plan.page_bytes);
   plan.minimum_bytes =
       static_cast<size_t>(plan.blob_pages + ids_pages_at_limit + blocks_at_limit) * plan.page_bytes;
-  // The directory: made now, so the probe below measures the filesystem
-  // the slab lands on — or, for a dry run, the nearest ancestor that
-  // exists (what mkdir -p would extend), left untouched.
-  std::string probe = plan.directory;
+  // Inspect before mkdir/open/preallocation, including in normal serving.
+  plan.storage = inspect_cache_directory(plan.directory);
+  plan.error = check_cache_storage(plan.storage, required_mount, allow_buffered);
+  if (!plan.error.empty()) return plan;
+  plan.directory = plan.storage.path;
+  plan.slab = plan.directory + "/rank" + std::to_string(rank) + ".slab";
+  const std::string& probe = plan.storage.probe;
   std::error_code ec;
-  if (create_directory) {
-    std::filesystem::create_directories(plan.directory, ec);
-    if (ec) {
-      plan.error = "nvme_cache.path " + plan.directory + " cannot be created: " + ec.message();
-      return plan;
-    }
-  } else {
-    std::filesystem::path p(plan.directory);
-    while (!p.empty() && !std::filesystem::is_directory(p, ec)) {
-      const std::filesystem::path parent = p.parent_path();
-      if (parent == p) break;
-      p = parent;
-    }
-    if (p.empty() || !std::filesystem::is_directory(p, ec)) {
-      plan.error = "nvme_cache.path " + plan.directory + ": no existing ancestor to probe";
-      return plan;
-    }
-    probe = p.string();
-  }
   if (::access(probe.c_str(), W_OK | X_OK) != 0) {
     plan.error = "nvme_cache.path " + probe + " is not writable: " + std::strerror(errno);
     return plan;
@@ -175,6 +159,17 @@ NvmeCachePlan plan_nvme_cache(const std::string& path, double capacity_gib, int 
         capacity_gib, gib(static_cast<double>(plan.capacity_bytes)), gib(static_cast<double>(plan.reserve_bytes)),
         gib(static_cast<double>(plan.free_bytes)), plan.directory);
     return plan;
+  }
+  if (create_directory) {
+    std::filesystem::create_directories(plan.directory, ec);
+    if (ec) {
+      plan.error = "nvme_cache.path " + plan.directory + " cannot be created: " + ec.message();
+      return plan;
+    }
+    // Recheck the directory actually created; the opener checks its descriptor
+    // too, before truncation, in case mounts change while the model loads.
+    plan.storage = inspect_cache_directory(plan.directory);
+    plan.error = check_cache_storage(plan.storage, required_mount, allow_buffered);
   }
   return plan;
 }

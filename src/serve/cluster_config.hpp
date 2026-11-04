@@ -397,6 +397,9 @@ struct ClusterConfig {
   struct NvmeCache {
     bool enabled = false;
     std::string path = "~/dgpp/nvme-cache";
+    // Local placement assertion, independent of cache identity and rank 0's
+    // numerical settings. Empty disables it; otherwise an absolute mountpoint.
+    std::string required_mount;
     double capacity_gib = 0.0;
     int64_t min_tokens = 0;
     // One staging slice in MiB: two slices of device work move per tick, so
@@ -415,8 +418,8 @@ struct ClusterConfig {
     // Select an existing binding across build/settings changes. This is
     // the operator's compatibility assertion; structural checks still run.
     std::string reuse_binding;
-    // A filesystem that refuses direct I/O (tmpfs) is refused unless this
-    // allows buffered I/O: the page cache would grow into the model's memory.
+    // Tests/experiments only: permits RAM-backed storage and filesystems that
+    // refuse direct I/O. Neither is suitable for the normal memory budget.
     bool allow_buffered = false;
     // An op without progress for this long fails, so a request waiting on
     // its restore admits cold instead of never (0: never).

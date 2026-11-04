@@ -31,6 +31,24 @@ The persistence section of `qwen_decode_test` also restores GPU state with
 explicit reuse and verifies that rejected reuse and world disagreement leave
 the selected files unchanged. Run GPU checks on idle hardware.
 
+`cache_storage_test` checks NVMe storage placement, including randomized
+mountinfo parsing, escaped mountpoint names, missing paths, symlinks,
+non-destructive refusals and unconditional tmpfs rejection. Two cases require
+real mounts and are reported as skipped in the ordinary host run. Run them
+in a private mount namespace with:
+
+```sh
+sudo python3 tests/python/nvme_storage_mount_check.py --binary build-ci/cache_storage_test
+```
+
+The driver creates temporary bind, read-only, nested, OverlayFS, tmpfs and
+ramfs mounts, checks startup planning, and verifies refusal after unmounting
+the required destination. It unmounts them before deleting its fixture; the
+private namespace also limits mount lifetime if interrupted. Container
+replacement/adoption and multi-rank serving remain separate integration
+checks. Keep the binary, model, effective settings and cache binding stable
+when testing replacement, so a compatibility change does not mask placement.
+
 `chat_template_generator_test` exercises the Python golden generator's Jinja
 sandbox without a checkpoint or GPU. It checks private-attribute restrictions,
 input immutability, literal message data, namespace/loop behavior, JSON rendering

@@ -439,10 +439,10 @@ class SchedulerEngine {
     // Explicit reuse must refuse an incompatible/missing index or a world
     // disagreement without clearing the cache the operator selected.
     bool require_existing = false;
-    // A filesystem that refuses direct I/O (tmpfs) gets buffered I/O only
-    // when allowed: the page cache would grow into the memory the model
-    // plans on. The tests allow it.
+    // Explicit allowance for tests/experiments: RAM-backed storage and buffered
+    // I/O would otherwise consume memory outside the model's budget.
     bool allow_buffered = false;
+    std::string required_mount;  // local placement assertion, checked again before slab mutation
     // An op that makes no progress this long fails — its buffers held by a
     // stuck read or write come back when the worker does — so the requests
     // waiting on a restore admit cold instead of never (0: never).

@@ -159,9 +159,13 @@ def deployment(path):
     nvme = cfg.get("nvme_cache", {})
     if not isinstance(nvme, dict) or set(nvme) - {"enabled", "path", "capacity_gib", "min_tokens",
                                                    "chunk_mib", "max_ops", "reserve_gib", "persist",
-                                                   "allow_buffered", "op_timeout_s", "reuse_binding"}:
+                                                   "allow_buffered", "op_timeout_s", "reuse_binding", "required_mount"}:
         raise ValueError("nvme_cache may only contain enabled, path, capacity_gib, min_tokens, chunk_mib, "
-                         "max_ops, reserve_gib, persist, allow_buffered, op_timeout_s and reuse_binding")
+                         "max_ops, reserve_gib, persist, allow_buffered, op_timeout_s, reuse_binding and required_mount")
+    required_mount = nvme.get("required_mount", "")
+    if (not isinstance(required_mount, str) or "\0" in required_mount
+            or (required_mount and not required_mount.startswith("/"))):
+        raise ValueError("nvme_cache.required_mount must be empty or an absolute mountpoint path")
     if "persist" in nvme and not isinstance(nvme["persist"], bool):
         raise ValueError("nvme_cache.persist must be true or false")
     if "allow_buffered" in nvme and not isinstance(nvme["allow_buffered"], bool):
