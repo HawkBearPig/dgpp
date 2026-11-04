@@ -700,3 +700,24 @@ drafter integration cases pass, including greedy and sampled captures at
 32/24/16/8 rows. The independent draft oracle and native kernel/loader
 gates also pass. The real 6144-wide graph is checked separately at startup;
 the tiny fixture alone cannot reproduce cuBLAS's shape-specific memset.
+
+### Four-rank native draft smoke
+
+Source `7b713fdf`, server SHA-256
+`9ec1dc26122a01656b6ea5afcd5f1395014bfab7dff1729f28ae4f27282122d1`,
+boots the full target and bundled DSpark with four slots and all 8/16/24/32
+verification-row graphs. Plain and speculative greedy transcripts match
+exactly for the four 256-token prompts, both sequentially and concurrently,
+including raw reasoning/content, finish reasons and token counts. The
+speculative world also passes the maintained API checks, cold/hot prefix
+usage, recursive typed tool calls in one-shot and SSE responses, and the
+unsupported-tool-schema refusal. Every rank is at zero swap before and
+after both worlds, with matching binaries. Operation streams match at
+`6210ef4df1bac9c0fb48d7ba48cd2a53` for speculation and
+`fc1071765bff124585ab6e298979e03f` for plain decode.
+
+These are integration probes, not published benchmark rows or completed
+task-quality tests. The initial base-logit shortlist draft is slower than
+plain decode on this battery; investigate the shortlist's effect on
+Markov-conditioned proposals and tune verification depth before choosing
+deployment defaults.
