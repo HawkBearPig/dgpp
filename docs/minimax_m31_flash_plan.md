@@ -1082,12 +1082,29 @@ The optimized TP4 numerical probe from `4a9726c0` (SHA-256
 passes the complete technical continuation against the fixed-order reference:
 mean NLL increases by approximately **0.0000212 nat**, with no argmax changes
 or changes exceeding 1 nat across 7,220 positions. Both native trials have
-identical logit hashes. All 1,860 hidden-state hashes per rank, covering both
+identical logit hashes. All 1,860 final-hidden-state hashes per rank, covering both
 trials through all 60 layers, match the earlier native run exactly; the small
 logit difference comes from the invariant scalar vocabulary head. Every rank
 reports zero process swap and the same binary hash throughout the run.
-This closes the long technical-corpus checks for these two changes; the
-other corpora and task-quality checks remain separate release gates.
+This closes the long technical-corpus checks for these two changes.
+
+The broader fixed-order reference also passes against this frozen native
+binary. Each native case repeats twice with identical logit hashes and zero
+process swap on every rank. The six cases together cover **28,329 scored
+positions**, with no argmax changes and no changes exceeding 1 nat. The
+maximum absolute per-position log-probability change is 0.00017479 nat.
+
+| Corpus | Scored positions | Mean NLL change, native minus reference (nat) |
+| --- | ---: | ---: |
+| Technical, chat continuation | 7,220 | +0.00002118 |
+| Technical, raw continuation | 7,219 | +0.00001927 |
+| Memorized, chat continuation | 6,417 | +0.00000713 |
+| Memorized, raw continuation | 6,416 | +0.00001543 |
+| Short, chat continuation | 529 | +0.00000664 |
+| Short, raw continuation | 528 | +0.00000616 |
+
+These results establish the optimized index plus scalar-head baseline. The
+following tensor-core head is checked separately against the same references.
 
 ### Vocabulary-head experiment
 

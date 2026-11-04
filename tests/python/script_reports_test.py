@@ -35,6 +35,7 @@ import bench_stream
 import bench_compare
 import serve_load
 import serve_prefill_probe
+import serve_context_matrix
 import fabric_logprob
 
 
@@ -42,6 +43,16 @@ def capture(function, *args):
     with redirect_stdout(io.StringIO()) as output:
         result = function(*args)
     return result, output.getvalue()
+
+
+class MinimalContextTest(unittest.TestCase):
+    def test_bounded_prompt_retains_cold_run_identity(self):
+        tag = 'deployment-with-a-long-label-' * 100
+        prompt = serve_context_matrix.make_prompt(None, 0, tag, 17)
+        self.assertLess(len(prompt), 100)
+        self.assertEqual(prompt, serve_context_matrix.make_prompt(None, 0, tag, 17))
+        self.assertNotEqual(prompt, serve_context_matrix.make_prompt(None, 0, tag + 'next', 17))
+        self.assertNotEqual(prompt, serve_context_matrix.make_prompt(None, 0, tag, 18))
 
 
 def response(request="chatcmpl-a", content="answer", tokens=4):
