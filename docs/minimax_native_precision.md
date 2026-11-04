@@ -44,10 +44,14 @@ Routed experts use NVFP4 W4A4. Both GEMM inputs are quantized dynamically per
 token. The MiniMax adapter explicitly neutralizes the checkpoint's static
 input globals; those globals must not be reused as static activation scales.
 The SwiGLU-OAI function uses alpha 1.702, an upper gate clamp of 7, an up
-clamp of [-7, 7] and an up offset of 1. Expert fusion boundaries and the
-second GEMM's scale/epilogue remain part of the reference audit; the earlier
-activation prescreen does not certify them.
+clamp of [-7, 7] and an up offset of 1. The per-token FlashInfer path fuses
+the FP32 first GEMM accumulations with the activation and emits BF16 before
+the explicit second input quantizer. The second GEMM emits BF16 before the
+weighted expert reduction. In particular, it does not insert separate BF16
+gate/up roundings. The earlier activation prescreen did not certify these
+boundaries.
 [MiniMax quantization adapter](https://github.com/sgl-project/sglang/blob/58484246d26523eaf1a7f16ab524deee288d2120/python/sglang/srt/layers/quantization/minimax_m3_nvfp4.py).
+[FlashInfer per-token workspace and output types](https://github.com/flashinfer-ai/flashinfer/blob/d84335d8c54e0c8f9f7e22faa15c7e34a58abf94/csrc/trtllm_fused_moe_kernel_launcher.cu).
 
 ## Q8KV4 attention
 
@@ -146,3 +150,27 @@ Run `ctest --test-dir build-release -R '^minimax_native_attention_test$'
 --output-on-failure` after building that target. The test generates temporary
 fixtures and checks CUDA output against the independent CPU formula. These
 tests certify the isolated path, not full-model fidelity or throughput.
+
+## Initial native expert stage validation
+
+The native expert quantizer matches the actual hash-pinned FlashInfer 0.7.2
+CuTe GPU producer byte for byte: E2M1 payloads, E4M3 block scales and FP32
+per-token globals. Cases include all 65,280 finite BF16 patterns, signed
+zero rows, padded input strides, outliers and row widths through 32,768.
+The exhaustive tiny inputs also reproduce upstream's approximate reciprocal
+with subnormal flushing; they are not evaluated with a normal-range
+nearest-format rounding bound.
+
+Four expert chains cover 1 through 65 rows and a 6,144-wide hidden input.
+Their first matrix products satisfy independent FP64 forward-error bounds;
+SwiGLU has the required FP32-to-BF16 boundary; and the second product meets
+its FP64 accumulation plus BF16-rounding bound. Splitting into 1-, 8- and
+17-row calls preserves the stage outputs exactly. The new producers pass
+PDL graph replay, CUDA memcheck and racecheck, with zero errors or hazards.
+
+Run `minimax_native_moe_test` through CTest for the independent stage checks.
+For the additional upstream GPU comparison, run
+`tools/minimax_native_moe_regression.py --app <test-binary> --upstream` in an
+environment containing the pinned FlashInfer source and its CuTe dependency.
+The checker verifies the quantizer source hashes before execution. This is
+not a full upstream MoE or full-model comparison.
