@@ -105,6 +105,9 @@ APP_ARGS=("$@")
 [[ -x "$APP" ]] || die "app not found/executable: $APP (build it, or pass --app)"
 # Refuse to stage over an executable that another run is using.
 APP_NAME="$(basename "$APP")"
+# Linux exposes only the first 15 bytes in comm (what pgrep -x matches).
+# Keep this guard conservative when two executable names share that prefix.
+APP_COMM="${APP_NAME:0:15}"
 WORLD=$((1 + ${#FABRIC_PEERS[@]}))
 LOG_DIR="${LOG_DIR:-$BUILD/fabric-runs/$(date -u +%Y%m%d-%H%M%S)}"
 mkdir -p "$LOG_DIR"
@@ -158,9 +161,9 @@ for i in "${!FABRIC_PEERS[@]}"; do
   peer_ssh "$ip" "test -f $PEER_DIR/cluster_process.py && python3 $PEER_DIR/cluster_process.py status --state $PEER_DIR/fabric_${RUN_ID}_rank$rank.process.json" >/dev/null 2>&1 \
     && die "this output directory has a running recorded peer on $ip; use --force to replace it"
 done
-pgrep -x "$APP_NAME" >/dev/null && die "a $APP_NAME already runs here; stop its owning run first"
+pgrep -x "$APP_COMM" >/dev/null && die "a $APP_NAME already runs here; stop its owning run first"
 for ip in "${FABRIC_PEERS[@]}"; do
-  peer_ssh "$ip" "pgrep -x $APP_NAME" >/dev/null 2>&1 \
+  peer_ssh "$ip" "pgrep -x $APP_COMM" >/dev/null 2>&1 \
     && die "a $APP_NAME already runs on $ip; stop its owning run first"
 done
 
