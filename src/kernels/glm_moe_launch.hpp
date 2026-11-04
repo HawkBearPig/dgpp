@@ -306,23 +306,20 @@ void launch_moe_slot_accum_routed_f32(float* out, const float* contrib,
 // and ignored by the grouped launcher (one m-tile per block always).
 // fp4_group 32 (2026-09-14): the MXFP4 table (e8m0 scales per 32 codes, no
 // global) through the same kernel, the pair decoded in fp32 (exact); k a
-// multiple of 32 then.
-void launch_moe_grouped_mma_fp4_bf16(const uint16_t* act, size_t act_stride,
-                                     const MoeSegment* segs, int n_segs,
-                                     int max_rows, int rows_per_block,
-                                     const MoeExpertView* views, int which,
-                                     uint16_t* out, size_t out_stride, int n,
-                                     int k, cudaStream_t stream,
-                                     const int32_t* act_rows = nullptr,
-                                     int fp4_group = kFp4Group);
-void launch_moe_grouped_mma_fp4_f32(const uint16_t* act, size_t act_stride,
-                                    const MoeSegment* segs, int n_segs,
-                                    int max_rows, int rows_per_block,
-                                    const MoeExpertView* views, int which,
-                                    float* out, size_t out_stride, int n, int k,
-                                    cudaStream_t stream,
-                                    const int32_t* act_rows = nullptr,
-                                    int fp4_group = kFp4Group);
+// multiple of 32 then. tile_rows selects a 16/64-row activation ring;
+// the accumulation order is identical. The default retains the 64-row tile.
+void launch_moe_grouped_mma_fp4_bf16(const uint16_t* act, size_t act_stride, const MoeSegment* segs,
+                                     int n_segs, int max_rows, int rows_per_block,
+                                     const MoeExpertView* views, int which, uint16_t* out,
+                                     size_t out_stride, int n, int k, cudaStream_t stream,
+                                     const int32_t* act_rows = nullptr, int fp4_group = kFp4Group,
+                                     int tile_rows = 64);
+void launch_moe_grouped_mma_fp4_f32(const uint16_t* act, size_t act_stride, const MoeSegment* segs,
+                                    int n_segs, int max_rows, int rows_per_block,
+                                    const MoeExpertView* views, int which, float* out,
+                                    size_t out_stride, int n, int k, cudaStream_t stream,
+                                    const int32_t* act_rows = nullptr, int fp4_group = kFp4Group,
+                                    int tile_rows = 64);
 // The reference kernel's grouped form (the microbench's A/B and the gate).
 void launch_moe_grouped_mma_fp4_ref_bf16(const uint16_t* act, size_t act_stride,
                                          const MoeSegment* segs, int n_segs,

@@ -217,7 +217,8 @@ void MinimaxMoeLayer::prepare_table(int layer, const MinimaxMoeResident& w, cuda
   m.prepared[layer] = true;
 }
 void MinimaxMoeLayer::enqueue(int layer, const MinimaxMoeResident& w, const uint16_t* x, int tokens,
-                              uint16_t* out, cudaStream_t stream, bool compact_segments) {
+                              uint16_t* out, cudaStream_t stream, bool compact_segments,
+                              bool narrow_tiles) {
   auto& m = *impl_;
   row_count(tokens, m.max_tokens);
   if (!m.prepared.at(static_cast<size_t>(layer)))
@@ -237,14 +238,17 @@ void MinimaxMoeLayer::enqueue(int layer, const MinimaxMoeResident& w, const uint
     minimax_compact_segments(m.segs, m.compact_segs, E, segments, stream);
     segs = m.compact_segs;
   }
+  // The smaller ring helps one to four rows. Wider verification batches
+  // keep the measured 64-row tile, including its lower memory traffic.
+  const int tile_rows = narrow_tiles && tokens <= 4 ? 16 : 64;
   launch_moe_grouped_mma_fp4_bf16(x, H, segs, segments, tokens, 0, views, 0, m.gate, I, I, H,
-                                  stream, m.rows);
+                                  stream, m.rows, kFp4Group, tile_rows);
   launch_moe_grouped_mma_fp4_bf16(x, H, segs, segments, tokens, 0, views, 1, m.up, I, I, H, stream,
-                                  m.rows);
+                                  m.rows, kFp4Group, tile_rows);
   minimax_swiglu(m.gate, m.up, m.act, static_cast<int64_t>(tokens) * K * I, m.cfg.swiglu_alpha,
                  m.cfg.swiglu_limit, stream);
   launch_moe_grouped_mma_fp4_f32(m.act, I, segs, segments, tokens, 0, views, 2, m.down, H, H, I,
-                                 stream);
+                                 stream, nullptr, kFp4Group, tile_rows);
   launch_moe_accum_ordered(out, m.down, H, m.slot_row, m.ids, m.weights, -1, tokens, K, H, stream);
   m.shared.enqueue(w.shared, x, tokens, m.shared_out, stream);
   glm_residual_add_bf16(out, m.shared_out, static_cast<int64_t>(tokens) * H, stream);

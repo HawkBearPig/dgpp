@@ -44,6 +44,10 @@ enabled by this template. Lossless BF12 vocabulary-head storage preserves the
 checkpoint's exact BF16 values; the template retains the BF16 copy as well for
 wider projections and prefill.
 
+The tested MXFP8-dense and NVFP4-expert activation controls fail the unchanged
+numerical limits. Their results and scope are recorded in the
+[activation precision prescreen](../minimax_m31_flash_plan.md#activation-precision-prescreen).
+
 Every layer uses MiniMax sparse attention: 128-token blocks, independent
 selection per index head, and 16 selected blocks including the current block
 inside that budget. The cache retains an index key for every token. The

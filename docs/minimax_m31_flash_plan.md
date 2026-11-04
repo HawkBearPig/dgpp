@@ -1140,3 +1140,78 @@ repeat exactly. All 7,256 final-hidden-state hashes per rank match the
 previous scalar-head binary, and every rank reports zero process swap and
 the expected binary hash throughout each case. These checks use
 `bf12+bf16` storage, including the packed narrow projection.
+
+### Activation precision prescreen
+
+The independent reference can isolate activation quantization with
+`--activation-quantization mxfp8` or `nvfp4`, keeping the fixed projection,
+elementwise and attention reductions. MXFP8 applies E4M3 values with
+ceil-rounded E8M0 scales over 32 columns at the published MXFP8 matrices.
+NVFP4 applies dynamic per-TP-row globals, E4M3 scales over 16 columns and
+nearest-even E2M1 codes at routed-expert matrices. Its global factor stays
+outside the dot, and the fused feed-forward activation is not first rounded
+to BF16. Quantizer self-tests cover code points, ties, neighboring values,
+zero rows, reconstruction error and exact invariance to row batching.
+
+These controls measure quantization error at the reference's reduction order;
+they do not implement or certify a native FP8/FP4 GEMM. The 60-layer pilots
+use 528 raw-prose and 529 chat-continuation scoring positions against the
+same BF16-activation references above. The reference controls are committed
+at `47c71f13`; all projection, elementwise and attention backends are
+`triton-fixed`.
+
+| Activation control | Corpus | Mean NLL change (nat) | Changes over 1 nat | Argmax changes |
+| --- | --- | ---: | ---: | ---: |
+| MXFP8 dense matrices | Raw prose | +0.06946 | 73/528 (13.83%) | 72 |
+| MXFP8 dense matrices | Chat prose | +0.00267 | 4/529 (0.76%) | 23 |
+| NVFP4 routed experts | Raw prose | -0.02122 | 89/528 (16.86%) | 95 |
+| NVFP4 routed experts | Chat prose | +0.00641 | 31/529 (5.86%) | 48 |
+
+Both recipes are rejected under the unchanged 0.02-nat absolute mean-NLL
+and 1% large-change limits. The MXFP8 chat case passes those two tests alone;
+its argmax changes have not been certified as near ties, and its raw case
+already rejects the recipe. Lower mean NLL on one NVFP4 case does not excuse
+its distribution changes. No native activation-quantized serving path is
+selected on this evidence. BF16 activations remain the deployment recipe;
+future selective or calibrated recipes need their own complete validation.
+
+### Serving profiles
+
+The TP4 server from `2e5f73a3`, SHA-256
+`bf69c93b9246352d2e7b10df8acf468fc41e8af0abeeb544507da5ae20773524`,
+was profiled on the code workload at C1 and C8 with a 65,536-token pool,
+eight request slots, `bf12+bf16` weights and fixed seven-proposal DSpark.
+All ranks reported zero process swap and the expected binary hash before
+and after; operation streams matched. These are instrumented profiles,
+including changes in occupancy as requests finish, not deployment rates.
+
+Expert projections account for approximately 48% and 53% of GPU kernel time
+at C1 and C8 respectively. Dense projections and collective work dominate
+the remainder. Short-context index selection accounts for less than 1%.
+This directs the next lossless experiment toward smaller expert activation
+tiles, followed by verification-depth and prefill-budget tuning.
+
+### Smaller expert activation ring
+
+The profile motivated a 16-row activation ring in the existing grouped FP4
+kernel. Its NVFP4 form uses 26,880 dynamic shared-memory bytes and 80 registers
+per thread, versus 47,616 bytes and 104 registers for the existing 64-row
+ring. It keeps the same ascending-k16 MMA chain, exact weight decoding and
+final global-scale division. All four default 64-row variants retain identical
+machine-code words; other model families continue selecting that default.
+
+The initial 16/32/64-row experiment passes bitwise dense-reference checks on
+ragged segments, gathered and unaligned inputs, BF16 gate output and FP32 down
+output. CUDA memcheck reports zero errors and racecheck zero hazards. Ten
+selected integration/reference targets also pass. Graph microbenchmarks use
+recorded normalized activations and actual TP4 rank-zero checkpoint weights
+at layers 3, 17 and 59, with five interleaved timing trials per shape.
+
+The 16-row ring improves the single-row MoE by 8.5%, 8.5% and 12.3% in these
+three layers. Four-row gains are 1.6%, 3.8% and 3.5%; two-row changes range
+from a 0.6% regression to a 2.3% gain. Eight-row results are mixed, including
+a 6.0% regression in layer 3, and all three 16-row cases regress. A 32-row
+ring brings no material gain and is removed. The retained dispatch selects
+16 only for one to four rows, and 64 otherwise. These are isolated MoE
+latencies, not serving throughput; final dispatch and end-to-end validation
+follow before release.

@@ -79,12 +79,12 @@ int main(int argc, char** argv) {
     cfg.validate_tp(rank, world);
     if (layer < 0 || layer >= cfg.num_hidden_layers || !cfg.is_moe_layer(layer))
       throw std::runtime_error("--layer must select a routed layer");
-    constexpr int max_rows = 32;
+    constexpr int max_rows = 64;
     const size_t elements = static_cast<size_t>(max_rows) * cfg.hidden_size;
     std::vector<uint16_t> x(elements);
     std::ifstream in(input, std::ios::binary);
     if (!in.read(reinterpret_cast<char*>(x.data()), elements * sizeof(uint16_t)))
-      throw std::runtime_error("input must contain at least 32 complete BF16 hidden rows");
+      throw std::runtime_error("input must contain at least 64 complete BF16 hidden rows");
     const auto geometry = dgpp::MinimaxLocalGeometry::from_config(
         cfg, rank, world, dgpp::LoaderHeadSharding::VocabSharded);
     // Only this layer is loaded. Resident-image preparation and all source
@@ -101,16 +101,16 @@ int main(int argc, char** argv) {
     Events clock;
     std::printf("MiniMax MoE kernel diagnostic: rank=%d world=%d layer=%d hidden=%d inter=%lld\n",
                 rank, world, layer, cfg.hidden_size, static_cast<long long>(geometry.local_inter));
-    std::printf("rows,reference_us,compact_us,speedup,outputs\n");
-    for (int rows : {1, 2, 4, 8, 16, 32}) {
-      Graph graphs[2];
+    std::printf("rows,reference_us,compact_us,narrow_us,compact_speedup,narrow_speedup,outputs\n");
+    for (int rows : {1, 2, 4, 8, 16, 17, 24, 32, 33, 64}) {
+      Graph graphs[3];
       std::vector<uint16_t> reference(static_cast<size_t>(rows) * cfg.hidden_size);
-      for (int mode = 0; mode < 2; ++mode) {
+      for (int mode = 0; mode < 3; ++mode) {
         for (int i = 0; i < 3; ++i)
-          moe.enqueue(layer, weights, dx.p, rows, dy.p, stream, mode != 0);
+          moe.enqueue(layer, weights, dx.p, rows, dy.p, stream, mode != 0, mode == 2);
         DGPP_CUDA_OK(cudaStreamSynchronize(stream));
         DGPP_CUDA_OK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
-        moe.enqueue(layer, weights, dx.p, rows, dy.p, stream, mode != 0);
+        moe.enqueue(layer, weights, dx.p, rows, dy.p, stream, mode != 0, mode == 2);
         DGPP_CUDA_OK(cudaStreamEndCapture(stream, &graphs[mode].graph));
         DGPP_CUDA_OK(
             cudaGraphInstantiate(&graphs[mode].exec, graphs[mode].graph, nullptr, nullptr, 0));
@@ -122,17 +122,17 @@ int main(int argc, char** argv) {
         if (mode == 0)
           reference = std::move(got);
         else if (got != reference)
-          throw std::runtime_error("compaction changed a BF16 output");
+          throw std::runtime_error("expert scheduling changed a BF16 output");
       }
-      std::vector<double> times[2];
+      std::vector<double> times[3];
       for (int trial = 0; trial < 5; ++trial)
-        for (int turn = 0; turn < 2; ++turn) {
-          const int mode = (trial + turn) % 2;
+        for (int turn = 0; turn < 3; ++turn) {
+          const int mode = (trial + turn) % 3;
           times[mode].push_back(clock.time(graphs[mode].exec, stream, iterations));
         }
       for (auto& values : times) std::sort(values.begin(), values.end());
-      std::printf("%d,%.3f,%.3f,%.4f,exact\n", rows, times[0][2], times[1][2],
-                  times[0][2] / times[1][2]);
+      std::printf("%d,%.3f,%.3f,%.3f,%.4f,%.4f,exact\n", rows, times[0][2], times[1][2],
+                  times[2][2], times[0][2] / times[1][2], times[1][2] / times[2][2]);
       std::fflush(stdout);
     }
     DGPP_CUDA_OK(cudaStreamDestroy(stream));
