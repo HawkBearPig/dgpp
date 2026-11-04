@@ -1362,6 +1362,16 @@ prefill chunks; long-context quality and the complete campaign remain pending.
 
 ### Native inference fidelity baseline
 
+The [native precision contract](minimax_native_precision.md) records the
+pinned source versions, actual dense activation fusion boundaries and the
+distinct upstream attention prefill/decode formulas. Its independent
+contiguous Q8KV4 oracle matches the pinned MSA CPU references exactly at
+1, 129, 270 and 2,057 keys, including permuted physical pages and sparse
+selections. All 16 FP4 codes crossed with all 127 nonnegative finite FP8
+scales also match the upstream cache conversion. These checks validate the
+reference formulas; native DGPP GPU kernels and full-model fidelity remain
+pending.
+
 The publisher's [model card](https://huggingface.co/MiniMaxAI/MiniMax-M3.1-Flash)
 recommends SGLang, vLLM and TokenSpeed. Their Blackwell paths execute the
 checkpoint's quantization-aware recipe. The pinned SGLang implementation
