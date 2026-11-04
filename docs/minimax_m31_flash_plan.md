@@ -942,3 +942,47 @@ exceed the per-token budget on this corpus. This control does not waive the
 native failure or establish a release-quality baseline. Layer-by-layer
 investigation, greedy-margin certification and task-quality validation remain
 required before merge.
+
+A 1,601-token prefix trace produces exactly the same 1,393 conditional scores
+as incremental verification, and all 60 layer hashes agree across four ranks.
+Replaying each recorded sublayer input through the independent fixed-projection
+reference passes all 60 layers, with exact routing at every one of the 57 MoE
+layers. Maximum global relative RMS is 0.000465855 for attention, 0.000091576
+for feed-forward outputs and 0.000020148 for normalization; maximum per-row
+errors are 0.00412831, 0.00172735 and 0.000738091 respectively. These isolated
+results rule out a large local discrepancy on this prefix, but do not clear
+the failed full-trajectory gate. Fixed-order elementwise reference controls
+are being evaluated to locate the remaining rounding sensitivity.
+
+### Distributed video and still-image checks
+
+The native video API passes eight real-checkpoint cases on four ranks in both
+plain and seven-proposal DSpark modes, at concurrency one and four. All raw
+choices and prompt/completion token counts match exactly across the four runs.
+Cases cover solid colors, temporal order, a ten-frame cross-segment clip, a
+large chunk-crossing clip, mixed still/video content, WebM and an odd final
+frame. Every cold request reports zero cached prompt tokens. The six still-image
+cases, including OCR and spatial layout, also pass at concurrency four and
+match exactly between plain and DSpark after the text RoPE correction.
+
+Both modes pass streaming and large video prefix-cache checks: a 9,348-token
+prompt reuses 9,345 tokens when warm and zero when caching is disabled.
+Changing only later frames invalidates the whole segment's earlier prefix;
+the changed request caches zero tokens and answers the new final-frame color.
+A streaming continuation reuses 9,345 tokens. All ranks have zero process swap
+before and after, and identical operation streams at teardown. The tested
+server is from `ef50d500`, SHA-256
+`1efa18a081146a3a74eb6944256be37d74c141dc4533605a1b8997b5f6b51467`.
+These are integration/accuracy checks, not throughput rows.
+
+Concurrent video readers exposed avoidable encoder work: the original single
+resident segment was displaced whenever another reader staged different pixels.
+The encoder now retains eight complete embedding results in a bounded LRU cache,
+using another 384 MiB of preallocated device memory per rank (1.789 GiB total
+visual workspace). Identity includes all pixels, frame count and patch geometry;
+prompt positions only control placement. This is a lossless reuse change.
+The fixture proves that revisiting eight interleaved inputs does not execute
+the tower again, while eviction, changed geometry and changed later frames
+recompute the correct results. All 21 selected CTest cases, the unit suite and
+CUDA memcheck pass. Distributed comparisons of this cache-enabled build remain
+required before publishing its performance.

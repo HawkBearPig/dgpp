@@ -15,6 +15,7 @@ struct MinimaxVisionConfig {
   static constexpr int kPatch = 14, kTemporal = 2, kMerge = 2, kGrid = 28;
   static constexpr int kQueryTile = 128, kWindowTokens = 513;
   static constexpr int kMaxFrames = 8, kMaxSegmentTokens = kMaxImageTokens * kMaxFrames / 2;
+  static constexpr int kEmbeddingCacheSlots = 8;
   // Match the CUDA BF16 reference's cuBLASLt workspace cap. Its selected
   // split-K epilogues have different BF16 bias rounding from the 64 MiB
   // plan at the published MLP shape; this is part of the precision recipe.
@@ -108,7 +109,8 @@ struct MinimaxVisionConfig {
            score_elements() * 6 +
            n * rotary_dim() * 4 +  // FP32 scores, BF16 probabilities, cos/sin
            2 * n * o * 2 + 2 * kMaxSegmentTokens * o * 2 +  // projector pair, merger, result
-           kWindowTokens * o * 2 + kGemmWorkspace + kFp32Workspace;
+           kWindowTokens * o * 2 + kGemmWorkspace + kFp32Workspace +
+           size_t(kEmbeddingCacheSlots) * kMaxSegmentTokens * o * 2;
   }
 };
 }  // namespace dgpp

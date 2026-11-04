@@ -4,6 +4,7 @@
 
 #include "common/cuda_check.hpp"
 #include "models/minimax/forward.hpp"
+#include "models/minimax/vision.hpp"
 
 namespace {
 void require(bool ok, const char* why) {
@@ -18,6 +19,48 @@ dgpp::ImageInput image(int64_t offset, int width, int height, int seed) {
   im.rgb.resize(size_t(width) * height * 3);
   for (size_t i = 0; i < im.rgb.size(); ++i) im.rgb[i] = (i * 17 + seed) % 256;
   return im;
+}
+void encoder_cache(const std::string& path) {
+  const auto cfg = dgpp::MinimaxConfig::from_json_file(path + "/config.json");
+  dgpp::MinimaxVisionEncoder encoder(*cfg.vision, path, nullptr);
+  const int h = cfg.hidden_size;
+  auto read = [&](const dgpp::ImageInput& im, bool fresh = false) {
+    const auto* data =
+        fresh ? encoder.encode(im) : encoder.stage({im}, im.offset, im.offset + im.tokens);
+    std::vector<uint16_t> result(size_t(im.tokens) * h);
+    DGPP_CUDA_OK(cudaMemcpy(result.data(), data, result.size() * 2, cudaMemcpyDeviceToHost));
+    return result;
+  };
+  std::vector<dgpp::ImageInput> images;
+  std::vector<std::vector<uint16_t>> expected;
+  for (int i = 0; i < cfg.vision->kEmbeddingCacheSlots; ++i) {
+    images.push_back(image(0, 56, 56, i * 23));
+    expected.push_back(read(images.back()));
+  }
+  const auto filled = encoder.encode_count();
+  for (size_t i = 0; i < images.size(); ++i)
+    require(read(images[i]) == expected[i], "interleaved encoder cache changed embeddings");
+  auto shifted = images.front();
+  shifted.offset = 73;
+  require(read(shifted) == expected.front() && encoder.encode_count() == filled,
+          "pixel-identical images reencoded after interleaving or prompt relocation");
+  read(image(0, 56, 56, 241));
+  require(encoder.encode_count() == filled + 1, "new pixels did not encode");
+  require(read(images[1]) == expected[1] && encoder.encode_count() == filled + 2,
+          "evicted encoder entry was stale or did not reencode");
+  auto geometry = images.front();
+  geometry.width = 28;
+  geometry.height = 112;
+  require(read(geometry) == read(geometry, true), "encoder cache ignored changed patch geometry");
+  auto video = images.front();
+  video.frames = 2;
+  video.frame_offsets = {0};
+  video.rgb.insert(video.rgb.end(), images[1].rgb.begin(), images[1].rgb.end());
+  const auto original = read(video);
+  std::fill(video.rgb.begin() + video.rgb.size() / 2, video.rgb.end(), 0);
+  const auto changed = read(video);
+  require(changed != original && changed == read(video, true),
+          "encoder cache ignored a changed later video frame");
 }
 std::vector<int32_t> check(const std::string& path, bool draft, bool video = false) {
   const auto cfg = dgpp::MinimaxConfig::from_json_file(path + "/config.json");
@@ -149,6 +192,7 @@ std::vector<int32_t> check(const std::string& path, bool draft, bool video = fal
 int main(int argc, char** argv) {
   try {
     if (argc != 2) throw std::invalid_argument("usage: minimax_image_prefill_test CHECKPOINT");
+    encoder_cache(argv[1]);
     require(check(argv[1], false) == check(argv[1], true),
             "plain/speculative image transcripts differ");
     require(check(argv[1], false, true) == check(argv[1], true, true),

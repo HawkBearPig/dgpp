@@ -167,8 +167,14 @@ starts; image requests do not allocate CUDA buffers while another rank may
 be spinning in a collective. Resized RGB bytes and token offsets travel in
 the admission journal so every rank uses the same input.
 
-MiniMax instead reserves 1.615 GiB of visual weights and 1.414 GiB of workspace
-for one eight-frame segment per rank. It stages up to 513 rows per window. The encoder uses
+MiniMax instead reserves 1.615 GiB of visual weights and 1.789 GiB of workspace
+per rank. This includes a 384 MiB cache for eight encoded images or eight-frame
+segments, so interleaved readers can reuse complete embeddings across prompt
+chunks. Cache entries compare geometry and every frame's pixels; prompt offsets
+only control embedding placement. Least-recently-used entries are evicted and
+recomputed without changing the numerical recipe. The retained RGB identities
+use at most another 147 MiB of host memory per rank. It stages up to 513 rows
+per window. The encoder uses
 FP32 SGEMM for the patch projection, FP32 scores with BF16 probabilities,
 and BF16 projections with the validated 1 MiB cuBLASLt workspace recipe.
 The FP32 rotary tables are built on CUDA. These choices preserve the

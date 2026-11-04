@@ -18,6 +18,8 @@ class MinimaxVisionEncoder {
   const uint16_t* encode(const ImageInput&, Trace = {});
   const uint16_t* stage(const std::vector<ImageInput>&, int64_t first, int64_t end);
   uint64_t digest() const;
+  // Successful tower executions, including explicit encode() diagnostics.
+  uint64_t encode_count() const;
 
  private:
   struct Impl;

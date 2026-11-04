@@ -43,9 +43,14 @@ struct MinimaxVisionEncoder::Impl {
   std::map<std::string, std::unique_ptr<Buffer>> weights;
   uint64_t hash = 14695981039346656037ull;
   Buffer rgb, patches, convolution, x, norm, tmp, qkv, q, k, v, attn, hidden, scores, probs, rope,
-      project1, project2, merged, result, window, work, fp32_work;
+      project1, project2, merged, result, window, work, fp32_work, cached_embeddings;
   std::unique_ptr<Fp32Gemm> patch_gemm;
-  ImageInput resident;
+  struct CachedEmbedding {
+    ImageInput image;
+    uint64_t used = 0;
+  };
+  std::vector<CachedEmbedding> cache{MinimaxVisionConfig::kEmbeddingCacheSlots};
+  uint64_t cache_clock = 0, encodes = 0;
   Trace observer;
 
   Impl(const MinimaxVisionConfig& cfg, const std::string& checkpoint, cudaStream_t s)
@@ -154,6 +159,7 @@ struct MinimaxVisionEncoder::Impl {
     window.reserve(size_t(c.kWindowTokens) * o * 2);
     work.reserve(c.kGemmWorkspace);
     fp32_work.reserve(c.kFp32Workspace);
+    cached_embeddings.reserve(size_t(c.kEmbeddingCacheSlots) * c.kMaxSegmentTokens * o * 2);
     patch_gemm = std::make_unique<Fp32Gemm>(fp32_work.p, fp32_work.bytes, stream);
   }
   const uint16_t* w(const std::string& name) const { return weights.at(name)->b(); }
@@ -257,13 +263,15 @@ MinimaxVisionEncoder::~MinimaxVisionEncoder() = default;
 uint64_t MinimaxVisionEncoder::digest() const {
   return impl_->hash;
 }
+uint64_t MinimaxVisionEncoder::encode_count() const {
+  return impl_->encodes;
+}
 const uint16_t* MinimaxVisionEncoder::encode(const ImageInput& im, Trace trace) {
   validate_image_pixels(im, true);
-  impl_->resident = {};
   impl_->observer = std::move(trace);
   try {
     impl_->encode_one(im);
-    impl_->resident = im;
+    ++impl_->encodes;
   } catch (...) {
     impl_->observer = {};
     throw;
@@ -276,20 +284,47 @@ const uint16_t* MinimaxVisionEncoder::stage(const std::vector<ImageInput>& image
   if (first < 0 || end < first || end - first > impl_->c.kWindowTokens)
     throw std::invalid_argument("MiniMax vision: staged window exceeds capacity");
   for (const auto& im : images) {
+    const uint16_t* embedding = nullptr;
     for (int span = 0; span < im.spans(); ++span) {
       const int64_t offset = im.span_offset(span);
       const int64_t begin = std::max(first, offset),
                     stop = std::min(end, offset + im.span_tokens());
       if (begin >= stop) continue;
-      const auto& r = impl_->resident;
-      if (r.tokens != im.tokens || r.width != im.width || r.height != im.height ||
-          r.grid != im.grid || r.frames != im.frames || r.rgb != im.rgb)
-        encode(im);
       const size_t h = impl_->c.output;
-      DGPP_CUDA_OK(
-          cudaMemcpyAsync(impl_->window.b() + (begin - first) * h,
-                          impl_->result.b() + (span * im.span_tokens() + begin - offset) * h,
-                          size_t(stop - begin) * h * 2, cudaMemcpyDeviceToDevice, impl_->stream));
+      if (!embedding) {
+        auto& cache = impl_->cache;
+        auto found = std::find_if(cache.begin(), cache.end(), [&](const auto& entry) {
+          const auto& r = entry.image;
+          // Positions affect placement in the prompt, not the encoder. Every
+          // frame participates in segment attention, including future spans.
+          return entry.used && r.tokens == im.tokens && r.width == im.width &&
+                 r.height == im.height && r.grid == im.grid && r.frames == im.frames &&
+                 r.rgb == im.rgb;
+        });
+        const bool hit = found != cache.end();
+        if (!hit)
+          found = std::min_element(cache.begin(), cache.end(),
+                                   [](const auto& a, const auto& b) { return a.used < b.used; });
+        auto* data = impl_->cached_embeddings.b() +
+                     size_t(found - cache.begin()) * impl_->c.kMaxSegmentTokens * h;
+        if (!hit) {
+          // Copy host identity before changing the entry, and invalidate the
+          // victim before overwriting its device bytes. All GPU storage was
+          // allocated at boot; these stream-ordered copies need no malloc.
+          auto identity = im;
+          encode(im);
+          found->used = 0;
+          DGPP_CUDA_OK(cudaMemcpyAsync(data, impl_->result.b(), size_t(im.tokens) * h * 2,
+                                       cudaMemcpyDeviceToDevice, impl_->stream));
+          found->image = std::move(identity);
+        }
+        found->used = ++impl_->cache_clock;
+        embedding = data;
+      }
+      DGPP_CUDA_OK(cudaMemcpyAsync(impl_->window.b() + (begin - first) * h,
+                                   embedding + (span * im.span_tokens() + begin - offset) * h,
+                                   size_t(stop - begin) * h * 2, cudaMemcpyDeviceToDevice,
+                                   impl_->stream));
     }
   }
   return impl_->window.b();
