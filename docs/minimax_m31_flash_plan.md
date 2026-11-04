@@ -1327,3 +1327,33 @@ CTest entries (including the independent DSpark oracle and shared engine
 integration), and CUDA memcheck with zero errors. The saved pre-fix output
 fails the logit contract as expected. The complete Python host suites and
 400-kernel dependency audit pass after the probe correction.
+
+### Selected serving settings
+
+The corrected release is built from
+`317bcd1baed42eb2f9d2ca3e09586e87c76c790d`, server SHA-256
+`83561c128f7b4cf1609fbc4b2f7c4a1252083db917904569d36ba1afbcd4a822`.
+Its confidence-scheduled DSpark uses the measured C1 cost fit of 55.0 ms base
+and 5.44 ms per verification row, with an adaptive multiplier initially at
+`1 / (55.0 + 5.44)`. All 45 adaptive/plain request pairs have identical
+text, finish reasons and completion-token counts. Adaptive drafting helps
+four C1 classes but regresses prose, and plain decoding wins every C8 class.
+These are tuning comparisons, not the final published throughput set.
+
+The plain world is then tested at the engine's supported maximum of sixteen
+request slots. C16 introduces 35 prompts absent from the C1/C8 reference;
+eight-row controls complete the reference set before comparing all 125
+requests at C1, C8 and C16. Every output is exact. All ranks retain the expected
+binary with zero swap before and after, and operation streams match. The
+wider batch improves aggregate throughput in all five classes, at the cost
+of a slower token stream per request. C1 and C8 remain close to the eight-slot
+controls.
+
+The selected template therefore uses plain decoding, sixteen request slots,
+a 32-request queue and an explicit 2,048-token idle prefill cap. The default
+512-row allocation would otherwise prevent the automatic policy from using
+the larger idle chunks. DSpark remains available with a seven-proposal block
+and at most eight slots. The final campaign includes C16 on sixteen-slot
+templates, retaining separate decode and wall-rate rows and the common
+C1/C2/C4/C8 comparison. The final media/cache checks use the selected larger
+prefill chunks; long-context quality and the complete campaign remain pending.

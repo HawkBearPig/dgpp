@@ -28,7 +28,7 @@ The download includes the bundled draft. `--sync-only` reuses the head node's
 download. All 73 files in the pinned snapshot have been checksum-verified on
 the four development nodes.
 
-The development template reserves eight request slots and a shared
+The deployment template reserves sixteen request slots and a shared
 786,432-token BF16 pool. Pool capacity is shared by active and cached requests;
 it is not a per-request allowance at every concurrency. The checkpoint's
 positional ceiling is 1,048,576, but this template does not reserve that many
@@ -54,11 +54,18 @@ selection per index head, and 16 selected blocks including the current block
 inside that budget. The cache retains an index key for every token. The
 implementation does not pool those keys, reduce top-k, or add RoPE scaling.
 
-`engine.mtp: true` enables the bundled five-layer DSpark model. Its learned
+Plain decoding is the default. The C1/C8 and wider-batch tuning controls
+favor it for throughput at load; adaptive drafting helps some single-request
+classes but regresses others. The idle prefill cap is 2,048 tokens, with
+adaptive chunking while requests decode.
+
+`engine.mtp: true` enables the bundled five-layer DSpark model. Limit it to
+eight request slots so its complete draft blocks fit the graph. From the
+launcher, use `--knobs='--mtp --mtp-depth 7 --max-concurrency 8'`. Its learned
 block proposes seven tokens; `engine.mtp_depth` must remain seven. The common
 verification schedule can check fewer proposals without changing the draft
 block; fresh slots still verify the full block until confidence is available.
-Use `--no-mtp` for the plain-decode control. Sampled speculation uses
+Use `--no-mtp` to return to plain decoding. Sampled speculation uses
 the full proposal distribution and rejection correction.
 
 ## API and media
@@ -109,3 +116,10 @@ run separately with pinned metadata. Video-enabled and video-disabled builds
 pass their capability and request checks. A 24-item large-pool quality pilot
 passes eight each of HumanEval, GSM8K and extraction without truncation;
 the complete task-quality campaign remains pending.
+
+The corrected confidence interface passes the independent DSpark reference,
+shared-engine regression tests and CUDA memcheck. A four-rank comparison
+matches all 45 adaptive/plain request pairs. The sixteen-slot plain world
+matches all 125 C1/C8/C16 requests against complete eight-row references,
+including the extra prompts introduced by C16, with zero swap and matching
+operation streams. The final serving campaign includes C16 automatically.
