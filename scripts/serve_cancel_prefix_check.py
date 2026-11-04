@@ -57,10 +57,13 @@ class Probe:
 
     def chat(self, messages, max_tokens, *, cache=True, cancel_deltas=0, ignore_eos=False):
         before = self.drained()
+        template_kwargs = {"clear_thinking": False}
+        if not self.thinking:
+            template_kwargs["enable_thinking"] = False
         payload = {"model": self.model, "messages": messages, "temperature": 0, "seed": 157,
                    "max_tokens": max_tokens, "stream": True, "prefix_cache": cache,
                    "ignore_eos": ignore_eos, "stream_options": {"include_usage": True},
-                   "chat_template_kwargs": {"enable_thinking": self.thinking, "clear_thinking": False}}
+                   "chat_template_kwargs": template_kwargs}
         connection = http.client.HTTPConnection(self.host, self.port, timeout=self.timeout)
         response = None
         started = time.monotonic()
@@ -152,7 +155,8 @@ def main():
     parser.add_argument("--rounds", type=int, default=3)
     parser.add_argument("--cancel-deltas", type=int, default=384)
     parser.add_argument("--prompt-lines", type=int, default=96)
-    parser.add_argument("--thinking", action="store_true", help="also preserve an interrupted reasoning stream")
+    parser.add_argument("--thinking", action="store_true",
+                        help="use the template's native thinking mode (also for always-on templates)")
     parser.add_argument("--require-answer-hit", action="store_true",
                         help="require at least one cancelled replay to reuse beyond its original prompt")
     parser.add_argument("--tag", default="cancel-prefix-157")
