@@ -562,3 +562,30 @@ reader/verifier/rollback graph checks and CUDA memcheck pass. The optional
 layer and recorded `ffn_norm` inputs under CUDA graphs. It requires exact
 BF16 outputs before timing; its local layer timings are not deployment
 throughput figures.
+
+The graph audit exposed missing programmatic dependency waits in all nine
+new MiniMax kernels. Every kernel now waits before reading its inputs. A
+regression graph deliberately releases its dependent before its last
+producer row is ready: it fails when the norm's wait is removed and passes
+with the wait restored. All nine MiniMax tests, the mixed prefill/verify/
+rollback graph contract, and kernel CUDA memcheck pass after the fix.
+Earlier serving smoke tests used the unsafe graph binary and do not qualify
+as release evidence.
+
+The optional Triton reference fixes the projection reduction chain and
+checks exact row-batch invariance, basis projections, and a condition-aware
+FP32 error bound against FP64. Its raw quick-text comparison still fails:
+absolute mean NLL delta 0.06404 nat and 9.28% large moves. Fixing reference
+matrix dispatch alone does not resolve the whole-trajectory discrepancy.
+
+Both numerical probes now support conditional scoring while retaining the
+entire prompt in the forward pass. They record the complete token hash and
+the first scored position, and test the scored suffix against full scoring.
+With the shipped chat template, a 211-token prompt asking for an overview
+of Lyon, and the same quick teacher article as 529 assistant target tokens,
+the native TP4 mean NLL is 1.7241 versus 1.7250 for the independent PyTorch
+reference. The likelihood gate passes (absolute mean delta 0.00087 nat,
+zero positions moving by over 1 nat). Twelve argmax choices differ; this
+likelihood result does not establish the separate greedy-flip limit, broad
+task quality, or resolve the failed raw-text control. The branch remains
+under development.

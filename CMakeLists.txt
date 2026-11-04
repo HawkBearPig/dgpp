@@ -2908,13 +2908,17 @@ if(TARGET dgpp_bus)
   dgpp_set_common(serving_head_check)
 endif()
 
-add_executable(minimax_test tests/cuda/minimax_test.cpp)
+add_executable(minimax_test tests/cuda/minimax_test.cpp tests/cuda/minimax_pdl_test.cu)
 target_link_libraries(minimax_test PRIVATE dgpp_models_minimax_layers dgpp_kernels dgpp_serve CUDA::cudart Threads::Threads)
 dgpp_set_common(minimax_test)
 add_test(NAME minimax_kernel_test COMMAND minimax_test --kernels)
 set_tests_properties(minimax_kernel_test PROPERTIES LABELS "cuda")
 add_test(NAME minimax_forward_fixture COMMAND ${DSV41_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/tools/minimax_reference_dump.py --fixture ${CMAKE_BINARY_DIR}/minimax_fixture)
 set_tests_properties(minimax_forward_fixture PROPERTIES FIXTURES_SETUP minimax_fixture LABELS "host")
+add_test(NAME minimax_scoring_probe COMMAND ${Python3_EXECUTABLE}
+  ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda/minimax_scoring_probe.py
+  --app $<TARGET_FILE:minimax_forward_check> --checkpoint-dir ${CMAKE_BINARY_DIR}/minimax_fixture)
+set_tests_properties(minimax_scoring_probe PROPERTIES FIXTURES_REQUIRED minimax_fixture LABELS "cuda")
 set_tests_properties(shared_prefill_test PROPERTIES FIXTURES_REQUIRED minimax_fixture)
 add_test(NAME minimax_forward_smoke COMMAND minimax_test --checkpoint-dir ${CMAKE_BINARY_DIR}/minimax_fixture --dump ${CMAKE_BINARY_DIR}/minimax_oracle)
 set_tests_properties(minimax_forward_smoke PROPERTIES FIXTURES_REQUIRED minimax_fixture FIXTURES_SETUP minimax_output LABELS "cuda")

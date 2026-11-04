@@ -5,6 +5,7 @@
 #include "common/dtypes.hpp"
 #include "kernels/glm_moe_launch.hpp"
 #include "kernels/minimax.hpp"
+#include "kernels/pdl.cuh"
 
 namespace dgpp {
 namespace {
@@ -23,6 +24,7 @@ __device__ float rb(float x) {
 }
 __global__ void compact_segments_kernel(const MoeSegment* input, MoeSegment* output, int experts,
                                         int capacity) {
+  dgpp_pdl_wait();
   __shared__ int counts[32];
   const int e = threadIdx.x, lane = e % 32, warp = e / 32;
   const bool live = e < experts && input[e].rows > 0;
@@ -40,6 +42,7 @@ __global__ void compact_segments_kernel(const MoeSegment* input, MoeSegment* out
 }
 __global__ void add_norm_kernel(uint16_t* residual, const uint16_t* add, const uint16_t* weight,
                                 uint16_t* out, int hidden, float eps) {
+  dgpp_pdl_wait();
   extern __shared__ float values[];
   __shared__ float sums[8];
   const int row = blockIdx.x, tid = threadIdx.x;
@@ -63,6 +66,7 @@ __global__ void add_norm_kernel(uint16_t* residual, const uint16_t* add, const u
 }
 __global__ void swiglu_kernel(const uint16_t* gate, const uint16_t* up, uint16_t* out,
                               int64_t count, float alpha, float limit) {
+  dgpp_pdl_wait();
   const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (i >= count) return;
   const float g = fminf(bf16_bits_to_float(gate[i]), limit);
@@ -72,6 +76,7 @@ __global__ void swiglu_kernel(const uint16_t* gate, const uint16_t* up, uint16_t
 __global__ void norm_rope_kernel(const uint16_t* x, const uint16_t* w, uint16_t* y,
                                  const int64_t* pos, const float* inv, int heads, int rotary,
                                  float eps) {
+  dgpp_pdl_wait();
   const int r = blockIdx.x, h = blockIdx.y, lane = threadIdx.x;
   const int64_t at = (static_cast<int64_t>(r) * heads + h) * 128;
   float value[4];
@@ -104,6 +109,7 @@ __global__ void norm_rope_kernel(const uint16_t* x, const uint16_t* w, uint16_t*
 }
 __global__ void append_kernel(const uint16_t* x, uint16_t* cache, const int32_t* req,
                               const int64_t* pos, const int32_t* table, int stride) {
+  dgpp_pdl_wait();
   const int r = blockIdx.x, d = threadIdx.x;
   const int64_t p = pos[r];
   if (p < 0) return;
@@ -114,6 +120,7 @@ __global__ void append_kernel(const uint16_t* x, uint16_t* cache, const int32_t*
 __global__ void index_score_kernel(const uint16_t* q, const uint16_t* cache, const int32_t* req,
                                    const int64_t* pos, const int32_t* table, int stride, int heads,
                                    int blocks, float* scores) {
+  dgpp_pdl_wait();
   const int r = blockIdx.x, h = blockIdx.y, b = blockIdx.z;
   const int lane = threadIdx.x;
   const int64_t p = pos[r];
@@ -150,6 +157,7 @@ __device__ void best_warp(float& score, int& id) {
 }
 __global__ void select_kernel(const float* scores, const int64_t* pos, int heads, int blocks,
                               int topk, int32_t* selected) {
+  dgpp_pdl_wait();
   const int r = blockIdx.x, h = blockIdx.y, tid = threadIdx.x, lane = tid % 32, warp = tid / 32;
   __shared__ int chosen[16], warp_id[8];
   __shared__ float warp_score[8];
@@ -198,6 +206,7 @@ __global__ void select_kernel(const float* scores, const int64_t* pos, int heads
 }
 __global__ void router_dot_kernel(const uint16_t* x, const float* w, float* scores, int hidden,
                                   int experts) {
+  dgpp_pdl_wait();
   const int r = blockIdx.x, e = blockIdx.y * 4 + threadIdx.x / 32, lane = threadIdx.x % 32;
   if (e >= experts) return;
   float sum = 0;
@@ -209,6 +218,7 @@ __global__ void router_dot_kernel(const uint16_t* x, const float* w, float* scor
 }
 __global__ void router_select_kernel(const float* scores, const float* bias, int experts, int topk,
                                      float factor, int32_t* ids, float* weights) {
+  dgpp_pdl_wait();
   const int r = blockIdx.x, lane = threadIdx.x;
   const float* row = scores + static_cast<int64_t>(r) * experts;
   __shared__ int picked[16];

@@ -18,6 +18,8 @@
 #include "models/minimax/forward.hpp"
 #include "models/minimax/reference.hpp"
 
+void minimax_pdl_test();
+
 namespace {
 using namespace dgpp;
 void require(bool ok, const std::string& msg) {
@@ -146,6 +148,7 @@ void near(const std::vector<uint16_t>& got, const std::vector<uint16_t>& want, d
   require(relative <= limit, std::string(name) + " numerical mismatch");
 }
 void kernels() {
+  minimax_pdl_test();
   {
     std::vector<MoeSegment> segments(128);
     for (int e : {0, 7, 32, 127}) segments[e] = MoeSegment{e * 3, 1, e};

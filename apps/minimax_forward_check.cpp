@@ -67,7 +67,7 @@ void score(const dgpp::MinimaxModel::Outputs& out, int row, int step, int64_t ta
 int main(int argc, char** argv) {
   try {
     std::string model, checkpoint, text, teacher, ids_text, dump, peer, images;
-    int rank = 0, world = 1, port = 29950, rows = 1;
+    int rank = 0, world = 1, port = 29950, rows = 1, score_from = 1;
     bool resident = false;
     const auto next = [&](int& i) {
       if (++i >= argc) throw std::runtime_error("missing option value");
@@ -99,6 +99,8 @@ int main(int argc, char** argv) {
         port = std::stoi(next(i));
       else if (a == "--rows")
         rows = std::stoi(next(i));
+      else if (a == "--score-from")
+        score_from = std::stoi(next(i));
       else if (a == "--resident")
         resident = true;
       else
@@ -127,6 +129,18 @@ int main(int argc, char** argv) {
     }
     if (ids.empty() || (!teacher.empty() && ids.size() < 2))
       throw std::runtime_error("empty token input");
+    if (score_from < 1 || static_cast<size_t>(score_from) > ids.size() ||
+        (ids.size() > 1 && static_cast<size_t>(score_from) == ids.size()))
+      throw std::runtime_error(
+          "--score-from must select a target token after the first input token");
+    uint64_t input_hash = 1469598103934665603ull;
+    for (auto id : ids) input_hash = (input_hash ^ static_cast<uint64_t>(id)) * 1099511628211ull;
+    std::printf("[minimax_protocol] world %d tokens %zu score_from %d input %016llx\n", world,
+                ids.size(), score_from, static_cast<unsigned long long>(input_hash));
+    const auto score_row = [&](const auto& out, int row, size_t position) {
+      if (position + 1 >= static_cast<size_t>(score_from))
+        score(out, row, position + 1 - score_from, ids[position + 1], rank);
+    };
     const auto cfg = dgpp::MinimaxConfig::from_json_file(checkpoint + "/config.json");
     cfg.validate_tp(rank, world);
     if (!images.empty())
@@ -164,13 +178,13 @@ int main(int argc, char** argv) {
         };
         auto out = engine.session_prefill(0, {ids.front()});
         check_repeat(out, 0);
-        if (trial == 0) score(out, 0, 0, ids[1], rank);
+        if (trial == 0) score_row(out, 0, 0);
         for (size_t at = 1; at + 1 < ids.size();) {
           const int n = std::min<size_t>(rows, ids.size() - at - 1);
           out = engine.session_verify(0, {ids.begin() + at, ids.begin() + at + n});
           check_repeat(out, at);
           if (trial == 0)
-            for (int row = 0; row < n; ++row) score(out, row, at + row, ids[at + row + 1], rank);
+            for (int row = 0; row < n; ++row) score_row(out, row, at + row);
           engine.session_rollback(0, n, n);
           at += n;
           std::fflush(stdout);
@@ -178,7 +192,8 @@ int main(int argc, char** argv) {
         engine.session_close(0);
         if (chunk != hashes.size()) throw std::runtime_error("repeat changed the chunk count");
       }
-      std::printf("[prefill_tf_end] rank %d world %d positions %zu\n", rank, world, ids.size() - 1);
+      std::printf("[prefill_tf_end] rank %d world %d positions %zu\n", rank, world,
+                  ids.size() - score_from);
     } else {
       engine.set_decode_row_traces(true);
       if (!dump.empty()) {
@@ -197,8 +212,9 @@ int main(int argc, char** argv) {
       for (size_t l = 0; l < out.layer_states.size(); ++l)
         std::printf("layer %zu hidden %016llx\n", l,
                     static_cast<unsigned long long>(digest(out.layer_states[l])));
-      for (size_t t = 0; t + 1 < ids.size(); ++t) score(out, t, t, ids[t + 1], rank);
-      std::printf("[prefill_tf_end] rank %d world %d positions %zu\n", rank, world, ids.size() - 1);
+      for (size_t t = 0; t + 1 < ids.size(); ++t) score_row(out, t, t);
+      std::printf("[prefill_tf_end] rank %d world %d positions %zu\n", rank, world,
+                  ids.size() - score_from);
       if (!dump.empty()) {
         const auto path = std::filesystem::path(dump) / ("rank" + std::to_string(rank));
         std::filesystem::create_directories(path);
@@ -210,7 +226,7 @@ int main(int argc, char** argv) {
         }
         std::ofstream meta(path / "metadata.json");
         meta << "{\"residual_norm\":\"fp32\",\"world\":" << world << ",\"rank\":" << rank
-             << ",\"vocab_begin\":" << out.lm_vocab_begin
+             << ",\"score_from\":" << score_from << ",\"vocab_begin\":" << out.lm_vocab_begin
              << ",\"vocab_count\":" << out.lm_vocab_count << ",\"tokens\":[";
         for (size_t t = 0; t < ids.size(); ++t) meta << (t ? "," : "") << ids[t];
         meta << "]}\n";

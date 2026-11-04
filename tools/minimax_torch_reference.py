@@ -25,12 +25,13 @@ from minimax_reference_dump import FP4, FP8, Weights
 
 
 class Reference:
-    def __init__(self, checkpoint, world, rounded_residual, projection_rows=0):
+    def __init__(self, checkpoint, world, rounded_residual, projection_rows=0, projection_backend='cublas'):
         self.w = Weights(checkpoint)
         self.c = json.loads((checkpoint / 'config.json').read_text())['text_config']
         self.world = world
         self.rounded_residual = rounded_residual
         self.projection_rows = projection_rows
+        self.projection_backend = projection_backend
         self.config_sha256 = hashlib.sha256((checkpoint/'config.json').read_bytes()).hexdigest()
         self.checkpoint = str(checkpoint.resolve())
         self.fp8 = torch.tensor(FP8, device='cuda')
@@ -64,22 +65,27 @@ class Reference:
         global_scale = float(self.w.tensor(base+'.weight_global_scale'))
         return weight.to(torch.bfloat16), global_scale
 
-    def mm(self, x, weight, divisor=1.0, rounded=True):
+    def mm(self, x, weight, divisor=1.0, rounded=True, streaming_order=False):
         # A reference-only control: changing cuBLAS's row geometry while
         # preserving every BF16 boundary measures its own reduction sensitivity.
         rows = self.projection_rows or len(x)
-        y = torch.cat([torch.mm(part, weight.T, out_dtype=torch.float32)
-                       for part in x.split(rows)]) / divisor
+        if self.projection_backend == 'triton-fixed':
+            from minimax_reference_gemm import projection
+            parts = [projection(part,weight,streaming_order) for part in x.split(rows)]
+        else:
+            parts = [torch.mm(part, weight.T, out_dtype=torch.float32) for part in x.split(rows)]
+        y = torch.cat(parts) / divisor
         return y.to(torch.bfloat16) if rounded else y
 
     def linear(self, x, base):
-        return self.mm(x, *self.matrix(base))
+        return self.mm(x, *self.matrix(base), streaming_order=base+'.weight_scale_inv' in self.w.header)
 
     def parts(self, x, base, rounded=True):
         weight, divisor = self.matrix(base)
         width = weight.shape[1] // self.world
         return [self.mm(x[:, r*width:(r+1)*width].contiguous(),
-                        weight[:, r*width:(r+1)*width].contiguous(), divisor, rounded)
+                        weight[:, r*width:(r+1)*width].contiguous(), divisor, rounded,
+                        streaming_order=base+'.weight_scale_inv' in self.w.header)
                 for r in range(self.world)]
 
     @staticmethod
@@ -268,16 +274,23 @@ class Reference:
         # Read vocabulary slabs so even the output head fits a small reference GPU.
         vocab = self.c['vocab_size']
         for case,hidden in zip(cases,states):
+            score_from = case.get('score_from',1)
+            input_hash = 1469598103934665603
+            for token in case['ids']:
+                input_hash = ((input_hash^token)*1099511628211)&((1<<64)-1)
             folder = output/case['name']
             folder.mkdir(parents=True,exist_ok=True)
             (folder/'metadata.json').write_text(json.dumps(dict(world=self.world,ids=case['ids'],rounded_residual=self.rounded_residual,
                 projection_rows=self.projection_rows,
+                projection_backend=self.projection_backend,
+                score_from=score_from,
                 backend='pytorch independent FP32 attention', torch_version=torch.__version__,
                 checkpoint=self.checkpoint,config_sha256=self.config_sha256),indent=2)+'\n')
             for rank in range(self.world):
                 begin,end = rank*vocab//self.world,(rank+1)*vocab//self.world
                 weight = self.tensor('language_model.lm_head.weight',slice(begin,end))
                 with (folder/f'r{rank}.log').open('w') as log:
+                    log.write(f"[minimax_protocol] world {self.world} tokens {len(case['ids'])} score_from {score_from} input {input_hash:016x}\n")
                     for at in range(0,len(hidden),64):
                         y = self.mm(hidden[at:at+64],weight,rounded=False).double()
                         lse = y.logsumexp(-1).cpu().tolist()
@@ -285,10 +298,12 @@ class Reference:
                         maximum,index = maximum.cpu().tolist(),index.cpu().tolist()
                         for row in range(len(y)):
                             step = at+row
+                            if step+1 < score_from:
+                                continue
                             target = case['ids'][step+1]
                             target_logit = y[row,target-begin].item() if begin<=target<end else math.nan
-                            log.write(f'[prefill_tf] rank {rank} step {step}: target {target} argmax {begin+index[row]} lmax {maximum[row]:.9g} lse {lse[row]:.12g} target_logit {target_logit:.9g}\n')
-                    log.write(f'[prefill_tf_end] rank {rank} world {self.world} positions {len(hidden)}\n')
+                            log.write(f'[prefill_tf] rank {rank} step {step+1-score_from}: target {target} argmax {begin+index[row]} lmax {maximum[row]:.9g} lse {lse[row]:.12g} target_logit {target_logit:.9g}\n')
+                    log.write(f'[prefill_tf_end] rank {rank} world {self.world} positions {len(hidden)+1-score_from}\n')
 
 
 def main():
@@ -302,21 +317,27 @@ def main():
     p.add_argument('--rounded-residual',action='store_true',help='diagnostic: normalize the rounded BF16 residual sum')
     p.add_argument('--dump-states',action='store_true',help='save sublayer boundaries for discrepancy tracing')
     p.add_argument('--projection-rows',type=int,default=0,help='reference reduction control: cap rows per cuBLAS projection (0: full)')
+    p.add_argument('--projection-backend',choices=['cublas','triton-fixed'],default='cublas',help='fixed 16-term tensor-core reductions or cuBLAS algorithm dispatch')
     args = p.parse_args()
     if args.projection_rows < 0:
         p.error('--projection-rows must be nonnegative')
-    reference = Reference(args.checkpoint_dir,args.world,args.rounded_residual,args.projection_rows)
+    reference = Reference(args.checkpoint_dir,args.world,args.rounded_residual,args.projection_rows,args.projection_backend)
     if args.check_engine_dir:
         with torch.inference_mode():
             reference.check_stages(args.check_engine_dir,args.output)
         return
     cases = json.loads(args.manifest.read_text())
-    tok = Tokenizer.from_file(str(args.checkpoint_dir/'tokenizer.json'))
+    tok = None
     for case in cases:
         if 'ids' not in case:
+            if tok is None:
+                tok = Tokenizer.from_file(str(args.checkpoint_dir/'tokenizer.json'))
             case['ids'] = tok.encode(case['text'],add_special_tokens=False).ids
         if len(case['ids'])<2 or Path(case['name']).name!=case['name']:
             p.error('each case needs a simple name and at least two tokens')
+        score_from = case.get('score_from',1)
+        if type(score_from) is not int or not 1 <= score_from < len(case['ids']):
+            p.error('score_from must select a target token after the first input token')
         print(f"{case['name']}: {len(case['ids'])} tokens",flush=True)
     with torch.inference_mode():
         reference.run(cases,args.output,args.dump_states)
