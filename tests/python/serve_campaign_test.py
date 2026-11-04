@@ -76,7 +76,8 @@ def main():
         t = sc.transcript_cells(d)
         assert t["matched"] == 4 and t["detail"]["chat"]["plain_distinct"] == 1 and t["isolation"] == "different", t
         assert sc.drafts({"dflash_model": "z"}) and sc.drafts({"mtp": True}) and not sc.drafts({"mtp": False})
-        plain = sc.plain_deployment({"engine": {"mtp": False, "dflash_model": "z", "mtp_schedule": True, "kv_capacity": 4}})["engine"]
+        plain = sc.plain_deployment({"engine": {"mtp": False, "dflash_model": "z", "mtp_schedule": True,
+                                               "mtp_schedule_options": 3, "kv_capacity": 4}})["engine"]
         assert plain == {"mtp": False, "kv_capacity": 4}, plain
         # without a plain boot the match is not a result
         import shutil

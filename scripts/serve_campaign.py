@@ -107,7 +107,7 @@ def deployment_from(template, port):
 
 
 DRAFT_KEYS = ("dflash_model", "draft_head", "dflash_weights", "mtp_schedule", "mtp_schedule_row_ms", "mtp_schedule_base_ms",
-              "mtp_schedule_lambda", "mtp_schedule_min_depth", "mtp_schedule_adapt", "mtp_schedule_sampled_scale", "mtp_draft",
+              "mtp_schedule_lambda", "mtp_schedule_min_depth", "mtp_schedule_options", "mtp_schedule_adapt", "mtp_schedule_sampled_scale", "mtp_draft",
               "mtp_draft_temperature", "mtp_verify", "mtp_depth", "lookup_draft", "lookup_tail", "dflash_batch_rows", "dflash_depth")
 
 

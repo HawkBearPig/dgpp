@@ -1,0 +1,31 @@
+{
+  "model": "MiniMaxAI/MiniMax-M3.1-Flash",
+  "world_size": 4,
+  "release": "",
+  "engine": {
+    "max_concurrency": 8,
+    "kv_capacity": 786432,
+    "kv_dtype": "bf16",
+    "bf16_weights": "bf12+bf16",
+    "default_max_tokens": 32768,
+    "queue_limit": 16,
+    "max_connections": 64,
+    "decode_graph": true,
+    "mtp": true,
+    "mtp_depth": 7,
+    "mtp_schedule": false,
+    "prefix_cache_gib": 2,
+    "admission": "full",
+    "admission_window": 256,
+    "sampling_candidates": 128,
+    "stats_interval_s": 10
+  },
+  "nvme_cache": {
+    "enabled": false,
+    "path": "~/dgpp/nvme-cache",
+    "capacity_gib": 64
+  },
+  "paths": {
+    "resident_cache": ""
+  }
+}
