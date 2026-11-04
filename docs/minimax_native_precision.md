@@ -100,8 +100,8 @@ finite E4M3 scales, signed-zero packing, zero groups, causal page boundaries,
 more than sixteen candidate pages, permuted physical pages and query chunk
 invariance within each formula. At 1, 129, 270 and 2,057 keys, both formulas
 match their upstream CPU references exactly. They deliberately produce
-different outputs from each other. GPU quantizer/kernel and full-model
-validation are still pending.
+different outputs from each other. The isolated GPU checks below cover the
+prefill formula; full-model validation is still pending.
 
 ## Initial GB10 projection kernel validation
 
@@ -124,3 +124,25 @@ model's serving path, and full-model native fidelity, throughput and final
 deployment selection remain pending. Reproduce the upstream quantizer check
 with `tools/minimax_mxfp8_quantization_check.py`, providing the built
 `mxfp8_gemm_test`, the pinned SGLang source and an untracked output directory.
+
+## Initial GB10 Q8KV4 kernel validation
+
+The new native attention kernels implement NVFP4 cache append, FP8 query
+conversion, sparse index scoring and the upstream **prefill** attention
+formula. They use that formula for every query geometry, including single
+rows. This preserves DGPP's batch/chunk invariance; it does not establish
+equivalence to the upstream online decode formula.
+
+Five cases cover 1 through 65 query rows, mixed requests, permuted physical
+pages, 1 through 4 KV heads, causal boundaries, more than sixteen candidate
+pages, exact index ties and padded rows with invalid request IDs. Query and
+cache bytes match the independent precision reference exactly. Selected
+pages match, index scores satisfy FP64 forward-error bounds, and attention
+relative RMS error is at most `1.74e-5`, within the existing `0.004` gate.
+Splits into 1-, 8- and 17-row calls and two PDL CUDA-graph replays preserve
+the output bits. CUDA memcheck and racecheck report zero errors or hazards.
+
+Run `ctest --test-dir build-release -R '^minimax_native_attention_test$'
+--output-on-failure` after building that target. The test generates temporary
+fixtures and checks CUDA output against the independent CPU formula. These
+tests certify the isolated path, not full-model fidelity or throughput.

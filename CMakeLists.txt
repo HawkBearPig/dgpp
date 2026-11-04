@@ -219,6 +219,7 @@ add_library(dgpp_kernels STATIC
   src/kernels/glm4_attn.cu
   src/kernels/sink_attn.cu
   src/kernels/minimax.cu
+  src/kernels/minimax_native_attention.cu
   src/kernels/mimo_mtp_history.cu
   src/kernels/sink_attn_prefill.cu
   src/kernels/add_rmsnorm.cu
@@ -2542,6 +2543,14 @@ target_link_libraries(mxfp8_gemm_test PRIVATE dgpp_kernels CUDA::cudart)
 dgpp_set_common(mxfp8_gemm_test)
 add_test(NAME mxfp8_gemm_test COMMAND mxfp8_gemm_test)
 set_tests_properties(mxfp8_gemm_test PROPERTIES SKIP_RETURN_CODE 2 LABELS "cuda")
+
+add_executable(minimax_native_attention_test tests/cuda/minimax_native_attention_test.cpp)
+target_link_libraries(minimax_native_attention_test PRIVATE dgpp_kernels dgpp_common)
+dgpp_set_common(minimax_native_attention_test)
+add_test(NAME minimax_native_attention_test COMMAND ${DSV41_PYTHON}
+  ${CMAKE_CURRENT_SOURCE_DIR}/tools/minimax_native_attention_regression.py
+  --app $<TARGET_FILE:minimax_native_attention_test>)
+set_tests_properties(minimax_native_attention_test PROPERTIES LABELS "cuda")
 
 add_executable(moe_w4a4_test tests/cuda/moe_w4a4_test.cu)
 target_include_directories(moe_w4a4_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
