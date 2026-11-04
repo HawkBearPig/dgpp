@@ -11,6 +11,7 @@
 #include "common/test.hpp"
 #include "kernels/fp32_gemm.hpp"
 #include "kernels/gemm.hpp"
+#include "kernels/qwen_vision.hpp"
 
 namespace {
 template <class T>
@@ -95,16 +96,47 @@ DGPP_TEST(minimax_vision_rotary_frequency_and_trigonometry_rounding) {
   constexpr uint32_t sine[] = {0x3e1081c3u, 0x3f7ee0f0u, 0x3f2a35d7u, 0x3eb3782du, 0x3e33a364u,
                                0x3db199b0u, 0x3d2f102fu, 0x3cac701eu, 0x3c29d287u, 0x3ba73d46u,
                                0x3b24b1a6u, 0x3aa22fd6u, 0x3a1fb7beu};
-  Managed<float> table(16 * 78);
-  dgpp::minimax_vision_rope_tables(table.p, 56, 56, 78, 10000, nullptr);
-  DGPP_CUDA_OK(cudaDeviceSynchronize());
-  for (int j = 0; j < 39; ++j) {
-    const int at = 15 * 39 + j;
-    const uint32_t want_cos = j < 13 ? 0x3f800000u : cosine[j % 13];
-    const uint32_t want_sin = j < 13 ? 0 : sine[j % 13];
-    if (std::bit_cast<uint32_t>(table.p[at]) != want_cos ||
-        std::bit_cast<uint32_t>(table.p[16 * 39 + at]) != want_sin)
-      throw std::runtime_error("MiniMax vision rotary table rounding changed");
+  Managed<float> table(64 * 78);
+  for (int frames : {1, 8}) {
+    const int n = frames == 1 ? 16 : 64;
+    dgpp::minimax_vision_rope_tables(table.p, 56, 56, 78, 10000, nullptr, frames);
+    DGPP_CUDA_OK(cudaDeviceSynchronize());
+    for (int j = 0; j < 39; ++j) {
+      const int at = (n - 1) * 39 + j;
+      const bool zero = frames == 1 && j < 13;
+      const uint32_t want_cos = zero ? 0x3f800000u : cosine[j % 13];
+      const uint32_t want_sin = zero ? 0 : sine[j % 13];
+      if (std::bit_cast<uint32_t>(table.p[at]) != want_cos ||
+          std::bit_cast<uint32_t>(table.p[n * 39 + at]) != want_sin)
+        throw std::runtime_error("MiniMax vision rotary table rounding changed");
+    }
+  }
+}
+DGPP_TEST(minimax_video_softmax_large_row_reference_rounding) {
+  // PyTorch 2.14.1 CUDA FP32 softmax -> BF16. Cover the register/shared/global
+  // reduction transitions and the non-4096-aligned global-memory tail.
+  constexpr int widths[] = {9216, 10000, 12256, 12288, 12300, 16384};
+  constexpr uint64_t hashes[] = {0x64ae0d7dee34b21full, 0xc1b50f53e7765c73ull,
+                                 0x092e4144d2abf924ull, 0x8a2298111f8701baull,
+                                 0xddd27fea72b677f7ull, 0x627c4313f40467e2ull};
+  Managed<float> scores(5 * 16384);
+  Managed<uint16_t> probabilities(5 * 16384);
+  for (int case_id = 0; case_id < 6; ++case_id) {
+    const int n = widths[case_id];
+    uint32_t state = 123456789;
+    for (int i = 0; i < 5 * n; ++i) {
+      state ^= state << 13;
+      state ^= state >> 17;
+      state ^= state << 5;
+      scores.p[i] = float(int((state >> 8) % 65536) - 32768) / 2048;
+    }
+    dgpp::qwen_vision_softmax(scores.p, probabilities.p, 5, n, .11180339887498948f, nullptr);
+    DGPP_CUDA_OK(cudaDeviceSynchronize());
+    uint64_t hash = 14695981039346656037ull;
+    for (int i = 0; i < 5 * n; ++i) hash = (hash ^ probabilities.p[i]) * 1099511628211ull;
+    if (hash != hashes[case_id])
+      throw std::runtime_error("video attention probability rounding changed at width " +
+                               std::to_string(n));
   }
 }
 }  // namespace

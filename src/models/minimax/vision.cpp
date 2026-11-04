@@ -137,8 +137,8 @@ struct MinimaxVisionEncoder::Impl {
     for (auto& [name, file] : files) file->close_mapping(true);
     // All allocations precede fabric execution; request-time malloc/free
     // can otherwise wait on a peer's spinning collective.
-    const size_t n = kMaxImageTokens * 4, rows = n * h;
-    rgb.reserve(pixels_for(c.kGrid) * 3);
+    const size_t n = c.kMaxSegmentTokens * 4, rows = n * h;
+    rgb.reserve(pixels_for(c.kGrid) * 3 * c.kMaxFrames);
     patches.reserve(n * c.patch_in() * 4);
     convolution.reserve(rows * 4);
     for (auto* b : {&x, &norm, &tmp, &q, &k, &v, &attn}) b->reserve(rows * 2);
@@ -149,8 +149,8 @@ struct MinimaxVisionEncoder::Impl {
     rope.reserve(n * c.rotary_dim() * 4);
     project1.reserve(n * o * 2);
     project2.reserve(n * o * 2);
-    merged.reserve(size_t(kMaxImageTokens) * o * 2);
-    result.reserve(size_t(kMaxImageTokens) * o * 2);
+    merged.reserve(size_t(c.kMaxSegmentTokens) * o * 2);
+    result.reserve(size_t(c.kMaxSegmentTokens) * o * 2);
     window.reserve(size_t(c.kWindowTokens) * o * 2);
     work.reserve(c.kGemmWorkspace);
     fp32_work.reserve(c.kFp32Workspace);
@@ -165,9 +165,10 @@ struct MinimaxVisionEncoder::Impl {
   void trace(const std::string& name, const void* data, size_t count, DType type = DType::BF16) {
     if (observer) observer(name, data, count, type);
   }
-  void geometry(int width, int height) {
-    minimax_vision_rope_tables(rope.f(), width, height, c.rotary_dim(), c.rope_theta, stream);
-    trace("rope", rope.p, size_t(width / 14) * (height / 14) * c.rotary_dim(), DType::F32);
+  void geometry(const ImageInput& im) {
+    minimax_vision_rope_tables(rope.f(), im.width, im.height, c.rotary_dim(), c.rope_theta, stream,
+                               im.frames);
+    trace("rope", rope.p, size_t(im.tokens) * 4 * c.rotary_dim(), DType::F32);
   }
   void encode_one(const ImageInput& im);
 };
@@ -179,9 +180,9 @@ void MinimaxVisionEncoder::Impl::encode_one(const ImageInput& im) {
   const size_t rows = size_t(n) * h;
   DGPP_CUDA_OK(
       cudaMemcpyAsync(rgb.p, im.rgb.data(), im.rgb.size(), cudaMemcpyHostToDevice, stream));
-  geometry(im.width, im.height);
+  geometry(im);
   minimax_vision_patchify(static_cast<const uint8_t*>(rgb.p), patches.f(), im.width, im.height,
-                          stream);
+                          stream, im.frames);
   trace("patches", patches.p, size_t(n) * c.patch_in(), DType::F32);
   patch_gemm->matmul(patches.f(),
                      weights.at(std::string(tower) + "embeddings.patch_embedding.weight")->f(),
@@ -257,7 +258,7 @@ uint64_t MinimaxVisionEncoder::digest() const {
   return impl_->hash;
 }
 const uint16_t* MinimaxVisionEncoder::encode(const ImageInput& im, Trace trace) {
-  validate_image_pixels(im);
+  validate_image_pixels(im, true);
   impl_->resident = {};
   impl_->observer = std::move(trace);
   try {
@@ -275,16 +276,21 @@ const uint16_t* MinimaxVisionEncoder::stage(const std::vector<ImageInput>& image
   if (first < 0 || end < first || end - first > impl_->c.kWindowTokens)
     throw std::invalid_argument("MiniMax vision: staged window exceeds capacity");
   for (const auto& im : images) {
-    const int64_t begin = std::max(first, im.offset), stop = std::min(end, im.offset + im.tokens);
-    if (begin >= stop) continue;
-    const auto& r = impl_->resident;
-    if (r.tokens != im.tokens || r.width != im.width || r.height != im.height ||
-        r.grid != im.grid || r.rgb != im.rgb)
-      encode(im);
-    const size_t h = impl_->c.output;
-    DGPP_CUDA_OK(cudaMemcpyAsync(
-        impl_->window.b() + (begin - first) * h, impl_->result.b() + (begin - im.offset) * h,
-        size_t(stop - begin) * h * 2, cudaMemcpyDeviceToDevice, impl_->stream));
+    for (int span = 0; span < im.spans(); ++span) {
+      const int64_t offset = im.span_offset(span);
+      const int64_t begin = std::max(first, offset),
+                    stop = std::min(end, offset + im.span_tokens());
+      if (begin >= stop) continue;
+      const auto& r = impl_->resident;
+      if (r.tokens != im.tokens || r.width != im.width || r.height != im.height ||
+          r.grid != im.grid || r.frames != im.frames || r.rgb != im.rgb)
+        encode(im);
+      const size_t h = impl_->c.output;
+      DGPP_CUDA_OK(
+          cudaMemcpyAsync(impl_->window.b() + (begin - first) * h,
+                          impl_->result.b() + (span * im.span_tokens() + begin - offset) * h,
+                          size_t(stop - begin) * h * 2, cudaMemcpyDeviceToDevice, impl_->stream));
+    }
   }
   return impl_->window.b();
 }

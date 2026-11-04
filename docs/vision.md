@@ -83,7 +83,29 @@ Image delimiters are `]<]start of image[>[`, `]<]image[>[` and
 `]<]end of image[>[` (200029, 200025 and 200030). Projected rows enter
 the target embedding; DSpark receives the resulting target features.
 Its language-model positions stay one-dimensional, as in the published
-MiniMax decoder. Video support is still pending.
+MiniMax decoder.
+
+MiniMax also accepts user content parts of the form
+`{"type":"video_url","video_url":{"url":"data:video/mp4;base64,...","fps":1}}`.
+WebM data URIs work too. Native FFmpeg decoding requires a build with
+`DGPP_ENABLE_VIDEO=ON` (the default); `/v1/models` advertises `video` only
+when both the frontend and model support it. Other model families refuse it.
+The API samples uniformly across the complete clip, using 1 fps by default
+and an optional positive rate up to 30. It selects 4–768 frames, bounded by
+the source frame count, and repeats the last frame when the count is odd.
+Per-frame resolution uses the published 28-pixel grid and 4–768-token
+budget, further bounded by the processor's 57,600-token total pixel budget
+over selected raw frames. Encoded inputs are limited to 32 MiB and decoded
+media across a request to 256 MiB. Remote URLs are not fetched.
+
+Every two frames form a temporal patch. A segment contains at most four
+temporal patches (eight raw frames), with bidirectional attention inside
+that segment and temporal RoPE positions starting at zero for each segment.
+Each pair contributes a timestamp `]<]0.0 seconds[>[`, image start/end
+delimiters, and one `]<]video[>[` token (200026) per merged spatial patch.
+The admission journal carries all RGB frames and the discontiguous token
+spans. Prefix-cache identity includes the whole segment even when a cached
+cut lies inside its first span: later frames can change earlier embeddings.
 
 Qwen3.8-Flash-Next deviations, both recorded here rather than hidden in a
 comment: images are single frames (`video_token_id` is refused, never
@@ -145,12 +167,16 @@ starts; image requests do not allocate CUDA buffers while another rank may
 be spinning in a collective. Resized RGB bytes and token offsets travel in
 the admission journal so every rank uses the same input.
 
-MiniMax instead reserves 1.615 GiB of visual weights and 0.380 GiB of
-workspace per rank. It stages up to 513 rows per window. The encoder uses
+MiniMax instead reserves 1.615 GiB of visual weights and 1.414 GiB of workspace
+for one eight-frame segment per rank. It stages up to 513 rows per window. The encoder uses
 FP32 SGEMM for the patch projection, FP32 scores with BF16 probabilities,
 and BF16 projections with the validated 1 MiB cuBLASLt workspace recipe.
 The FP32 rotary tables are built on CUDA. These choices preserve the
 reference's rounding across the full 32-layer tower.
+For segments above 9,216 patch rows, attention softmax follows the reference's
+four-value reduction order, including its shared-memory cutoff and scalar
+tail. The shorter still-image reduction cannot be extended unchanged to
+16,384 patch rows without accumulating full-depth error.
 
 For the MiniMax encoder, build `minimax_vision_check` and run the real-weight
 regressions on an idle GPU (the oracle requires NumPy and PyTorch):
@@ -160,14 +186,25 @@ python3 tools/minimax_vision_regression.py --checkpoint-dir "$CKPT" \
   --binary build-release/minimax_vision_check --output-dir build-minimax-vision-regression
 ```
 
-Eight fixed cases cover gradients, noise, checkerboards, rectangular images,
+Eight fixed image cases cover gradients, noise, checkerboards, rectangular images,
 the 128-query tile boundary, the processor's 576-token budget and the
 encoder's 1,024-token allocation limit. All eight final embeddings match
-the CUDA reference bitwise with the pinned real checkpoint. The numerical
+the CUDA reference bitwise with the pinned real checkpoint. Eight additional
+video cases cover 2/4/6/8-frame segments, temporal coordinates and the
+largest allocated segment. `--media image` or `--media video` selects a
+subset for focused development checks. The numerical
 gate remains relative RMS ≤0.005 and cosine ≥0.99998. See the
 [MiniMax implementation record](minimax_m31_flash_plan.md#native-still-image-encoder)
 for checkpoint and arithmetic details; encoder parity alone does not certify
 end-to-end visual task accuracy.
+
+The lossless API fixtures `tests/data/minimax_video_10frames.mp4` and `.webm`
+contain ten 56×56 constant RGB frames at 2 fps. Frame `i` is
+`[17*i, 255-11*i, 10+7*i]`. They were encoded with FFmpeg 6.1.1 using
+`libx264rgb -crf 0 -preset veryslow -pix_fmt rgb24 -movflags +faststart` and
+`libvpx-vp9 -lossless 1 -pix_fmt gbrp`, respectively. The host regression
+checks exact decoded pixels, frame selection, odd-frame repetition,
+segment boundaries, timestamp text, token spans, and invalid inputs.
 
 On an idle test deployment, run:
 

@@ -27,13 +27,16 @@ void MinimaxModel::validate_images(const std::vector<int64_t>& ids,
   if (!vision_) throw std::invalid_argument("MiniMax: checkpoint has no vision tower");
   if (start < 0 || ids.size() > size_t(std::numeric_limits<int64_t>::max() - start))
     throw std::invalid_argument("MiniMax image prefill: invalid position range");
-  validate_image_inputs(images, size_t(start) + ids.size());
+  validate_image_inputs(images, size_t(start) + ids.size(), true);
   for (const auto& im : images) {
     if (im.grid != MinimaxVisionConfig::kGrid)
       throw std::invalid_argument("MiniMax image prefill: wrong pixel grid");
-    for (int64_t pos = std::max(start, im.offset); pos < im.offset + im.tokens; ++pos)
-      if (ids[pos - start] != cfg_.vision->tokens.pad)
-        throw std::invalid_argument("MiniMax: image span does not contain image tokens");
+    const int64_t token = im.is_video() ? cfg_.vision->video_token : cfg_.vision->tokens.pad;
+    for (int span = 0; span < im.spans(); ++span)
+      for (int64_t pos = std::max(start, im.span_offset(span));
+           pos < im.span_offset(span) + im.span_tokens(); ++pos)
+        if (ids[pos - start] != token)
+          throw std::invalid_argument("MiniMax: media span does not contain its media tokens");
   }
 }
 MinimaxModel::Outputs MinimaxModel::session_prefill_images(int req, const std::vector<int64_t>& ids,
@@ -84,11 +87,15 @@ void MinimaxModel::apply_image_embeddings(uint16_t* dst, const RowRun& run) {
     const int64_t end = std::min(run.pos0 + run.T, first + MinimaxVisionConfig::kWindowTokens);
     const uint16_t* rows = nullptr;
     for (const auto& im : *images) {
-      const int64_t begin = std::max(first, im.offset), stop = std::min(end, im.offset + im.tokens);
-      if (begin >= stop) continue;
-      if (!rows) rows = vision_->stage(*images, first, end);
-      qwen_image_copy(rows + (begin - first) * h, dst + (begin - run.pos0) * h, stop - begin, h,
-                      stream_);
+      for (int span = 0; span < im.spans(); ++span) {
+        const int64_t offset = im.span_offset(span);
+        const int64_t begin = std::max(first, offset),
+                      stop = std::min(end, offset + im.span_tokens());
+        if (begin >= stop) continue;
+        if (!rows) rows = vision_->stage(*images, first, end);
+        qwen_image_copy(rows + (begin - first) * h, dst + (begin - run.pos0) * h, stop - begin, h,
+                        stream_);
+      }
     }
     first = end;
   }

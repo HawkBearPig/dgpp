@@ -878,3 +878,45 @@ draft table sizes. All 27 selected CTest gates pass, including the image
 session tests and all 21 shared drafter cases; CUDA memcheck reports zero
 errors and the PDL audit covers 398 kernels. Full-checkpoint teacher scoring
 is repeated after this arithmetic correction.
+
+### Native video implementation and numerical gate
+
+The media path now represents an eight-frame MiniMax attention segment as one
+immutable pixel identity with up to four discontiguous prompt spans. The native
+encoder implements temporal pairs, segment-local 3-D rotary positions and
+bidirectional segment attention. The frontend decodes inline MP4/WebM with
+FFmpeg, samples across the complete clip, preserves pair timestamps and repeats
+an odd final frame. The admission journal transports every frame and span.
+Other model families retain explicit video refusal. The default build requires
+FFmpeg development/runtime libraries; a video-disabled build advertises no
+video capability. See [video input policy](vision.md) for bounds and sampling.
+
+Eight real-checkpoint video cases cover 2/4/6/8 raw frames, rectangular patch
+order, the 9,216-key softmax boundary, 10,000-key shared-memory reductions, the
+maximum 768-token processor canvas and the 1,024-token allocation ceiling per
+frame pair. Every final embedding matches the independent PyTorch 2.14.1 CUDA
+reference bit-for-bit after correcting the large-row softmax reduction order.
+The initial 16,384-patch-row case failed the unchanged 0.005 RMS / 0.99998 cosine
+gate: 855 of 20,971,520 first-layer attention values differed and the final RMS
+error reached 0.032724. Identical patch, Q/K and rotary tensors isolated the
+first discrepancy to attention. Matching the pinned reference's four-value
+softmax summation above 9,216 keys removes the divergence. Fixed CUDA golden
+hashes cover register/shared/global reduction transitions and scalar tails.
+The tested encoder binary SHA-256 is
+`0558a1d00e8f81c99103123e1c8c387e26a181adc70b6a5b312ce0166e0980f0`.
+
+The image/video fixture covers chunk sizes 1/7/64/128, snapshots inside a
+video's first span, resumed target/draft state, interleaved requests, pixel
+changes and plain/speculative transcript equality. All 24 selected CTest
+cases pass, including the shared prefill suite. The service suite and native
+video frontend pass, as do journal and prefix-cache identity tests. Native
+video prefill and the expanded vision kernels report zero CUDA memcheck
+errors; vision kernel racecheck reports zero errors and warnings. These
+checks establish the encoder and engine contracts; four-rank video task
+checks and the release campaign remain pending.
+
+The corrected text RoPE recipe also passes the 529-token chat continuation
+comparison against the independently corrected CUDA reference: absolute mean
+NLL difference 0.00685 nat and zero changes exceeding 1 nat. Same-binary
+repeats are exact. This quick case does not replace the longer technical
+corpus, near-tie certification or task-quality gates.

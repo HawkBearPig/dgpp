@@ -133,6 +133,7 @@ class ModelFrontend {
     std::vector<ImageInput> images;
   };
   virtual bool supports_images() const { return false; }
+  virtual bool supports_video() const { return false; }
   virtual ChatInput prepare_chat(const minijson::Value& globals) const {
     return {encode_text(render_chat(globals)), {}};
   }

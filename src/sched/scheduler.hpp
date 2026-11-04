@@ -84,6 +84,7 @@ class SchedulerEngine {
   // generated token. Returns a token id in [0, vocab).
   virtual int32_t prefill(int req, const std::vector<int64_t>& prompt) = 0;
   virtual bool supports_images() const { return false; }
+  virtual bool supports_video() const { return false; }
   // The checkpoint's image delimiters, for the frontend that renders them.
   virtual ImageTokens image_token_ids() const { return {}; }
   virtual bool supports_image_prefix_cache() const { return false; }

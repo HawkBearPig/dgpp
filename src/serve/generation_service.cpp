@@ -407,11 +407,11 @@ std::string text_completion_body(const std::string& id, int64_t created,
 // The model object, with the served surfaces as extensions: the sampling
 // defaults (what an omitted field becomes), whether stochastic requests
 // are executable on this engine at all, and the tool/reasoning surface.
-std::string model_object(const ServiceConfig& scfg, const std::string& model_id,
-                         int64_t created, bool sampling_available,
-                         const sample::Params& d, bool tools_available,
-                         bool constraints_available,
-                         bool reasoning_in_content, const ModelFrontend& frontend, bool images_available) {
+std::string model_object(const ServiceConfig& scfg, const std::string& model_id, int64_t created,
+                         bool sampling_available, const sample::Params& d, bool tools_available,
+                         bool constraints_available, bool reasoning_in_content,
+                         const ModelFrontend& frontend, bool images_available,
+                         bool video_available) {
   std::string out;
   out.append("{\"id\":");
   append_json_string(&out, model_id);
@@ -464,6 +464,7 @@ std::string model_object(const ServiceConfig& scfg, const std::string& model_id,
   out.append(scfg.default_chat_template_kwargs);
   out.append(",\"input_modalities\":[\"text\"");
   if (images_available) out.append(",\"image\"");
+  if (video_available) out.append(",\"video\"");
   out.append("]");
   // The rope ramp in force, under the names the deployment JSON uses, so
   // what an operator set is what a client reads, plus the three values the
@@ -1682,12 +1683,20 @@ bool GenerationService::parse_chat(const dgpp::minijson::Value& body,
           saw_thinking = true;
           continue;
         }
-        if (type->as_string() == "image_url") {
-          if (r != "user") return refuse("images require a user message", at + ".type", "unsupported_content_type");
-          if (!frontend_->supports_images() || !engine_->supports_images())
-            return refuse("the served model does not support image inputs", at + ".type", "unsupported_content_type");
-          const auto* image = part.find("image_url");
-          if (!image || !image->is_object()) return refuse("image_url must be an object", at + ".image_url");
+        if (type->as_string() == "image_url" || type->as_string() == "video_url") {
+          const bool video = type->as_string() == "video_url";
+          const std::string field = video ? "video_url" : "image_url";
+          if (r != "user")
+            return refuse("media inputs require a user message", at + ".type",
+                          "unsupported_content_type");
+          if (video ? (!frontend_->supports_video() || !engine_->supports_video())
+                    : (!frontend_->supports_images() || !engine_->supports_images()))
+            return refuse(video ? "the served model does not support video inputs"
+                                : "the served model does not support image inputs",
+                          at + ".type", "unsupported_content_type");
+          const auto* image = part.find(field);
+          if (!image || !image->is_object())
+            return refuse(field + " must be an object", at + "." + field);
           parts.push_back(part);
           continue;
         }
@@ -2332,9 +2341,12 @@ void GenerationService::prepare_chat_completions(const HttpRequest& req,
     auto input = frontend_->prepare_chat(plan.globals);
     prompt = std::move(input.tokens);
     images = std::move(input.images);
-    validate_image_inputs(images, prompt.size());
+    validate_image_inputs(images, prompt.size(),
+                          frontend_->supports_video() && engine_->supports_video());
   } catch (const ImageInputError& e) {
-    respond_error(w, 400, e.what(), "invalid_request_error", e.param, "invalid_image");
+    respond_error(
+        w, 400, e.what(), "invalid_request_error", e.param,
+        e.param.find(".video_url") != std::string::npos ? "invalid_video" : "invalid_image");
     return;
   } catch (const std::exception& e) {
     respond_error(w, 400,
@@ -2678,21 +2690,24 @@ void GenerationService::route_models(const HttpRequest& req,
                                      HttpResponseWriter& w) {
   const int64_t created = std::time(nullptr);
   if (req.path == "/v1/models") {
-    w.respond(200, "application/json",
-              "{\"object\":\"list\",\"data\":[" +
-                  model_object(cfg_, cfg_.model_id, created, sampling_available_,
-                               cfg_.sampling_defaults, tool_calls_available(),
-                               constraints_available(),
-                               cfg_.reasoning_in_content, *frontend_, frontend_->supports_images() && engine_->supports_images()) +
-                  "]}");
+    w.respond(
+        200, "application/json",
+        "{\"object\":\"list\",\"data\":[" +
+            model_object(cfg_, cfg_.model_id, created, sampling_available_, cfg_.sampling_defaults,
+                         tool_calls_available(), constraints_available(), cfg_.reasoning_in_content,
+                         *frontend_, frontend_->supports_images() && engine_->supports_images(),
+                         frontend_->supports_video() && engine_->supports_video()) +
+            "]}");
     return;
   }
   const std::string id = req.path.substr(std::string("/v1/models/").size());
   if (id == cfg_.model_id) {
-    w.respond(200, "application/json",
-              model_object(cfg_, id, created, sampling_available_,
-                           cfg_.sampling_defaults, tool_calls_available(),
-                           constraints_available(), cfg_.reasoning_in_content, *frontend_, frontend_->supports_images() && engine_->supports_images()));
+    w.respond(
+        200, "application/json",
+        model_object(cfg_, id, created, sampling_available_, cfg_.sampling_defaults,
+                     tool_calls_available(), constraints_available(), cfg_.reasoning_in_content,
+                     *frontend_, frontend_->supports_images() && engine_->supports_images(),
+                     frontend_->supports_video() && engine_->supports_video()));
     return;
   }
   respond_error(w, 404, "the model '" + id + "' does not exist",

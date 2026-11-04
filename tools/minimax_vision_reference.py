@@ -12,11 +12,12 @@ import numpy as np
 from minimax_reference_dump import Weights, f32, rounded, relative_rms
 
 
-def check(path, dump, width, height, isolate_layers=False, report_all=False):
+def check(path, dump, width, height, isolate_layers=False, report_all=False, frames_count=1):
     c = json.loads((path / 'config.json').read_text())['vision_config']
     weights = Weights(path)
     h, heads, depth = c['hidden_size'], c['num_attention_heads'], c['num_hidden_layers']
-    d, n = h // heads, width // 14 * (height // 14)
+    temporal = max(1, frames_count // 2)
+    d, n = h // heads, width // 14 * (height // 14) * temporal
     failures = []
     def read(name, shape):
         return f32(np.fromfile(dump / (name + '.bf16'), dtype='<u2')).reshape(shape)
@@ -33,12 +34,14 @@ def check(path, dump, width, height, isolate_layers=False, report_all=False):
     y, x = np.indices((height, width))
     rgb = np.stack([x * 255 // (width - 1), y * 255 // (height - 1),
                     (x + y) * 255 // (width + height - 2)], axis=-1).astype(np.uint8)
+    rgb = np.stack([(rgb.astype(np.uint16) + np.array([17, 29, 43]) * i).astype(np.uint8)
+                    for i in range(frames_count)])
     mean = np.array([.48145466, .4578275, .40821073], dtype=np.float32)
     std = np.array([.26862954, .26130258, .27577711], dtype=np.float32)
     pixels = (rgb.astype(np.float32) * np.float32(1 / 255) - mean) / std
     # NCHW, duplicate temporal frame; block, spatial merge, then C/T/P/P.
-    frames = np.stack([pixels, pixels]).transpose(0, 3, 1, 2)
-    patches = frames.reshape(1, 2, 3, height // 28, 2, 14, width // 28, 2, 14)
+    frames = (np.repeat(pixels, 2, axis=0) if frames_count == 1 else pixels).transpose(0, 3, 1, 2)
+    patches = frames.reshape(temporal, 2, 3, height // 28, 2, 14, width // 28, 2, 14)
     patches = rounded(patches.transpose(0, 3, 6, 4, 7, 2, 1, 5, 8).reshape(n, -1))
     compare('patches', patches, 0, '<f4')
     p = 'vision_tower.vision_model.'
@@ -58,12 +61,9 @@ def check(path, dump, width, height, isolate_layers=False, report_all=False):
     x = ln(x, p + 'pre_layrnorm')
     compare('pre_norm', x, .001)
     axis = d // 6
-    positions = []
-    for by in range(height // 28):
-        for bx in range(width // 28):
-            for iy in range(2):
-                for ix in range(2):
-                    positions.append([0, by * 2 + iy, bx * 2 + ix])
+    positions = [[t, by * 2 + iy, bx * 2 + ix] for t in range(temporal)
+                 for by in range(height // 28) for bx in range(width // 28)
+                 for iy in range(2) for ix in range(2)]
     angles = (np.asarray(positions, dtype=np.float32)[:, :, None] *
               np.power(c['rope_theta'], -np.arange(axis, dtype=np.float32) / axis)).reshape(n, 3 * axis)
     cos, sin = np.cos(angles)[:, None], np.sin(angles)[:, None]
@@ -112,7 +112,8 @@ if __name__ == '__main__':
     ap.add_argument('--engine-dir', type=Path, required=True)
     ap.add_argument('--width', type=int, default=84)
     ap.add_argument('--height', type=int, default=56)
+    ap.add_argument('--frames', type=int, choices=[1, 2, 4, 6, 8], default=1)
     ap.add_argument('--isolate-layers', action='store_true', help='Check each layer on observed inputs; not an end-to-end quality gate')
     ap.add_argument('--report-all', action='store_true', help='Report every boundary before returning a failing exit status')
     a = ap.parse_args()
-    check(a.checkpoint_dir, a.engine_dir, a.width, a.height, a.isolate_layers, a.report_all)
+    check(a.checkpoint_dir, a.engine_dir, a.width, a.height, a.isolate_layers, a.report_all, a.frames)

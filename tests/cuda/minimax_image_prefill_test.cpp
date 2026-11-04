@@ -19,16 +19,29 @@ dgpp::ImageInput image(int64_t offset, int width, int height, int seed) {
   for (size_t i = 0; i < im.rgb.size(); ++i) im.rgb[i] = (i * 17 + seed) % 256;
   return im;
 }
-std::vector<int32_t> check(const std::string& path, bool draft) {
+std::vector<int32_t> check(const std::string& path, bool draft, bool video = false) {
   const auto cfg = dgpp::MinimaxConfig::from_json_file(path + "/config.json");
   dgpp::MinimaxModel model(cfg, path, 512, 1024, dgpp::LoaderResidency::Resident, nullptr, 0, 1, 2,
                            draft, 16);
   require(model.supports_images() && model.vision_digest() != 0, "image capability and identity");
   std::vector<dgpp::ImageInput> images{image(126, 84, 56, 11), image(190, 56, 56, 31)};
+  if (video) {
+    auto& segment = images.front();
+    segment.frames = 8;
+    segment.frame_offsets = {126, 145, 164, 183};
+    segment.tokens *= 4;
+    for (int f = 1; f < segment.frames; ++f) {
+      const auto frame = image(0, 84, 56, 11 + f * 31);
+      segment.rgb.insert(segment.rgb.end(), frame.rgb.begin(), frame.rgb.end());
+    }
+    images.back().offset = 205;
+  }
   std::vector<int64_t> ids(257);
   for (size_t i = 0; i < ids.size(); ++i) ids[i] = (i * 13 + 9) % 400;
   for (const auto& im : images)
-    std::fill_n(ids.begin() + im.offset, im.tokens, cfg.vision->tokens.pad);
+    for (int span = 0; span < im.spans(); ++span)
+      std::fill_n(ids.begin() + im.span_offset(span), im.span_tokens(),
+                  im.is_video() ? cfg.vision->video_token : cfg.vision->tokens.pad);
   auto baseline = model.session_prefill_images(0, ids, images);
   const auto next = model.session_step(0, 7);
   model.session_close(0);
@@ -138,7 +151,10 @@ int main(int argc, char** argv) {
     if (argc != 2) throw std::invalid_argument("usage: minimax_image_prefill_test CHECKPOINT");
     require(check(argv[1], false) == check(argv[1], true),
             "plain/speculative image transcripts differ");
-    std::cout << "MiniMax image prefill, chunking, snapshots, isolation and speculation pass\n";
+    require(check(argv[1], false, true) == check(argv[1], true, true),
+            "plain/speculative video transcripts differ");
+    std::cout
+        << "MiniMax image/video prefill, chunking, snapshots, isolation and speculation pass\n";
     return 0;
   } catch (const std::exception& e) {
     std::cerr << e.what() << '\n';

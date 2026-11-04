@@ -29,7 +29,8 @@ def run(a):
             w[name] = raw.cuda()
     H, heads = c['hidden_size'], c['num_attention_heads']
     D, width, height = H // heads, a.width, a.height
-    n = width // 14 * (height // 14)
+    temporal = max(1, a.frames // 2)
+    n = width // 14 * (height // 14) * temporal
     p = 'vision_tower.vision_model.'
     def compare(name, x):
         path = a.engine_dir / (name + '.bf16')
@@ -46,15 +47,21 @@ def run(a):
     y, x = np.indices((height, width))
     rgb = np.stack([x * 255 // (width - 1), y * 255 // (height - 1),
                     (x + y) * 255 // (width + height - 2)], -1).astype(np.uint8)
+    rgb = np.stack([(rgb.astype(np.uint16) + np.array([17, 29, 43]) * i).astype(np.uint8)
+                    for i in range(a.frames)])
     if a.input_rgb:
-        rgb = np.fromfile(a.input_rgb, dtype=np.uint8).reshape(height, width, 3)
+        rgb = np.fromfile(a.input_rgb, dtype=np.uint8).reshape(a.frames, height, width, 3)
     pixels = torch.from_numpy(rgb).cuda().float() / 255
     mean = torch.tensor([.48145466, .4578275, .40821073], device='cuda')
     std = torch.tensor([.26862954, .26130258, .27577711], device='cuda')
     pixels = (pixels - mean) / std
-    frames = torch.stack([pixels, pixels]).permute(0, 3, 1, 2)
-    patches = frames.reshape(1, 2, 3, height // 28, 2, 14, width // 28, 2, 14)
+    frames = (pixels.repeat(2, 1, 1, 1) if a.frames == 1 else pixels).permute(0, 3, 1, 2)
+    patches = frames.reshape(temporal, 2, 3, height // 28, 2, 14, width // 28, 2, 14)
     patches = patches.permute(0, 3, 6, 4, 7, 2, 1, 5, 8).reshape(n, -1).bfloat16()
+    patch_path = a.engine_dir / 'patches.f32'
+    if patch_path.exists():
+        if not np.array_equal(np.fromfile(patch_path, dtype='<f4'), patches.float().cpu().numpy().ravel()):
+            raise AssertionError('spatiotemporal patch layout differs')
     x = F.linear(patches.float(), w[p + 'embeddings.patch_embedding.weight'].reshape(H, -1)).bfloat16()
     compare('patch_projection', x)
     def ln(x, name): return F.layer_norm(x, (H,), w[name + '.weight'], w[name + '.bias'], c['layer_norm_eps'])
@@ -62,7 +69,7 @@ def run(a):
     x = ln(x, p + 'pre_layrnorm')
     compare('pre_norm', x)
     axis = D // 6
-    pos = [[0, by * 2 + iy, bx * 2 + ix] for by in range(height // 28) for bx in range(width // 28)
+    pos = [[t, by * 2 + iy, bx * 2 + ix] for t in range(temporal) for by in range(height // 28) for bx in range(width // 28)
            for iy in range(2) for ix in range(2)]
     freq = 1 / torch.pow(c['rope_theta'], torch.arange(axis, device='cuda', dtype=torch.float32) / axis)
     angles = (torch.tensor(pos, device='cuda')[:, :, None] * freq).reshape(n, 3 * axis)
@@ -114,6 +121,9 @@ def run(a):
         compare(f'layer{layer}.mlp_proj', mlp)
         x = x + mlp
         compare(f'layer{layer}', x)
+        if a.stop_after_layer == layer:
+            print('Diagnostic stopped at requested layer; no full-depth quality verdict.', flush=True)
+            return
     x = linear(F.gelu(linear(x, 'multi_modal_projector.linear_1')), 'multi_modal_projector.linear_2')
     compare('projected_patches', x)
     x = linear(F.gelu(linear(x.reshape(n // 4, -1), 'patch_merge_mlp.linear_1')), 'patch_merge_mlp.linear_2')
@@ -128,7 +138,9 @@ if __name__ == '__main__':
     ap.add_argument('--engine-dir', type=Path, required=True)
     ap.add_argument('--width', type=int, default=56)
     ap.add_argument('--height', type=int, default=56)
+    ap.add_argument('--frames', type=int, choices=[1, 2, 4, 6, 8], default=1)
     ap.add_argument('--trace-dir', type=Path)
     ap.add_argument('--input-rgb', type=Path, help='Processed RGB pixels used by the native harness')
     ap.add_argument('--attention', choices=['explicit', 'flash'], default='explicit')
+    ap.add_argument('--stop-after-layer', type=int, default=-1, help='Diagnostic sublayer trace only; skips the full-depth verdict')
     run(ap.parse_args())

@@ -45,6 +45,7 @@ class MinimaxModel : public SessionModel<MinimaxModel> {
   int64_t prefill_group_span_limit() const { return max_tokens_; }
   const MinimaxConfig& config() const { return cfg_; }
   bool supports_images() const { return vision_ != nullptr; }
+  bool supports_video() const { return vision_ != nullptr; }
   ImageTokens image_tokens() const { return cfg_.vision ? cfg_.vision->tokens : ImageTokens{}; }
   uint64_t vision_digest() const { return vision_ ? vision_->digest() : 0; }
   struct PrefillCursor : Base::PrefillCursor {

@@ -115,11 +115,14 @@ class FakeEngine : public SchedulerEngine {
   MtpAcceptance mtp_acceptance() const override { return mtp_counters(mtp_fixture.load()); }
 
   std::atomic<bool> images_available{false};
+  std::atomic<bool> video_available{false};
   std::atomic<int> image_prefills{0};
   bool supports_images() const override { return images_available; }
+  bool supports_video() const override { return video_available; }
   bool supports_image_prefix_cache() const override { return images_available; }
   int32_t prefill_images(int req, const std::vector<int64_t>& prompt, const std::vector<dgpp::ImageInput>& images) override {
-    require(!images.empty() && images[0].rgb.size() == 112 * 112 * 3, "decoded image reaches the engine");
+    require(!images.empty(), "decoded media reaches the engine");
+    dgpp::validate_image_inputs(images, prompt.size(), video_available);
     ++image_prefills;
     return prefill(req, prompt);
   }
@@ -225,8 +228,8 @@ class FakeEngine : public SchedulerEngine {
   int32_t prefill_cached(int req, const std::vector<int64_t>& prompt,
                          dgpp::sched::SchedulerEngine::PrefixPrefill* plan) override {
     if (plan->images && !plan->images->empty()) {
-      require(images_available && plan->images->front().rgb.size() == 112 * 112 * 3,
-              "image payload survives cached admission");
+      require(images_available, "image payload survives cached admission");
+      dgpp::validate_image_inputs(*plan->images, prompt.size(), video_available);
       ++image_prefills;
     }
     if (plan->attach_slot >= 0) {
@@ -447,7 +450,9 @@ class FakeFrontend : public ModelFrontend {
   std::function<std::string(const dgpp::minijson::Value&)> render_hook;
   mutable std::atomic<size_t> decoded_ids{0};
   std::atomic<bool> images_available{false};
+  std::atomic<bool> video_available{false};
   bool supports_images() const override { return images_available; }
+  bool supports_video() const override { return video_available; }
   ChatInput prepare_chat(const dgpp::minijson::Value& globals) const override {
     auto input = ModelFrontend::prepare_chat(globals);
     const auto& messages = globals.at("messages").items();
@@ -455,6 +460,13 @@ class FakeFrontend : public ModelFrontend {
       const auto* content = messages[i].find("content");
       if (!content || !content->is_array()) continue;
       for (size_t j = 0; j < content->items().size(); ++j) {
+        if (content->items()[j].find("video_url")) {
+          const int64_t offset = input.tokens.size();
+          input.images.push_back(
+              {offset, 2, 28, 56, std::vector<uint8_t>(28 * 56 * 3 * 2), 28, 2, {offset}});
+          input.tokens.insert(input.tokens.end(), 2, 200026);
+          continue;
+        }
         const auto* image = content->items()[j].find("image_url");
         if (!image) continue;
         auto im = dgpp::serve::prepare_glm_image(*image,
@@ -5454,6 +5466,31 @@ DGPP_TEST(serve_images_capability_validation_and_streaming) {
   response = post_chat(rig, body("data:image/png;base64,AAAA", false), "invalid_image");
   require(response.find("messages[0].content[1].image_url.url") != std::string::npos,
           "invalid image names the precise field");
+}
+
+DGPP_TEST(serve_video_requires_both_capabilities_and_reaches_the_engine) {
+  ServiceRig rig;
+  const std::string body =
+      R"({"model":"glm-5.3-flash-fp8","max_tokens":1,"messages":[{"role":"user","content":[{"type":"video_url","video_url":{"url":"fixture"}}]}]})";
+  auto response = post_chat(rig, body, "unsupported_content_type");
+  require(response.find("400 Bad Request") != std::string::npos, "text frontend refuses video");
+  rig.frontend.video_available = true;
+  response = post_chat(rig, body, "unsupported_content_type");
+  require(response.find("400 Bad Request") != std::string::npos, "image-only engine refuses video");
+  rig.engine.images_available = true;
+  rig.engine.video_available = true;
+  response = post_chat(rig, body, "usage");
+  require(response.find("200 OK") != std::string::npos && rig.engine.image_prefills == 1,
+          "video payload reaches prefill");
+  Client models(rig.port());
+  models.send_all("GET /v1/models HTTP/1.1\r\nHost: t\r\n\r\n");
+  require(models.read_available(800).find("\"input_modalities\":[\"text\",\"video\"]") !=
+              std::string::npos,
+          "model capabilities report the effective video modality");
+  auto wrong_role = body;
+  wrong_role.replace(wrong_role.find("user"), 4, "assistant");
+  response = post_chat(rig, wrong_role, "unsupported_content_type");
+  require(response.find("400 Bad Request") != std::string::npos, "video requires a user message");
 }
 
 DGPP_TEST(serve_models_reports_the_active_rope_and_the_effective_limit) {

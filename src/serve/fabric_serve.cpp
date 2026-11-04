@@ -179,7 +179,7 @@ std::string encode_journal_tick(const GenerationService::PassEvents& events) {
         append_json_string(&out, r.cache_key);
       }
       if (!r.images.empty()) {
-        validate_image_inputs(r.images, r.prompt.size());
+        validate_image_inputs(r.images, r.prompt.size(), true);
         out += ",\"images\":[";
         for (size_t j = 0; j < r.images.size(); ++j) {
           const auto& im = r.images[j];
@@ -195,6 +195,15 @@ std::string encode_journal_tick(const GenerationService::PassEvents& events) {
           out += ',';
           append_json_int(&out, im.grid);
           out += ',';
+          if (im.is_video()) {
+            append_json_int(&out, im.frames);
+            out += ",[";
+            for (size_t k = 0; k < im.frame_offsets.size(); ++k) {
+              if (k) out += ',';
+              append_json_int(&out, im.frame_offsets[k]);
+            }
+            out += "],";
+          }
           append_json_string(
               &out, encode_base64(std::string_view(reinterpret_cast<const char*>(im.rgb.data()),
                                                    im.rgb.size())));
@@ -1105,10 +1114,12 @@ JournalRecord decode_journal_line(std::string_view line) {
           throw std::runtime_error("journal: invalid image list");
         size_t image_bytes = 0;
         for (const auto& entry : images->items()) {
-          if (!entry.is_array() || (entry.items().size() != 5 && entry.items().size() != 6))
+          if (!entry.is_array() ||
+              (entry.items().size() != 5 && entry.items().size() != 6 && entry.items().size() != 8))
             throw std::runtime_error("journal: invalid image entry");
           const auto& a = entry.items();
-          for (size_t j = 0; j + 1 < a.size(); ++j)
+          const size_t scalars = a.size() == 8 ? 6 : a.size() - 1;
+          for (size_t j = 0; j < scalars; ++j)
             if (!a[j].is_number() || !std::isfinite(a[j].as_double()) || a[j].as_double() < 0 ||
                 a[j].as_double() > INT32_MAX || a[j].as_double() != std::floor(a[j].as_double()))
               throw std::runtime_error("journal: invalid image dimension or span");
@@ -1119,14 +1130,25 @@ JournalRecord decode_journal_line(std::string_view line) {
           im.width = static_cast<int>(a[2].as_int());
           im.height = static_cast<int>(a[3].as_int());
           // A five-field entry predates the per-family pixel grid.
-          im.grid = a.size() == 6 ? static_cast<int>(a[4].as_int()) : 28;
+          im.grid = a.size() >= 6 ? static_cast<int>(a[4].as_int()) : 28;
+          if (a.size() == 8) {
+            im.frames = static_cast<int>(a[5].as_int());
+            if (!a[6].is_array() || a[6].items().size() > 4)
+              throw std::runtime_error("journal: invalid video spans");
+            for (const auto& at : a[6].items()) {
+              if (at.kind() != minijson::Value::Kind::Int || at.as_int() < 0 ||
+                  at.as_int() > INT32_MAX)
+                throw std::runtime_error("journal: invalid video span offset");
+              im.frame_offsets.push_back(at.as_int());
+            }
+          }
           const auto bytes =
               decode_base64(a.back().as_string(), kMaxRequestImageBytes - image_bytes);
           image_bytes += bytes.size();
           im.rgb.assign(bytes.begin(), bytes.end());
           r.images.push_back(std::move(im));
         }
-        validate_image_inputs(r.images, r.prompt.size());
+        validate_image_inputs(r.images, r.prompt.size(), true);
       }
       if (const dgpp::minijson::Value* lb = item.find("lb")) {
         if (!lb->is_array())

@@ -36,6 +36,7 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 option(DGPP_WERROR "Treat compiler warnings as errors" OFF)
 option(DGPP_BUILD_BENCHMARKS "Build platform, kernel and transport microbenchmarks" ON)
+option(DGPP_ENABLE_VIDEO "Build native MP4/WebM video input decoding with FFmpeg" ON)
 set(DGPP_SANITIZE "" CACHE STRING "Host sanitizer (address or undefined)")
 set_property(CACHE DGPP_SANITIZE PROPERTY STRINGS "" address undefined)
 
@@ -966,10 +967,11 @@ if(DGPP_ENABLE_IBV)
   target_include_directories(dgpp_serve_app PRIVATE ${CMAKE_BINARY_DIR}/generated)
   # The install layout (the versioned artifact, scripts/release.sh): the
   # binary finds the CUDA runtime it was built against beside itself, so
-  # a node needs only the driver, rdma-core, libnl and libstdc++.
+  # a node needs the driver, rdma-core, libnl, libstdc++ and (with video
+  # enabled) the system FFmpeg runtime libraries.
   set_target_properties(dgpp_serve_app PROPERTIES INSTALL_RPATH "$ORIGIN/../lib")
   install(TARGETS dgpp_serve_app RUNTIME DESTINATION bin)
-  foreach(_lib cudart cublasLt)
+  foreach(_lib cudart cublas cublasLt)
     get_target_property(_loc CUDA::${_lib} IMPORTED_LOCATION)
     if(NOT _loc)
       get_target_property(_loc CUDA::${_lib} LOCATION)
@@ -1212,6 +1214,7 @@ set_tests_properties(flint_chat_template_test PROPERTIES SKIP_RETURN_CODE 2)
 # journal (fabric_serve.cpp over the host-only dgpp_net TCP primitives).
 add_library(dgpp_serve STATIC
   src/serve/image_inputs.cpp
+  src/serve/video_inputs.cpp
   src/serve/vision_frontend.cpp
   src/serve/glm_vision_frontend.cpp
   src/serve/qwen_vision_frontend.cpp
@@ -1226,6 +1229,12 @@ add_library(dgpp_serve STATIC
   src/serve/rank_metrics.cpp)
 target_link_libraries(dgpp_serve
   PUBLIC dgpp_core dgpp_models_glm dgpp_loaders dgpp_net Threads::Threads)
+if(DGPP_ENABLE_VIDEO)
+  find_package(PkgConfig REQUIRED)
+  pkg_check_modules(DGPP_FFMPEG REQUIRED IMPORTED_TARGET libavformat libavcodec libavutil libswscale)
+  target_link_libraries(dgpp_serve PRIVATE PkgConfig::DGPP_FFMPEG)
+  target_compile_definitions(dgpp_serve PRIVATE DGPP_ENABLE_VIDEO=1)
+endif()
 dgpp_set_common(dgpp_serve)
 
 add_executable(http_server_test tests/host/http_server_test.cpp)
@@ -2880,6 +2889,14 @@ foreach(shape IN ITEMS rect tiled minimum)
   set_tests_properties(minimax_vision_reference_${shape} PROPERTIES FIXTURES_REQUIRED minimax_vision_${shape}_output LABELS "host" ENVIRONMENT "OPENBLAS_NUM_THREADS=1")
 endforeach()
 
+foreach(frames IN ITEMS 2 4 6 8)
+  set(vdump ${CMAKE_BINARY_DIR}/minimax_video_${frames})
+  add_test(NAME minimax_video_forward_${frames} COMMAND minimax_vision_check ${CMAKE_BINARY_DIR}/minimax_vision_fixture 84 56 ${vdump}.bf16 ${vdump} - ".*" ${frames})
+  set_tests_properties(minimax_video_forward_${frames} PROPERTIES FIXTURES_REQUIRED minimax_vision_checkpoint FIXTURES_SETUP minimax_video_${frames}_output LABELS "gpu")
+  add_test(NAME minimax_video_reference_${frames} COMMAND ${DSV41_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/tools/minimax_vision_reference.py --checkpoint-dir ${CMAKE_BINARY_DIR}/minimax_vision_fixture --engine-dir ${vdump} --width 84 --height 56 --frames ${frames})
+  set_tests_properties(minimax_video_reference_${frames} PROPERTIES FIXTURES_REQUIRED minimax_video_${frames}_output LABELS "host" ENVIRONMENT "OPENBLAS_NUM_THREADS=1")
+endforeach()
+
 add_executable(qwen_vision_test tests/cuda/qwen_vision_test.cpp)
 target_link_libraries(qwen_vision_test PRIVATE dgpp_kernels CUDA::cudart)
 dgpp_set_common(qwen_vision_test)
@@ -2908,6 +2925,11 @@ target_link_libraries(minimax_vision_frontend_test PRIVATE dgpp_serve)
 dgpp_set_common(minimax_vision_frontend_test)
 add_test(NAME minimax_vision_frontend_test COMMAND minimax_vision_frontend_test)
 set_tests_properties(minimax_vision_frontend_test PROPERTIES LABELS "host;checkpoint" SKIP_RETURN_CODE 2)
+add_executable(minimax_video_frontend_test tests/host/minimax_video_frontend_test.cpp)
+target_link_libraries(minimax_video_frontend_test PRIVATE dgpp_serve)
+dgpp_set_common(minimax_video_frontend_test)
+add_test(NAME minimax_video_frontend_test COMMAND minimax_video_frontend_test ${CMAKE_CURRENT_SOURCE_DIR}/tests/data)
+set_tests_properties(minimax_video_frontend_test PROPERTIES LABELS "host" SKIP_RETURN_CODE 2)
 
 # Isolated upstream-port regression: paged BF16/FP8 history and head rows.
 add_executable(mimo_port_test tests/cuda/mimo_port_test.cpp)

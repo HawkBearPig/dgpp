@@ -5,19 +5,23 @@
 
 namespace dgpp {
 namespace {
-__global__ void patchify(const uint8_t* rgb, float* out, int width, int64_t count) {
+__global__ void patchify(const uint8_t* rgb, float* out, int width, int height, int frames,
+                         int64_t count) {
   dgpp_pdl_wait();
   const int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
   if (i >= count) return;
   constexpr int patch = 14, grid = 28, inner = 1176;
-  const int token = i / inner, lane = i % inner, channel = lane / (2 * patch * patch);
+  const int plane = (width / patch) * (height / patch);
+  const int token = (i / inner) % plane, lane = i % inner, channel = lane / (2 * patch * patch);
+  const int frame = frames == 1 ? 0 : int(i / inner / plane) * 2 + lane / (patch * patch) % 2;
   const int y =
       (token / 4 / (width / grid)) * grid + (token % 4 / 2) * patch + lane / patch % patch;
   const int x = (token / 4 % (width / grid)) * grid + (token % 2) * patch + lane % patch;
   constexpr float mean[3] = {0.48145466f, 0.4578275f, 0.40821073f};
   constexpr float std[3] = {0.26862954f, 0.26130258f, 0.27577711f};
   // Match the processor's separate rescale/subtract/divide operations.
-  const float rescaled = __fmul_rn(float(rgb[(int64_t(y) * width + x) * 3 + channel]), 1.0f / 255);
+  const float rescaled =
+      __fmul_rn(float(rgb[((int64_t(frame) * height + y) * width + x) * 3 + channel]), 1.0f / 255);
   const float normalized = __fdiv_rn(__fsub_rn(rescaled, mean[channel]), std[channel]);
   out[i] = bf16_bits_to_float(float_to_bf16_bits(normalized));
 }
@@ -26,13 +30,14 @@ __global__ void cast(const float* x, uint16_t* y, int64_t count) {
   const int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
   if (i < count) y[i] = float_to_bf16_bits(x[i]);
 }
-__global__ void rope_tables(float* out, int width, int half, float theta, int count) {
+__global__ void rope_tables(float* out, int width, int height, int half, float theta, int count) {
   dgpp_pdl_wait();
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= count) return;
-  const int token = i / half, axis = half / 3, dim = i % half;
+  const int plane = width / 14 * (height / 14);
+  const int token = i / half % plane, axis = half / 3, dim = i % half;
   const int block = token / 4;
-  const int pos = dim < axis       ? 0
+  const int pos = dim < axis       ? i / half / plane
                   : dim < 2 * axis ? block / (width / 28) * 2 + token % 4 / 2
                                    : block % (width / 28) * 2 + token % 2;
   const float exponent = __fmul_rn(float(dim % axis), __fdiv_rn(1.0f, float(axis)));
@@ -65,9 +70,10 @@ __global__ void split_rope(const uint16_t* qkv, uint16_t* q, uint16_t* k, uint16
   v[dst] = qkv[src + 2 * hidden];
 }
 }  // namespace
-void minimax_vision_patchify(const uint8_t* rgb, float* out, int w, int h, cudaStream_t s) {
-  const int64_t count = int64_t(w / 14) * (h / 14) * 1176;
-  patchify<<<(count + 255) / 256, 256, 0, s>>>(rgb, out, w, count);
+void minimax_vision_patchify(const uint8_t* rgb, float* out, int w, int h, cudaStream_t s,
+                             int frames) {
+  const int64_t count = int64_t(w / 14) * (h / 14) * 1176 * (frames == 1 ? 1 : frames / 2);
+  patchify<<<(count + 255) / 256, 256, 0, s>>>(rgb, out, w, h, frames, count);
   DGPP_CUDA_OK(cudaGetLastError());
 }
 void minimax_vision_cast(const float* x, uint16_t* y, int64_t count, cudaStream_t s) {
@@ -75,9 +81,9 @@ void minimax_vision_cast(const float* x, uint16_t* y, int64_t count, cudaStream_
   DGPP_CUDA_OK(cudaGetLastError());
 }
 void minimax_vision_rope_tables(float* out, int width, int height, int rot, float theta,
-                                cudaStream_t s) {
-  const int count = width / 14 * (height / 14) * (rot / 2);
-  rope_tables<<<(count + 255) / 256, 256, 0, s>>>(out, width, rot / 2, theta, count);
+                                cudaStream_t s, int frames) {
+  const int count = width / 14 * (height / 14) * (rot / 2) * (frames == 1 ? 1 : frames / 2);
+  rope_tables<<<(count + 255) / 256, 256, 0, s>>>(out, width, height, rot / 2, theta, count);
   DGPP_CUDA_OK(cudaGetLastError());
 }
 void minimax_vision_split_rope(const uint16_t* qkv, uint16_t* q, uint16_t* k, uint16_t* v,
