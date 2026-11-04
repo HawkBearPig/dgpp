@@ -167,7 +167,7 @@ struct MinimaxMoeLayer::Impl : Scratch {
   float *scores, *weights, *down;
   int32_t *ids, *rows, *slot_row;
   uint16_t *gate, *up, *act, *shared_out;
-  MoeSegment* segs;
+  MoeSegment *segs, *compact_segs;
   MoeExpertView* views;
   std::vector<bool> prepared;
   Impl(const MinimaxConfig& c, const MinimaxLocalGeometry& g, int t)
@@ -184,6 +184,7 @@ struct MinimaxMoeLayer::Impl : Scratch {
     rows = alloc<int32_t>(T * (K + 1));
     slot_row = alloc<int32_t>(T * K);
     segs = alloc<MoeSegment>(E + 1);
+    compact_segs = alloc<MoeSegment>(E);
     gate = alloc<uint16_t>(T * K * inter);
     up = alloc<uint16_t>(T * K * inter);
     act = alloc<uint16_t>(T * K * inter);
@@ -199,7 +200,7 @@ size_t MinimaxMoeLayer::scratch_bytes(const MinimaxConfig& c, const MinimaxLocal
                                       int t) {
   const size_t T = static_cast<size_t>(t), K = c.num_experts_per_tok, E = c.num_local_experts,
                H = c.hidden_size;
-  return T * E * 4 + T * K * 4 * 3 + T * (K + 1) * 4 + (E + 1) * sizeof(MoeSegment) +
+  return T * E * 4 + T * K * 4 * 3 + T * (K + 1) * 4 + (2 * E + 1) * sizeof(MoeSegment) +
          T * K * g.local_inter * 6 + T * K * H * 4 + T * H * 2 +
          static_cast<size_t>(c.num_hidden_layers) * E * 3 * sizeof(MoeExpertView) +
          MinimaxMlp::scratch_bytes(static_cast<int>(g.local_shared_inter), t);
@@ -220,7 +221,7 @@ void MinimaxMoeLayer::prepare_table(int layer, const MinimaxMoeResident& w, cuda
   m.prepared[layer] = true;
 }
 void MinimaxMoeLayer::enqueue(int layer, const MinimaxMoeResident& w, const uint16_t* x, int tokens,
-                              uint16_t* out, cudaStream_t stream) {
+                              uint16_t* out, cudaStream_t stream, bool compact_segments) {
   auto& m = *impl_;
   row_count(tokens, m.max_tokens);
   if (!m.prepared.at(static_cast<size_t>(layer)))
@@ -232,13 +233,22 @@ void MinimaxMoeLayer::enqueue(int layer, const MinimaxMoeResident& w, const uint
   minimax_router(x, w.router, w.router_bias, tokens, H, E, K, m.cfg.routed_scaling_factor, m.scores,
                  m.ids, m.weights, stream);
   launch_moe_segment(m.ids, tokens, K, E, m.rows, m.slot_row, m.segs, stream);
-  launch_moe_grouped_mma_fp4_bf16(x, H, m.segs, E, tokens, 0, views, 0, m.gate, I, I, H, stream,
-                                  m.rows);
-  launch_moe_grouped_mma_fp4_bf16(x, H, m.segs, E, tokens, 0, views, 1, m.up, I, I, H, stream,
+  const int segments = compact_segments ? std::min(E, tokens * K) : E;
+  const MoeSegment* segs = m.segs;
+  if (segments < E) {
+    // A short verification can touch only tokens * top_k experts. Avoid
+    // scheduling empty tiles for the rest, retaining every dot's arithmetic.
+    minimax_compact_segments(m.segs, m.compact_segs, E, segments, stream);
+    segs = m.compact_segs;
+  }
+  launch_moe_grouped_mma_fp4_bf16(x, H, segs, segments, tokens, 0, views, 0, m.gate, I, I, H,
+                                  stream, m.rows);
+  launch_moe_grouped_mma_fp4_bf16(x, H, segs, segments, tokens, 0, views, 1, m.up, I, I, H, stream,
                                   m.rows);
   minimax_swiglu(m.gate, m.up, m.act, static_cast<int64_t>(tokens) * K * I, m.cfg.swiglu_alpha,
                  m.cfg.swiglu_limit, stream);
-  launch_moe_grouped_mma_fp4_f32(m.act, I, m.segs, E, tokens, 0, views, 2, m.down, H, H, I, stream);
+  launch_moe_grouped_mma_fp4_f32(m.act, I, segs, segments, tokens, 0, views, 2, m.down, H, H, I,
+                                 stream);
   launch_moe_accum_ordered(out, m.down, H, m.slot_row, m.ids, m.weights, -1, tokens, K, H, stream);
   m.shared.enqueue(w.shared, x, tokens, m.shared_out, stream);
   glm_residual_add_bf16(out, m.shared_out, static_cast<int64_t>(tokens) * H, stream);

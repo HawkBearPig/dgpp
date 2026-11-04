@@ -12,6 +12,7 @@
 
 #include "common/cuda_check.hpp"
 #include "common/dtypes.hpp"
+#include "kernels/glm_moe_launch.hpp"
 #include "kernels/sink_attn.hpp"
 #include "minimax_fixture.hpp"
 #include "models/minimax/forward.hpp"
@@ -145,6 +146,26 @@ void near(const std::vector<uint16_t>& got, const std::vector<uint16_t>& want, d
   require(relative <= limit, std::string(name) + " numerical mismatch");
 }
 void kernels() {
+  {
+    std::vector<MoeSegment> segments(128);
+    for (int e : {0, 7, 32, 127}) segments[e] = MoeSegment{e * 3, 1, e};
+    Device<MoeSegment> source(segments), compact(4);
+    minimax_compact_segments(source.p, compact.p, 128, 4, nullptr);
+    auto got = compact.get();
+    int at = 0;
+    for (const auto& s : segments)
+      if (s.rows) {
+        require(got[at].row0 == s.row0 && got[at].rows == s.rows && got[at].expert == s.expert,
+                "segment compaction preserves row offsets and expert order");
+        ++at;
+      }
+    segments[7].rows = segments[127].rows = 0;
+    source.upload(segments);
+    minimax_compact_segments(source.p, compact.p, 128, 4, nullptr);
+    got = compact.get();
+    require(got[0].expert == 0 && got[1].expert == 32 && got[2].rows == 0 && got[3].rows == 0,
+            "segment compaction clears unused entries when the route set shrinks");
+  }
   {
     const int rows = 3, hidden = 256;
     std::vector<uint16_t> x(rows * hidden), add(x.size()), weight(hidden), expected(x.size()),

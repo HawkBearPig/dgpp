@@ -37,8 +37,10 @@ class MinimaxMoeLayer {
   MinimaxMoeLayer(const MinimaxConfig&, const MinimaxLocalGeometry&, int max_tokens);
   ~MinimaxMoeLayer();
   void prepare_table(int layer, const MinimaxMoeResident&, cudaStream_t);
+  // compact_segments=false is the diagnostic reference schedule. Both
+  // schedules preserve the same segments and floating-point operations.
   void enqueue(int layer, const MinimaxMoeResident&, const uint16_t* x, int tokens, uint16_t* out,
-               cudaStream_t);
+               cudaStream_t, bool compact_segments = true);
   const int32_t* route_ids() const;
   const float* route_weights() const;
   static size_t scratch_bytes(const MinimaxConfig&, const MinimaxLocalGeometry&, int max_tokens);

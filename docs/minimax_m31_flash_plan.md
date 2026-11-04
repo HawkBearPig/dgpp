@@ -551,3 +551,14 @@ produce discrepancies of this size on the quick text. It does not relax the
 accuracy limits or certify dgpp. A fixed arithmetic reference is required
 before this comparison can support a release verdict. Investigation remains
 open and the feature branch is not ready to merge.
+
+Short batches now compact nonempty expert segments before the three routed
+matrix launches. The launch bound is `min(experts, rows * top_k)`; it changes
+neither row offsets nor the order of any dot or expert accumulation. The
+four-rank quick teacher run has identical logit and hidden hashes for every
+chunk in both repeat trials, with exactly zero NLL delta. Fixture, mixed
+reader/verifier/rollback graph checks and CUDA memcheck pass. The optional
+`minimax_moe_bench` target compares both schedules on one real checkpoint
+layer and recorded `ffn_norm` inputs under CUDA graphs. It requires exact
+BF16 outputs before timing; its local layer timings are not deployment
+throughput figures.

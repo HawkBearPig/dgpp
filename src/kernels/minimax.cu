@@ -3,6 +3,7 @@
 
 #include "common/cuda_check.hpp"
 #include "common/dtypes.hpp"
+#include "kernels/glm_moe_launch.hpp"
 #include "kernels/minimax.hpp"
 
 namespace dgpp {
@@ -19,6 +20,23 @@ __device__ float max_warp(float x) {
 }
 __device__ float rb(float x) {
   return bf16_bits_to_float(float_to_bf16_bits(x));
+}
+__global__ void compact_segments_kernel(const MoeSegment* input, MoeSegment* output, int experts,
+                                        int capacity) {
+  __shared__ int counts[32];
+  const int e = threadIdx.x, lane = e % 32, warp = e / 32;
+  const bool live = e < experts && input[e].rows > 0;
+  const unsigned mask = __ballot_sync(~0u, live);
+  if (lane == 0) counts[warp] = __popc(mask);
+  __syncthreads();
+  int before = 0, total = 0;
+  for (int w = 0; w < blockDim.x / 32; ++w) {
+    if (w < warp) before += counts[w];
+    total += counts[w];
+  }
+  const int at = before + __popc(mask & ((1u << lane) - 1));
+  if (live && at < capacity) output[at] = input[e];
+  if (e >= total && e < capacity) output[e] = MoeSegment{};
 }
 __global__ void add_norm_kernel(uint16_t* residual, const uint16_t* add, const uint16_t* weight,
                                 uint16_t* out, int hidden, float eps) {
@@ -228,6 +246,16 @@ __global__ void router_select_kernel(const float* scores, const float* bias, int
   }
 }
 }  // namespace
+
+void minimax_compact_segments(const MoeSegment* input, MoeSegment* output, int experts,
+                              int capacity, cudaStream_t stream) {
+  if (!input || !output || input == output || experts < 1 || experts > 1024 || capacity < 1 ||
+      capacity > experts)
+    throw std::invalid_argument("MiniMax segment compaction geometry");
+  compact_segments_kernel<<<1, (experts + 31) / 32 * 32, 0, stream>>>(input, output, experts,
+                                                                      capacity);
+  DGPP_CUDA_OK(cudaGetLastError());
+}
 
 void minimax_add_norm(uint16_t* residual, const uint16_t* add, const uint16_t* weight,
                       uint16_t* out, int rows, int hidden, float eps, cudaStream_t stream) {

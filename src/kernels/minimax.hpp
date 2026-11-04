@@ -4,6 +4,12 @@
 #include <cuda_runtime.h>
 
 namespace dgpp {
+struct MoeSegment;
+// Stable compaction of nonempty routed segments. Capacity bounds the number
+// of nonempty experts (min(experts, tokens * top_k)); unused entries are zero.
+// Row offsets and expert ids are preserved, so the grouped MMA chain is unchanged.
+void minimax_compact_segments(const MoeSegment* input, MoeSegment* output, int experts,
+                              int capacity, cudaStream_t);
 // Save the BF16 residual, but normalize its FP32 pre-rounding sum, matching
 // MiniMax's fused Gemma normalization. Both outputs have one BF16 rounding.
 void minimax_add_norm(uint16_t* residual, const uint16_t* add, const uint16_t* weight,
