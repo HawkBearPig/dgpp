@@ -424,7 +424,8 @@ ClusterConfig parse_cluster_config(const std::string& json, const std::string& w
         else if (p.key == "dflash_draft_batch") e.dflash_draft_batch = boolean(x, ek, what);
         else if (p.key == "dflash_depth") e.dflash_depth = static_cast<int>(integer(x, ek, what, 0, 7));
         else if (p.key == "mtp_depth") {
-          e.mtp_depth = static_cast<int>(integer(x, ek, what, 1, 5));  // the MTP families' chains; the DFlash2 block is its checkpoint's
+          e.mtp_depth = static_cast<int>(
+              integer(x, ek, what, 1, 7));  // The loaded family validates its own draft width.
           e.mtp_depth_set = true;
         } else if (p.key == "compact_batches")
           e.compact_batches = boolean(x, ek, what);

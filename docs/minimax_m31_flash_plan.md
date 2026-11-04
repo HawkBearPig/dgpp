@@ -681,3 +681,10 @@ The tier harness sizes staging chunks and restore positions from the
 model's physical block size. Kernel and native draft-forward memchecks
 report zero errors; the MiniMax shared-prefill test passes. Four-node real
 model speculation and acceptance/throughput tuning remain separate gates.
+
+The first real DSpark boot caught a remaining deployment-parser ceiling of
+five draft tokens. The parser and CLI now admit seven; a family check
+preserves the five-token ceiling for existing MTP chains and requires the
+checkpoint's full physical block width for MiniMax. A deployment regression
+test covers the seven-proposal configuration. MiniMax uses the verification
+scheduler to reduce verified rows without changing that physical block.

@@ -371,6 +371,10 @@ struct ServeFamily {
   // acceptance collapses with no diagnostic, so the combination is refused at
   // startup instead. Opt-in: the capture is what earns the flag.
   virtual bool block_draft_graph_ok() const { return false; }
+  virtual void check_mtp_depth(int depth) const {
+    if (depth > 5)
+      throw std::invalid_argument("engine.mtp_depth: this family supports at most 5 drafts");
+  }
 };
 
 // GLM-5.3-Flash: the DSA pool's block and pool-id geometry, the latent
@@ -1180,6 +1184,14 @@ struct MinimaxFamily final : ServeFamily {
   size_t lat_slot_bytes(int decode_rows) const override {
     return static_cast<size_t>(decode_rows) * static_cast<size_t>(cfg.hidden_size) * 2;
   }
+  void check_mtp_depth(int depth) const override {
+    if (!cfg.dspark)
+      throw std::invalid_argument("engine.mtp: MiniMax requires its bundled dspark/config.json");
+    if (depth != cfg.dspark->drafts())
+      throw std::invalid_argument("engine.mtp_depth: MiniMax requires its checkpoint block width " +
+                                  std::to_string(cfg.dspark->drafts()) +
+                                  "; engine.mtp_schedule can select fewer verification rows");
+  }
   dgpp::MemoryPlan plan(int forward_rows, int64_t context, int rank, int world_, bool fabric,
                         int slots, bool mtp, int decode_rows) const override {
     return dgpp::MinimaxModel::plan_memory(
@@ -1819,7 +1831,7 @@ int main(int argc, char** argv) {
       "    [--graph-batch-min-live N (default min(2, max-concurrency);\n"
       "      must be in [1, max-concurrency])]\n"
       "      (the row batch needs max-concurrency * (1 + mtp depth) <= 8)\n"
-      "    [--mtp-depth N]  draft tokens per step (1..5; the verify runs 1+N rows)\n"
+      "    [--mtp-depth N]  draft tokens per step (1..7; family-specific limits apply)\n"
       "    [--prefill-fp8-per-tensor]  Qwen3.8-27B: prefill GEMMs on cuBLASLt's per-tensor e4m3 kernels\n"
       "      (engine.prefill_fp8_per_tensor; ~2x the prefill rate, +23 GiB, changes greedy output)\n"
       "    [--dflash-model DIR_OR_ID]  DFlash2 block drafter checkpoint: the drafter's world. It\n"
@@ -1976,7 +1988,7 @@ int main(int argc, char** argv) {
   int max_connections = 64;
   int world = 1, rank = 0, rendezvous_timeout_ms = 120000;
   bool no_eos = false, decode_graph = false, mtp = false;
-  int mtp_depth = 1;  // draft tokens per step (needs --mtp; 1..5)
+  int mtp_depth = 1;  // draft tokens per step (needs --mtp; family-specific limit)
   bool no_mtp_cli = false, mtp_depth_cli = false, mtp_schedule_cli = false;  // given on the command line
   bool no_dflash_cli = false, dflash_model_cli = false, mtp_cli = false;
   bool lookup_draft_cli = false, lookup_tail_cli = false, draft_head_cli = false;
@@ -3224,8 +3236,8 @@ int main(int argc, char** argv) {
     DGPP_LOG_ERROR("--mtp-schedule-sampled-scale must be in [0, 1], got {}", mtp_schedule_sampled_scale);
     return 2;
   }
-  if (mtp_depth < 1 || mtp_depth > 5) {
-    DGPP_LOG_ERROR("--mtp-depth must be in [1, 5], got {}", mtp_depth);
+  if (mtp_depth < 1 || mtp_depth > 7) {
+    DGPP_LOG_ERROR("--mtp-depth must be in [1, 7], got {}", mtp_depth);
     return 2;
   }
   if (!mtp && mtp_depth != 1) {
@@ -3322,6 +3334,7 @@ int main(int argc, char** argv) {
       return 1;
     }
     const std::string family_name = std::string(family->name());
+    if (mtp) family->check_mtp_depth(mtp_depth);
     // The Dory family's two keys (docs/dory_plan.md D1, D2) and its two
     // refusals (plan D4): no draft layer, so speculation is refused by name,
     // and the loop keys belong to no other family.

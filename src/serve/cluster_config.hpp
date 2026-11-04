@@ -265,8 +265,9 @@ struct ClusterConfig {
     bool compact_batches = true;
     bool decode_graph = false;
     bool mtp = false;
-    int mtp_depth = 1;             // draft tokens per step (1..5); needs mtp
-    bool mtp_depth_set = false;    // the file named it (else a family may default it: DSpark's block is 5)
+    int mtp_depth = 1;  // draft tokens per step (1..7); family-specific limits apply
+    bool mtp_depth_set =
+        false;  // the file named it (else a family may default it from its checkpoint)
     // The DFlash2 block drafter (Qwen3.5-family, eager path only): a
     // checkpoint directory or HF id whose config.json names the drafter.
     // Replaces mtp (mutually exclusive); the draft width is the
