@@ -37,14 +37,17 @@ uint64_t digest(const std::vector<uint16_t>& data) {
   }
   return h;
 }
-void log_digest(const dgpp::MinimaxModel::Outputs& out, int offset, int rank) {
+uint64_t log_digest(const dgpp::MinimaxModel::Outputs& out, int offset, int rank, int trial) {
   uint64_t hash = 1469598103934665603ull;
   for (float v : out.logits) {
     hash ^= std::bit_cast<uint32_t>(v);
     hash *= 1099511628211ull;
   }
-  std::printf("[minimax_logits] rank %d offset %d rows %zu digest %016llx\n", rank, offset,
-              out.logits.size() / out.lm_vocab_count, static_cast<unsigned long long>(hash));
+  std::printf(
+      "[minimax_logits] rank %d trial %d offset %d rows %zu digest %016llx hidden %016llx\n", rank,
+      trial, offset, out.logits.size() / out.lm_vocab_count, static_cast<unsigned long long>(hash),
+      static_cast<unsigned long long>(digest(out.final_hidden_bits)));
+  return hash;
 }
 void score(const dgpp::MinimaxModel::Outputs& out, int row, int step, int64_t target, int rank) {
   const float* x = out.logits.data() + static_cast<size_t>(row) * out.lm_vocab_count;
@@ -146,19 +149,35 @@ int main(int argc, char** argv) {
         boundary.get(), rank, world, 1, false, std::max(rows, 8));
     if (resident) engine.graph_prepare();
     if (!teacher.empty()) {
-      auto out = engine.session_prefill(0, {ids.front()});
-      log_digest(out, 0, rank);
-      score(out, 0, 0, ids[1], rank);
-      for (size_t at = 1; at + 1 < ids.size();) {
-        const int n = std::min<size_t>(rows, ids.size() - at - 1);
-        out = engine.session_verify(0, {ids.begin() + at, ids.begin() + at + n});
-        log_digest(out, at, rank);
-        for (int row = 0; row < n; ++row) score(out, row, at + row, ids[at + row + 1], rank);
-        engine.session_rollback(0, n, n);
-        at += n;
-        std::fflush(stdout);
+      std::vector<uint64_t> hashes;
+      for (int trial = 0; trial < 2; ++trial) {
+        size_t chunk = 0;
+        const auto check_repeat = [&](const auto& out, int offset) {
+          const auto hash = log_digest(out, offset, rank, trial);
+          if (trial == 0)
+            hashes.push_back(hash);
+          else if (chunk >= hashes.size() || hash != hashes[chunk])
+            throw std::runtime_error(
+                "fixed-token same-geometry logits are not repeatable at offset " +
+                std::to_string(offset));
+          ++chunk;
+        };
+        auto out = engine.session_prefill(0, {ids.front()});
+        check_repeat(out, 0);
+        if (trial == 0) score(out, 0, 0, ids[1], rank);
+        for (size_t at = 1; at + 1 < ids.size();) {
+          const int n = std::min<size_t>(rows, ids.size() - at - 1);
+          out = engine.session_verify(0, {ids.begin() + at, ids.begin() + at + n});
+          check_repeat(out, at);
+          if (trial == 0)
+            for (int row = 0; row < n; ++row) score(out, row, at + row, ids[at + row + 1], rank);
+          engine.session_rollback(0, n, n);
+          at += n;
+          std::fflush(stdout);
+        }
+        engine.session_close(0);
+        if (chunk != hashes.size()) throw std::runtime_error("repeat changed the chunk count");
       }
-      engine.session_close(0);
       std::printf("[prefill_tf_end] rank %d world %d positions %zu\n", rank, world, ids.size() - 1);
     } else {
       engine.set_decode_row_traces(true);
@@ -179,6 +198,7 @@ int main(int argc, char** argv) {
         std::printf("layer %zu hidden %016llx\n", l,
                     static_cast<unsigned long long>(digest(out.layer_states[l])));
       for (size_t t = 0; t + 1 < ids.size(); ++t) score(out, t, t, ids[t + 1], rank);
+      std::printf("[prefill_tf_end] rank %d world %d positions %zu\n", rank, world, ids.size() - 1);
       if (!dump.empty()) {
         const auto path = std::filesystem::path(dump) / ("rank" + std::to_string(rank));
         std::filesystem::create_directories(path);
@@ -189,7 +209,7 @@ int main(int argc, char** argv) {
             write(path / ("routes-" + std::to_string(l) + ".i32"), out.route_ids[moe++]);
         }
         std::ofstream meta(path / "metadata.json");
-        meta << "{\"world\":" << world << ",\"rank\":" << rank
+        meta << "{\"residual_norm\":\"fp32\",\"world\":" << world << ",\"rank\":" << rank
              << ",\"vocab_begin\":" << out.lm_vocab_begin
              << ",\"vocab_count\":" << out.lm_vocab_count << ",\"tokens\":[";
         for (size_t t = 0; t < ids.size(); ++t) meta << (t ? "," : "") << ids[t];

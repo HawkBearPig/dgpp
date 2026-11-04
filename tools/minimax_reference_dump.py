@@ -292,20 +292,23 @@ def ffn_forward(n, layer, w, c, world=1):
     return y, routes
 
 
-def layer_forward(x, layer, w, c, world=1):
+def layer_forward(x, layer, w, c, world=1, rounded_residual=True):
     p = f'language_model.model.layers.{layer}.'
     n = norm(x, w.tensor(p+'input_layernorm.weight'), c['rms_norm_eps'])
-    x = rounded(x + attention_forward(n, layer, w, c, world))
+    x = rounded(x) + attention_forward(n, layer, w, c, world)
+    if rounded_residual:
+        x = rounded(x)
     n = norm(x, w.tensor(p+'post_attention_layernorm.weight'), c['rms_norm_eps'])
     y, routes = ffn_forward(n, layer, w, c, world)
-    return rounded(x+y), routes
+    result = rounded(x)+y
+    return rounded(result) if rounded_residual else result, routes
 
 
 def relative_rms(actual, expected):
     return np.linalg.norm(actual.astype(np.float64)-expected) / max(np.linalg.norm(expected.astype(np.float64)), 1e-20)
 
 
-def check_stages(engine, x, layer, w, c, world):
+def check_stages(engine, x, layer, w, c, world, rounded_residual):
     """Isolate each operation using its recorded input; this is not an end-to-end quality gate."""
     p = f'language_model.model.layers.{layer}.'
     def compare(stage, expected):
@@ -317,10 +320,14 @@ def check_stages(engine, x, layer, w, c, world):
         return actual
     n = compare('input_norm', norm(x, w.tensor(p+'input_layernorm.weight'), c['rms_norm_eps']))
     a = compare('attention', attention_forward(n, layer, w, c, world))
-    n = compare('ffn_norm', norm(rounded(x+a), w.tensor(p+'post_attention_layernorm.weight'), c['rms_norm_eps']))
+    x = rounded(x)+a
+    if rounded_residual:
+        x = rounded(x)
+    n = compare('ffn_norm', norm(x, w.tensor(p+'post_attention_layernorm.weight'), c['rms_norm_eps']))
     expected, routes = ffn_forward(n, layer, w, c, world)
     y = compare('ffn', expected)
-    return rounded(rounded(x+a)+y), routes
+    result = rounded(x)+y
+    return rounded(result) if rounded_residual else result, routes
 
 
 def check(path, engine, stages=False):
@@ -332,6 +339,9 @@ def check(path, engine, stages=False):
             raise ValueError('no engine output metadata')
         engine = ranks[0]
     meta = json.loads((engine/'metadata.json').read_text())
+    rounded_residual = meta.get('residual_norm','bf16') == 'bf16'
+    if meta.get('residual_norm','bf16') not in ('bf16','fp32'):
+        raise ValueError('unknown residual normalization boundary')
     if ranks and len(ranks) != meta['world']:
         raise ValueError('incomplete vocabulary rank set')
     tokens = np.array(meta['tokens'])
@@ -339,10 +349,11 @@ def check(path, engine, stages=False):
     x = w.tensor('language_model.model.embed_tokens.weight', tokens)
     for layer in range(c['num_hidden_layers']):
         if stages:
-            expected, routes = check_stages(engine, x, layer, w, c, meta.get('world',1))
+            expected, routes = check_stages(engine, x, layer, w, c, meta.get('world',1), rounded_residual)
         else:
-            expected, routes = layer_forward(x,layer,w,c,world=meta.get('world',1))
+            expected, routes = layer_forward(x,layer,w,c,world=meta.get('world',1),rounded_residual=rounded_residual)
         actual = f32(np.fromfile(engine/f'layer-{layer}.bf16',dtype='<u2').reshape(expected.shape))
+        expected = rounded(expected)
         rms = np.sqrt(np.mean((actual.astype(np.float64)-expected)**2)) / max(np.sqrt(np.mean(expected.astype(np.float64)**2)),1e-20)
         print(f'Layer {layer}: teacher-forced relative RMS {rms:.6g}', flush=True)
         if not np.isfinite(rms) or rms > (.0 if stages else .01):
@@ -353,7 +364,16 @@ def check(path, engine, stages=False):
             print(f'  router slot disagreement: {flips:.6g}')
             if flips != 0:
                 raise AssertionError(f'Layer {layer}: fixture routing mismatch; investigate ties before accepting')
-        x = actual  # independent layer math, every layer sees the engine's input
+        if rounded_residual:
+            x = actual
+        else:
+            # Restore the actual pair feeding the NEXT fused norm. The BF16
+            # residual dump alone has already lost the sum's low bits.
+            attention = f32(np.fromfile(engine/f'attention-{layer}.bf16',dtype='<u2').reshape(x.shape))
+            ffn = f32(np.fromfile(engine/f'ffn-{layer}.bf16',dtype='<u2').reshape(x.shape))
+            x = rounded(rounded(x)+attention)+ffn
+            if not np.array_equal(rounded(x),actual):
+                raise AssertionError(f'Layer {layer}: recorded residual composition differs')
     expected = norm(x,w.tensor('language_model.model.norm.weight'),c['rms_norm_eps']).astype(np.float64) @ w.matrix('language_model.lm_head').T
     if ranks:
         shards, begin = [], 0

@@ -6,6 +6,7 @@
 #include "common/cuda_check.hpp"
 #include "kernels/glm_norm.hpp"
 #include "kernels/kernels.hpp"
+#include "kernels/minimax.hpp"
 #include "kernels/qwen_norm.hpp"
 
 namespace dgpp {
@@ -177,7 +178,7 @@ void MinimaxModel::fold(uint16_t* p, int rows, bool capture) {
 void MinimaxModel::norm(uint16_t* resid, const uint16_t* add, const uint16_t* w, uint16_t* out,
                         int rows) {
   if (add)
-    qwen_add_rmsnorm_bf16(resid, add, w, out, rows, cfg_.hidden_size, cfg_.rms_norm_eps, stream_);
+    minimax_add_norm(resid, add, w, out, rows, cfg_.hidden_size, cfg_.rms_norm_eps, stream_);
   else
     qwen_rmsnorm_bf16(resid, w, out, rows, cfg_.hidden_size, cfg_.rms_norm_eps, stream_);
 }
@@ -235,12 +236,17 @@ MinimaxModel::Outputs MinimaxModel::run_rows(const RowRun& run) {
     pending = ffn;
     if (r.moe) ++ordinal;
     if (run.capture_layers) {
-      glm_residual_add_bf16(resid_, pending, static_cast<int64_t>(T) * H, stream_);
-      pending = nullptr;
+      // Capturing a residual must not materialize the sum on the execution
+      // path: the next fused norm needs its unrounded FP32 value.
       DGPP_CUDA_OK(cudaStreamSynchronize(stream_));
       out.layer_states.emplace_back(static_cast<size_t>(T) * H);
+      std::vector<uint16_t> add(static_cast<size_t>(T) * H);
       DGPP_CUDA_OK(cudaMemcpy(out.layer_states.back().data(), resid_,
                               static_cast<size_t>(T) * H * 2, cudaMemcpyDeviceToHost));
+      DGPP_CUDA_OK(cudaMemcpy(add.data(), pending, add.size() * 2, cudaMemcpyDeviceToHost));
+      for (size_t i = 0; i < add.size(); ++i)
+        out.layer_states.back()[i] = float_to_bf16_bits(
+            bf16_bits_to_float(out.layer_states.back()[i]) + bf16_bits_to_float(add[i]));
     }
   }
   norm(resid_, pending, globals_.final_norm, h_, T);

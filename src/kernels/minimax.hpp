@@ -4,6 +4,10 @@
 #include <cuda_runtime.h>
 
 namespace dgpp {
+// Save the BF16 residual, but normalize its FP32 pre-rounding sum, matching
+// MiniMax's fused Gemma normalization. Both outputs have one BF16 rounding.
+void minimax_add_norm(uint16_t* residual, const uint16_t* add, const uint16_t* weight,
+                      uint16_t* out, int rows, int hidden, float eps, cudaStream_t);
 void minimax_swiglu(const uint16_t* gate, const uint16_t* up, uint16_t* out, int64_t count,
                     float alpha, float limit, cudaStream_t);
 // x and y are [rows,heads,128], in-place allowed. Gemma norm rounds before

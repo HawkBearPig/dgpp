@@ -143,7 +143,8 @@ MinimaxConfig MinimaxConfig::from_json_file(const std::string& path) {
 }
 
 void MinimaxConfig::validate() const {
-  if (hidden_size <= 0 || hidden_size % 64) bad("hidden_size", "must be a positive multiple of 64");
+  if (hidden_size <= 0 || hidden_size > 8192 || hidden_size % 64)
+    bad("hidden_size", "must be a positive multiple of 64 up to 8192");
   if (vocab_size <= 0) bad("vocab_size", "must be positive");
   if (eos_token_ids.empty()) bad("eos_token_id", "must be present");
   for (int64_t eos : eos_token_ids)

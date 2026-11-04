@@ -145,6 +145,32 @@ void near(const std::vector<uint16_t>& got, const std::vector<uint16_t>& want, d
   require(relative <= limit, std::string(name) + " numerical mismatch");
 }
 void kernels() {
+  {
+    const int rows = 3, hidden = 256;
+    std::vector<uint16_t> x(rows * hidden), add(x.size()), weight(hidden), expected(x.size()),
+        residual(x.size());
+    for (size_t i = 0; i < x.size(); ++i) {
+      x[i] = b(std::sin(float(i) * .21f));
+      add[i] = b(std::cos(float(i) * .37f) * .3f);
+    }
+    for (int d = 0; d < hidden; ++d) weight[d] = b(std::sin(float(d)) * .1f);
+    for (int r = 0; r < rows; ++r) {
+      double sum = 0;
+      for (int d = 0; d < hidden; ++d) {
+        const float v = f(x[r * hidden + d]) + f(add[r * hidden + d]);
+        sum += double(v) * v;
+        residual[r * hidden + d] = b(v);
+      }
+      const float inv = 1 / std::sqrt(float(sum / hidden) + 1e-6f);
+      for (int d = 0; d < hidden; ++d)
+        expected[r * hidden + d] =
+            b((f(x[r * hidden + d]) + f(add[r * hidden + d])) * inv * (1 + f(weight[d])));
+    }
+    Device<uint16_t> dx(x), da(add), dw(weight), dy(x.size());
+    minimax_add_norm(dx.p, da.p, dw.p, dy.p, rows, hidden, 1e-6f, nullptr);
+    require(dx.get() == residual, "fused norm residual must round exactly once");
+    near(dy.get(), expected, .0001, "FP32 residual Gemma norm");
+  }
   // Activation extremes distinguish all three parts of SwiGLU-OAI.
   std::vector<uint16_t> g(513), u(g.size()), want(g.size());
   for (size_t i = 0; i < g.size(); ++i) {
@@ -287,9 +313,38 @@ void smoke(const std::string& path, const std::string& dump) {
   MinimaxModel m(cfg, path, 512, 1536, LoaderResidency::Resident, nullptr, 0, 1, 3);
   m.graph_prepare();
   m.set_decode_row_traces(true);
+  if (!dump.empty()) {
+    std::filesystem::create_directories(dump);
+    m.set_observer([&](int layer, std::string_view stage, const uint16_t* data, int rows,
+                       cudaStream_t stream) {
+      DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+      write(std::filesystem::path(dump) /
+                (std::string(stage) + "-" + std::to_string(layer) + ".bf16"),
+            copy_device(data, static_cast<size_t>(rows) * cfg.hidden_size));
+    });
+  }
   auto first = m.forward(tokens, true), second = m.forward(tokens, true);
   require(first.logits == second.logits && first.layer_states == second.layer_states,
           "repeated forward must be bitwise identical");
+  require(first.logits == m.forward(tokens, false).logits,
+          "diagnostic layer capture must not change arithmetic");
+  m.set_observer({});
+  {
+    auto decoded = m.session_prefill(0, {tokens.front()});
+    require(std::equal(decoded.final_hidden_bits.begin(), decoded.final_hidden_bits.end(),
+                       first.final_hidden_bits.begin()),
+            "first decode hidden differs from full prefill");
+    for (size_t at = 1; at < tokens.size();) {
+      const int rows = std::min<size_t>(8, tokens.size() - at);
+      decoded = m.session_verify(0, {tokens.begin() + at, tokens.begin() + at + rows});
+      require(std::equal(decoded.final_hidden_bits.begin(), decoded.final_hidden_bits.end(),
+                         first.final_hidden_bits.begin() + at * cfg.hidden_size),
+              "incremental verification hidden differs from full prefill at " + std::to_string(at));
+      m.session_rollback(0, rows, rows);
+      at += rows;
+    }
+    m.session_close(0);
+  }
   for (float x : first.logits) require(std::isfinite(x), "finite logits");
   if (!dump.empty()) {
     std::filesystem::create_directories(dump);
@@ -303,7 +358,7 @@ void smoke(const std::string& path, const std::string& dump) {
               first.route_ids[ordinal++]);
     }
     std::ofstream meta(std::filesystem::path(dump) / "metadata.json");
-    meta << "{\"tokens\":[";
+    meta << "{\"residual_norm\":\"fp32\",\"tokens\":[";
     for (size_t i = 0; i < tokens.size(); ++i) {
       if (i) meta << ',';
       meta << tokens[i];

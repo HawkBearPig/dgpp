@@ -20,6 +20,29 @@ __device__ float max_warp(float x) {
 __device__ float rb(float x) {
   return bf16_bits_to_float(float_to_bf16_bits(x));
 }
+__global__ void add_norm_kernel(uint16_t* residual, const uint16_t* add, const uint16_t* weight,
+                                uint16_t* out, int hidden, float eps) {
+  extern __shared__ float values[];
+  __shared__ float sums[8];
+  const int row = blockIdx.x, tid = threadIdx.x;
+  const int64_t start = static_cast<int64_t>(row) * hidden;
+  float sum = 0;
+  for (int d = tid; d < hidden; d += blockDim.x) {
+    const float value =
+        bf16_bits_to_float(residual[start + d]) + bf16_bits_to_float(add[start + d]);
+    values[d] = value;
+    residual[start + d] = float_to_bf16_bits(value);
+    sum = fmaf(value, value, sum);
+  }
+  sum = sum_warp(sum);
+  if (tid % 32 == 0) sums[tid / 32] = sum;
+  __syncthreads();
+  sum = 0;
+  for (int w = 0; w < 8; ++w) sum += sums[w];
+  const float rstd = rsqrtf(sum / hidden + eps);
+  for (int d = tid; d < hidden; d += blockDim.x)
+    out[start + d] = float_to_bf16_bits(values[d] * rstd * (1 + bf16_bits_to_float(weight[d])));
+}
 __global__ void swiglu_kernel(const uint16_t* gate, const uint16_t* up, uint16_t* out,
                               int64_t count, float alpha, float limit) {
   const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -205,6 +228,15 @@ __global__ void router_select_kernel(const float* scores, const float* bias, int
   }
 }
 }  // namespace
+
+void minimax_add_norm(uint16_t* residual, const uint16_t* add, const uint16_t* weight,
+                      uint16_t* out, int rows, int hidden, float eps, cudaStream_t stream) {
+  if (rows <= 0) return;
+  if (hidden <= 0 || hidden > 8192) throw std::invalid_argument("MiniMax add/norm hidden width");
+  add_norm_kernel<<<rows, 256, static_cast<size_t>(hidden) * sizeof(float), stream>>>(
+      residual, add, weight, out, hidden, eps);
+  DGPP_CUDA_OK(cudaGetLastError());
+}
 
 void minimax_swiglu(const uint16_t* gate, const uint16_t* up, uint16_t* out, int64_t count,
                     float alpha, float limit, cudaStream_t stream) {

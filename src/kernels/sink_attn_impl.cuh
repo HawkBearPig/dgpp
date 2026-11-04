@@ -470,7 +470,10 @@ __global__ void attn_partial_kernel(const uint16_t* __restrict__ q, int64_t q_st
     const float rescale = expf(m_run - m_new);  // 0 when m_run is -inf
     const float e = lane < n ? expf(score - m_new) : 0.f;
     l_run = l_run * rescale + warp_sum(e);
-    pbuf[warp * kTile + lane] = round_bf16(e);
+    // MiniMax's baseline keeps probabilities in FP32. Rounding each
+    // block's unnormalized probabilities perturbs its sensitive routers.
+    // The other families retain their existing BF16 probability recipe.
+    pbuf[warp * kTile + lane] = kSelectedBlocks ? e : round_bf16(e);
 #pragma unroll
     for (int i = 0; i < 4; ++i) creg[i] *= rescale;
     __syncwarp();

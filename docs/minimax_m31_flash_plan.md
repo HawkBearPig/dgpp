@@ -513,12 +513,41 @@ reference streams the real checkpoint one layer at a time without loading
 dgpp kernels; it simulates TP folds and scores complete texts with FP32
 attention. Its default follows the published fused normalization of the
 unrounded residual sum. The explicit `--rounded-residual` diagnostic isolates
-the baseline's existing BF16 residual-normalization boundary. These tools
+the initial baseline's BF16 residual-normalization boundary. These tools
 provide numerical evidence; their elapsed times are not serving benchmarks.
 
 The first independent full-text check (529 tokens, 528 scored positions,
 quick teacher text) failed against the published normalization recipe:
 absolute mean NLL delta 0.10734 nat and 7.01% of positions moving by over
 1 nat. The baseline's NLL was lower, but the bidirectional numerical gate
-still fails. Normalization and attention arithmetic are under investigation;
-no quality or completion claim is made from the chat smoke.
+still fails. The current baseline normalizes the unrounded FP32 residual
+sum while storing the BF16 residual, as the published fused norm does.
+Selected-block attention retains FP32 probabilities. The ordinary sink
+attention variants keep their existing arithmetic.
+
+The real probe also exposed a shape-dependent MXFP8 projection dispatch:
+short verification and long prefill selected different reduction chains.
+The MiniMax baseline now uses the streaming projection at every row count.
+Full prefill and eight-row verification then produce exactly identical
+teacher scores at all 528 positions. Two same-process trials and a separate
+process repeat have identical logit hashes, with hidden-state agreement
+across all four ranks. Synthetic fixtures additionally require exact
+full-prefill versus incremental hidden states and verify that recording
+layer states does not change the execution. CUDA memcheck reports zero
+errors for the changed norm and the complete fixture/session smoke.
+
+The corrected baseline still fails the independent PyTorch trajectory
+comparison: absolute mean NLL delta 0.09451 nat, with 10.98% of positions
+moving by more than 1 nat. An independent replay of all 60 layers using
+the recorded inputs has maximum sublayer RMS 0.002023 and identical expert
+selections at all 57 MoE layers. These isolated checks locate the discrepancy
+without certifying end-to-end quality. The reference's `--projection-rows`
+control measures its own matrix-shape sensitivity; `--check-engine-dir`
+checks recorded sublayers separately. Changing only the PyTorch projection
+batch size to eight rows also fails the same gate against its full-row
+reference: absolute mean NLL delta 0.13521 nat and 10.98% large moves.
+This control establishes that cuBLAS shape-dependent reductions alone can
+produce discrepancies of this size on the quick text. It does not relax the
+accuracy limits or certify dgpp. A fixed arithmetic reference is required
+before this comparison can support a release verdict. Investigation remains
+open and the feature branch is not ready to merge.

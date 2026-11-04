@@ -84,6 +84,7 @@ DGPP_TEST(minimax_config_refuses_semantic_changes) {
   rejects("\"num_hidden_layers\": 60", "\"num_hidden_layers\": 59", "moe_layer_freq");
   rejects("\"hidden_size\": 6144", "\"hidden_size\": 6144.5", "hidden_size");
   rejects("\"hidden_size\": 6144", "\"hidden_size\": 6112", "hidden_size");
+  rejects("\"hidden_size\": 6144", "\"hidden_size\": 8256", "hidden_size");
   rejects("\"num_key_value_heads\": 4", "\"num_key_value_heads\": 0", "num_attention_heads");
   rejects("\"swiglu_alpha\": 1.702", "\"swiglu_alpha\": 0", "numerics");
   rejects("\"rotary_dim\": 64", "\"rope_scaling\": {}, \"rotary_dim\": 64", "rope_scaling");

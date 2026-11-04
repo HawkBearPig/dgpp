@@ -25,11 +25,12 @@ from minimax_reference_dump import FP4, FP8, Weights
 
 
 class Reference:
-    def __init__(self, checkpoint, world, rounded_residual):
+    def __init__(self, checkpoint, world, rounded_residual, projection_rows=0):
         self.w = Weights(checkpoint)
         self.c = json.loads((checkpoint / 'config.json').read_text())['text_config']
         self.world = world
         self.rounded_residual = rounded_residual
+        self.projection_rows = projection_rows
         self.config_sha256 = hashlib.sha256((checkpoint/'config.json').read_bytes()).hexdigest()
         self.checkpoint = str(checkpoint.resolve())
         self.fp8 = torch.tensor(FP8, device='cuda')
@@ -63,9 +64,12 @@ class Reference:
         global_scale = float(self.w.tensor(base+'.weight_global_scale'))
         return weight.to(torch.bfloat16), global_scale
 
-    @staticmethod
-    def mm(x, weight, divisor=1.0, rounded=True):
-        y = torch.mm(x, weight.T, out_dtype=torch.float32) / divisor
+    def mm(self, x, weight, divisor=1.0, rounded=True):
+        # A reference-only control: changing cuBLAS's row geometry while
+        # preserving every BF16 boundary measures its own reduction sensitivity.
+        rows = self.projection_rows or len(x)
+        y = torch.cat([torch.mm(part, weight.T, out_dtype=torch.float32)
+                       for part in x.split(rows)]) / divisor
         return y.to(torch.bfloat16) if rounded else y
 
     def linear(self, x, base):
@@ -157,11 +161,13 @@ class Reference:
         c = self.c
         p = f'language_model.model.layers.{layer}.'
         if not c['moe_layer_freq'][layer]:
+            self.last_routes = None
             return self.fold(self.mlp(n,p+'mlp.'))
         p += 'block_sparse_moe.'
         scores = torch.sigmoid(torch.mm(n.float(),self.tensor(p+'gate.weight').T))
         biased = scores+self.tensor(p+'e_score_correction_bias')
         ids = biased.argsort(dim=-1,descending=True,stable=True)[:,:c['num_experts_per_tok']].sort(dim=-1).values
+        self.last_routes = ids
         picked = scores.gather(1,ids)
         weights = picked/picked.sum(dim=1,keepdim=True).clamp(min=1e-20)*c['routed_scaling_factor']
         routed = [torch.zeros_like(n,dtype=torch.float32) for _ in range(self.world)]
@@ -175,7 +181,65 @@ class Reference:
         return self.fold([(r.to(torch.bfloat16).float()+s.float()).to(torch.bfloat16)
                           for r,s in zip(routed,shared)])
 
-    def run(self, cases, output):
+    def check_stages(self, engine, output):
+        """Check each operation with recorded inputs, separately from trajectory quality."""
+        metadata = json.loads((engine/'metadata.json').read_text())
+        if metadata.get('world', 1) != self.world:
+            raise ValueError('engine/reference TP worlds differ')
+        if metadata.get('residual_norm', 'bf16') != ('bf16' if self.rounded_residual else 'fp32'):
+            raise ValueError('engine/reference residual-normalization recipes differ')
+        rows, hidden = len(metadata['tokens']), self.c['hidden_size']
+        metrics, failures = [], []
+
+        def read(stage, layer):
+            data = np.fromfile(engine/f'{stage}-{layer}.bf16', dtype='<u2').reshape(rows, hidden)
+            return torch.from_numpy(data).cuda().view(torch.bfloat16)
+
+        def compare(stage, layer, expected):
+            actual = read(stage, layer)
+            error = (actual.double()-expected.double())
+            rms = (error.norm()/expected.double().norm().clamp(min=1e-20)).item()
+            per_row = error.norm(dim=1)/expected.double().norm(dim=1).clamp(min=1e-20)
+            metrics.append(dict(layer=layer, stage=stage, rms=rms,
+                                max_row_rms=per_row.max().item(), worst_row=per_row.argmax().item()))
+            print(f'Layer {layer} {stage}: relative RMS {rms:.6g}', flush=True)
+            if not math.isfinite(rms) or rms > .01:
+                failures.append(f'layer {layer} {stage}: relative RMS {rms} exceeds 1%')
+            return actual
+
+        x = self.tensor('language_model.model.embed_tokens.weight', np.array(metadata['tokens']))
+        for layer in range(self.c['num_hidden_layers']):
+            p = f'language_model.model.layers.{layer}.'
+            n = compare('input_norm', layer, self.norm(x, p+'input_layernorm'))
+            a = compare('attention', layer, self.attention(n, layer))
+            x, expected = self.add_norm(x.to(torch.bfloat16), a, p+'post_attention_layernorm')
+            n = compare('ffn_norm', layer, expected)
+            y = compare('ffn', layer, self.ffn(n, layer))
+            if self.last_routes is not None:
+                actual = np.fromfile(engine/f'routes-{layer}.i32', dtype='<i4').reshape(rows, -1)
+                changed = np.flatnonzero(np.any(actual != self.last_routes.cpu().numpy(), axis=1))
+                print(f'Layer {layer} router: {len(changed)} mismatched rows', flush=True)
+                if len(changed):
+                    failures.append(f'layer {layer}: router mismatch at rows {changed.tolist()}')
+            x = x.float()+y.float()
+            saved = read('layer', layer)
+            if not torch.equal(saved, x.to(torch.bfloat16)):
+                failures.append(f'layer {layer}: residual composition differs')
+            if self.rounded_residual:
+                x = saved
+        output.mkdir(parents=True, exist_ok=True)
+        (output/'stages.json').write_text(json.dumps(dict(metrics=metrics, failures=failures), indent=2)+'\n')
+        if failures:
+            raise AssertionError('\n'.join(failures))
+        print('All isolated sublayer checks passed; this is not a full-trajectory quality verdict.', flush=True)
+
+    def run(self, cases, output, dump_states=False):
+        def record(case_index, stage, layer, tensor):
+            if not dump_states:
+                return
+            folder = output/cases[case_index]['name']
+            folder.mkdir(parents=True,exist_ok=True)
+            (folder/f'{stage}-{layer}.bf16').write_bytes(tensor.to(torch.bfloat16).contiguous().view(torch.uint16).cpu().numpy().tobytes())
         inputs = [self.tensor('language_model.model.embed_tokens.weight', np.array(case['ids'][:-1])) for case in cases]
         states = [self.norm(x,'language_model.model.layers.0.input_layernorm') for x in inputs]
         for layer in range(self.c['num_hidden_layers']):
@@ -183,14 +247,22 @@ class Reference:
             norms = []
             for case_index,(x,n) in enumerate(zip(inputs,states)):
                 p = f'language_model.model.layers.{layer}.'
+                record(case_index,'input_norm',layer,n)
                 a = self.attention(n,layer)
+                record(case_index,'attention',layer,a)
                 x,n = self.add_norm(x,a,p+'post_attention_layernorm')
+                record(case_index,'ffn_norm',layer,n)
                 inputs[case_index] = x
                 norms.append(n)
             outputs = self.ffn(torch.cat(norms),layer).split([len(n) for n in norms])
+            routes = self.last_routes.split([len(n) for n in norms]) if self.last_routes is not None else None
             for case_index,(x,y) in enumerate(zip(inputs,outputs)):
+                record(case_index,'ffn',layer,y)
                 next_norm = f'language_model.model.layers.{layer+1}.input_layernorm' if layer+1<self.c['num_hidden_layers'] else 'language_model.model.norm'
                 inputs[case_index],states[case_index] = self.add_norm(x,y,next_norm)
+                record(case_index,'layer',layer,inputs[case_index])
+                if dump_states and routes is not None:
+                    (output/cases[case_index]['name']/f'routes-{layer}.i32').write_bytes(routes[case_index].to(torch.int32).cpu().numpy().tobytes())
             torch.cuda.synchronize()
             print(f'layer {layer} complete in {time.monotonic()-start:.2f}s',flush=True)
         # Read vocabulary slabs so even the output head fits a small reference GPU.
@@ -199,6 +271,7 @@ class Reference:
             folder = output/case['name']
             folder.mkdir(parents=True,exist_ok=True)
             (folder/'metadata.json').write_text(json.dumps(dict(world=self.world,ids=case['ids'],rounded_residual=self.rounded_residual,
+                projection_rows=self.projection_rows,
                 backend='pytorch independent FP32 attention', torch_version=torch.__version__,
                 checkpoint=self.checkpoint,config_sha256=self.config_sha256),indent=2)+'\n')
             for rank in range(self.world):
@@ -221,11 +294,22 @@ class Reference:
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--checkpoint-dir',type=Path,required=True)
-    p.add_argument('--manifest',type=Path,required=True)
+    mode = p.add_mutually_exclusive_group(required=True)
+    mode.add_argument('--manifest',type=Path)
+    mode.add_argument('--check-engine-dir',type=Path,help='check recorded sublayers using their actual inputs')
     p.add_argument('--output',type=Path,required=True)
     p.add_argument('--world',type=int,choices=[1,2,4],default=4)
     p.add_argument('--rounded-residual',action='store_true',help='diagnostic: normalize the rounded BF16 residual sum')
+    p.add_argument('--dump-states',action='store_true',help='save sublayer boundaries for discrepancy tracing')
+    p.add_argument('--projection-rows',type=int,default=0,help='reference reduction control: cap rows per cuBLAS projection (0: full)')
     args = p.parse_args()
+    if args.projection_rows < 0:
+        p.error('--projection-rows must be nonnegative')
+    reference = Reference(args.checkpoint_dir,args.world,args.rounded_residual,args.projection_rows)
+    if args.check_engine_dir:
+        with torch.inference_mode():
+            reference.check_stages(args.check_engine_dir,args.output)
+        return
     cases = json.loads(args.manifest.read_text())
     tok = Tokenizer.from_file(str(args.checkpoint_dir/'tokenizer.json'))
     for case in cases:
@@ -235,7 +319,7 @@ def main():
             p.error('each case needs a simple name and at least two tokens')
         print(f"{case['name']}: {len(case['ids'])} tokens",flush=True)
     with torch.inference_mode():
-        Reference(args.checkpoint_dir,args.world,args.rounded_residual).run(cases,args.output)
+        reference.run(cases,args.output,args.dump_states)
 
 
 if __name__=='__main__':

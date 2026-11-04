@@ -31,7 +31,7 @@ void linear(const uint16_t* x, const GlmQuantMatrix& w, uint16_t* y, int rows,
             cudaStream_t stream) {
   launch_scale_gemm_grid_e8m0_bf16(x, w.cols, w.payload, w.scales_e8m0, y, rows,
                                    static_cast<int>(w.rows), static_cast<int>(w.cols), stream,
-                                   w.rows, 0, 5, nullptr, 0, rows > 16);
+                                   w.rows, 0, 5, nullptr, 0, false);
 }
 void row_count(int n, int limit) {
   if (n <= 0 || n > limit)
