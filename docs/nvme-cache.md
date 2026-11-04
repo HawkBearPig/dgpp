@@ -55,6 +55,11 @@ entry is skipped. A memory entry stays attachable while its copy is written,
 an entry being written or read is never evicted, and at most `max_ops`
 operations are in flight.
 
+Cancellation can retain an existing committed answer snapshot in memory,
+but does not start a new spill for it. Its blocks remain evictable when
+live requests need capacity; a disk write would pin them until completion.
+Earlier prefill entries retain their ordinary disk-cache behavior.
+
 A restore starts when a queued request's deepest usable state is on disk. It
 reads into fresh pool blocks and a free arena slot, then the request attaches
 and prefills only its suffix. One restore runs at a time, and a second

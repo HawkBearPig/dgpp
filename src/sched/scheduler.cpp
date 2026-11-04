@@ -1382,7 +1382,10 @@ void Scheduler::retire(int arrival, Result::Status status,
           kept = true;
           ++cache_.stats().close_entries;
           emit_prefix(r.spec.id, "close", position, slot);
-          want_spill(e, r.spec.id);
+          // A cancelled answer stays reclaimable: starting a spill pins its
+          // blocks until IO completes, which can shed another request when
+          // grow-on-demand needs that capacity after the cancellation sweep.
+          if (reason != Result::Reason::kCancelled) want_spill(e, r.spec.id);
         }
       }
     }

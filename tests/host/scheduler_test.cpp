@@ -3050,6 +3050,73 @@ DGPP_TEST(scheduler_prefixCache_cancelledHistoryHonorsOptOutAndEntryFloor) {
   }
 }
 
+DGPP_TEST(scheduler_prefixCache_cancelledHistoryRandomizedReplay) {
+  // Fixed seeds exercise batch cuts, short client delivery, edited histories,
+  // lookahead identity and small arenas. Replay must make identical decisions;
+  // no hit may extend past either the matching ids or the committed prefix.
+  const auto run = [](uint32_t seed) {
+    std::mt19937 rng(seed);
+    const int align = rng() % 2 ? 4 : 8;
+    FakeEngine engine(1, 128, align);
+    engine.set_prefix_arena(1 + rng() % 4, align, 16);
+    engine.prefill_lookahead_ = rng() % 2;
+    engine.set_step_tokens_max(8);
+    std::vector<std::vector<int32_t>> batches;
+    int token = 1001;
+    while (token < 1080) {
+      std::vector<int32_t> batch;
+      const int count = 1 + rng() % 8;
+      for (int i = 0; i < count; ++i) batch.push_back(token++);
+      batches.push_back(std::move(batch));
+    }
+    engine.arm_batches(0, 1000, batches, 64);
+    engine.arm(0, {90}, 1);
+    Scheduler sched(&engine, {kEos});
+    const auto prompt = counted_prompt(17 + rng() % 65);
+    const int stop = 1 + rng() % 40;
+    const bool external = rng() % 2;
+    auto first = make_cached_request("cancel", prompt, {8, 16}, 64);
+    if (!external) first.cancel_after = stop;
+    sched.submit(first);
+    if (external) {
+      for (int tick = 0; tick < 100 && sched.meters().tokens_generated < stop; ++tick) sched.tick();
+      require(sched.cancel("cancel"), "external cancellation remains live");
+    }
+    sched.run_to_completion();
+    const auto& result = *sched.find("cancel");
+    require(result.reason == Scheduler::Result::Reason::kCancelled, "random cancellation retires");
+    auto history = prompt;
+    history.insert(history.end(), result.generated.begin(), result.generated.end());
+    auto next = history;
+    next.resize(prompt.size() + rng() % (result.generated.size() + 1));
+    const int64_t boundary = static_cast<int64_t>(next.size());
+    if (rng() % 2) next[rng() % next.size()] += 5000;
+    next.insert(next.end(), {9000, 9001, 9002});
+    int64_t common = 0;
+    while (common < static_cast<int64_t>(std::min(history.size(), next.size())) &&
+           history[common] == next[common]) ++common;
+    const auto before = sched.meters().prefix_tokens_saved;
+    sched.submit(make_cached_request("next", next, {8, 16, boundary}, 1));
+    sched.run_to_completion();
+    const auto saved = sched.meters().prefix_tokens_saved - before;
+    require(saved <= common && saved <= static_cast<int64_t>(history.size()) - 1,
+            "a cancelled cache hit stays inside matching committed history, seed " + std::to_string(seed));
+    require(saved % align == 0, "the reused cut is aligned");
+    // An uncached request consumes the entire pool, forcing every retained
+    // entry to relinquish its arena slot and blocks after the replay.
+    engine.arm(0, {kEos}, 128 * align - 4);
+    auto flush = make_request("flush", 4, 128 * align - 4);
+    flush.no_cache = true;
+    sched.submit(flush);
+    sched.run_to_completion();
+    require(engine.pool_blocks_in_use() == 0 && sched.meters().prefix_entries == 0,
+            "random replay leaves every retained block reclaimable");
+    return std::make_pair(engine.op_stream(), sched.prefix_digest());
+  };
+  for (uint32_t seed = 0; seed < 512; ++seed)
+    require(run(seed) == run(seed), "random cancellation replay agrees across ranks");
+}
+
 DGPP_TEST(scheduler_prefixCache_rollingSnapshotBecomesTheCloseEntryTheNextTurnAttachesTo) {
   // GIVEN a 21-token prompt whose answer runs six tokens and ends in EOS:
   // committed positions 21 (after the prefill pick), 22, 23, 24 <- aligned,
@@ -3714,6 +3781,66 @@ void settle(Scheduler& sched, FakeEngine& engine, int max_ticks = 1000) {
   }
   (void)engine;
   throw std::runtime_error("settle: the scheduler did not drain in " + std::to_string(max_ticks) + " ticks");
+}
+
+DGPP_TEST(scheduler_nvmeCache_cancelledSnapshotYieldsToLiveGrowthWithoutASpill) {
+  for (bool disk_enabled : {false, true}) {
+    for (int arena_slots : {1, 2, 3}) {
+      SharedPrefixEngine engine(2, 6, arena_slots);
+      if (disk_enabled) engine.set_disk(100, 1, 0, 100);
+      dgpp::sched::AdmissionPolicy policy;
+      policy.mode = dgpp::sched::AdmissionPolicy::Mode::kGrowOnDemand;
+      policy.window_tokens = 4;
+      Scheduler sched(&engine, {kEos}, 0, policy);
+      engine.arm(0, long_script(20), 20);
+      engine.arm(1, long_script(16), 16);
+      // No prompt cut: the only entry will be the cancelled answer's
+      // rolling snapshot. Its three blocks share the live reservation.
+      sched.submit(make_cached_request("cancel", counted_prompt(9), {}, 20));
+      auto live = make_request("live", 4, 16);
+      live.no_cache = true;
+      sched.submit(live);
+      for (int tick = 0; tick < 20 && sched.meters().prefix_rolling == 0; ++tick) sched.tick();
+      require(sched.meters().prefix_rolling > 0, "cancel with a rolling snapshot");
+      require(sched.cancel("cancel"), "cancel the active request");
+      settle(sched, engine);
+      require(sched.find("cancel")->reason == Scheduler::Result::Reason::kCancelled,
+              "the interrupted request is cancelled");
+      require(sched.find("live")->steps_done == 16 && sched.meters().requests_shed_pool == 0,
+              "cancelled history gives way when the surviving request grows");
+      require(sched.meters().prefix_close_entries == 1 && sched.meters().prefix_evictions == 1,
+              "the cancelled snapshot was retained, then evicted for live work");
+      require(engine.disk_ops_begun() == 0 && sched.disk_ops_pending() == 0,
+              "cancellation must not pin retained blocks for a new spill");
+      require(engine.pool_blocks_in_use() == 0 && sched.meters().prefix_entries == 0,
+              "the shared blocks and arena slot are reclaimed");
+    }
+  }
+}
+
+DGPP_TEST(scheduler_nvmeCache_cancelledSnapshotReusesInMemoryAndCompletionStillSpills) {
+  SharedPrefixEngine engine(1, 32, 3);
+  engine.set_disk(100, 1, 0, 3);
+  Scheduler sched(&engine, {kEos});
+  engine.arm(0, long_script(12), 12);
+  const auto prompt = counted_prompt(9);
+  auto first = make_cached_request("cancel", prompt, {}, 12);
+  first.cancel_after = 5;
+  sched.submit(first);
+  settle(sched, engine);
+  require(sched.meters().prefix_entries == 1 && engine.disk_ops_begun() == 0,
+          "cancellation keeps its eligible snapshot in memory only");
+  auto next = prompt;
+  const auto& generated = sched.find("cancel")->generated;
+  next.insert(next.end(), generated.begin(), generated.end());
+  next.push_back(9000);
+  engine.arm(0, long_script(4), 4);
+  sched.submit(make_cached_request("reuse", next, {14}, 4));
+  settle(sched, engine);
+  require(sched.meters().prefix_tokens_saved == 12,
+          "the cancelled snapshot can still serve the next turn");
+  require(engine.disk_ops_begun() > 0 && sched.meters().disk_spilled > 0,
+          "normal completion still spills its new eligible snapshot");
 }
 
 DGPP_TEST(scheduler_nvmeCache_spillsAnEvictedEntryAndRestoresItForALaterRequest) {

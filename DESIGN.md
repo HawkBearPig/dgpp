@@ -1840,7 +1840,9 @@ is within the committed response prefix (prompt plus generated tokens,
 excluding the pending last token). It does not take a fresh retirement
 snapshot. A client that received fewer tokens or changed the rendered
 history still has to match the stored prefix and a valid cut. Retained
-entries use the ordinary arena, block accounting and eviction policy.
+entries use the ordinary arena, block accounting and eviction policy. They
+remain in memory only: cancellation must not start an NVMe spill that pins
+their blocks and prevents live requests from reclaiming capacity.
 
 MTP can commit past an aligned position in one step. The scheduler can
 arm a post-row snapshot for that position; the engine reconstructs it
