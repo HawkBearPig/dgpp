@@ -214,6 +214,7 @@ add_library(dgpp_kernels STATIC
   src/kernels/full_attn.cu
   src/kernels/glm4_attn.cu
   src/kernels/sink_attn.cu
+  src/kernels/minimax.cu
   src/kernels/mimo_mtp_history.cu
   src/kernels/sink_attn_prefill.cu
   src/kernels/add_rmsnorm.cu
@@ -366,6 +367,27 @@ add_library(dgpp_models_flint STATIC
 target_include_directories(dgpp_models_flint PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(dgpp_models_flint PUBLIC dgpp_loaders dgpp_common)
 dgpp_set_common(dgpp_models_flint)
+
+add_library(dgpp_models_minimax STATIC
+  src/models/minimax/config.cpp
+  src/models/minimax/binding.cpp
+  src/models/minimax/reference.cpp)
+target_include_directories(dgpp_models_minimax PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(dgpp_models_minimax PUBLIC dgpp_loaders dgpp_common)
+dgpp_set_common(dgpp_models_minimax)
+
+add_library(dgpp_models_minimax_loader STATIC src/models/minimax/loader.cpp)
+target_include_directories(dgpp_models_minimax_loader PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(dgpp_models_minimax_loader PUBLIC dgpp_models_minimax dgpp_loaders CUDA::cudart dgpp_device_ranges)
+dgpp_set_common(dgpp_models_minimax_loader)
+
+add_library(dgpp_models_minimax_layers STATIC
+  src/models/minimax/kv_pool.cpp
+  src/models/minimax/layers.cpp
+  src/models/minimax/forward.cpp)
+target_include_directories(dgpp_models_minimax_layers PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(dgpp_models_minimax_layers PUBLIC dgpp_models_minimax dgpp_models_minimax_loader dgpp_kernels CUDA::cudart)
+dgpp_set_common(dgpp_models_minimax_layers)
 
 # The MiMo resident loader (loaders/resident_stream.hpp + the family's builders).
 add_library(dgpp_models_mimo_loader STATIC
@@ -920,7 +942,7 @@ if(DGPP_ENABLE_IBV)
   target_link_libraries(dgpp_serve_app PRIVATE dgpp_models_glm_loader dgpp_models_qwen_layers dgpp_models_glm4_layers dgpp_models_glm_dsa_layers
                                              dgpp_models_dsv41_layers dgpp_models_dsv4_layers dgpp_models_mimo_layers
                                              dgpp_models_dory_layers
-                                             dgpp_models_flint_layers
+                                             dgpp_models_flint_layers dgpp_models_minimax_layers
                                              dgpp_loaders dgpp_bus
                                              dgpp_serve CUDA::cudart
                                              Threads::Threads)
@@ -1026,6 +1048,9 @@ add_executable(unit_tests
   tests/unit/dory_reference_test.cpp
   tests/unit/flint_config_test.cpp
   tests/unit/flint_binding_test.cpp
+  tests/unit/minimax_config_test.cpp
+  tests/unit/minimax_binding_test.cpp
+  tests/unit/minimax_reference_test.cpp
   tests/unit/nvfp4_quant_test.cpp
   tests/unit/verify_schedule_test.cpp
   tests/unit/lookup_draft_test.cpp
@@ -1035,7 +1060,7 @@ target_link_libraries(unit_tests PRIVATE CUDA::cudart dgpp_loaders
                                         dgpp_models_glm dgpp_models_qwen dgpp_models_qwen_loader
                                         dgpp_models_glm4
                                         dgpp_models_glm_dsa dgpp_models_dsv41 dgpp_models_dsv4 dgpp_models_mimo
-                                        dgpp_models_dory
+                                        dgpp_models_dory dgpp_models_minimax
                                         dgpp_models_glm_dsa dgpp_models_dsv41 dgpp_models_dsv4 dgpp_models_mimo dgpp_models_flint
                                         dgpp_rope_scaling
                                         dgpp_net dgpp_serve Threads::Threads)
@@ -2874,3 +2899,21 @@ if(TARGET dgpp_bus)
     dgpp_bus dgpp_text CUDA::cudart Threads::Threads)
   dgpp_set_common(serving_head_check)
 endif()
+
+add_executable(minimax_test tests/cuda/minimax_test.cpp)
+target_link_libraries(minimax_test PRIVATE dgpp_models_minimax_layers dgpp_kernels dgpp_serve CUDA::cudart Threads::Threads)
+dgpp_set_common(minimax_test)
+add_test(NAME minimax_kernel_test COMMAND minimax_test --kernels)
+set_tests_properties(minimax_kernel_test PROPERTIES LABELS "cuda")
+add_test(NAME minimax_forward_fixture COMMAND ${DSV41_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/tools/minimax_reference_dump.py --fixture ${CMAKE_BINARY_DIR}/minimax_fixture)
+set_tests_properties(minimax_forward_fixture PROPERTIES FIXTURES_SETUP minimax_fixture LABELS "host")
+add_test(NAME minimax_forward_smoke COMMAND minimax_test --checkpoint-dir ${CMAKE_BINARY_DIR}/minimax_fixture --dump ${CMAKE_BINARY_DIR}/minimax_oracle)
+set_tests_properties(minimax_forward_smoke PROPERTIES FIXTURES_REQUIRED minimax_fixture FIXTURES_SETUP minimax_output LABELS "cuda")
+add_test(NAME minimax_forward_reference COMMAND ${DSV41_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/tools/minimax_reference_dump.py --checkpoint-dir ${CMAKE_BINARY_DIR}/minimax_fixture --check-engine-dir ${CMAKE_BINARY_DIR}/minimax_oracle)
+set_tests_properties(minimax_forward_reference PROPERTIES FIXTURES_REQUIRED minimax_output LABELS "cuda" ENVIRONMENT "OPENBLAS_NUM_THREADS=2")
+
+add_executable(minimax_prompt_test tests/host/minimax_prompt_test.cpp)
+target_link_libraries(minimax_prompt_test PRIVATE dgpp_text dgpp_loaders Threads::Threads)
+dgpp_set_common(minimax_prompt_test)
+add_test(NAME minimax_prompt_test COMMAND minimax_prompt_test ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/minimax_prompt_goldens.jsonl)
+set_tests_properties(minimax_prompt_test PROPERTIES LABELS "host;checkpoint" SKIP_RETURN_CODE 2)

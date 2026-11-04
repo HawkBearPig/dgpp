@@ -60,7 +60,9 @@ class TextFrontend : public ModelFrontend {
     // The checkpoint contracts differ: Qwen exposes low/medium/xhigh;
     // GLM's effort-aware template exposes low/high/max. Never pass an
     // unrecognised value through GLM's silent fallback to max.
-    if (markers_.tool_format() == dgpp::text::ToolFormat::kQwenXml) {
+    if (markers_.minimax_namespace.available()) {
+      out.effort = effort == "minimal" ? "low" : effort == "xhigh" ? "max" : std::string(effort);
+    } else if (markers_.tool_format() == dgpp::text::ToolFormat::kQwenXml) {
       out.effort = effort == "minimal" ? "low" :
                    (effort == "high" || effort == "max") ? "xhigh" : std::string(effort);
     } else if (markers_.tool_format() == dgpp::text::ToolFormat::kGlmMarkers) {

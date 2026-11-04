@@ -30,6 +30,13 @@ ChatMarkers ChatMarkers::from_tokenizer(const Tokenizer& tok) {
   };
   m.think_open = lookup("<think>");
   m.think_close = lookup("</think>");
+  // MiniMax carries both canonical and model-specific reasoning tokens.
+  // Its shipped template uses the latter, even though both pairs exist.
+  m.minimax_namespace = lookup("]<]minimax[>[");
+  if (m.minimax_namespace.available()) {
+    m.think_open = lookup("<mm:think>");
+    m.think_close = lookup("</mm:think>");
+  }
   m.tool_call_open = lookup("<tool_call>");
   m.tool_call_close = lookup("</tool_call>");
   m.arg_key_open = lookup("<arg_key>");
@@ -40,8 +47,9 @@ ChatMarkers ChatMarkers::from_tokenizer(const Tokenizer& tok) {
   // The MiMo tokenizers (the Qwen2 vocabulary with the audio / video
   // markers) go with the compact XML call format.
   m.xml_compact = lookup("<|mimo_audio_start|>").available();
-  for (const char* role : {"<|system|>", "<|user|>", "<|assistant|>", "<|observation|>",
-                           "<|im_start|>", "<|im_end|>", "<｜System｜>", "<｜User｜>", "<｜Assistant｜>"}) {
+  for (const char* role :
+       {"<|system|>", "<|user|>", "<|assistant|>", "<|observation|>", "<|im_start|>", "<|im_end|>",
+        "<｜System｜>", "<｜User｜>", "<｜Assistant｜>", "]~!b[", "]~b]", "[e~["}) {
     const ChatMarker r = lookup(role);
     if (r.available()) m.role_markers.push_back(r);
   }

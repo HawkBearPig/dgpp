@@ -41,16 +41,16 @@
 #include <algorithm>
 #include <atomic>
 #include <charconv>
-#include <cstdlib>
 #include <chrono>
 #include <cmath>
-#include <cstdint>
 #include <csignal>
+#include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <exception>
 #include <filesystem>
-#include <functional>
 #include <format>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -63,62 +63,63 @@
 #include "common/cuda_check.hpp"
 #include "common/log.hpp"
 #include "common/process_memory.hpp"
-#include "kernels/l2_prefetch.hpp"
-#include "kernels/draft_head.hpp"
-#include "kernels/bf12_companions.hpp"
-#include "kernels/latent_format.hpp"
-#include "loaders/hf_cache.hpp"
-#include "serve/cluster_config.hpp"
-#include "serve/rank_metrics.hpp"
-#include "serve/nvme_cache_check.hpp"
 #include "dgpp_version.hpp"
-#include "text/chat_template.hpp"
 #include "engine/eager_engine.hpp"
 #include "engine/graph_engine.hpp"
-#include "engine/verify_schedule.hpp"
 #include "engine/memory_plan.hpp"
-#include "loaders/architecture.hpp"
-#include "models/glm/fabric_engine.hpp"
-#include "models/glm/moe_layer.hpp"
+#include "engine/verify_schedule.hpp"
+#include "kernels/bf12_companions.hpp"
+#include "kernels/draft_head.hpp"
+#include "kernels/l2_prefetch.hpp"
+#include "kernels/latent_format.hpp"
 #include "kernels/packq_gemm.hpp"
-#include "models/glm/forward.hpp"
-#include "models/glm/gen_engine.hpp"
-#include "models/qwen/config.hpp"
-#include "models/qwen/forward.hpp"
-#include "models/qwen/model35.hpp"
-#include "models/glm4/config.hpp"
-#include "models/glm4/forward.hpp"
-#include "models/glm_dsa/config.hpp"
-#include "models/dsv41/config.hpp"
-#include "models/dsv41/loader.hpp"
-#include "models/dsv41/model.hpp"
-#include "models/dsv4/config.hpp"
-#include "models/dsv4/loader.hpp"
-#include "models/dsv4/model.hpp"
-#include "text/dsv41_prompt.hpp"
-#include "text/dsv4_prompt.hpp"
-#include "models/glm_dsa/model.hpp"
-#include "models/mimo/config.hpp"
-#include "models/mimo/forward.hpp"
+#include "loaders/architecture.hpp"
+#include "loaders/hf_cache.hpp"
 #include "models/dory/binding.hpp"
 #include "models/dory/config.hpp"
 #include "models/dory/forward.hpp"
 #include "models/dory/loader.hpp"
+#include "models/dsv4/config.hpp"
+#include "models/dsv4/loader.hpp"
+#include "models/dsv4/model.hpp"
+#include "models/dsv41/config.hpp"
+#include "models/dsv41/loader.hpp"
+#include "models/dsv41/model.hpp"
 #include "models/flint/config.hpp"
 #include "models/flint/forward.hpp"
+#include "models/glm/fabric_engine.hpp"
+#include "models/glm/forward.hpp"
+#include "models/glm/gen_engine.hpp"
+#include "models/glm/moe_layer.hpp"
+#include "models/glm4/config.hpp"
+#include "models/glm4/forward.hpp"
+#include "models/glm_dsa/config.hpp"
+#include "models/glm_dsa/model.hpp"
+#include "models/mimo/config.hpp"
+#include "models/mimo/forward.hpp"
+#include "models/minimax/forward.hpp"
+#include "models/qwen/config.hpp"
+#include "models/qwen/forward.hpp"
+#include "models/qwen/model35.hpp"
+#include "net/collective_bus.hpp"
 #include "sched/scheduler.hpp"
+#include "serve/cluster_config.hpp"
+#include "serve/engine_watchdog.hpp"
+#include "serve/fabric_serve.hpp"
+#include "serve/frontend.hpp"
+#include "serve/generation_service.hpp"
+#include "serve/glm_vision_frontend.hpp"
+#include "serve/http_server.hpp"
+#include "serve/nvme_cache_check.hpp"
+#include "serve/prefill_policy.hpp"
+#include "serve/qwen_vision_frontend.hpp"
+#include "serve/rank_metrics.hpp"
+#include "serve/shutdown_watchdog.hpp"
+#include "text/chat_template.hpp"
+#include "text/dsv41_prompt.hpp"
+#include "text/dsv4_prompt.hpp"
 #include "text/tokenizer.hpp"
 #include "text/tool_grammar.hpp"
-#include "net/collective_bus.hpp"
-#include "serve/fabric_serve.hpp"
-#include "serve/generation_service.hpp"
-#include "serve/frontend.hpp"
-#include "serve/glm_vision_frontend.hpp"
-#include "serve/qwen_vision_frontend.hpp"
-#include "serve/http_server.hpp"
-#include "serve/prefill_policy.hpp"
-#include "serve/shutdown_watchdog.hpp"
-#include "serve/engine_watchdog.hpp"
 
 namespace fs = std::filesystem;
 
@@ -1147,6 +1148,92 @@ struct FlintFamily final : ServeFamily {
   }
 };
 
+struct MinimaxFamily final : ServeFamily {
+  dgpp::MinimaxConfig cfg;
+  std::string ckpt;
+  dgpp::LatentFormat kv_format = dgpp::LatentFormat::kBf16;
+  std::unique_ptr<dgpp::MinimaxModel> model;
+  MinimaxFamily(const std::string& checkpoint, dgpp::LatentFormat fmt)
+      : cfg(dgpp::MinimaxConfig::from_json_file((fs::path(checkpoint) / "config.json").string())),
+        ckpt(checkpoint),
+        kv_format(fmt) {
+    if (kv_format != dgpp::LatentFormat::kBf16)
+      throw std::invalid_argument(std::string("engine.kv_dtype ") +
+                                  dgpp::latent_format_name(kv_format) +
+                                  " is not implemented for the Minimax K/V cache (bf16 baseline)");
+  }
+  const char* name() const override { return "minimax_m3"; }
+  // The shipped template leaves adaptive <mm:think> emission to the model.
+  bool model_opens_thinking() const override { return true; }
+  int64_t vocab_size() const override { return cfg.vocab_size; }
+  const std::vector<int64_t>& eos_token_ids() const override { return cfg.eos_token_ids; }
+  // The checkpoint's positional ceiling: a larger pool seats more
+  // requests, a single request never passes it.
+  int64_t position_limit() const override { return cfg.max_position_embeddings; }
+  int64_t block_tokens() const override { return dgpp::MinimaxModel::kv_block_tokens_static(); }
+  int prefill_chunk_tokens() const override { return dgpp::MinimaxModel::prefill_chunk_tokens(); }
+  std::string pool_check(int64_t) const override { return ""; }
+  const char* kv_format_name() const override { return dgpp::latent_format_name(kv_format); }
+  int decode_rows_cap() const override { return dgpp::MinimaxModel::decode_rows_cap(); }
+  // The widest fold the decode graph records: a block output [rows, hidden].
+  size_t lat_slot_bytes(int decode_rows) const override {
+    return static_cast<size_t>(decode_rows) * static_cast<size_t>(cfg.hidden_size) * 2;
+  }
+  static void refuse_mtp(bool mtp) {
+    if (mtp)
+      throw std::invalid_argument(
+          "engine.mtp: MiniMax DSpark execution is not enabled yet (set \"mtp\": false; the plain "
+          "world)");
+  }
+  dgpp::MemoryPlan plan(int forward_rows, int64_t context, int rank, int world_, bool fabric,
+                        int slots, bool mtp, int decode_rows) const override {
+    refuse_mtp(mtp);
+    return dgpp::MinimaxModel::plan_memory(
+        cfg, forward_rows, context, fabric ? rank : 0, fabric ? world_ : 1,
+        fabric ? dgpp::LoaderResidency::Resident : dgpp::LoaderResidency::Streaming, slots,
+        /*mtp=*/false, decode_rows, kv_format, /*serving_logits=*/true);
+  }
+  size_t snapshot_bytes(int world_, bool mtp) const override {
+    refuse_mtp(mtp);
+    return dgpp::MinimaxModel::session_snapshot_bytes(cfg, world_, false);
+  }
+  size_t cache_block_bytes(int world_, bool mtp) const override {
+    refuse_mtp(mtp);
+    return dgpp::MinimaxModel::kv_block_bytes_static(cfg, 0, world_, kv_format);
+  }
+  void build_model(dgpp::BoundaryReducer* reducer, int rank, int world_, bool fabric,
+                   int forward_rows, int64_t pool_tokens, int slots, bool mtp,
+                   int decode_rows) override {
+    refuse_mtp(mtp);
+    dgpp::MinimaxLayerStream::set_resident_image_dir(dgpp::GlmLayerStream::resident_image_dir());
+    model = std::make_unique<dgpp::MinimaxModel>(
+        cfg, ckpt, forward_rows, pool_tokens,
+        fabric ? dgpp::LoaderResidency::Resident : dgpp::LoaderResidency::Streaming, reducer,
+        fabric ? rank : 0, fabric ? world_ : 1, slots, /*mtp=*/false, decode_rows, kv_format,
+        /*serving_logits=*/true);
+  }
+  void destroy_model() override { model.reset(); }
+  size_t model_snapshot_bytes() const override {
+    return model ? model->session_snapshot_bytes() : 0;
+  }
+  std::unique_ptr<ServeGraphEngine> make_graph_engine(
+      dgpp::net::CollectiveBus* bus, int rank, int world_, uint16_t* pick_scratch,
+      int batch_min_live, uint16_t* prefix_scratch, uint16_t* gather_scratch, int candidates,
+      const dgpp::text::GrammarVocab* grammar, int prefix_slots, int mtp_depth,
+      bool compact_batches, int lookup_tail = 0) override {
+    return std::make_unique<ServeGraphEngineOf<dgpp::MinimaxModel>>(
+        model.get(), bus, rank, world_, pick_scratch, cfg.vocab_size, /*pick_timeout_ms=*/60000,
+        batch_min_live, prefix_scratch, gather_scratch, candidates, grammar, prefix_slots,
+        mtp_depth, compact_batches, lookup_tail);
+  }
+  std::unique_ptr<dgpp::sched::SchedulerEngine> make_eager_engine(
+      int slots, dgpp::DecodePick pick, dgpp::DecodeSample sample,
+      const dgpp::text::GrammarVocab* grammar, int prefix_slots) override {
+    return std::make_unique<dgpp::EagerEngineAdapter<dgpp::MinimaxModel>>(
+        model.get(), slots, std::move(pick), std::move(sample), grammar, prefix_slots);
+  }
+};
+
 // Qwen3.8-27B dense family (FP8 text-only, bf16 K/V pool, the MTP draft layer).
 // engine.dense_weights = fp8 requantizes its BF16 lm head to block FP8 and
 // engine.prefill_fp8_per_tensor selects the per-tensor prefill recipe; both
@@ -1288,6 +1375,8 @@ std::unique_ptr<ServeFamily> make_family(const std::string& ckpt, int world,
   if (arch == dgpp::ModelArchitecture::MimoV2) return std::make_unique<MimoFamily>(ckpt, kv_format);
   if (arch == dgpp::ModelArchitecture::Dory) return std::make_unique<DoryFamily>(ckpt, world);
   if (arch == dgpp::ModelArchitecture::Flint) return std::make_unique<FlintFamily>(ckpt, kv_format);
+  if (arch == dgpp::ModelArchitecture::MinimaxM3)
+    return std::make_unique<MinimaxFamily>(ckpt, kv_format);
   if (arch == dgpp::ModelArchitecture::Qwen4Exp)
     return std::make_unique<QwenFamily>(ckpt, rope_scaling, fp8_head_mma, kv_format);
   if (arch == dgpp::ModelArchitecture::Qwen3_5)

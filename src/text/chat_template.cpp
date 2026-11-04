@@ -546,8 +546,8 @@ class ExprParser {
     if (accept_kw("is")) {
       const bool inv = accept_kw("not");
       if (peek().t != ETok::T::Ident) fail(line_, "'is' needs a test name");
-      static const char* kTests[] = {"defined", "undefined", "none", "string",
-                                     "mapping", "iterable", "sequence", "true", "false"};
+      static const char* kTests[] = {"defined",  "undefined", "none", "string", "mapping",
+                                     "iterable", "sequence",  "true", "false",  "boolean"};
       ExprPtr e = make(Expr::Tag::Test);
       e->name = peek().s;
       e->inverted = inv;
@@ -1907,6 +1907,8 @@ struct Renderer {
           r = v.kind() == Value::Kind::Null;
         else if (e.name == "string")
           r = v.kind() == Value::Kind::String;
+        else if (e.name == "boolean")
+          r = v.kind() == Value::Kind::Bool;
         else if (e.name == "mapping")
           r = v.kind() == Value::Kind::Map;  // namespaces are not mappings
         else if (e.name == "sequence")

@@ -3,6 +3,7 @@
 #include <stdexcept>
 
 #include "kernels/sink_attn_impl.cuh"
+#include "kernels/minimax.hpp"
 
 // The sink-attention family's entry points: the qk-192 geometry (MiMo:
 // rotary 64) and the qk-128 one (Flint: rotary 128, the head norm, the
@@ -61,6 +62,21 @@ void sink_attn_combine(const float* m_ws, const float* l_ws, const float* c_ws, 
   if (!m_ws || !l_ws || !c_ws || !out) throw std::invalid_argument("sink_attn_combine: null pointer");
   const dim3 grid(static_cast<unsigned>(rows), static_cast<unsigned>(local_heads));
   sink_attn::attn_combine_kernel<<<grid, sink_attn::DV, 0, stream>>>(m_ws, l_ws, c_ws, n_split, local_heads, out);
+  DGPP_CUDA_OK(cudaGetLastError());
+}
+
+void minimax_attn_partial(const uint16_t* q, const uint16_t* k, const uint16_t* v,
+                          const int32_t* req, const int64_t* pos, const int32_t* table,
+                          int stride, const int32_t* selected, int rows, int heads,
+                          int kv_heads, int topk, float* m, float* l, float* c, cudaStream_t stream) {
+  if (rows <= 0) return;
+  if (heads <= 0 || kv_heads <= 0 || heads % kv_heads || heads / kv_heads > 32 || topk <= 0 || topk > 16)
+    throw std::invalid_argument("MiniMax attention shape");
+  const int hpk = heads / kv_heads;
+  const size_t smem = 32 * (136 + 128) * 2 + static_cast<size_t>(hpk) * (128 + 32) * 4;
+  sink_attn::attn_partial_kernel<128, false, true><<<dim3(rows, topk, kv_heads), hpk * 32, smem, stream>>>(
+      q, static_cast<int64_t>(heads) * 128, k, v, req, pos, topk, heads, kv_heads, 128, table,
+      stride, 0, static_cast<float>(1.0 / std::sqrt(128.0)), nullptr, m, l, c, nullptr, nullptr, selected);
   DGPP_CUDA_OK(cudaGetLastError());
 }
 

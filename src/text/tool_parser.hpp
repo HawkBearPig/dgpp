@@ -101,6 +101,7 @@ struct ChatMarkers {
   ChatMarker arg_value_open;    // "<arg_value>"    (GLM)
   ChatMarker arg_value_close;   // "</arg_value>"   (GLM)
   ChatMarker dsml;              // "｜DSML｜"        (DeepSeek-V4.1 / V4: the tool-call tag token)
+  ChatMarker minimax_namespace;  // "]<]minimax[>[" (recursive MiniMax XML)
   // The DSML spelling (kDsml only). from_tokenizer leaves the default — the
   // two tokenizers carry the same tag token — so a DeepSeek-V4 frontend (and
   // the grammar vocabulary built beside it) sets kV4 explicitly.
@@ -184,6 +185,9 @@ struct ChatMarkers {
   // markers, the two Qwen ones, or DeepSeek's tag token.
   bool reasoning_available() const { return think_close.available(); }
   ToolFormat tool_format() const {
+    // Its namespaced recursive XML needs a distinct parser and grammar.
+    // Do not accidentally advertise the Qwen dialect from shared tokens.
+    if (minimax_namespace.available()) return ToolFormat::kNone;
     if (tool_call_open.available() && tool_call_close.available() &&
         arg_key_open.available() && arg_key_close.available() &&
         arg_value_open.available() && arg_value_close.available())

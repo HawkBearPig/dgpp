@@ -316,7 +316,7 @@ __device__ __forceinline__ float tile_score(const uint16_t* __restrict__ krow_bf
   return acc;
 }
 
-template <int DK, bool kFp8>
+template <int DK, bool kFp8, bool kSelectedBlocks = false>
 __global__ void attn_partial_kernel(const uint16_t* __restrict__ q, int64_t q_stride,
                                     const uint16_t* __restrict__ k_cache,
                                     const uint16_t* __restrict__ v_cache,
@@ -329,7 +329,8 @@ __global__ void attn_partial_kernel(const uint16_t* __restrict__ q, int64_t q_st
                                     float* __restrict__ m_ws, float* __restrict__ l_ws,
                                     float* __restrict__ c_ws,
                                     const float* __restrict__ k_scale,
-                                    const float* __restrict__ v_scale) {
+                                    const float* __restrict__ v_scale,
+                                    const int32_t* __restrict__ selected_blocks = nullptr) {
   dgpp_pdl_wait();
   constexpr int kRowStride = Geo<DK>::kRowStride;
   extern __shared__ __align__(16) uint16_t smem[];
@@ -348,6 +349,17 @@ __global__ void attn_partial_kernel(const uint16_t* __restrict__ q, int64_t q_st
   const int64_t p = pos[r];
   int64_t t_begin = 0, t_end = 0;
   if (p >= 0) {
+    if constexpr (kSelectedBlocks) {
+      // MiniMax MSA: each index head owns one KV head and selects a
+      // separate list of logical 128-token blocks. Each split covers one
+      // selected block, with causal masking inside the current block.
+      const int b = selected_blocks[(static_cast<int64_t>(r) * kv_heads + kvh) * n_split + s];
+      if (b >= 0) {
+        t_begin = static_cast<int64_t>(b) * block_tokens;
+        const int64_t e = t_begin + block_tokens;
+        t_end = e < p + 1 ? e : p + 1;
+      }
+    } else {
     const int64_t t_lo = window > 0 ? (p - window + 1 > 0 ? p - window + 1 : 0) : 0;
     const int64_t visible = p - t_lo + 1;
     const int64_t tiles = (visible + kTile - 1) / kTile;
@@ -358,6 +370,7 @@ __global__ void attn_partial_kernel(const uint16_t* __restrict__ q, int64_t q_st
       t_begin = t_lo + tile0 * kTile;
       const int64_t e = t_lo + tile1 * kTile;
       t_end = e < p + 1 ? e : p + 1;
+    }
     }
   }
   if (t_begin >= t_end) {

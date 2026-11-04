@@ -460,3 +460,28 @@ here and validation summaries belong in the PR. This investigation has
 not run the model or measured GB10 throughput; the remaining decisions
 are kernel numerics, native-recipe quality, draft acceptance, and measured
 memory/runtime costs.
+
+## Implementation record: 2026-11-04 baseline
+
+The pinned target and nested DSpark weights are downloaded and verified on
+all four cluster nodes. The initial text implementation binds all 89,109
+text tensors, retains FP32 routing weights, runs MXFP8 weights with BF16
+activations and NVFP4 experts with BF16 activations, and implements paged
+MSA including the independent per-head block selection. It uses the shared
+session, prefix-cache and graph interfaces. DSpark, vision and the MiniMax
+tool-call parser/grammar remain under development; this is a feature-branch
+baseline, not a completed model release. Tool calls are refused until their
+own dialect is wired rather than being interpreted as Qwen XML.
+
+The synthetic four-layer checkpoint passes repeated forward, partial-block
+prefix restore, continuation and request-isolation smoke tests. An
+independent NumPy teacher-forced reference reports maximum per-layer relative
+RMS error 0.003312, exact routed-expert selections, and output-head relative
+RMS error 2.27e-7. Kernel and forward CUDA memchecks report zero errors. The
+shared attention regression tests pass for Flint and MiMo. These fixture
+results do not establish real-checkpoint quality or throughput.
+
+Prompt validation covers the shipped Jinja template and HF tokenizer,
+including recursive XML history, NFC, the case-sensitive split pattern,
+contractions, Unicode and adaptive `<mm:think>` reasoning. The native
+renderer adds the Jinja boolean test required by the shipped template.
