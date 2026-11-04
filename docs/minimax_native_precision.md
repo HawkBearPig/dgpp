@@ -40,6 +40,15 @@ kernel, defines this reference.
 [MLP dispatch](https://github.com/sgl-project/sglang/blob/58484246d26523eaf1a7f16ab524deee288d2120/python/sglang/srt/models/minimax_m3.py),
 [fused producer](https://github.com/sgl-project/sglang/blob/58484246d26523eaf1a7f16ab524deee288d2120/python/sglang/kernels/ops/activation/swiglu_mxfp8_swizzled.py).
 
+That producer's sigmoid evaluation is also explicit: it multiplies the gate
+by the sigmoid before multiplying by the up term. Its Triton-generated
+exp2 and division are not replaced with `gate / (1 + expf(-alpha * gate))`.
+DGPP's native dense/shared path now fuses this evaluation, BF16 rounding and
+MXFP8 production into one kernel. Payloads and scales match the actual pinned
+SGLang fused GPU producer byte for byte on 170,272 pairs, including all
+65,280 finite BF16 gate values and a 6,176-wide partial tile. Independent
+FP64 error bounds, row splits, graph replays and CUDA memcheck pass.
+
 Routed experts use NVFP4 W4A4. Both GEMM inputs are quantized dynamically per
 token. The MiniMax adapter explicitly neutralizes the checkpoint's static
 input globals; those globals must not be reused as static activation scales.
@@ -210,6 +219,15 @@ through the fixture's attention and routed experts. This comparison uses
 native quantization on both sides; it is not the earlier BF16-relative
 prescreen. The mismatch remains under investigation, and isolated stage
 passes must not be presented as an end-to-end native accuracy pass.
+
+The first real-checkpoint diagnostic at TP4 checks all 60 layers on five
+tokens. Its stage comparison passes (maximum relative RMS `0.00142110`),
+with exact router selections and the same binary hash and zero swap on all
+four ranks. The four-position full trajectory fails the numerical gate
+(absolute mean NLL difference `0.38348` nat; one position exceeds 1 nat).
+These initial trajectory probes used the earlier dense sigmoid expression;
+they remain recorded as failures and must be rerun after the fused-producer
+correction above. Neither short diagnostic establishes task quality.
 
 Run the diagnostic with:
 

@@ -12,8 +12,10 @@ namespace dgpp {
 namespace {
 constexpr int kThreads = 128, kBK = 64, kBN = 64, kStride = 80, kStages = 3;
 
+template <bool SwiGLU>
 __global__ void mxfp8_quantize_kernel(const uint16_t* x, size_t stride, int k, uint8_t* codes,
-                                      uint8_t* scales) {
+                                      uint8_t* scales, const uint16_t* up = nullptr,
+                                      float alpha = 0.f, float limit = 0.f) {
   dgpp_pdl_wait();
   // Eight lanes cooperate on each group; each lane loads four adjacent BF16s.
   const int row = blockIdx.y;
@@ -23,6 +25,25 @@ __global__ void mxfp8_quantize_kernel(const uint16_t* x, size_t stride, int k, u
       *reinterpret_cast<const uint2*>(x + static_cast<size_t>(row) * stride + column);
   float values[4] = {__uint_as_float(bits.x << 16), __uint_as_float(bits.x & 0xffff0000u),
                      __uint_as_float(bits.y << 16), __uint_as_float(bits.y & 0xffff0000u)};
+  if constexpr (SwiGLU) {
+    // Pinned SGLang fused producer: gate * sigmoid(alpha * gate), followed
+    // by (up + 1), BF16 rounding, then MXFP8. Keep Triton's exp2/div.full
+    // evaluation, rather than substituting g / (1 + expf(-alpha * g)).
+    const uint2 ub = *reinterpret_cast<const uint2*>(up + static_cast<size_t>(row) * stride + column);
+    const float ups[4] = {__uint_as_float(ub.x << 16), __uint_as_float(ub.x & 0xffff0000u),
+                          __uint_as_float(ub.y << 16), __uint_as_float(ub.y & 0xffff0000u)};
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const float g = fminf(values[i], limit), u = fminf(fmaxf(ups[i], -limit), limit);
+      const float exponent = __fmul_rn(__fmul_rn(g, -alpha), __uint_as_float(0x3fb8aa3bu));
+      float e, sigmoid;
+      asm("ex2.approx.f32 %0, %1;" : "=f"(e) : "f"(exponent));
+      const float denominator = __fadd_rn(1.f, e);
+      asm("div.full.f32 %0, %1, %2;" : "=f"(sigmoid) : "f"(1.f), "f"(denominator));
+      values[i] = __bfloat162float(__float2bfloat16_rn(
+          __fmul_rn(__fmul_rn(g, sigmoid), __fadd_rn(u, 1.f))));
+    }
+  }
   float maximum =
       fmaxf(fmaxf(fabsf(values[0]), fabsf(values[1])), fmaxf(fabsf(values[2]), fabsf(values[3])));
   const unsigned active = __activemask();
@@ -201,7 +222,20 @@ void launch_mxfp8_quantize_rows(const uint16_t* x, size_t stride, int rows, int 
     throw std::invalid_argument("MXFP8 quantize: requires 32-wide groups and aligned input rows");
   const dim3 grid(static_cast<unsigned>((k + 4 * kThreads - 1) / (4 * kThreads)),
                   static_cast<unsigned>(rows));
-  mxfp8_quantize_kernel<<<grid, kThreads, 0, stream>>>(x, stride, k, codes, scales);
+  mxfp8_quantize_kernel<false><<<grid, kThreads, 0, stream>>>(x, stride, k, codes, scales);
+  DGPP_CUDA_OK(cudaGetLastError());
+}
+
+void launch_minimax_swiglu_mxfp8_rows(const uint16_t* gate, const uint16_t* up, size_t stride,
+                                      int rows, int k, float alpha, float limit, uint8_t* codes,
+                                      uint8_t* scales, cudaStream_t stream) {
+  if (rows <= 0) return;
+  if (k <= 0 || k % 32 || stride < static_cast<size_t>(k) || stride % 4)
+    throw std::invalid_argument("MiniMax SwiGLU MXFP8: requires 32-wide groups and aligned input rows");
+  const dim3 grid(static_cast<unsigned>((k + 4 * kThreads - 1) / (4 * kThreads)),
+                  static_cast<unsigned>(rows));
+  mxfp8_quantize_kernel<true><<<grid, kThreads, 0, stream>>>(gate, stride, k, codes, scales, up,
+                                                          alpha, limit);
   DGPP_CUDA_OK(cudaGetLastError());
 }
 

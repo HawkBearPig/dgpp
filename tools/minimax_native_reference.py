@@ -10,17 +10,14 @@ kernel or GEMM is imported. See docs/minimax_native_precision.md.
 """
 
 import argparse
-import hashlib
-import importlib.util
 import json
 from pathlib import Path
-import sys
 
 import torch
 from tokenizers import Tokenizer
 
 import minimax_native_attention_reference as msa
-from minimax_mxfp8_quantization_check import SOURCE as MX_SOURCE, SHA256 as MX_SHA256
+from minimax_mxfp8_quantization_check import load_producers
 from minimax_torch_reference import Reference
 
 
@@ -36,14 +33,9 @@ class NativeReference(Reference):
         self.native_cache = native_cache
         self.phase = phase
         if native_activations:
-            path = sglang_source / MX_SOURCE
-            if hashlib.sha256(path.read_bytes()).hexdigest() != MX_SHA256:
-                raise ValueError('expected the pinned SGLang 58484246 MXFP8 producer')
-            spec = importlib.util.spec_from_file_location('_minimax_native_reference_mx', path)
-            module = importlib.util.module_from_spec(spec)
-            sys.modules[spec.name] = module
-            spec.loader.exec_module(module)
+            module, fused = load_producers(sglang_source)
             self.mx_quant = module.mxfp8_quantize_swizzled
+            self.mx_swiglu = fused.swiglu_oai_mxfp8
             # Check the actual producer files, then keep all tensors on GPU.
             from minimax_native_moe_regression import upstream_producer
             upstream_producer()
@@ -51,18 +43,21 @@ class NativeReference(Reference):
             self.nv_quant = nvfp4_quantize_per_token_cute_dsl
             self.nv_global_inv = torch.tensor([1 / (6 * 448)], device='cuda', dtype=torch.float32)
 
+    @staticmethod
+    def decode_mx(codes, scales):
+        r = torch.arange(len(codes), device=codes.device)[:, None]
+        c = torch.arange(codes.shape[1] // 32, device=codes.device)[None, :]
+        blocks = (codes.shape[1] // 32 + 3) // 4
+        offsets = ((r // 128) * blocks + c // 4) * 512 + (r % 32) * 16 + ((r % 128) // 32) * 4 + c % 4
+        scale = torch.exp2(scales[offsets].float() - 127).repeat_interleave(32, -1)
+        return (codes.float() * scale).to(torch.bfloat16)
+
     def quantized(self, x, mode):
         if x.dtype != torch.bfloat16:
             raise ValueError('native projection input must have the specified BF16 boundary')
         x = x.contiguous()
         if mode == 'mxfp8':
-            codes, scales = self.mx_quant(x)
-            r = torch.arange(len(x), device=x.device)[:, None]
-            c = torch.arange(x.shape[1] // 32, device=x.device)[None, :]
-            blocks = (x.shape[1] // 32 + 3) // 4
-            offsets = ((r // 128) * blocks + c // 4) * 512 + (r % 32) * 16 + ((r % 128) // 32) * 4 + c % 4
-            scale = torch.exp2(scales[offsets].float() - 127).repeat_interleave(32, -1)
-            return (codes.float() * scale).to(torch.bfloat16), None
+            return self.decode_mx(*self.mx_quant(x)), None
         codes, scales, globals_ = self.nv_quant(
             x, self.nv_global_inv, sf_layout=2, enable_pdl=False, nvfp4_4over6=None)
         codes = torch.stack((codes & 15, codes >> 4), -1).flatten(-2)
@@ -77,7 +72,9 @@ class NativeReference(Reference):
         if mode is None:
             return self.mm(x, weight, divisor, rounded)
         x, scale = self.quantized(x, mode)
-        y = self.mm(x, weight, rounded=False, streaming_order=mode == 'mxfp8')
+        # The native GEMM walks K in ordinary order. The BF16 control's
+        # streaming-weight column permutation does not apply to this kernel.
+        y = self.mm(x, weight, rounded=False)
         if scale is not None:
             # Per-token decode scale and reciprocal weight encode scale are
             # one FP32 epilogue factor, outside the block-scaled dot.
@@ -92,6 +89,19 @@ class NativeReference(Reference):
         gate, up, down = ('w1', 'w3', 'w2') if expert else ('gate_proj', 'up_proj', 'down_proj')
         g = self.project(n, *self.matrix(base + gate), base + gate, rounded=not expert)
         u = self.project(n, *self.matrix(base + up), base + up, rounded=not expert)
+        if not expert:
+            # Execute the actual upstream fusion, including its sigmoid
+            # evaluation, BF16 boundary and MXFP8 rounding. Group scales are
+            # local to 32 values, so slicing after quantization preserves TP.
+            act = self.decode_mx(*self.mx_swiglu(torch.cat((g, u), dim=1),
+                                                c['swiglu_alpha'], c['swiglu_limit']))
+            weight, divisor = self.matrix(base + down)
+            if divisor != 1.0:
+                raise ValueError('dense/shared down projection must be MXFP8')
+            width = weight.shape[1] // self.world
+            return [self.mm(act[:, r*width:(r+1)*width].contiguous(),
+                            weight[:, r*width:(r+1)*width].contiguous())
+                    for r in range(self.world)]
         if self.elementwise_backend == 'triton-fixed':
             from minimax_reference_arithmetic import activation
             act = activation(g, u, c['swiglu_alpha'], c['swiglu_limit'], rounded=True)

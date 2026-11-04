@@ -11,6 +11,12 @@ namespace dgpp {
 void launch_mxfp8_quantize_rows(const uint16_t* x, size_t x_stride, int rows, int k, uint8_t* codes,
                                 uint8_t* scales, cudaStream_t);
 
+// Pinned SGLang dense/shared SwiGLU-OAI producer, including its sigmoid
+// evaluation and BF16 boundary. Gate and up have the same BF16 row stride.
+void launch_minimax_swiglu_mxfp8_rows(const uint16_t* gate, const uint16_t* up, size_t stride,
+                                      int rows, int k, float alpha, float limit, uint8_t* codes,
+                                      uint8_t* scales, cudaStream_t);
+
 // Native SM121 block-scaled E4M3 x E4M3, FP32 accumulation. Both operands
 // are row-major with k-contiguous payloads and k/32-contiguous E8M0 scales.
 // out[m,n] = A[m,k] * W[n,k]^T; out_stride is in output elements (0 -> n).

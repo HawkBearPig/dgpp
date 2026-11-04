@@ -118,6 +118,79 @@ void quantization() {
       "passed");
 }
 
+void fused_quantization(int rows, int k, bool exhaustive) {
+  const int stride = k + 4;
+  std::vector<uint16_t> gate(static_cast<size_t>(rows) * stride, 0x7fc0), up = gate;
+  std::mt19937 rng(1749);
+  std::normal_distribution<float> normal(0.f, 6.f);
+  for (int row = 0; row < rows; ++row)
+    for (int c = 0; c < k; ++c) {
+      const int i = row * k + c, at = row * stride + c;
+      gate[at] = exhaustive ? (i < 32640 ? i : (i - 32640) | 0x8000)
+                            : float_to_bf16_bits(normal(rng));
+      up[at] = float_to_bf16_bits(normal(rng));
+    }
+  Buffer<uint16_t> dg(gate), du(up);
+  Buffer<uint8_t> codes(static_cast<size_t>(rows) * k), scales(static_cast<size_t>(rows) * k / 32);
+  cudaStream_t stream;
+  DGPP_CUDA_OK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+  auto launch = [&](int start, int count) {
+    launch_minimax_swiglu_mxfp8_rows(dg.ptr + start * stride, du.ptr + start * stride, stride,
+                                     count, k, 1.702f, 7.f, codes.ptr + start * k,
+                                     scales.ptr + start * (k / 32), stream);
+  };
+  launch(0, rows);
+  DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+  const auto actual = codes.read(), actual_scales = scales.read();
+  for (int row = 0; row < rows; ++row)
+    for (int group = 0; group < k / 32; ++group) {
+      double expected[32], maximum = 0;
+      for (int i = 0; i < 32; ++i) {
+        const int at = row * stride + group * 32 + i;
+        const double g = std::min<double>(bf16_bits_to_float(gate[at]), 7),
+                     u = std::clamp<double>(bf16_bits_to_float(up[at]), -7, 7);
+        expected[i] = (g / (1 + std::exp(-double(1.702f) * g))) * (u + 1);
+        maximum = std::max(maximum, std::abs(expected[i]));
+      }
+      const double scale = std::ldexp(1., int(actual_scales[row * (k / 32) + group]) - 127);
+      for (int i = 0; i < 32; ++i) {
+        const double decoded = fp8(actual[row * k + group * 32 + i]) * scale;
+        require(std::isfinite(decoded) && std::abs(decoded - expected[i]) <= .07 * maximum + 1e-38,
+                "fused SwiGLU exceeds BF16/MXFP8 rounding envelope against FP64");
+      }
+    }
+  for (int chunk : {1, 8, 17}) {
+    for (int at = 0; at < rows; at += chunk) launch(at, std::min(chunk, rows - at));
+    DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+    require(codes.read() == actual && scales.read() == actual_scales, "fused SwiGLU row geometry");
+  }
+  cudaGraph_t graph;
+  cudaGraphExec_t exec;
+  DGPP_CUDA_OK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+  launch(0, rows);
+  DGPP_CUDA_OK(cudaStreamEndCapture(stream, &graph));
+  DGPP_CUDA_OK(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
+  for (int replay = 0; replay < 2; ++replay) {
+    DGPP_CUDA_OK(cudaMemsetAsync(codes.ptr, 0x55, codes.count, stream));
+    DGPP_CUDA_OK(cudaGraphLaunch(exec, stream));
+    DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+    require(codes.read() == actual && scales.read() == actual_scales, "fused SwiGLU graph replay");
+  }
+  DGPP_CUDA_OK(cudaGraphExecDestroy(exec));
+  DGPP_CUDA_OK(cudaGraphDestroy(graph));
+  DGPP_CUDA_OK(cudaStreamDestroy(stream));
+  if (!dump_dir.empty()) {
+    const auto base = dump_dir / ("fused-" + std::to_string(rows) + "x" + std::to_string(k));
+    dump(base.string() + ".input.bf16", gate);
+    dump(base.string() + ".up.bf16", up);
+    dump(base.string() + ".codes.u8", actual);
+    dump(base.string() + ".scales.u8", actual_scales);
+    std::ofstream meta(base.string() + ".json");
+    meta << "{\"rows\":" << rows << ",\"k\":" << k << ",\"stride\":" << stride << ",\"swiglu\":true}\n";
+  }
+  std::printf("Fused SwiGLU MXFP8: %dx%d, FP64 envelope, row geometry and graph replay passed\n", rows, k);
+}
+
 void gemm(int rows, int n, int k, unsigned seed) {
   std::mt19937 random(seed);
   std::vector<uint8_t> a(static_cast<size_t>(rows) * k), w(static_cast<size_t>(n) * k);
@@ -200,6 +273,8 @@ int main(int argc, char** argv) {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || !devices) return 2;
     quantization();
+    fused_quantization(2040, 32, true);
+    fused_quantization(17, 6176, false);
     gemm(1, 1, 64, 1);
     gemm(17, 73, 128, 2);
     gemm(65, 65, 256, 3);

@@ -222,10 +222,12 @@ void MinimaxMlp::enqueue(const MinimaxMlpResident& w, const uint16_t* x, int tok
     launch_mxfp8_quantize_rows(x, w.gate.cols, tokens, w.gate.cols, m.codes, m.scales, stream);
   linear(x, w.gate, m.gate, tokens, stream, m.codes, m.scales);
   linear(x, w.up, m.up, tokens, stream, m.codes, m.scales);
-  minimax_swiglu(m.gate, m.up, m.act, static_cast<int64_t>(tokens) * m.inter, m.alpha, m.limit,
-                 stream);
   if (m.codes)
-    launch_mxfp8_quantize_rows(m.act, m.inter, tokens, m.inter, m.codes, m.scales, stream);
+    launch_minimax_swiglu_mxfp8_rows(m.gate, m.up, m.inter, tokens, m.inter, m.alpha, m.limit,
+                                     m.codes, m.scales, stream);
+  else
+    minimax_swiglu(m.gate, m.up, m.act, static_cast<int64_t>(tokens) * m.inter, m.alpha, m.limit,
+                   stream);
   linear(m.act, w.down, out, tokens, stream, m.codes, m.scales);
 }
 
