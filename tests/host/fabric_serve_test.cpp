@@ -385,12 +385,12 @@ void test_settings_handshake() {
   sent.rendezvous_timeout_ms = 120000;
   sent.stats_interval_s = 10.0;
   {
-    dgpp::serve::JournalWriter writer(29938);
+    dgpp::serve::JournalWriter writer(0);
     std::atomic<bool> stop{false};
     dgpp::serve::WorldSettings got;
     bool ok = false;
     std::thread peer([&] {
-      dgpp::serve::JournalReader reader("127.0.0.1", 29938, 5000, 1);
+      dgpp::serve::JournalReader reader("127.0.0.1", writer.port(), 5000, 1);
       ok = dgpp::serve::wait_journal_settings(&reader, [&] { return stop.load(); }, &got,
                                               "0.1.0+gtest");
     });
@@ -415,11 +415,11 @@ void test_settings_handshake() {
   }
   {
     // A peer of another version refuses: a mixed-version world cannot form.
-    dgpp::serve::JournalWriter writer(29941);
+    dgpp::serve::JournalWriter writer(0);
     std::atomic<bool> stop{false};
     std::string violation;
     std::thread peer([&] {
-      dgpp::serve::JournalReader reader("127.0.0.1", 29941, 5000, 1);
+      dgpp::serve::JournalReader reader("127.0.0.1", writer.port(), 5000, 1);
       dgpp::serve::WorldSettings got;
       try {
         (void)dgpp::serve::wait_journal_settings(&reader, [&] { return stop.load(); }, &got,
@@ -437,12 +437,12 @@ void test_settings_handshake() {
             "a different version refuses naming both: " + violation);
   }
   {
-    dgpp::serve::JournalWriter writer(29939);
+    dgpp::serve::JournalWriter writer(0);
     std::atomic<bool> stop{false};
     bool ended = true;
     std::string violation;
     std::thread peer([&] {
-      dgpp::serve::JournalReader reader("127.0.0.1", 29939, 5000, 1);
+      dgpp::serve::JournalReader reader("127.0.0.1", writer.port(), 5000, 1);
       dgpp::serve::WorldSettings got;
       try {
         ended = !dgpp::serve::wait_journal_settings(&reader, [&] { return stop.load(); }, &got);
@@ -457,11 +457,11 @@ void test_settings_handshake() {
             "a first record that is not the settings is a protocol violation: " + violation);
   }
   {
-    dgpp::serve::JournalWriter writer(29940);
+    dgpp::serve::JournalWriter writer(0);
     std::atomic<bool> stop{false};
     bool ended = false;
     std::thread peer([&] {
-      dgpp::serve::JournalReader reader("127.0.0.1", 29940, 5000, 1);
+      dgpp::serve::JournalReader reader("127.0.0.1", writer.port(), 5000, 1);
       dgpp::serve::WorldSettings got;
       ended = !dgpp::serve::wait_journal_settings(&reader, [&] { return stop.load(); }, &got);
     });
@@ -1428,12 +1428,19 @@ int64_t sample_of(const std::string& text, const std::string& series) {
 }
 
 void test_rank_metrics(FabricRig& rig) {
-  const std::string r0 = scrape_metrics(rig.port());
+  // The reply can reach HTTP before the engine publishes the pass's meters.
+  // Wait for rank 0's snapshot, just as we wait for the peers below.
+  std::string r0;
+  int64_t tokens = 0;
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  do {
+    r0 = scrape_metrics(rig.port());
+    tokens = sample_of(
+        r0, "dgpp_rank_generation_tokens_total{model_name=\"glm-5.3-flash-fp8\",rank=\"0\"}");
+  } while (tokens <= 0 && std::chrono::steady_clock::now() < deadline);
   require(r0.find("dgpp_rank_info{model_name=\"glm-5.3-flash-fp8\",rank=\"0\",world_size=\"3\",version=\"v\","
                   "git_sha=\"g\"} 1\n") != std::string::npos,
           "rank 0's identity: " + r0);
-  const int64_t tokens =
-      sample_of(r0, "dgpp_rank_generation_tokens_total{model_name=\"glm-5.3-flash-fp8\",rank=\"0\"}");
   require(tokens > 0, "rank 0 counted its generated tokens");
   require(r0.find("dgpp_rank_ticks_total") == std::string::npos, "rank 0 follows no journal");
   for (size_t i = 0; i < rig.peers.size(); ++i) {
