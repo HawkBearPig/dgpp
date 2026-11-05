@@ -2,11 +2,13 @@
 
 Investigated 2026-11-04 against dgpp `403d3f987964f6cd548348316c86520fb700ec71`.
 Status: text, tools, DSpark, image and video support implemented on the feature
-branch. BF16 control and local regression gates pass; native precision is
-integrated and passes synthetic checks. Real-weight native fidelity,
-deployment tuning, task quality and long-context release validation remain
-in progress. The initial
-plan below is followed by the implementation and measurement record.
+branch. Both BF16 and native recipes pass their independent 28,329-position
+TP4 comparisons. Native decode pages run in parallel, and generated-state
+prefix reuse is enabled. The native serving campaign and final integration
+checks are complete. The initial plan below is followed by the historical
+implementation and measurement record; current behavior is described in the
+[model card](model_cards/MiniMax-M3.1-Flash.md) and
+[native precision contract](minimax_native_precision.md).
 
 Implement `MiniMaxAI/MiniMax-M3.1-Flash` as a new model family on the shared
 engine, initially at TP4. Keep its published NVFP4 experts and MXFP8 dense
@@ -1420,3 +1422,47 @@ cached prefix; the harness now preserves each case's unique early tag.
 NVMe eviction/restore preserves the memory-hit continuation with zero spill
 or restore failures. Both correctness boots retain the expected executable,
 zero swap on every rank and matching operation streams.
+
+
+### Final native deployment validation (2026-11-05)
+
+The shipped four-node template selects native activations, Q8KV4 attention,
+a 2,097,152-token shared pool, sixteen slots, plain decoding and a 2,048-token
+idle prefill cap. Source `3062ce1f05d92513b1b0b6e384d01ed93db72477`, server
+SHA-256 `d84fd564456f90c8f01cd66be8b21683a53429ab8f51f33796402e70e7829621`.
+The [benchmark tables](benchmarks.md) contain its single-campaign row set.
+C1 decode is 21.6–21.9 tokens/s, C16 106.2–121.1, and cold 2K/8K/32K prefill
+is 2.104/7.634/30.694 seconds. All 465 requests succeed; 385 repeat/batch
+comparisons, fifteen DSpark/plain comparisons and solo/C16 isolation are exact.
+All eighteen context requests through 512K succeed with exact repeats and
+zero cached tokens in cold requests. Both campaign boots have the expected
+binary, zero swap on every rank and matching operation streams.
+
+Native task scores are 151/164 HumanEval, 294/300 GSM8K and 99/100 extraction.
+Six HumanEval responses reach the standard cap; three complete and pass at
+8,192 tokens, while three remain in reasoning at that cap. Standard-cap
+scores retain all misses. Completed failures include ordinary coding errors,
+math interpretations and one name-capitalization error; no evaluator parsing
+or transport defect was found. Full upstream runtime parity and native
+1M retrieval quality are not claimed.
+
+Native integration passes eight video and six image cases against plain
+C1 and DSpark C8, 24-image history/cache checks, recursive tools and streaming.
+The first cancellation diagnostic passes its 24 replay comparisons, edited
+controls and retirement accounting, but its optional `--require-answer-hit`
+assertion fails: none of its three cancelled answers has a retained entry
+matching an eligible cut in the submitted history. This is preserved as an
+unmet diagnostic, not relabeled as a pass. All six following turns do reuse
+completed-answer state. The shared cache looks up exact token prefixes at
+incoming cuts; retaining a cancelled snapshot does not guarantee such a hit.
+No engine policy or numerical limit was changed to satisfy that assertion.
+
+A targeted rerun verifies the supported cancellation contract and requires
+completed-answer reuse. Both cases and all eight replay comparisons pass,
+including cold/cached transcript equality and edited-prefix rejection.
+Together the runs contain 32 exact replay comparisons and eight completed
+answer reuse checks. The final NVMe run commits 17 spills and two restores,
+restores 46,056 tokens, and has zero failures or skipped spills. Its restored
+continuation matches the memory-hit continuation exactly. Both final cache
+boots have zero swap, the recorded executable on every rank and matching
+operation streams. These cache checks do not add throughput rows.

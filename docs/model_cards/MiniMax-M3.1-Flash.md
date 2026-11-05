@@ -1,9 +1,5 @@
 # MiniMax M3.1 Flash
 
-Development status: the implementation and deployment are still undergoing
-release validation. The final serving campaign and task-quality results are
-pending; the template's tuning settings may change before release.
-
 DGPP loads [MiniMaxAI/MiniMax-M3.1-Flash](https://huggingface.co/MiniMaxAI/MiniMax-M3.1-Flash)
 with its bundled `dspark/` drafter. Validation pins both to revision
 `2f33a8b9ae49ce7b51c994df97166a7fd059bc2e`. The publisher describes approximately
@@ -33,9 +29,10 @@ The deployment template reserves sixteen request slots and a shared
 it is not a per-request allowance at every concurrency. The checkpoint's
 positional ceiling is 1,048,576. The larger shared pool provides concurrency
 headroom; it does not extend that ceiling. The native pool has loaded on all
-four nodes with zero process swap. The BF16 control passes retrieval, prefix
-reuse and concurrent streams through 512K; native long-context quality
-validation remains pending.
+four nodes with zero process swap. The native campaign measures timing and
+cache repeatability through 512K; it does not certify long-context retrieval
+quality or the 1M ceiling. The BF16 control passes retrieval at all five tested
+positions, prefix reuse and concurrent streams through 512K.
 
 ## Numerical recipe and drafting
 
@@ -48,12 +45,11 @@ wider projections and prefill.
 
 Set `engine.activations: "native"` for MXFP8 W8A8 dense/shared projections
 and dynamic NVFP4 W4A4 experts. Independently, `engine.kv_dtype: "nvfp4"`
-selects Q8KV4 attention and compressed main/index caches. These paths are
-integrated but remain under release validation. They implement the native
-quantized recipe for which the model was trained; differences from the BF16
-control alone do not establish an accuracy regression. The full native
-likelihood check passes 28,329 positions with zero argmax changes; final
-task-quality and throughput results remain pending.
+selects Q8KV4 attention and compressed main/index caches. These implement
+the native quantized recipe for which the model was trained; differences
+from the BF16 control alone do not establish an accuracy regression. The
+full native likelihood check passes 28,329 positions with zero argmax
+changes. Task-quality and throughput results are recorded below.
 
 Native quantizers match the pinned SGLang/FlashInfer GPU producers byte for
 byte. Native-cache attention uses the upstream per-page formula for prompts
@@ -68,19 +64,31 @@ the same live conversation, rather than requiring the two upstream phases
 to be interchangeable. Full upstream runtime equivalence has not been
 established. The
 [native precision contract](../minimax_native_precision.md) records these
-boundaries, independent controls and outstanding comparisons.
+boundaries, independent controls and validation scope.
+
+A cancelled answer can retain committed state, but reuse still requires
+the retained token prefix and position to match a cut in the next rendered
+prompt. An arbitrary disconnect therefore does not guarantee an answer-cache
+hit. Completed-answer reuse and safe cancellation accounting are validated
+separately.
 
 BF12 support currently covers the main vocabulary head. The embedding,
 vision matrices and the drafter's BF16 matrices retain BF16 storage.
+
+For the validated BF16 comparison recipe, set both `engine.activations`
+and `engine.kv_dtype` to `bf16` and reduce `engine.kv_capacity` to `786432`.
+The native template's 2M-token cache allocation is too large in BF16 on
+four GB10 nodes. This changes activation/cache precision while retaining
+the published quantized weights; it does not create a full-BF16 checkpoint.
 
 Every layer uses MiniMax sparse attention: 128-token blocks, independent
 selection per index head, and 16 selected blocks including the current block
 inside that budget. The cache retains an index key for every token. The
 implementation does not pool those keys, reduce top-k, or add RoPE scaling.
 
-Plain decoding is the default. The C1/C8 and wider-batch tuning controls
-favor it for throughput at load; adaptive drafting helps some single-request
-classes but regresses others. The idle prefill cap is 2,048 tokens, with
+Plain decoding is the default, with sixteen request slots. Full-seven
+DSpark is slower on all five measured C1 classes: 14.6–20.6 decode tokens/s
+versus plain decoding's 21.6–21.9. The idle prefill cap is 2,048 tokens, with
 adaptive chunking while requests decode.
 
 `engine.mtp: true` enables the bundled five-layer DSpark model. Limit it to
@@ -118,33 +126,71 @@ explicit schema error. Numeric strings retain their string type.
 
 ## Validation
 
-In the BF16 activation/cache control, the exact index optimization and
-tensor-core vocabulary head pass the independent
-fixed-order reference on six raw/chat corpora: 28,329 scored positions, zero
-argmax changes, zero changes exceeding 1 nat, and a largest absolute mean NLL
-difference below 0.00000022 nat against the 0.02-nat gate. Repeats are exact. The
-unrestricted reference's arithmetic-order failures are retained in the
-[implementation record](../minimax_m31_flash_plan.md); thresholds were not
-relaxed.
+The native phase-aware TP4 comparison passes all six raw/chat corpora:
+28,329 scored positions, zero argmax changes and zero changes above 1 nat.
+The largest absolute mean-NLL difference is `1.49e-7` nat and the largest
+per-position difference is `1.20e-4` nat. The existing limits remain
+`0.02` nat mean NLL and a 1% rate above 1 nat. Both engine passes repeat
+exactly, hidden hashes match across ranks and input protocols match.
+This is an independent reference using pinned upstream quantizers and
+explicit arithmetic controls, not a full upstream serving execution.
+The BF16 activation/cache control passes the same corpora with zero argmax
+changes and a maximum absolute mean-NLL difference below `2.2e-7` nat.
 
-Four-rank BF16-control API, image, video, streaming and cache tests pass, including C8
-DSpark batch isolation. Independent vision checks retain the existing
-0.005 relative-RMS and 0.99998 cosine limits. The real video cases produce
-bit-exact final embeddings. Kernel diagnostics and microbenchmarks do not
-establish deployment throughput; final results belong in
-[the benchmark tables](../benchmarks.md) after the complete shipped-template
-campaign.
+The shipped-template campaign uses source `3062ce1f05d9` and server SHA-256
+`d84fd564456f90c8f01cd66be8b21683a53429ab8f51f33796402e70e7829621`.
+Decode throughput is 21.6–21.9 tokens/s at C1 and 106.2–121.1 at C16;
+these ranges span the five class medians. Cold prefill takes
+2.104 / 7.634 / 30.694 seconds at approximately 2K / 8K / 32K tokens.
+At 512K, cold prefill takes 893.523 seconds and median decode throughput
+is 11.6 tokens/s. Index selection scans token keys: its work grows linearly
+per decode query and quadratically over a complete cold prompt. See the
+[benchmark tables](../benchmarks.md) for all concurrency and context rows,
+with wall throughput reported separately.
 
-The clean native release and warnings-as-errors builds pass. All 381 local
-CTest entries have passing runs, including the 17 optional checkpoint tests
-run separately with pinned metadata. Video-enabled and video-disabled builds
-pass their capability and request checks. A 24-item large-pool quality pilot
-passes eight each of HumanEval, GSM8K and extraction without truncation;
-the complete task-quality campaign remains pending.
+| Task | Standard-cap result | Output cap | Larger-cap retry |
+| --- | --- | --- | --- |
+| HumanEval | 151/164 | 2,048 | Six capped; three completed and passed at 8,192, three remained in reasoning at the cap |
+| GSM8K | 294/300 | 2,048 | No capped responses |
+| Schema extraction | 99/100 | 512 | No capped responses |
 
-The corrected confidence interface passes the independent DSpark reference,
-shared-engine regression tests and CUDA memcheck. A four-rank comparison
-matches all 45 adaptive/plain request pairs. The sixteen-slot plain world
-matches all 125 C1/C8/C16 requests against complete eight-row references,
-including the extra prompts introduced by C16, with zero swap and matching
-operation streams. The final serving campaign includes C16 automatically.
+The seven uncapped HumanEval misses contain coding errors, including an
+incorrect regular expression, bounds and median indexing. The extraction
+miss changes `Esme` to `EsmE`; its JSON schema and other fields are correct.
+Scores retain all misses and the standard-cap verdicts. They do not claim
+identical task scores to BF16 or to an upstream serving runtime.
+
+All 465 load requests succeed, with 385 exact repeat/batch comparisons.
+The separate three-repeat transcripts are stable in all five classes,
+solo/C16 isolation is exact, and all fifteen full-seven DSpark transcripts
+match plain decoding. The API suite passes 9/9 checks. All eighteen context
+requests through 512K succeed; each bucket's three transcripts match and
+all cold probes have zero cached tokens. Both campaign boots run the
+recorded binary with zero swap on all four ranks and matching operation
+streams.
+
+The Release warnings-as-errors build and rebuilt targeted native tests pass,
+including all four precision combinations, graph replay and generated-prefix
+restoration followed by prompt extension and decode. Parallel native decode
+matches its serial control bit for bit in the attention fixtures and a
+256-token real-checkpoint diagnostic; CUDA memcheck and racecheck report
+zero errors or hazards. Earlier feature validation includes all 381 local
+CTest entries, with seventeen optional checkpoint cases supplied separately,
+and video-enabled/disabled builds. Independent vision checks retain the
+0.005 relative-RMS and 0.99998 cosine gates; eight real video cases have
+exact final embeddings.
+
+Native media integration passes eight video and six image cases against
+plain decoding, with DSpark at C8, plus 24-image history reuse, changed-frame
+invalidation and recursive streaming tools. The targeted cancellation check
+passes all eight replays and both completed-answer reuse checks. Across it
+and the earlier six-case diagnostic, all 32 cold/cached reply comparisons
+are exact and all eight following turns reuse completed-answer state.
+The earlier optional assertion demanding a cancelled-answer cache hit was
+unmet; cancellation reuse has the cut-matching constraint described above.
+
+Native NVMe validation commits 17 spills and two restores, with zero failures
+or skipped spills and 46,056 restored tokens. The disk-restored continuation
+matches the memory-hit continuation exactly. Both final cache boots have
+matching operation streams, the expected executable and zero swap on every
+rank.

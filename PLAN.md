@@ -1,20 +1,21 @@
 # DGPP implementation status
 
 MiniMax M3.1 Flash is implemented on the shared engine with its published
-NVFP4/MXFP8 weights, BF16 activations and caches, seven-proposal DSpark,
-recursive tools, images and native video. All six independent fixed-order
-text corpus checks pass across 28,329 scored positions with no argmax changes;
-distributed media, cache and batch-isolation checks pass. Activation
-quantization prescreens exceed the BF16-relative parity limits. These do not
-establish fidelity to the publisher's native quantized inference recipe,
-which still requires a matching reference and native-kernel validation.
-The 768K pool boots at zero swap and passes a 24-item task-quality pilot.
-The selected sixteen-slot plain template passes all 125 C1/C8/C16 output
-comparisons, and its idle prefill cap is 2,048 tokens.
-Release validation still requires native-recipe fidelity, full task-quality
-and long-context checks, followed by the final tuned-template campaign. The full local test
-suite and video-enabled/disabled build checks pass. See
-the [implementation record](docs/minimax_m31_flash_plan.md) and
+NVFP4/MXFP8 weights, native activations and Q8KV4 attention, seven-proposal
+DSpark, recursive tools, images and native video. BF16 activations and caches
+remain independently selectable. Both recipes pass their six-corpus,
+28,329-position independent TP4 references with zero argmax changes. Native
+decode pages run in parallel, and generated conversation prefixes remain
+reusable. The selected four-node template has sixteen slots, a 2M shared
+NVFP4 pool and a 2,048-token idle prefill cap. The complete load sweep passes
+all 465 requests and 385 exact repeat/batch comparisons. The native campaign
+passes API, isolation and context/cache checks through 512K; quality scores
+are 151/164 HumanEval, 294/300 GSM8K and 99/100 extraction at standard caps.
+Native media, tools, cancellation and NVMe integration pass. Full-seven
+DSpark preserves the measured plain transcripts but is slower on these C1
+classes. Native 1M retrieval quality and full upstream runtime parity are
+not certified. See the
+[implementation record](docs/minimax_m31_flash_plan.md) and
 [deployment notes](docs/model_cards/MiniMax-M3.1-Flash.md).
 
 NVMe slab startup acquires its exclusive lock before truncation. Duplicate-open
@@ -152,7 +153,7 @@ operations to its peers. Every rank checks the operation-stream digest.
 
 | family | implemented paths | deployment constraints |
 |---|---|---|
-| MiniMax M3.1 Flash | Native NVFP4 experts and MXFP8 dense weights, BF16 activations and K/V, FP32 routers, block-sparse attention with an exact per-token index, seven-proposal DSpark, graph decode, prefix cache, recursive tools, images and MP4/WebM video | Four nodes, sixteen request slots with plain decoding and a 768K shared token pool. Optional DSpark supports eight slots, with seven proposals and potentially fewer verification rows. Release measurements and long-context validation are pending; see [the model card](docs/model_cards/MiniMax-M3.1-Flash.md). |
+| MiniMax M3.1 Flash | Native NVFP4 experts and MXFP8 dense weights, native MXFP8/NVFP4 activations, Q8KV4 attention and BF16 controls, FP32 routers, block-sparse attention with an exact per-token index, seven-proposal DSpark, graph decode, prefix cache, recursive tools, images and MP4/WebM video | Four nodes, sixteen request slots with plain decoding and a 2M shared token pool (1M request ceiling). Optional DSpark supports eight slots, with seven proposals and potentially fewer verification rows. Native timing/cache validation reaches 512K; the 1M ceiling is not retrieval-certified. See [the model card](docs/model_cards/MiniMax-M3.1-Flash.md) for measurements and accuracy evidence. |
 | GLM-5.3-Flash | KDA and DSA attention, mHC, FP8 and hybrid NVFP4 experts, resident loading, graph decode, prefix cache and MTP | The full model needs four Sparks for resident serving. Batched decode has an eight-row limit; MTP depths 2–3 use scalar graphs |
 | Qwen3.8-Flash-Next | GDN, QSA, gated residuals, PLE n-gram embeddings, FP8, NVFP4 and AutoRound int4 (GPTQ g128) experts with the int8 g128 head, optional FP8 dense projections, graph decode, prefix cache and MTP | FP8 deployment templates use two or four nodes. Single-node NVFP4 serving maps the n-gram table from NVMe. Batched decode supports 64 rows, including sixteen slots at MTP depth 3 with scheduled verification disabled; default fixed-depth compaction reduces wide graphs within their numerical dispatch range, with scalar fallback when no physical family fits. Shared prefill continuation gives decode a turn between chunks, with early text admission enabled by default |
 | GLM-4.7 | Paged GQA, partial RoPE, NVFP4 dense and expert weights, draft-layer requantization, graph decode, prefix cache and MTP | Four-node serving is measured. The engine supports up to 32 batched decode rows, including deeper MTP; the supplied default recipe uses depth 1 |

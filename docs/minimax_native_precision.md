@@ -8,6 +8,13 @@ current DGPP BF16 activation/cache path is a separate comparison recipe.
 Failure of that recipe's parity limits does not establish failure of native
 inference fidelity or task quality.
 
+The native deployment now passes the phase-aware, independent TP4 reference
+on all six corpora (28,329 scored positions). The sections below retain the
+initial diagnostics and their corrections. The completed serving campaign
+records task quality and throughput separately in the
+[model card](model_cards/MiniMax-M3.1-Flash.md) and
+[benchmark tables](benchmarks.md).
+
 ## Pinned reference
 
 The initial native reference audit uses:
@@ -132,9 +139,8 @@ the rounding of FP32 outputs. Splitting the same queries into 1-, 8- and
 17-row calls preserves every FP32 output bit. The warnings-as-errors build,
 CUDA memcheck and racecheck pass, with zero errors or hazards.
 
-These are isolated kernel checks. The kernels are now connected to the
-target model's serving path; real-checkpoint native fidelity, throughput and
-final deployment selection remain pending. Reproduce the upstream quantizer check
+These are isolated kernel checks. The kernels are connected to the target
+model's serving path; full-model fidelity is recorded below. Reproduce the upstream quantizer check
 with `tools/minimax_mxfp8_quantization_check.py`, providing the built
 `mxfp8_gemm_test`, the pinned SGLang source and an untracked output directory.
 
@@ -191,8 +197,8 @@ not a full upstream MoE or full-model comparison.
 `engine.activations: "native"` selects MXFP8 dense/shared projections and
 dynamic NVFP4 routed experts for every target-model row, including decode.
 `engine.kv_dtype: "nvfp4"` independently selects the Q8KV4 attention path.
-Both settings default to `bf16`; the provisional deployment remains the
-BF16 control while real-checkpoint native validation is in progress. The
+Both settings default to `bf16`; the shipped deployment explicitly selects
+`native` activations and `nvfp4` cache after native fidelity validation. The
 vision encoder and optional DSpark drafter retain their existing precision.
 
 The cache pool exposes format-specific planes, and its memory planner,
@@ -219,17 +225,18 @@ difference is `0.00100` nat, but 105 positions (27.34%) differ by more than
 1 nat and 97 argmax choices differ. Small first-layer differences grow
 through the fixture's attention and routed experts. This comparison uses
 native quantization on both sides; it is not the earlier BF16-relative
-prescreen. The mismatch remains under investigation, and isolated stage
-passes must not be presented as an end-to-end native accuracy pass.
+prescreen. The arithmetic controls below explain this mismatch; isolated
+stage passes alone do not establish end-to-end native accuracy.
 
 The first real-checkpoint diagnostic at TP4 checks all 60 layers on five
 tokens. Its stage comparison passes (maximum relative RMS `0.00142110`),
 with exact router selections and the same binary hash and zero swap on all
 four ranks. The four-position full trajectory fails the numerical gate
 (absolute mean NLL difference `0.38348` nat; one position exceeds 1 nat).
-These initial trajectory probes used the earlier dense sigmoid expression;
-they remain recorded as failures and must be rerun after the fused-producer
-correction above. Neither short diagnostic establishes task quality.
+These initial trajectory probes used the earlier dense sigmoid expression.
+They remain recorded as failures; the corrected producer and phase-aware
+comparisons below supply the subsequent evidence. Neither short diagnostic
+establishes task quality.
 
 Run the diagnostic with:
 
@@ -293,8 +300,9 @@ changes; all four engine ranks have matching layer hashes. Using only the
 matrix/elementwise controls left attention differences that grew through
 the trajectory. These controls explain those short-probe discrepancies;
 they do not turn the unrestricted-reference failures into passes or certify
-full upstream runtime equivalence. Broader native corpus fidelity, task
-quality and the upstream decode-formula comparison remain required.
+full upstream runtime equivalence. Those short probes did not establish
+broader corpus fidelity, task quality or the upstream decode formula;
+the subsequent comparisons below address the corpus and phase checks.
 
 The next real-checkpoint TP4 pilot covers complete raw-text and chat prompts:
 528 and 529 scored positions respectively. Both pass the unchanged
@@ -409,6 +417,12 @@ It reuses existing prefill scratch and adds no cache storage.
 All five attention fixtures match the serial kernel bit for bit, including
 row splits, padded rows, physical-page permutations and PDL graph replay.
 The independent phase oracle and all four model precision combinations
-pass. The diagnostic will be repeated on the same prompt before the
-shipped-template serving campaign; these profile timings are not release
-throughput rows.
+pass. CUDA memcheck and racecheck report zero errors or hazards.
+
+On the same 7,435-token prompt, the replacement reduces the diagnostic
+decode step from 77.926 to 48.134 ms (38.2%) and attention from 31.731 to
+2.303 ms. All 256 output tokens, text and finish reason match the serial
+baseline exactly. The comparison uses sources `4d2e4574` and `3062ce1f`,
+with the expected executable and zero swap on every rank and matching
+operation streams. These profile timings explain the optimization; the
+separate shipped-template campaign provides deployment throughput rows.

@@ -8,10 +8,11 @@ project procedures and design guidance live in `docs/`.
 - **MiniMax M3.1 Flash**: native text, image and MP4/WebM video input,
   recursive tool calls and the bundled seven-proposal DSpark on the shared
   engine. The loader preserves the published NVFP4 expert and MXFP8 dense
-  weights; the serving recipe keeps BF16 activations and caches and FP32
-  routing. Exact index-key reuse, tensor-core vocabulary projections and a
-  bounded visual-embedding cache reduce repeated work. The four-node
-  deployment remains under release validation; see the
+  weights; the serving recipe uses native MXFP8/NVFP4 activations, Q8KV4
+  attention and FP32 routing, with BF16 controls available. Parallel decode
+  pages, tensor-core vocabulary projections and reusable conversation and
+  visual prefixes reduce repeated work. The four-node
+  deployment passes native reference and serving validation; see the
   [model card](docs/model_cards/MiniMax-M3.1-Flash.md) and
   [numerical evidence](docs/minimax_m31_flash_plan.md).
 
