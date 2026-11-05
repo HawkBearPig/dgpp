@@ -296,6 +296,8 @@ MinimaxModel::Outputs MinimaxModel::run_rows(const RowRun& run) {
     // its unrounded sum for the target's norm. Upstream converts L to L+1
     // at its capture interface; it does not tap entry of layer L itself.
     accumulate_draft_tap(layer - 1, T);
+    if (observer_ && !run.capture && df_.on() && df_.tap(layer - 1) >= 0)
+      observer_(layer - 1, "draft_tap", resid_, T, stream_);
     if (observer_ && !run.capture) observer_(layer, "input_norm", x_, T, stream_);
     auto* attn = stage(T, run.capture);
     run.for_each_kernel_group([](int a, int b) { return a > 128 && b > 128; },
@@ -353,6 +355,8 @@ MinimaxModel::Outputs MinimaxModel::run_rows(const RowRun& run) {
   // There is no next decoder layer for the final tap (59 in the release).
   // final_norm has saved its updated residual, before normalization, too.
   accumulate_draft_tap(cfg_.num_hidden_layers - 1, T);
+  if (observer_ && !run.capture && df_.on() && df_.tap(cfg_.num_hidden_layers - 1) >= 0)
+    observer_(cfg_.num_hidden_layers - 1, "draft_tap", resid_, T, stream_);
   const bool packed = project_head_rows(run, [&](int input, int output, int n) {
     project_head(h_ + static_cast<size_t>(input) * H,
                  logits_ + static_cast<size_t>(output) * lm_vocab_count_, n,

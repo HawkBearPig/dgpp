@@ -108,6 +108,7 @@ class MinimaxModel : public SessionModel<MinimaxModel> {
   void restore_chain_state(int) {}
 
   const DFlash2Drafter& dspark_drafter() const { return df_; }
+  DFlash2Drafter& dspark_drafter() { return df_; }
   bool dflash2_enabled() const { return df_.on(); }
   int dflash_depth() const { return 0; }
   int dflash2_drafts() const { return df_.on() ? df_.drafts() : 0; }
