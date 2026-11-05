@@ -125,6 +125,9 @@ class DFlash2Drafter {
   const uint16_t* block_hidden() const { return df_h_; }
   const float* block_logits() const { return df_logits_; }
   const uint16_t* context_norm() const { return df_norm_; }
+  // Eager diagnostics only; observers never execute during graph capture.
+  using Observer = std::function<void(int, const char*, const uint16_t*, int, int, cudaStream_t)>;
+  void set_observer(Observer observer) { observer_ = std::move(observer); }
   int drafts() const { return cfg_.drafts(); }
   int query_rows() const { return cfg_.query_rows(); }
   int batch_slots() const { return df_batch_; }
@@ -186,6 +189,7 @@ class DFlash2Drafter {
   void minimax_select(int slots, const int* reqs, bool capture);
 
   DFlash2Host h_{};
+  Observer observer_;
   DFlash2CaptureCtx cap_{};  // bound per family at the capture calls
   bool on_ = false;
   DFlash2Config cfg_;

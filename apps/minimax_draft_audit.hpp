@@ -64,8 +64,15 @@ void audit_draft(dgpp::MinimaxModel& model, const std::vector<DraftAuditCase>& c
       const auto path = root / ("block-" + std::to_string(round));
       std::filesystem::create_directories(path);
       const int64_t position = model.session_position(0);
+      model.dspark_drafter().set_observer([path](int layer, const char* name, const uint16_t* data,
+                                               int rows, int width, cudaStream_t stream) {
+        DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+        write(path / ("stage-" + std::to_string(layer) + "-" + name + ".bf16"),
+              draft_audit_copy(data, size_t(rows) * width));
+      });
       std::vector<int32_t> proposals;
       if (!model.dflash2_draft(0, anchor, &proposals)) throw std::runtime_error("draft audit could not draft");
+      model.dspark_drafter().set_observer({});
       DGPP_CUDA_OK(cudaStreamSynchronize(model.stream()));
       write(path / "hidden.bf16", draft_audit_copy(df.block_hidden(), size_t(q) * h));
       write(path / "logits.f32", draft_audit_copy(df.block_logits(), size_t(q) * model.lm_vocab_count()));

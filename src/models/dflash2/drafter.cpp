@@ -506,6 +506,9 @@ void DFlash2Drafter::block_layers(int slots, const int* reqs, bool capture) {
 void DFlash2Drafter::minimax_block_layers(int slots, const int* reqs, bool capture) {
   const int H = h_.hidden, QR = cfg_.query_rows(), R = slots * QR;
   const int Q = df_qw_, K = df_kvr_, I = df_i_, S = Q + 2 * K;
+  const auto observe = [&](int layer, const char* name, const uint16_t* data, int width) {
+    if (!capture && observer_) observer_(layer, name, data, R, width, h_.stream);
+  };
   auto* boundary = h_.boundary ? h_.boundary() : nullptr;
   const auto stage = [&]() {
     auto* p = boundary ? boundary->stage(R, H) : nullptr;
@@ -535,11 +538,14 @@ void DFlash2Drafter::minimax_block_layers(int slots, const int* reqs, bool captu
       minimax_add_norm(df_resid_, pending, w.input_norm, df_x_, R, H, cfg_.rms_norm_eps, h_.stream);
     else
       qwen_rmsnorm_bf16(df_resid_, w.input_norm, df_x_, R, H, cfg_.rms_norm_eps, h_.stream);
+    observe(l, "input_norm", df_x_, H);
     linear(df_x_, w.qkv_fp8, w.qkv_e8m0, df_qkv_, S, H);
+    observe(l, "qkv", df_qkv_, S);
     minimax_norm_rope(df_qkv_, w.q_norm, df_q_, df_pos_, df_inv_freq_, R, df_nh_, cfg_.rotary_dim,
                       cfg_.rms_norm_eps, h_.stream, S, Q);
     minimax_norm_rope(df_qkv_ + Q, w.k_norm, df_qkv_ + Q, df_pos_, df_inv_freq_, R, df_kvh_,
                       cfg_.rotary_dim, cfg_.rms_norm_eps, h_.stream, S, S);
+    observe(l, "q", df_q_, Q);
     const auto plane = h_.plane(l);
     for (int b = 0; b < slots; ++b) {
       const size_t row = static_cast<size_t>(b) * QR;
@@ -553,12 +559,18 @@ void DFlash2Drafter::minimax_block_layers(int slots, const int* reqs, bool captu
                                df_attn_part_ + row * df_nh_ * dflash2_block_attn_splits() * 130,
                                df_attn_ + row * Q, h_.stream, true);
     }
+    observe(l, "attention", df_attn_, Q);
     auto* output = stage();
     linear(df_attn_, w.o_fp8, w.o_e8m0, output, H, Q);
+    observe(l, "o_local", output, H);
     fold(output);
+    observe(l, "o", output, H);
     minimax_add_norm(df_resid_, output, w.post_norm, df_x_, R, H, cfg_.rms_norm_eps, h_.stream);
+    observe(l, "ffn_norm", df_x_, H);
     linear(df_x_, w.gate_fp8, w.gate_e8m0, df_gate_, I, H);
     linear(df_x_, w.up_fp8, w.up_e8m0, df_up_, I, H, false);
+    observe(l, "gate", df_gate_, I);
+    observe(l, "up", df_up_, I);
     if (df_native_codes_)
       launch_minimax_swiglu_mxfp8_rows(df_gate_, df_up_, I, R, I, cfg_.swiglu_alpha,
                                        cfg_.swiglu_limit, df_native_codes_, df_native_scales_,
@@ -568,7 +580,9 @@ void DFlash2Drafter::minimax_block_layers(int slots, const int* reqs, bool captu
                      cfg_.swiglu_limit, h_.stream);
     output = stage();
     linear(df_mlp_, w.down_fp8, w.down_e8m0, output, H, I, false);
+    observe(l, "down_local", output, H);
     fold(output);
+    observe(l, "down", output, H);
     pending = output;
   }
   minimax_add_norm(df_resid_, pending, w_.norm, df_h_, R, H, cfg_.rms_norm_eps, h_.stream);
