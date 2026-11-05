@@ -55,11 +55,15 @@ control alone do not establish an accuracy regression. The provisional
 template will be selected after fidelity, task-quality and throughput tests.
 
 Native quantizers match the pinned SGLang/FlashInfer GPU producers byte for
-byte. DGPP uses the upstream per-page prefill attention formula at all query
-geometries for batch/chunk consistency; upstream's online decode formula has
-different rounding boundaries. Full upstream runtime equivalence has not
-been established. The [native precision contract](../minimax_native_precision.md)
-records these boundaries, independent controls and outstanding comparisons.
+byte. Native-cache attention uses the upstream per-page formula for prompts
+and the online formula for decode and speculative verification. These have
+different rounding boundaries: applying prefill during decode failed the
+numerical gate and was corrected. Each phase preserves its own batch/chunk
+consistency. Prompt-prefix snapshots remain reusable; generated-state
+snapshots are disabled because they are incompatible with cold prefill.
+Full upstream runtime equivalence has not been established. The
+[native precision contract](../minimax_native_precision.md) records these
+boundaries, independent controls and outstanding comparisons.
 
 BF12 support currently covers the main vocabulary head. The embedding,
 vision matrices and the drafter's BF16 matrices retain BF16 storage.

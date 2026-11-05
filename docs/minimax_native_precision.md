@@ -333,6 +333,16 @@ including the scheduler and all four target precision combinations. The
 scheduler regression retains prompt-cache hits while forbidding decode
 snapshots, including a pool that fits without decode-snapshot headroom.
 
+The corrected real-checkpoint TP4 pilot passes against the prompt-aware
+native reference on all 1,057 raw/chat scored positions. There are zero
+argmax changes and zero changes above 1 nat; absolute mean NLL deltas are
+`3.41e-8` and `3.98e-8` nat, with a maximum per-position difference below
+`3.70e-5` nat. Both trials repeat exactly, input protocols match, all four
+ranks agree on hidden-state hashes, and every rank has the expected binary
+and zero swap. This resolves the pilot's phase-formula mismatch. It remains
+an independent fixed-arithmetic reference comparison, not a full upstream
+serving execution or the broader native quality verdict.
+
 ## Cache reconstruction and decode scheduling
 
 Cache consumers reconstruct four FP8 values together. E2M1 multiplied by a
