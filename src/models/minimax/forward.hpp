@@ -114,7 +114,7 @@ class MinimaxModel : public SessionModel<MinimaxModel> {
   int block_draft_rows() const { return df_.on() ? df_.query_rows() : 0; }
   int dflash2_batch_slots() const { return df_.batch_slots(); }
   bool dflash_graph_verify_available() const {
-    return df_.on() && max_decode_rows() >= df_.query_rows();
+    return df_.on() && max_decode_rows() >= df_.drafts() + 1;
   }
   bool dflash2_draft(int req, int64_t bonus, std::vector<int32_t>* drafts) {
     return df_.draft(req, bonus, drafts);

@@ -10,7 +10,7 @@
 // DFlash2Host (the pool's block table and draft planes, the session and
 // graph state, the embeddings, the head dispatch and the block GEMMs) and
 // reads the taps out of the feature accumulator (acc / tap_gemm_out) at
-// the checkpoint's target tap sites (MiniMax uses layer inputs).
+// the checkpoint's target tap sites (MiniMax uses completed layer outputs).
 //
 // The recorded walk may be ARMED to draw for the sampled requests
 // (arm_proposals, the Qwen35 family's rule): null specs keep every walk
@@ -51,6 +51,7 @@ struct DFlash2Host {
   int max_context = 0;      // the session's cache bound (the staging gates)
   int64_t position_limit = 0;  // the target config's position ceiling (the config cross-check's domain)
   bool weights_fp8 = false; // engine.dflash_weights fp8
+  bool native_activations = false;  // MiniMax MXFP8 projections, including context K/V.
   const RopeScaling* rope = nullptr;  // the target's ramp (null: the draft's own theta)
   int64_t* session_pos = nullptr;     // device [max_requests]: the committed ends
   int64_t* decode_tokens = nullptr;   // device d_tokens_: the fixed batch's feeds sit behind the decode rows
@@ -169,7 +170,7 @@ class DFlash2Drafter {
   static void plan_entries(const DFlash2Config& cfg, int world, int decode_rows, int max_tokens,
                            int max_requests, int64_t vocab_count, bool weights_fp8,
                            std::vector<std::pair<std::string, size_t>>* out,
-                           size_t native_weight_bytes = 0);
+                           size_t native_weight_bytes = 0, bool native_activations = false);
 
  private:
   // The block forward's layers over `slots` stacked [bonus, mask x D]
@@ -198,6 +199,8 @@ class DFlash2Drafter {
   float* df_t32_ = nullptr;     // [max_tokens, H] one tap's GEMM out (F32)
   uint16_t* df_norm_ = nullptr; // [rows_cap, H] hidden_norm
   uint16_t* df_kv_ = nullptr;   // [rows_cap, 2*kvr]
+  uint8_t* df_native_codes_ = nullptr;  // shared context/block MXFP8 input scratch
+  uint8_t* df_native_scales_ = nullptr;
   float* df_inv_freq_ = nullptr;  // [head_dim / 2] the draft's rope
   // Block forward (draft / draft_batch / the captures) at BR = df_batch_ *
   // query_rows stacked rows.

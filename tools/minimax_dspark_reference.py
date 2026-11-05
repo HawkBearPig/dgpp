@@ -4,10 +4,10 @@ import argparse
 import json
 from pathlib import Path
 import numpy as np
-from minimax_reference_dump import Weights, rounded, f32, norm, rotary, activate, relative_rms
+from minimax_reference_dump import Weights, rounded, f32, norm, rotary, activate, relative_rms, FP8
 
 
-def check(path, dump):
+def check(path, dump, native=False):
     c = json.loads((path / 'dspark/config.json').read_text())['text_config']
     w, target = Weights(path / 'dspark'), Weights(path)
     p = 'language_model.model.dspark.'
@@ -35,12 +35,25 @@ def check(path, dump):
             raise AssertionError(f'{name}: {error} > {threshold}')
         return actual
     compare('context', context, .0005)
-    R = c['dflash_config']['block_size'] + 1
+    # Pinned SGLang defaults MiniMax DSpark sample_from_anchor to true.
+    # gamma queries [anchor, gamma-1 masks] predict all gamma proposals.
+    R = c['dflash_config']['block_size']
     tokens = [7] + [c['dspark_noise_token_id']] * (R - 1)
     residual = target.tensor('language_model.model.embed_tokens.weight')[tokens]
     pending = None
     pos = np.arange(T, T + R)
     def linear(x, base):
+        if native:
+            groups = x.astype(np.float64).reshape(len(x), -1, 32)
+            maximum = np.abs(groups).max(-1, keepdims=True)
+            scale = np.exp2(np.ceil(np.log2(np.maximum(maximum, 1e-30) / 448)))
+            magnitude = np.minimum(np.abs(groups / scale), 448)
+            table = FP8[:127].astype(np.float64)
+            hi = np.minimum(np.searchsorted(table, magnitude), 126)
+            lo = np.maximum(hi - 1, 0)
+            dl, dh = magnitude - table[lo], table[hi] - magnitude
+            code = np.where((dl < dh) | ((dl == dh) & ((lo & 1) == 0)), lo, hi)
+            x = (np.copysign(table[code], groups) * scale).reshape(x.shape)
         return rounded(x.astype(np.float64) @ w.matrix(base).T)
     def qk(x, name, positions, heads):
         x = x.reshape(len(x), heads, D)
@@ -89,13 +102,13 @@ def check(path, dump):
     conf_w = w.tensor(p + 'confidence_head.proj.weight').astype(np.float64).ravel()
     conf_b = float(w.tensor(p + 'confidence_head.proj.bias')[0])
     previous = 7
-    for r in range(R - 1):
-        corrected = actual_logits[r + 1].astype(np.float64) + succ @ pred[previous]
+    for r in range(R):
+        corrected = actual_logits[r].astype(np.float64) + succ @ pred[previous]
         chosen = np.lexsort((np.arange(c['vocab_size']), -corrected))[0]
         if chosen != proposals[r]:
             raise AssertionError(f'vanilla Markov selection at {r}: {chosen} != {proposals[r]}')
         # DGPP's shared scheduler accepts logits and applies sigmoid itself.
-        expected = np.concatenate([actual_hidden[r + 1], pred[previous]]) @ conf_w + conf_b
+        expected = np.concatenate([actual_hidden[r], pred[previous]]) @ conf_w + conf_b
         if abs(expected - confidence[r]) > 2e-6:
             raise AssertionError(f'learned confidence logit at {r}: {expected} != {confidence[r]}')
         previous = int(proposals[r])
@@ -106,5 +119,6 @@ if __name__ == '__main__':
     ap = argparse.ArgumentParser()
     ap.add_argument('--checkpoint-dir', type=Path, required=True)
     ap.add_argument('--engine-dir', type=Path, required=True)
+    ap.add_argument('--native-activations', action='store_true')
     a = ap.parse_args()
-    check(a.checkpoint_dir, a.engine_dir)
+    check(a.checkpoint_dir, a.engine_dir, a.native_activations)

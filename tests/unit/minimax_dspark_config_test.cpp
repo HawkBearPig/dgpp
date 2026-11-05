@@ -39,11 +39,12 @@ DGPP_TEST(minimax_dspark_config_release) {
   require(c.intermediate_size == 12288 && c.conv_taps == 0, "dense FFN without convolutions");
   require(c.num_attention_heads == 64 && c.num_key_value_heads == 4 && c.rotary_dim == 64,
           "attention geometry");
-  require(c.query_rows() == 8 && c.drafts() == 7 && c.mask_token_id == 200058,
-          "seven proposals plus anchor");
+  require(c.query_rows() == 7 && c.drafts() == 7 && c.mask_token_id == 200058 &&
+              c.sample_from_anchor && c.proposal_row_offset() == 0,
+          "seven proposals start at the anchor row; verification has eight rows");
   require(c.selector_rank == 256 && c.sliding_window == 4096, "Markov rank and window");
   require(c.target_layer_ids == std::vector<int>({3, 17, 31, 45, 59}),
-          "input taps in FC column order");
+          "output taps in FC column order");
   c.validate_against({6144, 200064, 60, 1048576});
 }
 DGPP_TEST(minimax_dspark_config_rejects_semantic_changes) {

@@ -317,7 +317,8 @@ DGPP_TEST(dflash2_conditioned_candidates_preserve_proposal_distribution) {
   da.upload(&anchor, 8);
   dp.upload(positions.data(), positions.size() * 8);
   for (float temperature : {0.f, .4f, 1.f})
-    for (int truncation = 0; truncation < 2; ++truncation) {
+    for (int truncation = 0; truncation < 2; ++truncation)
+     for (int position_offset : {0, 1}) {
       dgpp::SampleSpec spec{};
       spec.temperature = temperature;
       spec.draft_temperature = .7f;
@@ -336,8 +337,9 @@ DGPP_TEST(dflash2_conditioned_candidates_preserve_proposal_distribution) {
       for (int step = 0; step < steps; ++step)
         dgpp::dflash2_sample_candidates(ci32(di) + step * k, cf32(ds) + step * k, k, step,
                                         i32(b) + step, static_cast<int64_t*>(prev.p) + step,
-                                        i32(recorded) + step * k, stream, ci64(dp) + step + 1, sp,
-                                        spb + step);
+                                        i32(recorded) + step * k, stream,
+                                        ci64(dp) + step + 1 - position_offset, sp,
+                                        spb + step, nullptr, position_offset);
       DGPP_CUDA_OK(cudaStreamSynchronize(stream));
       std::vector<int32_t> ta(steps), tb(steps), got(ids.size());
       std::vector<int64_t> previous(steps);

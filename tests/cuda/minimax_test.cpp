@@ -682,16 +682,18 @@ void write(const std::filesystem::path& p, const std::vector<T>& x) {
   f.write(reinterpret_cast<const char*>(x.data()), x.size() * sizeof(T));
   if (!f) throw std::runtime_error("cannot write " + p.string());
 }
-void dspark_oracle(const std::string& path, const std::string& dump) {
+void dspark_oracle(const std::string& path, const std::string& dump, bool native) {
   const auto cfg = MinimaxConfig::from_json_file(path + "/config.json");
   require(cfg.dspark != nullptr && !dump.empty(), "DSpark oracle needs model and dump directory");
   std::vector<int64_t> ids{3, 12, 25, 7, 91, 17, 6, 7, 47, 3, 19, 83, 71, 8, 12, 9, 31};
   MinimaxModel::Outputs plain;
   {
-    MinimaxModel target(cfg, path, 256, 512, LoaderResidency::Resident);
+    MinimaxModel target(cfg, path, 256, 512, LoaderResidency::Resident, nullptr, 0, 1, 1,
+                         false, 16, LatentFormat::kBf16, false, native);
     plain = target.forward(ids, true);
   }
-  MinimaxModel model(cfg, path, 256, 512, LoaderResidency::Resident, nullptr, 0, 1, 1, true, 16);
+  MinimaxModel model(cfg, path, 256, 512, LoaderResidency::Resident, nullptr, 0, 1, 1, true, 16,
+                       LatentFormat::kBf16, false, native);
   (void)model.session_prefill(0, ids);
   std::vector<int32_t> proposals;
   require(model.dflash2_draft(0, 7, &proposals), "DSpark oracle draft");
@@ -944,7 +946,7 @@ int main(int argc, char** argv) {
       minimaxfx::write(fixture, config);
       return 0;
     }
-    if (!dspark_model.empty()) dspark_oracle(dspark_model, dump);
+    if (!dspark_model.empty()) dspark_oracle(dspark_model, dump, native);
     if (!dspark.empty()) dspark_loader(dspark);
     if (run_kernels) kernels();
     if (!checkpoint.empty()) smoke(checkpoint, dump, native, format);

@@ -41,7 +41,8 @@ struct DFlash2Config {
   int rotary_dim = 128;
   float swiglu_alpha = 1.702f, swiglu_limit = 7.0f;
   // dflash_config.
-  int block_size = 8;             // query rows per draft: 1 anchor + (block_size - 1) mask rows
+  int block_size = 8;             // target verification rows: anchor + proposals
+  bool sample_from_anchor = false;  // DSpark predicts from row 0; DFlash2 from row 1.
   int mask_token_id = -1;
   int conv_taps = 2;
   int conv_group_size = 16;
@@ -65,7 +66,8 @@ struct DFlash2Config {
   static DFlash2Config parse(const minijson::Value& root);
 
   int drafts() const { return block_size - 1; }
-  int query_rows() const { return block_size; }
+  int query_rows() const { return block_size - (sample_from_anchor ? 1 : 0); }
+  int proposal_row_offset() const { return sample_from_anchor ? 0 : 1; }
   int kv_row() const { return num_key_value_heads * head_dim; }
   int q_row() const { return num_attention_heads * head_dim; }
   // The tensor-parallel slices (2026-10-04): the attention heads, the kv

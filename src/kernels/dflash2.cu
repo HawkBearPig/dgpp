@@ -520,7 +520,7 @@ __global__ void selector_kernel(
     int32_t* __restrict__ tokens, int steps, int k, int rank, const int64_t* __restrict__ pos,
     const SampleSpec* __restrict__ spec, DraftProposal* __restrict__ proposal,
     DraftProposal* __restrict__ proposal_host, float* __restrict__ conf, int step_offset,
-    int64_t* __restrict__ next_anchor, int32_t* __restrict__ record_ids) {
+    int64_t* __restrict__ next_anchor, int32_t* __restrict__ record_ids, int position_offset) {
   dgpp_pdl_wait();
   extern __shared__ float sm[];
   const int32_t anchor = anchor_tok ? static_cast<int32_t>(*anchor_tok) : 0;
@@ -617,7 +617,8 @@ __global__ void selector_kernel(
         const uint64_t seed = spec->seed ^ kSampleDraftSeedMix ^
                               (static_cast<uint64_t>(l + 1 + step_offset) * 0xD1B54A32D192ED03ull);
         const int64_t p =
-            pos != nullptr ? pos[rank == 0 ? l : l + 1] : static_cast<int64_t>(l + 1 + step_offset);
+            pos != nullptr ? pos[rank == 0 ? l : l + 1] + position_offset
+                           : static_cast<int64_t>(l + 1 + step_offset);
         const double u = uniform01(seed, static_cast<uint64_t>(p < 0 ? 0 : p));
         double cum = 0.0;
         int chosen = -1, last_live = 0;
@@ -966,21 +967,22 @@ void dflash2_selector_walk(const int32_t* ids, const float* unary, const float* 
     throw std::invalid_argument("dflash2_selector_walk: shared memory over the static limit");
   selector_kernel<<<1, 256, smem, stream>>>(ids, unary, hidden, pred_cb, succ_cb, anchor, tokens,
                                             steps, k, rank, pos, spec, proposal, proposal_host,
-                                            conf, 0, nullptr, nullptr);
+                                            conf, 0, nullptr, nullptr, 0);
   DGPP_CUDA_OK(cudaGetLastError());
 }
 
 void dflash2_sample_candidates(const int32_t* ids, const float* scores, int k, int step,
                                int32_t* token, int64_t* next_anchor, int32_t* record_ids,
                                cudaStream_t stream, const int64_t* pos, const SampleSpec* spec,
-                               DraftProposal* proposal, DraftProposal* proposal_host) {
+                               DraftProposal* proposal, DraftProposal* proposal_host,
+                               int position_offset) {
   if (!ids || !scores || !token || !next_anchor || !record_ids || k < 2 || k > kSampleProposalMax ||
       step < 0 || step >= kSampleProposalSlots)
     throw std::invalid_argument("dflash2_sample_candidates: buffers/shape/step");
   // rank=0 is a unary-only walk: no codebook reads or transition term.
   selector_kernel<<<1, 256, static_cast<size_t>(k * k + k) * 4, stream>>>(
       ids, scores, nullptr, nullptr, nullptr, nullptr, token, 1, k, 0, pos, spec, proposal,
-      proposal_host, nullptr, step, next_anchor, record_ids);
+      proposal_host, nullptr, step, next_anchor, record_ids, position_offset);
   DGPP_CUDA_OK(cudaGetLastError());
 }
 

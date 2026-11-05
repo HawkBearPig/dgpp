@@ -21,6 +21,7 @@
 #include "kernels/gemm.hpp"
 #include "kernels/kernels.hpp"
 #include "kernels/minimax.hpp"
+#include "kernels/mxfp8_gemm.hpp"
 #include "kernels/mma_gemv.hpp"
 #include "kernels/qsa.hpp"
 #include "kernels/qwen_norm.hpp"
@@ -35,7 +36,7 @@ namespace {
 size_t batch_width(const DFlash2Config& cfg, int decode_rows, int max_requests) {
   return std::max<size_t>(1,
                           static_cast<size_t>(std::max({kDecodeRows, decode_rows, max_requests})) /
-                              static_cast<size_t>(cfg.query_rows()));
+                              static_cast<size_t>(cfg.drafts() + 1));
 }
 void validate_host(const DFlash2Config& cfg, const DFlash2Host& h) {
   cfg.validate_against(
@@ -107,11 +108,17 @@ void DFlash2Drafter::init(const DFlash2Host& h, const DFlash2Config& cfg, DFlash
   // same buffers).
   const int CR = rows_cap();
   const int QR = cfg_.query_rows();
-  const int D = QR - 1;  // mask rows = drafts
-  df_batch_ = std::max(1, h.max_decode_rows / QR);
+  const int D = cfg_.drafts();
+  df_batch_ = std::max(1, h.max_decode_rows / (D + 1));
   const int BR = df_batch_ * QR, BD = df_batch_ * D;
   const size_t MT = static_cast<size_t>(h.max_tokens);
   const int H = h.hidden;
+  if (cfg_.backbone == DFlash2Config::Backbone::MiniMaxM3 && h.native_activations) {
+    const size_t elements = std::max(static_cast<size_t>(CR) * H,
+                                    static_cast<size_t>(BR) * std::max({H, df_qw_, df_i_}));
+    DGPP_CUDA_OK(cudaMalloc(&df_native_codes_, elements));
+    DGPP_CUDA_OK(cudaMalloc(&df_native_scales_, elements / 32));
+  }
   DGPP_CUDA_OK(cudaMalloc(&df_acc_, MT * H * 4));
   DGPP_CUDA_OK(cudaMalloc(&df_t32_, MT * H * 4));
   DGPP_CUDA_OK(cudaMalloc(&df_norm_, static_cast<size_t>(CR) * H * 2));
@@ -171,6 +178,10 @@ void DFlash2Drafter::init(const DFlash2Host& h, const DFlash2Config& cfg, DFlash
 }
 
 void DFlash2Drafter::free() {
+  cudaFree(df_native_codes_);
+  cudaFree(df_native_scales_);
+  df_native_codes_ = nullptr;
+  df_native_scales_ = nullptr;
   cudaFree(df_inv_freq_);
   cudaFree(df_acc_);
   cudaFree(df_t32_);
@@ -282,15 +293,18 @@ void DFlash2Drafter::plan_entries(const DFlash2Config& cfg, int world, int decod
                                   int max_tokens, int max_requests, int64_t vocab_count,
                                   bool weights_fp8,
                                   std::vector<std::pair<std::string, size_t>>* out,
-                                  size_t native_weight_bytes) {
+                                  size_t native_weight_bytes, bool native_activations) {
   if (!cfg.tp_divisible(world))
     throw std::invalid_argument("DFlash2 plan: the drafter's heads / kv heads / MLP rows must divide across the world");
   const size_t H = cfg.hidden_size, I = cfg.local_intermediate(world);
-  const size_t QR = static_cast<size_t>(cfg.query_rows()), D = QR - 1;
+  const size_t QR = static_cast<size_t>(cfg.query_rows()), D = cfg.drafts();
   const size_t BW = batch_width(cfg, decode_rows, max_requests);
   const size_t BR = BW * QR, BD = BW * D, CR = rows_cap();
   const size_t QW = cfg.local_q_row(world), KV = cfg.local_kv_row(world), NH = cfg.local_heads(world);
   const size_t M = static_cast<size_t>(max_tokens), V = static_cast<size_t>(vocab_count);
+  if (cfg.backbone == DFlash2Config::Backbone::MiniMaxM3 && native_activations)
+    out->push_back({"MiniMax DSpark MXFP8 activation scratch",
+                    std::max(CR * H, BR * std::max({H, QW, I})) * 33 / 32});
   const size_t G = cfg.conv_groups(), TAPS = cfg.conv_taps, K = cfg.selector_top_k, RANK = cfg.selector_rank;
   out->push_back(
       {weights_fp8 ? "dflash2 drafter weights (this rank's slices; the block matrices as fp8, the "
@@ -342,10 +356,19 @@ void DFlash2Drafter::store_features(int T, const int32_t* d_req, const int64_t* 
     else
       dflash2_norm_f32_bf16(df_acc_ + static_cast<size_t>(off) * H, w_.hidden_norm, df_norm_, rows,
                             H, cfg_.rms_norm_eps, h_.stream);
+    if (df_native_codes_)
+      launch_mxfp8_quantize_rows(df_norm_, H, rows, H, df_native_codes_, df_native_scales_,
+                                 h_.stream);
     for (int l = 0; l < L; ++l) {
       const auto& w = w_.layers[l];
       if (native) {
-        launch_scale_gemm_grid_e8m0_bf16(df_norm_, H, w.qkv_fp8 + static_cast<size_t>(df_qw_) * H,
+        if (df_native_codes_)
+          launch_mxfp8_gemm_bf16(df_native_codes_, df_native_scales_,
+                                  w.qkv_fp8 + static_cast<size_t>(df_qw_) * H,
+                                  w.qkv_e8m0 + static_cast<size_t>(df_qw_) * H / 32, df_kv_,
+                                  rows, 2 * KV, H, h_.stream);
+        else
+          launch_scale_gemm_grid_e8m0_bf16(df_norm_, H, w.qkv_fp8 + static_cast<size_t>(df_qw_) * H,
                                          w.qkv_e8m0 + static_cast<size_t>(df_qw_) * H / 32, df_kv_,
                                          rows, 2 * KV, H, h_.stream, 2 * KV, 0, 5, nullptr, 0,
                                          false);
@@ -495,9 +518,15 @@ void DFlash2Drafter::minimax_block_layers(int slots, const int* reqs, bool captu
     boundary->reduce(p, R, H);
   };
   const auto linear = [&](const uint16_t* x, const uint8_t* w, const uint8_t* scale, uint16_t* y,
-                          int n, int k) {
-    launch_scale_gemm_grid_e8m0_bf16(x, k, w, scale, y, R, n, k, h_.stream, n, 0, 5, nullptr, 0,
-                                     false);
+                          int n, int k, bool quantize = true) {
+    if (df_native_codes_) {
+      if (quantize)
+        launch_mxfp8_quantize_rows(x, k, R, k, df_native_codes_, df_native_scales_, h_.stream);
+      launch_mxfp8_gemm_bf16(df_native_codes_, df_native_scales_, w, scale, y, R, n, k, h_.stream);
+    } else {
+      launch_scale_gemm_grid_e8m0_bf16(x, k, w, scale, y, R, n, k, h_.stream, n, 0, 5, nullptr, 0,
+                                       false);
+    }
   };
   const uint16_t* pending = nullptr;
   for (int l = 0; l < cfg_.num_hidden_layers; ++l) {
@@ -529,11 +558,16 @@ void DFlash2Drafter::minimax_block_layers(int slots, const int* reqs, bool captu
     fold(output);
     minimax_add_norm(df_resid_, output, w.post_norm, df_x_, R, H, cfg_.rms_norm_eps, h_.stream);
     linear(df_x_, w.gate_fp8, w.gate_e8m0, df_gate_, I, H);
-    linear(df_x_, w.up_fp8, w.up_e8m0, df_up_, I, H);
-    minimax_swiglu(df_gate_, df_up_, df_mlp_, static_cast<int64_t>(R) * I, cfg_.swiglu_alpha,
-                   cfg_.swiglu_limit, h_.stream);
+    linear(df_x_, w.up_fp8, w.up_e8m0, df_up_, I, H, false);
+    if (df_native_codes_)
+      launch_minimax_swiglu_mxfp8_rows(df_gate_, df_up_, I, R, I, cfg_.swiglu_alpha,
+                                       cfg_.swiglu_limit, df_native_codes_, df_native_scales_,
+                                       h_.stream);
+    else
+      minimax_swiglu(df_gate_, df_up_, df_mlp_, static_cast<int64_t>(R) * I, cfg_.swiglu_alpha,
+                     cfg_.swiglu_limit, h_.stream);
     output = stage();
-    linear(df_mlp_, w.down_fp8, w.down_e8m0, output, H, I);
+    linear(df_mlp_, w.down_fp8, w.down_e8m0, output, H, I, false);
     fold(output);
     pending = output;
   }
@@ -604,6 +638,7 @@ void DFlash2Drafter::gather_candidates(int rows, int32_t* ids, float* scores, bo
 
 void DFlash2Drafter::minimax_select(int slots, const int* reqs, bool capture) {
   const int H = h_.hidden, QR = cfg_.query_rows(), D = cfg_.drafts();
+  const int offset = cfg_.proposal_row_offset();
   const int K = cfg_.selector_top_k, rank = cfg_.selector_rank, V = h_.vocab_count;
   const bool sampled = capture && df_specs_ != nullptr && reqs != nullptr;
   for (int step = 0; step < D; ++step) {
@@ -611,7 +646,7 @@ void DFlash2Drafter::minimax_select(int slots, const int* reqs, bool capture) {
     // Shortlisting the base logits first can remove its winning token.
     // Reuse the full-vocabulary FP32 projection and exchange the corrected
     // top-K once per step; all ranks then choose the same predecessor.
-    dsv41_dspark_markov_bias(df_logits_, static_cast<int64_t>(QR) * V, step + 1, w_.pred_codebook,
+    dsv41_dspark_markov_bias(df_logits_, static_cast<int64_t>(QR) * V, step + offset, w_.pred_codebook,
                              w_.succ_codebook, rank, h_.vocab_begin, V,
                              step == 0 ? df_tokens_ : df_markov_prev_, step == 0 ? QR : 1, slots,
                              df_markov_logits_, V, 1, h_.stream);
@@ -623,14 +658,14 @@ void DFlash2Drafter::minimax_select(int slots, const int* reqs, bool capture) {
       const size_t po = sampled ? static_cast<size_t>(reqs[k]) * df_props_stride_ + step : 0;
       dflash2_sample_candidates(
           df_markov_ids_ + k * K, df_markov_scores_ + k * K, K, step, df_tok_ + k * D + step,
-          df_markov_prev_ + k, df_ids_ + (ro + step + 1) * K, h_.stream,
-          sampled ? df_pos_ + ro + step + 1 : nullptr, sampled ? df_specs_ + reqs[k] : nullptr,
+          df_markov_prev_ + k, df_ids_ + (ro + step + offset) * K, h_.stream,
+          sampled ? df_pos_ + ro + step + offset : nullptr, sampled ? df_specs_ + reqs[k] : nullptr,
           sampled ? df_props_ + po : nullptr,
-          sampled && df_props_h_ != nullptr ? df_props_h_ + po : nullptr);
+          sampled && df_props_h_ != nullptr ? df_props_h_ + po : nullptr, 1 - offset);
     }
   }
   for (int k = 0; k < slots; ++k) {
-    const size_t ro = static_cast<size_t>(k) * QR, co = static_cast<size_t>(k) * D, mo = ro + 1;
+    const size_t ro = static_cast<size_t>(k) * QR, co = static_cast<size_t>(k) * D, mo = ro + offset;
     if (reqs != nullptr)
       minimax_dspark_confidence(df_h_ + mo * H, w_.pred_codebook, df_tokens_ + ro, df_tok_ + co,
                                 w_.confidence_weight, w_.confidence_bias,
@@ -646,10 +681,10 @@ bool DFlash2Drafter::draft(int req, int64_t bonus, std::vector<int32_t>* drafts)
   const int H = h_.hidden;
   const int QR = cfg_.query_rows(), D = cfg_.drafts();
   const int64_t pos = h_.session_position(req);
-  if (pos < 0 || pos + QR > h_.max_context) return false;
+  if (pos < 0 || pos + D + 1 > h_.max_context) return false;
   // The block writes K/V at [pos, pos + QR): grow the table now (the next
   // verify's rows live in the same span). Pool exhausted -> plain step.
-  if (!h_.ensure_request_blocks(req, pos + QR, h_.stream)) return false;
+  if (!h_.ensure_request_blocks(req, pos + D + 1, h_.stream)) return false;
 
   // Row inputs: [bonus, mask x D] at positions pos..pos+QR-1.
   for (int j = 0; j < QR; ++j) {
@@ -698,8 +733,8 @@ void DFlash2Drafter::draft_batch(const std::vector<int>& reqs, const std::vector
   for (int s = 0; s < S; ++s) {
     const int req = reqs[static_cast<size_t>(s)];
     const int64_t pos = h_.session_position(req);
-    if (pos < 0 || pos + QR > h_.max_context) continue;
-    if (!h_.ensure_request_blocks(req, pos + QR, h_.stream)) continue;
+    if (pos < 0 || pos + D + 1 > h_.max_context) continue;
+    if (!h_.ensure_request_blocks(req, pos + D + 1, h_.stream)) continue;
     poss[static_cast<size_t>(s)] = pos;
     idx.push_back(s);
     creqs.push_back(req);
@@ -744,7 +779,7 @@ void DFlash2Drafter::capture_block_draft(int req, const PickVerdict* verdict, co
     throw std::logic_error("session_graph_capture_block_draft: the step must be captured with device positions and tokens");
   const int H = h_.hidden;
   const int QR = cfg_.query_rows(), D = cfg_.drafts();
-  if ((cap.graph_feed_rows > 0 ? cap.graph_feed_rows : cap.decode_rows) != QR)
+  if ((cap.graph_feed_rows > 0 ? cap.graph_feed_rows : cap.decode_rows) != D + 1)
     throw std::logic_error("session_graph_capture_block_draft: the token feed is [next, drafts] (T = query rows)");
   // The block's rows off the verdict: the anchor is the verify's next
   // token at the position the recorded commit advanced to; mask rows
@@ -760,7 +795,8 @@ void DFlash2Drafter::capture_block_draft(int req, const PickVerdict* verdict, co
   dflash2_block_feed(verdict, df_tok_, D, cap.step_tokens, h_.stream);
   dflash2_publish_drafts(df_tok_, df_mirror_h_ + static_cast<size_t>(req) * D, D, h_.stream);
   const int K = cfg_.selector_top_k;
-  dflash2_publish_words(df_ids_ + K, df_cands_h_ + static_cast<size_t>(req) * D * K, D * K, h_.stream);  // the mask rows' lists
+  dflash2_publish_words(df_ids_ + cfg_.proposal_row_offset() * K,
+                         df_cands_h_ + static_cast<size_t>(req) * D * K, D * K, h_.stream);
 }
 
 void DFlash2Drafter::capture_block_draft_batch(const PickVerdict* verdicts, int requests,
@@ -780,7 +816,7 @@ void DFlash2Drafter::capture_block_draft_batch(const PickVerdict* verdicts, int 
   // query rows); a reduced-row verify (engine.dflash_batch_rows) reads it
   // compacted and the block draft still writes the whole of it.
   const int feed_rows = cap.graph_feed_rows > 0 ? cap.graph_feed_rows : cap.graph_rows_per_request;
-  if (feed_rows != QR || cap.graph_rows_per_request > QR)
+  if (feed_rows != D + 1 || cap.graph_rows_per_request > D + 1)
     throw std::logic_error("session_graph_capture_block_draft_batch: the feed is [next, drafts] per slot (T = query rows)");
   const int R = requests * QR;
   dflash2_stage_block_batched(verdicts, h_.session_pos, cfg_.mask_token_id, QR, requests, h_.max_context,
@@ -794,11 +830,11 @@ void DFlash2Drafter::capture_block_draft_batch(const PickVerdict* verdicts, int 
   // The fixed batch's feeds sit behind the decode rows at QR rows per slot
   // (the step capture's step_tokens_).
   int64_t* feeds = h_.decode_tokens + static_cast<size_t>(h_.max_decode_rows);
-  dflash2_block_feed_batched(verdicts, df_tok_, D, requests, QR, feeds, h_.stream);
+  dflash2_block_feed_batched(verdicts, df_tok_, D, requests, D + 1, feeds, h_.stream);
   dflash2_publish_drafts_batched(df_tok_, df_mirror_h_, D, requests, h_.stream);
   const int K = cfg_.selector_top_k;
   for (int q = 0; q < requests; ++q)  // slot q == request q: its mask rows' lists
-    dflash2_publish_words(df_ids_ + (static_cast<size_t>(q) * QR + 1) * K,
+    dflash2_publish_words(df_ids_ + (static_cast<size_t>(q) * QR + cfg_.proposal_row_offset()) * K,
                           df_cands_h_ + static_cast<size_t>(q) * D * K, D * K, h_.stream);
 }
 

@@ -115,6 +115,12 @@ DFlash2Config minimax_dspark_config(const V& root) {
   word(t, "dspark_aux_gemm_precision", "bf16");
   const auto& d = need(t, "dflash_config");
   c.block_size = 1 + integer(d, "block_size", 1, kSpecRows - 1);
+  // The published DSpark contract defaults sample_from_anchor to true:
+  // seven proposals use [anchor, six masks], reading hidden rows 0..6.
+  // The target still verifies eight rows [anchor, seven proposals].
+  c.sample_from_anchor = true;
+  for (const auto* object : {&root, &t})
+    if (object->find("sample_from_anchor")) flag(*object, "sample_from_anchor", true);
   c.mask_token_id = integer(d, "mask_token_id", 0, c.vocab_size - 1);
   c.selector_rank = integer(t, "dspark_markov_rank", 256, 256);
   c.selector_top_k =
