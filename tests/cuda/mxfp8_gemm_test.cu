@@ -245,6 +245,15 @@ void gemm(int rows, int n, int k, unsigned seed) {
   }
   const double relative = std::sqrt(error2 / std::max(reference2, 1e-30));
   require(relative < 4e-6, "MXFP8 FP64 relative RMS");
+  // Column tiling redistributes complete dot products; it must preserve
+  // every accumulator bit, including tail columns and padded row strides.
+  for (int tile : {8, 16, 32, 64}) {
+    launch_mxfp8_gemm_f32(da.ptr, das.ptr, dw.ptr, dws.ptr, out.ptr, rows, n, k, nullptr,
+                          stride, tile);
+    const auto tiled = out.read();
+    require(std::memcmp(tiled.data(), actual.data(), actual.size() * sizeof(float)) == 0,
+            "MXFP8 column tile changed an FP32 accumulator");
+  }
   // Exercise both tile geometries, repeated launches and arbitrary input
   // offsets. Every scalar uses the same k32 accumulation chain.
   for (int chunk : {1, 8, 17}) {

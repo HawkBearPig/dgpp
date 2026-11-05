@@ -21,10 +21,12 @@ void launch_minimax_swiglu_mxfp8_rows(const uint16_t* gate, const uint16_t* up, 
 // are row-major with k-contiguous payloads and k/32-contiguous E8M0 scales.
 // out[m,n] = A[m,k] * W[n,k]^T; out_stride is in output elements (0 -> n).
 // All supported row geometries retain the same ordered k32 MMA chain.
+// output_tile overrides the column tile for kernel diagnostics (8/16/32/64);
+// zero selects the production policy. Overrides use sixteen-row tiles.
 void launch_mxfp8_gemm_bf16(const uint8_t* a, const uint8_t* a_scales, const uint8_t* w,
                             const uint8_t* w_scales, uint16_t* out, int m, int n, int k,
-                            cudaStream_t, size_t out_stride = 0);
+                            cudaStream_t, size_t out_stride = 0, int output_tile = 0);
 void launch_mxfp8_gemm_f32(const uint8_t* a, const uint8_t* a_scales, const uint8_t* w,
                            const uint8_t* w_scales, float* out, int m, int n, int k, cudaStream_t,
-                           size_t out_stride = 0);
+                           size_t out_stride = 0, int output_tile = 0);
 }  // namespace dgpp

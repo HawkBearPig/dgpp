@@ -2770,6 +2770,9 @@ if(DGPP_BUILD_BENCHMARKS)
   dgpp_add_benchmark(minimax_index_bench
     SOURCES benchmarks/micro/minimax_index_bench.cpp
     LIBRARIES dgpp_kernels CUDA::cudart)
+  dgpp_add_benchmark(mxfp8_gemm_bench
+    SOURCES benchmarks/micro/mxfp8_gemm_bench.cu
+    LIBRARIES dgpp_kernels CUDA::cudart)
   dgpp_add_benchmark(minimax_head_bench
     SOURCES benchmarks/micro/minimax_head_bench.cpp
     LIBRARIES dgpp_models_minimax_layers CUDA::cudart Threads::Threads)

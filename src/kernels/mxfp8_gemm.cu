@@ -10,7 +10,15 @@
 
 namespace dgpp {
 namespace {
-constexpr int kThreads = 128, kBK = 64, kBN = 64, kStride = 80, kStages = 3;
+constexpr int kThreads = 128, kStages = 3;
+
+template <int BM, int BN>
+struct Tile {
+  static constexpr int warps = BM == 16 ? (BN < 16 ? 1 : BN / 16) : 4;
+  static constexpr int threads = warps * 32;
+  static constexpr int bk = BM == 16 && BN == 8 ? 512 : BM == 16 && BN == 16 ? 256 : 64;
+  static constexpr int stride = bk + 16;
+};
 
 template <bool SwiGLU>
 __global__ void mxfp8_quantize_kernel(const uint16_t* x, size_t stride, int k, uint8_t* codes,
@@ -95,31 +103,34 @@ __device__ __forceinline__ void mma(float (&c)[4], const uint32_t (&a)[4], uint3
         "h"(static_cast<uint16_t>(0)), "h"(static_cast<uint16_t>(0)));
 }
 
-template <typename Out, int BM>
-__global__ __launch_bounds__(kThreads) void mxfp8_gemm_kernel(
+template <typename Out, int BM, int BN>
+__global__ __launch_bounds__((Tile<BM, BN>::threads)) void mxfp8_gemm_kernel(
     const uint8_t* a, const uint8_t* a_scales, const uint8_t* w, const uint8_t* w_scales, Out* out,
     int m, int n, int k, size_t out_stride) {
   dgpp_pdl_wait();
-  constexpr int warp_m = BM == 16 ? 1 : 2, warp_n = 4 / warp_m;
-  constexpr int MT = BM / warp_m / 16, NT = kBN / warp_n / 8;
-  constexpr int slot_bytes = (BM + kBN) * kStride;
+  constexpr int threads = Tile<BM, BN>::threads;
+  constexpr int BK = Tile<BM, BN>::bk, stride = Tile<BM, BN>::stride;
+  constexpr int warp_m = BM == 16 ? 1 : 2, warp_n = Tile<BM, BN>::warps / warp_m;
+  constexpr int MT = BM / warp_m / 16, NT = BN / warp_n / 8;
+  constexpr int slot_bytes = (BM + BN) * stride;
   extern __shared__ __align__(16) uint8_t smem[];
   const int tid = threadIdx.x, warp = tid / 32, lane = tid % 32;
   const int m_tiles = (m + BM - 1) / BM;
-  const int m0 = (blockIdx.x % m_tiles) * BM, n0 = (blockIdx.x / m_tiles) * kBN;
+  const int m0 = (blockIdx.x % m_tiles) * BM, n0 = (blockIdx.x / m_tiles) * BN;
   const int row_base = (warp / warp_n) * (BM / warp_m);
-  const int col_base = (warp % warp_n) * (kBN / warp_n);
+  const int col_base = (warp % warp_n) * (BN / warp_n);
   const int group = lane / 4, part = lane % 4;
-  const int steps = k / kBK, scale_stride = k / 32;
+  const int steps = (k + BK - 1) / BK, scale_stride = k / 32;
   auto issue = [&](int step, int slot) {
 #pragma unroll
-    for (int chunk = tid; chunk < (BM + kBN) * 4; chunk += kThreads) {
-      const int row = chunk / 4, column = (chunk % 4) * 16;
+    for (int chunk = tid; chunk < (BM + BN) * (BK / 16); chunk += threads) {
+      const int row = chunk / (BK / 16), column = (chunk % (BK / 16)) * 16;
       const bool is_a = row < BM;
       const int global_row = is_a ? m0 + row : n0 + row - BM;
-      const bool valid = global_row < (is_a ? m : n);
+      const bool valid = global_row < (is_a ? m : n) && step * BK + column < k;
       const uint8_t* src = (is_a ? a : w) + static_cast<size_t>(valid ? global_row : 0) * k;
-      copy16(smem + slot * slot_bytes + row * kStride + column, src + step * kBK + column, valid);
+      copy16(smem + slot * slot_bytes + row * stride + column,
+               valid ? src + step * BK + column : src, valid);
     }
   };
   float accum[MT][NT][4] = {};
@@ -134,19 +145,21 @@ __global__ __launch_bounds__(kThreads) void mxfp8_gemm_kernel(
     if (step + kStages - 1 < steps) issue(step + kStages - 1, (step + kStages - 1) % kStages);
     commit();
     const uint8_t* sa = smem + (step % kStages) * slot_bytes;
-    const uint8_t* sw = sa + BM * kStride;
+    const uint8_t* sw = sa + BM * stride;
 #pragma unroll
-    for (int kk = 0; kk < kBK; kk += 32) {
+    for (int kk = 0; kk < BK; kk += 32) {
+      if constexpr (BK > 64)
+        if (step * BK + kk >= k) break;
       uint32_t af[MT][4], bf[NT][2], as[MT], bs[NT];
-      const int scale_column = (step * kBK + kk) / 32;
+      const int scale_column = (step * BK + kk) / 32;
 #pragma unroll
       for (int i = 0; i < MT; ++i) {
         const int row = row_base + i * 16 + group;
-        const uint8_t* p = sa + row * kStride + kk + part * 4;
+        const uint8_t* p = sa + row * stride + kk + part * 4;
         af[i][0] = *reinterpret_cast<const uint32_t*>(p);
-        af[i][1] = *reinterpret_cast<const uint32_t*>(p + 8 * kStride);
+        af[i][1] = *reinterpret_cast<const uint32_t*>(p + 8 * stride);
         af[i][2] = *reinterpret_cast<const uint32_t*>(p + 16);
-        af[i][3] = *reinterpret_cast<const uint32_t*>(p + 8 * kStride + 16);
+        af[i][3] = *reinterpret_cast<const uint32_t*>(p + 8 * stride + 16);
         const int scale_row = m0 + row + (lane & 1) * 8;
         as[i] = scale_row < m
                     ? a_scales[static_cast<size_t>(scale_row) * scale_stride + scale_column]
@@ -155,7 +168,7 @@ __global__ __launch_bounds__(kThreads) void mxfp8_gemm_kernel(
 #pragma unroll
       for (int j = 0; j < NT; ++j) {
         const int row = col_base + j * 8 + group;
-        const uint8_t* p = sw + row * kStride + kk + part * 4;
+        const uint8_t* p = sw + row * stride + kk + part * 4;
         bf[j][0] = *reinterpret_cast<const uint32_t*>(p);
         bf[j][1] = *reinterpret_cast<const uint32_t*>(p + 16);
         const int scale_row = n0 + row;
@@ -189,29 +202,42 @@ __global__ __launch_bounds__(kThreads) void mxfp8_gemm_kernel(
       }
 }
 
-template <typename Out, int BM>
+template <typename Out, int BM, int BN>
 void launch(const uint8_t* a, const uint8_t* as, const uint8_t* w, const uint8_t* ws, Out* out,
             int m, int n, int k, cudaStream_t stream, size_t stride) {
-  constexpr int smem = kStages * (BM + kBN) * kStride;
-  const unsigned blocks = static_cast<unsigned>(((m + BM - 1) / BM) * ((n + kBN - 1) / kBN));
-  mxfp8_gemm_kernel<Out, BM>
-      <<<blocks, kThreads, smem, stream>>>(a, as, w, ws, out, m, n, k, stride);
+  constexpr int smem = kStages * (BM + BN) * Tile<BM, BN>::stride;
+  const unsigned blocks = static_cast<unsigned>(((m + BM - 1) / BM) * ((n + BN - 1) / BN));
+  mxfp8_gemm_kernel<Out, BM, BN>
+      <<<blocks, Tile<BM, BN>::threads, smem, stream>>>(a, as, w, ws, out, m, n, k, stride);
   DGPP_CUDA_OK(cudaGetLastError());
 }
 
 template <typename Out>
 void dispatch(const uint8_t* a, const uint8_t* as, const uint8_t* w, const uint8_t* ws, Out* out,
-              int m, int n, int k, cudaStream_t stream, size_t stride) {
+              int m, int n, int k, cudaStream_t stream, size_t stride, int output_tile) {
   if (m <= 0 || n <= 0) return;
   if (k <= 0 || k % 64)
     throw std::invalid_argument("MXFP8 GEMM: k must be a positive multiple of 64");
   if (stride == 0) stride = static_cast<size_t>(n);
   if (stride < static_cast<size_t>(n))
     throw std::invalid_argument("MXFP8 GEMM: output stride is too small");
-  if (m <= 16)
-    launch<Out, 16>(a, as, w, ws, out, m, n, k, stream, stride);
+  if (output_tile != 0 && output_tile != 8 && output_tile != 16 && output_tile != 32 && output_tile != 64)
+    throw std::invalid_argument("MXFP8 GEMM: output tile must be 0, 8, 16, 32 or 64");
+  // Rotating-weight measurements at MiniMax's projection shapes: narrow
+  // column tiles spread short batches across more SMs, while longer K
+  // stages amortize their pipeline waits. Short-K shared-down and the
+  // 2048-output query projection favor the sixteen-column variant.
+  if (output_tile == 0 && m <= 16) output_tile = k < 1024 || n == 2048 ? 16 : 8;
+  if (output_tile == 8)
+    launch<Out, 16, 8>(a, as, w, ws, out, m, n, k, stream, stride);
+  else if (output_tile == 16)
+    launch<Out, 16, 16>(a, as, w, ws, out, m, n, k, stream, stride);
+  else if (output_tile == 32)
+    launch<Out, 16, 32>(a, as, w, ws, out, m, n, k, stream, stride);
+  else if (m <= 16 || output_tile == 64)
+    launch<Out, 16, 64>(a, as, w, ws, out, m, n, k, stream, stride);
   else
-    launch<Out, 64>(a, as, w, ws, out, m, n, k, stream, stride);
+    launch<Out, 64, 64>(a, as, w, ws, out, m, n, k, stream, stride);
 }
 }  // namespace
 
@@ -241,11 +267,12 @@ void launch_minimax_swiglu_mxfp8_rows(const uint16_t* gate, const uint16_t* up, 
 
 void launch_mxfp8_gemm_bf16(const uint8_t* a, const uint8_t* as, const uint8_t* w,
                             const uint8_t* ws, uint16_t* out, int m, int n, int k,
-                            cudaStream_t stream, size_t stride) {
-  dispatch(a, as, w, ws, out, m, n, k, stream, stride);
+                            cudaStream_t stream, size_t stride, int output_tile) {
+  dispatch(a, as, w, ws, out, m, n, k, stream, stride, output_tile);
 }
 void launch_mxfp8_gemm_f32(const uint8_t* a, const uint8_t* as, const uint8_t* w, const uint8_t* ws,
-                           float* out, int m, int n, int k, cudaStream_t stream, size_t stride) {
-  dispatch(a, as, w, ws, out, m, n, k, stream, stride);
+                           float* out, int m, int n, int k, cudaStream_t stream, size_t stride,
+                           int output_tile) {
+  dispatch(a, as, w, ws, out, m, n, k, stream, stride, output_tile);
 }
 }  // namespace dgpp

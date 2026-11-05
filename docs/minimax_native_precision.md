@@ -308,3 +308,21 @@ The existing mixed-request, selected-page, row-split and PDL graph tests
 pass; the packed conversion and attention kernels pass CUDA memcheck, and
 attention racecheck reports no hazards. Full-model native/cache smokes also
 pass. Serving speedups require separate measurement.
+
+## MXFP8 projection scheduling
+
+Short batches use eight- or sixteen-column tiles with K512 or K256 staging,
+respectively. Shared-down projections with short K and the 2,048-output
+query projection select sixteen columns; other measured target projections
+select eight. Larger batches retain the original 64-row/64-column tile.
+Staging changes do not change the ordered K32 products, and incomplete
+stages stop at the actual reduction width.
+
+`mxfp8_gemm_bench` measures seven real projection shapes at 1, 8 and 16
+rows. It rotates at least 64 MiB of weights, uses CUDA graphs and event
+timing, rotates the order of four candidates over five trials, and requires
+identical FP32 and BF16 outputs. Its measurements are isolated kernel
+diagnostics. The regression test additionally checks padded outputs, tail
+columns, short reductions, FP64 error bounds and 1/8/17-row splits across
+all four column tiles. Full-model graph smokes pass in all four precision
+combinations; CUDA memcheck and racecheck pass with no errors or hazards.
