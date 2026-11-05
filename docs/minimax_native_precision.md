@@ -348,6 +348,19 @@ and zero swap. This resolves the pilot's phase-formula mismatch. It remains
 an independent fixed-arithmetic reference comparison, not a full upstream
 serving execution or the broader native quality verdict.
 
+The completed phase-aware TP4 comparison covers all six raw/chat corpora:
+**28,329 scored positions**, zero argmax changes and zero changes above
+1 nat. The largest absolute mean-NLL difference is `1.49e-7` nat; the
+largest per-position difference is `1.20e-4` nat. The existing limits remain
+`0.02` nat mean NLL and a 1% rate above 1 nat. Both engine passes are exact,
+all ranks agree on hidden hashes, input protocols match, and every rank
+runs the recorded binary with zero swap. Arithmetic source is `1c625c87`;
+`4d2e4574` restores the standard generated-prefix policy without changing
+those kernels. Its seven targeted tests pass, including a mixed
+prefill/decode prefix restored before a new prompt extension and decode.
+These results establish native fidelity against the independent control;
+the serving campaign supplies task-quality and throughput evidence.
+
 ## Cache reconstruction and decode scheduling
 
 Cache consumers reconstruct four FP8 values together. E2M1 multiplied by a
