@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -371,7 +372,7 @@ inline void write_fixture(const QwenTextConfig& cfg, const std::string& dir,
   size_t off = 0;
   std::string index = "{\"weight_map\":{";
   const bool nested = cfg.experts_nvfp4_csf || cfg.mtp_experts_nvfp4_csf;
-  auto append = [&](const QwenExpectedTensor& e, const std::vector<uint8_t>& b) {
+  auto append = [&](const QwenExpectedTensor& e, std::span<const uint8_t> b) {
     std::string shape = "[";
     for (size_t i = 0; i < e.shape.size(); ++i) {
       if (i) shape += ",";
@@ -401,9 +402,9 @@ inline void write_fixture(const QwenTextConfig& cfg, const std::string& dir,
       side.name = e.name + ".nvfp4_csf_exceptions";
       side.dtype = dgpp::DType::U32;
       side.shape = {static_cast<int64_t>(exceptions.size())};
-      std::vector<uint8_t> bytes(exceptions.size() * 4);
-      if (!bytes.empty()) std::memcpy(bytes.data(), exceptions.data(), bytes.size());
-      append(side, bytes);
+      append(side, std::span<const uint8_t>(
+          reinterpret_cast<const uint8_t*>(exceptions.data()),
+          exceptions.size() * sizeof(uint32_t)));
     } else append(e, b);
   }
   header += "}";
