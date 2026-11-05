@@ -35,6 +35,7 @@
 #include <cuda_runtime.h>
 
 #include "core/arena.hpp"
+#include "engine/cache_planes.hpp"
 #include "models/dsa_geometry.hpp"
 
 namespace dgpp {
@@ -139,6 +140,11 @@ class DsaStatePool {
   const int32_t* request_table_row(int req) const;
   int64_t free_blocks() const { return int64_t(free_.size()); }
   int32_t block_refcount(int32_t block) const { return refcount_[size_t(block)]; }
+  // The NVMe cold tier's view (issue #26, engine/cache_planes.hpp): the
+  // block's identity (its id and the generation of its contents, bumped
+  // at every acquisition) and every plane a block spans.
+  uint64_t block_identity(int32_t block) const;
+  std::vector<CachePlane> planes() const;
 
   // Cold start: zero every cache, tail ring, and table row, and return all
   // blocks to the free list. One call at init or between test cases.
@@ -189,6 +195,7 @@ class DsaStatePool {
   std::vector<int32_t> held_;         // blocks per request
   std::vector<int32_t> free_;         // LIFO free list
   std::vector<int32_t> refcount_;     // per physical block (M7 sharing)
+  std::vector<uint64_t> generation_;  // per physical block: acquisitions so far
 };
 
 }  // namespace dgpp

@@ -152,6 +152,17 @@ int FlintModel::table_slots() const {
   return loader_.residency() == FlintResidency::Resident ? cfg_.num_moe_layers() : 0;
 }
 
+size_t FlintModel::kv_block_bytes_static(const FlintTextConfig& cfg, int tp_rank, int tp_world,
+                                         LatentFormat kv_format) {
+  const FlintHeadSharding head = tp_world > 1 ? FlintHeadSharding::VocabSharded : FlintHeadSharding::Full;
+  const FlintLocalGeometry geo = FlintLocalGeometry::from_config(cfg, tp_rank, tp_world, head);
+  const auto bytes = [&](int64_t tokens) {
+    const MimoKvPoolShape shape = pool_shape(cfg, geo.local_kv_heads, 1, tokens, kv_format);
+    return MimoKvPool::cache_bytes(shape) - PagedBlockTable::table_bytes(1, tokens / kBlockTokens);
+  };
+  return bytes(2 * kBlockTokens) - bytes(kBlockTokens);
+}
+
 FlintModel::MemoryPlan FlintModel::plan_memory(const FlintTextConfig& cfg, int max_tokens, int64_t max_cache_tokens,
                                                int tp_rank, int tp_world, FlintResidency residency,
                                                int max_requests, bool mtp, int decode_rows, LatentFormat kv_format,

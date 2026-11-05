@@ -1,0 +1,49 @@
+name: GB10 build
+
+# Cross-compiles dgpp-serve for Linux/aarch64 and sm_121a in the Docker
+# image from dev/Dockerfile.spark-cross. It proves the tree builds for the
+# target without a Spark. Execution and GPU validation stay on real hardware.
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "src/**"
+      - "apps/**"
+      - "cmake/**"
+      - "CMakeLists.txt"
+      - "CMakePresets.json"
+      - "dev/Dockerfile.spark-cross"
+      - "scripts/spark-cross"
+      - ".github/workflows/gb10-build.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: gb10-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cross-build:
+    name: Cross-compile dgpp-serve
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free disk space for the CUDA image
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune -af
+          df -h /
+      - name: Build the cross-compile image
+        run: scripts/spark-cross image
+      - name: Cross-compile
+        run: DGPP_BUILD_JOBS=4 scripts/spark-cross build
+      - name: Inspect the binary
+        run: |
+          file build-spark-cross/dgpp-serve
+          ls -l build-spark-cross/dgpp-serve
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dgpp-serve-aarch64-${{ github.sha }}
+          path: build-spark-cross/dgpp-serve
+          retention-days: 14

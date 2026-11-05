@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
 
 namespace dgpp::text {
@@ -76,6 +77,7 @@ struct Stmt {
   std::string target;             // Set target name
   std::string target_attr;        // Set target attribute ({% set ns.a = %})
   std::vector<std::string> names;  // For loop variables (1 or 2)
+  ExprPtr filter;                 // For: the trailing `if <cond>` inline filter
   std::shared_ptr<MacroDef> macro;      // Macro definition
   std::vector<StmtPtr> body;            // If-then / For / Macro body
   std::vector<std::pair<ExprPtr, std::vector<StmtPtr>>> elifs;
@@ -98,6 +100,43 @@ uint64_t fnv1a64(const char* data, size_t n) {
 [[noreturn]] void fail(size_t line, const std::string& what) {
   throw std::runtime_error("chat-template: line " + std::to_string(line) +
                            ": " + what);
+}
+
+// Structural safeguards, not an all-allocation budget or CPU deadline.
+constexpr size_t kSourceBytes = 1024 * 1024;
+constexpr size_t kExpressionTokens = 512;
+constexpr size_t kParseDepth = 64;
+constexpr size_t kRenderDepth = 256;
+constexpr size_t kRenderSteps = 10000000;
+constexpr size_t kStringBytes = 16 * 1024 * 1024;
+constexpr size_t kEmittedBytes = 64 * 1024 * 1024;
+constexpr size_t kRangeElements = 262144;
+
+struct DepthGuard {
+  size_t& depth;
+  DepthGuard(size_t& d, size_t limit, size_t line, const char* reason) : depth(d) {
+    if (depth == limit) fail(line, reason);
+    ++depth;
+  }
+  ~DepthGuard() { --depth; }
+  DepthGuard(const DepthGuard&) = delete;
+  DepthGuard& operator=(const DepthGuard&) = delete;
+};
+
+bool checked_add(int64_t a, int64_t b, int64_t* result) {
+  if ((b > 0 && a > std::numeric_limits<int64_t>::max() - b) ||
+      (b < 0 && a < std::numeric_limits<int64_t>::min() - b))
+    return false;
+  *result = a + b;
+  return true;
+}
+
+bool checked_subtract(int64_t a, int64_t b, int64_t* result) {
+  if ((b > 0 && a < std::numeric_limits<int64_t>::min() + b) ||
+      (b < 0 && a > std::numeric_limits<int64_t>::max() + b))
+    return false;
+  *result = a - b;
+  return true;
 }
 
 size_t utf8_length(std::string_view s) {
@@ -293,6 +332,9 @@ std::vector<ETok> lex_expr(std::string_view s, size_t line) {
       ++i;
       continue;
     }
+    // Bound left-associated ASTs before construction as well as recursive
+    // syntax: parse-depth guards alone do not bound AST destruction depth.
+    if (out.size() == kExpressionTokens) fail(line, "resource limit: expression tokens");
     if (c == '\'' || c == '"') {
       std::string str;
       ++i;
@@ -438,6 +480,7 @@ class ExprParser {
   }
 
   ExprPtr ternary() {
+    DepthGuard guard(depth_, kParseDepth, line_, "resource limit: parse depth");
     ExprPtr a = or_();
     if (accept_kw("if")) {
       ExprPtr cond = or_();
@@ -477,6 +520,7 @@ class ExprParser {
   }
 
   ExprPtr not_() {
+    DepthGuard guard(depth_, kParseDepth, line_, "resource limit: parse depth");
     if (accept_kw("not")) {
       ExprPtr e = make(Expr::Tag::Not);
       e->kids.push_back(not_());
@@ -502,8 +546,8 @@ class ExprParser {
     if (accept_kw("is")) {
       const bool inv = accept_kw("not");
       if (peek().t != ETok::T::Ident) fail(line_, "'is' needs a test name");
-      static const char* kTests[] = {"defined", "undefined", "none", "string",
-                                     "mapping", "sequence", "iterable", "true", "false"};
+      static const char* kTests[] = {"defined",  "undefined", "none", "string", "mapping",
+                                     "iterable", "sequence",  "true", "false",  "boolean"};
       ExprPtr e = make(Expr::Tag::Test);
       e->name = peek().s;
       e->inverted = inv;
@@ -749,6 +793,7 @@ class ExprParser {
   std::vector<ETok> toks_;
   size_t pos_ = 0;
   size_t line_;
+  size_t depth_ = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -763,6 +808,7 @@ class StmtParser {
   // end). The terminator's keyword is reported through `ended`.
   std::vector<StmtPtr> parse_statements(const char* const* terminators,
                                         size_t n_term, std::string* ended) {
+    DepthGuard guard(depth_, kParseDepth, last_line_, "resource limit: parse depth");
     std::vector<StmtPtr> out;
     for (;;) {
       if (pos_ >= toks_.size()) {
@@ -937,7 +983,47 @@ class StmtParser {
     }
     const size_t ib = rest.find_first_not_of(" \t", in + 4);
     if (ib == std::string::npos) fail(line, "for: missing iterable");
-    s->expr = parse_expr_str(rest.substr(ib), line);
+    const std::string es = rest.substr(ib);
+    try {
+      s->expr = parse_expr_str(es, line);  // the whole string, if it parses whole
+    } catch (const std::exception&) {
+      // e.g. a filter's `x if cond` with no else: a legal inline-if, tried below.
+    }
+    // The trailing inline filter, `for x in ys if cond` (the generic
+    // transformers template's render_extra_keys uses it). jinja consumes
+    // the iterable as one expression, so the split is the LAST top-level
+    // `if` whose two halves each parse: a `a if b else c` iterable leaves
+    // an `else` in the tail that no filter expression swallows, and the
+    // whole string stays the ternary it is.
+    std::vector<size_t> ifs;
+    int depth = 0;
+    char quote = 0;
+    for (size_t p = 0; p < es.size(); ++p) {
+      const char c = es[p];
+      if (quote) {
+        if (c == '\\') ++p;
+        else if (c == quote) quote = 0;
+        continue;
+      }
+      if (c == '\'' || c == '"') quote = c;
+      else if (c == '(' || c == '[' || c == '{') ++depth;
+      else if (c == ')' || c == ']' || c == '}') --depth;
+      else if (depth == 0 && c == 'i' && es.compare(p, 2, "if") == 0 &&
+               (p == 0 || es[p - 1] == ' ' || es[p - 1] == '\t') &&
+               (p + 2 >= es.size() || es[p + 2] == ' ' || es[p + 2] == '\t'))
+        ifs.push_back(p);
+    }
+    for (auto it = ifs.rbegin(); it != ifs.rend(); ++it) {
+      try {
+        ExprPtr f = parse_expr_str(es.substr(*it + 2), line);
+        ExprPtr e = parse_expr_str(es.substr(0, *it), line);
+        s->expr = std::move(e);
+        s->filter = std::move(f);
+        break;
+      } catch (const std::exception&) {
+      }
+    }
+    if (!s->expr) s->expr = parse_expr_str(es, line);  // the whole's own error message
     ++pos_;
     static const char* kForTerm[] = {"endfor"};
     std::string ended;
@@ -996,6 +1082,7 @@ class StmtParser {
   const std::vector<Tok>& toks_;
   size_t pos_ = 0;
   size_t last_line_ = 1;
+  size_t depth_ = 0;
 };
 
 }  // namespace
@@ -1249,9 +1336,9 @@ void Value::set_attr(std::string_view name, Value v) const {
 Value Value::get_item(const Value& index) const {
   if (kind_ == Kind::List && index.kind_ == Kind::Int) {
     const int64_t i = index.i_;
-    if (i >= 0 && i < static_cast<int64_t>(list_.size())) return list_[i];
-    if (i < 0 && -i <= static_cast<int64_t>(list_.size()))
-      return list_[list_.size() + i];
+    const int64_t len = static_cast<int64_t>(list_.size());
+    if (i >= 0 && i < len) return list_[i];
+    if (i < 0 && i >= -len) return list_[static_cast<size_t>(len + i)];
     return Value();
   }
   if (kind_ == Kind::Map && index.kind_ == Kind::String) {
@@ -1337,10 +1424,35 @@ struct Ctx {
 };
 
 struct Renderer {
+  // Owned by this renderer, outside Ctx: macro frame replacement never resets
+  // these counters. Each render() creates its own Renderer, including on error.
+  size_t depth_ = 0, steps_ = 0, emitted_ = 0;
+  void step() {
+    if (steps_ == kRenderSteps) fail(ctx_.line, "resource limit: render steps");
+    ++steps_;
+  }
+  void check_string(size_t size, size_t extra = 0) {
+    if (size > kStringBytes || extra > kStringBytes - size)
+      fail(ctx_.line, "resource limit: string bytes");
+  }
+  void append(std::string& out, std::string_view text) {
+    check_string(out.size(), text.size());
+    out.append(text);
+  }
+  void emit(std::string& out, std::string_view text) {
+    // Counts final output, block captures and macro buffers, including output
+    // later discarded or emitted again. Never refunded when a buffer is freed.
+    if (text.size() > kEmittedBytes - emitted_) fail(ctx_.line, "resource limit: emitted bytes");
+    emitted_ += text.size();
+    append(out, text);
+  }
+
   // A macro call renders its body into a fresh buffer with a stack of
   // just the parameter frame: macros close over the root frame only
   // (this template's macros reference nothing else across scopes).
   Value call_macro(const MacroDef& def, const std::vector<Value>& args) {
+    DepthGuard guard(depth_, kRenderDepth, ctx_.line, "resource limit: render depth");
+    step();
     if (args.size() > def.params.size())
       fail(ctx_.line, "macro '" + def.name + "': expected at most " +
                      std::to_string(def.params.size()) +
@@ -1470,15 +1582,37 @@ struct Renderer {
       const std::string& to = args[1].as_string();
       const std::string& s = v.as_string();
       std::string out;
+      if (from.empty()) {
+        // Python inserts at every codepoint boundary, including both ends.
+        if (to.empty()) return v;
+        const size_t boundaries = utf8_length(s) + 1;
+        if (to.size() > (out.max_size() - s.size()) / boundaries)
+          fail(ctx_.line, "replace result is too large");
+        check_string(s.size(), boundaries * to.size());
+        out.reserve(s.size() + boundaries * to.size());
+        out += to;
+        for (size_t i = 0; i < s.size();) {
+          const unsigned char c = static_cast<unsigned char>(s[i]);
+          const size_t n = std::min<size_t>(c < 0x80   ? 1
+                                            : c < 0xE0 ? 2
+                                            : c < 0xF0 ? 3
+                                                       : 4,
+                                            s.size() - i);
+          out.append(s, i, n);
+          out += to;
+          i += n;
+        }
+        return Value::string_value(std::move(out));
+      }
       size_t start = 0;
       for (;;) {
         const size_t hit = s.find(from, start);
         if (hit == std::string::npos) break;
-        out.append(s, start, hit - start);
-        out += to;
+        append(out, std::string_view(s).substr(start, hit - start));
+        append(out, to);
         start = hit + from.size();
       }
-      out.append(s, start, s.size() - start);
+      append(out, std::string_view(s).substr(start));
       return Value::string_value(std::move(out));
     }
     if (name == "length") {
@@ -1499,8 +1633,13 @@ struct Renderer {
       const size_t e = x.find_last_not_of(ws);
       return Value::string_value(x.substr(b, e - b + 1));
     }
-    if (name == "default") {  // undefined -> the default (boolean=false form)
-      if (args.size() != 1) fail(ctx_.line, "default: takes one argument");
+    if (name == "default") {  // undefined -> the default; the two-value
+                              // form (fallback, true) adds the truthiness
+                              // test — falsy wraps take the fallback too
+                              // (Dory's `content | default('', true)`).
+      if (args.empty() || args.size() > 2)
+        fail(ctx_.line, "default: takes one or two arguments");
+      if (args.size() == 2 && args[1].truthy() && !v.truthy()) return args[0];
       return v.is_defined() ? v : args[0];
     }
     if (name == "string") {  // str(x); strings stay themselves
@@ -1524,6 +1663,8 @@ struct Renderer {
   }
 
   Value eval(const Expr& e) {
+    DepthGuard guard(depth_, kRenderDepth, ctx_.line, "resource limit: render depth");
+    step();
     switch (e.tag) {
       case Expr::Tag::Const:
         return e.value;
@@ -1573,10 +1714,11 @@ struct Renderer {
         const int64_t start = norm(e.kids[1], 0, len - 1);
         const int64_t stop = norm(e.kids[2], len, -1);
         std::vector<Value> out;
-        if (step > 0)
-          for (int64_t i = start; i < stop; i += step) out.push_back(items[static_cast<size_t>(i)]);
-        else
-          for (int64_t i = start; i > stop; i += step) out.push_back(items[static_cast<size_t>(i)]);
+        for (int64_t i = start; step > 0 ? i < stop : i > stop;) {
+          out.push_back(items[static_cast<size_t>(i)]);
+          // An unrepresentable next index is past any int64 stop bound.
+          if (!checked_add(i, step, &i)) break;
+        }
         if (is_list) return Value::list_value(std::move(out));
         std::string joined;
         for (const Value& c : out) joined += c.as_string();
@@ -1606,10 +1748,20 @@ struct Renderer {
           const int64_t step = args.size() == 3 ? args[2].as_int(0) : 1;
           if (step == 0) fail(ctx_.line, "range: step must not be zero");
           std::vector<Value> out;
-          if (step > 0)
-            for (int64_t k = a; k < b; k += step) out.push_back(Value::integer(k));
-          else
-            for (int64_t k = a; k > b; k += step) out.push_back(Value::integer(k));
+          const bool nonempty = step > 0 ? a < b : a > b;
+          // Unsigned arithmetic covers the full int64 distance and INT64_MIN
+          // stride. Reject before reserve or materializing the first element.
+          const uint64_t distance =
+              step > 0 ? uint64_t(b) - uint64_t(a) : uint64_t(a) - uint64_t(b);
+          const uint64_t stride = step > 0 ? uint64_t(step) : uint64_t(0) - uint64_t(step);
+          const uint64_t count = nonempty ? 1 + (distance - 1) / stride : 0;
+          if (count > kRangeElements) fail(ctx_.line, "resource limit: range elements");
+          out.reserve(static_cast<size_t>(count));
+          for (int64_t k = a; step > 0 ? k < b : k > b;) {
+            out.push_back(Value::integer(k));
+            // Overflow means the next value has passed the finite stop bound.
+            if (!checked_add(k, step, &k)) break;
+          }
           return Value::list_value(std::move(out));
         }
         if (callee.tag == Expr::Tag::Name && callee.name == "namespace") {
@@ -1656,13 +1808,16 @@ struct Renderer {
         const Value a = eval(*e.kids[0]);
         const Value b = eval(*e.kids[1]);
         if (e.name == "~") {
+          if (a.kind() == Value::Kind::String) check_string(a.as_string().size());
+          if (b.kind() == Value::Kind::String) check_string(b.as_string().size());
           std::string out = a.to_output_string();
-          out += b.to_output_string();
+          append(out, b.to_output_string());
           return Value::string_value(std::move(out));
         }
         // '+' with two strings concatenates (Python semantics); otherwise
         // both operands must be numbers.
         if (a.kind() == Value::Kind::String && b.kind() == Value::Kind::String) {
+          check_string(a.as_string().size(), b.as_string().size());
           std::string out = a.as_string();
           out += b.as_string();
           return Value::string_value(std::move(out));
@@ -1675,15 +1830,23 @@ struct Renderer {
           fail(ctx_.line, std::string("'") + e.name +
                          "' needs two numbers (or, for '+', two strings)");
         if (e.name == "+") {
-          if (a.kind() == Value::Kind::Int && b.kind() == Value::Kind::Int)
-            return Value::integer(a.as_int(0) + b.as_int(0));
+          if (a.kind() == Value::Kind::Int && b.kind() == Value::Kind::Int) {
+            int64_t result;
+            if (!checked_add(a.as_int(), b.as_int(), &result))
+              fail(ctx_.line, "integer addition overflow");
+            return Value::integer(result);
+          }
           const double x = a.as_double(0);
           const double y = b.as_double(0);
           return Value::number(x + y);
         }
         if (e.name == "-") {
-          if (a.kind() == Value::Kind::Int && b.kind() == Value::Kind::Int)
-            return Value::integer(a.as_int(0) - b.as_int(0));
+          if (a.kind() == Value::Kind::Int && b.kind() == Value::Kind::Int) {
+            int64_t result;
+            if (!checked_subtract(a.as_int(), b.as_int(), &result))
+              fail(ctx_.line, "integer subtraction overflow");
+            return Value::integer(result);
+          }
           const double x = a.as_double(0);
           const double y = b.as_double(0);
           return Value::number(x - y);
@@ -1744,10 +1907,12 @@ struct Renderer {
           r = v.kind() == Value::Kind::Null;
         else if (e.name == "string")
           r = v.kind() == Value::Kind::String;
+        else if (e.name == "boolean")
+          r = v.kind() == Value::Kind::Bool;
         else if (e.name == "mapping")
           r = v.kind() == Value::Kind::Map;  // namespaces are not mappings
         else if (e.name == "sequence")
-          r = v.kind() == Value::Kind::String || v.kind() == Value::Kind::List;  // Jinja: str counts
+          r = v.kind() == Value::Kind::String || v.kind() == Value::Kind::List;  // Python truth: a str is a sequence, a map is not
         else  // iterable (strings, lists and maps — Python truth)
           r = v.kind() == Value::Kind::String || v.kind() == Value::Kind::List ||
               v.kind() == Value::Kind::Map;
@@ -1779,20 +1944,26 @@ struct Renderer {
   }
 
   Flow exec(const std::vector<StmtPtr>& stmts, std::string* out) {
+    DepthGuard guard(depth_, kRenderDepth, ctx_.line, "resource limit: render depth");
     for (const auto& s : stmts) {
       ctx_.line = s->line;
+      step();
       switch (s->tag) {
         case Stmt::Tag::Text:
-          if (!s->text.empty()) *out += s->text;
+          emit(*out, s->text);
           break;
         case Stmt::Tag::Output:
-          *out += eval(*s->expr).to_output_string();
+          // Check a string before to_output_string() would copy it.
+          if (Value value = eval(*s->expr); value.kind() == Value::Kind::String)
+            emit(*out, value.as_string());
+          else
+            emit(*out, value.to_output_string());
           break;
         case Stmt::Tag::Set:
           if (!s->expr) {  // the block form: the body's render is the value
             std::string captured;
             exec(s->body, &captured);
-            ctx_.set(s->target, Value::string_value(captured));
+            ctx_.set(s->target, Value::string_value(std::move(captured)));
           } else if (s->target_attr.empty()) {
             ctx_.set(s->target, eval(*s->expr));
           } else {
@@ -1828,20 +1999,57 @@ struct Renderer {
         }
         case Stmt::Tag::For: {
           const Value iter = eval(*s->expr);
-          if (iter.kind() != Value::Kind::List)
+          // Items: a list's elements or a map's KEYS (jinja iterates a
+          // mapping by keys — the generic template's render_extra_keys).
+          // The inline `if` filter drops items BEFORE the walk, so the loop
+          // metadata and the body see the filtered sequence (the generic
+          // template reads no loop.* inside a filtered loop).
+          std::vector<const Value*> items;
+          std::vector<Value> keys;  // storage for map-key iteration (reserved first)
+          if (iter.kind() == Value::Kind::List) {
+            for (const Value& it : iter.as_list()) items.push_back(&it);
+          } else if (iter.kind() == Value::Kind::Map) {
+            keys.reserve(iter.as_members()->size());
+            for (const auto& m : *iter.as_members()) {
+              keys.push_back(Value::string_value(m.first));
+              items.push_back(&keys.back());
+            }
+          } else {
             fail(s->line, "for: cannot iterate a non-list");
+          }
+          if (s->filter) {
+            std::vector<const Value*> kept;
+            for (const Value* it : items) {
+              ctx_.stack.emplace_back();
+              Frame& fframe = *ctx_.stack.rbegin();
+              const bool ftuple = s->names.size() == 2;
+              if (ftuple) {
+                if (it->kind() != Value::Kind::List || it->as_list().size() != 2)
+                  fail(s->line, "for: tuple target needs 2-element items");
+                fframe[s->names[0]] = it->as_list()[0];
+                fframe[s->names[1]] = it->as_list()[1];
+              } else {
+                fframe[s->names[0]] = *it;
+              }
+              const bool keep = eval(*s->filter).truthy();
+              ctx_.stack.pop_back();
+              if (keep) kept.push_back(it);
+            }
+            items.swap(kept);
+          }
           const bool tuple = s->names.size() == 2;
-          for (size_t idx = 0; idx < iter.as_list().size(); ++idx) {
+          for (size_t idx = 0; idx < items.size(); ++idx) {
+            step();
             ctx_.stack.emplace_back();
             Frame& frame = *ctx_.stack.rbegin();
             if (tuple) {
-              const Value& item = iter.as_list()[idx];
+              const Value& item = *items[idx];
               if (item.kind() != Value::Kind::List || item.as_list().size() != 2)
                 fail(s->line, "for: tuple target needs 2-element items");
               frame[s->names[0]] = item.as_list()[0];
               frame[s->names[1]] = item.as_list()[1];
             } else {
-              frame[s->names[0]] = iter.as_list()[idx];
+              frame[s->names[0]] = *items[idx];
             }
             // Fresh loop metadata each iteration (index0/index/first/
             // last/length).
@@ -1852,16 +2060,13 @@ struct Renderer {
             lm.emplace_back("first", Value::boolean(idx == 0));
             lm.emplace_back("last", Value::boolean(
                                         static_cast<int64_t>(idx) + 1 ==
-                                        static_cast<int64_t>(
-                                            iter.as_list().size())));
+                                        static_cast<int64_t>(items.size())));
             lm.emplace_back("length",
-                            Value::integer(
-                                static_cast<int64_t>(iter.as_list().size())));
+                            Value::integer(static_cast<int64_t>(items.size())));
             // previtem / nextitem: undefined at the ends.
-            lm.emplace_back("previtem", idx > 0 ? iter.as_list()[idx - 1] : Value());
-            lm.emplace_back("nextitem", idx + 1 < iter.as_list().size()
-                                            ? iter.as_list()[idx + 1]
-                                            : Value());
+            lm.emplace_back("previtem", idx > 0 ? *items[idx - 1] : Value());
+            lm.emplace_back("nextitem",
+                            idx + 1 < items.size() ? *items[idx + 1] : Value());
             frame["loop"] = Value::namespace_value(std::move(lm));
             const Flow f = exec(s->body, out);
             ctx_.stack.pop_back();
@@ -1942,6 +2147,7 @@ void collect_global_reads(const std::vector<StmtPtr>& body,
         collect_name_reads(*s->expr, bound, out);  // the iterable is the parent's
         std::vector<std::string> inner = bound;
         for (const std::string& n : s->names) inner.push_back(n);
+        if (s->filter) collect_name_reads(*s->filter, inner, out);  // the loop's own
         collect_global_reads(s->body, std::move(inner), out);
         break;
       }
@@ -1981,6 +2187,7 @@ ChatTemplate::ChatTemplate(ChatTemplate&&) noexcept = default;
 ChatTemplate& ChatTemplate::operator=(ChatTemplate&&) noexcept = default;
 
 ChatTemplate ChatTemplate::compile(std::string source) {
+  if (source.size() > kSourceBytes) fail(1, "resource limit: source bytes");
   if (source.empty())
     throw std::runtime_error("chat-template: empty source");
   const std::vector<Tok> toks = lex(source);
@@ -2008,7 +2215,13 @@ ChatTemplate ChatTemplate::load(const std::string& chat_template_path) {
   std::string data;
   char buf[65536];
   size_t n;
-  while ((n = std::fread(buf, 1, sizeof(buf), f)) > 0) data.append(buf, n);
+  while ((n = std::fread(buf, 1, sizeof(buf), f)) > 0) {
+    if (n > kSourceBytes - data.size()) {
+      std::fclose(f);
+      fail(1, "resource limit: source bytes");
+    }
+    data.append(buf, n);
+  }
   std::fclose(f);
   return compile(std::move(data));
 }

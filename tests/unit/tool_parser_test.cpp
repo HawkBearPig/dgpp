@@ -808,6 +808,18 @@ DGPP_TEST(tool_parser_preservesNumbersAcrossSchemaBoundaries) {
   }
 }
 
+DGPP_TEST(tool_parser_malformedNumbersRemainText) {
+  for (const std::string value : {"1e+", "01", "1.2.3"}) {
+    const Run glm = drive(ids_of("</think><tool_call>flat_tool<arg_key>x</arg_key><arg_value>" +
+                                 value + "</arg_value></tool_call>"));
+    const Run qwen = drive_qwen("</think><tool_call>\n<function=flat_tool>\n<parameter=x>\n" +
+                                value + "\n</parameter>\n</function>\n</tool_call>");
+    for (const Run& run : {glm, qwen})
+      require(run.calls.size() == 1 && run.calls[0].arguments == "{\"x\": \"" + value + "\"}",
+              "malformed numeric text is not silently changed to a numeric prefix");
+  }
+}
+
 DGPP_TEST(tool_parser_nestedJsonAndNoArgsAndUnicode) {
   const Run run = drive(ids_of(
       "</think>Calling.<tool_call>get_weather"

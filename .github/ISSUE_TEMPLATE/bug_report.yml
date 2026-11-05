@@ -1,0 +1,48 @@
+name: Bug report
+description: Something served, built or measured wrongly
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected and what you saw. Paste the request that reproduces it when there is one.
+    validations:
+      required: true
+  - type: input
+    id: template
+    attributes:
+      label: Deployment template
+      description: The deploy/*.json you started from and any changed keys or launcher flags.
+      placeholder: cluster_qwen3.8-27b_nvfp4_w1.example.json, engine.kv_capacity 524288
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Server version
+      description: The output of `dgpp-serve --version`, or the source revision and whether the tree was clean.
+      placeholder: 0.1.0+g1c6ed8b770bc
+    validations:
+      required: true
+  - type: input
+    id: world
+    attributes:
+      label: Nodes and hardware
+      description: World size, DGX OS version, kernel and driver.
+      placeholder: 4 Sparks, DGX OS 7.x, kernel 6.17.0-1026-nvidia, driver 580.x
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: The relevant rank logs from `dgpp-cluster down`, the startup memory plan when it refused, or the operation-stream mismatch report. Trim secrets and addresses.
+      render: text
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: Every rank ran with zero swap and no other world or build was active on the fabric.
+        - label: The same request reproduces the problem on a fresh boot.

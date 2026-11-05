@@ -1,5 +1,7 @@
 #include "sched/scheduler.hpp"
 
+#include "engine/pool_exhausted.hpp"
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -26,6 +28,30 @@ std::vector<std::vector<int32_t>> SchedulerEngine::step_batch(
 }
 
 namespace {
+
+// Fit calculations borrow full blocks from cached prefixes before the
+// selected requests begin. Keep those entries alive through every begin:
+// both a later fit and an earlier begin's snapshot can otherwise evict one.
+class PlannedPrefixes {
+ public:
+  explicit PlannedPrefixes(PrefixCache& cache) : cache_(cache) {}
+  ~PlannedPrefixes() { release(); }
+  PlannedPrefixes(const PlannedPrefixes&) = delete;
+  PlannedPrefixes& operator=(const PlannedPrefixes&) = delete;
+  void retain(int entry) {
+    if (entry < 0) return;
+    entries_.push_back(entry);
+    cache_.retain(entry);
+  }
+  void release() {
+    for (const int entry : entries_) cache_.detach(entry);
+    entries_.clear();
+  }
+
+ private:
+  PrefixCache& cache_;
+  std::vector<int> entries_;
+};
 
 // A request's lifetime token footprint: the prompt plus every token it
 // can generate. The last generated token is never fed back, so a one-row
@@ -76,6 +102,7 @@ Scheduler::Scheduler(SchedulerEngine* engine,
   PrefixCache::Config pc;
   pc.slots = slots;
   pc.align = std::max<int64_t>(1, prefix_info_.align);
+  pc.pin_max_pct = policy_.prefix_pin_max_pct;
   pc.chunk_tokens = std::max<int64_t>(1, prefix_info_.chunk_tokens);
   cache_ = PrefixCache(pc);
   if (policy_.window_tokens < 1)
@@ -118,6 +145,44 @@ Scheduler::Scheduler(SchedulerEngine* engine,
     throw std::invalid_argument(
         "Scheduler: engine decode batch capacity must be in [1, " +
         std::to_string(slots_.size()) + "]");
+  // The NVMe cold tier (issue #26): the engine's slab geometry becomes the
+  // disk index's; without the memory cache there is nothing to spill.
+  disk_info_ = engine_->disk_info();
+  if (disk_info_.enabled && !cache_.enabled()) {
+    DGPP_LOG_WARN("sched: the NVMe cache is configured but the prefix cache is off — the cold tier stays off");
+    disk_info_ = SchedulerEngine::DiskInfo{};
+  }
+  if (disk_info_.enabled) {
+    if (disk_info_.pages <= 0 || disk_info_.page_bytes == 0 || disk_info_.blob_pages <= 0)
+      throw std::invalid_argument("Scheduler: the engine's cold tier reports an empty slab");
+    if (disk_info_.max_ops < 1) throw std::invalid_argument("Scheduler: the cold tier's op bound must be >= 1");
+    DiskCache::Config dc;
+    dc.pages = disk_info_.pages;
+    dc.page_bytes = disk_info_.page_bytes;
+    dc.blob_pages = disk_info_.blob_pages;
+    dc.block_tokens = std::max<int64_t>(0, prefix_info_.block_tokens);
+    dc.min_tokens = std::max<int64_t>(0, disk_info_.min_tokens);
+    dc.pin_max_pct = policy_.prefix_pin_max_pct;
+    disk_ = DiskCache(dc);
+    // A previous run's index the world adopted: its entries, with their
+    // ids read back from the slab, become resident before the first tick
+    // — the same bytes on every rank, so the same index.
+    if (disk_info_.persist) {
+      const std::vector<uint8_t> adopted = engine_->disk_adopted_index();
+      if (!adopted.empty()) {
+        const std::vector<uint64_t> digests = engine_->disk_adopted_digests();
+        const DiskCache::Adopted a = disk_.restore(
+            adopted, [this](int64_t page, int64_t count, void* dst) { return engine_->disk_read_pages(page, count, dst); },
+            &digests);
+        if (!a.error.empty())
+          DGPP_LOG_WARN("sched: NVMe cache: the previous run's index was not adopted: {}", a.error);
+        else
+          DGPP_LOG_INFO("sched: NVMe cache: {} entries adopted from the previous run ({} dropped as unreadable)",
+                        a.entries, a.dropped);
+        if (a.dropped > 0 || !a.error.empty()) persist_disk_index();  // the file says what memory holds
+      }
+    }
+  }
 }
 
 bool Scheduler::is_eos(int32_t token) const {
@@ -254,12 +319,26 @@ Scheduler::PrefixPlan Scheduler::plan_prefix(const Request& r) const {
       break;
     }
   }
+  // The cold tier (issue #26): a disk entry deeper than what memory offers
+  // is worth a restore first; one at the same cut is the memory entry's
+  // own copy (or a duplicate the memory index would refuse).
+  if (disk_.enabled()) {
+    const int d = disk_.lookup(r.spec.prompt, r.cuts, r.cut_hashes, r.cache_images);
+    if (d >= 0 && disk_.entry(d).position > plan.attach_position) plan.disk_entry = d;
+  }
   return plan;
 }
 
 std::vector<int64_t> Scheduler::cut_boundaries(const Request& r) const {
   std::vector<int64_t> out;
-  if (!cache_on(r)) return out;
+  // The deployment's cuts, not the request's: a prompt that opts out of the
+  // cache (prefix_cache: false, or a pool too short for its blocks) walks
+  // the chunks a cached prompt walks, so its greedy transcript is the cached
+  // prompt's. The NVMe fuzz of 2026-10-27 caught the request-level gate: an
+  // opted-out repeat diverged mid-answer from its cold cache-on first answer
+  // because its last chunk ran through the prompt's final boundary.
+  if (!cache_.enabled()) return out;
+  if (!r.spec.images.empty() && !engine_->supports_image_prefix_cache()) return out;
   const int64_t align = cache_.config().align;
   for (const int64_t b : r.spec.boundaries) {
     const int64_t image = align > 0 ? (b / align) * align : b;
@@ -284,7 +363,7 @@ bool Scheduler::ensure_free_blocks(int64_t need, const std::string& id) {
     const int64_t free =
         engine_->pool_blocks_total() - engine_->pool_blocks_in_use();
     if (free >= need) return true;
-    const int slot = cache_.evict_lru();
+    const int slot = evict_memory_entry();
     if (slot < 0) return false;
     free_arena_slot(slot);
     emit_prefix(id, "evict", 0, slot);
@@ -309,16 +388,40 @@ int64_t Scheduler::new_blocks(const Request& r, const PrefixPlan& plan) const {
   return std::max<int64_t>(blocks, 0);
 }
 
+bool Scheduler::evict_to_fit(const Request& r, int64_t& free_blocks) {
+  for (;;) {
+    const PrefixPlan plan = plan_prefix(r);
+    if (new_blocks(r, plan) <= free_blocks) return true;
+    if (plan.attach_entry >= 0) cache_.touch(plan.attach_entry, ticks_);
+    const int slot = evict_memory_entry();
+    if (slot < 0) return false;
+    const int64_t in_use_before = engine_->pool_blocks_in_use();
+    free_arena_slot(slot);
+    emit_prefix(r.spec.id, "evict", 0, slot);
+    // Add back only the blocks THIS eviction freed. free_blocks carries the
+    // caller's running projection — the needs of the begins already collected
+    // into this walk — which a raw `total - in_use` recompute would discard.
+    // Losing it lets a later begin over-fit a pool an earlier begin in the
+    // same walk will fill, and the engine's session_reserve_blocks then
+    // fails (the 2026-10-20 d8192 c2 "cannot cover 10384 tokens" crash).
+    free_blocks += in_use_before - engine_->pool_blocks_in_use();
+  }
+}
+
 int Scheduler::next_admissible() {
-  int64_t free_blocks =
-      engine_->pool_blocks_total() - engine_->pool_blocks_in_use();
   for (size_t i = 0; i < requests_.size(); ++i) {
     if (requests_[i].state != State::kQueued) continue;
+    // A request waiting on the cold tier's restore of its deepest state
+    // (issue #26) stands aside until the op's commit lands, as does one whose
+    // restore an op in flight blocks (start_restores decided at the tick's top).
+    if (requests_[i].restore_op != 0 || requests_[i].restore_blocked) continue;
     // No head-of-line blocking: the OLDEST request that FITS admits. A
     // large deferred request must not dam the queue behind it — the
     // starvation it could suffer under an unbounded small-request stream
     // is a Stage 4 bounded-queue problem, not a policy bug.
     if (free_slot() < 0) return -1;
+    int64_t free_blocks =
+        engine_->pool_blocks_total() - engine_->pool_blocks_in_use();
     // A pool too small for the request WITH the cache's blocks (the cut
     // entry's copy, the rolling headroom) but large enough without them
     // admits the request cache-less rather than never: the same decision on
@@ -337,26 +440,10 @@ int Scheduler::next_admissible() {
       return static_cast<int>(i);
     // The prefix cache's entries pin blocks; the LRU unattached ones give
     // way to a request that needs them (never a block a live request
-    // holds). The planned entry is touched first so it is evicted last —
-    // and the plan is recomputed after every eviction, because the victim
-    // may have been that entry.
-    if (cache_.enabled()) {
-      bool evicted = false;
-      for (;;) {
-        const PrefixPlan plan = plan_prefix(requests_[i]);
-        if (new_blocks(requests_[i], plan) <= free_blocks) break;
-        if (plan.attach_entry >= 0) cache_.touch(plan.attach_entry, ticks_);
-        const int slot = cache_.evict_lru();
-        if (slot < 0) break;
-        free_arena_slot(slot);
-        emit_prefix(requests_[i].spec.id, "evict", 0, slot);
-        evicted = true;
-        free_blocks = engine_->pool_blocks_total() - engine_->pool_blocks_in_use();
-      }
-      if (evicted &&
-          new_blocks(requests_[i], plan_prefix(requests_[i])) <= free_blocks)
-        return static_cast<int>(i);
-    }
+    // holds). Only reached when the request does not fit yet, so a fit
+    // from evict_to_fit implies at least one eviction happened.
+    if (cache_.enabled() && evict_to_fit(requests_[i], free_blocks))
+      return static_cast<int>(i);
   }
   return -1;
 }
@@ -372,7 +459,7 @@ void Scheduler::validate_new(const SchedulerRequest& request) const {
   if (request.prompt.empty())
     throw std::invalid_argument("Scheduler: request '" + request.id +
                                "' has an empty prompt");
-  validate_image_inputs(request.images, request.prompt.size());
+  validate_image_inputs(request.images, request.prompt.size(), engine_->supports_video());
   if (!request.images.empty() && !engine_->supports_images())
     throw std::invalid_argument("Scheduler: this engine does not support image inputs");
   if (request.max_steps < 1)
@@ -526,12 +613,13 @@ std::vector<int> Scheduler::admissible_group(int first, int64_t budget) {
       : engine_->prefill_group_total_limit();
   if (span_limit <= 0 || total_limit <= 0) return group;
   const auto groupable = [&](const Request& r) {
-    if (r.state != State::kQueued || !r.spec.images.empty()) return false;
+    if (r.state != State::kQueued || !r.spec.images.empty() || r.restore_op != 0 || r.restore_blocked)
+      return false;
     const int64_t P = static_cast<int64_t>(r.spec.prompt.size());
     if (P <= 0 || P > span_limit) return false;
     if (!cache_on(r)) return true;
     const PrefixPlan plan = plan_prefix(r);
-    return plan.attach_entry < 0 && plan.snap_position <= 0;
+    return plan.attach_entry < 0 && plan.snap_position <= 0 && plan.disk_entry < 0;
   };
   if (!groupable(requests_[static_cast<size_t>(first)])) return group;
   group.push_back(first);
@@ -626,6 +714,7 @@ void Scheduler::admit(int arrival) {
       // 2026-09-05: "PrefixArena: slot 25 is empty" — the victim's slot came
       // back as the snapshot slot, and the prefill attached to nothing).
       cache_.attach(plan.attach_entry, ticks_);
+      if (const int d = cache_.entry(plan.attach_entry).disk; d >= 0) disk_.touch(d, ticks_);
       pp.attach_slot = cache_.entry(plan.attach_entry).slot;
       pp.attach_position = plan.attach_position;
     }
@@ -701,6 +790,7 @@ void Scheduler::begin_prefill(int arrival, int64_t budget) {
       const PrefixPlan plan = plan_prefix(r);
       if (plan.attach_entry >= 0) {
         cache_.attach(plan.attach_entry, ticks_);
+        if (const int d = cache_.entry(plan.attach_entry).disk; d >= 0) disk_.touch(d, ticks_);
         r.attach_entry = plan.attach_entry;
         r.attach_position = plan.attach_position;
         pp.attach_slot = cache_.entry(plan.attach_entry).slot;
@@ -965,13 +1055,14 @@ void Scheduler::finish_prefill_snapshot(Request& r, int slot, int64_t position, 
   const int64_t next_token =
       prefix_info_.prefill_lookahead ? r.spec.prompt.at(static_cast<size_t>(position)) : -1;
   const int entry =
-      cache_.insert(r.spec.prompt.data(), position, slot, ticks_, r.cache_images, next_token);
+      cache_.insert(r.spec.prompt.data(), position, slot, ticks_, r.cache_images, next_token, r.spec.cache_key);
   if (entry < 0)
     free_arena_slot(slot);
   else {
     ++cache_.stats().snapshots;
     if (head) ++cache_.stats().head_snapshots;
     emit_prefix(r.spec.id, "snapshot", position, slot);
+    want_spill(entry, r.spec.id);
   }
 }
 
@@ -1267,25 +1358,34 @@ void Scheduler::retire(int arrival, Result::Status status,
   }
   // The prefix cache (M7): the rolling snapshot — the state at the aligned
   // image of the last token's position, where the next turn's cold prefill
-  // cuts — becomes an entry when the answer completed (EOS or the cap); a
-  // cancelled or shed request's partial answer is not worth a slot.
+  // cuts — becomes an entry when the answer completed (EOS or the cap).
+  // Cancellation can retain an existing snapshot within the committed
+  // response prefix; it must not publish speculative state beyond it.
   if (r.rolling_slot >= 0) {
     const int slot = r.rolling_slot;
     const int64_t position = r.rolling_position;
     r.rolling_slot = -1;
     r.rolling_position = -1;
     bool kept = false;
-    if (reason == Result::Reason::kEos || reason == Result::Reason::kSteps) {
+    const bool cancelled_snapshot_is_committed =
+        reason == Result::Reason::kCancelled && position > 0 &&
+        position <= static_cast<int64_t>(r.spec.prompt.size()) + r.steps_done - 1;
+    if (reason == Result::Reason::kEos || reason == Result::Reason::kSteps ||
+        cancelled_snapshot_is_committed) {
       std::vector<int64_t> ids(r.spec.prompt.begin(), r.spec.prompt.end());
       const int64_t gen = position - static_cast<int64_t>(r.spec.prompt.size());
       if (gen > 0)
         ids.insert(ids.end(), r.generated.begin(), r.generated.begin() + gen);
       if (static_cast<int64_t>(ids.size()) == position) {
-        const int e = cache_.insert(ids.data(), position, slot, ticks_, r.cache_images);
+        const int e = cache_.insert(ids.data(), position, slot, ticks_, r.cache_images, -1, r.spec.cache_key);
         if (e >= 0) {
           kept = true;
           ++cache_.stats().close_entries;
           emit_prefix(r.spec.id, "close", position, slot);
+          // A cancelled answer stays reclaimable: starting a spill pins its
+          // blocks until IO completes, which can shed another request when
+          // grow-on-demand needs that capacity after the cancellation sweep.
+          if (reason != Result::Reason::kCancelled) want_spill(e, r.spec.id);
         }
       }
     }
@@ -1504,6 +1604,12 @@ bool Scheduler::quantum(std::optional<int64_t> adaptive_budget) {
   // and every rank grows or sheds the same requests at the same quantum.
   grow_reservations();
   mixed_stepped_.clear();
+  // The cold tier (issue #26): the tier's next slice of device work on the
+  // model stream, then the queued spills, up to the op bound, at this same
+  // fixed position on every rank.
+  if (disk_.enabled()) engine_->disk_pump();
+  start_spills();
+  start_restores();
 
   const bool any_active = std::any_of(
       requests_.begin(), requests_.end(),
@@ -1567,8 +1673,8 @@ bool Scheduler::quantum(std::optional<int64_t> adaptive_budget) {
     for (size_t i = 0; i < requests_.size(); ++i) {
       if (requests_[i].state == State::kPrefilling) {
         ++readers;
-      } else if (requests_[i].state == State::kQueued && open_slots > 0 &&
-                 needs_chunked_prefill(static_cast<int>(i), budget)) {
+      } else if (requests_[i].state == State::kQueued && open_slots > 0 && requests_[i].restore_op == 0 &&
+                 !requests_[i].restore_blocked && needs_chunked_prefill(static_cast<int>(i), budget)) {
         ++readers;
         --open_slots;
       }
@@ -1586,6 +1692,7 @@ bool Scheduler::quantum(std::optional<int64_t> adaptive_budget) {
   // trimmed share do not measure the cost of a 1024-token service quantum.
   prefill_pass_budget_tokens_ = budget;
   std::vector<int> inflight, begins;
+  PlannedPrefixes planned_prefixes(cache_);
   int64_t align = 0;
   size_t max_advances = 0;
   if (chunk_tick) {
@@ -1598,10 +1705,14 @@ bool Scheduler::quantum(std::optional<int64_t> adaptive_budget) {
       if (requests_[i].state == State::kPrefilling) inflight.push_back(static_cast<int>(i));
     align = engine_->prefill_chunk_alignment();
     max_advances = static_cast<size_t>(budget / align);
-    // The one new begin, when any: the oldest fitting eligible
-    // request (skip-fit, no eviction dance — a begin must not disturb the
-    // pool the in-flight prefills hold), gated so every share keeps at
-    // least one aligned chunk.
+    // The new begins, when any: the oldest eligible requests that fit, in
+    // arrival order, gated so every share keeps at least one aligned chunk.
+    // A begin that does not fit may evict the cache's LRU unattached
+    // entries to make room — the same give-way the idle pool applies, and
+    // never a block the in-flight prefills hold (each keeps its own
+    // refcount on every reserved block, and a victim only drops the
+    // cache's extra ref) — so a pool pinned by retired sessions cannot
+    // hold a peer out of the walk for a whole solo read-in.
     // An engine that advances its prefills as one walk begins as many as
     // the budget has aligned shares left (arrivals that came together are
     // read in together): the walk is bounded by the budget, not by them.
@@ -1612,14 +1723,23 @@ bool Scheduler::quantum(std::optional<int64_t> adaptive_budget) {
       for (size_t i = 0; i < requests_.size(); ++i) {
         if (open_slots <= 0 || inflight.size() + begins.size() >= max_advances) break;
         if (requests_[i].state != State::kQueued) continue;
+        // A request waiting on the cold tier's restore (issue #26), or on the
+        // ops that block it, does not begin cold: its deepest state is on
+        // its way into memory.
+        if (requests_[i].restore_op != 0 || requests_[i].restore_blocked) continue;
         // Text of any size can join an early-admission walk, including
         // prompts shorter than one alignment unit. Images retain their
         // existing eligibility rules.
         if ((!policy_.prefill_early_admission || !requests_[i].spec.images.empty()) &&
             !needs_chunked_prefill(static_cast<int>(i), budget)) continue;
-        const int64_t need = new_blocks(requests_[i], plan_prefix(requests_[i]));
-        if (need > free_blocks) continue;
+        int64_t need = new_blocks(requests_[i], plan_prefix(requests_[i]));
+        if (need > free_blocks && !evict_to_fit(requests_[i], free_blocks)) continue;
+        // The victim may have been the plan's attach entry; recompute so
+        // the bookkeeping below matches the plan the begin itself takes.
+        const PrefixPlan plan = plan_prefix(requests_[i]);
+        need = new_blocks(requests_[i], plan);
         begins.push_back(static_cast<int>(i));
+        planned_prefixes.retain(plan.attach_entry);
         if (!group_advance) break;
         free_blocks -= need;
         --open_slots;
@@ -1646,6 +1766,7 @@ bool Scheduler::quantum(std::optional<int64_t> adaptive_budget) {
       begin_prefill(b, share);
       admitted_any = true;
     }
+    planned_prefixes.release();  // the begun requests now hold their own refs
     int64_t leftover = budget - n * share;
     if (group_advance && inflight.size() >= 2) {
       // One walk for all of them: the budget in aligned units, by need.
@@ -1766,13 +1887,14 @@ bool Scheduler::quantum(std::optional<int64_t> adaptive_budget) {
   }
   if (!admitted_any && any_queued) {
     // Deferral bookkeeping: log the head of the queue once per
-    // deferral episode, with the numbers an operator needs.
+    // deferral episode, with the numbers an operator needs. A request
+    // waiting on the cold tier's restore is not deferred (issue #26).
     const auto head = std::find_if(
         requests_.begin(), requests_.end(),
-        [](const Request& r) { return r.state == State::kQueued; });
+        [](const Request& r) { return r.state == State::kQueued && r.restore_op == 0 && !r.restore_blocked; });
     const int head_arrival =
-        static_cast<int>(head - requests_.begin());
-    if (deferred_logged_ != head_arrival) {
+        head == requests_.end() ? -1 : static_cast<int>(head - requests_.begin());
+    if (head_arrival >= 0 && deferred_logged_ != head_arrival) {
       deferred_logged_ = head_arrival;
       const int64_t free_blocks = engine_->pool_blocks_total() -
                                   engine_->pool_blocks_in_use();
@@ -1812,6 +1934,10 @@ bool Scheduler::quantum(std::optional<int64_t> adaptive_budget) {
   }
 
   if (!progressed) {
+    // The cold tier (issue #26): a queued request waiting on a restore, or
+    // an op whose commit has not landed, is work the next record brings;
+    // nothing to do THIS tick is not a deadlock.
+    if (!disk_ops_.empty()) return false;
     // No admission, no step, work remaining. With any active request
     // the rotation always yields one, so this is the admission
     // deadlock: the queue cannot fit the pool ever (its head's
@@ -1891,6 +2017,29 @@ Scheduler::Meters Scheduler::meters() const {
   m.prefix_skipped_image_bytes = cache_.stats().skipped_image_bytes;
   m.prefix_image_bytes = static_cast<int64_t>(cache_.image_bytes());
   m.prefix_blocks_pinned = cache_.blocks_pinned(prefix_info_.block_tokens);
+  m.prefix_pinned = cache_.pinned_entries();
+  m.disk_enabled = disk_.enabled();
+  if (disk_.enabled()) {
+    const DiskCache::Stats& ds = disk_.stats();
+    m.disk_pages_total = disk_.pages_total();
+    m.disk_pages_used = disk_.pages_used();
+    m.disk_page_bytes = static_cast<int64_t>(disk_.config().page_bytes);
+    m.disk_entries = disk_.live_entries();
+    m.disk_blocks = disk_.live_blocks();
+    m.disk_spills = ds.spills;
+    m.disk_spilled = ds.spilled;
+    m.disk_spill_failed = ds.spill_failed;
+    m.disk_spill_skipped = ds.spill_skipped;
+    m.disk_restores = ds.restores;
+    m.disk_restored = ds.restored;
+    m.disk_restore_failed = ds.restore_failed;
+    m.disk_evictions = ds.evictions;
+    m.disk_blocks_shared = ds.blocks_shared;
+    m.disk_pending = static_cast<int64_t>(disk_ops_.size());
+    m.disk_tokens_restored = ds.tokens_restored;
+    m.disk_pinned = disk_.pinned_entries();
+    m.disk_adopted = ds.adopted;
+  }
   return m;
 }
 
@@ -1965,7 +2114,7 @@ void Scheduler::rolling_snapshots() {
 int Scheduler::acquire_arena_slot(const std::string& id) {
   int slot = cache_.take_free_slot();
   if (slot >= 0) return slot;
-  slot = cache_.evict_lru();
+  slot = evict_memory_entry();
   if (slot < 0) return -1;
   // The victim's state leaves the engine; the slot is the caller's now.
   engine_->prefix_release(slot);
@@ -2022,6 +2171,281 @@ void Scheduler::log_prefix_miss(const Request& r) const {
       "entries; the nearest entry (position {}) shares the first {} of the "
       "prompt's {} tokens ({})",
       r.spec.id, r.cuts.size(), entries, e.position, near.common, n, reading);
+}
+
+// ---- the NVMe cold tier (issue #26) ------------------------------------------
+
+int Scheduler::evict_memory_entry() {
+  int disk = -1;
+  const int slot = cache_.evict_lru(&disk);
+  if (slot < 0) return -1;
+  if (disk >= 0) disk_.on_memory_evicted(disk);
+  return slot;
+}
+
+void Scheduler::drop_disk_link(int memory_entry, int disk_entry) {
+  if (memory_entry < 0 || memory_entry >= cache_.size()) return;
+  const PrefixCache::Entry& m = cache_.entry(memory_entry);
+  if (m.live && m.disk == disk_entry) cache_.set_disk(memory_entry, -1);
+}
+
+bool Scheduler::restore_in_flight() const {
+  for (const DiskOp& o : disk_ops_)
+    if (o.restore) return true;
+  return false;
+}
+
+void Scheduler::want_spill(int entry, const std::string& id) {
+  if (!disk_.enabled()) return;
+  const PrefixCache::Entry& m = cache_.entry(entry);
+  if (m.disk >= 0 || m.position < disk_.config().min_tokens) return;
+  disk_wanted_.push_back(DiskWant{entry, m.hash, id});
+  // Started here, not at the next tick's top: a busy entry is never
+  // evicted, and an entry that waited a tick could be taken by the same
+  // request's rolling snapshot or close before its copy began (the
+  // one-Spark drafter smoke of 2026-10-27 lost the deepest cut that way).
+  // The op bound still holds; what it defers, the tick's top starts.
+  start_spills();
+}
+
+void Scheduler::start_spills() {
+  if (!disk_.enabled()) return;
+  while (!disk_wanted_.empty() && static_cast<int>(disk_ops_.size()) < disk_info_.max_ops) {
+    const DiskWant want = disk_wanted_.front();
+    disk_wanted_.erase(disk_wanted_.begin());
+    if (want.entry < 0 || want.entry >= cache_.size()) continue;
+    const PrefixCache::Entry& m = cache_.entry(want.entry);
+    // The record may have died (evicted) or been reused since it asked.
+    if (!m.live || m.hash != want.hash || m.disk >= 0 || m.busy) continue;
+    (void)start_spill(want.entry, want.id);
+  }
+}
+
+void Scheduler::start_restores() {
+  if (!disk_.enabled()) return;
+  // Every admission path — the one-shot of next_admissible, the chunked
+  // begin, the group — reads the queue after this, so a request whose
+  // deepest usable state is on disk is already waiting on its restore (or
+  // the one in flight for the same entry) when they look. One restore in
+  // flight at a time; a request whose restore cannot start — no arena
+  // slot, no blocks, another entry's restore running — admits from memory
+  // or cold, as before.
+  for (size_t i = 0; i < requests_.size(); ++i) {
+    Request& r = requests_[i];
+    r.restore_blocked = false;
+    if (r.state != State::kQueued || r.restore_op != 0 || !cache_on(r)) continue;
+    const PrefixPlan plan = plan_prefix(r);
+    if (plan.disk_entry < 0) continue;
+    const DiskCache::Entry& de = disk_.entry(plan.disk_entry);
+    if (de.state == DiskCache::State::kRestoring) {
+      r.restore_op = de.op;
+      continue;
+    }
+    // Another entry's restore, or the slots and blocks held by spills in
+    // flight: the shortage ends when those ops commit (seconds), where a
+    // cold prefill of the prompt costs far more — the request waits a
+    // tick. A shortage with nothing in flight (every slot attached to a
+    // live request) is not going to lift soon: the request admits cold.
+    // The wait is bounded by the ops themselves: every op ends in a commit
+    // (nvme_cache.op_timeout_s fails one that makes no progress), and a
+    // committed spill's entry is evictable for the restore's slot. A tick
+    // count is no clock here — an idle world with ops pending ticks back to
+    // back, so sixty-four ticks pass in well under a second while a spill
+    // paced by the device is still in flight (the 27B drafter check of
+    // 2026-10-28 went cold on such a bound).
+    if (restore_in_flight() || !start_restore(plan.disk_entry, r)) {
+      if (!disk_ops_.empty()) r.restore_blocked = true;
+    }
+  }
+}
+
+bool Scheduler::start_spill(int entry, const std::string& id) {
+  const PrefixCache::Entry& m = cache_.entry(entry);
+  if (m.slot < 0) return false;
+  const uint64_t op = next_disk_op_;
+  const SchedulerEngine::DiskBlocks blocks = engine_->disk_entry_blocks(m.slot);
+  const DiskCache::SpillPlan plan =
+      disk_.begin_spill(m.ids.data(), m.position, m.next_token, m.images, blocks.mtp_position,
+                        blocks.identities, blocks.partial_identity, op, ticks_, entry, m.key);
+  for (const DiskCache::Evicted& v : plan.evicted) {
+    if (v.memory >= 0) drop_disk_link(v.memory, v.entry);
+    cache_.note(12, static_cast<uint64_t>(v.position), 0);
+    emit_prefix(id, "disk_evict", v.position, -1);
+  }
+  if (!plan.ok) {
+    if (!plan.evicted.empty()) persist_disk_index();
+    if (plan.duplicate)
+      DGPP_LOG_DEBUG("sched: request '{}' entry at {} tokens is on the NVMe cache already", id, m.position);
+    else
+      DGPP_LOG_INFO("sched: request '{}' entry at {} tokens not spilled — the NVMe cache holds no room for it "
+                    "({} of {} pages in use)",
+                    id, m.position, disk_.pages_used(), disk_.pages_total());
+    return false;
+  }
+  ++next_disk_op_;
+  SchedulerEngine::DiskSpill req;
+  req.op = op;
+  req.slot = m.slot;
+  req.blob_page = plan.blob_page;
+  req.pages = plan.pages;
+  req.partial_page = plan.partial_page;
+  req.ids = m.ids;
+  req.ids_page = plan.ids_page;
+  req.ids_pages = plan.ids_pages;
+  engine_->disk_spill_begin(req);
+  cache_.set_busy(entry, true);
+  DiskOp o;
+  o.op = op;
+  o.restore = false;
+  o.disk_entry = plan.entry;
+  o.memory_entry = entry;
+  o.slot = m.slot;
+  o.position = m.position;
+  o.id = id;
+  disk_ops_.push_back(std::move(o));
+  cache_.note(7, op, static_cast<uint64_t>(m.position));
+  emit_prefix(id, "spill", m.position, m.slot);
+  persist_disk_index();  // the evictions; the entry itself joins at its commit
+  return true;
+}
+
+void Scheduler::persist_disk_index() {
+  if (disk_.enabled() && disk_info_.persist)
+    engine_->disk_persist_index(disk_.serialize(), disk_.content_digests());
+}
+
+bool Scheduler::start_restore(int disk_entry, Request& r) {
+  if (restore_in_flight()) return false;
+  const int64_t position = disk_.entry(disk_entry).position;
+  const int64_t mtp_position = disk_.entry(disk_entry).mtp_position;
+  const int64_t bt = prefix_info_.block_tokens;
+  const int64_t n_full = bt > 0 ? position / bt : 0;
+  const int64_t need = n_full + (bt > 0 && position % bt != 0 ? 1 : 0);
+  // The request must be admissible once attached: its reservation less
+  // the full blocks the entry shares, beside the entry's own blocks.
+  if (need + std::max<int64_t>(0, reserve_blocks(r) - n_full) + 1 > engine_->pool_blocks_total()) return false;
+  const int slot = acquire_arena_slot(r.spec.id);
+  if (slot < 0) {
+    ++cache_.stats().skipped_no_slot;
+    return false;
+  }
+  if (!ensure_free_blocks(need, r.spec.id)) {
+    cache_.give_back_slot(slot);
+    ++cache_.stats().skipped_no_block;
+    return false;
+  }
+  const uint64_t op = next_disk_op_++;
+  const DiskCache::RestorePlan plan = disk_.begin_restore(disk_entry, op);
+  SchedulerEngine::DiskRestore req;
+  req.op = op;
+  req.slot = slot;
+  req.position = position;
+  req.mtp_position = mtp_position;
+  req.blob_page = plan.blob_page;
+  req.pages = plan.pages;
+  req.partial_page = plan.partial_page;
+  DiskOp o;
+  o.op = op;
+  o.restore = true;
+  o.disk_entry = disk_entry;
+  o.slot = slot;
+  o.position = position;
+  o.id = r.spec.id;
+  try {
+    o.restored = engine_->disk_restore_begin(req);
+  } catch (const CachePoolExhausted& e) {
+    // The pool had no block for the records after all (the same count on
+    // every rank, from the same journaled state): the disk entry stands as
+    // it was, the slot returns, the request admits without the restore —
+    // the convention every snapshot site follows (engine/pool_exhausted.hpp).
+    disk_.cancel_restore(disk_entry);
+    cache_.give_back_slot(slot);
+    ++cache_.stats().skipped_no_block;
+    DGPP_LOG_WARN("sched: request '{}' restore of {} tokens skipped: {}", r.spec.id, position, e.what());
+    return false;
+  } catch (...) {
+    // Anything else is a contract violation: the entry and the slot are
+    // put back, the error is the caller's (fatal, operator class).
+    disk_.cancel_restore(disk_entry);
+    cache_.give_back_slot(slot);
+    throw;
+  }
+  disk_ops_.push_back(std::move(o));
+  r.restore_op = op;
+  cache_.note(9, op, static_cast<uint64_t>(position));
+  emit_prefix(r.spec.id, "restore", position, slot);
+  DGPP_LOG_INFO("sched: request '{}' restoring {} prompt tokens from the NVMe cache into arena slot {} (op {})",
+                r.spec.id, position, slot, op);
+  return true;
+}
+
+void Scheduler::apply_disk_commits(const std::vector<DiskCommit>& commits) {
+  for (const DiskCommit& c : commits) {
+    const auto it = std::find_if(disk_ops_.begin(), disk_ops_.end(),
+                                 [&](const DiskOp& o) { return o.op == c.op; });
+    if (it == disk_ops_.end())
+      throw std::runtime_error("Scheduler: a cold tier commit names op " + std::to_string(c.op) +
+                               ", which this rank never started — scheduler divergence");
+    const DiskOp o = std::move(*it);
+    disk_ops_.erase(it);
+    if (!o.restore) {
+      // A busy entry is never evicted, so the memory record is still the one
+      // the spill copied.
+      cache_.set_busy(o.memory_entry, false);
+      if (c.ok) {
+        disk_.commit_spill(o.disk_entry);
+        // The entry's content on this rank's slab, bound into the index so
+        // an adoption after a crash keeps it only while its pages still
+        // hold these bytes.
+        disk_.set_content(o.disk_entry, engine_->disk_pages_digest(disk_.entry_pages(o.disk_entry),
+                                                                     static_cast<uint64_t>(o.position)));
+        cache_.set_disk(o.memory_entry, o.disk_entry);
+        cache_.note(8, o.op, 1);
+        emit_prefix(o.id, "spilled", o.position, o.slot);
+      } else {
+        disk_.abort_spill(o.disk_entry);
+        cache_.note(8, o.op, 0);
+        emit_prefix(o.id, "spill_fail", o.position, o.slot);
+        DGPP_LOG_WARN("sched: the NVMe cache spill of request '{}' entry at {} tokens failed on a rank; "
+                      "the entry stays in memory only",
+                      o.id, o.position);
+      }
+      continue;
+    }
+    for (Request& r : requests_)
+      if (r.restore_op == o.op) r.restore_op = 0;
+    if (c.ok) {
+      const DiskCache::Entry& de = disk_.entry(o.disk_entry);
+      const int e = cache_.insert(de.ids.data(), de.position, o.slot, ticks_, de.images, de.next_token, de.key);
+      if (e < 0) {
+        // The memory index holds an identical entry already (a cold prefill
+        // took it while the restore ran): the read copy is surplus.
+        free_arena_slot(o.slot);
+        disk_.commit_restore(o.disk_entry, -1, {}, 0, ticks_);
+        cache_.note(10, o.op, 2);
+        emit_prefix(o.id, "restored", o.position, -1);
+      } else {
+        cache_.set_disk(e, o.disk_entry);
+        disk_.commit_restore(o.disk_entry, e, o.restored.identities, o.restored.partial_identity, ticks_);
+        cache_.note(10, o.op, 1);
+        emit_prefix(o.id, "restored", o.position, o.slot);
+      }
+    } else {
+      free_arena_slot(o.slot);
+      disk_.abort_restore(o.disk_entry);
+      cache_.note(10, o.op, 0);
+      emit_prefix(o.id, "restore_fail", o.position, o.slot);
+      DGPP_LOG_WARN("sched: the NVMe cache restore for request '{}' ({} tokens) failed on a rank; the entry "
+                    "is dropped and the request prefills without it",
+                    o.id, o.position);
+    }
+  }
+  if (!commits.empty()) persist_disk_index();
+}
+
+std::vector<SchedulerEngine::DiskCompletion> Scheduler::poll_disk_completions() {
+  if (!disk_.enabled()) return {};
+  return engine_->disk_poll();
 }
 
 void Scheduler::emit_prefix(const std::string& id, const char* op,

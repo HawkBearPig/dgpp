@@ -65,6 +65,19 @@ Dsv4PoolShape Dsv4Model::pool_shape(const Dsv4Config& cfg, int max_requests, int
   return s;
 }
 
+size_t Dsv4Model::kv_block_bytes_static(const Dsv4Config& cfg) {
+  // Per cache: its entries per block of main rows, plus the index keys and
+  // scales where it is indexed (Dsv4StatePool::planes, copy_block_contents).
+  const Dsv4PoolShape s = pool_shape(cfg, 1, kBlockTokens);
+  size_t total = 0;
+  for (const int r : s.cache_ratio) {
+    const size_t epb = static_cast<size_t>(s.block_tokens / r);
+    total += epb * Dsv4StatePool::kRowBytes;
+    if (r == 4) total += epb * kDsv4IndexDim + epb * sizeof(float);
+  }
+  return total;
+}
+
 // ---------------------------------------------------------------------------
 // Construction.
 // ---------------------------------------------------------------------------

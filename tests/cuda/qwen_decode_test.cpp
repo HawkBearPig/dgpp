@@ -17,19 +17,31 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <fcntl.h>
+#include <unistd.h>
+
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <memory>
+#include <random>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <cuda_runtime.h>
 
 #include "common/bf16_residency.hpp"
 #include "common/dtypes.hpp"
+#include "engine/nvme_tier.hpp"
+#include "common/crc32c.hpp"
+#include <atomic>
+#include "engine/prefix_arena.hpp"
 #include "engine/speculative.hpp"
 #include "kernels/draft_head.hpp"
 #include "kernels/gemm.hpp"
@@ -457,6 +469,673 @@ int run_fixture(const std::string& dir, bool fp8_head = false) {
     require(m.kv_blocks_in_use() == 0, "prefix: every block released with the entries");
     for (uint8_t* p : arena) cudaFree(p);
     std::printf("[ OK ] prefix snapshots: hot == cold bitwise at a cut and mid-decode\n");
+  }
+  // 7. The NVMe cold tier (issue #26): a snapshot at cut 12 spilled to a
+  //    slab file and restored into another arena slot and fresh pool
+  //    blocks reads back bitwise (the blob and every block plane), attaches
+  //    and decodes bitwise the in-memory entry; a page corrupted on disk
+  //    fails the restore by its checksum and releases what it took.
+  {
+    dgpp::PrefixArena<QwenModel> arena(&m, /*slots=*/2);
+    const std::vector<int64_t> bounds{12};
+    QwenModel::SnapshotRequest snap = arena.request(0, 12);
+    const QwenModel::Outputs cold = m.session_prefill(0, A, bounds, &snap);
+    arena.commit(0, snap);
+    require(arena.filled(0) && arena.meta(0).position == 12, "tier: the snapshot at 12 is in slot 0");
+    const QwenModel::Outputs cold_step = m.session_step(0, tA.tokens[0]);
+    m.session_close(0);
+    const int64_t blocks_before = m.kv_blocks_in_use();
+    const std::string slab_dir = (fs::temp_directory_path() / "dgpp_nvme_tier_test").string();
+    fs::create_directories(slab_dir);
+    dgpp::sched::SchedulerEngine::DiskEnable en;
+    en.slab_path = slab_dir + "/rank0.slab";
+    en.capacity_bytes = size_t{64} << 20;
+    en.chunk_bytes = size_t{1} << 20;
+    en.rank = 0;
+    en.allow_buffered = true;  // a tmpfs temp directory refuses direct I/O
+    std::unique_ptr<dgpp::NvmeTier<QwenModel>> tier;
+    tier = std::make_unique<dgpp::NvmeTier<QwenModel>>(&m, &arena, en);
+    require(tier->block_bytes() == dgpp::cache_block_bytes(m.cache_planes()), "tier: the record is the planes' bytes");
+    require(QwenModel::kv_block_bytes_static(cfg, 0, 1, /*mtp=*/false) == tier->block_bytes(),
+            "tier: the family's static estimate is the planes' bytes");
+    require(tier->page_bytes() % 4096 == 0 && tier->blob_pages() >= 1, "tier: 4 KiB pages, at least one blob page");
+    // The scheduler pumps the tier at every tick; here the loop does.
+    const auto wait = [&](uint64_t op) {
+      for (int i = 0; i < 2000; ++i) {
+        tier->pump();
+        for (const auto& c : tier->poll())
+          if (c.op == op) return c.ok;
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+      }
+      throw std::runtime_error("tier: op " + std::to_string(op) + " never completed");
+    };
+    // The spill: the entry's identities, one page per block (12 tokens in
+    // 64-token blocks: no full block, one partial), the blob's run.
+    const dgpp::sched::SchedulerEngine::DiskBlocks ids = tier->entry_blocks(0);
+    require(ids.identities.empty() && ids.partial_identity != 0, "tier: cut 12 is one partial block");
+    dgpp::sched::SchedulerEngine::DiskSpill spill;
+    spill.op = 1;
+    spill.slot = 0;
+    spill.blob_page = 0;
+    spill.partial_page = tier->blob_pages();
+    spill.ids.assign(A.begin(), A.begin() + 12);
+    spill.ids_page = tier->blob_pages() + 1;
+    spill.ids_pages = 1;
+    tier->spill_begin(spill);
+    require(wait(1), "tier: the spill completed");
+    // The restore into slot 1: fresh blocks, the same bytes.
+    dgpp::sched::SchedulerEngine::DiskRestore rs;
+    rs.op = 2;
+    rs.slot = 1;
+    rs.position = 12;
+    rs.mtp_position = arena.meta(0).mtp_position;
+    rs.blob_page = 0;
+    rs.partial_page = tier->blob_pages();
+    const dgpp::sched::SchedulerEngine::DiskBlocks fresh = tier->restore_begin(rs);
+    require(fresh.partial_identity != 0 && fresh.partial_identity != ids.partial_identity,
+            "tier: the restore took a fresh block");
+    require(m.kv_blocks_in_use() == blocks_before + 1, "tier: one block acquired for the restore");
+    require(wait(2), "tier: the restore completed");
+    require(arena.filled(1) && arena.meta(1).position == 12 && arena.meta(1).partial_block >= 0,
+            "tier: slot 1 adopted the restored entry");
+    {
+      const size_t bytes = arena.bytes();
+      std::vector<uint8_t> a(bytes), b(bytes);
+      DGPP_CUDA_OK(cudaMemcpy(a.data(), arena.slot_data(0), bytes, cudaMemcpyDeviceToHost));
+      DGPP_CUDA_OK(cudaMemcpy(b.data(), arena.slot_data(1), bytes, cudaMemcpyDeviceToHost));
+      require(a == b, "tier: the restored blob differs from the spilled one");
+      for (const dgpp::CachePlane& plane : m.cache_planes()) {
+        std::vector<uint8_t> x(plane.block_bytes), y(plane.block_bytes);
+        DGPP_CUDA_OK(cudaMemcpy(x.data(), plane.base + static_cast<size_t>(arena.meta(0).partial_block) * plane.block_bytes,
+                                plane.block_bytes, cudaMemcpyDeviceToHost));
+        DGPP_CUDA_OK(cudaMemcpy(y.data(), plane.base + static_cast<size_t>(arena.meta(1).partial_block) * plane.block_bytes,
+                                plane.block_bytes, cudaMemcpyDeviceToHost));
+        require(x == y, "tier: a restored block plane differs from the original");
+      }
+    }
+    // Attached from the restored slot, the suffix prefill and the first
+    // step are bitwise the cold run's.
+    arena.attach(1, 1);
+    const QwenModel::Outputs hot = m.session_prefill_resume(1, std::vector<int64_t>(A.begin() + 12, A.end()), bounds);
+    require(bitwise(hot.logits, cold.logits), "tier: the prefill after a restored attach differs");
+    require(bitwise(m.session_step(1, tA.tokens[0]).logits, cold_step.logits), "tier: the step after a restored attach differs");
+    m.session_close(1);
+    arena.release(1);
+    require(m.kv_blocks_in_use() == blocks_before, "tier: the release returned the restored block");
+    // A corrupted page: the restore fails on its checksum, and releasing
+    // the slot returns the block it took.
+    {
+      const int fd = ::open(en.slab_path.c_str(), O_WRONLY);
+      require(fd >= 0, "tier: reopen the slab");
+      const uint8_t junk[16] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
+      require(::pwrite(fd, junk, sizeof junk, static_cast<off_t>(static_cast<size_t>(tier->blob_pages()) * tier->page_bytes() + 64)) ==
+                  static_cast<ssize_t>(sizeof junk),
+              "tier: corrupt the partial block's page");
+      ::close(fd);
+    }
+    rs.op = 3;
+    (void)tier->restore_begin(rs);
+    require(!wait(3), "tier: a corrupted page fails the restore");
+    require(tier->stats().failures == 1, "tier: the failure counted");
+    arena.release(1);
+    require(m.kv_blocks_in_use() == blocks_before, "tier: the failed restore's block was released");
+    tier.reset();
+    require(!fs::exists(en.slab_path), "tier: the slab is removed with the tier");
+    // 8. The slab outlives the tier (nvme_cache.persist): under a binding, a
+    //    spill writes the entry with its token ids and the tier takes an
+    //    index to keep; closed and reopened under the same binding it offers
+    //    the index back, reads the ids run bitwise, and restores the entry
+    //    from the retained pages; a refused adoption recreates the slab.
+    {
+      dgpp::sched::SchedulerEngine::DiskEnable pe = en;
+      const std::string bdir = slab_dir + "/binding-a";
+      fs::remove_all(bdir);  // an earlier run that failed mid-way leaves its slab behind
+      fs::create_directories(bdir);
+      pe.slab_path = bdir + "/rank0.slab";
+      pe.persist = true;
+      pe.binding = "binding-a";
+      const auto wait_on = [&](dgpp::NvmeTier<QwenModel>& t, uint64_t op) {
+        for (int i = 0; i < 2000; ++i) {
+          t.pump();
+          for (const auto& c : t.poll())
+            if (c.op == op) return c.ok;
+          std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        throw std::runtime_error("persist: op " + std::to_string(op) + " never completed");
+      };
+      auto t2 = std::make_unique<dgpp::NvmeTier<QwenModel>>(&m, &arena, pe);
+      require(t2->candidate_index().empty() && t2->candidate_digest() == "0", "persist: nothing to adopt yet");
+      dgpp::sched::SchedulerEngine::DiskSpill ps = spill;  // slot 0's entry at 12, with its ids
+      ps.op = 4;
+      t2->spill_begin(ps);
+      require(wait_on(*t2, 4), "persist: the spill with its ids completed");
+      // The index the scheduler would persist: one record over the spill's
+      // pages, with this rank's content digest.
+      std::vector<uint8_t> index;
+      std::vector<uint64_t> index_digests;
+      {
+        dgpp::sched::DiskCache::Header h;
+        h.pages = static_cast<uint64_t>(t2->pages());
+        h.page_bytes = t2->page_bytes();
+        h.blob_pages = static_cast<uint64_t>(t2->blob_pages());
+        h.block_tokens = static_cast<uint64_t>(m.kv_block_tokens());
+        dgpp::sched::DiskCache::Record r;
+        r.position = 12;
+        r.blob_page = ps.blob_page;
+        r.ids_pages = 1;
+        r.partial_page = ps.partial_page;
+        index = dgpp::sched::DiskCache::write(h, {r});
+        index_digests.assign(1, t2->pages_digest(dgpp::sched::DiskCache::record_pages(r, t2->blob_pages()), 12));
+      }
+      t2->persist_index(index, index_digests);
+      t2.reset();  // the worker lands the index; the slab stays
+      require(fs::exists(pe.slab_path) && fs::exists(bdir + "/rank0.index") && fs::exists(bdir + "/rank0.crc"),
+              "persist: the slab, its index and its CRC table stay");
+      auto reuse = pe;
+      reuse.require_existing = true;
+      // Explicit reuse preserves the selected files on a rejected geometry,
+      // and releases the slab lock even if rejection follows opening it.
+      const auto file_bytes = [](const std::string& path) {
+        std::ifstream in(path, std::ios::binary);
+        return std::vector<uint8_t>(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+      };
+      const auto saved_slab = file_bytes(pe.slab_path);
+      const auto saved_index = file_bytes(bdir + "/rank0.index");
+      const auto saved_crc = file_bytes(bdir + "/rank0.crc");
+      for (const bool wrong_capacity : {true, false}) {
+        auto bad = reuse;
+        if (wrong_capacity) bad.capacity_bytes *= 2;
+        else bad.binding = "another-binding";
+        bool refused = false;
+        try { dgpp::NvmeTier<QwenModel> rejected(&m, &arena, bad); }
+        catch (const std::runtime_error&) { refused = true; }
+        require(refused && file_bytes(pe.slab_path) == saved_slab &&
+                    file_bytes(bdir + "/rank0.index") == saved_index && file_bytes(bdir + "/rank0.crc") == saved_crc,
+                "explicit reuse refuses incompatible files without clearing them");
+      }
+      {
+        auto bad_index = saved_index;
+        // Envelope, then world-index magic, page count and page bytes:
+        // change the snapshot's page count, checked after the slab is locked.
+        bad_index.at(8 + 4 + pe.binding.size() + 8 + 8 + 8 + 8) ^= 0x40;
+        const auto save_index = [&](const std::vector<uint8_t>& bytes) {
+          std::ofstream out(bdir + "/rank0.index", std::ios::binary);
+          out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+          require(static_cast<bool>(out), "write the fixture index");
+        };
+        save_index(bad_index);
+        bool refused = false;
+        try { dgpp::NvmeTier<QwenModel> rejected(&m, &arena, reuse); }
+        catch (const std::runtime_error&) { refused = true; }
+        require(refused && file_bytes(pe.slab_path) == saved_slab &&
+                    file_bytes(bdir + "/rank0.index") == bad_index && file_bytes(bdir + "/rank0.crc") == saved_crc,
+                "explicit reuse preserves an incompatible snapshot layout");
+        save_index(saved_index);
+      }
+      {
+        dgpp::NvmeTier<QwenModel> disagreement(&m, &arena, reuse);
+        bool refused = false;
+        try { disagreement.adopt(false); }
+        catch (const std::runtime_error&) { refused = true; }
+        require(refused, "explicit reuse refuses world disagreement");
+      }
+      require(file_bytes(pe.slab_path) == saved_slab && file_bytes(bdir + "/rank0.index") == saved_index &&
+                  file_bytes(bdir + "/rank0.crc") == saved_crc,
+              "world disagreement preserves every selected file");
+      auto t3 = std::make_unique<dgpp::NvmeTier<QwenModel>>(&m, &arena, reuse);
+      require(t3->candidate_index() == index && t3->candidate_digest() != "0" && t3->adopted_digests() == index_digests,
+              "persist: the index comes back for the binding, its content digest with it");
+      std::vector<int64_t> ids_back(t3->page_bytes() / sizeof(int64_t));
+      require(t3->read_pages(ps.ids_page, 1, ids_back.data()) && std::equal(A.begin(), A.begin() + 12, ids_back.begin()),
+              "persist: the ids run reads back bitwise");
+      t3->adopt(true);
+      dgpp::sched::SchedulerEngine::DiskRestore pr = rs;  // into slot 1, from the retained pages
+      pr.op = 5;
+      (void)t3->restore_begin(pr);
+      require(wait_on(*t3, 5), "persist: the restore from the retained slab completed");
+      require(arena.filled(1) && arena.meta(1).position == 12, "persist: slot 1 holds the entry again");
+      {
+        std::vector<uint8_t> a(arena.bytes()), b(arena.bytes());
+        DGPP_CUDA_OK(cudaMemcpy(a.data(), arena.slot_data(0), a.size(), cudaMemcpyDeviceToHost));
+        DGPP_CUDA_OK(cudaMemcpy(b.data(), arena.slot_data(1), b.size(), cudaMemcpyDeviceToHost));
+        require(a == b, "persist: the restored blob is the spilled one");
+      }
+      arena.release(1);
+      t3.reset();
+      auto t4 = std::make_unique<dgpp::NvmeTier<QwenModel>>(&m, &arena, pe);
+      require(!t4->candidate_index().empty(), "persist: the index is offered again");
+      t4->adopt(false);
+      require(t4->candidate_index().empty() && !fs::exists(bdir + "/rank0.index"),
+              "persist: a refused adoption starts the slab fresh");
+      t4.reset();
+      require(fs::exists(pe.slab_path), "persist: the fresh slab stays for the next run");
+      // 9. The tier under random damage (the fuzz): spills of the entry over
+      //    the same pages, a random byte of a random page of the entry
+      //    flipped on disk half the time, then a restore — which must come
+      //    back bitwise or fail on the checksum of the page hit, never
+      //    with other bytes; blocks return every time. Random staging
+      //    chunks reopen the tier mid-way.
+      {
+        std::mt19937_64 rng(20261027);
+        auto t5 = std::make_unique<dgpp::NvmeTier<QwenModel>>(&m, &arena, pe);
+        t5->adopt(false);
+        int failed = 0, restored = 0;
+        uint64_t op = 10;
+        for (int iter = 0; iter < 16; ++iter) {
+          if (iter % 5 == 4) {  // another chunk: more or fewer slices per op
+            dgpp::sched::SchedulerEngine::DiskEnable pc = pe;
+            pc.chunk_bytes = (size_t{1} << 20) * (1 + static_cast<size_t>(rng() % 4));
+            t5.reset();
+            t5 = std::make_unique<dgpp::NvmeTier<QwenModel>>(&m, &arena, pc);
+            t5->adopt(false);
+          }
+          dgpp::sched::SchedulerEngine::DiskSpill fs_spill = spill;
+          fs_spill.op = op++;
+          t5->spill_begin(fs_spill);
+          require(wait_on(*t5, fs_spill.op), "fuzz: the spill completed");
+          // The entry's pages: the blob run, the partial block, the ids page.
+          const int64_t entry_pages = t5->blob_pages() + 2;
+          int64_t hit = -1;
+          if (rng() % 2 == 0) {
+            hit = static_cast<int64_t>(rng() % static_cast<uint64_t>(entry_pages));
+            const int fd = ::open(pe.slab_path.c_str(), O_RDWR);
+            require(fd >= 0, "fuzz: reopen the slab");
+            uint8_t byte = 0;
+            const off_t at = static_cast<off_t>(static_cast<size_t>(hit) * t5->page_bytes() +
+                                                rng() % t5->page_bytes());
+            const ssize_t got = ::pread(fd, &byte, 1, at);
+            require(got == 1, "fuzz: read the byte to flip");
+            byte = static_cast<uint8_t>(byte ^ static_cast<uint8_t>(1u << (rng() % 8)));
+            require(::pwrite(fd, &byte, 1, at) == 1, "fuzz: flip a byte");
+            ::close(fd);
+          }
+          dgpp::sched::SchedulerEngine::DiskRestore fr = rs;
+          fr.op = op++;
+          (void)t5->restore_begin(fr);
+          const bool ok = wait_on(*t5, fr.op);
+          const bool ids_hit = hit == t5->blob_pages() + 1;  // a restore never reads the ids page
+          if (hit < 0 || ids_hit) {
+            require(ok, "fuzz: an undamaged entry restores");
+            std::vector<uint8_t> a(arena.bytes()), b(arena.bytes());
+            DGPP_CUDA_OK(cudaMemcpy(a.data(), arena.slot_data(0), a.size(), cudaMemcpyDeviceToHost));
+            DGPP_CUDA_OK(cudaMemcpy(b.data(), arena.slot_data(1), b.size(), cudaMemcpyDeviceToHost));
+            require(a == b, "fuzz: the restored blob is bitwise the spilled one");
+            ++restored;
+          } else {
+            require(!ok, "fuzz: a damaged page fails the restore (page " + std::to_string(hit) + ")");
+            ++failed;
+          }
+          arena.release(1);
+          require(m.kv_blocks_in_use() == blocks_before, "fuzz: the restore's blocks came back");
+        }
+        require(restored > 0 && failed > 0, "fuzz: both outcomes seen");
+        t5.reset();
+        std::printf("[ OK ] NVMe tier fuzz: %d restores bitwise, %d damaged restores refused\n", restored, failed);
+      }
+      // 10. The slab across a crash (2026-10-28): adoption is bound to the
+      //     entries' content, one world holds a slab, damaged files start
+      //     fresh, an op without progress times out, an injected I/O
+      //     failure fails its op cleanly, and buffered I/O is refused
+      //     unless allowed.
+      {
+        namespace dc = dgpp::sched;
+        using Tier = dgpp::NvmeTier<QwenModel>;
+        dgpp::sched::SchedulerEngine::DiskEnable pc = pe;
+        const std::string cdir = slab_dir + "/binding-c";
+        fs::remove_all(cdir);
+        fs::create_directories(cdir);
+        pc.slab_path = cdir + "/rank0.slab";
+        pc.binding = "binding-c";
+        const std::string index_file = cdir + "/rank0.index", crc_file = cdir + "/rank0.crc";
+        size_t pbytes = 0;
+        int64_t npages = 0, nblob = 0;
+        {
+          Tier probe(&m, &arena, pc);  // the geometry (the tier of block 7 is gone)
+          pbytes = probe.page_bytes();
+          npages = probe.pages();
+          nblob = probe.blob_pages();
+        }
+        // The scheduler's layout: the ids run right behind the blob, the
+        // partial block's page after it (the index implies the ids' pages).
+        dgpp::sched::SchedulerEngine::DiskSpill cspill = spill;
+        cspill.ids_page = nblob;
+        cspill.partial_page = nblob + 1;
+        // The index the scheduler persists for the entry: one record over
+        // the spill's pages, with this rank's content digest.
+        const auto index_for = [&](Tier& t, std::vector<uint64_t>* digests) {
+          dc::DiskCache::Header h;
+          h.pages = static_cast<uint64_t>(t.pages());
+          h.page_bytes = t.page_bytes();
+          h.blob_pages = static_cast<uint64_t>(t.blob_pages());
+          h.block_tokens = static_cast<uint64_t>(m.kv_block_tokens());
+          dc::DiskCache::Record r;
+          r.position = 12;
+          r.blob_page = cspill.blob_page;
+          r.ids_pages = 1;
+          r.partial_page = cspill.partial_page;
+          digests->assign(1, t.pages_digest(dc::DiskCache::record_pages(r, t.blob_pages()), 12));
+          return dc::DiskCache::write(h, {r});
+        };
+        const auto records_of = [&](const std::vector<uint8_t>& bytes) {
+          dc::DiskCache::Header h;
+          std::vector<dc::DiskCache::Record> records;
+          return dc::DiskCache::parse(bytes, &h, &records) ? static_cast<int>(records.size()) : -1;
+        };
+        uint64_t op = 40;
+        // A clean run: the entry spilled, the index persisted at exit.
+        const auto persist_clean = [&](const dgpp::sched::SchedulerEngine::DiskEnable& cfg) {
+          auto t = std::make_unique<Tier>(&m, &arena, cfg);
+          t->adopt(false);
+          dgpp::sched::SchedulerEngine::DiskSpill cs = cspill;
+          cs.op = op++;
+          t->spill_begin(cs);
+          require(wait_on(*t, cs.op), "crash: the spill completed");
+          std::vector<uint64_t> dg;
+          const std::vector<uint8_t> bytes = index_for(*t, &dg);
+          t->persist_index(bytes, dg);
+          t.reset();
+          require(fs::exists(index_file), "crash: the index landed");
+        };
+        const auto patch_file = [&](const std::string& path, off_t at, const void* bytes, size_t n) {
+          const int fd = ::open(path.c_str(), O_RDWR);
+          require(fd >= 0 && ::pwrite(fd, bytes, n, at) == static_cast<ssize_t>(n), "crash: patch " + path);
+          ::close(fd);
+        };
+        // A fresh slab has no index to adopt. A refused duplicate must not
+        // truncate it, whether or not persistence is enabled.
+        for (const bool persist : {false, true}) {
+          auto fresh = pc;
+          const fs::path fresh_dir =
+              fs::path(slab_dir) / (persist ? "lock-persistent" : "lock-transient");
+          fs::remove_all(fresh_dir);
+          fs::create_directories(fresh_dir);
+          fresh.slab_path = (fresh_dir / "rank0.slab").string();
+          fresh.persist = persist;
+          auto owner = std::make_unique<Tier>(&m, &arena, fresh);
+          const uintmax_t bytes = fs::file_size(fresh.slab_path);
+          require(bytes > 1 && !fs::exists(fresh_dir / "rank0.index"),
+                  "lock: a fresh slab has no index");
+          const uint8_t marker = 0x5a;
+          patch_file(fresh.slab_path, 0, &marker, 1);
+          patch_file(fresh.slab_path, static_cast<off_t>(bytes - 1), &marker, 1);
+          bool refused = false;
+          try {
+            Tier other(&m, &arena, fresh);
+          } catch (const std::runtime_error& e) {
+            refused = std::string(e.what()).find("held by another process") != std::string::npos;
+          }
+          require(refused, "lock: a duplicate fresh tier is refused");
+          require(fs::file_size(fresh.slab_path) == bytes, "lock: refusal preserves the slab size");
+          const auto check_markers = [&](uint8_t expected) {
+            const int fd = ::open(fresh.slab_path.c_str(), O_RDONLY);
+            require(fd >= 0, "lock: open the slab for verification");
+            uint8_t first = 0, last = 0;
+            const bool read = ::pread(fd, &first, 1, 0) == 1 &&
+                              ::pread(fd, &last, 1, static_cast<off_t>(bytes - 1)) == 1;
+            ::close(fd);
+            require(read && first == expected && last == expected, "lock: slab contents match");
+          };
+          check_markers(marker);
+          owner.reset();
+          if (!persist) {
+            require(!fs::exists(fresh.slab_path), "lock: a transient tier removes its slab");
+            // Leave the stale bytes a crashed transient owner would leave.
+            const int fd = ::open(fresh.slab_path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+            require(fd >= 0, "lock: create a stale transient slab");
+            const bool sized = ::ftruncate(fd, static_cast<off_t>(bytes)) == 0;
+            ::close(fd);
+            require(sized, "lock: size the stale transient slab");
+            patch_file(fresh.slab_path, 0, &marker, 1);
+            patch_file(fresh.slab_path, static_cast<off_t>(bytes - 1), &marker, 1);
+          }
+          check_markers(marker);
+          // With ownership released, a new tier still clears an unadopted slab.
+          owner = std::make_unique<Tier>(&m, &arena, fresh);
+          require(fs::file_size(fresh.slab_path) == bytes, "lock: a fresh reopen sizes the slab");
+          check_markers(0);
+          owner.reset();
+          fs::remove_all(fresh_dir);
+        }
+        // (a) The lock: a second tier on the slab is refused while the first holds it.
+        {
+          auto t = std::make_unique<Tier>(&m, &arena, pc);
+          bool refused = false;
+          try {
+            Tier other(&m, &arena, pc);
+          } catch (const std::runtime_error& e) {
+            refused = std::string(e.what()).find("held by another process") != std::string::npos;
+          }
+          require(refused, "lock: a second tier on the same slab is refused");
+          t->adopt(false);  // a recreation on the held descriptor keeps the lock
+          refused = false;
+          try {
+            Tier other(&m, &arena, pc);
+          } catch (const std::runtime_error& e) {
+            refused = std::string(e.what()).find("held by another process") != std::string::npos;
+          }
+          require(refused, "lock: still held across a recreation of the slab");
+          t.reset();
+        }
+        // (b) A clean restart offers the entry with its digest.
+        persist_clean(pc);
+        {
+          auto t = std::make_unique<Tier>(&m, &arena, pc);
+          require(records_of(t->candidate_index()) == 1 && t->adopted_digests().size() == 1,
+                  "content: a clean restart offers the entry");
+          std::vector<int64_t> ids_back(t->page_bytes() / sizeof(int64_t));
+          require(t->read_pages(cspill.ids_page, 1, ids_back.data()) && std::equal(A.begin(), A.begin() + 12, ids_back.begin()),
+                  "content: the ids kept at open serve the adoption");
+          t.reset();
+        }
+        // (c) The hazard: a later run reused the entry's partial page — new
+        //     bytes, the CRC table updated as a spill updates it — and
+        //     crashed before its index landed. The old index names the
+        //     entry and its checksums pass; the content digest prunes it.
+        {
+          std::vector<uint8_t> junk(pbytes);
+          std::mt19937_64 rng(20261028);
+          for (auto& b : junk) b = static_cast<uint8_t>(rng());
+          patch_file(pc.slab_path, static_cast<off_t>(static_cast<size_t>(cspill.partial_page) * junk.size()), junk.data(),
+                     junk.size());
+          const uint32_t crc = dgpp::crc32c(junk.data(), junk.size());
+          patch_file(crc_file, static_cast<off_t>(cspill.partial_page) * 4, &crc, sizeof crc);
+          auto t = std::make_unique<Tier>(&m, &arena, pc);
+          require(records_of(t->candidate_index()) == 0 && t->adopted_digests().empty() && t->candidate_digest() != "0",
+                  "content: the entry whose pages hold other bytes is pruned");
+          t.reset();
+        }
+        // (d) Unreadable ids: the ids page's bytes changed without their CRC.
+        persist_clean(pc);
+        {
+          const uint8_t flip = 0x5a;
+          patch_file(pc.slab_path, static_cast<off_t>(static_cast<size_t>(cspill.ids_page) * pbytes + 8), &flip, 1);
+          auto t = std::make_unique<Tier>(&m, &arena, pc);
+          require(records_of(t->candidate_index()) == 0, "content: an entry with unreadable ids is pruned");
+          t.reset();
+        }
+        // (e) Damaged files start fresh: no candidate, the slab and the CRC
+        //     table at full size afterwards.
+        {
+          const auto fresh_after = [&](const char* what) {
+            auto t = std::make_unique<Tier>(&m, &arena, pc);
+            require(t->candidate_index().empty() && t->candidate_digest() == "0", std::string("damage: no candidate after ") + what);
+            t.reset();
+            require(fs::file_size(pc.slab_path) == static_cast<uintmax_t>(npages) * pbytes &&
+                        fs::file_size(crc_file) == static_cast<uintmax_t>(npages) * 4,
+                    std::string("damage: the files are whole again after ") + what);
+          };
+          persist_clean(pc);
+          fs::resize_file(index_file, fs::file_size(index_file) / 2);
+          fresh_after("a truncated index");
+          persist_clean(pc);
+          fs::resize_file(crc_file, 8);
+          fresh_after("a truncated CRC table");
+          persist_clean(pc);
+          fs::resize_file(pc.slab_path, fs::file_size(pc.slab_path) - pbytes);
+          fresh_after("a slab one page short");
+          persist_clean(pc);
+          {
+            const uint8_t other = 'X';
+            patch_file(index_file, 12, &other, 1);  // the binding's first byte
+          }
+          fresh_after("another binding's index");
+          persist_clean(pc);
+          {
+            const uint8_t v1 = 'I';
+            patch_file(index_file, 7, &v1, 1);  // the previous file format's magic
+          }
+          fresh_after("the previous index format");
+          // A record whose ids run claims more pages than the slab holds (a
+          // flipped high byte): pruned before any list is built from it,
+          // never a 32 GiB allocation at startup.
+          {
+            auto t = std::make_unique<Tier>(&m, &arena, pc);
+            t->adopt(false);
+            dc::DiskCache::Header h;
+            h.pages = static_cast<uint64_t>(npages);
+            h.page_bytes = pbytes;
+            h.blob_pages = static_cast<uint64_t>(nblob);
+            h.block_tokens = static_cast<uint64_t>(m.kv_block_tokens());
+            dc::DiskCache::Record r;
+            r.position = 12;
+            r.blob_page = cspill.blob_page;
+            r.ids_pages = 0xffffffffu;
+            r.partial_page = cspill.partial_page;
+            t->persist_index(dc::DiskCache::write(h, {r}), {0});
+            t.reset();
+            auto t2 = std::make_unique<Tier>(&m, &arena, pc);
+            require(records_of(t2->candidate_index()) == 0 && t2->adopted_digests().empty(),
+                    "damage: a record with an impossible ids run is pruned");
+            t2.reset();
+          }
+        }
+        // (f) The op timeout: reads that hang against a one-second bound —
+        //     the restore fails (the request would admit cold), the buffer
+        //     returns when the read does, and the next restore is bitwise.
+        {
+          std::atomic<int> delay_ms{0};
+          dgpp::sched::SchedulerEngine::DiskEnable pt = pc;
+          pt.op_timeout_s = 1;
+          pt.io_hook = [&](bool write, int64_t) { return write ? 0 : delay_ms.load(); };
+          auto t = std::make_unique<Tier>(&m, &arena, pt);
+          t->adopt(false);
+          dgpp::sched::SchedulerEngine::DiskSpill ts = spill;
+          ts.op = op++;
+          t->spill_begin(ts);
+          require(wait_on(*t, ts.op), "timeout: the spill completed");
+          delay_ms = 2500;
+          dgpp::sched::SchedulerEngine::DiskRestore tr = rs;
+          tr.op = op++;
+          (void)t->restore_begin(tr);
+          const auto t0 = std::chrono::steady_clock::now();
+          require(!wait_on(*t, tr.op), "timeout: the hung restore failed");
+          const double waited = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+          require(waited >= 0.9 && waited < 2.4, "timeout: failed at the bound, before the read returned (" + std::to_string(waited) + " s)");
+          require(t->stats().failures == 1, "timeout: the failure counted");
+          arena.release(1);
+          require(m.kv_blocks_in_use() == blocks_before, "timeout: the failed restore's blocks came back");
+          // While the hung read still holds the worker: a restore asked for
+          // now is refused at once the way a full pool refuses one (the
+          // scheduler keeps the entry and admits cold), nothing taken; a
+          // spill queued now fails at once (the review of 2026-10-28: a
+          // one-thread worker inside a stuck call serves nobody, and every
+          // later op used to wait out the timeout and drop its entry).
+          delay_ms = 0;
+          tr.op = op++;
+          bool refused = false;
+          try {
+            (void)t->restore_begin(tr);
+          } catch (const dgpp::CachePoolExhausted& e) {
+            refused = std::string(e.what()).find("stuck") != std::string::npos;
+          }
+          require(refused, "timeout: a restore while the worker is stuck is refused at once");
+          require(m.kv_blocks_in_use() == blocks_before && !arena.filled(1), "timeout: the refused restore took nothing");
+          dgpp::sched::SchedulerEngine::DiskSpill ss = spill;
+          ss.op = op++;
+          const auto t1 = std::chrono::steady_clock::now();
+          t->spill_begin(ss);
+          require(!wait_on(*t, ss.op), "timeout: a spill queued while the worker is stuck fails at once");
+          require(std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count() < 1.0,
+                  "timeout: it failed without waiting out another timeout");
+          std::this_thread::sleep_for(std::chrono::milliseconds(2500));  // the hung read returns, the buffer with it
+          for (int i = 0; i < 50; ++i) t->pump();  // the worker freed the stale buffer; nothing else moves
+          tr.op = op++;
+          (void)t->restore_begin(tr);
+          require(wait_on(*t, tr.op), "timeout: the restore after the recovery completed");
+          {
+            std::vector<uint8_t> a(arena.bytes()), b(arena.bytes());
+            DGPP_CUDA_OK(cudaMemcpy(a.data(), arena.slot_data(0), a.size(), cudaMemcpyDeviceToHost));
+            DGPP_CUDA_OK(cudaMemcpy(b.data(), arena.slot_data(1), b.size(), cudaMemcpyDeviceToHost));
+            require(a == b, "timeout: the restore after the recovery is bitwise");
+          }
+          arena.release(1);
+          t.reset();
+        }
+        // (g) An injected write failure fails the spill cleanly.
+        {
+          dgpp::sched::SchedulerEngine::DiskEnable pf = pc;
+          pf.io_hook = [&](bool write, int64_t page) { return write && page == spill.partial_page ? -1 : 0; };
+          auto t = std::make_unique<Tier>(&m, &arena, pf);
+          t->adopt(false);
+          dgpp::sched::SchedulerEngine::DiskSpill fs_ = spill;
+          fs_.op = op++;
+          t->spill_begin(fs_);
+          require(!wait_on(*t, fs_.op) && t->stats().failures == 1, "fault: the spill failed on the injected write");
+          pf.io_hook = nullptr;
+          t.reset();
+        }
+        // (h) RAM-backed storage is refused even when tmpfs accepts O_DIRECT.
+        if (fs::is_directory("/dev/shm")) {
+          dgpp::sched::SchedulerEngine::DiskEnable pb = pc;
+          const std::string shm = "/dev/shm/dgpp_nvme_tier_test";
+          fs::create_directories(shm);
+          pb.slab_path = shm + "/rank0.slab";
+          pb.persist = false;
+          pb.binding.clear();
+          pb.allow_buffered = false;
+          bool refused = false;
+          try {
+            Tier t(&m, &arena, pb);
+          } catch (const std::runtime_error& e) {
+            refused = std::string(e.what()).find("RAM-backed") != std::string::npos;
+          }
+          const auto placement = dgpp::inspect_cache_directory(shm);
+          if (placement.ram_backed) {
+            require(refused, "RAM-backed slab refused regardless of O_DIRECT support");
+            require(!fs::exists(pb.slab_path), "RAM refusal happens before creating a slab");
+            // A file symlink can escape a correctly placed parent directory.
+            // The descriptor check must refuse before truncating its target.
+            const std::string target = shm + "/redirect-target.slab";
+            const std::string redirect = cdir + "/redirect.slab";
+            std::ofstream(target) << "preserve these bytes";
+            fs::create_symlink(target, redirect);
+            auto redirected = pb;
+            redirected.slab_path = redirect;
+            refused = false;
+            try { Tier t(&m, &arena, redirected); }
+            catch (const std::runtime_error& e) {
+              refused = std::string(e.what()).find("RAM-backed") != std::string::npos;
+            }
+            std::ifstream input(target);
+            std::string retained;
+            std::getline(input, retained);
+            require(refused && retained == "preserve these bytes", "descriptor refusal preserves redirected slab");
+            fs::remove(redirect);
+            pb.allow_buffered = true;
+            Tier t(&m, &arena, pb);
+            require(t.pages() > 0, "buffered: allowed when asked");
+          }
+          fs::remove_all(shm);
+        }
+        fs::remove_all(cdir);
+        std::printf("[ OK ] NVMe tier across a crash: content-bound adoption, the lock, damaged files, the op timeout\n");
+      }
+      fs::remove_all(bdir);
+    }
+    arena.release(0);
+    require(m.kv_blocks_in_use() == 0, "tier: every block released");
+    std::printf("[ OK ] NVMe tier: spill/restore bitwise, attach bitwise, corruption detected, the slab across a "
+                "restart\n");
   }
   // Two cuts in one prefill: an earlier document state for changed tails,
   // and the deepest state for identical repeats. Both include MTP state.

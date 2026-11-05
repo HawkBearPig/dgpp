@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python-host:
+    name: Python host suites
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install the tooling requirements
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends rsync jq
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-tools.txt
+      - name: Compile every Python source
+        run: python -m compileall -q scripts tools tests/python
+      - name: Run the host suites
+        # qwen_head_check_test needs a built binary and a checkpoint, so it
+        # runs under CTest on a Spark instead.
+        run: |
+          set -eu
+          for t in tests/python/*_test.py; do
+            case "$(basename "$t")" in
+              qwen_head_check_test.py) continue ;;
+            esac
+            echo "== $t"
+            python "$t"
+          done
+          python tests/python/pdl_wait_audit.py "$PWD"
+
+  docs:
+    name: Documentation links and style
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - run: python3 scripts/docs_check.py

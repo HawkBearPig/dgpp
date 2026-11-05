@@ -115,11 +115,14 @@ class FakeEngine : public SchedulerEngine {
   MtpAcceptance mtp_acceptance() const override { return mtp_counters(mtp_fixture.load()); }
 
   std::atomic<bool> images_available{false};
+  std::atomic<bool> video_available{false};
   std::atomic<int> image_prefills{0};
   bool supports_images() const override { return images_available; }
+  bool supports_video() const override { return video_available; }
   bool supports_image_prefix_cache() const override { return images_available; }
   int32_t prefill_images(int req, const std::vector<int64_t>& prompt, const std::vector<dgpp::ImageInput>& images) override {
-    require(!images.empty() && images[0].rgb.size() == 112 * 112 * 3, "decoded image reaches the engine");
+    require(!images.empty(), "decoded media reaches the engine");
+    dgpp::validate_image_inputs(images, prompt.size(), video_available);
     ++image_prefills;
     return prefill(req, prompt);
   }
@@ -225,8 +228,8 @@ class FakeEngine : public SchedulerEngine {
   int32_t prefill_cached(int req, const std::vector<int64_t>& prompt,
                          dgpp::sched::SchedulerEngine::PrefixPrefill* plan) override {
     if (plan->images && !plan->images->empty()) {
-      require(images_available && plan->images->front().rgb.size() == 112 * 112 * 3,
-              "image payload survives cached admission");
+      require(images_available, "image payload survives cached admission");
+      dgpp::validate_image_inputs(*plan->images, prompt.size(), video_available);
       ++image_prefills;
     }
     if (plan->attach_slot >= 0) {
@@ -444,9 +447,12 @@ std::string json_of(const dgpp::minijson::Value& v) {
 class FakeFrontend : public ModelFrontend {
  public:
   std::function<void(std::string_view)> encode_hook;
+  std::function<std::string(const dgpp::minijson::Value&)> render_hook;
   mutable std::atomic<size_t> decoded_ids{0};
   std::atomic<bool> images_available{false};
+  std::atomic<bool> video_available{false};
   bool supports_images() const override { return images_available; }
+  bool supports_video() const override { return video_available; }
   ChatInput prepare_chat(const dgpp::minijson::Value& globals) const override {
     auto input = ModelFrontend::prepare_chat(globals);
     const auto& messages = globals.at("messages").items();
@@ -454,6 +460,13 @@ class FakeFrontend : public ModelFrontend {
       const auto* content = messages[i].find("content");
       if (!content || !content->is_array()) continue;
       for (size_t j = 0; j < content->items().size(); ++j) {
+        if (content->items()[j].find("video_url")) {
+          const int64_t offset = input.tokens.size();
+          input.images.push_back(
+              {offset, 2, 28, 56, std::vector<uint8_t>(28 * 56 * 3 * 2), 28, 2, {offset}});
+          input.tokens.insert(input.tokens.end(), 2, 200026);
+          continue;
+        }
         const auto* image = content->items()[j].find("image_url");
         if (!image) continue;
         auto im = dgpp::serve::prepare_glm_image(*image,
@@ -519,6 +532,7 @@ class FakeFrontend : public ModelFrontend {
     return out;
   }
   std::string render_chat(const dgpp::minijson::Value& globals) const override {
+    if (render_hook) return render_hook(globals);
     {
       std::lock_guard<std::mutex> lock(mu_);
       last_globals_ = json_of(globals);
@@ -1394,7 +1408,9 @@ DGPP_TEST(serve_prometheusExposition_countersAndDistributions) {
   // WHEN the exposition is read,
   Client m(rig.port());
   m.send_all("GET /metrics/prometheus HTTP/1.1\r\nHost: t\r\n\r\n");
-  const std::string r = m.read_until("dgpp_request_generation_tokens_count", 2000);
+  // The final metric name can arrive before its labels and value. Consume
+  // the complete response so TCP fragmentation cannot truncate the checks.
+  const std::string r = m.read_response(2000);
 
   // THEN it is the text format: the route's original unlabeled lines
   // intact, every family declared once, the counters typed and labeled
@@ -1656,6 +1672,105 @@ void expect_invalid_request(const std::string& resp, const std::string& param) {
   require(error.at("param").as_string() == param, "error names " + param + ": " + resp);
 }
 
+DGPP_TEST(serve_json_numbersAndCompleteRequestBodies) {
+  ServiceRig rig(8, model_defaults(), true);
+  for (bool chat : {false, true}) {
+    const auto body = [&](const std::string& extra) {
+      return chat ? chat_body("abcd", 2, extra)
+                  : "{\"model\":\"" + kModel + "\",\"prompt\":\"abcd\",\"max_tokens\":2" + extra +
+                        "}";
+    };
+    const auto post = [&](const std::string& payload, bool valid = false) {
+      Client c(rig.port());
+      c.send_all("POST " + std::string(chat ? "/v1/chat/completions" : "/v1/completions") +
+                 " HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\nContent-Length: " +
+                 std::to_string(payload.size()) + "\r\n\r\n" + payload);
+      return c.read_until(valid ? "usage" : "\"param\"", 3000);
+    };
+    const size_t armed = rig.engine.armed().size();
+    for (const char* token : {"1e", "1e+", "1.2.3", "1-2", "01", "1.", "1.e2", "1e309"})
+      expect_invalid_request(post(body(",\"temperature\":" + std::string(token))), "body");
+    for (const char* extra : {",\"x_vendor\":1e+", ",\"x_vendor\":{\"nested\":[01]}"})
+      expect_invalid_request(post(body(extra)), "body");
+    for (bool stream : {false, true})
+      for (const std::string& suffix :
+           {std::string("junk"), std::string("{}"), std::string(" true"), std::string("\n[]"),
+            std::string(1, '\0'), std::string("\v"), std::string("\f")})
+        expect_invalid_request(post(body(stream ? ",\"stream\":true" : "") + suffix), "body");
+    expect_invalid_request(post(body(",\"seed\":1e0")), "seed");
+    expect_invalid_request(post(body(",\"seed\":9223372036854775808")), "seed");
+    require(rig.engine.armed().size() == armed, "invalid JSON never arms the engine");
+    for (const char* extra : {"", ",\"temperature\":1e+0", ",\"temperature\":-0.0",
+                              ",\"seed\":9223372036854775807", ",\"seed\":-9223372036854775808"})
+      require(post(body(extra) + " \t\r\n", true).find("200 OK") != std::string::npos,
+              "valid numeric syntax and whitespace still complete after refusals");
+    for (const char* number : {"2e0", "2.0", "1e20"}) {
+      auto payload = body("");
+      const size_t at = payload.find("\"max_tokens\":2") + std::strlen("\"max_tokens\":");
+      payload.replace(at, 1, number);
+      const auto response = post(payload, std::string_view(number) != "1e20");
+      if (std::string_view(number) == "1e20")
+        expect_invalid_request(response, "max_tokens");
+      else
+        require(response.find("200 OK") != std::string::npos, "integral doubles remain accepted");
+    }
+  }
+}
+
+DGPP_TEST(serve_json_fileBodiesValidatedBeforeNormalization) {
+  ServiceRig rig(8, model_defaults(), true);
+  const std::string body =
+      "{\"model\":\"" + kModel +
+      R"(","messages":[{"role":"user","content":[{"type":"file","file":{"filename":"input.txt","file_data":"aGVsbG8="}}]}],"max_tokens":2})";
+  for (const std::string& suffix :
+       {std::string("junk"), std::string("{}"), std::string(" \n[]"), std::string(1, '\0')})
+    expect_invalid_request(post_chat(rig, body + suffix, "\"param\""), "body");
+  auto malformed = body;
+  malformed.insert(malformed.size() - 1, "e");
+  expect_invalid_request(post_chat(rig, malformed, "\"param\""), "body");
+  require(rig.engine.armed().empty(), "malformed file requests never arm the engine");
+  require(post_chat(rig, body + " \t\r\n", "usage").find("200 OK") != std::string::npos,
+          "valid padded file request completes");
+  require(rig.frontend.last_globals().find("hello") != std::string::npos,
+          "file normalization still extracts text");
+}
+
+DGPP_TEST(serve_templateLimits_rejectBeforeEncodingAndRecover) {
+  const std::vector<std::pair<std::string, std::string>> cases = {
+      {"{{ range(262145)|length }}", "range elements"},
+      {"{% macro f() %}{{ f() }}{% endmacro %}{{ f() }}", "render depth"},
+      {"{% set n = namespace(s='reject') %}{% for i in range(22) %}"
+       "{% set n.s = n.s + n.s %}{% endfor %}", "string bytes"},
+  };
+  for (const auto& [body, reason] : cases) {
+    const auto tpl = dgpp::text::ChatTemplate::compile(
+        "{% if messages[0].content == 'reject' %}" + body +
+        "{% else %}{{ messages[0].content }}{% endif %}");
+    std::atomic<int> encoded{0};
+    ServiceRig rig;
+    rig.frontend.render_hook = [&](const dgpp::minijson::Value& globals) {
+      return tpl.render(dgpp::text::Value::from_minijson(globals));
+    };
+    rig.frontend.encode_hook = [&](std::string_view) { ++encoded; };
+    for (const bool stream : {false, true}) {
+      const int before = encoded.load();
+      const auto response = post_chat(
+          rig, chat_body("reject", 1, stream ? ",\"stream\":true" : ""));
+      expect_invalid_request(response, "messages");
+      require(response.find("chat-template: line 1: resource limit: " + reason) != std::string::npos,
+              "template refusal retains its line and reason: " + response);
+      require(response.find("text/event-stream") == std::string::npos,
+              "template refusal precedes streaming headers");
+      require(encoded.load() == before, "rejected render must not reach tokenization");
+      const auto recovered = post_chat(rig, chat_body("abcd", 1), "usage");
+      require(recovered.find("200 OK") != std::string::npos,
+              "the same template and service recover after refusal: " + recovered);
+      require(encoded.load() == before + 1 && !rig.failed.load(),
+              "only the valid request reaches tokenization and the engine stays healthy");
+    }
+  }
+}
+
 std::string assistant_history_body(const std::string& messages) {
   return "{\"model\":\"" + kModel + "\",\"max_tokens\":1,\"messages\":["
          "{\"role\":\"user\",\"content\":\"hi\"}," + messages + "]}";
@@ -1666,6 +1781,44 @@ std::string assistant_history_globals(ServiceRig& rig, const std::string& messag
   require(response.find("200 OK") != std::string::npos,
           "assistant history is accepted: " + response);
   return rig.frontend.last_globals();
+}
+
+DGPP_TEST(serve_json_stringToolArgumentsAreCompleteDocuments) {
+  ServiceRig rig;
+  const auto history = [&](const std::string& arguments) {
+    return R"({"role":"assistant","tool_calls":[{"id":"call_1","type":"function",)"
+           R"("function":{"name":"f","arguments":)" +
+           arguments + "}}]}";
+  };
+  for (const std::string& input : {std::string(R"({"x":1e+})"), std::string(R"({"x":01})"),
+                                   std::string(R"({"x":1.2.3})"), std::string(R"({"x":1}junk)"),
+                                   std::string(R"({"x":1}{})"), std::string(R"({"x":1})") + '\0'})
+    expect_invalid_request(
+        post_chat(
+            rig,
+            assistant_history_body(history(json_of(dgpp::minijson::Value::make_string(input)))),
+            "\"param\""),
+        "messages[1].tool_calls[0].function.arguments");
+  for (const auto& arguments :
+       {std::string(R"({"x":1e0})"),
+        json_of(dgpp::minijson::Value::make_string("{\"x\":1e0} \t\r\n"))}) {
+    const auto globals = assistant_history_globals(rig, history(arguments));
+    const auto parsed = dgpp::minijson::parse(globals);
+    require(parsed.root.at("messages")
+                    .items()[1]
+                    .at("tool_calls")
+                    .items()[0]
+                    .at("function")
+                    .at("arguments")
+                    .at("x")
+                    .as_double() == 1.0,
+            "object and complete string tool arguments agree");
+  }
+  const auto custom = assistant_history_globals(
+      rig, R"({"role":"assistant","tool_calls":[{"id":"call_2","type":"custom",)"
+           R"("custom":{"name":"exec","input":"1e+ trailing text"}}]})");
+  require(custom.find("1e+ trailing text") != std::string::npos,
+          "custom tool input remains raw text");
 }
 
 DGPP_TEST(serve_refusalParts_preserveTextAndLaterHistory) {
@@ -4249,6 +4402,100 @@ std::string post_legacy(ServiceRig& rig, const std::string& body,
              std::to_string(body.size()) + "\r\n\r\n" + body);
   return c.read_until(until, budget_ms);
 }
+DGPP_TEST(serve_promptLogprobs_rejectsUnsupportedScoringOnBothRoutes) {
+  ServiceRig rig(8, model_defaults(), true);
+  for (bool chat : {false, true}) {
+    for (bool stream : {false, true}) {
+      for (const std::string value :
+           {"0", "1", "-1", "1.5", "true", "false", "\"0\"", "[]", "{}"}) {
+        const std::string extra =
+            ",\"prompt_logprobs\":" + value + (stream ? ",\"stream\":true" : "");
+        const std::string body = chat ? chat_body("abcd", 2, extra)
+                                      : "{\"model\":\"" + kModel +
+                                            "\",\"prompt\":\"abcd\",\"max_tokens\":2" + extra + "}";
+        const auto response = chat ? post_chat(rig, body, "unsupported_parameter")
+                                   : post_legacy(rig, body, "unsupported_parameter");
+        expect_invalid_request(response, "prompt_logprobs");
+        require(response.find("\"code\":\"unsupported_parameter\"") != std::string::npos,
+                "prompt scoring is explicitly unsupported, not silently ignored");
+        require(response.find("text/event-stream") == std::string::npos,
+                "reject before starting a stream");
+      }
+    }
+  }
+  require(rig.engine.armed().empty(), "unsupported scoring never reaches generation");
+}
+
+DGPP_TEST(serve_promptLogprobs_nullAndOmissionPreserveGeneratedLogprobs) {
+  ServiceRig rig(8, model_defaults(), true);
+  for (bool chat : {false, true}) {
+    for (bool stream : {false, true}) {
+      for (bool explicit_null : {false, true}) {
+        const std::string extra = std::string(chat ? ",\"logprobs\":true" : ",\"logprobs\":1") +
+                                  (explicit_null ? ",\"prompt_logprobs\":null" : "") +
+                                  (stream ? ",\"stream\":true" : "");
+        const std::string body = chat ? chat_body("abcd", 2, extra)
+                                      : "{\"model\":\"" + kModel +
+                                            "\",\"prompt\":\"abcd\",\"max_tokens\":2" + extra + "}";
+        const std::string until = stream ? "[DONE]" : "usage";
+        const auto response = chat ? post_chat(rig, body, until) : post_legacy(rig, body, until);
+        require(response.starts_with("HTTP/1.1 200 OK"), "null is omission on both routes");
+        require(response.find(chat ? "\"logprob\":-0.25" : "\"token_logprobs\":[-0.25") !=
+                    std::string::npos,
+                "generated-token logprobs remain available");
+      }
+    }
+  }
+}
+
+DGPP_TEST(serve_parameters_duplicateFieldsRejectBeforeGeneration) {
+  ServiceRig rig(8, model_defaults(), true);
+  for (bool chat : {false, true}) {
+    for (bool stream : {false, true}) {
+      Client client(rig.port());
+      const auto post = [&](const std::string& extra) {
+        const std::string options = extra + (stream ? ",\"stream\":true" : "");
+        const std::string body = chat ? chat_body("abcd", 2, options)
+                                      : "{\"model\":\"" + kModel +
+                                            "\",\"prompt\":\"abcd\",\"max_tokens\":2" + options +
+                                            "}";
+        client.send_all(
+            std::string("POST ") + (chat ? "/v1/chat/completions" : "/v1/completions") +
+            " HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\nContent-Length: " +
+            std::to_string(body.size()) + "\r\n\r\n" + body);
+        return client.read_response(5000);
+      };
+      const size_t armed = rig.engine.armed().size();
+      const auto admitted = rig.service.stats().requests_total;
+      for (const auto& [extra, param] :
+           {std::pair{R"(,"prompt_logprobs":null,"prompt_logprobs":0)", "prompt_logprobs"},
+            std::pair{R"(,"prompt_logprobs":0,"prompt_logprobs":null)", "prompt_logprobs"},
+            std::pair{R"(,"prompt_logprobs":null,"prompt_logprobs":null)", "prompt_logprobs"},
+            std::pair{R"(,"prompt_logprobs":null,"\u0070rompt_logprobs":1)", "prompt_logprobs"},
+            std::pair{R"(,"max_tokens":3)", "max_tokens"},
+            std::pair{R"(,"model":"glm-5.3-flash-fp8")", "model"},
+            std::pair{R"(,"logprobs":null,"logprobs":1)", "logprobs"},
+            std::pair{R"(,"client_extension":null,"client_extension":{})", "client_extension"}}) {
+        const auto response = post(extra);
+        expect_invalid_request(response, param);
+        require(response.find("text/event-stream") == std::string::npos,
+                "duplicate fields never start SSE");
+        if (!chat)
+          require(response.find("\"code\":\"invalid_parameter\"") != std::string::npos,
+                  "legacy duplicate fields use the invalid_parameter code");
+      }
+      require(rig.engine.armed().size() == armed && rig.service.stats().requests_total == admitted,
+              "duplicate fields never reach admission or generation");
+      const auto response =
+          post(std::string(R"(,"prompt_logprobs":null,"logprobs":)") + (chat ? "true" : "1"));
+      require(response.starts_with("HTTP/1.1 200 OK") &&
+                  response.find(chat ? "\"logprob\":-0.25" : "\"token_logprobs\":[-0.25") !=
+                      std::string::npos,
+              "the same connection still serves valid null and generated logprobs after refusals");
+    }
+  }
+}
+
 // A one-shot chat read through the usage object's last key.
 std::string post_full(ServiceRig& rig, const std::string& body) {
   return post_chat(rig, body, "reasoning_tokens\":", 5000);
@@ -4589,7 +4836,22 @@ DGPP_TEST(serve_edge_reasoningAliasesAndSwitchOnlyModels) {
             rig.frontend.last_globals().find("reasoning_effort") == std::string::npos, "no invented effort level on switch-only model");
   }
   rig.frontend.reads_enable_thinking = false;
-  expect_invalid_request(post_chat(rig, chat_body("abcd", 2, R"(,"reasoning_effort":"low")"), "\"param\""), "reasoning_effort");
+  // Always-on models such as Flint accept positive effort without inventing
+  // template controls, but still cannot disable reasoning.
+  for (const auto* effort : {"minimal", "low", "medium", "high", "xhigh", "max"}) {
+    const auto result = post_until_usage(
+        rig, chat_body("abcd", 2, std::string(R"(,"reasoning_effort":")") + effort + "\""));
+    require(result.find("200 OK") != std::string::npos,
+            "always-on model accepts positive effort");
+    const auto rendered_globals = rig.frontend.last_globals();
+    const auto parsed_globals = dgpp::minijson::parse(rendered_globals);
+    require(!parsed_globals.root.find("enable_thinking") &&
+                !parsed_globals.root.find("reasoning_effort"),
+            "always-on model receives no invented template controls");
+  }
+  expect_invalid_request(post_chat(rig, chat_body("abcd", 2, R"(,"reasoning_effort":"none")"),
+                                  "\"param\""),
+                         "reasoning_effort");
 }
 
 DGPP_TEST(serve_edge_filePreprocessingPipeliningAndDisconnect) {
@@ -5204,6 +5466,31 @@ DGPP_TEST(serve_images_capability_validation_and_streaming) {
   response = post_chat(rig, body("data:image/png;base64,AAAA", false), "invalid_image");
   require(response.find("messages[0].content[1].image_url.url") != std::string::npos,
           "invalid image names the precise field");
+}
+
+DGPP_TEST(serve_video_requires_both_capabilities_and_reaches_the_engine) {
+  ServiceRig rig;
+  const std::string body =
+      R"({"model":"glm-5.3-flash-fp8","max_tokens":1,"messages":[{"role":"user","content":[{"type":"video_url","video_url":{"url":"fixture"}}]}]})";
+  auto response = post_chat(rig, body, "unsupported_content_type");
+  require(response.find("400 Bad Request") != std::string::npos, "text frontend refuses video");
+  rig.frontend.video_available = true;
+  response = post_chat(rig, body, "unsupported_content_type");
+  require(response.find("400 Bad Request") != std::string::npos, "image-only engine refuses video");
+  rig.engine.images_available = true;
+  rig.engine.video_available = true;
+  response = post_chat(rig, body, "usage");
+  require(response.find("200 OK") != std::string::npos && rig.engine.image_prefills == 1,
+          "video payload reaches prefill");
+  Client models(rig.port());
+  models.send_all("GET /v1/models HTTP/1.1\r\nHost: t\r\n\r\n");
+  require(models.read_available(800).find("\"input_modalities\":[\"text\",\"video\"]") !=
+              std::string::npos,
+          "model capabilities report the effective video modality");
+  auto wrong_role = body;
+  wrong_role.replace(wrong_role.find("user"), 4, "assistant");
+  response = post_chat(rig, wrong_role, "unsupported_content_type");
+  require(response.find("400 Bad Request") != std::string::npos, "video requires a user message");
 }
 
 DGPP_TEST(serve_models_reports_the_active_rope_and_the_effective_limit) {

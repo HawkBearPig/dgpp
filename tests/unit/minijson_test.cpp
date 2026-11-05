@@ -1,6 +1,8 @@
 #include "loaders/minijson.hpp"
 
+#include <cmath>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -8,6 +10,100 @@
 
 using dgpp::minijson::parse;
 using dgpp::minijson::Value;
+
+namespace {
+void rejects_json(std::string_view input, bool document = false) {
+  try {
+    if (document)
+      dgpp::minijson::parse_document(input);
+    else
+      parse(input);
+  } catch (const std::runtime_error&) {
+    return;
+  }
+  throw std::runtime_error("accepted malformed JSON: " + std::string(input));
+}
+}  // namespace
+
+DGPP_TEST(minijson_number_grammar) {
+  for (const char* token :
+       {"1e",     "1e+",      "1e-",       "1E",    "1E+",    "1E-",
+        "1.2.3",  "1-2",      "1+2",       "1e2e3", "1e++2",  "1e--2",
+        "01",     "00",       "-01",       "00.1",  "01e2",   "1.",
+        "-1.",    "1.e2",     "-",         "--1",   "+1",     ".1",
+        "NaN",    "Infinity", "-Infinity", "1e309", "-1e309", "1.7976931348623159e308",
+        "1e-400", "-1e-400"}) {
+    rejects_json(token);
+    rejects_json("[" + std::string(token) + "]");
+    rejects_json("{\"n\":" + std::string(token) + "}");
+  }
+}
+
+DGPP_TEST(minijson_number_representations) {
+  using K = Value::Kind;
+  const std::pair<const char*, int64_t> integers[] = {{"0", 0},
+                                                      {"-0", 0},
+                                                      {"1", 1},
+                                                      {"-1", -1},
+                                                      {"9007199254740993", 9007199254740993LL},
+                                                      {"9223372036854775807", INT64_MAX},
+                                                      {"-9223372036854775808", INT64_MIN}};
+  for (const auto& [text, expected] : integers) {
+    const auto result = parse(text);
+    if (result.root.kind() != K::Int || result.root.as_int() != expected)
+      throw std::runtime_error("integer representation: " + std::string(text));
+  }
+  const std::pair<const char*, double> doubles[] = {
+      {"0.0", 0.0},
+      {"-0.0", -0.0},
+      {"-0e0", -0.0},
+      {"1.0", 1.0},
+      {"1e0", 1.0},
+      {"1E+2", 100.0},
+      {"1e-2", .01},
+      {"0.125", .125},
+      {"9223372036854775808", 0x1p63},
+      {"-9223372036854775809", -0x1p63},
+      {"18446744073709551615", 0x1p64},
+      {"1.7976931348623157e308", std::numeric_limits<double>::max()},
+      {"2.2250738585072014e-308", std::numeric_limits<double>::min()},
+      {"4.9406564584124654e-324", std::numeric_limits<double>::denorm_min()}};
+  for (const auto& [text, expected] : doubles) {
+    const auto result = parse(text);
+    if (result.root.kind() != K::Double || result.root.as_double() != expected ||
+        std::signbit(result.root.as_double()) != std::signbit(expected))
+      throw std::runtime_error("double representation: " + std::string(text));
+  }
+  const auto nested = parse("{\"n\":[1,1.0,1e0 \t\r\n],\"end\":-2}");
+  if (nested.root.at("n").items()[0].kind() != K::Int ||
+      nested.root.at("n").items()[1].kind() != K::Double ||
+      nested.root.at("n").items()[2].kind() != K::Double || nested.root.at("end").as_int() != -2)
+    throw std::runtime_error("number delimiters or representations changed");
+}
+
+DGPP_TEST(minijson_document_requires_only_json_whitespace_after_value) {
+  for (const char* root : {"0", "-0.0", "true", "null", "\"x\"", "[]", "{}"}) {
+    const std::string padded = " \t\r\n" + std::string(root) + " \t\r\n";
+    const auto result = dgpp::minijson::parse_document(padded);
+    if (result.consumed != 4 + std::strlen(root))
+      throw std::runtime_error("document consumed count includes trailing whitespace");
+    for (const std::string& suffix :
+         {std::string("junk"), std::string("{}"), std::string("[]"), std::string("true"),
+          std::string("0"), std::string(1, '\0'), std::string("\v"), std::string("\f"),
+          std::string("//comment"), std::string("/*comment*/")})
+      rejects_json(std::string(root) + " \n" + suffix, true);
+  }
+  for (const char* input : {"", " \n\t", "0x10", "1foo", "{}suffix", "{}{}"})
+    rejects_json(input, true);
+  for (const auto& [input, count] :
+       std::initializer_list<std::pair<const char*, size_t>>{{"{}suffix", 2},
+                                                             {"1 rest", 1},
+                                                             {"1,2", 1},
+                                                             {"truefalse", 4},
+                                                             {"0x10", 1},
+                                                             {"  [1, 2, 3]   \n\t ", 11}})
+    if (parse(input).consumed != count) throw std::runtime_error("prefix API changed");
+}
 
 DGPP_TEST(minijson_object_scalars) {
   const char* json = R"({"a":1,"b":-2,"c":3.5,"d":true,"e":false,"f":null})";

@@ -1,4 +1,5 @@
 #include "serve/cluster_config.hpp"
+#include "serve/nvme_cache_check.hpp"
 
 #include <algorithm>
 #include <arpa/inet.h>
@@ -279,6 +280,10 @@ ClusterConfig parse_cluster_config(const std::string& json, const std::string& w
           e.prefill_activations = text(x, ek, what);
           if (e.prefill_activations != "bf16" && e.prefill_activations != "native")
             fail(what, "'" + ek + "' must be \"bf16\" or \"native\"");
+        } else if (p.key == "activations") {
+          e.activations = text(x, ek, what);
+          if (e.activations != "bf16" && e.activations != "native")
+            fail(what, "'" + ek + "' must be \"bf16\" or \"native\"");
         } else if (p.key == "prefill_attention") {
           e.prefill_attention = text(x, ek, what);
           if (e.prefill_attention != "bf16" && e.prefill_attention != "fp8")
@@ -304,6 +309,12 @@ ClusterConfig parse_cluster_config(const std::string& json, const std::string& w
           e.prefill = text(x, ek, what);
           if (e.prefill != "bounded" && e.prefill != "exact")
             fail(what, "'" + ek + "' must be \"bounded\" or \"exact\"");
+        } else if (p.key == "dory_loops") {
+          e.dory_loops = static_cast<int>(integer(x, ek, what, 1, 1 << 16));
+        } else if (p.key == "dory_kv_cache") {
+          e.dory_kv_cache = text(x, ek, what);
+          if (e.dory_kv_cache != "per_loop" && e.dory_kv_cache != "last_loop")
+            fail(what, "'" + ek + "' must be \"per_loop\" or \"last_loop\"");
         } else if (p.key == "prefill_dense") {
           e.prefill_dense = text(x, ek, what);
           if (e.prefill_dense != "auto" && e.prefill_dense != "tile" && e.prefill_dense != "streaming")
@@ -417,7 +428,8 @@ ClusterConfig parse_cluster_config(const std::string& json, const std::string& w
         else if (p.key == "dflash_draft_batch") e.dflash_draft_batch = boolean(x, ek, what);
         else if (p.key == "dflash_depth") e.dflash_depth = static_cast<int>(integer(x, ek, what, 0, 7));
         else if (p.key == "mtp_depth") {
-          e.mtp_depth = static_cast<int>(integer(x, ek, what, 1, 5));  // the MTP families' chains; the DFlash2 block is its checkpoint's
+          e.mtp_depth = static_cast<int>(
+              integer(x, ek, what, 1, 7));  // The loaded family validates its own draft width.
           e.mtp_depth_set = true;
         } else if (p.key == "compact_batches")
           e.compact_batches = boolean(x, ek, what);
@@ -432,7 +444,8 @@ ClusterConfig parse_cluster_config(const std::string& json, const std::string& w
         } else if (p.key == "mtp_schedule_lambda") {
           e.mtp_schedule_lambda = number(x, ek, what);
           if (!(e.mtp_schedule_lambda >= 0.0)) fail(what, "'" + ek + "' must be >= 0 (0: the reservation rate)");
-        } else if (p.key == "mtp_schedule_min_depth") e.mtp_schedule_min_depth = static_cast<int>(integer(x, ek, what, 1, 5));
+        } else if (p.key == "mtp_schedule_min_depth")
+          e.mtp_schedule_min_depth = static_cast<int>(integer(x, ek, what, 1, 7));
         else if (p.key == "mtp_schedule_options") e.mtp_schedule_options = static_cast<int>(integer(x, ek, what, 0, 6));
         else if (p.key == "mtp_schedule_adapt") e.mtp_schedule_adapt = boolean(x, ek, what);
         else if (p.key == "mtp_schedule_sampled_scale") {
@@ -482,6 +495,8 @@ ClusterConfig parse_cluster_config(const std::string& json, const std::string& w
             fail(what, "'" + ek + "' must be >= 0 (0 turns the cache off)");
         } else if (p.key == "prefix_min_tokens")
           e.prefix_min_tokens = static_cast<int>(integer(x, ek, what, 0, 1 << 30));
+        else if (p.key == "prefix_pin_max_pct")
+          e.prefix_pin_max_pct = static_cast<int>(integer(x, ek, what, 0, 100));
         else if (p.key == "prefix_head_snapshots") e.prefix_head_snapshots = boolean(x, ek, what);
         else if (p.key == "admission") {
           e.admission = text(x, ek, what);
@@ -508,6 +523,42 @@ ClusterConfig parse_cluster_config(const std::string& json, const std::string& w
         } else if (p.key == "reasoning_in_content") e.reasoning_in_content = boolean(x, ek, what);
         else fail(what, "unknown key '" + ek + "'");
       }
+    } else if (k == "nvme_cache") {
+      if (!v.is_object()) fail(what, "'nvme_cache' must be an object");
+      ClusterConfig::NvmeCache& n = c.nvme_cache;
+      for (const Member& p : v.members()) {
+        const std::string nk = "nvme_cache." + p.key;
+        if (p.key == "enabled") n.enabled = boolean(p.value, nk, what);
+        else if (p.key == "path") {
+          n.path = text(p.value, nk, what);
+          if (n.path.empty()) fail(what, "'" + nk + "' must not be empty");
+        } else if (p.key == "required_mount") {
+          n.required_mount = text(p.value, nk, what);
+          if ((!n.required_mount.empty() && n.required_mount.front() != '/') ||
+              n.required_mount.find('\0') != std::string::npos)
+            fail(what, "'" + nk + "' must be empty or an absolute mountpoint path");
+        } else if (p.key == "capacity_gib") {
+          n.capacity_gib = number(p.value, nk, what);
+          if (n.capacity_gib < 0.0) fail(what, "'" + nk + "' must be >= 0");
+        } else if (p.key == "min_tokens") n.min_tokens = integer(p.value, nk, what, 0, 1ll << 40);
+        else if (p.key == "chunk_mib") n.chunk_mib = integer(p.value, nk, what, 4, 4096);
+        else if (p.key == "max_ops") n.max_ops = integer(p.value, nk, what, 1, 256);
+        else if (p.key == "reserve_gib") {
+          n.reserve_gib = number(p.value, nk, what);
+          if (n.reserve_gib < 0.0) fail(what, "'" + nk + "' must be >= 0");
+        } else if (p.key == "persist") n.persist = boolean(p.value, nk, what);
+        else if (p.key == "reuse_binding") {
+          n.reuse_binding = text(p.value, nk, what);
+          if (!n.reuse_binding.empty() && !valid_nvme_cache_binding(n.reuse_binding))
+            fail(what, "'" + nk + "' must be an existing binding (16 lowercase hexadecimal digits)");
+        } else if (p.key == "allow_buffered") n.allow_buffered = boolean(p.value, nk, what);
+        else if (p.key == "op_timeout_s") n.op_timeout_s = integer(p.value, nk, what, 0, 86400);
+        else fail(what, "unknown key '" + nk + "'");
+      }
+      if (n.enabled && n.capacity_gib <= 0.0)
+        fail(what, "'nvme_cache.capacity_gib' must be positive when the cache is enabled");
+      if (!n.reuse_binding.empty() && (!n.enabled || !n.persist))
+        fail(what, "'nvme_cache.reuse_binding' requires enabled and persist to be true");
     } else if (k == "paths") {
       if (!v.is_object()) fail(what, "'paths' must be an object");
       for (const Member& p : v.members()) {

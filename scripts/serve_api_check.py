@@ -3,7 +3,7 @@
 n, logit_bias and the usage details, exercised on the real model and
 reported compactly.
 
-    serve_api_check.py HOST PORT [MODEL]
+    serve_api_check.py HOST PORT [MODEL] [--tokenizer PATH]
 
   stop        a one-shot with a stop string the model is bound to produce
               (the second word of its own unconstrained answer): the content
@@ -25,9 +25,30 @@ from serve_client import served_model
 import sys
 import http.client
 import uuid
+import argparse
+from pathlib import Path
 
-HOST, PORT = sys.argv[1], int(sys.argv[2])
-MODEL = sys.argv[3] if len(sys.argv) > 3 else served_model(HOST, PORT)
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("host")
+parser.add_argument("port", type=int)
+parser.add_argument("model", nargs="?")
+parser.add_argument("--tokenizer", type=Path, help="checkpoint tokenizer.json; selects a visible token for logit_bias")
+args = parser.parse_args()
+HOST, PORT = args.host, args.port
+MODEL = args.model or served_model(HOST, PORT)
+FORCE_ID, FORCE_TEXT = 100, None
+if args.tokenizer:
+    tokenizer = json.loads(args.tokenizer.read_text())
+    special = {t["id"] for t in tokenizer.get("added_tokens", []) if t.get("special")}
+    # These ASCII byte-level BPE entries decode literally. Low ids can be
+    # invisible control tokens (Dory reserves 0..999), so inspect the vocab.
+    for text in ("!", "~", "^"):
+        token = tokenizer["model"]["vocab"].get(text)
+        if token is not None and token not in special:
+            FORCE_ID, FORCE_TEXT = token, text
+            break
+    else:
+        parser.error("tokenizer has no regular ASCII token for the logit_bias probe")
 failures = []
 
 
@@ -159,7 +180,6 @@ check("n=2 stream",
 # forced-token probe: forcing a token inside an open chat reasoning block
 # never closes that block, and Chat logprobs cover visible content only.
 # The unit and loopback gates cover the ban's exact arithmetic.
-FORCE_ID = 100
 forced = {"model": MODEL, "prompt": "Continue: ", "temperature": 0,
           "logit_bias": {str(FORCE_ID): 100}, "max_tokens": 6}
 st, r = post("/v1/completions", forced)
@@ -168,6 +188,7 @@ st2, r2 = post("/v1/completions", dict(forced, logprobs=1))
 toks = r2["choices"][0]["logprobs"]["tokens"] if st2 == 200 else []
 check("logit_bias force",
       st == 200 and st2 == 200 and len(set(toks)) == 1 and len(toks) == 6
+      and (FORCE_TEXT is None or forced_text == FORCE_TEXT * 6)
       and forced_text == r2["choices"][0]["text"],
       f"tokens={toks} text={forced_text!r}")
 st, r = post("/v1/chat/completions", chat(prompt, logit_bias={str(FORCE_ID): -100}, **no_think))

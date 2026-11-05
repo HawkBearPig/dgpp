@@ -110,6 +110,9 @@ class FlintModel : public SessionModel<FlintModel> {
   static constexpr int kv_block_tokens_static() { return kBlockTokens; }
   // The same number for a shape that is not built yet (the memory plan).
   static size_t session_snapshot_bytes(const FlintTextConfig&, int, bool) { return kSnapshotStamp; }
+  // One cache block's bytes across every pool plane (the NVMe cold tier's
+  // record, issue #26) for a shape that is not built yet.
+  static size_t kv_block_bytes_static(const FlintTextConfig& cfg, int tp_rank, int tp_world, LatentFormat kv_format);
   using Base::session_snapshot_bytes;
 
   const FlintTextConfig& config() const { return cfg_; }

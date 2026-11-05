@@ -142,6 +142,11 @@ DGPP_TEST(safetensors_rejects_header_lengths_outside_file) {
   expect_rejected("{}", 0, "header length", 3);
 }
 
+DGPP_TEST(safetensors_rejects_leading_zero_numbers) {
+  expect_rejected(tensor_header("[01]", "[0,1]"), 1, "malformed number");
+  expect_rejected(tensor_header("[1]", "[00,1]"), 1, "malformed number");
+}
+
 DGPP_TEST(safetensors_rejects_invalid_data_offsets) {
   for (const auto offsets : {"[-1,0]", "[-8,-4]", "[0,-1]", "[1,0]", "[1048576,0]", "[0,2]",
                              "[9223372036854775807,0]", "[18446744073709551615,0]", "[0.5,1]",

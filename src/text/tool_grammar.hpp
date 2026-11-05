@@ -60,7 +60,8 @@
 
 namespace dgpp::text {
 class Tokenizer;
-}
+class MiniMaxToolGrammar;
+}  // namespace dgpp::text
 
 namespace dgpp::text {
 
@@ -77,7 +78,7 @@ struct GrammarArg {
   enum class Kind : int { kFree = 0, kJson, kText };
   std::string key;
   Kind kind = Kind::kFree;
-  std::string schema;              // kJson: the property's schema JSON text
+  std::string schema;              // kJson, or every kind for recursive XML: full schema JSON
   std::vector<std::string> texts;  // kText: the exact values allowed
   bool operator==(const GrammarArg& o) const {
     return key == o.key && kind == o.kind && schema == o.schema && texts == o.texts;
@@ -111,10 +112,12 @@ struct GrammarTool {
 // a value (minimum, maxLength, pattern, format, ...) — each is a line in
 // `notes`, "not enforced" — and only a schema outside the subset in shape
 // ($ref, oneOf, ...) leaves the value free, with a line in `warnings`.
-// Either vector may be null.
+// Either vector may be null. recursive_xml retains every property's schema
+// because recursive XML has no JSON spelling from which to recover types.
 GrammarTool grammar_tool_from_function(const minijson::Value& def,
                                        std::vector<std::string>* warnings,
-                                       std::vector<std::string>* notes = nullptr);
+                                       std::vector<std::string>* notes = nullptr,
+                                       bool recursive_xml = false);
 
 // The request's constraint — what rides the journal (fabric_serve.cpp) and
 // reaches every rank's engine through SchedulerEngine::configure_constraint.
@@ -380,6 +383,8 @@ class GrammarState {
   int arg_ = -1;           // the open argument (index into the tool's args)
   JsonMachine json_;       // kJson: the body's machine (inactive otherwise)
   JsonMachine value_json_; // a kJson argument's machine
+  // Immutable when shared by speculative copies; advance detaches its cursor.
+  std::shared_ptr<MiniMaxToolGrammar> minimax_;
   // The compiled schemas of every kJson argument, [tool][arg] (null
   // where the argument is not kJson).
   std::vector<std::vector<std::shared_ptr<const JsonSchema>>> arg_schemas_;

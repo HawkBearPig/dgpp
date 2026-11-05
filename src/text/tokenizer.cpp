@@ -32,6 +32,23 @@ constexpr const char* kSplitPatternQwen =
 constexpr const char* kSplitPatternQwen2 =
     "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}"
     "| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
+// The Nemotron pattern (Dory1.0-4B's tokenizer, 2026-10-18): no contraction
+// branch, CamelCase letter branches — with U = [\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]
+// and L2 = [\p{Ll}\p{Lm}\p{Lo}\p{M}], `P? U* L2+ | P? U+ L2*` (P excludes
+// only CR/LF, letters and numbers, so a leading space joins the run) — a
+// single \p{N} per pretoken, and the punctuation branch's tail class also
+// swallows '/'. The marks in both letter classes (and in the punctuation
+// class, which excludes only \s, L and N) are the scanner's n_u/n_l2/n_pn.
+constexpr const char* kSplitPatternNemotron =
+    "[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]*[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]+|[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]+[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]*|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
+// MiniMax adds contraction suffixes and three-digit runs to these case
+// classes. Removed+invert retains regex matches; the pattern covers every
+// codepoint, so there are no unmatched gaps to remove.
+constexpr const char* kSplitPatternMinimax =
+    "[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]*[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]+(?i:'"
+    "s|'t|'re|'ve|'m|'ll|'d)?|[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]+[\\p{Ll}"
+    "\\p{Lm}\\p{Lo}\\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\\p{N}{1,3}| "
+    "?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
 // The DeepSeek-V4.1 pre-tokenizer: THREE Split stages (each Isolated,
 // applied to the previous stage's pieces) then ByteLevel. Stage 1 cuts
 // number runs into pieces of at most three; stage 2 isolates CJK runs
@@ -176,8 +193,14 @@ class SplitScanner {
   // marks: the letter-run class admits \p{M} and the punctuation class
   // excludes it (the Qwen3.8 pattern); single_number: one \p{N} per
   // pretoken (Qwen3.8, Qwen2) instead of runs of up to three (GLM).
-  SplitScanner(std::string_view text, std::vector<std::string_view>* out, bool marks, bool single_number)
-      : text_(text), out_(out), marks_(marks), single_number_(single_number) {
+  SplitScanner(std::string_view text, std::vector<std::string_view>* out, bool marks,
+               bool single_number, bool nemotron = false, bool minimax = false)
+      : text_(text),
+        out_(out),
+        marks_(marks),
+        single_number_(single_number),
+        nemotron_(nemotron),
+        minimax_(minimax) {
     // Decode codepoint boundaries once. Strict UTF-8: a chat prompt
     // arrives as valid UTF-8; anything else is a caller bug, not a
     // tokenization ambiguity.
@@ -291,8 +314,87 @@ class SplitScanner {
     return false;
   }
 
+  // ---- the Nemotron pattern (Dory1.0-4B) ---------------------------------
+  // The CamelCase classes: U = [\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}] (a letter
+  // that is not Ll, or a mark), L2 = [\p{Ll}\p{Lm}\p{Lo}\p{M}] (a letter
+  // that is not Lu/Lt, or a mark). The prefix class P = [^\r\n\p{L}\p{N}]
+  // (spaces and marks count), the punctuation class PN = [^\s\p{L}\p{N}].
+  bool n_u(size_t i) const { return !eos(i) && ((letter(i) && !unicode::is_lower(cps_[i])) || unicode::is_mark(cps_[i])); }
+  bool n_l2(size_t i) const { return !eos(i) && ((letter(i) && !unicode::is_upper(cps_[i])) || unicode::is_mark(cps_[i])); }
+  bool n_pre(size_t i) const { return !eos(i) && cps_[i] != '\r' && cps_[i] != '\n' && !letter(i) && !number(i); }
+  bool n_pn(size_t i) const { return !eos(i) && !ws(i) && !letter(i) && !number(i); }
+
+  // `U* L2+` from j with the greedy backtracking (0 = no match): the
+  // longest U run whose position or last character also opens the L2 run.
+  size_t n_core_camel(size_t j) const {
+    size_t p = j;
+    while (n_u(p)) ++p;
+    if (n_l2(p)) {
+      size_t q = p + 1;
+      while (n_l2(q)) ++q;
+      return q;
+    }
+    for (size_t r = p; r-- > j;) {
+      if (n_l2(r)) {
+        size_t q = r + 1;
+        while (n_l2(q)) ++q;
+        return q;
+      }
+    }
+    return 0;
+  }
+  // `U+ L2*` from j (0 = no match).
+  size_t n_core_upper(size_t j) const {
+    if (!n_u(j)) return 0;
+    size_t p = j;
+    while (n_u(p)) ++p;
+    size_t q = p;
+    while (n_l2(q)) ++q;
+    return q;
+  }
+
+  // The Nemotron alternatives in order (B1 has no contraction branch); the
+  // whitespace tail is the other patterns' A5-A7.
+  size_t match_at_nemotron(size_t i) const {
+    size_t end = 0;
+    const auto suffix = [&](size_t at) {
+      size_t last = at;
+      if (minimax_) match_contraction(at, &last);
+      return last;
+    };
+    if (n_pre(i)) {
+      if ((end = n_core_camel(i + 1))) return suffix(end);
+    }
+    if ((end = n_core_camel(i))) return suffix(end);
+    if (n_pre(i)) {
+      if ((end = n_core_upper(i + 1))) return suffix(end);
+    }
+    if ((end = n_core_upper(i))) return suffix(end);
+    if (!eos(i) && number(i)) {
+      size_t j = i + 1;
+      if (minimax_)
+        while (j < i + 3 && !eos(j) && number(j)) ++j;
+      return j;
+    }
+    {
+      size_t j = i;
+      if (cp(i) == ' ' && n_pn(i + 1)) j = i + 1;
+      if (n_pn(j)) {
+        while (n_pn(j)) ++j;
+        while (!eos(j) && (cps_[j] == '\r' || cps_[j] == '\n' || cps_[j] == '/')) ++j;
+        return j;
+      }
+    }
+    if (match_newline_run(i, &end)) return end;
+    if (match_trailing_ws(i, &end)) return end;
+    size_t j = i;
+    while (!eos(j) && ws(j)) ++j;
+    return j;
+  }
+
   // Returns the codepoint index one PAST the match at i (never i).
   size_t match_at(size_t i) const {
+    if (nemotron_ || minimax_) return match_at_nemotron(i);
     size_t end = 0;
     if (match_contraction(i, &end)) return end;
 
@@ -340,6 +442,8 @@ class SplitScanner {
   std::vector<std::string_view>* out_;
   bool marks_ = false;
   bool single_number_ = false;
+  bool nemotron_ = false;  // the Nemotron/Dory CamelCase pattern (Pattern::Nemotron)
+  bool minimax_ = false;
   std::vector<uint32_t> cps_;
   std::vector<size_t> starts_;  // size = cps+1 (end sentinel)
 };
@@ -651,6 +755,14 @@ Tokenizer Tokenizer::load(const std::string& path, size_t word_cache_entries) {
     reject("pre_tokenizer is neither [Split, ByteLevel] nor [Split x 3, ByteLevel]");
   for (size_t k = 0; k < splits; ++k) {
     if (want_string(pres[k], "type", "pre_tokenizer[k]") != "Split") reject("pre_tokenizer stage is not a Split");
+    const bool minimax = splits == 1 && want_string(field(pres[k], "pattern", "Split"), "Regex",
+                                                    "Split.pattern") == kSplitPatternMinimax;
+    if (minimax) {
+      if (want_string(pres[k], "behavior", "Split") != "Removed" ||
+          !want_bool(pres[k], "invert", "Split"))
+        reject("MiniMax Split requires Removed with invert=true");
+      continue;
+    }
     if (want_string(pres[k], "behavior", "Split") != "Isolated") reject("Split behavior is not Isolated");
     if (const minijson::Value* inv = pres[k].find("invert"); inv && inv->kind() == minijson::Value::Kind::Bool && inv->as_bool())
       reject("Split invert must be false");
@@ -661,9 +773,12 @@ Tokenizer Tokenizer::load(const std::string& path, size_t word_cache_entries) {
   };
   if (splits == 1) {
     const std::string_view regex = split_regex(0);
-    if (regex == kSplitPattern) t.pattern_ = 0;
-    else if (regex == kSplitPatternQwen) t.pattern_ = 1;
-    else if (regex == kSplitPatternQwen2) t.pattern_ = 3;
+    if (regex == kSplitPattern) t.pattern_ = Pattern::Glm;
+    else if (regex == kSplitPatternQwen) t.pattern_ = Pattern::Qwen;
+    else if (regex == kSplitPatternQwen2) t.pattern_ = Pattern::Qwen2;
+    else if (regex == kSplitPatternNemotron) t.pattern_ = Pattern::Nemotron;
+    else if (regex == kSplitPatternMinimax)
+      t.pattern_ = Pattern::Minimax;
     else
       reject("Split pattern differs from the pinned regexes (the scanner "
              "hardcodes them — update the scanner or the checkpoint)");
@@ -671,8 +786,8 @@ Tokenizer Tokenizer::load(const std::string& path, size_t word_cache_entries) {
     if (split_regex(0) != kSplitPatternDsv41Numbers || split_regex(1) != kSplitPatternDsv41Cjk)
       reject("the first two Split patterns differ from the pinned three-stage regexes (the scanner "
              "hardcodes them — update the scanner or the checkpoint)");
-    if (split_regex(2) == kSplitPatternDsv41Main) t.pattern_ = 2;
-    else if (split_regex(2) == kSplitPatternFlintMain) t.pattern_ = 4;
+    if (split_regex(2) == kSplitPatternDsv41Main) t.pattern_ = Pattern::Dsv41;
+    else if (split_regex(2) == kSplitPatternFlintMain) t.pattern_ = Pattern::Flint;
     else
       reject("the third Split pattern differs from the pinned DeepSeek-V4.1 and Flint regexes (the scanner "
              "hardcodes them — update the scanner or the checkpoint)");
@@ -827,9 +942,15 @@ Tokenizer Tokenizer::load(const std::string& path, size_t word_cache_entries) {
   DGPP_LOG_INFO(
       "tokenizer: loaded vocab {} merges {} added {} (revision 0x{:016x}; "
       "{} pattern, {}, ignore_merges {})",
-      t.vocab_.size(), t.merge_rank_.size(), t.added_tokens_.size(),
-      t.revision_hash_, t.pattern_ == 2 ? "deepseek-v4.1" : t.pattern_ == 4 ? "flint" : t.pattern_ == 1 ? "qwen" : t.pattern_ == 3 ? "qwen2" : "glm", t.nfc_ ? "NFC" : "no normalizer",
-      t.ignore_merges_);
+      t.vocab_.size(), t.merge_rank_.size(), t.added_tokens_.size(), t.revision_hash_,
+      t.pattern_ == Pattern::Dsv41      ? "deepseek-v4.1"
+      : t.pattern_ == Pattern::Minimax  ? "minimax"
+      : t.pattern_ == Pattern::Nemotron ? "nemotron"
+      : t.pattern_ == Pattern::Flint    ? "flint"
+      : t.pattern_ == Pattern::Qwen     ? "qwen"
+      : t.pattern_ == Pattern::Qwen2    ? "qwen2"
+                                        : "glm",
+      t.nfc_ ? "NFC" : "no normalizer", t.ignore_merges_);
   return t;
 }
 
@@ -880,11 +1001,15 @@ void Tokenizer::encode_segment(std::string_view segment,
     segment = normalized;
   }
   std::vector<std::string_view> pretokens;
-  if (pattern_ == 2 || pattern_ == 4) {
-    Dsv41Scanner scanner(segment, &pretokens, /*flint=*/pattern_ == 4);
+  if (pattern_ == Pattern::Dsv41 || pattern_ == Pattern::Flint) {
+    Dsv41Scanner scanner(segment, &pretokens, /*flint=*/pattern_ == Pattern::Flint);
     scanner.run();
   } else {
-    SplitScanner scanner(segment, &pretokens, /*marks=*/pattern_ == 1, /*single_number=*/pattern_ == 1 || pattern_ == 3);
+    SplitScanner scanner(segment, &pretokens, /*marks=*/pattern_ == Pattern::Qwen,
+                         /*single_number=*/pattern_ == Pattern::Qwen ||
+                             pattern_ == Pattern::Qwen2 || pattern_ == Pattern::Nemotron,
+                         /*nemotron=*/pattern_ == Pattern::Nemotron,
+                         /*minimax=*/pattern_ == Pattern::Minimax);
     scanner.run();
   }
   for (const std::string_view p : pretokens) {

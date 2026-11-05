@@ -6,7 +6,7 @@ performance campaigns remain pending.
 
 References: `z-lab/Qwen3.5-122B-A10B-DFlash` (snap
 `bce6f76c`, 69 tensors, 1.5 GB BF16), the DFlash2 family
-(`src/models/qwen/dflash2.*`, `docs/performance_improvement_plan.md`
+(`src/models/dflash2/*`, `docs/performance_improvement_plan.md`
 §7), `docs/adding_a_model.md`.
 
 ## Architecture

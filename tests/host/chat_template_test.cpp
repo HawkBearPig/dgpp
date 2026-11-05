@@ -168,9 +168,11 @@ DGPP_TEST(structured_output_with_tools_over_the_real_tokenizer) {
   spec.parallel = false;
   spec.tools.push_back(dgpp::text::grammar_tool_from_function(fn.root, nullptr));
   spec.json_schema = R"({"type":"object","properties":{"score":{"type":"number","minimum":0,"maximum":10}},"required":["score"],"additionalProperties":false})";
+  const std::string sep = mk.xml_compact ? "" : "\n";
   const auto call = [&](const std::string& value) {
-    return qwen ? mk.tool_call_open.text + "\n<function=record_score>\n<parameter=score>\n" +
-                      value + "\n</parameter>\n</function>\n" + mk.tool_call_close.text
+    return qwen ? mk.tool_call_open.text + sep + "<function=record_score>" + sep +
+                      "<parameter=score>" + sep + value + sep + "</parameter>" + sep +
+                      "</function>" + sep + mk.tool_call_close.text
                 : mk.tool_call_open.text + "record_score" + mk.arg_key_open.text + "score" +
                       mk.arg_key_close.text + mk.arg_value_open.text + value +
                       mk.arg_value_close.text + mk.tool_call_close.text;
@@ -257,7 +259,9 @@ DGPP_TEST(generation_prompt_tails_across_the_cached_checkpoints) {
     }
     if (arch == dgpp::ModelArchitecture::DeepseekV41 || arch == dgpp::ModelArchitecture::DeepseekV4) continue;
     // The family's declaration, as apps/dgpp_serve.cpp's ServeFamily states it.
-    const bool family_declares = arch == dgpp::ModelArchitecture::Flint || arch == dgpp::ModelArchitecture::MimoV2;
+    const bool family_declares = arch == dgpp::ModelArchitecture::Flint ||
+                                 arch == dgpp::ModelArchitecture::MimoV2 ||
+                                 arch == dgpp::ModelArchitecture::MinimaxM3;
     const auto tok = dgpp::text::Tokenizer::load((snap / "tokenizer.json").string());
     const auto tpl = dgpp::text::ChatTemplate::load((snap / "chat_template.jinja").string());
     dgpp::text::ChatMarkers silent = dgpp::text::ChatMarkers::from_tokenizer(tok);
@@ -303,8 +307,8 @@ DGPP_TEST(generation_prompt_tails_across_the_cached_checkpoints) {
       require(!silent.prompt_leaves_thinking_to_model(prompt),
               tag + ": without the declaration nothing is left to the model" + tail_of(prompt));
       // Under the declaration: unsettled iff the template wrote no marker —
-      // Flint's and MiMo's generation prompts with thinking unset or on,
-      // nothing else; thinking off settles it everywhere.
+      // Flint, MiMo and MiniMax leave the generation prompt unsettled.
+      // A supported thinking-off switch settles it everywhere.
       const bool unsettled = declaring.prompt_leaves_thinking_to_model(prompt);
       const bool expected = family_declares && i < 2;
       require(unsettled == expected,
@@ -339,12 +343,15 @@ DGPP_TEST(custom_tools_and_references_over_the_real_tokenizer) {
   spec.mode = dgpp::text::GrammarSpec::Mode::kRequired;
   spec.parallel = false;
   spec.tools.push_back(dgpp::text::grammar_tool_from_function(fn.root, nullptr));
+  const std::string sep = mk.xml_compact ? "" : "\n";
   for (const auto& [value, expected] : std::vector<std::pair<std::string, bool>>{
       {R"("ABC=12")", true}, {R"("\u0041BC=12")", true}, {R"("ABC=x")", false}, {R"("abc=12")", false}}) {
-    const auto call = qwen ? mk.tool_call_open.text + "\n<function=assign>\n<parameter=input>\n" +
-        value + "\n</parameter>\n</function>\n" + mk.tool_call_close.text :
-        mk.tool_call_open.text + "assign" + mk.arg_key_open.text + "input" + mk.arg_key_close.text +
-        mk.arg_value_open.text + value + mk.arg_value_close.text + mk.tool_call_close.text;
+    const auto call = qwen ? mk.tool_call_open.text + sep + "<function=assign>" + sep +
+                                 "<parameter=input>" + sep + value + sep + "</parameter>" + sep +
+                                 "</function>" + sep + mk.tool_call_close.text
+                           : mk.tool_call_open.text + "assign" + mk.arg_key_open.text + "input" +
+                                 mk.arg_key_close.text + mk.arg_value_open.text + value +
+                                 mk.arg_value_close.text + mk.tool_call_close.text;
     auto ids = tok.encode(call);
     ids.push_back(vocab.call_turn_eos());
     dgpp::text::GrammarState state(&vocab, spec, false);
@@ -993,31 +1000,28 @@ DGPP_TEST(qwen_tool_grammar_accepts_the_golden_turns_over_the_real_tokenizer) {
               name + ": the turn ends with <|im_end|>");
       turn.erase(turn.size() - kEnd.size());
       if (mimo) {
-        // The MiMo template renders the compact form; the grammar emits the
-        // newline form on every XML tokenizer (tool_grammar.cpp), so the
-        // turn the constrained path would produce is rebuilt from the case:
-        // the model's own <think> block and content, then the calls.
+        // History may contain pre-serialized JSON arguments. Constrained
+        // generation writes parameter tags from the decoded arguments in
+        // MiMo's compact XML dialect. Keep reasoning, then force the calls
+        // directly: required/named mode cannot emit the optional prose.
         const dgpp::minijson::Value* rc = msg.find("reasoning_content");
-        const dgpp::minijson::Value* mc = msg.find("content");
         std::string rebuilt = "<think>";
         if (rc && rc->is_string()) rebuilt += std::string(rc->as_string());
         rebuilt += "</think>";
-        if (mc && mc->is_string()) rebuilt += std::string(mc->as_string());
         for (size_t c = 0; c < tcs->items().size(); ++c) {
           const dgpp::minijson::Value& fn = function_of(tcs->items()[c]);
-          if (c > 0) rebuilt += "\n";
-          rebuilt += "<tool_call>\n<function=" + std::string(fn.at("name").as_string()) + ">\n";
+          rebuilt += "<tool_call><function=" + std::string(fn.at("name").as_string()) + ">";
           const dgpp::minijson::Value& args = fn.at("arguments");
           const dgpp::minijson::ParseResult parsed_args =
               args.is_string() ? dgpp::minijson::parse(args.as_string()) : dgpp::minijson::ParseResult{};
           const dgpp::minijson::Value& argv = args.is_string() ? parsed_args.root : args;
           for (const auto& arg : argv.members()) {
-            rebuilt += "<parameter=" + arg.key + ">\n";
+            rebuilt += "<parameter=" + arg.key + ">";
             rebuilt += arg.value.is_string() ? std::string(arg.value.as_string())
                                              : dgpp::text::Value::from_minijson(arg.value).to_json(false);
-            rebuilt += "\n</parameter>\n";
+            rebuilt += "</parameter>";
           }
-          rebuilt += "</function>\n</tool_call>";
+          rebuilt += "</function></tool_call>";
         }
         turn = rebuilt;
       }
@@ -1106,7 +1110,7 @@ DGPP_TEST(qwen_tool_grammar_accepts_the_golden_turns_over_the_real_tokenizer) {
           true);
       wrong.advance(vocab.markers().think_close.id);
       wrong.advance(vocab.markers().tool_call_open.id);
-      for (const int64_t id : tok.encode("\n<function=")) {
+      for (const int64_t id : tok.encode(mimo ? "<function=" : "\n<function=")) {
         require(wrong.allows(id), name + ": the literal before the name is accepted");
         wrong.advance(id);
       }
@@ -1511,13 +1515,28 @@ DGPP_TEST(glm_json_grammar_accepts_tokenized_documents_over_the_real_tokenizer) 
     spec.mode = dgpp::text::GrammarSpec::Mode::kJson;
     spec.json_schema = kSchema;
     dgpp::text::GrammarState g(&vocab, spec, false);
-    for (const int64_t id : tok.encode("{\"")) g.advance(id);
+    const auto advance_checked = [&](const std::string& text) {
+      const auto ids = tok.encode(text);
+      require(!ids.empty(), "JSON key fragment encodes to at least one token: " + text);
+      for (const int64_t id : ids) {
+        dgpp::text::TokenMask current;
+        g.mask(&current);
+        require(current.allows(id), "JSON key fragment refused at " + std::string(g.state_name()) +
+                                        ": " + text + " (token " + std::to_string(id) + ")");
+        require(g.allows(id), "pointwise acceptance agrees for JSON key fragment: " + text);
+        g.advance(id);
+      }
+    };
+    advance_checked("{\"");
     dgpp::text::TokenMask m;
     g.mask(&m);
     require(m.constrained() && m.allowed > 0 && m.allowed < 200,
             "a closed key position admits few ids: " + std::to_string(m.allowed));
-    for (const int64_t id : tok.encode("city")) require(m.allows(id) || true, "");
-    require(!m.allows(tok.encode("zebra")[0]), "a foreign key's first token refused");
+    const auto foreign = tok.encode("zebra");
+    require(!foreign.empty(), "the foreign key encodes to at least one token");
+    require(!m.allows(foreign.front()), "a foreign key's first token refused");
+    advance_checked("city");
+    advance_checked("\":");
   }
   DGPP_LOG_INFO(
       "glm_chat_template_test: JSON tables built in {:.2f} s; {} documents "
@@ -1530,6 +1549,59 @@ DGPP_TEST(glm_json_grammar_accepts_tokenized_documents_over_the_real_tokenizer) 
 }
 
 }  // namespace
+
+// The transformers-generic template's syntax (the shape Dory1.0-4B ships,
+// 2026-10-18): the inline `for k in m if cond` filter over a MAP (jinja
+// iterates a mapping by keys), the `sequence` test (a str is a sequence,
+// a map is not), and tojson's separators. The filtered items get the loop
+// metadata; the keys keep the document's order.
+DGPP_TEST(chat_template_generic_hf_render_extra_keys) {
+  static const char* kSrc =
+      "{% macro render_extra_keys(json_dict, handled_keys) %}"
+      "{%- if json_dict is mapping %}"
+      "{%- for json_key in json_dict if json_key not in handled_keys %}"
+      "{%- if json_dict[json_key] is mapping or (json_dict[json_key] is sequence and json_dict[json_key] is not string) %}"
+      "<{{ json_key }}>{{ json_dict[json_key] | tojson | safe }}</{{ json_key }}>"
+      "{%- else %}"
+      "<{{ json_key }}>{{ json_dict[json_key] | string }}</{{ json_key }}>"
+      "{%- endif %}"
+      "{%- endfor %}"
+      "{%- endif %}"
+      "{% endmacro %}"
+      "{{ render_extra_keys(extra, ['handled']) }}";
+  const auto tpl = dgpp::text::ChatTemplate::compile(kSrc);
+  dgpp::text::Value::Members extra;
+  extra.emplace_back("handled", dgpp::text::Value::integer(1));
+  extra.emplace_back("tags", dgpp::text::Value::list_value(
+                                 {dgpp::text::Value::string_value("a"),
+                                  dgpp::text::Value::string_value("b")}));
+  extra.emplace_back("note", dgpp::text::Value::string_value("plain"));
+  dgpp::text::Value::Members g;
+  g.emplace_back("extra", dgpp::text::Value::map_value(std::move(extra)));
+  const std::string out = tpl.render(dgpp::text::Value::map_value(std::move(g)));
+  const std::string want = "<tags>[\"a\", \"b\"]</tags><note>plain</note>";
+  require(out == want, "generic-template render: got '" + out + "'");
+  // The loop metadata follows the FILTERED sequence.
+  const auto t2 = dgpp::text::ChatTemplate::compile(
+      "{% for k in m if k != 'x' %}{{ loop.index0 }}:{{ k }};{% endfor %}");
+  dgpp::text::Value::Members m2;
+  m2.emplace_back("x", dgpp::text::Value::integer(0));
+  m2.emplace_back("y", dgpp::text::Value::integer(1));
+  m2.emplace_back("z", dgpp::text::Value::integer(2));
+  dgpp::text::Value::Members g2;
+  g2.emplace_back("m", dgpp::text::Value::map_value(std::move(m2)));
+  require(t2.render(dgpp::text::Value::map_value(std::move(g2))) == "0:y;1:z;",
+          "filtered loop metadata");
+  // The iterable stays a ternary when its `if` carries an `else`.
+  const auto t3 = dgpp::text::ChatTemplate::compile(
+      "{% for k in (a if b else c) %}{{ k }}{% endfor %}");
+  dgpp::text::Value::Members g3;
+  g3.emplace_back("a", dgpp::text::Value::list_value({dgpp::text::Value::string_value("A")}));
+  g3.emplace_back("b", dgpp::text::Value::boolean(true));
+  g3.emplace_back("c", dgpp::text::Value::list_value({dgpp::text::Value::string_value("C")}));
+  require(t3.render(dgpp::text::Value::map_value(std::move(g3))) == "A",
+          "a parenthesized ternary iterable still parses");
+}
 
 int main(int argc, char** argv) {
   g_argc = argc;

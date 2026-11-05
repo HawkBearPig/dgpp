@@ -18,6 +18,10 @@ need four Unicode predicates on codepoints:
   is_lower       Ll; is_upper_or_title: Lu, Lt (the Flint pattern's case classes)
   is_mark        Unicode General_Category M* (Mn, Mc, Me)
   is_number      Unicode General_Category N* (Nd, Nl, No)
+  is_upper       Unicode General_Category Lu and Lt (the Nemotron/Dory
+                 CamelCase scanner's upper class; U = (L and not Ll) or M)
+  is_lower       Unicode General_Category Ll (the same scanner's lower
+                 class; L2 = (L and not (Lu or Lt)) or M)
   is_white_space Unicode White_Space property (NOT category Zs alone:
                  0x09-0x0D and 0x85 are White_Space but Cc/Cf)
 
@@ -72,9 +76,9 @@ def main():
         "src/text/unicode_tables.hpp"
     letters = ranges_of(
         lambda cp: unicodedata.category(chr(cp)) in ("Lu", "Ll", "Lt", "Lm", "Lo"))
-    # The Flint pattern's case classes (2026-10-22): [\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]
-    # and [\p{Ll}\p{Lm}\p{Lo}\p{M}] — Ll and Lu+Lt as tables, the rest is
-    # letter-minus-case plus the marks.
+    # The CamelCase case tables (the Nemotron/Dory scanner's U and L2, the
+    # Flint pattern's case classes): Lu+Lt versus Ll — the same ranges both
+    # patterns use.
     lowers = ranges_of(lambda cp: unicodedata.category(chr(cp)) == "Ll")
     uppers = ranges_of(lambda cp: unicodedata.category(chr(cp)) in ("Lu", "Lt"))
     marks = ranges_of(
@@ -174,9 +178,9 @@ namespace dgpp::text::unicode {{
 
 {emit("Letter", letters, "General_Category L* (Lu, Ll, Lt, Lm, Lo)")}
 
-{emit("Lower", lowers, "General_Category Ll — the Flint pattern's lowercase class")}
+{emit("Lower", lowers, "General_Category Ll — the case classes' lower range (the Flint pattern's, the Nemotron/Dory scanner's L2)")}
 
-{emit("Upper", uppers, "General_Category Lu, Lt — the Flint pattern's uppercase class")}
+{emit("Upper", uppers, "General_Category Lu, Lt — the case classes' upper range (the Flint pattern's, the Nemotron/Dory scanner's U)")}
 
 {emit("Mark", marks, "General_Category M* (Mn, Mc, Me)")}
 
@@ -223,6 +227,9 @@ inline bool is_lower(uint32_t cp) {{
   return in_ranges(kLowerRanges, std::size(kLowerRanges), cp);
 }}
 inline bool is_upper_or_title(uint32_t cp) {{
+  return in_ranges(kUpperRanges, std::size(kUpperRanges), cp);
+}}
+inline bool is_upper(uint32_t cp) {{
   return in_ranges(kUpperRanges, std::size(kUpperRanges), cp);
 }}
 inline bool is_punctuation(uint32_t cp) {{

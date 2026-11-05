@@ -34,6 +34,11 @@
     "dense_weights": "fp8",
     "mtp_expert_format": "bf16_fused"
   },
+  "nvme_cache": {
+    "enabled": false,
+    "path": "~/dgpp/nvme-cache",
+    "capacity_gib": 64
+  },
   "paths": {
     "resident_cache": ""
   },

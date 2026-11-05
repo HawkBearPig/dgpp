@@ -4,7 +4,7 @@ Run setup on the first Spark in your cluster (rank 0).
 A supported deployment uses one GB10 per node
 on Linux/aarch64; choose a model and node count from the
 [supported configurations](../README.md#supported-models-and-configurations).
-For the abbreviated command sequence, see the [quickstart](../README.md#quickstart).
+For the abbreviated command sequence, see the README's [getting started](../README.md#getting-started).
 
 For compilation on an x86 Linux workstation, see [cross-compiling for Spark](cross-compiling.md).
 
@@ -142,17 +142,20 @@ and troubleshooting.
    sudo apt-get update
    sudo apt-get install python3 rdma-core libibverbs1 ibverbs-providers \
      libnl-3-200 libnl-route-3-200 libstdc++6 openssh-client openssh-server \
-     rsync curl jq zstd iproute2
+     rsync curl jq zstd iproute2 libavformat60 libavcodec60 libswscale7
    ```
 
 4. On **rank 0 only**, install build and downloader tools:
 
    ```bash
-   sudo apt-get install git build-essential cmake pkg-config python3-venv libibverbs-dev poppler-utils
+   sudo apt-get install git build-essential cmake pkg-config python3-venv \
+     libibverbs-dev poppler-utils libavformat-dev libavcodec-dev libswscale-dev
    ```
 
-   PDF file inputs use `pdftotext` from `poppler-utils` on rank 0. String
-   constraints use PCRE2: CMake uses an installed development package when
+   PDF file inputs use `pdftotext` from `poppler-utils` on rank 0.
+   Native MP4/WebM decoding uses the FFmpeg libraries above.
+   `-DDGPP_ENABLE_VIDEO=OFF` builds without that dependency and advertises no
+   video modality. String constraints use PCRE2: CMake uses an installed development package when
    available, otherwise downloads and builds the pinned static library.
    For an offline build, prefetch PCRE2 10.45 and set
    `-DFETCHCONTENT_SOURCE_DIR_PCRE2=/path/to/pcre2-10.45` during configuration.
@@ -221,6 +224,14 @@ measured best. The other shapes (plain decode with `--no-mtp`, another draft
 depth, slot count or cache budget) are boot knobs; see
 [deployment templates](../deploy/README.md) for the list and the knobs that
 reproduce every retired variant.
+
+The long-context templates carry an `nvme_cache` block, off. Turning it on
+keeps the prefix entries memory evicts on each node's local NVMe, so a
+document pushed out of the cache comes back from disk instead of being
+recomputed. Read [the cold tier](nvme-cache.md) before sizing
+`capacity_gib`. To retain an existing compatible cache when upgrading the
+server, set `nvme_cache.reuse_binding` to its previous binding as described
+in [reuse across upgrades](nvme-cache.md#across-restarts).
 
 ## 3. Set your node addresses and SSH user
 

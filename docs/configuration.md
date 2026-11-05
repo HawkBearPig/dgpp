@@ -18,6 +18,8 @@ Restart the deployment after changing either file.
 | Accept larger file uploads or keep them across restarts | [File inputs](#file-inputs) |
 | Serve longer prompts or more simultaneous requests | [Request capacity and memory](#request-capacity-and-memory) |
 | Reuse work from earlier prompts | [Prefix caching](#prefix-caching) |
+| Keep evicted prefix entries on local NVMe | [NVMe cache](#nvme-cache) |
+| Keep an existing compatible NVMe cache across server upgrades | [`nvme_cache.reuse_binding`](nvme-cache.md#across-restarts) |
 | Balance prompt processing against smooth streaming | [Prefill scheduling](#prefill-scheduling) |
 | Change model storage, precision or generation speed | [Execution and performance](#execution-and-performance) |
 | Extend a supported Qwen model's context limit | [Extended context](#extended-context) |
@@ -223,9 +225,44 @@ Its memory budget is separate from the KV token pool.
 | `engine.prefix_cache_gib` | Memory budget per rank for saved prompt state. A larger cache can retain more reusable prefixes but leaves less memory for other uses. `0` disables it. A chat turn costs about two entries, an agent call about three, and eviction is LRU without time expiry, so an idle agent session survives about slots ÷ 3 other calls. See [cache sizing](prefix-cache.md). | 1.5 GiB |
 | `engine.prefix_min_tokens` | Earliest prompt position at which any snapshot may be saved. Higher values keep short probes and requests from replacing longer cached conversations. Shorter prompts can still reuse matching entries. `0` allows snapshots at every supported cut. | 1024 tokens |
 | `engine.prefix_head_snapshots` | Save an extra snapshot at the first structural prompt boundary, such as the end of the system prompt. This can help a new conversation or a client that shortened its history reuse that prefix. Uses another cache entry and obeys `prefix_min_tokens`. Disabled on DeepSeek's bounded prefill path, which cannot take extra cuts. | true |
+| `engine.prefix_pin_max_pct` | How much of the cache `prompt_cache_key` pins may protect, as a percentage of the arena's slots and of the NVMe slab's pages. While the pinned entries stay within it, unpinned entries are evicted first. Past it a pin protects nothing and plain least-recently-used order applies, so one client cannot pin the whole cache against everyone else. `100` lets pins always protect and `0` ignores pins. Every rank runs rank 0's value. | 50 |
 
 See [prefix caching](prefix-cache.md#the-entry-floor-and-the-head-cut) for how
 snapshot positions and reuse work.
+
+### NVMe cache
+
+The `nvme_cache` block is a top-level deployment key beside `engine`. It keeps
+the prefix-cache entries memory evicts, the snapshot and the KV blocks it
+pins, in one preallocated slab file per rank on local NVMe, and restores an
+entry before a later matching request prefills its suffix. Startup checks the
+directory, the free space and the minimum size on every rank and refuses to
+boot when they do not fit, and `dgpp-serve --memory-plan` runs the same check.
+[The cold tier](nvme-cache.md) describes what is stored, how entries move and
+how retention works.
+
+```json
+"nvme_cache": {
+  "enabled": true,
+  "path": "~/dgpp/nvme-cache",
+  "capacity_gib": 64
+}
+```
+
+| Key | What it controls and what to expect | Default |
+|---|---|---|
+| `nvme_cache.enabled` | Turns the cold tier on. Requires `engine.prefix_cache_gib` above 0 (the tier holds what the arena evicts) and a positive `capacity_gib`. Rank 0's value is applied on every rank. | false |
+| `nvme_cache.path` | Directory for the slab files, created at startup if missing. Choose one on every node's local NVMe. Each rank keeps `<path>/<binding>/rank<N>.slab` on its own node, where the automatic binding names the build version, the checkpoint, the deployment's effective settings and the slab geometry, with the index and the page checksums beside it. Another model or configuration served from the same node gets its own binding directory. Startup names other bindings' slabs left in the directory and their size. Remove them to reclaim the disk. | `~/dgpp/nvme-cache` |
+| `nvme_cache.required_mount` | Optional absolute mountpoint that must contain the cache on each rank. Existing symlinks are resolved; a directory without a mount, a different containing mount, or unavailable mount metadata refuses startup before cache creation. A nested mount is different storage and must be named explicitly. Empty disables the assertion. This verifies placement in the process's mount namespace, not the device or physical NVMe backing. See [container storage](nvme-cache.md#storage-placement-and-containers). | empty |
+| `nvme_cache.capacity_gib` | Size of each rank's slab in GiB. Retention evicts the least recently used entries so the slab never grows past it. Must hold at least one entry at the request context limit plus its snapshot (startup names the number) and must fit the filesystem's free space beside a 1 GiB reserve. Every rank runs rank 0's value. | 0 |
+| `nvme_cache.min_tokens` | The shortest entry worth keeping cold, in prompt tokens. Shorter entries stay memory-only. `0` keeps every entry memory keeps, which `engine.prefix_min_tokens` already floors. | 0 |
+| `nvme_cache.chunk_mib` | One staging slice in MiB, from 4 to 4096. Two slices of device work move per scheduler tick, so this paces a spill or restore against the decode step (128 MiB per tick at the default) and sizes the staging buffers in the memory plan (4 × chunk + 8 MiB). A slice must hold one cache block. Every rank runs rank 0's value. | 64 |
+| `nvme_cache.max_ops` | Spills and restores started but not yet committed by the world, from 1 to 256. A started entry is busy, never evicted, until its commit, so a higher bound protects more freshly taken entries on a slow device at the cost of slots the arena cannot reclaim meanwhile. Every rank runs rank 0's value. | 4 |
+| `nvme_cache.reserve_gib` | Free space the pre-flight leaves on the slab's filesystem, in GiB. Startup refuses a capacity that would cut into it. | 1 |
+| `nvme_cache.persist` | Keep the slab across restarts. A start under the same binding (the same build version, checkpoint, effective settings and slab geometry) adopts the previous run's entries when every rank holds the same index, so switching models and back finds the earlier model's entries, while a build upgrade starts fresh by default. Use `reuse_binding` to select existing entries across upgrades. Under another binding, and with `false`, the slab starts fresh. Each entry is bound to the checksums of its pages when it was written: an entry whose pages a later run reused before a crash, or whose token ids are unreadable, is dropped at startup rather than restored. Entries with image inputs and spills in flight at shutdown are not kept. | true |
+| `nvme_cache.reuse_binding` | Select an existing 16-character lowercase hexadecimal binding directory across build or settings changes. Requires `enabled` and `persist`. Rank 0 sends this selection to every rank; it must exist on each node. The operator asserts that model artifacts and cached-state interpretation remain compatible. Format, geometry, checksum and world-agreement checks remain active; rejected reuse refuses startup without clearing the selected cache. See [reuse across upgrades](nvme-cache.md#across-restarts). | empty (automatic binding) |
+| `nvme_cache.allow_buffered` | Allow RAM-backed storage (tmpfs, ramfs, hugetlbfs) and filesystems that refuse direct I/O. Off, startup refuses these placements because they consume memory outside the model's budget. RAM-backed storage is detected independently of whether `O_DIRECT` is accepted. This does not bypass `required_mount`. For tests and experiments only. | false |
+| `nvme_cache.op_timeout_s` | Give up on a spill or restore that makes no progress for this many seconds (a stuck device or filesystem): the op fails, a request waiting on the restore prefills cold, and the staging buffer the stuck call holds returns when the call does. `0` waits forever. The stall is logged at 30 s and every minute regardless. Every rank runs rank 0's value. | 120 |
 
 ## Prefill scheduling
 
@@ -337,6 +374,8 @@ Keep the template's choices unless you have measured both speed and quality.
 | Key | What it controls and what to expect | Default |
 |---|---|---|
 | `engine.prefill` | DeepSeek-V4.1 prefill mode. `bounded` processes the whole prompt in the encoder and only the final window in the decoder, following the model's serving recipe. `exact` processes every row through every layer for reference comparisons and costs more work. Other families ignore it. | `bounded` |
+| `engine.dory_loops` | Dory1.0-4B: override the recurrent block's loop count. The exact path leaves this unset and runs the checkpoint's own `n_recurrent_loops` (2); the block's weights are shared, so more loops cost time, not memory. Naming a count changes what the engine computes. Other families refuse it at startup. | the checkpoint's value |
+| `engine.dory_kv_cache` | Dory1.0-4B: the recurrent K/V policy. `per_loop` gives every loop of the recurrent block its own paged K/V planes — the exact path. `last_loop` shares one plane per layer and keeps only the last loop's rows: the pool at half the planes, and the earlier loops' history gone (lossy; one cold prefill is unaffected, decode and prefix reuse of a mid-loop state are not). Other families refuse it at startup. | `per_loop` |
 | `engine.prefill_dense` | `auto` selects the family policy: the weight tile for DeepSeek-V4.1, the existing streaming/large-row BF16 bridge for Qwen MXFP8. Explicit `tile` and `streaming` select either form. The DeepSeek-V4.1 prefill walk's dense projections (the attention's q/kv/o projections, the indexer's, the Engram projection, the draft's main projection): `tile` runs them on the fp8-weight tile GEMM, `streaming` on the decode rows' streaming form, which re-reads each weight once per 128 rows and ran a prompt's 4096-row chunks at a quarter of the tile kernel's rate. Both place the same bf16(e4m3 × scale) weights and accumulate in fp32 in different orders: equal within rounding, not bitwise, so a prefill row's value depends on the form, never on the chunk cut. Measured on DeepSeek-V4.1-Flash-1017 on four nodes (2026-10-18): cold prefill 0.480 / 1.415 / 4.045 / 15.328 s at 512 / 2K / 8K / 32K tokens against 0.514 / 1.572 / 4.715 / 17.916 streaming (−14 % at 8K and 32K); decode untouched. Qwen3.8 MXFP8 attention and shared-expert prefill can also select the tile path (resident E8M0 or F32 scales); `streaming` retains their existing streaming/large-row BF16 bridge path. Decode dispatch is unchanged. Other weight forms ignore the key. | `auto` |
 | `engine.prefill_fold_overlap` | The DeepSeek-V4.1 prefill walk's boundary folds overlapped with compute: a walk of 512 rows or more on a multi-rank world runs each layer as two row blocks (the boundary a row of the request's block grid nearest the middle), so every all-reduce of one block lands under the other block's attention, mHC site, router or expert accumulation, and block B's MoE fold under the next layer's block A. Bitwise the one-block walk (the attention takes the second block as it takes any chunk; the MoE's phased form runs the same kernels per row). Under the bounded prefill the encoder layers overlap; the decoder's replay segments are shorter than a block pair. Measured on DeepSeek-V4.1-Flash-1017 on four nodes (2026-10-18): see the model card. Other families keep their own overlap (GLM, DeepSeek-V4). | `true` |
 | `engine.decode_pdl` | The decode graph's kernel-to-kernel edges as programmatic dependencies: a kernel's blocks are scheduled as its predecessor's blocks exit and wait, before their first read, for the predecessor's completion, so each launch's ramp overlaps the previous drain. Only kernels that carry the wait take the edge (the registry in `engine/graph_pdl.hpp`); others keep plain edges. Arithmetic unchanged. `false` leaves every edge plain. | `true` |
@@ -348,6 +387,7 @@ Keep the template's choices unless you have measured both speed and quality.
 | `engine.prefill_fp8_gemm` | Qwen with `dense_weights: "fp8"`: use FP8 tensor cores for eligible block-FP8 dense prefill projections instead of expanding their weights to BF16 first. Smaller projections and unsupported scale grids retain their existing computation paths. Quantizes activations and can change answers. Independent of KV-cache and attention precision. The AutoRound template enables it. | false |
 | `engine.prefill_fp8_per_tensor` | Qwen3.8-27B: make extra FP8 weight copies with one scale per matrix and use them for prefill. Can speed matrix multiplication but requires substantial additional memory, about 23 GiB at the 27B shape. The added quantization can change answers, including greedy completions. | false |
 | `engine.prefill_activations` | Qwen3.8-27B prefill activation precision. `bf16` keeps intermediate inputs in BF16 and expands quantized weights for multiplication. `native` uses the checkpoint's FP8 or mixed NVFP4/FP8 activation recipe, allowing faster tensor-core work without repeated weight expansion. `native` can change answers through rounding; the 27B templates enable it. Decode keeps BF16 activations. Other families accept only `bf16`. | `bf16` |
+| `engine.activations` | MiniMax target activation precision for both prefill and decode. `native` uses dynamic MXFP8 dense projections and dynamic NVFP4 routed experts; `bf16` keeps the comparison path. Independent of `kv_dtype`: MiniMax `nvfp4`/`fp4` cache storage also selects Q8KV4 attention, while `bf16` retains BF16 attention. Other families accept only `bf16`. DSpark currently retains BF16 activations and cache. | `bf16` |
 
 See the [Qwen3.8-27B NVFP4 model card](model_cards/Qwen3.8-27B-NVFP4.md)
 and [AutoRound notes](qwen38_autoround_int4_plan.md) for measured tradeoffs.
@@ -433,7 +473,7 @@ as described above.
 | Key | What it controls and what to expect | Default |
 |---|---|---|
 | `engine.mtp` | Enable native MTP drafting and verification. Can reduce generation time but uses draft state and extra computation. Requires `decode_graph: true`; cannot be combined with `dflash_model`. | false |
-| `engine.mtp_depth` | Native MTP tokens proposed per step, from 1 to 5. More drafts can produce more accepted tokens per pass, but use extra verification rows and can waste work. Values above 1 require MTP. DeepSeek templates set their supported block depth explicitly: V4.1 uses 4 and V4 uses 5. | 1; when omitted with DeepSeek MTP, use the checkpoint's DSpark block size |
+| `engine.mtp_depth` | Native draft tokens per step: 1–5 for MTP chains; MiniMax requires its bundled seven-proposal DSpark block. More drafts can produce more accepted tokens per pass, but use extra verification rows and can waste work. Values above 1 require MTP. DeepSeek templates set their supported block depth explicitly: V4.1 uses 4 and V4 uses 5. | 1; when omitted with DeepSeek or MiniMax, use the checkpoint's DSpark block size |
 | `engine.mtp_draft` | Draft choice for sampled requests. `sampled` draws from the draft distribution; `greedy` proposes its most likely token. Both use exact verification but can have different acceptance rates. `auto` selects greedy for DeepSeek-V4-Flash and DeepSeek-V4.1-Flash (their DSpark block's argmax out-proposes a draw from it, and only greedy slots take the scheduled verify depth) and sampled for other native families. DFlash2 uses sampled for `auto`. Greedy client requests are unaffected. | `auto` |
 | `engine.mtp_draft_temperature` | Draft sampling temperature as a multiple of the client's temperature, greater than 0 and at most 4. Lower values make proposals more concentrated; higher values spread them out. This changes draft acceptance, not the target output distribution. Applies to sampled MTP and DFlash2 proposals. | 1.0 |
 | `engine.mtp_verify` | Verification rule for sampled drafts. `token` checks them one at a time. `block` checks them jointly and can accept more tokens, while preserving the target distribution. It falls back to token verification where the block rule cannot be used. Greedy requests are unaffected. | `token` |
@@ -454,7 +494,7 @@ settings; use your deployment's measured values.
 | `engine.mtp_schedule_row_ms` | Estimated milliseconds for one verification row; must be greater than 0. Higher row cost makes extra drafts less attractive. Set from measurements of the deployment: a sweep of fixed depths gives the row cost as the slope of the pass time and the base as its intercept (DeepSeek-V4.1-Flash-1017 on four nodes, 2026-10-18: 5.17 ms per row on a 31.1 ms base; the template carries 5.2 / 31.1). | 8.0 ms |
 | `engine.mtp_schedule_base_ms` | Estimated fixed milliseconds per pass, including draft work; must be nonnegative. Higher fixed cost makes accepting several tokens in one pass more valuable. Used with row cost to estimate throughput. | 28.0 ms |
 | `engine.mtp_schedule_lambda` | Value assigned to decode time, in tokens/ms. Higher values demand more expected benefit before checking another draft. `0` derives an initial value as `1 / (base_ms + row_ms)`; a positive value supplies the floor for adaptation. | 0 (derived) |
-| `engine.mtp_schedule_min_depth` | Fewest drafts verified per scheduled step, from 1 to 5 and no more than the draft width. Higher values force more checking even when confidence is low. | 1 |
+| `engine.mtp_schedule_min_depth` | Fewest drafts verified per scheduled step, from 1 to 7 and strictly below the loaded draft width. Higher values force more checking even when confidence is low. | 1 |
 | `engine.mtp_schedule_options` | At most this many scheduled verify depths, from 0 to 6: the engine spreads them evenly between `engine.mtp_schedule_min_depth` and the draft width, always keeping the full block (three on a 4-draft block are 1, 3 and 4). `0` takes every depth the graph-variant budget holds. Fewer options round a policy depth up to the next one, never down: the DeepSeek EXL3 template pins three because its confidence under-reads the third row on code, where the depth-2 option cost 8 % of the tokens a step (2026-10-23). | `0` |
 | `engine.mtp_schedule_adapt` | Update the value of decode time from committed tokens and modeled pass cost. This helps depth follow the workload and concurrency. `false` uses the fixed configured or derived value. | true |
 | `engine.mtp_schedule_sampled_scale` | Scale predicted acceptance for sampled requests using greedy drafts, from 0 to 1. Smaller positive values are more conservative and tend to verify fewer drafts. `0` disables depth scheduling for those requests and verifies the full block. | 0.93 |
@@ -464,10 +504,27 @@ settings; use your deployment's measured values.
 These controls apply when `engine.dflash_model` is set. The eager engine runs
 without a full decode graph on one node; the graph engine is required for
 multi-node DFlash2. Options marked eager-only do not tune the graph path.
+On the Qwen3.8-Flash-Next family (`qwen4_exp`) the recorded block draft runs
+on the graph engine, and the drafter's block confidence feeds the scheduler
+settings above. `engine.dflash_model` names it in a template (the
+Qwen3.8-27B releases) or `--dflash-model DIR_OR_ID` selects it at boot on a
+template that names MTP, for example:
+`dgpp-serve --config deploy/cluster_qwen-3.8-flash-next_nvfp4_w1.example.json --dflash-model incoai/Qwen3.8-Flash-Next-DFlash2 --dflash-weights fp8 --draft-head screen --mtp-schedule`
+(the drafter replaces the MTP draft, so the template's `mtp_depth`,
+`mtp_schedule`, `lookup_draft`, `lookup_tail` and `draft_head` revert to
+their defaults unless the command line names them). With `mtp_schedule` true,
+the scheduler chooses the verification depth from the drafter's confidence
+and the configured cost model. Measure those costs on the selected deployment;
+acceptance and throughput depend on its target weights and workload.
+Add `--draft-head screen` explicitly to screen DFlash2's proposal head;
+target verification keeps the full served head. Flash-Next also uses its
+recurrent-state checkpoint/replay path for DFlash2. See the
+[performance notes](optimizing_performance.md#flash-next-dflash2) for the
+pass-time and acceptance tradeoffs.
 
 | Key | What it controls and what to expect | Default |
 |---|---|---|
-| `engine.dflash_model` | Qwen draft checkpoint, as a Hugging Face ID or local directory; for example, `z-lab/Qwen3.8-27B-DFlash2` or `z-lab/Qwen3.5-122B-A10B-DFlash`. The architecture selects v2 or v1. Replaces native MTP, so set `mtp: false`. Verifies up to seven proposals per step and needs extra model memory. The v1 drafter still computes its full 16-row block; use BF16 draft weights and keep `mtp_schedule: false`. Multi-node use requires `decode_graph: true`; one node can use either engine. Requests with logprobs, logit bias or a grammar use plain decode. | Empty (off) |
+| `engine.dflash_model` | Qwen draft checkpoint, as a Hugging Face ID or local directory; for example, `z-lab/Qwen3.8-27B-DFlash2`, `z-lab/Qwen3.5-122B-A10B-DFlash` or `incoai/Qwen3.8-Flash-Next-DFlash2`. The architecture selects v2 or v1. Replaces native MTP, so set `mtp: false`. Verifies up to seven proposals per step and needs extra model memory. The v1 drafter still computes its full 16-row block; use BF16 draft weights and keep `mtp_schedule: false`. Multi-node use requires `decode_graph: true`; one node can use either engine. Requests with logprobs, logit bias or a grammar use plain decode. | Empty (off) |
 | `engine.dflash_weights` | Draft-matrix storage. `checkpoint` keeps BF16 weights, with lossless packing where supported by `bf16_weights`. `fp8` converts them to FP8 at load time, reducing draft weight reads; some BF16 data remains for context processing. Quantization can change proposals and acceptance, while target verification remains exact. | `checkpoint` |
 | `engine.dflash_verify_graph` | Eager engine: replay the multi-request verification batch as a CUDA graph to reduce launch overhead. `false` launches the packed batch directly. A lone request stays on its scalar path. | true |
 | `engine.dflash_draft_batch` | Eager engine: propose drafts for active speculative requests together, reusing one read of the draft weights. `false` drafts one request at a time. Batching can improve total throughput. | true |

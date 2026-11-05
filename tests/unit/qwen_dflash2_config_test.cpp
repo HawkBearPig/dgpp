@@ -7,8 +7,7 @@
 #include "common/test.hpp"
 #include "engine/decode_outputs.hpp"
 #include "loaders/minijson.hpp"
-#include "models/qwen/config35.hpp"
-#include "models/qwen/dflash2.hpp"
+#include "models/dflash2/dflash2.hpp"
 
 namespace {
 
@@ -67,16 +66,16 @@ std::string patched(const std::string& from, const std::string& to) {
   return s;
 }
 
-dgpp::Qwen35TextConfig target_like() {
-  dgpp::Qwen35TextConfig t;
+dgpp::DFlash2TargetShape target_like() {
+  dgpp::DFlash2TargetShape t;
   t.hidden_size = 5120;
   t.vocab_size = 248320;
   t.num_hidden_layers = 64;
-  t.max_position_embeddings = 262144;
+  t.context_limit = 262144;
   return t;
 }
 
-std::string refusal_against(const dgpp::DFlash2Config& c, const dgpp::Qwen35TextConfig& t) {
+std::string refusal_against(const dgpp::DFlash2Config& c, const dgpp::DFlash2TargetShape& t) {
   try {
     c.validate_against(t);
   } catch (const std::runtime_error& e) {
@@ -129,7 +128,7 @@ DGPP_TEST(dflash2_config_refuses_the_wrong_checkpoints) {
 }
 
 DGPP_TEST(dflash2_config_cross_checks_the_target) {
-  dgpp::Qwen35TextConfig t = target_like();
+  dgpp::DFlash2TargetShape t = target_like();
   auto c = parse(kFixture);
   require(refusal_against(c, t).empty(), "the pair must pass");
   t.hidden_size = 4096;
@@ -144,4 +143,31 @@ DGPP_TEST(dflash2_config_cross_checks_the_target) {
   auto big = parse(patched("\"block_size\": 8",
                            "\"block_size\": " + std::to_string(dgpp::kSpecRows + 1)));
   require(refusal_against(big, target_like()).empty() == false, "an over-deep block must be refused");
+}
+
+// The Qwen3.8-Flash-Next target geometry (the 2026-10-20 drafter port):
+// the qwen4_exp shape of incoai/Qwen3.8-Flash-Next-DFlash2, through the
+// single DFlash2TargetShape cross-check.
+DGPP_TEST(dflash2_config_cross_checks_the_flash_next_target) {
+  std::string text = patched("\"hidden_size\": 5120", "\"hidden_size\": 2560");
+  const size_t at = text.find("\"target_layer_ids\": [5, 19, 33, 47, 61]");
+  require(at != std::string::npos, "patch anchor missing: target_layer_ids");
+  text.replace(at, std::string("\"target_layer_ids\": [5, 19, 33, 47, 61]").size(),
+               "\"target_layer_ids\": [5, 15, 25, 35, 45]");
+  const auto c = parse(text);
+  dgpp::DFlash2TargetShape t;
+  t.hidden_size = 2560;
+  t.vocab_size = 248320;
+  t.num_hidden_layers = 48;
+  t.context_limit = 262144;
+  require(refusal_against(c, t).empty(), "the Flash-Next pair must pass");
+  auto wide = t;
+  wide.hidden_size = 2048;
+  require(!refusal_against(c, wide).empty(), "width mismatch must be refused");
+  auto short_stack = t;
+  short_stack.num_hidden_layers = 45;
+  require(!refusal_against(c, short_stack).empty(), "a tap past the target stack must be refused");
+  auto small_ctx = t;
+  small_ctx.context_limit = 65536;
+  require(!refusal_against(c, small_ctx).empty(), "a draft past the target's context must be refused");
 }

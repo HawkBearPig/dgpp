@@ -98,7 +98,33 @@ class ServeStartupTest(unittest.TestCase):
                 self.assertEqual(result.returncode, 2, result.stdout)
                 self.assertIn("--sse-ping-interval must be", result.stdout)
 
-    def run_world(self, settings, head_modes=None):
+    def test_dflash_switch_and_explicit_disable_precedence(self):
+        with tempfile.TemporaryDirectory(prefix="dgpp-dflash-switch-") as directory:
+            config = Path(directory) / "cluster.json"
+            config.write_text(json.dumps({
+                "model": "unused/model", "nodes": ["127.0.0.1"],
+                "engine": {"decode_graph": True, "mtp": True, "mtp_depth": 2,
+                           "mtp_schedule": True, "lookup_draft": True, "lookup_tail": 2,
+                           "draft_head": "screen"},
+            }))
+            common = [self.binary, "--config", str(config), "--model", "",
+                      "--checkpoint-dir", directory, "--max-connections", "0"]
+            for flags, contradiction in (
+                (["--dflash-model", directory], False),
+                (["--mtp", "--dflash-model", directory], True),
+                (["--dflash-model", directory, "--mtp"], True),
+                (["--no-dflash", "--dflash-model", "unused/not-cached"], False),
+                (["--dflash-model", "unused/not-cached", "--no-dflash"], False),
+            ):
+                with self.subTest(flags=flags):
+                    result = subprocess.run(common + flags, text=True, stdout=subprocess.PIPE,
+                                            stderr=subprocess.STDOUT, timeout=10,
+                                            env={**os.environ, "CUDA_VISIBLE_DEVICES": ""})
+                    self.assertEqual(result.returncode, 2 if contradiction else 1, result.stdout)
+                    self.assertIn("enable one or the other" if contradiction else
+                                  "all capacity knobs must be >= 1", result.stdout)
+
+    def run_world(self, settings, head_modes=None, nvme_bindings=None):
         with socket.socket() as listener:
             listener.bind(("127.0.0.1", 0))
             port = listener.getsockname()[1]
@@ -114,6 +140,14 @@ class ServeStartupTest(unittest.TestCase):
             try:
                 for rank, (slots, threshold) in enumerate(settings):
                     args = common + ["--rank", str(rank), "--max-concurrency", str(slots)]
+                    if nvme_bindings is not None:
+                        config = Path(directory) / f"rank{rank}.json"
+                        config.write_text(json.dumps({
+                            "model": "unused/model", "nodes": ["127.0.0.1"] * len(settings),
+                            "nvme_cache": {"enabled": True, "capacity_gib": 1,
+                                           "reuse_binding": nvme_bindings[rank]},
+                        }))
+                        args += ["--config", str(config), "--model", ""]
                     if head_modes is not None and head_modes[rank] is not None:
                         args += ["--fp8-head", head_modes[rank]]
                     if rank:
@@ -146,6 +180,14 @@ class ServeStartupTest(unittest.TestCase):
                     process.wait(timeout=5)
                 for output in files:
                     output.close()
+
+    def test_nvme_reuse_binding_is_selected_by_rank_zero(self):
+        binding = "0123456789abcdef"
+        for bindings in ([binding, ""], ["", binding]):
+            with self.subTest(bindings=bindings):
+                logs = self.run_world([(4, None), (4, None)], nvme_bindings=bindings)
+                head = logs[0].split("peer(s): ", 1)[1].splitlines()[0]
+                self.assertEqual(f"nvme_reuse={binding}" in head, bool(bindings[0]))
 
     def test_memlock_prepared_before_cuda_with_config_debug_and_mlock_off(self):
         _, inherited_hard = resource.getrlimit(resource.RLIMIT_MEMLOCK)

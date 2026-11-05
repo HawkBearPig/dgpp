@@ -78,6 +78,28 @@ class LauncherScanTest(unittest.TestCase):
         return subprocess.run([sys.executable, str(LAUNCHER), *argv], env=self.environ,
                               text=True, capture_output=True, timeout=120)
 
+    def test_fabric_refuses_running_long_executable_name(self):
+        # Linux truncates comm to 15 bytes. A full-name pgrep silently misses
+        # minimax_forward_check and would admit a second diagnostic world.
+        app = self.root / ("dg" + self.root.name[-8:] + "_forward_check")
+        shutil.copy2(shutil.which("sleep"), app)
+        process = subprocess.Popen([str(app), "60"])
+        try:
+            config = self.root / "probe.json"
+            config.write_text(json.dumps({"model": "fixture", "world_size": 1}))
+            env = dict(self.environ, DGPP_CLUSTER_CONFIG=str(config))
+            result = subprocess.run(
+                [str(ROOT / "scripts/fabric_run.sh"), "--app", str(app),
+                 "--timeout", "5", "--log-dir", str(self.root / "probe-logs"), "--", "0"],
+                env=env, text=True, capture_output=True, timeout=30)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("already runs here", result.stderr)
+            self.assertNotIn("longer than 15 characters", result.stderr)
+            self.assertIsNone(process.poll(), "preflight must not stop the existing process")
+        finally:
+            process.terminate()
+            process.wait(timeout=10)
+
     def test_down_without_config_stops_every_running_deployment(self):
         running = self.namespace("aaaa", "org/running")
         also = self.namespace("bbbb", "org/also-running", record_source=False)

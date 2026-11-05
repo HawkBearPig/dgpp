@@ -113,10 +113,10 @@ __device__ __forceinline__ void decode_fp8_piece(const uint4 codes, float scale,
 
 template <int DK, bool kFp8>
 __global__ void __launch_bounds__(kThreads) attn_prefill_kernel(SinkAttnPrefillArgs a) {
+  dgpp_pdl_wait();
   constexpr int kQStride = PGeo<DK>::kQStride;
   constexpr int kKStride = PGeo<DK>::kKStride;
   constexpr int kKStepsS = PGeo<DK>::kKStepsS;
-  dgpp_pdl_wait();
   extern __shared__ __align__(16) uint16_t smem[];
   uint16_t* qt = smem;                        // [kQueryVecs][kQStride]
   uint16_t* kt = qt + kQueryVecs * kQStride;  // [kTile][kKStride]

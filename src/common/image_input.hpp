@@ -19,6 +19,16 @@ struct ImageInput {
   int width = 0, height = 0;
   std::vector<uint8_t> rgb;
   int grid = 28;
+  // MiniMax video segments contain 2/4/6/8 RGB frames. Each consecutive
+  // pair produces one spatial token span; timestamp text separates spans.
+  // All frames remain one cache identity: attention is bidirectional over
+  // the segment, so later pixels can change its first token's embedding.
+  int frames = 1;
+  std::vector<int64_t> frame_offsets = {};
+  bool is_video() const { return frames != 1; }
+  int spans() const { return is_video() ? frames / 2 : 1; }
+  int span_tokens() const { return tokens / spans(); }
+  int64_t span_offset(int span) const { return is_video() ? frame_offsets.at(span) : offset; }
 };
 inline constexpr int kMaxImageTokens = 1024;
 inline constexpr int kGlmImageGrid = 28;
@@ -42,32 +52,44 @@ struct ImageTokens {
   int64_t end = -1;
 };
 
-inline void validate_image_pixels(const ImageInput& im) {
+inline void validate_image_pixels(const ImageInput& im, bool allow_video = false) {
   if (!image_grid_supported(im.grid))
     throw std::invalid_argument("unsupported image pixel grid");
+  if (im.frames != 1 &&
+      (!allow_video || im.grid != 28 || im.frames < 2 || im.frames > 8 || im.frames % 2))
+    throw std::invalid_argument("unsupported video frame geometry");
   const int64_t g = im.grid;
-  if (im.tokens < 1 || im.tokens > kMaxImageTokens || im.width < 1 || im.height < 1 ||
+  const int spans = im.spans();
+  if (im.tokens < 1 || im.tokens > kMaxImageTokens * spans || im.width < 1 || im.height < 1 ||
       im.width % g != 0 || im.height % g != 0 ||
       static_cast<uint64_t>(im.width) * im.height > pixels_for(g) ||
-      static_cast<uint64_t>(im.width / g) * (im.height / g) != static_cast<uint64_t>(im.tokens) ||
-      im.rgb.size() != static_cast<uint64_t>(im.width) * im.height * 3)
+      static_cast<uint64_t>(im.width / g) * (im.height / g) * spans !=
+          static_cast<uint64_t>(im.tokens) ||
+      im.rgb.size() != static_cast<uint64_t>(im.width) * im.height * 3 * im.frames)
     throw std::invalid_argument("invalid image RGB dimensions or token geometry");
 }
 
-inline void validate_image_inputs(const std::vector<ImageInput>& images, size_t prompt_tokens) {
+inline void validate_image_inputs(const std::vector<ImageInput>& images, size_t prompt_tokens,
+                                  bool allow_video = false) {
   if (prompt_tokens > static_cast<size_t>(std::numeric_limits<int64_t>::max()))
     throw std::invalid_argument("image prompt length exceeds the position range");
   int64_t end = 0;
   size_t bytes = 0;
   for (const auto& im : images) {
-    validate_image_pixels(im);
-    if (im.offset < end || im.offset < 0 || im.tokens < 1 || im.tokens > kMaxImageTokens ||
-        static_cast<uint64_t>(im.offset) > prompt_tokens ||
-        static_cast<size_t>(im.tokens) > prompt_tokens - static_cast<size_t>(im.offset))
-      throw std::invalid_argument("invalid image token span");
+    validate_image_pixels(im, allow_video);
+    if ((!im.is_video() && !im.frame_offsets.empty()) ||
+        (im.is_video() &&
+         (im.frame_offsets.size() != size_t(im.spans()) || im.frame_offsets.front() != im.offset)))
+      throw std::invalid_argument("invalid video token spans");
+    for (int span = 0; span < im.spans(); ++span) {
+      const int64_t at = im.span_offset(span);
+      if (at < end || at < 0 || static_cast<uint64_t>(at) > prompt_tokens ||
+          static_cast<size_t>(im.span_tokens()) > prompt_tokens - static_cast<size_t>(at))
+        throw std::invalid_argument("invalid image token span");
+      end = at + im.span_tokens();
+    }
     if (im.rgb.size() > kMaxRequestImageBytes - bytes)
       throw std::invalid_argument("decoded image data exceeds the 256 MiB request byte limit");
-    end = im.offset + im.tokens;
     bytes += im.rgb.size();
   }
 }

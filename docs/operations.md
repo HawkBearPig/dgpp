@@ -96,6 +96,24 @@ representative traffic. The [native MTP experiment](experiments/mimo-native-mtp.
 and [prefill experiment](experiments/mimo-upstream-ports.md) describe the
 configurations and limitations.
 
+## Dory1.0-4B loop options
+
+Dory serves the exact path by default: the checkpoint's own
+`n_recurrent_loops` (2) and the `per_loop` K/V policy, where every loop of
+the recurrent block keeps its own paged K/V planes. Both are
+[engine keys](configuration.md), not environment variables:
+`engine.dory_loops` overrides the loop count and `engine.dory_kv_cache:
+"last_loop"` shares one plane per attention layer and keeps only the last
+loop's rows, roughly halving the recurrent block's pool at a lossy cost —
+one cold prefill is bitwise the same under either policy, but decode rows
+and prefix reuse of a mid-loop state differ from the exact walk. The
+family is one rank and has no draft layer: `--world > 1`, `engine.mtp`,
+the drafter keys and the other families' loop keys are refused at startup,
+not ignored. The pool is BF16 only (`engine.kv_dtype` other than `bf16`
+says so and stays BF16). See the
+[model card](model_cards/Dory1.0-4B-NVFP4.md) and the
+[architecture plan](dory_plan.md).
+
 ## Qwen sparse prefill attention
 
 Qwen QSA uses the tensor-core warp kernel for prefills of at least 128 rows
@@ -563,7 +581,16 @@ version; a rollback is `up` naming the previous one, which is still
 installed. `dgpp-cluster releases` shows what each node has;
 `dgpp-serve --version` prints a binary's version, and rank 0 puts its
 version on the journal's settings record so a peer of another version
-exits before its first tick rather than form a mixed world.
+exits before its first tick rather than form a mixed world. By default a new
+build selects a fresh NVMe cache binding. To keep an existing compatible
+cache, record its 16-character binding from the current startup log or cache
+directory and set `nvme_cache.reuse_binding` to it in the deployment before
+starting the new version. Keep the setting on later upgrades and keep the
+cache capacity unchanged. This bypasses automatic build/settings identity;
+the model artifacts and cached-state interpretation must remain compatible.
+See [reuse across upgrades](nvme-cache.md#across-restarts) for the full example
+and refusal behavior. Keep the old cache directory while it is selected or
+needed for rollback.
 
 ## What a node needs
 
@@ -591,8 +618,10 @@ exits before its first tick rather than form a mixed world.
 For prefix caching, size the snapshot arena and KV pool separately. Startup
 and `--memory-plan` report snapshot slots, bytes per slot and actual arena
 allocation. The [prefix-cache guide](prefix-cache.md) lists the current recipe
-capacities and explains when a larger `prefix_cache_gib` helps. The cache is
-memory-resident; it does not spill evicted prefixes to NVMe.
+capacities and explains when a larger `prefix_cache_gib` helps. With
+`nvme_cache.enabled`, the entries the arena evicts are kept on each node's
+NVMe instead of being lost, as [the cold tier](nvme-cache.md) describes and
+[its subsection below](#the-nvme-cold-tier) operates.
 
 Reserve enough node memory for weights, model state and runtime buffers.
 The GLM-5.3-FP8 main stack alone uses about 82 GiB per rank at TP=4;
@@ -978,7 +1007,8 @@ quoting it. Qwen3.5-122B-A10B templates select depth 2; throughput and
 acceptance measurements for the shipped templates remain pending under
 [the benchmark protocol](benchmarks.md#workload-and-timing).
 
-**The draft depth** (`engine.mtp_depth`, `--mtp-depth`, 1–5, with `mtp`)
+**The draft depth** (`engine.mtp_depth`, `--mtp-depth`, 1–5 for MTP chains,
+7 for MiniMax DSpark, with `mtp`)
 is the number of draft tokens verified per decode step. Depth 1 is the
 two-row step: the pending token and one draft through the main stack, the
 draft block proposing the next draft. A deeper step feeds 1 + depth rows,
@@ -1186,6 +1216,32 @@ locked or unlocked. NTP between nodes only matters for reading logs side by
 side, and `scripts/fabric_run.sh --node-probe` records each node's clock
 offset per run so even that works without it.
 
+### The NVMe cold tier
+
+With `nvme_cache.enabled`, the prefix entries memory evicts are kept in a
+preallocated slab on each node's local NVMe and restored for later matching
+requests. Startup refuses to boot when the slab's directory, free space or
+minimum size does not fit, on every rank and under `--memory-plan`.
+[The cold tier](nvme-cache.md) describes what is kept and how it moves.
+
+Watch `nvme_cache` in `/v1/metrics`. `pages_used` against `pages_total`
+says how full the slab is, `evictions` that retention is at work,
+`spill_skipped` that an entry found no room, and `restore_failed` that a
+read came back wrong on some rank, which the world treats as a cold miss. A
+stalled operation is logged after 30 s without progress and fails after
+`op_timeout_s`.
+
+The slab persists across restarts under a directory named by the build
+version, checkpoint, effective settings and slab geometry. A build or
+settings change selects a new directory by default. Set
+`nvme_cache.reuse_binding` to the existing binding to retain a compatible
+cache across those changes; the file format, geometry, checksum and
+cross-rank checks remain active. Explicit reuse refuses startup if the
+selected cache cannot be adopted, leaving its files intact. After a
+successful start, `nvme_cache.adopted` reports the retained entries.
+Startup names other binding directories and their sizes; remove only caches
+that are no longer selected by a deployment or needed for rollback.
+
 ### The resident image cache
 
 The first start of a resident rank builds its layers from the checkpoint
@@ -1370,7 +1426,10 @@ the prompts. Its artifacts land under `build-ci/fabric-runs/failure_drill_*`.
 - **Per request:** `GET /metrics` (also available at `GET /v1/metrics`
   for backward compatibility) — JSON counters for requests, sheds, cancellations,
   failures, the admission policy, the prefix cache (entries, hits, tokens
-  saved, hop snapshots, the TTFT split by hit and miss), sampling
+  saved, hop snapshots, the TTFT split by hit and miss), the NVMe cache
+  (`nvme_cache`: pages used and total, entries and block records, spills
+  and restores begun / committed / failed, tokens restored, disk evictions,
+  ops in flight, bytes moved and average op times), sampling
   fallbacks. `scheduler.spec_decode` reports cumulative MTP draft rounds,
   attempted and accepted draft tokens, and per-position counters; see the
   [counter definitions](openai-compatibility.md#speculative-decoding-counters)

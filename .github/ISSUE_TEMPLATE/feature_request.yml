@@ -1,0 +1,21 @@
+name: Feature request
+description: A capability, API surface or operational need
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What you are trying to do and where the engine stops you today.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: What you would like to happen. Name the engine key, endpoint or command if you have one in mind.
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives
+      description: What you tried instead, including other engines or settings.

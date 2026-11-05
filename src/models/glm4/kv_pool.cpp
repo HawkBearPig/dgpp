@@ -66,6 +66,18 @@ void Glm4KvPool::reset_all(cudaStream_t stream) {
   table_.reset_all(stream);
 }
 
+std::vector<CachePlane> Glm4KvPool::planes() const {
+  std::vector<CachePlane> out;
+  if (!initialized_) return out;
+  const size_t blk = static_cast<size_t>(shape_.block_tokens) * kv_row_elems() * 2;
+  for (int l = 0; l < shape_.layers; ++l) {
+    const Glm4KvCache c = view(l);
+    out.push_back({reinterpret_cast<uint8_t*>(c.k_cache), blk});
+    out.push_back({reinterpret_cast<uint8_t*>(c.v_cache), blk});
+  }
+  return out;
+}
+
 void Glm4KvPool::copy_block_contents(int32_t src, int32_t dst, cudaStream_t stream) {
   table_.check_block(src);
   table_.check_block(dst);

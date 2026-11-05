@@ -68,6 +68,29 @@ DGPP_TEST(image_inputs_reject_invalid_sources_and_spans) {
   rejects([&] { dgpp::validate_image_inputs({im}, 3); });
 }
 
+DGPP_TEST(video_segment_validation_preserves_discontiguous_spans) {
+  dgpp::ImageInput video{10, 8, 56, 56, std::vector<uint8_t>(56 * 56 * 3 * 4), 28, 4, {10, 25}};
+  dgpp::validate_image_inputs({video}, 29, true);
+  rejects([&] { dgpp::validate_image_inputs({video}, 29); });
+  rejects([&] { dgpp::validate_image_inputs({video}, 28, true); });
+  for (const std::vector<int64_t>& offsets :
+       {std::vector<int64_t>{}, {10}, {11, 25}, {10, 13}, {10, -1}}) {
+    auto bad = video;
+    bad.frame_offsets = offsets;
+    rejects([&] { dgpp::validate_image_inputs({bad}, 100, true); });
+  }
+  for (int frames : {0, -2, 3, 10}) {
+    auto bad = video;
+    bad.frames = frames;
+    rejects([&] { dgpp::validate_image_pixels(bad, true); });
+  }
+  auto bad = video;
+  bad.rgb.pop_back();
+  rejects([&] { dgpp::validate_image_pixels(bad, true); });
+  dgpp::ImageInput following{20, 1, 28, 28, std::vector<uint8_t>(28 * 28 * 3)};
+  rejects([&] { dgpp::validate_image_inputs({video, following}, 40, true); });
+}
+
 DGPP_TEST(image_inputs_history_uses_context_and_bytes_instead_of_image_count) {
   std::vector<dgpp::ImageInput> images;
   int64_t end = 1;

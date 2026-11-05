@@ -233,6 +233,10 @@ struct CublasLtGemm::Impl {
                  int64_t weight_batch_stride = 0, int64_t out_batch_stride = 0,
                  const uint16_t* bias = nullptr, bool weight_kn = false,
                  bool fp32_reductions = false, int out_ld = 0) {
+    if (io != DType::BF16 && io != DType::F8_E4M3 && io != DType::F32)
+      throw std::invalid_argument("CublasLtGemm: unsupported input dtype");
+    if (io == DType::F32 && (od != GemmOut::F32 || bias))
+      throw std::invalid_argument("CublasLtGemm: FP32 inputs require an unbiased FP32 destination");
     PlanKey key{m,
                 n,
                 k,
@@ -253,7 +257,9 @@ struct CublasLtGemm::Impl {
     bool fp8 = io == DType::F8_E4M3;
     bool out_f32 = od == GemmOut::F32;
     cublasComputeType_t comp = CUBLAS_COMPUTE_32F;
-    cudaDataType_t ab_type = fp8 ? CUDA_R_8F_E4M3 : CUDA_R_16BF;
+    // MiniMax's patch convolution is stored in FP32. Keep both operands
+    // in FP32 with ordinary 32F compute (no FAST_TF32 approximation).
+    cudaDataType_t ab_type = fp8 ? CUDA_R_8F_E4M3 : io == DType::F32 ? CUDA_R_32F : CUDA_R_16BF;
 
     // Convention (see benchmarks/micro/gemm_peak.cu): out row-major [M,N] is
     // issued as column-major D(N,M) = op_T(W cm(K,N)) x Act cm(K,M). Weight

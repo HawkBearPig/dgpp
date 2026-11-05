@@ -190,6 +190,9 @@ struct ClusterConfig {
     bool prefill_fp8_gemm = false;
     bool prefill_fp8_per_tensor = false;
     std::string prefill_activations = "bf16";
+    // MiniMax: the activation recipe on every target row, including decode.
+    // Independent of kv_dtype, so both precision controls can be measured.
+    std::string activations = "bf16";
     std::string prefill_attention = "bf16";
     // Flash-Next QSA decode arithmetic over its fp8 pool. Independent of
     // prefill_attention so either phase can retain bf16 compute.
@@ -218,6 +221,17 @@ struct ClusterConfig {
     // recipe, half the prefill work) or "exact" (every layer over every
     // row, the parity mode).
     std::string prefill = "bounded";
+    // The Dory1.0-4B loop (docs/dory_plan.md D1, D2). Applies to the Dory
+    // family only; every other family refuses them (serve, by name).
+    //   dory_loops: the recurrent block's loop count. Absent (0) is the
+    //     exact path: the checkpoint's own `n_recurrent_loops` (2 in the
+    //     release). Naming one changes what the engine computes.
+    //   dory_kv_cache: "per_loop" (the default, exact: every loop of the
+    //     recurrent block gets its own K/V planes) or "last_loop" (one
+    //     plane per layer, only the last loop's rows kept — the pool at
+    //     half the planes, the loops past the last one's history gone).
+    int dory_loops = 0;
+    std::string dory_kv_cache = "per_loop";
     std::string prefill_dense = "auto";  // family default | tile | streaming
     std::string prefill_window = "flash";  // the DeepSeek-V4.1 prefill's window attention: flash | scalar
     std::string decode_window = "flash";   // the DeepSeek-V4.1 decode's window attention: flash | scalar
@@ -254,8 +268,9 @@ struct ClusterConfig {
     bool compact_batches = true;
     bool decode_graph = false;
     bool mtp = false;
-    int mtp_depth = 1;             // draft tokens per step (1..5); needs mtp
-    bool mtp_depth_set = false;    // the file named it (else a family may default it: DSpark's block is 5)
+    int mtp_depth = 1;  // draft tokens per step (1..7); family-specific limits apply
+    bool mtp_depth_set =
+        false;  // the file named it (else a family may default it from its checkpoint)
     // The DFlash2 block drafter (Qwen3.5-family, eager path only): a
     // checkpoint directory or HF id whose config.json names the drafter.
     // Replaces mtp (mutually exclusive); the draft width is the
@@ -355,6 +370,10 @@ struct ClusterConfig {
     double prefix_cache_gib = 1.5;
     int prefix_min_tokens = 1024;       // no prefix snapshot below this position (0: every cut)
     bool prefix_head_snapshots = true;  // a cold prompt also keeps its first structural cut (the system prompt's end)
+    // prompt_cache_key pins protect their entries while the pinned entries
+    // hold at most this share of the arena's slots and the NVMe slab's
+    // pages; past it a pin protects nothing (100: always).
+    int prefix_pin_max_pct = 50;
     std::string admission = "full";
     int admission_window = 256;
     int prefill_budget_tokens = -1;  // automatic: 256 tokens, adjusted to engine geometry
@@ -372,6 +391,44 @@ struct ClusterConfig {
     double stats_interval_s = 10.0;
     bool reasoning_in_content = false;
   } engine;
+  // The NVMe cold tier for the prefix cache (issue #26): a preallocated
+  // slab per rank under `path`, sized to `capacity_gib`, that evicted
+  // entries spill to and later requests restore from. Top-level, so a
+  // deployment turns the tier on with one value; `enabled` requires a
+  // positive capacity. Startup checks the path, the free space and the
+  // minimum size before anything is allocated. `min_tokens` (0: one
+  // prefill chunk) is the shortest entry worth keeping cold.
+  struct NvmeCache {
+    bool enabled = false;
+    std::string path = "~/dgpp/nvme-cache";
+    // Local placement assertion, independent of cache identity and rank 0's
+    // numerical settings. Empty disables it; otherwise an absolute mountpoint.
+    std::string required_mount;
+    double capacity_gib = 0.0;
+    int64_t min_tokens = 0;
+    // One staging slice in MiB: two slices of device work move per tick, so
+    // the chunk paces spills and restores against the decode step and
+    // sizes the staging (4 x chunk + 8 MiB) in the memory plan.
+    int64_t chunk_mib = 64;
+    // Spills and restores started but not yet committed by the world: a
+    // started entry is busy (never evicted) until its commit.
+    int64_t max_ops = 4;
+    // Free space the pre-flight leaves on the slab's filesystem, in GiB.
+    double reserve_gib = 1.0;
+    // The slab outlives the process: a start with the same checkpoint,
+    // settings and slab geometry adopts its entries (when every rank holds
+    // the same index). False recreates the slab at every start.
+    bool persist = true;
+    // Select an existing binding across build/settings changes. This is
+    // the operator's compatibility assertion; structural checks still run.
+    std::string reuse_binding;
+    // Tests/experiments only: permits RAM-backed storage and filesystems that
+    // refuse direct I/O. Neither is suitable for the normal memory budget.
+    bool allow_buffered = false;
+    // An op without progress for this long fails, so a request waiting on
+    // its restore admits cold instead of never (0: never).
+    int64_t op_timeout_s = 120;
+  } nvme_cache;
   struct Paths {
     std::string log_dir = "~/dgpp/log";
     std::string stage_dir = "/tmp/bus4";     // where the launcher puts the peers' binary and config

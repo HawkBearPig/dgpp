@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Questions and ideas
+    url: https://github.com/HawkBearPig/dgpp/discussions
+    about: Ask about a deployment, share a result or discuss a direction before opening an issue.
+  - name: Security vulnerabilities
+    url: https://github.com/HawkBearPig/dgpp/security/advisories/new
+    about: Report a vulnerability privately. Please do not open a public issue for it.

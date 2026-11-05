@@ -222,6 +222,7 @@ __device__ float attention_reduce(float value, float* partials) {
   __syncthreads();
   return partials[0];
 }
+template <bool VectorReduce = false>
 __global__ void softmax(const float* scores, uint16_t* probs, int n, float scale) {
   dgpp_pdl_wait();
   __shared__ float partials[32];
@@ -231,8 +232,19 @@ __global__ void softmax(const float* scores, uint16_t* probs, int n, float scale
     largest = fmaxf(largest, __fmul_rn(scores[row * n + j], scale));
   largest = attention_reduce<true>(largest, partials);
   float sum = 0;
-  for (int j = t; j < n; j += 1024)
-    sum += expf(__fmul_rn(scores[row * n + j], scale) - largest);
+  if constexpr (VectorReduce) {
+    // The pinned CUDA reference switches from scalar register rows to
+    // four-value reductions above 9216 keys. GB10 has 48 KiB of default
+    // shared memory: larger rows use full 4096-key groups plus a scalar
+    // tail. Preserve that addition order before rounding P to BF16.
+    const int vector_end = n < (48 * 1024 - 128) / 4 ? n : n - n % 4096;
+    for (int j = t * 4; j < vector_end; j += 4096)
+      for (int k = 0; k < 4; ++k) sum += expf(__fmul_rn(scores[row * n + j + k], scale) - largest);
+    for (int j = vector_end + t; j < n; j += 1024)
+      sum += expf(__fmul_rn(scores[row * n + j], scale) - largest);
+  } else {
+    for (int j = t; j < n; j += 1024) sum += expf(__fmul_rn(scores[row * n + j], scale) - largest);
+  }
   const float denom = attention_reduce<false>(sum, partials);
   for (int j = t; j < n; j += 1024)
     probs[row * n + j] =
@@ -329,8 +341,10 @@ void qwen_vision_softmax(const float* scores, uint16_t* probs, int rows, int n, 
                          cudaStream_t stream) {
   if (n <= 2048)
     softmax_warp<<<(rows + 3) / 4, dim3(32, 4), 0, stream>>>(scores, probs, rows, n, scale);
+  else if (n > 9216 && n % 4 == 0)
+    softmax<true><<<static_cast<unsigned>(rows), 1024, 0, stream>>>(scores, probs, n, scale);
   else
-    softmax<<<static_cast<unsigned>(rows), 1024, 0, stream>>>(scores, probs, n, scale);
+    softmax<false><<<static_cast<unsigned>(rows), 1024, 0, stream>>>(scores, probs, n, scale);
   DGPP_CUDA_OK(cudaGetLastError());
 }
 

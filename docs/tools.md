@@ -70,6 +70,7 @@ modules to see their arguments. Their offline regression tests run with
 | `scripts/fabric_run.sh [--stage-file F] [--fetch-logs] [--node-probe] -- APP-ARGS` | launches any app on the four-node fabric with the rendezvous discipline (head first, peers fire-and-forget, verified by pgrep, swept on head death); collects rank-invariant md5s and bus stats |
 | `scripts/serve_run.sh up/down/status` | boots/stops the serving world (`DGPP_SERVE_KNOBS` overrides the engine flags on every rank, e.g. `--max-concurrency 1 ... --decode-graph --mtp`); `down` fetches and md5s every rank's op stream |
 | `scripts/serve_api_check.py HOST PORT` (the request fields against a running world), `scripts/serve_soak_run.sh MINUTES OUT`, `scripts/serve_failure_drill.sh VICTIM`, `scripts/serve_prefix_curve_sweep.sh`, `scripts/fabric_prefill_repeat.sh`, `scripts/fabric_mtp_classes.sh` | the M9 evidence procedures: the mixed-workload soak with node probes and the four-way md5, the kill −9 drill, the prefix cache's capacity curve, the steady-state prefill per length, MTP acceptance per prompt class (`docs/operations.md`) |
+| `scripts/serve_nvme_cache_check.py --port P`, `scripts/serve_nvme_cache_fuzz.py --config FILE --port P --requests N [--clients K --cancel-pct P --restart-every N --crash-every N]` | the NVMe cold tier against a booted world. The check drives one document through a cold prefill, a changed question, eviction by other documents and a restore from disk, reporting each step's first-token latency and whether the restored answer equals the in-memory one. The fuzz drives a random workload with pins, opt-outs, concurrent clients, mid-flight cancels, restarts and rank kills, checking every repeated answer and the tier's counters |
 | `scripts/roce_counters.sh snapshot\|diff` | the fabric's RoCE hardware counters (sequence errors, adaptive retransmissions, CNPs, NIC ingress discards) per node and device, and the deltas between two snapshots — the wire-side view of a collective run |
 | `scripts/serve_load.py HOST PORT [--concurrency 1,2,4] [--max-tokens N]`, `scripts/fabric_glm4_load.sh CONFIG OUT [--concurrency ...] [--tokens N]` | the fixed-concurrency decode reading (2026-09-10): c streaming long-answer requests at once per phase (thinking off, greedy), the client's per-request pace and aggregate tokens/s, and rank 0's stats lines inside each phase (the procedure boots the world with a 5-second stats line) — the batched depth-2 study's table |
 | `scripts/serve_bench.py HOST PORT MAX_TOKENS LABEL [PROMPT]`, `scripts/serve_pace.py RANK_LOG [--waves]` | the service's pace: client-side SSE stamps; server-side per-request pace (from the per-token lines: run the service with `DGPP_LOG_LEVEL=debug`); and, with `--waves`, the steady peak-occupancy replay latency, tokens/replay, and aggregate tok/s used by the Phase-2 gate |
@@ -119,3 +120,15 @@ Tokens that decode to no text leave the grammar state unchanged. Argument
 names must remain distinct even when `additionalProperties: true` allows
 undeclared names. Truncated or malformed calls still return as literal
 content; reaching the generation limit retains `finish_reason: length`.
+
+MiniMax M3.1 calls use a namespace before every recursive XML tag. Nested
+objects, arrays and empty containers retain their schema types, including
+numeric-looking strings. All invokes in a block are returned together;
+malformed or truncated blocks remain literal content. Its grammar enforces
+required arguments, typed values and distinct keys, and supports adaptive
+reasoning before a call or JSON answer. The template omits null fields.
+Required schemas without a finite non-null XML spelling, `anyOf` with
+multiple non-null alternatives, and container `enum`/`const` are refused
+with the offending field named. Nullable single-alternative schemas and
+scalar enums are supported; JSON response schemas keep the normal JSON
+grammar's capabilities.

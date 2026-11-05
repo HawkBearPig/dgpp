@@ -8,6 +8,8 @@ import os
 import pathlib
 import sys
 import tempfile
+from types import SimpleNamespace
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "scripts"))
 import serve_campaign as sc  # noqa: E402
@@ -76,7 +78,8 @@ def main():
         t = sc.transcript_cells(d)
         assert t["matched"] == 4 and t["detail"]["chat"]["plain_distinct"] == 1 and t["isolation"] == "different", t
         assert sc.drafts({"dflash_model": "z"}) and sc.drafts({"mtp": True}) and not sc.drafts({"mtp": False})
-        plain = sc.plain_deployment({"engine": {"mtp": False, "dflash_model": "z", "mtp_schedule": True, "kv_capacity": 4}})["engine"]
+        plain = sc.plain_deployment({"engine": {"mtp": False, "dflash_model": "z", "mtp_schedule": True,
+                                               "mtp_schedule_options": 3, "kv_capacity": 4}})["engine"]
         assert plain == {"mtp": False, "kv_capacity": 4}, plain
         # without a plain boot the match is not a result
         import shutil
@@ -95,6 +98,46 @@ def main():
         for table in ("serving", "wall", "classes", "config", "context", "context-prefill", "quality", "transcripts"):
             assert f"-- {table}\n| Model X | 1 | opts |" in out, table
         assert "| 786,432 | fp8 | 20 | adaptive (default) | DFlash2 adaptive ≤7 |" in out, out
+        assert "-- serving-extra" not in out and "-- wall-extra" not in out
+        # Wider measurements retain the common C1-C8 rows and report their
+        # decode and service-level rates separately, with the configured cap.
+        data = json.loads((d / "decode.json").read_text())
+        for cls_i, cls in enumerate(sc.CLASSES):
+            for offset in (-1, 0, 1):
+                data["phases"].append(phase(cls, 16, 160 + cls_i + offset, 144 + cls_i + offset))
+        (d / "decode.json").write_text(json.dumps(data))
+        cfg = json.loads((d / "deployment.json").read_text())
+        cfg["engine"].update(max_concurrency=16, prefill_idle_budget_tokens=2048)
+        (d / "deployment.json").write_text(json.dumps(cfg))
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            sc.rows(d, "Model X", 1, "opts")
+        out = buf.getvalue()
+        assert "-- serving-extra\n| Model X | 1 | opts | 16 | 160.0–164.0 |" in out, out
+        assert "-- wall-extra\n| Model X | 1 | opts | 16 | 144.0–148.0 |" in out, out
+        assert "| adaptive / idle cap 2048 |" in out, out
+        # Exercise the runner through command construction: the one-command
+        # campaign must actually produce the additional cells it can publish.
+        class FakeBoot:
+            host = "127.0.0.1"
+            def __init__(self, directory, *args, **kwargs):
+                self.directory, self.status = directory, {}
+            def up(self):
+                self.directory.mkdir()
+            def down(self):
+                self.status["opstreams_match"] = True
+        for slots, wanted in ((8, "1,2,4,8"), (16, "1,2,4,8,16")):
+            cfg["engine"]["max_concurrency"] = slots
+            (d / "deployment.json").write_text(json.dumps(cfg))
+            args = SimpleNamespace(config=str(d / "deployment.json"), out=str(d / f"run-{slots}"),
+                                   port=18081, phases="serving", no_swap_scope=True, label="fixture",
+                                   bin="fixture-binary", dry_run=False, mode=None)
+            with patch.object(sc, "Boot", FakeBoot), patch.object(sc, "run") as run, \
+                    contextlib.redirect_stdout(io.StringIO()):
+                assert sc.run_campaign(args) == 0
+            command = run.call_args.args[0]
+            assert command[command.index("--concurrency") + 1] == wanted, command
+            assert command[command.index("--repeat") + 1] == "3", command
     print("serve_campaign_test: ok")
 
 

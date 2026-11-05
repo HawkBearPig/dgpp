@@ -1,5 +1,30 @@
 # DGPP implementation status
 
+MiniMax M3.1 Flash is implemented on the shared engine with its published
+NVFP4/MXFP8 weights, native activations and Q8KV4 attention, seven-proposal
+DSpark, recursive tools, images and native video. BF16 activations and caches
+remain independently selectable. Both recipes pass their six-corpus,
+28,329-position independent TP4 references with zero argmax changes. Native
+decode pages run in parallel, and generated conversation prefixes remain
+reusable. The selected four-node template has sixteen slots, a 2M shared
+NVFP4 pool and a 2,048-token idle prefill cap. The complete load sweep passes
+all 465 requests and 385 exact repeat/batch comparisons. The native campaign
+passes API, isolation and context/cache checks through 512K; quality scores
+are 151/164 HumanEval, 294/300 GSM8K and 99/100 extraction at standard caps.
+Native media, tools, cancellation and NVMe integration pass. Full-seven
+DSpark preserves the measured plain transcripts but is slower on these C1
+classes. Native 1M retrieval quality and full upstream runtime parity are
+not certified. See the
+[implementation record](docs/minimax_m31_flash_plan.md) and
+[deployment notes](docs/model_cards/MiniMax-M3.1-Flash.md).
+
+NVMe slab startup acquires its exclusive lock before truncation. Duplicate-open
+regressions check size and content preservation for fresh persistent and
+nonpersistent slabs, then verify that both modes clear stale contents after
+ownership is released. The aligned adoption buffer is released on constructor
+failure. Qwen's BF16/FP8-head fixtures and the NVMe family fixture pass on idle
+GB10 hardware; host sanitizer checks cover duplicate-open cleanup.
+
 HTTP framing validates complete decimal request lengths and matching repeated
 fields before dispatch. Host regressions cover malformed/overflowing lengths,
 keep-alive compatibility, canonical handler-visible headers, connection closure
@@ -66,11 +91,29 @@ and GPU recovery coverage for both resident loader implementations.
 
 ## Serving support
 
+Chat-template reference generation uses an immutable Jinja sandbox, with
+host Python regressions for private-attribute access, input mutation and
+valid rendering behavior. This change affects the golden generator;
+serving continues to use the native C++ template interpreter.
+
+Native templates have source, expression-token and parser-depth limits, plus
+per-render depth, dispatch, emitted-byte and selected string/range growth limits.
+Native tests cover refusal boundaries, file loading and repeat/concurrent render
+recovery. HTTP tests check refusal before tokenization and successful requests
+afterwards; six-family checkpoint goldens cover rendered bytes and token IDs.
+Shared-object cycle prevention and cumulative allocation/helper-work accounting
+remain deferred; these guards do not provide complete resource containment.
+
 Host sampling automatically omits neutral penalty preparation using the
 effective request parameters. Deployment defaults and request overrides
 are covered by config, sampler, HTTP and journal regressions, including
 greedy penalties without logprobs. This is a host-work reduction; serving
 throughput gains require deployment measurements.
+
+Completion requests validate JSON number syntax and complete document boundaries
+before preparation or file normalization. String-encoded function arguments use
+the same boundary check; parser, file-input and HTTP regressions cover invalid
+syntax, trailing input and valid numeric representations.
 
 The mixed `unsloth/Qwen3.8-27B-NVFP4` checkpoint runs at TP 1/2/4
 with the shipped DFlash2 recipes. Its dense FP4 prefill kernel reuses
@@ -112,12 +155,13 @@ preserving Qwen PLE padding and segmentation. The correction passes host tests
 and was exercised in a real TP2 replay. It does not resolve the near-limit
 retrieval failure in issue #4.
 
-The server uses a shared scheduler, text frontend and decode engine for
-three model families. Rank 0 accepts HTTP requests and journals scheduler
+The server uses a shared scheduler, text frontend and decode engine across
+the model families below. Rank 0 accepts HTTP requests and journals scheduler
 operations to its peers. Every rank checks the operation-stream digest.
 
 | family | implemented paths | deployment constraints |
 |---|---|---|
+| MiniMax M3.1 Flash | Native NVFP4 experts and MXFP8 dense weights, native MXFP8/NVFP4 activations, Q8KV4 attention and BF16 controls, FP32 routers, block-sparse attention with an exact per-token index, seven-proposal DSpark, graph decode, prefix cache, recursive tools, images and MP4/WebM video | Four nodes, sixteen request slots with plain decoding and a 2M shared token pool (1M request ceiling). Optional DSpark supports eight slots, with seven proposals and potentially fewer verification rows. Native timing/cache validation reaches 512K; the 1M ceiling is not retrieval-certified. See [the model card](docs/model_cards/MiniMax-M3.1-Flash.md) for measurements and accuracy evidence. |
 | GLM-5.3-Flash | KDA and DSA attention, mHC, FP8 and hybrid NVFP4 experts, resident loading, graph decode, prefix cache and MTP | The full model needs four Sparks for resident serving. Batched decode has an eight-row limit; MTP depths 2–3 use scalar graphs |
 | Qwen3.8-Flash-Next | GDN, QSA, gated residuals, PLE n-gram embeddings, FP8, NVFP4 and AutoRound int4 (GPTQ g128) experts with the int8 g128 head, optional FP8 dense projections, graph decode, prefix cache and MTP | FP8 deployment templates use two or four nodes. Single-node NVFP4 serving maps the n-gram table from NVMe. Batched decode supports 64 rows, including sixteen slots at MTP depth 3 with scheduled verification disabled; default fixed-depth compaction reduces wide graphs within their numerical dispatch range, with scalar fallback when no physical family fits. Shared prefill continuation gives decode a turn between chunks, with early text admission enabled by default |
 | GLM-4.7 | Paged GQA, partial RoPE, NVFP4 dense and expert weights, draft-layer requantization, graph decode, prefix cache and MTP | Four-node serving is measured. The engine supports up to 32 batched decode rows, including deeper MTP; the supplied default recipe uses depth 1 |
@@ -126,6 +170,7 @@ operations to its peers. Every rank checks the operation-stream digest.
 | MiMo-V2.6-Flash | Hybrid sliding-window (128, sink-biased) / global GQA attention over 192/128-wide heads with partial RoPE, the fused pre-sharded fp8 qkv projection read in the checkpoint's chunk layout, MXFP4 routed experts without a shared expert, BF16 o_proj / head / eh_proj as 12-bit companions, one MTP draft layer, a per-layer-width paged K/V pool in BF16 or the fp8 row form, graph decode and prefix cache | Served 2026-09-22 on four nodes (50.06 GiB per rank at 128K: C1 71.0–84.4 tok/s at 23 ms/pass, cold prefill 1.83 / 7.42 / 36.6 s at 2K / 8K / 32K, HumanEval 151/164, GSM8K 294/300, extraction 100/100) and two nodes (97.2 GiB per rank with a 256K fp8 pool: C1 42–48 tok/s). The vision and audio encoders are not served; the sliding-window layers keep their full history in the paged cache (a 128-token ring is the recorded memory lever); the one-split prefill attention is the recorded prefill lever past 8K |
 | Flint | Hybrid sliding-window (513, sink-biased, full-head RoPE) / full-attention (no RoPE) GQA over 128-wide heads with per-head q / k norms, BF16 projections and MLPs in their 12-bit decode form, the routed experts in the export's per-projection FP8 / NVFP4 formats (one decode kernel per pair form), the ungated BF16 shared expert, graph decode and the prefix cache | No draft head: the family serves at T=1 only. One, two or four nodes (the kv heads divide the world). See [the Flint plan](docs/flint_plan.md). |
 | DeepSeek-V4-Flash | 128-token sliding-window attention over one shared 512-wide latent with ratio-4 (64-head indexer, 512 entries per query) and ratio-128 compressed caches, two-pass hyper-connections over four streams, token-table routing on layers 0–2, MXFP4 routed experts with an FP8 shared expert, the DSpark block draft, graph decode, prefix cache, chunk-invariant prefill | Two or four nodes at the full 1M-token context (95.4 / 63.0 GiB per rank). The templates schedule the verify depth over the five-draft block; sampled requests draft greedily (`engine.mtp_draft`) and follow the schedule. Text only. |
+| Dory1.0-4B | Looped normalized GPT (nGPT): a 16-layer input block, a 40-layer recurrent block walked twice with the input re-injected and the state re-normalized per loop, a 16-layer output block; every sublayer a slerp residual behind `justnorm`, sliding/full GQA (window 1024, two thetas) with the nGPT qk-norm after RoPE, NVFP4 W4A16 as shipped, a paged BF16 K/V pool (one plane per attention layer per loop), graph decode and prefix cache; no draft layer and one rank (the release refuses TP) | One Spark, resident (the 2.98 GiB image plus the pool: ≈ 56 GiB of planes at the full 256K pool under `per_loop`). The loop keys `engine.dory_loops` / `engine.dory_kv_cache` are opt-in overrides of the exact path |
 
 World size comes from the configuration's node list. A single-node graph
 world uses resident weights and identity collectives. A single-node run
@@ -133,12 +178,16 @@ without graph decode uses the eager streaming path. Memory planning at
 startup checks whether the selected model and request capacity fit.
 
 The text API supports streaming, tools, supported JSON schemas, reasoning
-output, sampling controls, logprobs, stop strings and multiple chat choices.
-Unsupported fields are rejected by name. GLM-5.3-Flash and Qwen3.8-Flash-Next
-support PNG/JPEG/WebP image inputs with native vision encoders, journaled RGB
+output, sampling controls, generated-token logprobs, stop strings and
+multiple chat choices.
+Prompt-token scoring remains pending; non-null `prompt_logprobs` requests
+are rejected explicitly on both completion endpoints.
+Unsupported fields are rejected by name. GLM-5.3-Flash, Qwen3.8-Flash-Next,
+Qwen3.8-27B and MiniMax M3.1 Flash support PNG/JPEG/WebP image inputs with native vision encoders, journaled RGB
 pixels, streaming and MTP. Image requests support prefix caching and
 resumable prefill, and bypass grouped prefill; see
-[image inputs](docs/vision.md). Audio and video inputs are unsupported.
+[image inputs](docs/vision.md). MiniMax also accepts native MP4/WebM video.
+Audio inputs are unsupported.
 Vision arithmetic now follows the CUDA BF16 eager reference, with fixed
 full-encoder and isolated-operation gates. The
 numerical investigation
@@ -159,8 +208,8 @@ limitations, including the one-hour soak used for that release.
 | M3 — DSA/MLA | Pooled sparse selection, latent caches, tail rings and paged state | Selection fuzzing, attention oracles, continuation and snapshot tests |
 | M4 — assembled GLM | Config/binding validation, layer loading, full forward and reference tools | Synthetic and real-checkpoint layer/forward comparisons |
 | M5 — tensor parallelism | Roster, CollectiveBus, sliced loading, resident images and transport regression tools | Loopback protocol tests, shard parity and four-node forward checks |
-| M6 — generation and API | Decode sessions, tokenizer with bounded merge scans and optional word caching, templates, scheduler, journal, HTTP/SSE, sampling and constrained output | Host service tests, [tokenizer work bounds](docs/tokenization.md), tokenizer/template goldens and fabric API checks |
-| M7 — prefix cache | Pool-aligned snapshots, an earlier long-document cut for changed tails, shared cache blocks, deterministic lookup and LRU eviction; MTP lookahead identity | Cached/cold target and draft parity, continuation cleanup, small-arena retention and [recipe sizing](docs/prefix-cache.md) |
+| M6 — generation and API | Decode sessions, tokenizer with bounded merge scans and optional word caching, templates, scheduler, journal, HTTP/SSE, sampling and constrained output | Host service tests, [tokenizer work bounds](docs/tokenization.md), template integer/replacement boundary tests, tokenizer/template goldens and fabric API checks |
+| M7 — prefix cache | Pool-aligned snapshots, an earlier long-document cut for changed tails, shared cache blocks, deterministic lookup and LRU eviction; MTP lookahead identity | Cached/cold target and draft parity, continuation cleanup, small-arena retention and [recipe sizing](docs/prefix-cache.md). Cancellation retention has deterministic host fuzzing, shared-block/NVMe pressure coverage, real HTTP history replay on Qwen and four-node GLM, and matching fabric operation streams. Reuse still requires a valid matching cut; DSA transcript comparisons retain the [chunk-shape limitation](docs/numerics.md#greedy-transcripts-and-chunk-shape) |
 | M8 — MTP | Transactional verification, rollback and on-device speculative steps | Greedy equality with plain decode, sampled-oracle comparisons and forced rejections |
 | M9 — optimization and hardening | Kernel and collective optimizations, memory planning, failure handling and drift detection | Numerical regression checks, failure drills, fuzzing and the mixed-workload soak |
 
@@ -304,9 +353,8 @@ silent-node-loss detection, wider batching for GLM-5.3-Flash, arbitrary
 slot subsets for oversized batches, and
 model-specific performance experiments. See
 [next steps](docs/next_steps.md) for the scope and validation needed for
-each. Failover, data-parallel routing, cross-instance prefix sharing and
-image-aware prefix identities, additional vision backends, audio and video
-execution remain future work.
+each. Failover, data-parallel routing, cross-instance prefix sharing, additional
+vision backends and audio execution remain future work.
 
 The DeepSeek inference study
 adds payload-dependent graph consumer widths and uses 4,096-token

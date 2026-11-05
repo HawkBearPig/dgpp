@@ -5,6 +5,101 @@ project procedures and design guidance live in `docs/`.
 
 ## Unreleased
 
+- **Correct MiniMax DSpark predictions and native activations**: predict from
+  the anchor row and use seven draft queries for seven proposals, while
+  retaining eight target verification rows. The previous mask-only convention
+  shifted every proposal and depressed acceptance. DSpark's MXFP8 projections
+  now honor the native activation setting, including context K/V and fused
+  SwiGLU quantization. The invalid DSpark performance comparison is withdrawn;
+  see the [implementation record](docs/minimax_m31_flash_plan.md).
+
+- **MiniMax M3.1 Flash**: native text, image and MP4/WebM video input,
+  recursive tool calls and the bundled seven-proposal DSpark on the shared
+  engine. The loader preserves the published NVFP4 expert and MXFP8 dense
+  weights; the serving recipe uses native MXFP8/NVFP4 activations, Q8KV4
+  attention and FP32 routing, with BF16 controls available. Parallel decode
+  pages, tensor-core vocabulary projections and reusable conversation and
+  visual prefixes reduce repeated work. The four-node
+  deployment passes native reference and serving validation; see the
+  [model card](docs/model_cards/MiniMax-M3.1-Flash.md) and
+  [numerical evidence](docs/minimax_m31_flash_plan.md).
+
+- **Keep an existing NVMe cache across upgrades**: set
+  `nvme_cache.reuse_binding` to the previous cache's 16-character binding to
+  bypass automatic build/settings invalidation. This selects the existing
+  files without changing their format or identity. The operator asserts
+  that model artifacts and cached-state interpretation remain compatible;
+  file format, geometry, checksum and cross-rank checks still apply. Rejected
+  explicit reuse refuses startup without clearing the selected cache.
+  See [reuse across upgrades](docs/nvme-cache.md#across-restarts).
+
+## v0.1.0 — 2026-10-28, the first published release (0.1.0+g11fe1807d63d)
+- **The README and the repository scaffolding** (2026-10-28): the README
+  restructured around what the engine is (Why DGPP, a headline table sourced
+  from `docs/benchmarks.md`, the architecture diagram, capability columns in
+  the model table, a first-deployment guide, the API section, credits);
+  GitHub Actions for the Python host suites, the documentation gate
+  (`scripts/docs_check.py`: relative links, heading anchors, the README's
+  punctuation rule) and the GB10 cross-build; issue forms, a pull request
+  template and `SECURITY.md`; Discussions and private vulnerability
+  reporting switched on for the repository.
+- **NVMe cold tier for the prefix cache** (2026-10-28, issue #26, PR #53): a
+  top-level `nvme_cache` deployment block keeps the prefix entries memory
+  evicts in a preallocated slab per rank on local NVMe and restores an entry
+  before a later matching request prefills its suffix. Entries persist
+  across restarts under a binding of the binary, checkpoint, settings and
+  slab geometry, with adoption bound to each entry's page checksums and
+  agreed by every rank. `prompt_cache_key` pins the entries a request
+  creates or attaches to, within `engine.prefix_pin_max_pct` of the cache.
+  Spills and restores are scheduler decisions journaled across the world,
+  so a failure on any rank is the same cold miss everywhere. Keys:
+  `enabled`, `path`, `capacity_gib`, `min_tokens`, `chunk_mib`, `max_ops`,
+  `reserve_gib`, `persist`, `allow_buffered`, `op_timeout_s`. On four
+  Sparks with GLM-5.3-Flash a 25K-token document comes back from disk in
+  about 120 ms of restore against 15 s of cold prefill, bitwise the
+  in-memory hit. See [the cold tier](docs/nvme-cache.md) and the
+  [configuration reference](docs/configuration.md#nvme-cache).
+- **DFlash2 integration fixes** (2026-10-25): the shared drafter follows
+  the active eager/capture reducer, copies complete draft KV blocks during
+  prefix reuse, and arms sampled proposal distributions on Flash-Next.
+  Memory plans use the local vocabulary slice. Flash-Next now honors the
+  explicitly requested draft-head screen and uses recurrent-state replay
+  for DFlash2, avoiding full recurrent snapshots at every speculative row.
+  Regression tests cover both model families, two-rank graph execution,
+  prefix reuse, screening, sampling and all eight accepted prefix lengths.
+  The paired probe reconciles completed requests and includes the bonus
+  token in mean acceptance length; explicit `--no-dflash` wins in either
+  command-line order.
+
+- **The draft mechanism is a knob, not a template fork** (2026-10-25):
+  `--dflash-model DIR_OR_ID` now replaces the template's MTP world the way its
+  usage text always claimed. The flag only worked on a template that
+  already set `mtp: false`; on an MTP template it hit the "enable one or the
+  other, not both" refusal (`apps/dgpp_serve.cpp`), which is why this work's
+  first cut shipped the RadixArk NVFP4 Flash-Next drafter as a second template
+  (`cluster_qwen-3.8-flash-next_nvfp4-radixark-dflash2_w1[_yarn512k]`). That is
+  a mechanism fork of the kind `deploy/README.md`'s one-template rule refuses
+  (the Qwen3.8-27B releases name `engine.dflash_model` in their single template
+  and reach the other worlds by knob), so the fork does not land: the two
+  templates are deleted here and the drafter ships as the knob. Giving the flag
+  on the command line takes the MTP group back to
+  its defaults unless the command line names the setting: `mtp` off,
+  `mtp_depth` 1, `mtp_schedule` off, `lookup_draft` off, `lookup_tail` 0 (the
+  block drafter refuses a tail outright, `engine/graph_engine.hpp`) and
+  `draft_head` exact — the same "the settings go with the switch" rule
+  `--no-mtp` and `--no-dflash` already follow. Explicit `--mtp` beside
+  `--dflash-model` is still the contradiction and still refused; `--no-dflash`
+  wins a `--dflash-model` on the same line. Gate: the drafter worlds of both
+  RadixArk shapes resolve to settings records identical to the deleted
+  templates' (digests `4b798c02e99efb2a` plain, `0a61b45aacd39d69` with
+  `--mtp-schedule`), verified with `--memory-plan` (no world forms). The two
+  fork templates are deleted, and the portability shape rule loses the
+  `-dflash2` marker that had been added to let the fork through, so a
+  drafter/MTP pair of one model, quant and world fails the gate again.
+  `deploy/README.md` and `docs/configuration.md` carry the drafter as the knob
+  it is; the benchmarks of record are untouched (the MTP templates are
+  byte-identical).
+
 - **DeepSeek-V4.1-Flash-1017 EXL3: sixteen slots on a 96-row decode
   batch, and the step's cost past a few rows** (2026-10-23 evening,
   `docs/deepseek_v41_flash_exl3_plan.md` §3.3, §3.6, §7). The family's
@@ -237,6 +332,37 @@ project procedures and design guidance live in `docs/`.
   NVFP4 column slices. Regression fixtures cover nested CSF checkpoints,
   TP slicing, independent forward references, graph replay and mixed prefill.
   See [docs/fp4local_plan.md](docs/fp4local_plan.md).
+
+- **The DFlash2 block drafter serves Qwen3.8-Flash-Next** (2026-10-20).
+  The Qwen3.5 drafter (`engine.dflash_model`, the block-diffusion proposal
+  model from a separate checkpoint) reaches the `qwen4_exp` family:
+  `incoai/Qwen3.8-Flash-Next-DFlash2` — five bidirectional sliding Qwen3
+  layers over a KV context built from the target's tapped features, the
+  mask rows' top-K through the chained selector walk, the embeddings and lm
+  head shared with the target. Re-hosted on `QwenModel`: the block forward
+  and the mask-row select, the feature store that feeds the draft planes,
+  the batched redraft, and the recorded block draft the decode graph
+  replays (the Qwen35 family's capture, re-hosted — the
+  `session_graph_capture_block_draft/_batch` pair), most of the arithmetic
+  riding the shared `kernels/dflash2` and the engine's `requires`-guarded
+  duck typing (one eager-engine dispatch guard for the families without the
+  captured static verify). Two family seams: the target-side taps read the
+  layer's output at the NEXT layer's attention-mix launch (a QSA stack has
+  no per-layer `[T, H]` residual stream to read, only the mixed hidden), and
+  the draft K/V rides new plain planes on the QSA pool's shared block table
+  (`QwenKvPoolShape::draft_layers`, copying with the request's blocks).
+  `engine.dflash_model` selects it (`mtp: false`) on the decode graph, and
+  `--mtp-schedule` sizes the verify depth
+  from the walk's published confidence. (At the time this shipped as its own
+  `nvfp4-radixark-dflash2` template; 2026-10-24 folded that fork back into the
+  one [RadixArk template](deploy/cluster_qwen-3.8-flash-next_nvfp4-radixark_w1.example.json)
+  as the `--dflash-model` knob.) Gates: the armed eager engine's
+  scalar and batched transcripts are bit-for-bit the plain engine's on the
+  world-1 fixture, the graph replay's published drafts are the eager
+  redraft's and its transcript the eager engine's bit-for-bit, the
+  drafter-armed plain walk is bitwise the no-drafter model's, and the block
+  proposes its seven drafts repeatably; the `validate_against` overload
+  cross-checks the qwen4_exp widths in the config unit suite.
 
 - **The day's DeepSeek-V4.1 levers ported where they apply; the campaign's
   C8 cell on a six-slot template read** (2026-10-20). Inventory of the
@@ -919,6 +1045,61 @@ project procedures and design guidance live in `docs/`.
   `timed_load.py` prints the decode-only
   per-class table before `serve_load.py`'s wall table. `AGENTS.md` carries
   the rules.
+- **A begin evicts its way into the in-flight prefill walk instead of
+  waiting it out** (2026-10-20). A queued request whose blocks are pinned
+  by retired sessions' cache entries now joins the walk other prefills are
+  advancing through — where it waited for the pool to drain before — by
+  taking the cache's LRU unattached entries, the give-way the idle path
+  already applied: never a block a live request holds (each in-flight
+  prefill keeps its own refcount on every reserved block and a victim
+  drops only the cache's extra ref), the planned attach touched first so
+  the join keeps its prefix hit, and the plan recomputed after every
+  eviction because the victim may have been that entry. Each begin's fit
+  is netted against the blocks the walk's earlier begins will take: the
+  2026-10-20 d8192 c2 crash (`session_reserve_blocks` "cannot cover
+  10 384 tokens") came from a fit check that recomputed the free pool
+  from the engine, discarding that projection and admitting an overdraw
+  the same walk would fill.
+- **The Dory1.0-4B template pins the exact walk and paces its prefill**
+  (2026-10-20).
+  [deploy/cluster_dory1.0-4b_nvfp4_w1.example.json](deploy/cluster_dory1.0-4b_nvfp4_w1.example.json)
+  states the exact path's two keys outright — `engine.dory_loops: 2` (the
+  checkpoint's own count) and `engine.dory_kv_cache: "per_loop"` (the
+  exact walk, one plane per attention layer per loop, ≈ 56 GiB of planes
+  at the full 262 144-token capacity; the lossy half-pool `last_loop`
+  stays the one-key alternative) — and paces prompt work with
+  `prefill_budget_tokens: 2048` under a `decode_gap_target_ms: 3000`.
+- **Dory1.0-4B served on one Spark** (2026-10-18). The looped normalized
+  GPT (`DoryForCausalLM`, `nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-NVFP4`)
+  joins the served families: a 16-layer input block, a 40-layer recurrent
+  block walked the checkpoint's own 2 times with the input re-injected and
+  the state re-normalized per loop, a 16-layer output block — no
+  LayerNorm anywhere (nGPT `justnorm` at eight sites, `slerp_alpha` for
+  every residual), sliding/full GQA with the qk-norm applied after RoPE,
+  the head scaled per vocabulary entry. The 2.98 GiB NVFP4 W4A16 image
+  loads as shipped (packed e2m1, E4M3 blocks, F32 globals, BF16
+  activations — no requantization, no lossy levers), resident on one rank
+  (the release refuses TP), the paged BF16 K/V pool carrying the full
+  history per (layer, loop) under the exact `per_loop` policy; the
+  checkpoint ships no draft layer, so `engine.mtp`, the drafter keys and
+  `--world > 1` are refused at startup by name, not ignored. Two
+  [engine keys](docs/configuration.md): `engine.dory_loops` (the exact
+  path leaves it unset) and `engine.dory_kv_cache` (`per_loop` default,
+  `last_loop` lossy for decode and prefix reuse). The template is
+  [deploy/cluster_dory1.0-4b_nvfp4_w1.example.json](deploy/cluster_dory1.0-4b_nvfp4_w1.example.json);
+  the model card is [docs/model_cards/Dory1.0-4B-NVFP4.md](docs/model_cards/Dory1.0-4B-NVFP4.md)
+  and the survey [docs/dory_plan.md](docs/dory_plan.md). The forward gate
+  runs the CUDA walk against a CPU fp64 host reference (fixture logits
+  within 0.008 relative L2, worst element 0.9 % of the logits' peak,
+  prefill and session decode alike). Landing a real checkpoint found and
+  fixed three: the 7168-wide NVFP4 GEMV K (the MLP down projection) joins
+  the compiled set, the decode-graph walk is memcpy-clean (the theta
+  tables stage at build, the staging copies are kernels), and the
+  tokenizer grew the Nemotron CamelCase pretokenizer pattern while the
+  chat-template subset grew the generic transformers template's pieces —
+  the `for x in ys if cond` filter, mapping-key iteration and the
+  `sequence` test. Boot 1.7 s to listening; a 48-token greedy generation
+  reproduces bitwise across runs.
 - **The fp8 K/V pool on every Qwen3.5 release, and the Qwen3.8-27B FP8
   templates take it with the fp8 attention** (2026-10-18). `engine.kv_dtype:
   "fp8"` needed a release that ships its `kv_cache_scheme` scales (the

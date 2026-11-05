@@ -153,9 +153,51 @@ def deployment(path):
         raise ValueError("deployment config must be an object")
     if set(cfg) & {"nodes", "ssh_user"}:
         raise ValueError("move nodes and ssh_user out of the deployment JSON into .env; use world_size")
-    unknown = set(cfg) - {"model", "world_size", "release", "engine", "paths", "http", "ports", "tokenizer"}
+    unknown = set(cfg) - {"model", "world_size", "release", "engine", "paths", "http", "ports", "tokenizer", "nvme_cache"}
     if unknown:
         raise ValueError("unknown deployment keys: " + ", ".join(sorted(unknown)))
+    nvme = cfg.get("nvme_cache", {})
+    if not isinstance(nvme, dict) or set(nvme) - {"enabled", "path", "capacity_gib", "min_tokens",
+                                                   "chunk_mib", "max_ops", "reserve_gib", "persist",
+                                                   "allow_buffered", "op_timeout_s", "reuse_binding", "required_mount"}:
+        raise ValueError("nvme_cache may only contain enabled, path, capacity_gib, min_tokens, chunk_mib, "
+                         "max_ops, reserve_gib, persist, allow_buffered, op_timeout_s, reuse_binding and required_mount")
+    required_mount = nvme.get("required_mount", "")
+    if (not isinstance(required_mount, str) or "\0" in required_mount
+            or (required_mount and not required_mount.startswith("/"))):
+        raise ValueError("nvme_cache.required_mount must be empty or an absolute mountpoint path")
+    if "persist" in nvme and not isinstance(nvme["persist"], bool):
+        raise ValueError("nvme_cache.persist must be true or false")
+    if "allow_buffered" in nvme and not isinstance(nvme["allow_buffered"], bool):
+        raise ValueError("nvme_cache.allow_buffered must be true or false")
+    if "op_timeout_s" in nvme and (type(nvme["op_timeout_s"]) is not int or not 0 <= nvme["op_timeout_s"] <= 86400):
+        raise ValueError("nvme_cache.op_timeout_s must be an integer number of seconds from 0 to 86400")
+    if "chunk_mib" in nvme and (type(nvme["chunk_mib"]) is not int or not 4 <= nvme["chunk_mib"] <= 4096):
+        raise ValueError("nvme_cache.chunk_mib must be an integer from 4 to 4096 MiB")
+    if "max_ops" in nvme and (type(nvme["max_ops"]) is not int or not 1 <= nvme["max_ops"] <= 256):
+        raise ValueError("nvme_cache.max_ops must be an integer from 1 to 256")
+    if "reserve_gib" in nvme and (isinstance(nvme["reserve_gib"], bool)
+                                 or not isinstance(nvme["reserve_gib"], (int, float))
+                                 or nvme["reserve_gib"] < 0):
+        raise ValueError("nvme_cache.reserve_gib must be a non-negative number of GiB")
+    if "enabled" in nvme and not isinstance(nvme["enabled"], bool):
+        raise ValueError("nvme_cache.enabled must be true or false")
+    if "path" in nvme and (not isinstance(nvme["path"], str) or not nvme["path"]):
+        raise ValueError("nvme_cache.path must be a non-empty directory path")
+    if "capacity_gib" in nvme and (isinstance(nvme["capacity_gib"], bool)
+                                  or not isinstance(nvme["capacity_gib"], (int, float))
+                                  or nvme["capacity_gib"] < 0):
+        raise ValueError("nvme_cache.capacity_gib must be a non-negative number of GiB")
+    if "min_tokens" in nvme and (type(nvme["min_tokens"]) is not int or nvme["min_tokens"] < 0):
+        raise ValueError("nvme_cache.min_tokens must be a non-negative integer")
+    if nvme.get("enabled") and not nvme.get("capacity_gib"):
+        raise ValueError("nvme_cache.capacity_gib must be positive when nvme_cache.enabled is true")
+    reuse = nvme.get("reuse_binding", "")
+    if not isinstance(reuse, str) or (reuse and
+            (len(reuse) != 16 or any(c not in "0123456789abcdef" for c in reuse))):
+        raise ValueError("nvme_cache.reuse_binding must be an existing binding (16 lowercase hexadecimal digits)")
+    if reuse and (not nvme.get("enabled", False) or not nvme.get("persist", True)):
+        raise ValueError("nvme_cache.reuse_binding requires enabled and persist to be true")
     if not isinstance(cfg.get("model"), str) or not cfg["model"]:
         raise ValueError("deployment model must be a non-empty string")
     release_name(cfg.get("release", ""))

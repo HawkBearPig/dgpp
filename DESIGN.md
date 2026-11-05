@@ -1,7 +1,7 @@
 # DGPP Engine Design
 
 This document describes the implemented serving architecture. The
-shared runtime supports the GLM, Qwen, DeepSeek, MiMo and Flint architectures listed
+shared runtime supports the GLM, Qwen, DeepSeek, MiMo, MiniMax, Flint and Dory architectures listed
 in the [supported-model guide](README.md), with resident loading, tensor
 parallelism, decode graphs, sampling, prefix caching and speculative decoding.
 World size and memory requirements depend on the model
@@ -11,6 +11,10 @@ The attention, weight-placement and state examples below describe
 GLM-5.3-Flash unless another family is named. Qwen's GDN/QSA/GR/PLE
 operators are documented in [its architecture study](docs/qwen38_flash_next_plan.md),
 and GLM-4.7's GQA and NVFP4 layout in [its implementation notes](docs/glm47_plan.md).
+MiniMax M3.1's per-head sparse block selection, FP32 routing, published
+MXFP8/NVFP4 weights, bundled DSpark and temporal vision encoder are described
+in [its implementation record](docs/minimax_m31_flash_plan.md). It uses the
+same session, prefill, graph, prefix-cache and speculative-decoding contracts.
 Shared session and engine interfaces live in `src/engine/`. A common scheduler
 owns admission, fair reader budgets and request lifecycle. `PrefillTask`,
 `PrefillContinuation`, `PrefillBatch`, `RowRun` and `GraphBatchMapping` share
@@ -1835,6 +1839,15 @@ the next conversation turn. Reuse requires the next prompt to contain
 the same token prefix, including the rendered answer and relevant
 reasoning/template content.
 
+Cancellation may retain an existing rolling snapshot only when its position
+is within the committed response prefix (prompt plus generated tokens,
+excluding the pending last token). It does not take a fresh retirement
+snapshot. A client that received fewer tokens or changed the rendered
+history still has to match the stored prefix and a valid cut. Retained
+entries use the ordinary arena, block accounting and eviction policy. They
+remain in memory only: cancellation must not start an NVMe spill that pins
+their blocks and prevents live requests from reclaiming capacity.
+
 MTP can commit past an aligned position in one step. The scheduler can
 arm a post-row snapshot for that position; the engine reconstructs it
 from speculative state snapshots and the corresponding cache references.
@@ -1879,8 +1892,37 @@ decisions from the same journaled inputs. The warm record supplies rank
 compares its own digest before applying the next record and exits on a
 mismatch. Decisions also appear in the operation stream.
 
+**The NVMe cold tier.** With `nvme_cache` enabled, entries the arena
+evicts survive on a preallocated slab per rank (`engine/nvme_tier.hpp`,
+`sched/disk_cache.hpp`). A spill copies an entry's blob and the cache
+blocks its metadata pins into 4 KiB-aligned records written with direct
+I/O, and a restore reads them into fresh pool blocks and an arena slot
+before the request attaches. Every byte of the tier's device work is
+enqueued by the engine thread on the model stream at a tick's top, two
+staging slices at a time, exactly as the arena's own copies interleave
+with the decode replays. A file worker moves slices between pinned staging
+and the slab and never calls into CUDA. Blocks are shared on disk by
+physical identity (the pool's block id and its contents generation), so a
+document and its attached variants are stored once, and retention is LRU
+within the capacity. The index is scheduler state, identical on every
+rank: spills and restores start as decisions, each rank reports a finished
+op to rank 0 over the journal's return path, and rank 0 journals the
+world's verdict once every rank has reported, ok only when all succeeded.
+Every page carries a CRC-32C, and a failed read or write on any rank is
+the same cold miss everywhere. The slab persists under a binding of the
+binary, the checkpoint, the effective settings and the geometry. The index
+file holds the world's bytes and, beside them, this rank's digest of every
+entry's page checksums taken at its commit. At open a rank validates each
+entry against its checksum table and reads its token ids back, pruning
+what fails, and the world adopts the candidate only when every rank
+validated the same bytes. The world acquires the slab's exclusive lock before
+truncating or sizing it, so a refused duplicate leaves its contents intact.
+An op without progress fails after `op_timeout_s`, and a stuck file worker refuses new
+restores at once.
+
 **Diagnostics.** Metrics report hits, misses, saved tokens, snapshots,
-evictions, pinned blocks and copy times. On a miss, the cache can report
+evictions, pinned blocks and copy times, and the cold tier's pages,
+entries, spills, restores and failures. On a miss, the cache can report
 the nearest live prefix or a matching entry in its recent-eviction history.
 These diagnostics do not affect lookup or eviction. Entries are local to
 the process and are not persisted across restarts.
@@ -2109,6 +2151,13 @@ See [tokenization](docs/tokenization.md) for bounds and validation. Golden corpo
 reference tokenizers and are keyed by the tokenizer file's hash. A
 different checkpoint revision must use its matching corpus.
 
+Template integers use signed 64-bit values. Addition and subtraction reject
+unrepresentable results with a line-numbered error. Range and slice iteration
+stop when the next value exceeds the integer domain, preserving finite
+sequences at its boundaries; out-of-range list indexes yield undefined.
+Replacing an empty pattern inserts at each UTF-8 codepoint boundary,
+including both ends, with a checked result size before allocation.
+
 `src/text/chat_template.*` parses the checkpoint's Jinja template at
 model load and renders its syntax tree per request. It implements the
 supported statements and expressions with transformers-compatible
@@ -2117,6 +2166,23 @@ during parsing; rendering errors identify the template line. Rendering
 state is per call, so the parsed template can be shared. Golden tests
 cover rendered bytes and encoded IDs for text, reasoning and tool calls
 in each supported family.
+
+Compilation limits source size, expression tokens and recursive parser entries.
+Each render limits evaluator/macro depth and interpreter dispatch steps. Macro
+buffers and block captures share a cumulative emitted-byte counter; output,
+concatenation and replacement builders check result size before growth. Range
+cardinality is checked before allocation. The defaults are documented in
+`src/text/chat_template.hpp`; exhaustion uses the existing line-numbered error
+path. These selective guards do not bound all helper work, implicit value copies,
+collections, allocations or elapsed time. Shared-object cycles and a broader
+allocation policy remain separate work.
+
+The Python golden generator uses Jinja's `ImmutableSandboxedEnvironment`.
+The sandbox blocks private-attribute access and mutation of built-in input
+collections; namespace assignments, loop controls and the JSON filter
+retain their reference semantics. This restricts template capabilities, not
+CPU or memory consumption, so untrusted templates still require resource
+isolation when generating reference data.
 
 ### Sampling semantics
 
@@ -2218,8 +2284,11 @@ At positive temperature, logprobs describe the final filtered and
 renormalized sampling distribution. At temperature zero they describe
 the raw distribution used by the greedy reporting path. Chat requests
 can ask for `logprobs` and up to 20 `top_logprobs`; the legacy
-route uses its integer logprobs field. Each returned token carries its
-corresponding report through scheduler events and the HTTP response.
+route uses its integer logprobs field. These reports cover generated tokens;
+prompt scoring is not implemented. Both routes reject non-null
+`prompt_logprobs` explicitly, while null is treated as omission.
+Each returned token carries its corresponding report through scheduler
+events and the HTTP response.
 
 The common greedy path avoids the full sampling calculation. Greedy
 requests needing penalties or logprobs use the reporting path while
@@ -2370,6 +2439,15 @@ schemas fall back to JSON-object mode with a warning. Each peer builds
 the same machine from the journal and its tokenizer.
 
 ## 11. Runtime and API
+
+The shared JSON parser validates number grammar before conversion, retaining exact
+signed integers when representable and the existing double fallback otherwise.
+Its prefix-parsing API remains available; `parse_document` additionally requires
+only JSON whitespace after the root. Completion bodies use document parsing,
+including before file-input normalization, as do string-encoded function arguments
+in request history. Malformed bodies receive HTTP 400 naming `body`; malformed
+embedded arguments name their history field. This does not change the separate
+model-output parser's precision-preserving fallback.
 
 HTTP request lengths are fully parsed as unsigned decimal integers after trimming
 space/tab padding. Repeated `Content-Length` fields must agree numerically and
@@ -2609,6 +2687,10 @@ Only accepted scheduler changes are journaled. HTTP validation failures
 stay on rank 0; token production and retirements are derived by each
 scheduler. A peer rejecting an admitted request or deriving a different
 digest exits with an error. The stop record is handled between ticks.
+The NVMe cold tier adds the journal's one return path: a peer writes a
+status line for each cold tier op its worker finishes; rank 0 reads those
+lines between passes, and the tick record's `dk` field carries the world's
+verdict on every op all ranks have reported, applied before that tick.
 
 ### Eager and graph engines
 

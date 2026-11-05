@@ -1,5 +1,5 @@
 #pragma once
-// IGemm interface (DESIGN §§4 and 11): weights [N,K] fp8/bf16 against
+// IGemm interface (DESIGN §§4 and 11): weights [N,K] fp8/bf16/fp32 against
 // activations [M,K].
 // Implementations must be deterministic run-to-run at fixed shapes so CUDA
 // graph capture replays bitwise.
@@ -24,6 +24,7 @@ class IGemm {
   // act_row_stride: element stride between consecutive rows of `act`.
   // Pass k for a contiguous [M,K] tensor; wider strides read K-column slices
   // of a fused projection buffer (e.g. KDA f_a/g_a views).
+  // FP32 operands use full FP32 compute and require an FP32 destination.
   virtual void matmul(const void* act, const void* weight, void* out, int m,
                       int n, int k, DType io_dtype, GemmOut out_dtype,
                       size_t act_row_stride, void* workspace, size_t ws_bytes,
@@ -122,8 +123,9 @@ class CublasLtGemm : public IGemm {
                            int64_t out_stride, void* workspace, size_t ws_bytes,
                            cudaStream_t stream, int plan_rows = 0, bool weight_kn = false);
 
-  // BF16 linear projection with FP32 split-K reductions and one BF16 output
-  // rounding. Optional bias uses the fused epilogue. Always uses cuBLASLt,
+  // BF16 linear projection with FP32 split-K reductions and BF16 output.
+  // Optional bias uses cuBLASLt's epilogue; its rounding can depend on the
+  // selected plan and workspace cap. Always uses cuBLASLt,
   // including small row counts; ordinary text matmul keeps its own dispatch.
   void matmul_linear_bf16(const uint16_t* act, const uint16_t* weight, const uint16_t* bias,
                         uint16_t* out, int m, int n, int k, void* workspace, size_t ws_bytes,

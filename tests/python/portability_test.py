@@ -47,6 +47,60 @@ class PortabilityTest(unittest.TestCase):
             self.assertEqual(site_env.default_host(), "127.0.0.1")
             self.assertEqual(site_env.http_port(), 8080)
 
+    def test_nvme_cache_block_passes_through_and_is_checked(self):
+        # The cold tier's top-level block (issue #26) rides the resolved config
+        # as written; its keys and types are checked by name.
+        self.config.write_text(json.dumps({"model": "org/model", "world_size": 1,
+                                         "nvme_cache": {"enabled": True, "path": "/nvme/dgpp",
+                                                        "capacity_gib": 64, "min_tokens": 2048,
+                                                        "chunk_mib": 32, "max_ops": 2, "reserve_gib": 2.5,
+                                                        "persist": False, "allow_buffered": True,
+                                                        "op_timeout_s": 30}}))
+        resolved = site_env.resolve_config(self.config, self.values)
+        self.assertEqual(resolved["nvme_cache"], {"enabled": True, "path": "/nvme/dgpp",
+                                                  "capacity_gib": 64, "min_tokens": 2048,
+                                                  "chunk_mib": 32, "max_ops": 2, "reserve_gib": 2.5,
+                                                  "persist": False, "allow_buffered": True,
+                                                  "op_timeout_s": 30})
+        self.config.write_text(json.dumps({"model": "org/model", "world_size": 1}))
+        self.assertNotIn("nvme_cache", site_env.resolve_config(self.config, self.values))
+        for nvme in ({"enabled": True}, {"enabled": 1}, {"capacity_gib": -1}, {"capacity_gib": True},
+                     {"path": ""}, {"min_tokens": 1.5}, {"size": 3}, [], {"chunk_mib": 2}, {"chunk_mib": 8192},
+                     {"chunk_mib": 1.5}, {"max_ops": 0}, {"max_ops": 257}, {"reserve_gib": -1},
+                     {"reserve_gib": True}, {"persist": 1}, {"allow_buffered": 1}, {"op_timeout_s": -1},
+                     {"op_timeout_s": 1.5}, {"op_timeout_s": 90000}):
+            with self.subTest(nvme=nvme):
+                self.config.write_text(json.dumps({"model": "org/model", "world_size": 1, "nvme_cache": nvme}))
+                with self.assertRaises(ValueError):
+                    site_env.resolve_config(self.config, self.values)
+
+    def test_nvme_reuse_binding_survives_resolution(self):
+        cache = {"enabled": True, "capacity_gib": 64, "reuse_binding": "0123456789abcdef"}
+        self.config.write_text(json.dumps({"model": "org/model", "world_size": 1, "nvme_cache": cache}))
+        resolved = site_env.server_config(site_env.resolve_config(self.config, self.values))
+        self.assertEqual(resolved["nvme_cache"], cache)
+        for changes in ({"reuse_binding": True}, {"reuse_binding": "../cache"},
+                        {"reuse_binding": "0123456789abcdeF"}, {"reuse_binding": "0123"},
+                        {"enabled": False}, {"persist": False}):
+            with self.subTest(changes=changes):
+                self.config.write_text(json.dumps({"model": "org/model", "world_size": 1,
+                                                  "nvme_cache": {**cache, **changes}}))
+                with self.assertRaisesRegex(ValueError, "nvme_cache.reuse_binding"):
+                    site_env.resolve_config(self.config, self.values)
+
+    def test_nvme_required_mount_survives_resolution(self):
+        for mount in ("", "/", "/mnt/cache", "/mnt/space tab\tback\\line\n"):
+            cache = {"enabled": True, "capacity_gib": 64, "required_mount": mount}
+            self.config.write_text(json.dumps({"model": "org/model", "world_size": 1, "nvme_cache": cache}))
+            resolved = site_env.server_config(site_env.resolve_config(self.config, self.values))
+            self.assertEqual(resolved["nvme_cache"], cache)
+        for mount in (True, None, 1, [], "relative", "~/cache", "/cache\0suffix"):
+            with self.subTest(mount=mount):
+                self.config.write_text(json.dumps({"model": "org/model", "world_size": 1,
+                                                  "nvme_cache": {"required_mount": mount}}))
+                with self.assertRaisesRegex(ValueError, "nvme_cache.required_mount"):
+                    site_env.resolve_config(self.config, self.values)
+
     def test_http_types_and_ports_rejected(self):
         for http in ({"bind_host": 0}, {"bind_host": "localhost"}, {"port": True}, {"port": 0}, {"host": "a"}):
             with self.subTest(http=http):
@@ -251,17 +305,26 @@ class PortabilityTest(unittest.TestCase):
             "nvidia/Qwen3.5-122B-A10B-NVFP4": "qwen3.5-122b-a10b_nvfp4",
             "local-inference-lab/Qwen3.8-Flash-Next-NVFP4": "qwen-3.8-flash-next_nvfp4-qad",
             "kaushikvira/Qwen3.8-Flash-Next-swift15-nvfp4-dgpp": "qwen-3.8-flash-next_nvfp4-swift15",
+            "nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-NVFP4": "dory1.0-4b_nvfp4",
             "HawkBearPig/flint-FP8-NVFP4": "flint_fp8-nvfp4",
+            "MiniMaxAI/MiniMax-M3.1-Flash": "minimax-m3.1-flash_nvfp4-mxfp8",
         }
-        # The families without a draft head (2026-10-22): their templates
-        # keep MTP off — the plain world is the only one.
-        no_draft = {"HawkBearPig/flint-FP8-NVFP4"}
+        # Families whose checkpoint ships no draft layer: their templates run
+        # plain (the spec keys are refused by name at boot, not merely off) —
+        # docs/dory_plan.md D4 for the Dory1.0-4B one, and the families
+        # without a draft head (2026-10-22) keep MTP off the same way.
+        draftless_models = {"nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-NVFP4",
+                            "HawkBearPig/flint-FP8-NVFP4"}
+        # MiniMax's measured throughput default is plain, although its bundled
+        # DSpark remains available as a knob (docs/minimax_m31_flash_plan.md).
+        plain_default_models = {"MiniMaxAI/MiniMax-M3.1-Flash"}
         values = {**site_env.DEFAULTS, "DGPP_NODES": "head peer1 peer2 peer3", "DGPP_SSH_USER": "ops"}
         templates = list((ROOT / "deploy").glob("*.example.json"))
         self.assertTrue(templates)
         index = (ROOT / "deploy/README.md").read_text()
         # One template per model, quant and world (2026-09-14): every template
-        # enables the decode graph and MTP, except a DFlash2-drafter variant
+        # enables the decode graph, with the measured draft or plain default.
+        # A DFlash2-drafter variant
         # (2026-10-01): it names engine.dflash_model instead of MTP, the
         # drafter replacing the MTP draft one-for-one, its block proposal
         # recorded in the graph step (2026-10-05; the eager engine is the
@@ -276,18 +339,25 @@ class PortabilityTest(unittest.TestCase):
                 if drafter:
                     self.assertFalse(engine["mtp"], "a drafter template replaces MTP, not both")
                     self.assertTrue(engine["decode_graph"], "the drafter's block proposal is recorded in the graph step")
-                elif cfg["model"] in no_draft:
-                    self.assertFalse(engine["mtp"], "a family without a draft head keeps MTP off")
+                elif cfg["model"] in draftless_models:
+                    self.assertFalse(engine.get("mtp", False), "a draftless family's template runs plain")
+                    self.assertTrue(engine["decode_graph"])
+                elif cfg["model"] in plain_default_models:
+                    self.assertFalse(engine["mtp"], "this family's measured default is plain")
                     self.assertTrue(engine["decode_graph"])
                 else:
-                    self.assertTrue(engine["mtp"], "every template enables MTP (the plain world is --no-mtp)")
+                    self.assertTrue(engine["mtp"], "this family's template enables MTP (plain is --no-mtp)")
                     self.assertTrue(engine["decode_graph"])
                 # The name is the shape: cluster_<model>_<quant>_w<n>, with an
                 # optional trailing _<variant> for a template that deviates from
                 # that shape in one documented engine setting (today the Qwen
                 # 512K YaRN ramp) instead of in its size. A base shape stays
                 # unique, and a variant may repeat one only with its suffix;
-                # deploy/README.md carries the rule and the catalogue.
+                # deploy/README.md carries the rule and the catalogue. The
+                # draft mechanism is never a fork of the shape: a model's
+                # drafter world is the same template with --dflash-model, so a
+                # drafter template and an MTP template of one model, quant and
+                # world share a stem and the rule below refuses the pair.
                 shape = re.fullmatch(
                     rf"cluster_{re.escape(models[cfg['model']])}_w([0-9]+)(_[a-z0-9]+)?",
                     path.name.removesuffix(".example.json"))

@@ -402,7 +402,7 @@ changes introduced by a different target quantization.
 ### Status (2026-10-01, Qwen3.8-27B lane)
 
 Steps 3–6 are implemented for the Qwen3.5-family target
-(`src/models/qwen/dflash2.*`, `src/kernels/dflash2.*`, the `dflash2_*`
+(`src/models/dflash2/*`, `src/kernels/dflash2.*`, the `dflash2_*`
 methods of `Qwen35Model`, `DFlash2Speculator`): the drafter loads
 independently with its weights and planes in the memory plan, taps
 capture through the five `fc` slices with fp32 accumulation, the five

@@ -1,0 +1,40 @@
+name: Model request
+description: A checkpoint or weight format you would like served
+labels: [model]
+body:
+  - type: input
+    id: checkpoint
+    attributes:
+      label: Checkpoint
+      description: The Hugging Face repository, with the revision if it matters.
+      placeholder: org/Model-Name-NVFP4
+    validations:
+      required: true
+  - type: input
+    id: format
+    attributes:
+      label: Weight format
+      description: How the tensors are stored, as the repository's config and safetensors headers say.
+      placeholder: NVFP4 routed experts, FP8 block-128 attention, BF16 head
+    validations:
+      required: true
+  - type: input
+    id: architecture
+    attributes:
+      label: Architecture
+      description: The `architectures` entry in config.json and anything unusual about the layers.
+      placeholder: Qwen3_5MoeForConditionalGeneration, gated DeltaNet plus sparse attention
+  - type: dropdown
+    id: nodes
+    attributes:
+      label: Nodes you want it on
+      multiple: true
+      options:
+        - "1"
+        - "2"
+        - "4"
+  - type: textarea
+    id: why
+    attributes:
+      label: Why this one
+      description: The workload it serves and, if you have them, quality or speed results from another engine.

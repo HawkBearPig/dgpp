@@ -14,5 +14,10 @@ set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
 set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
 set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
 set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)
+# pkg-config does not use CMAKE_FIND_ROOT_PATH. Select ARM64 FFmpeg metadata
+# explicitly instead of accidentally linking the build host's libraries.
+if(NOT DEFINED ENV{PKG_CONFIG_LIBDIR})
+  set(ENV{PKG_CONFIG_LIBDIR} "/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig")
+endif()
 set(IBVERBS_INCLUDE_DIR /usr/include CACHE PATH "ARM64 verbs headers")
 set(IBVERBS_LIBRARY /usr/lib/aarch64-linux-gnu/libibverbs.so CACHE FILEPATH "ARM64 verbs library")

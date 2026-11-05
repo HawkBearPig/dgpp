@@ -200,8 +200,8 @@ __global__ void qkv_finish_kernel(const float* __restrict__ qkv, int64_t qkv_str
                                   int block_tokens, uint16_t* __restrict__ q_out, int64_t q_out_stride,
                                   uint16_t* __restrict__ k_cache, uint16_t* __restrict__ v_cache,
                                   float* __restrict__ k_scale, float* __restrict__ v_scale) {
-  using HL = HeadLane<DK, R>;
   dgpp_pdl_wait();
+  using HL = HeadLane<DK, R>;
   const int heads_total = local_heads + 2 * kv_heads;
   const int item = static_cast<int>(blockIdx.x) * (blockDim.x / 32) + threadIdx.x / 32;
   if (item >= rows * heads_total) return;
@@ -316,7 +316,7 @@ __device__ __forceinline__ float tile_score(const uint16_t* __restrict__ krow_bf
   return acc;
 }
 
-template <int DK, bool kFp8>
+template <int DK, bool kFp8, bool kSelectedBlocks = false>
 __global__ void attn_partial_kernel(const uint16_t* __restrict__ q, int64_t q_stride,
                                     const uint16_t* __restrict__ k_cache,
                                     const uint16_t* __restrict__ v_cache,
@@ -329,9 +329,10 @@ __global__ void attn_partial_kernel(const uint16_t* __restrict__ q, int64_t q_st
                                     float* __restrict__ m_ws, float* __restrict__ l_ws,
                                     float* __restrict__ c_ws,
                                     const float* __restrict__ k_scale,
-                                    const float* __restrict__ v_scale) {
-  constexpr int kRowStride = Geo<DK>::kRowStride;
+                                    const float* __restrict__ v_scale,
+                                    const int32_t* __restrict__ selected_blocks = nullptr) {
   dgpp_pdl_wait();
+  constexpr int kRowStride = Geo<DK>::kRowStride;
   extern __shared__ __align__(16) uint16_t smem[];
   const int hpk = local_heads / kv_heads;
   const int r = static_cast<int>(blockIdx.x);
@@ -348,6 +349,17 @@ __global__ void attn_partial_kernel(const uint16_t* __restrict__ q, int64_t q_st
   const int64_t p = pos[r];
   int64_t t_begin = 0, t_end = 0;
   if (p >= 0) {
+    if constexpr (kSelectedBlocks) {
+      // MiniMax MSA: each index head owns one KV head and selects a
+      // separate list of logical 128-token blocks. Each split covers one
+      // selected block, with causal masking inside the current block.
+      const int b = selected_blocks[(static_cast<int64_t>(r) * kv_heads + kvh) * n_split + s];
+      if (b >= 0) {
+        t_begin = static_cast<int64_t>(b) * block_tokens;
+        const int64_t e = t_begin + block_tokens;
+        t_end = e < p + 1 ? e : p + 1;
+      }
+    } else {
     const int64_t t_lo = window > 0 ? (p - window + 1 > 0 ? p - window + 1 : 0) : 0;
     const int64_t visible = p - t_lo + 1;
     const int64_t tiles = (visible + kTile - 1) / kTile;
@@ -358,6 +370,7 @@ __global__ void attn_partial_kernel(const uint16_t* __restrict__ q, int64_t q_st
       t_begin = t_lo + tile0 * kTile;
       const int64_t e = t_lo + tile1 * kTile;
       t_end = e < p + 1 ? e : p + 1;
+    }
     }
   }
   if (t_begin >= t_end) {
@@ -457,7 +470,10 @@ __global__ void attn_partial_kernel(const uint16_t* __restrict__ q, int64_t q_st
     const float rescale = expf(m_run - m_new);  // 0 when m_run is -inf
     const float e = lane < n ? expf(score - m_new) : 0.f;
     l_run = l_run * rescale + warp_sum(e);
-    pbuf[warp * kTile + lane] = round_bf16(e);
+    // MiniMax's baseline keeps probabilities in FP32. Rounding each
+    // block's unnormalized probabilities perturbs its sensitive routers.
+    // The other families retain their existing BF16 probability recipe.
+    pbuf[warp * kTile + lane] = kSelectedBlocks ? e : round_bf16(e);
 #pragma unroll
     for (int i = 0; i < 4; ++i) creg[i] *= rescale;
     __syncwarp();
@@ -678,9 +694,9 @@ __device__ __forceinline__ void store_tile_pieces(int64_t t0, int64_t t_end, con
 
 template <int DK, int R, bool kFp8>
 __global__ void __launch_bounds__(kFusedMaxThreads) attn_fused_kernel(SinkAttnFusedArgs a) {
+  dgpp_pdl_wait();
   using HL = HeadLane<DK, R>;
   constexpr int kRowStride = Geo<DK>::kRowStride;
-  dgpp_pdl_wait();
   extern __shared__ __align__(16) uint16_t smem[];
   __shared__ int s_last;
   const int hpk = a.local_heads / a.kv_heads;

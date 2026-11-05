@@ -35,6 +35,18 @@
 // FNV-1a-64 hash (header "template_hash"); a gate run against a
 // different chat_template.jinja refuses rather than compares.
 //
+// Structural guards: compile/load allow at most 1 MiB source, 512 tokens per
+// expression and 64 recursive parser entries. Each render allows 256 active
+// eval/exec/macro entries and 10 million steps (expression evaluations, executed
+// statements, macro calls and loop iterations). Macro buffers and block captures
+// share the 64 MiB cumulative emission limit; each output buffer and newly built
+// concatenation/replacement string is limited to 16 MiB. range() allows 262144
+// elements. Identity replacement returns an existing value without this check.
+// Exhaustion throws std::runtime_error. These are selective guards, not a bound
+// on all work, collections, allocations, helper recursion, RSS or elapsed time.
+// Input construction, implicit Value copies, tojson/equality traversal and
+// shared-object cycles are outside this policy.
+//
 // Threading: compile/load once, then render() is const and thread-safe
 // (all renderer state is per-call; namespace objects never escape).
 #include <cstdint>

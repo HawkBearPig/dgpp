@@ -41,16 +41,16 @@
 #include <algorithm>
 #include <atomic>
 #include <charconv>
-#include <cstdlib>
 #include <chrono>
 #include <cmath>
-#include <cstdint>
 #include <csignal>
+#include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <exception>
 #include <filesystem>
-#include <functional>
 #include <format>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -63,57 +63,65 @@
 #include "common/cuda_check.hpp"
 #include "common/log.hpp"
 #include "common/process_memory.hpp"
-#include "kernels/l2_prefetch.hpp"
-#include "kernels/draft_head.hpp"
-#include "kernels/bf12_companions.hpp"
-#include "kernels/latent_format.hpp"
-#include "loaders/hf_cache.hpp"
-#include "serve/cluster_config.hpp"
-#include "serve/rank_metrics.hpp"
 #include "dgpp_version.hpp"
-#include "text/chat_template.hpp"
 #include "engine/eager_engine.hpp"
 #include "engine/graph_engine.hpp"
-#include "engine/verify_schedule.hpp"
 #include "engine/memory_plan.hpp"
-#include "loaders/architecture.hpp"
-#include "models/glm/fabric_engine.hpp"
-#include "models/glm/moe_layer.hpp"
+#include "engine/verify_schedule.hpp"
+#include "kernels/bf12_companions.hpp"
+#include "kernels/draft_head.hpp"
+#include "kernels/l2_prefetch.hpp"
+#include "kernels/latent_format.hpp"
 #include "kernels/packq_gemm.hpp"
-#include "models/glm/forward.hpp"
-#include "models/glm/gen_engine.hpp"
-#include "models/qwen/config.hpp"
-#include "models/qwen/forward.hpp"
-#include "models/qwen/model35.hpp"
-#include "models/glm4/config.hpp"
-#include "models/glm4/forward.hpp"
-#include "models/glm_dsa/config.hpp"
-#include "models/dsv41/config.hpp"
-#include "models/dsv41/loader.hpp"
-#include "models/dsv41/model.hpp"
+#include "loaders/architecture.hpp"
+#include "loaders/hf_cache.hpp"
+#include "models/dory/binding.hpp"
+#include "models/dory/config.hpp"
+#include "models/dory/forward.hpp"
+#include "models/dory/loader.hpp"
 #include "models/dsv4/config.hpp"
 #include "models/dsv4/loader.hpp"
 #include "models/dsv4/model.hpp"
-#include "text/dsv41_prompt.hpp"
-#include "text/dsv4_prompt.hpp"
+#include "models/dsv41/config.hpp"
+#include "models/dsv41/loader.hpp"
+#include "models/dsv41/model.hpp"
+#include "models/flint/config.hpp"
+#include "models/flint/forward.hpp"
+#include "models/glm/fabric_engine.hpp"
+#include "models/glm/forward.hpp"
+#include "models/glm/gen_engine.hpp"
+#include "models/glm/moe_layer.hpp"
+#include "models/glm4/config.hpp"
+#include "models/glm4/forward.hpp"
+#include "models/glm_dsa/config.hpp"
 #include "models/glm_dsa/model.hpp"
 #include "models/mimo/config.hpp"
 #include "models/mimo/forward.hpp"
-#include "models/flint/config.hpp"
-#include "models/flint/forward.hpp"
+#include "models/minimax/dspark.hpp"
+#include "models/minimax/forward.hpp"
+#include "models/qwen/config.hpp"
+#include "models/qwen/forward.hpp"
+#include "models/qwen/model35.hpp"
+#include "net/collective_bus.hpp"
 #include "sched/scheduler.hpp"
+#include "serve/cluster_config.hpp"
+#include "serve/engine_watchdog.hpp"
+#include "serve/fabric_serve.hpp"
+#include "serve/frontend.hpp"
+#include "serve/generation_service.hpp"
+#include "serve/glm_vision_frontend.hpp"
+#include "serve/http_server.hpp"
+#include "serve/minimax_vision_frontend.hpp"
+#include "serve/nvme_cache_check.hpp"
+#include "serve/prefill_policy.hpp"
+#include "serve/qwen_vision_frontend.hpp"
+#include "serve/rank_metrics.hpp"
+#include "serve/shutdown_watchdog.hpp"
+#include "text/chat_template.hpp"
+#include "text/dsv41_prompt.hpp"
+#include "text/dsv4_prompt.hpp"
 #include "text/tokenizer.hpp"
 #include "text/tool_grammar.hpp"
-#include "net/collective_bus.hpp"
-#include "serve/fabric_serve.hpp"
-#include "serve/generation_service.hpp"
-#include "serve/frontend.hpp"
-#include "serve/glm_vision_frontend.hpp"
-#include "serve/qwen_vision_frontend.hpp"
-#include "serve/http_server.hpp"
-#include "serve/prefill_policy.hpp"
-#include "serve/shutdown_watchdog.hpp"
-#include "serve/engine_watchdog.hpp"
 
 namespace fs = std::filesystem;
 
@@ -335,6 +343,9 @@ struct ServeFamily {
   virtual dgpp::MemoryPlan plan(int forward_rows, int64_t context, int rank, int world, bool fabric,
                                 int slots, bool mtp, int decode_rows) const = 0;
   virtual size_t snapshot_bytes(int world, bool mtp) const = 0;
+  // One cache block's bytes across the pool's planes (the NVMe cold tier's
+  // record, issue #26) at this shape; 0 for a family without a paged cache.
+  virtual size_t cache_block_bytes(int world, bool mtp) const = 0;
   virtual void build_model(dgpp::BoundaryReducer* reducer, int rank, int world, bool fabric,
                            int forward_rows, int64_t pool_tokens, int slots, bool mtp, int decode_rows) = 0;
   virtual void destroy_model() = 0;
@@ -353,6 +364,17 @@ struct ServeFamily {
   virtual void set_draft_model(const std::string& dir) {
     if (!dir.empty())
       throw std::invalid_argument(std::string(name()) + ": no block drafter (dflash_model) support");
+  }
+  // Whether this family records the block drafter's draft inside the decode
+  // graph step (the session_graph_capture_block_draft pair the graph engine
+  // duck-types). A family that takes a drafter but not the capture would
+  // replay a step that records no draft at all: the verify stays exact and the
+  // acceptance collapses with no diagnostic, so the combination is refused at
+  // startup instead. Opt-in: the capture is what earns the flag.
+  virtual bool block_draft_graph_ok() const { return false; }
+  virtual void check_mtp_depth(int depth) const {
+    if (depth > 5)
+      throw std::invalid_argument("engine.mtp_depth: this family supports at most 5 drafts");
   }
 };
 
@@ -401,6 +423,9 @@ struct GlmFamily final : ServeFamily {
   size_t snapshot_bytes(int world_, bool mtp) const override {
     return dgpp::GlmDiagnosticModel::session_snapshot_bytes(cfg, world_, mtp);
   }
+  size_t cache_block_bytes(int world_, bool mtp) const override {
+    return dgpp::GlmDiagnosticModel::kv_block_bytes_static(cfg, world_, mtp, kv_format);
+  }
   void build_model(dgpp::BoundaryReducer* reducer, int rank, int world_, bool fabric, int forward_rows,
                    int64_t pool_tokens, int slots, bool mtp, int decode_rows) override {
     model = std::make_unique<dgpp::GlmDiagnosticModel>(
@@ -439,6 +464,7 @@ struct GlmFamily final : ServeFamily {
 struct QwenFamily final : ServeFamily {
   dgpp::QwenTextConfig cfg;
   std::string ckpt;
+  std::string dflash;  // the DFlash2 drafter's checkpoint dir (empty: off)
   std::unique_ptr<dgpp::QwenModel> model;
   bool fp8_head_mma;
   dgpp::LatentFormat kv_format;
@@ -521,12 +547,16 @@ struct QwenFamily final : ServeFamily {
   }
   dgpp::MemoryPlan plan(int forward_rows, int64_t context, int rank, int world_, bool fabric, int slots,
                         bool mtp, int decode_rows) const override {
-    return dgpp::QwenModel::plan_memory(cfg, forward_rows, context, fabric ? rank : 0, fabric ? world_ : 1,
-                                        fabric ? dgpp::QwenResidency::Resident : dgpp::QwenResidency::Streaming,
-                                        slots, fabric && mtp, decode_rows, /*serving_logits=*/true, kv_format);
+    return dgpp::QwenModel::plan_memory(
+        cfg, forward_rows, context, fabric ? rank : 0, fabric ? world_ : 1,
+        fabric || !dflash.empty() ? dgpp::QwenResidency::Resident : dgpp::QwenResidency::Streaming,
+        slots, fabric && mtp, decode_rows, /*serving_logits=*/true, kv_format, dflash);
   }
   size_t snapshot_bytes(int world_, bool mtp) const override {
     return dgpp::QwenModel::session_snapshot_bytes(cfg, world_, mtp);
+  }
+  size_t cache_block_bytes(int world_, bool mtp) const override {
+    return dgpp::QwenModel::kv_block_bytes_static(cfg, 0, world_, mtp, kv_format, dflash);
   }
   void build_model(dgpp::BoundaryReducer* reducer, int rank, int world_, bool fabric, int forward_rows,
                    int64_t pool_tokens, int slots, bool mtp, int decode_rows) override {
@@ -535,10 +565,17 @@ struct QwenFamily final : ServeFamily {
     dgpp::QwenLayerStream::set_resident_image_dir(dgpp::GlmLayerStream::resident_image_dir());
     model = std::make_unique<dgpp::QwenModel>(
         cfg, ckpt, forward_rows, pool_tokens,
-        fabric ? dgpp::QwenResidency::Resident : dgpp::QwenResidency::Streaming, reducer,
+        fabric || !dflash.empty() ? dgpp::QwenResidency::Resident : dgpp::QwenResidency::Streaming,
+        reducer,
         fabric ? rank : 0, fabric ? world_ : 1, slots, fabric && mtp, decode_rows, fp8_head_mma,
-        /*serving_logits=*/true, kv_format);
+        /*serving_logits=*/true, kv_format, dflash);
   }
+  // The drafter (2026-10-20 port of the Qwen35 DFlash2 walk): its recorded
+  // block draft (session_graph_capture_block_draft/_batch, mirrors and the
+  // capture-aware folds) re-hosted in commit 40da8852..0fae644e, so the
+  // decode graph records it (block_draft_graph_ok).
+  void set_draft_model(const std::string& dir) override { dflash = dir; }
+  bool block_draft_graph_ok() const override { return true; }
   void destroy_model() override { model.reset(); }
   size_t model_snapshot_bytes() const override { return model ? model->session_snapshot_bytes() : 0; }
   std::unique_ptr<ServeGraphEngine> make_graph_engine(dgpp::net::CollectiveBus* bus, int rank,
@@ -595,6 +632,9 @@ struct Glm4Family final : ServeFamily {
   }
   size_t snapshot_bytes(int world_, bool mtp) const override {
     return dgpp::Glm4Model::session_snapshot_bytes(cfg, world_, mtp);
+  }
+  size_t cache_block_bytes(int world_, bool mtp) const override {
+    return dgpp::Glm4Model::kv_block_bytes_static(cfg, 0, world_, mtp);
   }
   void build_model(dgpp::BoundaryReducer* reducer, int rank, int world_, bool fabric, int forward_rows,
                    int64_t pool_tokens, int slots, bool mtp, int decode_rows) override {
@@ -667,6 +707,9 @@ struct GlmDsaFamily final : ServeFamily {
   }
   size_t snapshot_bytes(int world_, bool mtp) const override {
     return dgpp::GlmDsaModel::session_snapshot_bytes(cfg, world_, mtp);
+  }
+  size_t cache_block_bytes(int world_, bool mtp) const override {
+    return dgpp::GlmDsaModel::kv_block_bytes_static(cfg, world_, mtp, kv_format);
   }
   void build_model(dgpp::BoundaryReducer* reducer, int rank, int world_, bool fabric, int forward_rows,
                    int64_t pool_tokens, int slots, bool mtp, int decode_rows) override {
@@ -769,6 +812,9 @@ struct Dsv41Family final : ServeFamily {
   size_t snapshot_bytes(int world_, bool mtp) const override {
     return dgpp::Dsv41Model::session_snapshot_bytes(cfg, world_, mtp);
   }
+  size_t cache_block_bytes(int, bool) const override {
+    return dgpp::Dsv41Model::kv_block_bytes_static(cfg);
+  }
   void build_model(dgpp::BoundaryReducer* reducer, int rank, int world_, bool fabric, int forward_rows,
                    int64_t pool_tokens, int slots, bool mtp, int decode_rows) override {
     dgpp::Dsv41LayerStream::set_resident_image_dir(dgpp::GlmLayerStream::resident_image_dir());
@@ -849,6 +895,7 @@ struct Dsv4Family final : ServeFamily {
   size_t snapshot_bytes(int world_, bool mtp) const override {
     return dgpp::Dsv4Model::session_snapshot_bytes(cfg, world_, mtp);
   }
+  size_t cache_block_bytes(int, bool) const override { return dgpp::Dsv4Model::kv_block_bytes_static(cfg); }
   void build_model(dgpp::BoundaryReducer* reducer, int rank, int world_, bool fabric, int forward_rows,
                    int64_t pool_tokens, int slots, bool mtp, int decode_rows) override {
     dgpp::Dsv4LayerStream::set_resident_image_dir(dgpp::GlmLayerStream::resident_image_dir());
@@ -927,6 +974,9 @@ struct MimoFamily final : ServeFamily {
   size_t snapshot_bytes(int world_, bool mtp) const override {
     return dgpp::MimoModel::session_snapshot_bytes(cfg, world_, mtp);
   }
+  size_t cache_block_bytes(int world_, bool mtp) const override {
+    return dgpp::MimoModel::kv_block_bytes_static(cfg, 0, world_, mtp, kv_format);
+  }
   void build_model(dgpp::BoundaryReducer* reducer, int rank, int world_, bool fabric, int forward_rows,
                    int64_t pool_tokens, int slots, bool mtp, int decode_rows) override {
     dgpp::MimoLayerStream::set_resident_image_dir(dgpp::GlmLayerStream::resident_image_dir());
@@ -958,12 +1008,70 @@ struct MimoFamily final : ServeFamily {
   }
 };
 
-// Flint (FlintForCausalLM, the fp8 / NVFP4 mixed export as shipped;
-// docs/flint_plan.md): the paged K/V pool (64-token blocks, bf16 or fp8
-// rows at 128 / 128, every layer's rows — the sliding-window layers read
-// theirs through the window), no recurrent state (snapshots at any
-// position), no draft head (engine.mtp is refused), the resident fabric
-// model / the streaming world-1 one.
+struct DoryFamily final : ServeFamily {
+  dgpp::DoryConfig cfg;
+  std::string ckpt;
+  std::unique_ptr<dgpp::DoryModel> model;
+  DoryFamily(const std::string& checkpoint, int world)
+      : cfg(dgpp::DoryConfig::from_json_file((fs::path(checkpoint) / "config.json").string())),
+        ckpt(checkpoint) {
+    dgpp::dory_validate_world(world);  // throws for any world but 1, naming the key
+  }
+  const char* name() const override { return "dory"; }
+  int64_t vocab_size() const override { return cfg.vocab_size; }
+  const std::vector<int64_t>& eos_token_ids() const override { return cfg.eos_token_ids; }
+  int64_t block_tokens() const override { return dgpp::DoryModel::kv_block_tokens_static(); }
+  int prefill_chunk_tokens() const override { return dgpp::DoryModel::prefill_chunk_tokens(); }
+  std::string pool_check(int64_t) const override { return ""; }
+  const char* kv_format_name() const override { return "bf16"; }  // the pool has no other form
+  int decode_rows_cap() const override { return dgpp::DoryModel::decode_rows_cap(); }
+  // The widest fold the decode graph records: a block output [rows, hidden].
+  size_t lat_slot_bytes(int decode_rows) const override {
+    return static_cast<size_t>(decode_rows) * static_cast<size_t>(cfg.hidden_size) * 2;
+  }
+  dgpp::MemoryPlan plan(int forward_rows, int64_t context, int, int, bool, int slots, bool,
+                        int decode_rows) const override {
+    return dgpp::DoryModel::plan_memory(cfg, forward_rows, context, dgpp::DoryResidency::Resident,
+                                        slots, decode_rows, /*serving_logits=*/true,
+                                        dgpp::DoryModel::kv_policy());
+  }
+  size_t snapshot_bytes(int, bool) const override {
+    return dgpp::DoryModel::session_snapshot_bytes(cfg, false);
+  }
+  size_t cache_block_bytes(int, bool) const override {
+    return dgpp::DoryModel::kv_block_bytes_static(cfg, dgpp::DoryModel::kv_policy());
+  }
+  void build_model(dgpp::BoundaryReducer*, int, int, bool, int forward_rows, int64_t pool_tokens,
+                   int slots, bool, int decode_rows) override {
+    // The resident image cache: the same directory the process configured
+    // for the GLM loader (prepare_serving_process), so paths.resident_cache
+    // applies (docs/adding_a_model.md §2).
+    dgpp::DoryLayerStream::set_resident_image_dir(dgpp::GlmLayerStream::resident_image_dir());
+    model = std::make_unique<dgpp::DoryModel>(cfg, ckpt, forward_rows, pool_tokens,
+                                              dgpp::DoryResidency::Resident, slots, decode_rows,
+                                              /*serving_logits=*/true, dgpp::DoryModel::kv_policy());
+  }
+  void destroy_model() override { model.reset(); }
+  size_t model_snapshot_bytes() const override { return model ? model->session_snapshot_bytes() : 0; }
+  std::unique_ptr<ServeGraphEngine> make_graph_engine(dgpp::net::CollectiveBus* bus, int rank,
+                                                      int, uint16_t* pick_scratch,
+                                                      int batch_min_live, uint16_t* prefix_scratch,
+                                                      uint16_t* gather_scratch, int candidates,
+                                                      const dgpp::text::GrammarVocab* grammar,
+                                                      int prefix_slots, int mtp_depth,
+                                                      bool compact_batches, int lookup_tail = 0) override {
+    return std::make_unique<ServeGraphEngineOf<dgpp::DoryModel>>(
+        model.get(), bus, rank, 1, pick_scratch, cfg.vocab_size, /*pick_timeout_ms=*/60000,
+        batch_min_live, prefix_scratch, gather_scratch, candidates, grammar, prefix_slots,
+        mtp_depth, compact_batches, lookup_tail);
+  }
+  std::unique_ptr<dgpp::sched::SchedulerEngine> make_eager_engine(
+      int slots, dgpp::DecodePick pick, dgpp::DecodeSample sample, const dgpp::text::GrammarVocab* grammar,
+      int prefix_slots) override {
+    return std::make_unique<dgpp::EagerEngineAdapter<dgpp::DoryModel>>(
+        model.get(), slots, std::move(pick), std::move(sample), grammar, prefix_slots);
+  }
+};
 struct FlintFamily final : ServeFamily {
   dgpp::FlintTextConfig cfg;
   std::string ckpt;
@@ -1010,6 +1118,10 @@ struct FlintFamily final : ServeFamily {
     refuse_mtp(mtp);
     return dgpp::FlintModel::session_snapshot_bytes(cfg, world_, false);
   }
+  size_t cache_block_bytes(int world_, bool mtp) const override {
+    refuse_mtp(mtp);
+    return dgpp::FlintModel::kv_block_bytes_static(cfg, 0, world_, kv_format);
+  }
   void build_model(dgpp::BoundaryReducer* reducer, int rank, int world_, bool fabric, int forward_rows,
                    int64_t pool_tokens, int slots, bool mtp, int decode_rows) override {
     refuse_mtp(mtp);
@@ -1038,6 +1150,88 @@ struct FlintFamily final : ServeFamily {
       int slots, dgpp::DecodePick pick, dgpp::DecodeSample sample, const dgpp::text::GrammarVocab* grammar,
       int prefix_slots) override {
     return std::make_unique<dgpp::EagerEngineAdapter<dgpp::FlintModel>>(
+        model.get(), slots, std::move(pick), std::move(sample), grammar, prefix_slots);
+  }
+};
+
+struct MinimaxFamily final : ServeFamily {
+  dgpp::MinimaxConfig cfg;
+  std::string ckpt;
+  dgpp::LatentFormat kv_format = dgpp::LatentFormat::kBf16;
+  bool native_activations = false;
+  std::unique_ptr<dgpp::MinimaxModel> model;
+  MinimaxFamily(const std::string& checkpoint, dgpp::LatentFormat fmt, bool native)
+      : cfg(dgpp::MinimaxConfig::from_json_file((fs::path(checkpoint) / "config.json").string())),
+        ckpt(checkpoint),
+        kv_format(fmt), native_activations(native) {
+    (void)dgpp::MinimaxKvPool::head_bytes(fmt);
+  }
+  const char* name() const override { return "minimax_m3"; }
+  // The shipped template leaves adaptive <mm:think> emission to the model.
+  bool model_opens_thinking() const override { return true; }
+  int64_t vocab_size() const override { return cfg.vocab_size; }
+  const std::vector<int64_t>& eos_token_ids() const override { return cfg.eos_token_ids; }
+  // The checkpoint's positional ceiling: a larger pool seats more
+  // requests, a single request never passes it.
+  int64_t position_limit() const override { return cfg.max_position_embeddings; }
+  int64_t block_tokens() const override { return dgpp::MinimaxModel::kv_block_tokens_static(); }
+  int prefill_chunk_tokens() const override { return dgpp::MinimaxModel::prefill_chunk_tokens(); }
+  std::string pool_check(int64_t) const override { return ""; }
+  const char* kv_format_name() const override { return dgpp::latent_format_name(kv_format); }
+  int decode_rows_cap() const override { return dgpp::MinimaxModel::decode_rows_cap(); }
+  // The widest fold the decode graph records: a block output [rows, hidden].
+  size_t lat_slot_bytes(int decode_rows) const override {
+    return static_cast<size_t>(decode_rows) * static_cast<size_t>(cfg.hidden_size) * 2;
+  }
+  void check_mtp_depth(int depth) const override {
+    if (!cfg.dspark)
+      throw std::invalid_argument("engine.mtp: MiniMax requires its bundled dspark/config.json");
+    if (depth != cfg.dspark->drafts())
+      throw std::invalid_argument("engine.mtp_depth: MiniMax requires its checkpoint block width " +
+                                  std::to_string(cfg.dspark->drafts()) +
+                                  "; engine.mtp_schedule can select fewer verification rows");
+  }
+  dgpp::MemoryPlan plan(int forward_rows, int64_t context, int rank, int world_, bool fabric,
+                        int slots, bool mtp, int decode_rows) const override {
+    return dgpp::MinimaxModel::plan_memory(
+        cfg, forward_rows, context, fabric ? rank : 0, fabric ? world_ : 1,
+        fabric ? dgpp::LoaderResidency::Resident : dgpp::LoaderResidency::Streaming, slots, mtp,
+        decode_rows, kv_format, /*serving_logits=*/true, native_activations);
+  }
+  size_t snapshot_bytes(int world_, bool mtp) const override {
+    return dgpp::MinimaxModel::session_snapshot_bytes(cfg, world_, mtp);
+  }
+  size_t cache_block_bytes(int world_, bool mtp) const override {
+    return dgpp::MinimaxModel::kv_block_bytes_static(cfg, 0, world_, kv_format, mtp);
+  }
+  void build_model(dgpp::BoundaryReducer* reducer, int rank, int world_, bool fabric,
+                   int forward_rows, int64_t pool_tokens, int slots, bool mtp,
+                   int decode_rows) override {
+    dgpp::MinimaxLayerStream::set_resident_image_dir(dgpp::GlmLayerStream::resident_image_dir());
+    model = std::make_unique<dgpp::MinimaxModel>(
+        cfg, ckpt, forward_rows, pool_tokens,
+        fabric ? dgpp::LoaderResidency::Resident : dgpp::LoaderResidency::Streaming, reducer,
+        fabric ? rank : 0, fabric ? world_ : 1, slots, mtp, decode_rows, kv_format,
+        /*serving_logits=*/true, native_activations);
+  }
+  void destroy_model() override { model.reset(); }
+  size_t model_snapshot_bytes() const override {
+    return model ? model->session_snapshot_bytes() : 0;
+  }
+  std::unique_ptr<ServeGraphEngine> make_graph_engine(
+      dgpp::net::CollectiveBus* bus, int rank, int world_, uint16_t* pick_scratch,
+      int batch_min_live, uint16_t* prefix_scratch, uint16_t* gather_scratch, int candidates,
+      const dgpp::text::GrammarVocab* grammar, int prefix_slots, int mtp_depth,
+      bool compact_batches, int lookup_tail = 0) override {
+    return std::make_unique<ServeGraphEngineOf<dgpp::MinimaxModel>>(
+        model.get(), bus, rank, world_, pick_scratch, cfg.vocab_size, /*pick_timeout_ms=*/60000,
+        batch_min_live, prefix_scratch, gather_scratch, candidates, grammar, prefix_slots,
+        mtp_depth, compact_batches, lookup_tail);
+  }
+  std::unique_ptr<dgpp::sched::SchedulerEngine> make_eager_engine(
+      int slots, dgpp::DecodePick pick, dgpp::DecodeSample sample,
+      const dgpp::text::GrammarVocab* grammar, int prefix_slots) override {
+    return std::make_unique<dgpp::EagerEngineAdapter<dgpp::MinimaxModel>>(
         model.get(), slots, std::move(pick), std::move(sample), grammar, prefix_slots);
   }
 };
@@ -1122,6 +1316,9 @@ struct Qwen35Family final : ServeFamily {
   size_t snapshot_bytes(int world_, bool mtp) const override {
     return dgpp::Qwen35Model::session_snapshot_bytes(cfg, world_, mtp);
   }
+  size_t cache_block_bytes(int world_, bool mtp) const override {
+    return dgpp::Qwen35Model::kv_block_bytes_static(cfg, 0, world_, mtp, dflash, kv_format);
+  }
   void build_model(dgpp::BoundaryReducer* reducer, int rank, int world_, bool fabric, int forward_rows,
                    int64_t pool_tokens, int slots, bool mtp, int decode_rows) override {
     // The resident image cache: the same directory the process configured
@@ -1134,6 +1331,11 @@ struct Qwen35Family final : ServeFamily {
         fabric ? world_ : 1, slots, decode_rows, fabric && mtp, dflash, kv_format);
   }
   void set_draft_model(const std::string& dir) override { dflash = dir; }
+  // The block draft records in this family's capture (the
+  // session_graph_capture_block_draft pair, the graph worlds since 2026-10-04,
+  // for both the DFlash2 and the DFlash v1 drafter), so the decode graph is a
+  // legal drafter world here.
+  bool block_draft_graph_ok() const override { return true; }
   void destroy_model() override { model.reset(); }
   size_t model_snapshot_bytes() const override { return model ? model->session_snapshot_bytes() : 0; }
   std::unique_ptr<ServeGraphEngine> make_graph_engine(dgpp::net::CollectiveBus* bus, int rank,
@@ -1160,9 +1362,13 @@ std::unique_ptr<ServeFamily> make_family(const std::string& ckpt, int world,
                                          dgpp::LatentFormat kv_format,
                                          const std::optional<dgpp::RopeScaling>& rope_scaling,
                                          bool fp8_head_mma, int index_topk, int candidate_topk_blocks,
-                                         int candidate_block_size) {
+                                         int candidate_block_size, const std::string& activations) {
   const dgpp::ModelArchitecture arch =
       dgpp::detect_architecture_file((fs::path(ckpt) / "config.json").string());
+  if (activations != "bf16" && activations != "native")
+    throw std::invalid_argument("engine.activations must be bf16 or native");
+  if (activations == "native" && arch != dgpp::ModelArchitecture::MinimaxM3)
+    throw std::invalid_argument("engine.activations native is currently supported only for MiniMax");
   if (arch == dgpp::ModelArchitecture::DeepseekV41)
     return std::make_unique<Dsv41Family>(ckpt, index_topk, candidate_topk_blocks, candidate_block_size);
   // The index budget is the DeepSeek-V4.1 indexer's: no other family has a
@@ -1173,7 +1379,10 @@ std::unique_ptr<ServeFamily> make_family(const std::string& ckpt, int world,
         "(deepseek_v41) indexer's budget; this checkpoint's family has no configurable selection budget");
   if (arch == dgpp::ModelArchitecture::DeepseekV4) return std::make_unique<Dsv4Family>(ckpt);
   if (arch == dgpp::ModelArchitecture::MimoV2) return std::make_unique<MimoFamily>(ckpt, kv_format);
+  if (arch == dgpp::ModelArchitecture::Dory) return std::make_unique<DoryFamily>(ckpt, world);
   if (arch == dgpp::ModelArchitecture::Flint) return std::make_unique<FlintFamily>(ckpt, kv_format);
+  if (arch == dgpp::ModelArchitecture::MinimaxM3)
+    return std::make_unique<MinimaxFamily>(ckpt, kv_format, activations == "native");
   if (arch == dgpp::ModelArchitecture::Qwen4Exp)
     return std::make_unique<QwenFamily>(ckpt, rope_scaling, fp8_head_mma, kv_format);
   if (arch == dgpp::ModelArchitecture::Qwen3_5)
@@ -1312,6 +1521,8 @@ int serve_openai(dgpp::sched::SchedulerEngine* engine, int64_t vocab_size,
         vision_frontend = std::make_unique<dgpp::serve::GlmVisionFrontend>(&tok, &*tpl, ids);
       else if (family_name == "qwen4_exp" || family_name == "qwen3_5")
         vision_frontend = std::make_unique<dgpp::serve::QwenVisionFrontend>(&tok, &*tpl, ids);
+      else if (family_name == "minimax_m3")
+        vision_frontend = std::make_unique<dgpp::serve::MinimaxVisionFrontend>(&tok, &*tpl, ids);
     }
     frontend = vision_frontend ? std::move(vision_frontend)
                                : std::make_unique<dgpp::serve::TextFrontend>(&tok, &*tpl, model_opens_thinking);
@@ -1360,6 +1571,30 @@ int serve_openai(dgpp::sched::SchedulerEngine* engine, int64_t vocab_size,
   if (oplog) service.set_audit_observer(oplog);
   if (k.world > 1)
     service.set_rank_metrics({0, k.world, DGPP_VERSION, DGPP_GIT_SHA}, collective_progress);
+  // The NVMe cold tier's verdicts (issue #26) on a fabric: every rank's
+  // completion of an op lands in the collector — the peers' over the
+  // journal's return path, this rank's from its own tier after each pass —
+  // and the commits ready at a pass ride that pass's record.
+  std::optional<dgpp::serve::DiskCommitCollector> disk_commits;
+  if (journal && engine->disk_info().enabled) {
+    disk_commits.emplace(k.world);
+    service.set_disk_hooks(
+        [&]() {
+          for (const auto& [peer, line] : journal->poll_peer_lines()) {
+            uint64_t op = 0;
+            bool ok = false;
+            if (!dgpp::serve::decode_disk_status(line, &op, &ok)) {
+              DGPP_LOG_WARN("journal: rank {} sent an unexpected line: '{}'", peer, line);
+              continue;
+            }
+            disk_commits->add(peer, op, ok);
+          }
+          return disk_commits->take_ready();
+        },
+        [&](const std::vector<dgpp::sched::SchedulerEngine::DiskCompletion>& done) {
+          for (const auto& c : done) disk_commits->add(0, c.op, c.ok);
+        });
+  }
   dgpp::serve::HttpServer http(k.http_port, &service, k.max_connections, k.http_bind,
                                k.http_max_body_bytes, k.stream_flush == "wake");
   DGPP_LOG_INFO("serve: HTTP request body limit {} bytes", k.http_max_body_bytes);
@@ -1577,6 +1812,11 @@ int main(int argc, char** argv) {
       "    bounded runs the decoder over the last window rows of each prompt\n"
       "    (the model's own serving recipe, half the prefill work), exact every\n"
       "    layer over every row (the parity mode)\n"
+      "  [--dory-loops N (dory only, default: the checkpoint's)]: override the\n"
+      "    recurrent block's loop count — changes what the engine computes\n"
+      "  [--dory-kv-cache per_loop|last_loop (dory only, default per_loop)]:\n"
+      "    per_loop gives every loop its own K/V planes (exact); last_loop\n"
+      "    shares one plane per layer and keeps the last loop's rows\n"
       "  [config: engine.rope_scaling {rope_type, factor,\n"
       "    original_max_position_embeddings, beta_fast, beta_slow,\n"
       "    attn_factor, mrope_cache_factor}]: the opt-in YaRN rope ramp\n"
@@ -1596,10 +1836,13 @@ int main(int argc, char** argv) {
       "    [--graph-batch-min-live N (default min(2, max-concurrency);\n"
       "      must be in [1, max-concurrency])]\n"
       "      (the row batch needs max-concurrency * (1 + mtp depth) <= 8)\n"
-      "    [--mtp-depth N]  draft tokens per step (1..5; the verify runs 1+N rows)\n"
+      "    [--mtp-depth N]  draft tokens per step (1..7; family-specific limits apply)\n"
       "    [--prefill-fp8-per-tensor]  Qwen3.8-27B: prefill GEMMs on cuBLASLt's per-tensor e4m3 kernels\n"
       "      (engine.prefill_fp8_per_tensor; ~2x the prefill rate, +23 GiB, changes greedy output)\n"
-      "    [--dflash-model DIR_OR_ID]  DFlash2 block drafter checkpoint (replaces --mtp; past world 1 on the decode graph)\n"
+      "    [--dflash-model DIR_OR_ID]  DFlash2 block drafter checkpoint: the drafter's world. It\n"
+      "      replaces the MTP draft on an MTP template (the draft's own settings go with the switch\n"
+      "      unless named; --mtp beside it is a contradiction and refused); past world 1 it runs on\n"
+      "      the decode graph\n"
       "    [--no-dflash]  run plain from a drafter template on the decode graph (the A/B knob; add --mtp for the MTP world)\n"
       "    [--no-dflash-verify-graph]  the multi-slot verify as an eager batch (engine.dflash_verify_graph)\n"
       "    [--no-prefill-group]  one cold prompt per prefill walk (engine.prefill_group false)\n"
@@ -1697,6 +1940,7 @@ int main(int argc, char** argv) {
   bool prefill_fp8_gemm = false;
   bool prefill_fp8_per_tensor = false;  // the Qwen3.8-27B per-tensor prefill recipe (opt-in)
   std::string prefill_activations = "bf16";  // "native": the checkpoint's activation recipe on prefill rows
+  std::string activations = "bf16";  // MiniMax target: every row, including decode
   std::string prefill_attention = "bf16";    // Qwen3.5 / Flash-Next attention over an fp8 pool
   std::string decode_attention = "bf16";     // Flash-Next QSA: bf16 or native fp8 compute
   std::string expert_gemm = "wide";         // the packed expert GEMM's form and companions (engine.expert_*)
@@ -1705,6 +1949,8 @@ int main(int argc, char** argv) {
   bool expert_gemm_pair = false;
   bool ngram_prestage = true;               // engine.ngram_prestage (Qwen)
   std::string prefill = "bounded";  // the DeepSeek-V4.1 prefill: bounded | exact
+  int dory_loops = 0;                   // engine.dory_loops (Dory1.0-4B; 0 = the checkpoint's)
+  std::string dory_kv_cache = "per_loop";  // engine.dory_kv_cache: per_loop | last_loop
   std::string prefill_dense = "auto";  // FP8 grid prefill projections: auto | tile | streaming
   bool prefill_fold_overlap = true;    // the DeepSeek-V4.1 prefill's boundary folds under the other row block's compute
   bool decode_pdl = true;              // the decode graph's kernel edges programmatic (engine/graph_pdl.hpp)
@@ -1740,6 +1986,7 @@ int main(int argc, char** argv) {
   // and a cold prompt keeps the cut at its first structural boundary.
   int prefix_min_tokens = 1024;
   bool prefix_head_snapshots = true;
+  int prefix_pin_max_pct = 50;
   // The bulk collective's sender pacing (prefill all-reduces): negative
   // derives the per-QP rate from the port at bus start.
   double bulk_pace_gbps = -1.0;
@@ -1747,9 +1994,10 @@ int main(int argc, char** argv) {
   int max_connections = 64;
   int world = 1, rank = 0, rendezvous_timeout_ms = 120000;
   bool no_eos = false, decode_graph = false, mtp = false;
-  int mtp_depth = 1;  // draft tokens per step (needs --mtp; 1..5)
+  int mtp_depth = 1;  // draft tokens per step (needs --mtp; family-specific limit)
   bool no_mtp_cli = false, mtp_depth_cli = false, mtp_schedule_cli = false;  // given on the command line
-  bool no_dflash_cli = false;
+  bool no_dflash_cli = false, dflash_model_cli = false, mtp_cli = false;
+  bool lookup_draft_cli = false, lookup_tail_cli = false, draft_head_cli = false;
   bool mtp_depth_explicit = false;  // named by the flag or the file (else the family's default)
   bool mtp_schedule = false;  // the confidence-scheduled verify depth (needs --mtp)
   double mtp_schedule_row_ms = 8.0;
@@ -1767,6 +2015,21 @@ int main(int argc, char** argv) {
   int lookup_nmin = 6, lookup_nstrong = 8, lookup_agree = 2;
   int lookup_tail = 0;  // engine.lookup_tail: extra verify rows past the MTP block (0: the block alone)
   double prefix_cache_gib = 1.5;  // M7: the snapshot arena; 0 = off
+  // The NVMe cold tier (issue #26): the top-level nvme_cache block of the
+  // cluster config; on/off, the capacity and the minimum ride the settings
+  // record, the path is each rank's own.
+  bool nvme_cache = false;
+  std::string nvme_cache_path = "~/dgpp/nvme-cache";
+  std::string nvme_cache_required_mount;
+  double nvme_cache_gib = 0.0;
+  int64_t nvme_cache_min_tokens = 0;
+  int64_t nvme_cache_chunk_mib = 64;
+  int64_t nvme_cache_max_ops = 4;
+  double nvme_cache_reserve_gib = 1.0;
+  bool nvme_cache_persist = true;
+  std::string nvme_cache_reuse_binding;
+  bool nvme_cache_allow_buffered = false;
+  int64_t nvme_cache_op_timeout_s = 120;
   std::optional<float> temperature, top_p, min_p, repetition_penalty;
   std::optional<float> frequency_penalty, presence_penalty;
   std::optional<int> top_k;
@@ -1835,6 +2098,7 @@ int main(int argc, char** argv) {
     prefill_fp8_gemm = e.prefill_fp8_gemm;
     prefill_fp8_per_tensor = e.prefill_fp8_per_tensor;
     prefill_activations = e.prefill_activations;
+    activations = e.activations;
     prefill_attention = e.prefill_attention;
     decode_attention = e.decode_attention;
     expert_gemm = e.expert_gemm;
@@ -1843,6 +2107,8 @@ int main(int argc, char** argv) {
     expert_gemm_pair = e.expert_gemm_pair;
     ngram_prestage = e.ngram_prestage;
     prefill = e.prefill;
+    dory_loops = e.dory_loops;
+    dory_kv_cache = e.dory_kv_cache;
     prefill_dense = e.prefill_dense;
     prefill_fold_overlap = e.prefill_fold_overlap;
     decode_pdl = e.decode_pdl;
@@ -1904,6 +2170,18 @@ int main(int argc, char** argv) {
     frequency_penalty = e.frequency_penalty;
     presence_penalty = e.presence_penalty;
     prefix_cache_gib = e.prefix_cache_gib;
+    nvme_cache = c.nvme_cache.enabled;
+    nvme_cache_path = c.nvme_cache.path;
+    nvme_cache_required_mount = c.nvme_cache.required_mount;
+    nvme_cache_gib = c.nvme_cache.capacity_gib;
+    nvme_cache_min_tokens = c.nvme_cache.min_tokens;
+    nvme_cache_chunk_mib = c.nvme_cache.chunk_mib;
+    nvme_cache_max_ops = c.nvme_cache.max_ops;
+    nvme_cache_reserve_gib = c.nvme_cache.reserve_gib;
+    nvme_cache_persist = c.nvme_cache.persist;
+    nvme_cache_reuse_binding = c.nvme_cache.reuse_binding;
+    nvme_cache_allow_buffered = c.nvme_cache.allow_buffered;
+    nvme_cache_op_timeout_s = c.nvme_cache.op_timeout_s;
     admission_mode = e.admission;
     admission_window = e.admission_window;
     model_alias = e.model_alias;
@@ -1915,6 +2193,7 @@ int main(int argc, char** argv) {
     prefill_early_admission_override = e.prefill_early_admission;
     prefix_min_tokens = e.prefix_min_tokens;
     prefix_head_snapshots = e.prefix_head_snapshots;
+    prefix_pin_max_pct = e.prefix_pin_max_pct;
     bulk_pace_gbps = e.bulk_pace_gbps;
     bulk_inflight = e.bulk_inflight;
     rendezvous_timeout_ms = e.rendezvous_timeout_ms;
@@ -1970,8 +2249,10 @@ int main(int argc, char** argv) {
     else if (a == "--dense-weights") dense_weights = next();
     else if (a == "--fp8-head")
       fp8_head = next();
-    else if (a == "--draft-head") draft_head = next();
-    else if (a == "--draft-head-blocks") draft_head_blocks = std::stoi(next());
+    else if (a == "--draft-head") {
+      draft_head = next();
+      draft_head_cli = true;
+    } else if (a == "--draft-head-blocks") draft_head_blocks = std::stoi(next());
     else if (a == "--mtp-expert-format") mtp_expert_format = next();
     else if (a == "--bf16-weights") bf16_weights = next();
     else if (a == "--draft-vocab") draft_vocab = next();
@@ -1985,6 +2266,8 @@ int main(int argc, char** argv) {
     else if (a == "--expert-gemm-pair") expert_gemm_pair = true;
     else if (a == "--no-ngram-prestage") ngram_prestage = false;
     else if (a == "--prefill") prefill = next();
+    else if (a == "--dory-loops") dory_loops = std::stoi(next());
+    else if (a == "--dory-kv-cache") dory_kv_cache = next();
     else if (a == "--embed-sharding") embed_sharding = next();
     else if (a == "--mtp-head") mtp_head = next();
     else if (a == "--attention-weights") attention_weights = next();
@@ -1998,15 +2281,20 @@ int main(int argc, char** argv) {
     else if (a == "--decode-graph") decode_graph = true;
     else if (a == "--graph-batch-min-live")
       graph_batch_min_live = std::stoi(next());
-    else if (a == "--mtp") mtp = true;
-    else if (a == "--dflash-model") dflash_model = next();
-    else if (a == "--no-dflash") {
+    else if (a == "--mtp") {
+      mtp = true;
+      mtp_cli = true;
+    } else if (a == "--dflash-model") {
+      dflash_model = next();
+      dflash_model_cli = true;
+    } else if (a == "--no-dflash") {
       // The plain world from a drafter template (the A/B knob): the drafter
       // runs on the eager engine, whose plain world without a drafter would
       // stream its layers (0.65 tok/s measured), so the knob lands on the
       // decode graph — the same resident plain world the MTP templates'
       // --no-mtp gives; --mtp [--mtp-depth N] beside it is the MTP world.
       dflash_model.clear();
+      dflash_model_cli = false;  // --no-dflash wins a --dflash-model on the same line
       decode_graph = true;
       no_dflash_cli = true;
     }
@@ -2052,13 +2340,19 @@ int main(int argc, char** argv) {
     else if (a == "--mtp-draft-temperature") mtp_draft_temperature = std::stod(next());
     else if (a == "--mtp-verify") mtp_verify = next();
     else if (a == "--dflash-batch-rows") dflash_batch_rows = std::stoi(next());
-    else if (a == "--lookup-draft") lookup_draft = true;
-    else if (a == "--no-lookup-draft") lookup_draft = false;
-    else if (a == "--lookup-nmin") lookup_nmin = std::stoi(next());
+    else if (a == "--lookup-draft") {
+      lookup_draft = true;
+      lookup_draft_cli = true;
+    } else if (a == "--no-lookup-draft") {
+      lookup_draft = false;
+      lookup_draft_cli = true;
+    } else if (a == "--lookup-nmin") lookup_nmin = std::stoi(next());
     else if (a == "--lookup-nstrong") lookup_nstrong = std::stoi(next());
     else if (a == "--lookup-agree") lookup_agree = std::stoi(next());
-    else if (a == "--lookup-tail") lookup_tail = std::stoi(next());
-    else if (a == "--sampling-candidates") sampling_candidates = std::stoi(next());
+    else if (a == "--lookup-tail") {
+      lookup_tail = std::stoi(next());
+      lookup_tail_cli = true;
+    } else if (a == "--sampling-candidates") sampling_candidates = std::stoi(next());
     else if (a == "--prefix-cache-gib") prefix_cache_gib = std::stod(next());
     else if (a == "--no-prefix-cache") prefix_cache_gib = 0.0;
     else if (a == "--admission") admission_mode = next();
@@ -2161,8 +2455,34 @@ int main(int argc, char** argv) {
   // schedule and its cost model are the drafter's — the plain world, and
   // the MTP world beside it (--mtp --mtp-depth N), run without it unless
   // the command line asked for it.
-  if (no_dflash_cli && !mtp_schedule_cli) mtp_schedule = false;
-  // The DFlash2 block drafter (models/qwen/dflash2.hpp): a standalone
+  if (no_dflash_cli) {
+    // An explicit disable wins regardless of the order of the CLI flags.
+    dflash_model.clear();
+    dflash_model_cli = false;
+    if (!mtp_schedule_cli) mtp_schedule = false;
+  }
+  // --dflash-model on the command line replaces the template's MTP world, as
+  // its usage has claimed since the drafter landed (until 2026-10-24 the flag
+  // only worked on a template that already set mtp false; on an MTP template
+  // it tripped the "not both" refusal below, which is why RadixArk NVFP4
+  // carried a second drafter template instead of a knob). The MTP group is the
+  // draft it replaces, so it goes with the switch the way --no-mtp's does: the
+  // depth, the schedule, the lookup drafts and the tail (the block drafter
+  // refuses a tail outright, engine/graph_engine.hpp), and the screened head
+  // — unless the command line named them. So an MTP template plus the flag is
+  // the drafter world the standalone template carried, setting for setting.
+  if (dflash_model_cli && !dflash_model.empty() && !mtp_cli) {
+    mtp = false;
+    if (!mtp_depth_cli) {
+      mtp_depth = 1;
+      mtp_depth_explicit = false;
+    }
+    if (!mtp_schedule_cli) mtp_schedule = false;
+    if (!lookup_draft_cli) lookup_draft = false;
+    if (!lookup_tail_cli) lookup_tail = 0;
+    if (!draft_head_cli) draft_head = "exact";
+  }
+  // The DFlash2 block drafter (models/dflash2/drafter.hpp): a standalone
   // checkpoint (a directory or a cached HF id) that replaces the MTP
   // draft. World 1 without the decode graph is the eager engine's drafter
   // (the batched verify graph, the stacked redrafts); the graph worlds —
@@ -2202,7 +2522,12 @@ int main(int argc, char** argv) {
   if (mtp && !mtp_depth_explicit && !ckpt.empty()) {
     const dgpp::ModelArchitecture arch =
         dgpp::detect_architecture_file((fs::path(ckpt) / "config.json").string());
-    if (arch == dgpp::ModelArchitecture::DeepseekV41) {
+    if (arch == dgpp::ModelArchitecture::MinimaxM3) {
+      const auto draft =
+          dgpp::minimax_dspark_config_file((fs::path(ckpt) / "dspark" / "config.json").string());
+      mtp_depth = draft.drafts();
+      DGPP_LOG_INFO("serve: --mtp on MiniMax: the DSpark block's {} drafts", mtp_depth);
+    } else if (arch == dgpp::ModelArchitecture::DeepseekV41) {
       mtp_depth = dgpp::Dsv41TextConfig::from_json_file((fs::path(ckpt) / "config.json").string()).dspark_block_size;
       DGPP_LOG_INFO("serve: --mtp without --mtp-depth on DeepSeek-V4.1: the DSpark block's {} drafts", mtp_depth);
     } else if (arch == dgpp::ModelArchitecture::DeepseekV4) {
@@ -2228,21 +2553,22 @@ int main(int argc, char** argv) {
     const int effective_batch_min_live =
         graph_batch_min_live == 0 ? std::min(2, max_concurrency) : graph_batch_min_live;
     return std::format(
-        "model={} world={} fabric={} journal={} conc={} kv={} kvdt={} pfattn={} dcattn={} ngt={} dw={} mtpef={} bfw={} "
-        "fp8head={} dh={} dhb={} mtph={} attw={} itopk={} ctb={} cbs={} pf={} pfd={} pfo={} pfw={} dcw={} ctr={} pdl={} "
+        "model={} world={} fabric={} journal={} conc={} kv={} kvdt={} act={} pfattn={} dcattn={} ngt={} dw={} mtpef={} bfw={} "
+        "fp8head={} dh={} dhb={} mtph={} attw={} itopk={} ctb={} cbs={} pf={} pfd={} pfo={} pfw={} dcw={} ctr={} pdl={} dlp={} dkv={} "
         "emsh={} maxtok={} queue={} "
         "eos={} graph={} compact={} mtp={} mtpd={} mss={} msrow={} msbase={} mslam={} msmin={} msopt={} "
         "msad={} msss={} mdr={} mdt={} mvf={} dbr={} "
         "batchmin={} cand={} "
         "pcgib={} adm={} win={} pfbudget={} pfidle={} gapms={} ttftms={} pfhr={} pfgrow={} pfrec={} pfstart={} pfifloor={} pfearly={} pmin={} phead={} pace={} inflight={} "
         "reasoning_in_content={} "
-        "rs={} dflash={} dfw={} lk={} lkn={} lks={} lka={} lkt={}",
+        "rs={} dflash={} dfw={} lk={} lkn={} lks={} lka={} lkt={} nvme={}",
         model_id.empty() ? ckpt : model_id, world, fabric_port, journal_port, max_concurrency,
-        kv_capacity, kv_dtype, prefill_attention, decode_attention, ngram_table, dense_weights, mtp_expert_format, bf16_weights, fp8_head,
+        kv_capacity, kv_dtype, activations, prefill_attention, decode_attention, ngram_table, dense_weights, mtp_expert_format, bf16_weights, fp8_head,
         draft_head,
         draft_head_blocks, mtp_head,
         attention_weights, index_topk, candidate_topk_blocks, candidate_block_size, prefill, prefill_dense,
-        prefill_fold_overlap ? 1 : 0, prefill_window, decode_window, collective_transport, decode_pdl ? 1 : 0, embed_sharding,
+        prefill_fold_overlap ? 1 : 0, prefill_window, decode_window, collective_transport, decode_pdl ? 1 : 0,
+        dory_loops, dory_kv_cache, embed_sharding,
         default_max_tokens, queue_limit, no_eos ? 0 : 1, decode_graph ? 1 : 0,
         compact_batches ? 1 : 0, mtp ? 1 : 0, mtp_depth, mtp_schedule ? 1 : 0, mtp_schedule_row_ms,
         mtp_schedule_base_ms, mtp_schedule_lambda, mtp_schedule_min_depth, mtp_schedule_options,
@@ -2254,7 +2580,7 @@ int main(int argc, char** argv) {
         prefill_latency.headroom_pct, prefill_latency.growth_factor, prefill_latency.recovery_pct,
         prefill_latency.initial_tokens, prefill_latency.idle_floor_tokens,
         prefill_early_admission_override.has_value() ? (*prefill_early_admission_override ? 1 : 0) : -1,
-        prefix_min_tokens, prefix_head_snapshots ? 1 : 0,
+        prefix_min_tokens, prefix_head_snapshots ? 1 : 0, prefix_pin_max_pct,
         bulk_pace_gbps, bulk_inflight, reasoning_in_content ? 1 : 0,
         rope_scaling ? std::format("yarn:{}:{}:{}:{}:{}:{}", rope_scaling->factor,
                                    rope_scaling->original_max_position_embeddings,
@@ -2262,8 +2588,37 @@ int main(int argc, char** argv) {
                                    rope_scaling->attn_factor, rope_scaling->mrope_cache_factor)
                      : "off",
         dflash_model.empty() ? "off" : dflash_model, dflash_weights, lookup_draft ? 1 : 0,
-        lookup_nmin, lookup_nstrong, lookup_agree, lookup_tail);
+        lookup_nmin, lookup_nstrong, lookup_agree, lookup_tail,
+        nvme_cache ? std::format("{}:{}:{}:{}:{}:{}:{}", nvme_cache_gib, nvme_cache_min_tokens, nvme_cache_chunk_mib,
+                                 nvme_cache_max_ops, nvme_cache_reserve_gib, nvme_cache_persist ? 1 : 0,
+                                 nvme_cache_op_timeout_s)
+                   : std::string("off")) +
+        (nvme_cache_reuse_binding.empty() ? std::string() : " nvme_reuse=" + nvme_cache_reuse_binding);
   };
+  // Dory1.0-4B is a one-rank family (the reference refuses
+  // tensor_parallel_size != 1; docs/dory_plan.md §2): refuse a world > 1
+  // before the journal handshake, so every rank's log names the reason
+  // rather than a rendezvous timeout. An unreadable config.json is NOT a
+  // refusal here — the checkpoint's own read errors belong to the normal
+  // path (serve_startup_test boots a world on an empty directory and
+  // expects the capacity-knob refusal, not an abort). DoryFamily's
+  // constructor keeps the same check for the paths that reach the build.
+  if (world > 1 && !ckpt.empty()) {
+    bool is_dory = false;
+    try {
+      is_dory = dgpp::detect_architecture_file((fs::path(ckpt) / "config.json").string()) ==
+                dgpp::ModelArchitecture::Dory;
+    } catch (const std::exception&) {
+    }
+    if (is_dory) {
+      try {
+        dgpp::dory_validate_world(world);
+      } catch (const std::exception& e) {
+        DGPP_LOG_ERROR("{}", e.what());
+        return 1;
+      }
+    }
+  }
   if ((world > 1 || rank > 0) && !memory_plan_only) {
     try {
       if (rank == 0) {
@@ -2300,6 +2655,7 @@ int main(int argc, char** argv) {
         ws.prefill_fp8_gemm = prefill_fp8_gemm;
         ws.prefill_fp8_per_tensor = prefill_fp8_per_tensor;
         ws.prefill_activations = prefill_activations;
+        ws.activations = activations;
         ws.prefill_attention = prefill_attention;
         ws.decode_attention = decode_attention;
         ws.dflash_model = dflash_model;
@@ -2322,6 +2678,8 @@ int main(int argc, char** argv) {
         ws.expert_gemm_pair = expert_gemm_pair;
         ws.ngram_prestage = ngram_prestage;
         ws.prefill = prefill;
+        ws.dory_loops = dory_loops;
+        ws.dory_kv_cache = dory_kv_cache;
         ws.prefill_dense = prefill_dense;
         ws.prefill_fold_overlap = prefill_fold_overlap;
         ws.decode_pdl = decode_pdl;
@@ -2372,11 +2730,21 @@ int main(int argc, char** argv) {
         ws.prefill_early_admission = prefill_early_admission_override;
         ws.prefix_min_tokens = prefix_min_tokens;
         ws.prefix_head_snapshots = prefix_head_snapshots;
+        ws.prefix_pin_max_pct = prefix_pin_max_pct;
         ws.bulk_pace_gbps = bulk_pace_gbps;
         ws.bulk_inflight = bulk_inflight;
         ws.rendezvous_timeout_ms = rendezvous_timeout_ms;
         ws.stats_interval_s = stats_interval_s;
         ws.reasoning_in_content = reasoning_in_content;
+        ws.nvme_cache = nvme_cache;
+        ws.nvme_cache_capacity_gib = nvme_cache ? nvme_cache_gib : 0.0;
+        ws.nvme_cache_min_tokens = nvme_cache ? nvme_cache_min_tokens : 0;
+        ws.nvme_cache_chunk_mib = nvme_cache_chunk_mib;
+        ws.nvme_cache_max_ops = nvme_cache_max_ops;
+        ws.nvme_cache_reserve_gib = nvme_cache_reserve_gib;
+        ws.nvme_cache_persist = nvme_cache_persist;
+        ws.nvme_cache_reuse_binding = nvme_cache_reuse_binding;
+        ws.nvme_cache_op_timeout_s = nvme_cache_op_timeout_s;
         journal->broadcast(dgpp::serve::encode_journal_settings(ws));
         DGPP_LOG_INFO("journal: settings pushed to {} peer(s): {}", world - 1,
                       canonical());
@@ -2410,6 +2778,7 @@ int main(int argc, char** argv) {
         prefill_fold_scales = ws.prefill_fold_scales;
         prefill_fp8_gemm = ws.prefill_fp8_gemm;
         prefill_fp8_per_tensor = ws.prefill_fp8_per_tensor;
+        activations = ws.activations;
         prefill_attention = ws.prefill_attention;
         decode_attention = ws.decode_attention;
         dflash_model = ws.dflash_model;
@@ -2432,6 +2801,8 @@ int main(int argc, char** argv) {
         expert_gemm_pair = ws.expert_gemm_pair;
         ngram_prestage = ws.ngram_prestage;
         prefill = ws.prefill;
+        dory_loops = ws.dory_loops;
+        dory_kv_cache = ws.dory_kv_cache;
         prefill_dense = ws.prefill_dense;
         prefill_fold_overlap = ws.prefill_fold_overlap;
         decode_pdl = ws.decode_pdl;
@@ -2482,11 +2853,23 @@ int main(int argc, char** argv) {
         prefill_early_admission_override = ws.prefill_early_admission;
         prefix_min_tokens = ws.prefix_min_tokens;
         prefix_head_snapshots = ws.prefix_head_snapshots;
+        prefix_pin_max_pct = ws.prefix_pin_max_pct;
         bulk_pace_gbps = ws.bulk_pace_gbps;
         bulk_inflight = ws.bulk_inflight;
         rendezvous_timeout_ms = ws.rendezvous_timeout_ms;
         stats_interval_s = ws.stats_interval_s;
         reasoning_in_content = ws.reasoning_in_content;
+        nvme_cache = ws.nvme_cache;
+        nvme_cache_reuse_binding = ws.nvme_cache_reuse_binding;
+        if (nvme_cache) {
+          nvme_cache_gib = ws.nvme_cache_capacity_gib;
+          nvme_cache_min_tokens = ws.nvme_cache_min_tokens;
+          nvme_cache_chunk_mib = ws.nvme_cache_chunk_mib;
+          nvme_cache_max_ops = ws.nvme_cache_max_ops;
+          nvme_cache_reserve_gib = ws.nvme_cache_reserve_gib;
+          nvme_cache_persist = ws.nvme_cache_persist;
+          nvme_cache_op_timeout_s = ws.nvme_cache_op_timeout_s;
+        }
         const std::string now = canonical();
         if (own != now)
           DGPP_LOG_WARN(
@@ -2680,16 +3063,32 @@ int main(int argc, char** argv) {
   // The prefill attention's arithmetic on the fp8 pool (engine.prefill_attention).
   dgpp::Qwen35Model::set_fp8_attention(prefill_attention == "fp8");
   dgpp::QwenModel::set_native_attention(prefill_attention == "fp8", decode_attention == "fp8");
+  // The Dory1.0-4B loop (engine.dory_loops, engine.dory_kv_cache; plan D1,
+  // D2): statics applied before the memory plan and the model build. The
+  // exact defaults: the checkpoint's n_recurrent_loops, per_loop.
+  if (dory_loops < 0) {
+    DGPP_LOG_ERROR("--dory-loops must be a positive integer, got {}", dory_loops);
+    return 2;
+  }
+  try {
+    if (dory_loops > 0) dgpp::DoryModel::set_recurrent_loops(dory_loops);
+    dgpp::DoryModel::set_kv_policy(dgpp::DoryModel::parse_kv_policy(dory_kv_cache));
+  } catch (const std::invalid_argument& e) {
+    DGPP_LOG_ERROR("{}", e.what());
+    return 2;
+  }
   if (dflash_weights != "checkpoint" && dflash_weights != "fp8") {
     DGPP_LOG_ERROR("--dflash-weights must be checkpoint or fp8, got '{}'", dflash_weights);
     return 2;
   }
   dgpp::Qwen35Model::set_dflash2_weights_fp8(dflash_weights == "fp8");
+  dgpp::QwenModel::set_dflash2_weights_fp8(dflash_weights == "fp8");
   if (dflash_depth < 0 || dflash_depth > 7) {
     DGPP_LOG_ERROR("engine.dflash_depth (--dflash-depth) must be in [0, 7], got {}", dflash_depth);
     return 2;
   }
   dgpp::Qwen35Model::set_dflash_options(dflash_verify_graph, dflash_draft_batch, dflash_depth);
+  dgpp::QwenModel::set_dflash_options(dflash_verify_graph, dflash_draft_batch, dflash_depth);
   if (prefill_fp8_per_tensor)
     DGPP_LOG_INFO("serve: engine.prefill_fp8_per_tensor on — prefill GEMMs on per-tensor e4m3 (not transcript-preserving)");
   dgpp::QwenLayerStream::set_ngram_prestage(ngram_prestage);
@@ -2797,6 +3196,32 @@ int main(int argc, char** argv) {
     DGPP_LOG_ERROR("--prefix-cache-gib must be >= 0, got {}", prefix_cache_gib);
     return 2;
   }
+  if (nvme_cache && !(nvme_cache_gib > 0.0)) {
+    DGPP_LOG_ERROR("nvme_cache.capacity_gib must be positive when the NVMe cache is enabled (got {})",
+                   nvme_cache_gib);
+    return 2;
+  }
+  if (!nvme_cache_reuse_binding.empty() && (!nvme_cache || !nvme_cache_persist)) {
+    DGPP_LOG_ERROR("nvme_cache.reuse_binding requires enabled and persist to be true");
+    return 2;
+  }
+  if (nvme_cache && !(prefix_cache_gib > 0.0)) {
+    DGPP_LOG_ERROR("nvme_cache.enabled needs the prefix cache (engine.prefix_cache_gib > 0): the tier holds "
+                   "what the arena evicts");
+    return 2;
+  }
+  if (nvme_cache && nvme_cache_min_tokens < 0) {
+    DGPP_LOG_ERROR("nvme_cache.min_tokens must be >= 0, got {}", nvme_cache_min_tokens);
+    return 2;
+  }
+  if (nvme_cache && (nvme_cache_op_timeout_s < 0 || nvme_cache_op_timeout_s > 86400)) {
+    DGPP_LOG_ERROR("nvme_cache.op_timeout_s must be in [0, 86400], got {}", nvme_cache_op_timeout_s);
+    return 2;
+  }
+  if (prefix_pin_max_pct < 0 || prefix_pin_max_pct > 100) {
+    DGPP_LOG_ERROR("engine.prefix_pin_max_pct must be in [0, 100], got {}", prefix_pin_max_pct);
+    return 2;
+  }
   if (!(stats_interval_s >= 0.0)) {
     DGPP_LOG_ERROR("--stats-interval-s must be >= 0, got {}", stats_interval_s);
     return 2;
@@ -2820,8 +3245,8 @@ int main(int argc, char** argv) {
     DGPP_LOG_ERROR("--mtp-schedule-sampled-scale must be in [0, 1], got {}", mtp_schedule_sampled_scale);
     return 2;
   }
-  if (mtp_depth < 1 || mtp_depth > 5) {
-    DGPP_LOG_ERROR("--mtp-depth must be in [1, 5], got {}", mtp_depth);
+  if (mtp_depth < 1 || mtp_depth > 7) {
+    DGPP_LOG_ERROR("--mtp-depth must be in [1, 7], got {}", mtp_depth);
     return 2;
   }
   if (!mtp && mtp_depth != 1) {
@@ -2897,12 +3322,19 @@ int main(int argc, char** argv) {
     // everything below the engine interface comes from it.
     std::unique_ptr<ServeFamily> family =
         make_family(ckpt, world, kv_format, rope_scaling, fp8_head == "mma", index_topk, candidate_topk_blocks,
-                    candidate_block_size);
+                    candidate_block_size, activations);
     if (!dflash_dir.empty()) {
       try {
         family->set_draft_model(dflash_dir);
       } catch (const std::exception& e) {
         DGPP_LOG_ERROR("{}", e.what());
+        return 2;
+      }
+      if (decode_graph && !family->block_draft_graph_ok()) {
+        DGPP_LOG_ERROR(
+            "engine.dflash_model on {} runs the eager engine: set engine.decode_graph false "
+            "(the recorded block draft is not ported to this family)",
+            family->name());
         return 2;
       }
     }
@@ -2911,6 +3343,22 @@ int main(int argc, char** argv) {
       return 1;
     }
     const std::string family_name = std::string(family->name());
+    if (mtp) family->check_mtp_depth(mtp_depth);
+    // The Dory family's two keys (docs/dory_plan.md D1, D2) and its two
+    // refusals (plan D4): no draft layer, so speculation is refused by name,
+    // and the loop keys belong to no other family.
+    if (family_name != "dory" && (dory_loops > 0 || dory_kv_cache != "per_loop")) {
+      DGPP_LOG_ERROR("engine.dory_loops / engine.dory_kv_cache are the Dory1.0-4B loop's keys; "
+                     "the {} family has no loop",
+                     family_name);
+      return 1;
+    }
+    if (family_name == "dory" && mtp) {
+      DGPP_LOG_ERROR("the {} family ships no draft layer (docs/dory_plan.md D4): run it with "
+                     "engine.mtp false (--no-mtp from the flag)",
+                     family_name);
+      return 1;
+    }
     if (rope_scaling.has_value() && family_name != "qwen4_exp" && family_name != "qwen3_5") {
       // A refused start, not a warning (review item 8, 2026-09-18): a WARN
       // scrolls past in a boot log and the world then serves with a knob the
@@ -3178,9 +3626,106 @@ int main(int argc, char** argv) {
         rank, prefix_cache_gib, arena_slots,
         static_cast<double>(snapshot_bytes) / (1024.0 * 1024.0),
         static_cast<double>(prefix_arena_bytes) / (1024.0 * 1024.0 * 1024.0), pool_tokens);
+    // The NVMe cold tier's pre-flight (issue #26): the slab's directory,
+    // the free space beside it and the minimum capacity, from the family's
+    // block record and snapshot sizes, before anything is allocated; its
+    // staging buffers join the engine's bytes in the memory plan.
+    const size_t kNvmeChunkBytes = static_cast<size_t>(nvme_cache_chunk_mib) << 20;
+    const size_t nvme_staging_bytes = nvme_cache ? dgpp::nvme_tier_staging_bytes(kNvmeChunkBytes) : 0;
+    dgpp::serve::NvmeCachePlan nvme_plan;
+    // The binding a slab that outlives the process is kept under: the
+    // binary (a release may lay a block's planes out differently at the
+    // same byte count, or compute its KV differently), the checkpoint, the
+    // effective settings (their digest) and the slab's geometry — a start
+    // under another one never sees these entries.
+    const std::string nvme_binding =
+        nvme_cache && nvme_cache_persist
+            ? dgpp::serve::nvme_cache_binding(
+                  DGPP_VERSION, config_digest, ckpt, family->cache_block_bytes(world, mtp && graph_world),
+                  snapshot_bytes, nvme_cache_gib, block_tokens, world, nvme_cache_reuse_binding)
+            : std::string();
+    if (nvme_cache) {
+      nvme_plan = dgpp::serve::plan_nvme_cache(nvme_cache_path, nvme_cache_gib, rank,
+                                               family->cache_block_bytes(world, mtp && graph_world),
+                                               snapshot_bytes, block_tokens, context_limit,
+                                               /*create_directory=*/!memory_plan_only && nvme_cache_reuse_binding.empty(),
+                                               static_cast<size_t>(nvme_cache_reserve_gib * 1024.0 * 1024.0 * 1024.0),
+                                               nvme_binding, kNvmeChunkBytes,
+                                               nvme_cache_required_mount, nvme_cache_allow_buffered);
+      if (nvme_plan.error.empty() && !nvme_cache_reuse_binding.empty()) {
+        nvme_plan.error = dgpp::serve::check_nvme_cache_reuse(nvme_plan, nvme_binding, rank, block_tokens);
+        if (nvme_plan.error.empty())
+          DGPP_LOG_INFO("rank {}: NVMe cache: explicitly reusing binding {}; build/settings identity overridden, "
+                        "format, geometry, checksums and world agreement still checked", rank, nvme_binding);
+      }
+      DGPP_LOG_INFO("rank {}: {}", rank, nvme_plan.describe());
+      DGPP_LOG_INFO("rank {}: {}", rank, nvme_plan.storage.describe());
+      if (const auto warning = nvme_plan.storage.warning(nvme_cache_allow_buffered); !warning.empty())
+        DGPP_LOG_WARN("rank {}: {}", rank, warning);
+      if (!nvme_plan.error.empty()) {
+        DGPP_LOG_ERROR("rank {}: NVMe cache preflight refused — {}", rank, nvme_plan.error);
+        return 1;
+      }
+      if (arena_slots <= 0) {
+        DGPP_LOG_ERROR("rank {}: the NVMe cache needs prefix cache slots (the arena holds none at this budget)",
+                       rank);
+        return 1;
+      }
+    }
     const size_t engine_bytes =
         static_cast<size_t>(max_concurrency) * static_cast<size_t>(family->vocab_size()) * 8 +
-        static_cast<size_t>(pool_tokens) * 16 + (size_t{64} << 20);
+        static_cast<size_t>(pool_tokens) * 16 + (size_t{64} << 20) + nvme_staging_bytes;
+    // The tier's opening (issue #26), once the engine exists and before any
+    // capture: the slab file at the planned capacity, the worker, the
+    // staging buffers.
+    const auto enable_nvme_cache = [&](dgpp::sched::SchedulerEngine* eng) {
+      if (!nvme_cache) return;
+      dgpp::sched::SchedulerEngine::DiskEnable en;
+      en.slab_path = nvme_plan.slab;
+      en.required_mount = nvme_cache_required_mount;
+      en.capacity_bytes = nvme_plan.capacity_bytes;
+      en.chunk_bytes = kNvmeChunkBytes;
+      en.min_tokens = nvme_cache_min_tokens;  // 0: every entry memory keeps (engine.prefix_min_tokens floors them)
+      en.max_ops = static_cast<int>(nvme_cache_max_ops);
+      en.rank = rank;
+      en.persist = nvme_cache_persist;
+      en.binding = nvme_binding;
+      en.require_existing = !nvme_cache_reuse_binding.empty();
+      en.allow_buffered = nvme_cache_allow_buffered;
+      en.op_timeout_s = static_cast<int>(nvme_cache_op_timeout_s);
+      eng->disk_enable(en);
+      const dgpp::sched::SchedulerEngine::DiskInfo info = eng->disk_info();
+      // The pre-flight sized the slab from the family's static estimate of a
+      // block's planes; the tier sized it from the pool as built. They must
+      // agree, or the minimum the check enforced and the page count the
+      // world's decisions assume are not this slab's — a defect in the
+      // family's estimate, refused here rather than discovered on a restore.
+      if (info.page_bytes != nvme_plan.page_bytes || info.pages != nvme_plan.pages)
+        throw std::runtime_error(std::format(
+            "NVMe cache: the family's static block estimate ({} bytes/page, {} pages) disagrees with the pool "
+            "as built ({} bytes/page, {} pages) — the estimate omits a plane",
+            nvme_plan.page_bytes, nvme_plan.pages, info.page_bytes, info.pages));
+      // The blob is the family's static snapshot estimate against the arena
+      // as built; a slot that came out a page larger (DeepSeek-V4.1's
+      // 3.476 MiB estimate against 3.5 MiB built, 2026-10-27) moves the
+      // minimum by that page, which is worth a line, not a refusal.
+      if (info.blob_pages != nvme_plan.blob_pages)
+        DGPP_LOG_WARN("rank {}: NVMe cache: the snapshot blob spans {} pages as built against {} in the plan (the "
+                      "family's static snapshot estimate is off by {} bytes); the minimum capacity was checked "
+                      "with the plan's figure",
+                      rank, info.blob_pages, nvme_plan.blob_pages,
+                      static_cast<int64_t>(info.blob_pages - nvme_plan.blob_pages) *
+                          static_cast<int64_t>(info.page_bytes));
+      DGPP_LOG_INFO("rank {}: NVMe cache on — {} pages of {} bytes ({:.2f} GiB), entries of at least {} tokens, "
+                    "{} MiB slices, {} ops in flight at most",
+                    rank, info.pages, info.page_bytes,
+                    static_cast<double>(info.pages) * static_cast<double>(info.page_bytes) /
+                        (1024.0 * 1024.0 * 1024.0),
+                    info.min_tokens, nvme_cache_chunk_mib, info.max_ops);
+      // A world of one decides its own adoption; a fabric decides at the
+      // warm handshake, every rank's candidate compared.
+      if (world == 1 && nvme_cache_persist) eng->disk_adopt(eng->disk_candidate_digest() != "0");
+    };
     if (memory_plan_only) {
       // The check alone, for the shape this rank would run (world > 1: the
       // resident, vocab-sharded fabric model; world 1: the streaming one).
@@ -3263,6 +3808,7 @@ int main(int argc, char** argv) {
     knobs.admission.prefill_latency = prefill_latency;
     knobs.admission.prefix_min_tokens = prefix_min_tokens;
     knobs.admission.prefix_head_snapshots = prefix_head_snapshots;
+    knobs.admission.prefix_pin_max_pct = prefix_pin_max_pct;
     knobs.default_max_tokens = default_max_tokens;
     knobs.file_inputs = file_inputs;
     knobs.sampling_defaults = sampling_defaults;
@@ -3383,23 +3929,49 @@ int main(int argc, char** argv) {
           engine.reset();
           family->destroy_model();
         };
-        const auto start_warm = [&] {
+        const auto start_warm = [&](dgpp::sched::SchedulerEngine* eng) {
           // Any rank can be last out of cold checkpoint loading. Wait on TCP
           // before launching collectives, whose deadlines bound execution,
           // not disk I/O on a peer. Apply the same hold to graph and eager serving.
+          // The readiness lines carry each rank's NVMe cache candidate (the
+          // previous run's index digest): rank 0 adopts only when every
+          // rank holds the same one, and says so on the warm record.
+          const bool persisted = nvme_cache && nvme_cache_persist;
           if (rank == 0) {
             if (journal) {
+              std::vector<std::pair<int, std::string>> notes;
               if (!journal->wait_peers_ready(rendezvous_timeout_ms,
-                                             [rank] { return peer_should_stop(rank); })) return false;
+                                             [rank] { return peer_should_stop(rank); }, &notes)) return false;
+              bool adopt = false;
+              if (persisted) {
+                const std::string own = eng->disk_candidate_digest();
+                adopt = own != "0";
+                for (const auto& [peer, note] : notes)
+                  if (note != own) {
+                    if (adopt)
+                      DGPP_LOG_INFO("rank 0: NVMe cache: rank {}'s previous index ({}) is not rank 0's ({})", peer,
+                                    note.empty() ? "none" : note, own);
+                    adopt = false;
+                  }
+                DGPP_LOG_INFO("rank 0: NVMe cache: {}",
+                              adopt ? "every rank holds the same previous index; the world adopts it"
+                                    : (nvme_cache_reuse_binding.empty()
+                                           ? "no previous index every rank holds; the slabs start fresh"
+                                           : "no previous index every rank holds; explicit reuse refused"));
+                eng->disk_adopt(adopt);
+              }
               journal->broadcast(dgpp::serve::encode_journal_warm(
-                  knobs.admission, prefix_slots, config_digest));
+                  knobs.admission, prefix_slots, config_digest, adopt));
             }
             return true;
           }
-          reader->send_ready();
-          return dgpp::serve::wait_journal_warm(
+          reader->send_ready(persisted ? eng->disk_candidate_digest() : std::string());
+          bool adopt = false;
+          const bool ok = dgpp::serve::wait_journal_warm(
               &*reader, [rank] { return peer_should_stop(rank); },
-              &peer_policy, &peer_prefix_slots, &rank0_config);
+              &peer_policy, &peer_prefix_slots, &rank0_config, &adopt);
+          if (ok && persisted) eng->disk_adopt(adopt);
+          return ok;
         };
         if (decode_graph) {
           std::unique_ptr<ServeGraphEngine> graph_engine =
@@ -3467,6 +4039,8 @@ int main(int argc, char** argv) {
                                        : "draw each draft from the selector's softmax under the ratio verify",
                           mtp_draft, mtp_draft_temperature);
           }
+          enable_nvme_cache(graph_engine->engine());
+          dgpp::sched::SchedulerEngine* const warm_engine = graph_engine->engine();
           if (mtp_schedule) {
             // The value of decode time: the configured throughput, or the
             // reservation rate of the configured curve (a plain step's).
@@ -3484,7 +4058,7 @@ int main(int argc, char** argv) {
           // point, so no capture pauses a live stream later. The warm-up
           // is a run of collectives, so the journal releases it only after
           // every rank has finished constructing its model and engine.
-          if (!start_warm()) {
+          if (!start_warm(warm_engine)) {
             graph_engine.reset();
             family->destroy_model();
             cudaFreeHost(pick_scratch);
@@ -3513,9 +4087,10 @@ int main(int argc, char** argv) {
           knobs.admission = dgpp::serve::resolve_prefill_policy(
               knobs.admission, *engine, prefill_early_admission_override);
           peer_policy = knobs.admission;
+          enable_nvme_cache(engine.get());
           // The eager fabric path exchanges the warm record too: it
           // carries the admission policy (no capture to start here).
-          if (!start_warm()) {
+          if (!start_warm(engine.get())) {
             engine_release();
             cudaFreeHost(pick_scratch);
             bus->stop();
@@ -3647,6 +4222,7 @@ int main(int argc, char** argv) {
         &grammar_vocab, prefix_slots);
     knobs.admission = dgpp::serve::resolve_prefill_policy(
         knobs.admission, *engine, prefill_early_admission_override);
+    enable_nvme_cache(engine.get());
     const int rc = serve_openai(engine.get(), family->vocab_size(), generation_eos, ckpt,
                                 model_display, knobs, no_eos, boot_s(), /*journal=*/nullptr,
                                 /*oplog=*/nullptr, family->name(), family->model_opens_thinking());

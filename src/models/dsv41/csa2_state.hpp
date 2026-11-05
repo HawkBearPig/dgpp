@@ -17,6 +17,7 @@
 
 #include <cuda_runtime.h>
 
+#include "engine/cache_planes.hpp"
 #include "engine/paged_blocks.hpp"
 #include "kernels/csa2.hpp"
 #include "kernels/latent_format.hpp"
@@ -91,6 +92,10 @@ class Csa2StatePool {
   // Every cache's rows of physical block `src` into `dst`, stream-ordered.
   void copy_block_contents(int32_t src, int32_t dst, cudaStream_t stream);
   int32_t block_refcount(int32_t block) const { return table_.block_refcount(block); }
+  // The NVMe cold tier's view (issue #26): the block's identity and every
+  // plane a block spans (each cache's main rows, index keys and scales).
+  uint64_t block_identity(int32_t block) const { return table_.block_identity(block); }
+  std::vector<CachePlane> planes() const;
 
  private:
   Csa2PoolShape shape_;

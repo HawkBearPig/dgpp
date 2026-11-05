@@ -67,6 +67,27 @@ Rules that keep the numbers comparable:
 | `engine.graph_batch_min_live` | when decode switches from scalar to batched graphs | earlier batching helps throughput under load and can cost a single stream |
 | `engine.sampling_candidates` | the candidates gathered per rank on the sampled path | fewer means less routine work and more full-gather fallbacks |
 
+### Flash-Next DFlash2
+
+DFlash2 runs a separate block drafter and verifies multiple target rows.
+Compare both milliseconds per pass and accepted tokens per pass: more
+accepted tokens alone do not establish a throughput gain. Measure each
+workload class and concurrency against the native MTP template.
+
+When switching an MTP template with `--dflash-model PATH`, the command line
+resets inherited draft settings. Add `--mtp-schedule --draft-head screen`
+explicitly to request adaptive verification and the screened proposal head.
+The screen computes exact logits in selected vocabulary blocks and masks
+the rest; target verification retains the full served head.
+`--dflash-weights fp8` is a separate choice that compresses the drafter's
+weights and can change its proposals and acceptance rate.
+
+Flash-Next uses recurrent-state checkpoint/replay for DFlash2 as well as
+native MTP. It saves the verify inputs and replays accepted rows, avoiding
+full recurrent-state snapshots for every speculative row.
+`DGPP_QWEN_GDN_REPLAY=off` selects full snapshots for diagnostic comparisons;
+the memory plan follows that choice.
+
 ### Prefill and time to first token
 
 | key | moves | trades |

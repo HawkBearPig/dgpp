@@ -205,3 +205,21 @@ does not alter the attention, expert routing, or cached hidden states. The
 probe uses resident weights, BF16 KV, and Qwen FP8 dense weights; it evaluates
 head behavior rather than a complete task benchmark. Its aggregate time
 includes lazy weight loading and is not a steady-state throughput benchmark.
+
+## Greedy transcripts and chunk shape
+
+A cold prefill's arithmetic depends on the shapes of the chunks it walks.
+The attention sites of the DSA families are not split-invariant, so the
+same prompt can answer differently at temperature 0 when its chunks differ,
+with or without the prefix cache. The admission controller changes those
+shapes: the first prompt after a boot walks its ramp from
+`prefill_initial_tokens`, and readers in flight together share the budget
+and get smaller chunks each. A cache hit reproduces the walk that made the
+entry, which is why a restored entry answers like the in-memory one.
+
+A transcript comparison across boots, restarts or concurrent clients is
+therefore not evidence about the change under test unless the chunk shapes
+are held fixed. Pin them by setting `engine.first_token_target_ms` and
+`engine.decode_gap_target_ms` to 0 in the deployment, so every tick offers
+the idle budget, and run one client at a time. Otherwise compare at the
+kernel level, where the row-count and split invariance gates apply.

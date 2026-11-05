@@ -1,5 +1,64 @@
 # Tests
 
+`scheduler_prefixCache_cancelledHistoryRandomizedReplay` replays 512 fixed
+seeds twice across speculative batch cuts, delivered-tail truncation, edited
+histories, lookahead identity and small arenas. The NVMe cancellation tests
+check that retained snapshots stay reclaimable during another request's
+growth, remain reusable in memory and leave normal completion spills intact.
+`serve_cancel_prefix_check_test` tests the diagnostic client's SSE transport,
+Unicode/whitespace preservation, disconnect retirement and cold controls.
+Run `scripts/serve_cancel_prefix_check.py` on an idle serving world to compare
+actual rerendered interrupted histories with cold replies; pass the source
+revision, binary hash and an output path for its detailed JSON report.
+`--thinking` uses the template's native reasoning mode, including always-on
+templates, and `--require-answer-hit` requires at least one cancelled reply
+to produce a deeper hit. The report distinguishes
+answer-prefix hits from earlier prompt hits; retained state may sit at no
+cut of the resubmitted history, especially with one-token snapshot alignment.
+The probe requires exact cached/cold text, finish reasons and completion-token
+counts, and retains its partial report on failure. DSA models can differ when
+cached decode state and cold prefill use different arithmetic shapes; see
+[greedy transcripts and chunk shape](numerics.md#greedy-transcripts-and-chunk-shape).
+Pin admission budgets for comparisons and use a base-revision normal-completion
+control to distinguish existing numerical differences from a retention regression.
+
+`nvme_cache_test` checks reuse of an existing binding after build/settings
+changes, adoption and exact-token lookup through the host disk index, legacy
+index encoding, and non-destructive refusal of missing or incompatible files.
+`fabric_serve_test` covers transport of the explicit binding to peers, and
+`portability_test.py` checks launcher validation and configuration forwarding.
+The persistence section of `qwen_decode_test` also restores GPU state with
+explicit reuse and verifies that rejected reuse and world disagreement leave
+the selected files unchanged. Run GPU checks on idle hardware.
+
+`cache_storage_test` checks NVMe storage placement, including randomized
+mountinfo parsing, escaped mountpoint names, missing paths, symlinks,
+non-destructive refusals and unconditional tmpfs rejection. Two cases require
+real mounts and are reported as skipped in the ordinary host run. Run them
+in a private mount namespace with:
+
+```sh
+sudo python3 tests/python/nvme_storage_mount_check.py --binary build-ci/cache_storage_test
+```
+
+The driver creates temporary bind, read-only, nested, OverlayFS, tmpfs and
+ramfs mounts, checks startup planning, and verifies refusal after unmounting
+the required destination. It unmounts them before deleting its fixture; the
+private namespace also limits mount lifetime if interrupted. Container
+replacement/adoption and multi-rank serving remain separate integration
+checks. Keep the binary, model, effective settings and cache binding stable
+when testing replacement, so a compatibility change does not mask placement.
+
+`chat_template_generator_test` exercises the Python golden generator's Jinja
+sandbox without a checkpoint or GPU. It checks private-attribute restrictions,
+input immutability, literal message data, namespace/loop behavior, JSON rendering
+and template validation errors, plus generator output and runtime-version
+metadata. Install `requirements-tools.txt`, then run
+`python3 tests/python/chat_template_generator_test.py` or select the test with
+CTest. Missing Jinja2 is an explicit skip (exit 2), not a passing check.
+The sandbox does not bound CPU or memory: use resource isolation when generating
+reference data from untrusted checkpoint templates.
+
 `resident_image_*` unit tests cover malformed offsets and lengths, truncated
 blobs, default payload verification, its explicit opt-out and recoverable
 read/size failures. `glm_loader_rebuilds_rejected_resident_images` and
@@ -16,6 +75,13 @@ JPEG and WebP decoding; `glm_vision_frontend_test` also shares the real loaded
 template/tokenizer across text/image preparation and output decoding.
 Set `DGPP_TP_REAL_MODEL` to select another cached GLM-5.3 checkpoint for that
 frontend test; its default is `unsloth/GLM-5.3-Flash-FP8`.
+
+`minijson_number_*` and `minijson_document_*` cover numeric grammar, integer/double
+representations and document versus prefix parsing. `serve_json_*` exercises both
+completion routes, file preprocessing and string-encoded function arguments with
+the fake engine, including refusal before admission and valid requests afterward.
+Run the service cases with both polling and `DGPP_TEST_STREAM_WAKE=1`; file-input,
+safetensors, cluster-config and tool-parser unit tests cover shared-parser callers.
 
 `serve_admission_bench_test` checks the HTTP/SSE admission benchmark's transport,
 native-overlap assertions, published-counter drain barrier and KV cleanup gate.
@@ -51,6 +117,28 @@ use the existing session numerical tier and certify changed argmax near ties;
 same-shape isolation and graph token comparisons remain exact. Qwen4Exp retains
 its two-rank `qwen_engine_test` coverage. Run GPU checks serially with production
 stopped, then restore and verify the original deployment.
+`dflash2_integration_test` checks both Flash-Next and Qwen35 with the shared
+v2 drafter. Partial-block snapshots must preserve every draft K/V row of
+the restored request and its live neighbor, including repeated slot reuse.
+Two-rank graph tests alternate scalar and batched scheduled verification
+with eager redrafts, comparing the recorded proposals and cross-rank
+transcripts. These tests exercise both installation and restoration of the
+capture reducer. Sampled graph runs also require the engine to arm the
+selector's proposal distributions and agree across ranks. The memory-plan
+checks require the drafter's head logits to use the local vocabulary slice
+and account for the requested head screen. Screened graph runs check the
+candidate-block bound. Flash-Next's recurrent-state replay is compared with
+full snapshots for scheduled scalar/batched transcripts and exact state
+bytes in prefix snapshots taken after speculative commits.
+A direct verify/rollback check forces every accepted prefix length from one
+through eight rows, then compares continuation logits before and after
+restoring a decoded prefix snapshot.
+Run them with `qwen_dflash2_test`, `dflash2_kernels_test`
+and `qwen35_tp_test` on idle hardware; the latter retains DFlash v1 coverage.
+`spec_ab_probe_test` checks bonus-inclusive mean acceptance length, delayed
+completion counters, idle-engine enforcement, model identity and the shared
+corpus without making network requests.
+
 `qwen35_moe_*` adds the ModelOpt MoE fixture, row/group invariance and
 independent reference/teacher comparisons. `qwen35_tp_test` covers MoE
 worlds 1/2/4, native MTP graphs at worlds 2/4, and DFlash v1 graph
@@ -183,6 +271,33 @@ TTFT/prefill/TPOT histograms, resumed prefill, streaming with usage omitted,
 false or true, multiple choices exceeding available slots, single-token
 completions and speculative batches. It also checks that existing usage, JSON
 metrics and Prometheus token counters keep their definitions.
+
+The NVMe cold tier is covered by `unit_tests` (the disk index: page
+allocation, block sharing, retention with pins and the pin cap, the index's
+round trip, pruning and adoption with content digests, and mutated index
+bytes), `scheduler_test` (the cold-tier cases: spill, evict, restore and
+attach, failed restores and spills, retention, two requests on one restore,
+a cancel while restoring, the adopted index, and two replicas fed random
+streams whose op streams and digests must stay identical),
+`fabric_serve_test` (the journal's return path, the commit collector, the
+settings and warm records, and the flow across three ranks over real
+sockets), `qwen_decode_test`'s tier block (spill and restore bitwise on the
+fixture, attach parity, a corrupted page detected, the slab across a
+restart and across a crash with content-bound adoption, the lock, damaged
+files, the op timeout and injected I/O failures), `nvme_tier_families_test`
+(spill, restore, attach and step bitwise on the MiMo, Flint and Qwen3.5
+tiny checkpoints) and `dflash2_integration_test`'s `prefix_tier` cases (a
+drafter world's entry spilled and restored with its draft K/V context
+intact on both Qwen families). On a booted world,
+`scripts/serve_nvme_cache_check.py` drives the whole flow and
+`scripts/serve_nvme_cache_fuzz.py` drives random workloads with pins,
+opt-outs, concurrent clients, mid-flight cancels, clean restarts and rank
+crashes, checking every repeated answer against its first.
+
+The Qwen fixture's duplicate-open cases check slab size and bytes before
+releasing ownership, then check stale-content clearing with persistence both
+enabled and disabled. Run this fixture with host leak detection as well:
+refused constructors must release their aligned adoption buffers.
 
 Release and testing builds use separate CMake presets and directories:
 
@@ -376,6 +491,21 @@ build. The suites cover:
   divergences rejected), and the TCP/roster control plane (seal, epoch
   bumps, eviction by death and by deadline, rejection reasons, coordinator
   loss).
+- native template unit cases (`DGPP_TEST_FILTER=chat_template_`) without model
+  data: empty-pattern replacement across UTF-8 codepoints, extreme list indexes,
+  finite range/slice results at integer boundaries, checked addition/subtraction
+  and line-numbered errors. `chat_template_limits_` covers compile limits,
+  recursion, dispatch exhaustion, preflight range cardinality, string growth,
+  cumulative emission across discarded captures/macros, file-loading boundaries,
+  and recovery after refusal, including concurrent calls on one compiled template.
+  Run these under the separate `asan` and `ubsan` presets as well as optimized builds.
+  Dispatch-exhaustion cases deliberately reach the production ten-million-step
+  budget, so allow for their instrumentation cost when setting external timeouts;
+  the checkpoint template goldens separately cover valid family renders and IDs.
+  `DGPP_TEST_FILTER=serve_templateLimits_ build-ci/serve_test` exercises the real
+  template interpreter through HTTP with a fake engine/tokenizer: limit errors
+  return HTTP 400 naming `messages` before tokenization or SSE headers, and a
+  subsequent valid request succeeds on the same compiled template and service.
 - the M6 host suites: the tokenizer (55 byte-exact goldens per family,
   hash-keyed — GLM-5.3, Qwen3.8-Flash-Next and GLM-4.7 corpora), the chat
   template (26 / 20 / 26 goldens + 8 refusal negatives, the tool-call

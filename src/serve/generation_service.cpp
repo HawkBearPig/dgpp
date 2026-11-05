@@ -1,6 +1,7 @@
 #include "serve/generation_service.hpp"
 #include "serve/image_inputs.hpp"
 #include "text/dsv41_prompt.hpp"
+#include "text/minimax_tool_grammar.hpp"
 
 #include <mutex>
 #include <unordered_set>
@@ -406,11 +407,11 @@ std::string text_completion_body(const std::string& id, int64_t created,
 // The model object, with the served surfaces as extensions: the sampling
 // defaults (what an omitted field becomes), whether stochastic requests
 // are executable on this engine at all, and the tool/reasoning surface.
-std::string model_object(const ServiceConfig& scfg, const std::string& model_id,
-                         int64_t created, bool sampling_available,
-                         const sample::Params& d, bool tools_available,
-                         bool constraints_available,
-                         bool reasoning_in_content, const ModelFrontend& frontend, bool images_available) {
+std::string model_object(const ServiceConfig& scfg, const std::string& model_id, int64_t created,
+                         bool sampling_available, const sample::Params& d, bool tools_available,
+                         bool constraints_available, bool reasoning_in_content,
+                         const ModelFrontend& frontend, bool images_available,
+                         bool video_available) {
   std::string out;
   out.append("{\"id\":");
   append_json_string(&out, model_id);
@@ -463,6 +464,7 @@ std::string model_object(const ServiceConfig& scfg, const std::string& model_id,
   out.append(scfg.default_chat_template_kwargs);
   out.append(",\"input_modalities\":[\"text\"");
   if (images_available) out.append(",\"image\"");
+  if (video_available) out.append(",\"video\"");
   out.append("]");
   // The rope ramp in force, under the names the deployment JSON uses, so
   // what an operator set is what a client reads, plus the three values the
@@ -1390,7 +1392,15 @@ bool GenerationService::parse_chat(const dgpp::minijson::Value& body,
         std::vector<std::string> warnings, notes;
         try {
           g.tools.push_back(
-              dgpp::text::grammar_tool_from_function(def, &warnings, &notes));
+              dgpp::text::grammar_tool_from_function(def, &warnings, &notes,
+                markers_.tool_format() == dgpp::text::ToolFormat::kMiniMax));
+          if (markers_.tool_format() == dgpp::text::ToolFormat::kMiniMax) {
+            GrammarSpec one;
+            one.tools.push_back(g.tools.back());
+            // Refuse unrepresentable XML schemas at the request boundary,
+            // before a worker or a peer rank configures its grammar.
+            dgpp::text::MiniMaxToolGrammar validate(nullptr, one);
+          }
         } catch (const std::invalid_argument& e) {
           const std::string prefix =
               "tools[" + std::to_string(i) + "]" + (fn != nullptr ? ".function." : ".");
@@ -1562,8 +1572,7 @@ bool GenerationService::parse_chat(const dgpp::minijson::Value& body,
       // GLM-5.3-Flash's never does — thinking is always on there.
       if (!frontend_->template_reads("enable_thinking"))
         return refuse(
-            "this template has no enable_thinking knob — thinking is always "
-            "on (the generation prompt opens <think>); use reasoning_effort",
+            "this template has no enable_thinking knob; use reasoning_effort",
             where, "unsupported_parameter");
       if (!m.value.is_bool()) return refuse(where + " must be a boolean", where);
       extra.push_back(m);
@@ -1573,8 +1582,7 @@ bool GenerationService::parse_chat(const dgpp::minijson::Value& body,
       // for that stack turns thinking off here too.
       if (!frontend_->template_reads("enable_thinking"))
         return refuse(
-            "this template has no thinking knob — thinking is always on "
-            "(the generation prompt opens <think>); use reasoning_effort",
+            "this template has no thinking knob; use reasoning_effort",
             where, "unsupported_parameter");
       if (!m.value.is_bool()) return refuse(where + " must be a boolean", where);
       Member alias = m;
@@ -1673,12 +1681,20 @@ bool GenerationService::parse_chat(const dgpp::minijson::Value& body,
           saw_thinking = true;
           continue;
         }
-        if (type->as_string() == "image_url") {
-          if (r != "user") return refuse("images require a user message", at + ".type", "unsupported_content_type");
-          if (!frontend_->supports_images() || !engine_->supports_images())
-            return refuse("the served model does not support image inputs", at + ".type", "unsupported_content_type");
-          const auto* image = part.find("image_url");
-          if (!image || !image->is_object()) return refuse("image_url must be an object", at + ".image_url");
+        if (type->as_string() == "image_url" || type->as_string() == "video_url") {
+          const bool video = type->as_string() == "video_url";
+          const std::string field = video ? "video_url" : "image_url";
+          if (r != "user")
+            return refuse("media inputs require a user message", at + ".type",
+                          "unsupported_content_type");
+          if (video ? (!frontend_->supports_video() || !engine_->supports_video())
+                    : (!frontend_->supports_images() || !engine_->supports_images()))
+            return refuse(video ? "the served model does not support video inputs"
+                                : "the served model does not support image inputs",
+                          at + ".type", "unsupported_content_type");
+          const auto* image = part.find(field);
+          if (!image || !image->is_object())
+            return refuse(field + " must be an object", at + "." + field);
           parts.push_back(part);
           continue;
         }
@@ -1754,8 +1770,7 @@ bool GenerationService::parse_chat(const dgpp::minijson::Value& body,
               args_value = *args;
             } else if (args->is_string()) {
               try {
-                dgpp::minijson::ParseResult pr =
-                    dgpp::minijson::parse(args->as_string());
+                dgpp::minijson::ParseResult pr = dgpp::minijson::parse_document(args->as_string());
                 if (!pr.root.is_object()) throw std::runtime_error("not an object");
                 args_value = std::move(pr.root);
               } catch (const std::exception& e) {
@@ -2061,7 +2076,8 @@ bool GenerationService::validate_chat_parameters(const minijson::Value& body, Pr
   const std::unordered_set<std::string> unsupported = {
       "web_search_options", "functions", "function_call", "prompt_cache_options"};
   const std::unordered_set<std::string> nullable_unsupported = {
-      "audio", "prediction", "moderation", "prompt_cache_key", "prompt_cache_retention", "verbosity"};
+      "audio",     "prediction",     "moderation", "prompt_cache_retention",
+      "verbosity", "prompt_logprobs"};
   std::unordered_set<std::string> seen;
   for (const auto& m : body.members()) {
     if (!seen.insert(m.key).second) return refuse(m.key, "duplicate request parameter", "invalid_parameter");
@@ -2186,7 +2202,7 @@ void GenerationService::prepare_chat_completions(const HttpRequest& req,
                                               PreparedRequest& w) {
   dgpp::minijson::ParseResult parsed;
   try {
-    parsed = dgpp::minijson::parse(req.body);
+    parsed = dgpp::minijson::parse_document(req.body);
   } catch (const std::exception& e) {
     respond_error(w, 400, std::string("invalid JSON body: ") + e.what(),
                   "invalid_request_error", "body");
@@ -2241,6 +2257,22 @@ void GenerationService::prepare_chat_completions(const HttpRequest& req,
       return;
     }
     prefix_cache = pcv->as_bool(true);
+  }
+  // prompt_cache_key (OpenAI's field, our semantics): a string that pins
+  // the prefix-cache entries this request creates or attaches to — memory
+  // and the NVMe tier keep them past unpinned entries under pressure. A
+  // pin is a priority, never a lookup key: matching stays by exact token
+  // prefix. Null is absent.
+  std::string prompt_cache_key;
+  if (const dgpp::minijson::Value* ckv = body.find("prompt_cache_key")) {
+    if (!ckv->is_null()) {
+      if (!ckv->is_string() || ckv->as_string().empty() || ckv->as_string().size() > 256) {
+        respond_error(w, 400, "prompt_cache_key must be a string of 1 to 256 bytes", "invalid_request_error",
+                      "prompt_cache_key");
+        return;
+      }
+      prompt_cache_key = std::string(ckv->as_string());
+    }
   }
 
   // Sampling: the spec over the model's defaults (M6 6b). temperature 0
@@ -2307,9 +2339,12 @@ void GenerationService::prepare_chat_completions(const HttpRequest& req,
     auto input = frontend_->prepare_chat(plan.globals);
     prompt = std::move(input.tokens);
     images = std::move(input.images);
-    validate_image_inputs(images, prompt.size());
+    validate_image_inputs(images, prompt.size(),
+                          frontend_->supports_video() && engine_->supports_video());
   } catch (const ImageInputError& e) {
-    respond_error(w, 400, e.what(), "invalid_request_error", e.param, "invalid_image");
+    respond_error(
+        w, 400, e.what(), "invalid_request_error", e.param,
+        e.param.find(".video_url") != std::string::npos ? "invalid_video" : "invalid_image");
     return;
   } catch (const std::exception& e) {
     respond_error(w, 400,
@@ -2423,6 +2458,7 @@ void GenerationService::prepare_chat_completions(const HttpRequest& req,
     sr.id = record->sched_id;
     sr.boundaries = boundaries;
     sr.no_cache = !prefix_cache;
+    sr.cache_key = prompt_cache_key;
     sr.images = images;
     sr.prompt = prompt;
     sr.max_steps = steps;
@@ -2448,7 +2484,7 @@ void GenerationService::prepare_completions(const HttpRequest& req,
                                           PreparedRequest& w) {
   dgpp::minijson::ParseResult parsed;
   try {
-    parsed = dgpp::minijson::parse(req.body);
+    parsed = dgpp::minijson::parse_document(req.body);
   } catch (const std::exception& e) {
     respond_error(w, 400, std::string("invalid JSON body: ") + e.what(),
                   "invalid_request_error", "body");
@@ -2471,6 +2507,14 @@ void GenerationService::prepare_completions(const HttpRequest& req,
                               "' does not exist on this server",
                   "invalid_request_error", "model", "model_not_found");
     return;
+  }
+  std::unordered_set<std::string> seen;
+  for (const auto& m : body.members()) {
+    if (!seen.insert(m.key).second) {
+      respond_error(w, 400, "duplicate request parameter", "invalid_request_error", m.key,
+                    "invalid_parameter");
+      return;
+    }
   }
   const dgpp::minijson::Value* prompt = body.find("prompt");
   if (prompt == nullptr || !prompt->is_string()) {
@@ -2506,6 +2550,22 @@ void GenerationService::prepare_completions(const HttpRequest& req,
     }
     prefix_cache = pcv->as_bool(true);
   }
+  // prompt_cache_key (OpenAI's field, our semantics): a string that pins
+  // the prefix-cache entries this request creates or attaches to — memory
+  // and the NVMe tier keep them past unpinned entries under pressure. A
+  // pin is a priority, never a lookup key: matching stays by exact token
+  // prefix. Null is absent.
+  std::string prompt_cache_key;
+  if (const dgpp::minijson::Value* ckv = body.find("prompt_cache_key")) {
+    if (!ckv->is_null()) {
+      if (!ckv->is_string() || ckv->as_string().empty() || ckv->as_string().size() > 256) {
+        respond_error(w, 400, "prompt_cache_key must be a string of 1 to 256 bytes", "invalid_request_error",
+                      "prompt_cache_key");
+        return;
+      }
+      prompt_cache_key = std::string(ckv->as_string());
+    }
+  }
 
   sample::Params sampling;
   std::optional<uint64_t> seed;
@@ -2529,6 +2589,11 @@ void GenerationService::prepare_completions(const HttpRequest& req,
     sampling.logprobs = logprobs;
   }
 
+  if (optional_field(body, "prompt_logprobs")) {
+    respond_error(w, 400, "'prompt_logprobs' is not supported by this server",
+                  "invalid_request_error", "prompt_logprobs", "unsupported_parameter");
+    return;
+  }
   const char* unsupported[] = {"echo", "suffix", "top_logprobs",
                               "n",    "best_of", "user"};
   for (const char* param : unsupported) {
@@ -2600,6 +2665,7 @@ void GenerationService::prepare_completions(const HttpRequest& req,
   sr.id = record->id;
   sr.boundaries = prompt_boundaries(ids);
   sr.no_cache = !prefix_cache;
+  sr.cache_key = prompt_cache_key;
   sr.prompt = std::move(ids);
   sr.max_steps = steps;
   sr.ignore_eos = ignore_eos;
@@ -2622,21 +2688,24 @@ void GenerationService::route_models(const HttpRequest& req,
                                      HttpResponseWriter& w) {
   const int64_t created = std::time(nullptr);
   if (req.path == "/v1/models") {
-    w.respond(200, "application/json",
-              "{\"object\":\"list\",\"data\":[" +
-                  model_object(cfg_, cfg_.model_id, created, sampling_available_,
-                               cfg_.sampling_defaults, tool_calls_available(),
-                               constraints_available(),
-                               cfg_.reasoning_in_content, *frontend_, frontend_->supports_images() && engine_->supports_images()) +
-                  "]}");
+    w.respond(
+        200, "application/json",
+        "{\"object\":\"list\",\"data\":[" +
+            model_object(cfg_, cfg_.model_id, created, sampling_available_, cfg_.sampling_defaults,
+                         tool_calls_available(), constraints_available(), cfg_.reasoning_in_content,
+                         *frontend_, frontend_->supports_images() && engine_->supports_images(),
+                         frontend_->supports_video() && engine_->supports_video()) +
+            "]}");
     return;
   }
   const std::string id = req.path.substr(std::string("/v1/models/").size());
   if (id == cfg_.model_id) {
-    w.respond(200, "application/json",
-              model_object(cfg_, id, created, sampling_available_,
-                           cfg_.sampling_defaults, tool_calls_available(),
-                           constraints_available(), cfg_.reasoning_in_content, *frontend_, frontend_->supports_images() && engine_->supports_images()));
+    w.respond(
+        200, "application/json",
+        model_object(cfg_, id, created, sampling_available_, cfg_.sampling_defaults,
+                     tool_calls_available(), constraints_available(), cfg_.reasoning_in_content,
+                     *frontend_, frontend_->supports_images() && engine_->supports_images(),
+                     frontend_->supports_video() && engine_->supports_video()));
     return;
   }
   respond_error(w, 404, "the model '" + id + "' does not exist",
@@ -2875,6 +2944,7 @@ void GenerationService::route_metrics_prometheus(HttpResponseWriter& w) {
   out.gauge("dgpp_prefix_cache_slots", "Prefix-cache snapshot slots (0: off).", int64_t{m.prefix_slots});
   out.gauge("dgpp_prefix_cache_entries", "Live prefix-cache entries.", int64_t{m.prefix_entries});
   out.gauge("dgpp_prefix_cache_blocks_pinned", "K/V pool blocks the entries pin.", m.prefix_blocks_pinned);
+  out.gauge("dgpp_prefix_cache_pinned", "Entries a prompt_cache_key pins against eviction.", static_cast<int64_t>(m.prefix_pinned));
   out.gauge("dgpp_prefix_cache_snapshot_bytes", "Bytes per arena snapshot.", pe.snapshot_bytes);
   out.counter("dgpp_prefix_cache_hits_total", "Admissions that attached to an entry.", m.prefix_hits);
   out.counter("dgpp_prefix_cache_misses_total", "Admissions that found no entry.", m.prefix_misses);
@@ -2938,6 +3008,7 @@ void GenerationService::route_metrics(HttpResponseWriter& w) {  Scheduler::Meter
   Stats st;
   const auto prefills = engine_->prefill_monitor()->snapshot();
   dgpp::sched::SchedulerEngine::PrefixEngineStats pe;
+  dgpp::sched::SchedulerEngine::DiskEngineStats de;
   double snapshot_age_ms = 0;
   size_t pending_admissions = 0, pending_cancellations = 0;
   {
@@ -2945,6 +3016,7 @@ void GenerationService::route_metrics(HttpResponseWriter& w) {  Scheduler::Meter
     m = meters_;
     st = stats_;
     pe = prefix_stats_;
+    de = disk_stats_;
     snapshot_age_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - meters_published_).count();
     pending_admissions = pending_admissions_.size();
@@ -3171,6 +3243,8 @@ void GenerationService::route_metrics(HttpResponseWriter& w) {  Scheduler::Meter
   append_json_int(&out, m.prefix_image_bytes);
   out.append(",\"blocks_pinned\":");
   append_json_int(&out, m.prefix_blocks_pinned);
+  out.append(",\"pinned\":");
+  append_json_int(&out, m.prefix_pinned);
   out.append(",\"snapshot_bytes\":");
   append_json_int(&out, pe.snapshot_bytes);
   out.append(",\"arena_snapshots\":");
@@ -3187,6 +3261,61 @@ void GenerationService::route_metrics(HttpResponseWriter& w) {  Scheduler::Meter
   append_ms("ttft_miss_ms_avg", avg(st.ttft_miss_ms, static_cast<int64_t>(st.ttft_miss_count)));
   out.append(",\"key\":");
   append_json_string(&out, cfg_.prefix_key);
+  // The NVMe cold tier (issue #26): the slab's occupancy, its entries and
+  // block records, the spills and restores begun / committed / failed,
+  // disk evictions, the ops in flight, the bytes moved and their times.
+  out.append("},\"nvme_cache\":{\"enabled\":");
+  out.append(m.disk_enabled ? "true" : "false");
+  out.append(",\"pages_total\":");
+  append_json_int(&out, m.disk_pages_total);
+  out.append(",\"pages_used\":");
+  append_json_int(&out, m.disk_pages_used);
+  out.append(",\"page_bytes\":");
+  append_json_int(&out, m.disk_page_bytes);
+  out.append(",\"bytes_total\":");
+  append_json_int(&out, m.disk_pages_total * m.disk_page_bytes);
+  out.append(",\"bytes_used\":");
+  append_json_int(&out, m.disk_pages_used * m.disk_page_bytes);
+  out.append(",\"entries\":");
+  append_json_int(&out, m.disk_entries);
+  out.append(",\"blocks\":");
+  append_json_int(&out, m.disk_blocks);
+  out.append(",\"spills\":");
+  append_json_int(&out, m.disk_spills);
+  out.append(",\"spilled\":");
+  append_json_int(&out, m.disk_spilled);
+  out.append(",\"spill_failed\":");
+  append_json_int(&out, m.disk_spill_failed);
+  out.append(",\"spill_skipped\":");
+  append_json_int(&out, m.disk_spill_skipped);
+  out.append(",\"restores\":");
+  append_json_int(&out, m.disk_restores);
+  out.append(",\"restored\":");
+  append_json_int(&out, m.disk_restored);
+  out.append(",\"restore_failed\":");
+  append_json_int(&out, m.disk_restore_failed);
+  out.append(",\"tokens_restored\":");
+  append_json_int(&out, m.disk_tokens_restored);
+  out.append(",\"pinned\":");
+  append_json_int(&out, m.disk_pinned);
+  out.append(",\"adopted\":");
+  append_json_int(&out, m.disk_adopted);
+  out.append(",\"blocks_shared\":");
+  append_json_int(&out, m.disk_blocks_shared);
+  out.append(",\"evictions\":");
+  append_json_int(&out, m.disk_evictions);
+  out.append(",\"pending\":");
+  append_json_int(&out, m.disk_pending);
+  out.append(",\"worker_pending\":");
+  append_json_int(&out, de.pending);
+  out.append(",\"bytes_written\":");
+  append_json_int(&out, de.bytes_written);
+  out.append(",\"bytes_read\":");
+  append_json_int(&out, de.bytes_read);
+  out.append(",\"failures\":");
+  append_json_int(&out, de.failures);
+  append_ms("spill_ms_avg", avg(de.spill_ms, de.spills));
+  append_ms("restore_ms_avg", avg(de.restore_ms, de.restores));
   out.append("},\"prefill\":{\"requests\":[");
   int64_t total = 0, processed = 0, cached = 0;
   const auto now = std::chrono::steady_clock::now();
@@ -4253,7 +4382,9 @@ bool GenerationService::engine_pass(const PreTickHook& pre_tick) {
   // The fixed journal position: this record and the tick below are one
   // atomic unit — rank 0 never ticks without broadcasting, a peer
   // never ticks without a record (see fabric_serve.hpp). The prefix
-  // cache's digest after the previous tick rides along (M7).
+  // cache's digest after the previous tick rides along (M7) — taken
+  // BEFORE this record's cold tier commits fold into it, since a peer
+  // compares its own before applying the record.
   if (sched_.prefix_slots() > 0) {
     events.has_prefix_digest = true;
     events.prefix_digest = sched_.prefix_digest();
@@ -4264,17 +4395,34 @@ bool GenerationService::engine_pass(const PreTickHook& pre_tick) {
     events.has_op_digest = true;
     events.op_digest = audit_->digest();
   }
+  // The NVMe cold tier's commits (issue #26): the world's verdicts on the
+  // ops every rank reported, applied before the tick — the record carries
+  // them so the peers apply the same list at the same quantum. A world of
+  // one commits its own completions.
+  if (sched_.disk_enabled()) {
+    if (disk_source_) {
+      events.disk_commits = disk_source_();
+    } else {
+      for (const auto& c : sched_.poll_disk_completions())
+        events.disk_commits.push_back({c.op, c.ok});
+    }
+    sched_.apply_disk_commits(events.disk_commits);
+  }
   events.prefill_budget = sched_.next_prefill_budget();
   if (pre_tick) pre_tick(events);
 
   const bool more = sched_.tick(events.prefill_budget);  // may throw on scheduler contract
                                        // violations — the app treats
                                        // that as fatal (operator class)
+  // This rank's cold tier completions since the last pass, to the
+  // collector (rank 0 of a fabric); a world of one polls at the next pass.
+  if (sched_.disk_enabled() && disk_sink_) disk_sink_(sched_.poll_disk_completions());
 
   {
     std::lock_guard<std::mutex> lock(mutex_);
     meters_ = sched_.meters();
     prefix_stats_ = engine_->prefix_engine_stats();
+    disk_stats_ = engine_->disk_engine_stats();
     meters_published_ = std::chrono::steady_clock::now();
     // The pass's decode steps, each at the pass's mean step time.
     const int64_t steps = meters_.decode_steps - observed_decode_steps_;

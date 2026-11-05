@@ -20,8 +20,10 @@
 
 #include <cuda_runtime.h>
 
+#include "engine/cache_planes.hpp"
 #include "engine/paged_blocks.hpp"
 #include "kernels/latent_format.hpp"
+#include "models/dflash2/draft_planes.hpp"
 #include "models/qwen/layers.hpp"
 
 namespace dgpp {
@@ -38,6 +40,13 @@ struct QwenKvPoolShape {
   LatentFormat format = LatentFormat::kBf16;  // the K/V cache's dtype (bf16 | fp8)
   bool fp8_prefill_attention = false;
   bool fp8_decode_attention = false;
+  // The DFlash2 drafter's planes (2026-10-20, the Flash-Next port): plain
+  // bf16 K/V rows over the SAME block table — the draft's KV context rides
+  // the request's blocks, so sharing, copying and release need no protocol
+  // of their own (models/dflash2/draft_planes.hpp). 0 layers: no planes.
+  int draft_layers = 0;
+  int draft_kv_heads = 0;
+  int draft_dim = 0;
 };
 
 class QwenKvPool {
@@ -64,6 +73,9 @@ class QwenKvPool {
 
   // The kernels' view of one layer's caches (the shared table inside).
   QwenQsaCache view(int layer) const;
+  // The drafter's plain bf16 K/V planes over the shared table (models/qwen/
+  // dflash2.hpp): layer `l` of the DRAFT stack, not the target's.
+  QwenFullAttnCache draft_view(int l) const;
   uint16_t* ring(int layer, int req) const;
   size_t ring_bytes_per_request() const;
 
@@ -91,6 +103,11 @@ class QwenKvPool {
   // Every layer's rows of physical block `src` into `dst`, stream-ordered.
   void copy_block_contents(int32_t src, int32_t dst, cudaStream_t stream);
   int32_t block_refcount(int32_t block) const { return table_.block_refcount(block); }
+  // The NVMe cold tier's view (issue #26): the block's identity and every
+  // plane a block spans (each layer's K rows, V rows, fp8 scales and index
+  // keys, then the drafter's planes over the same table).
+  uint64_t block_identity(int32_t block) const { return table_.block_identity(block); }
+  std::vector<CachePlane> planes() const;
 
  private:
   QwenKvPoolShape shape_;
@@ -102,6 +119,7 @@ class QwenKvPool {
   float* v_scale_ = nullptr;
   uint16_t* idx_base_ = nullptr;  // [layers][pool_slots][idx_dim]
   uint16_t* ring_base_ = nullptr; // [layers][max_requests][kpool][idx_dim]
+  DraftKvPlanes draft_;           // the DFlash2 drafter's planes over the shared table
   bool fp8() const { return shape_.format == LatentFormat::kFp8; }
   size_t kv_row_elems() const { return static_cast<size_t>(shape_.kv_heads) * shape_.dim; }
   size_t kv_row_bytes() const { return kv_row_elems() * (fp8() ? 1 : 2); }

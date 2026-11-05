@@ -133,6 +133,7 @@ class ModelFrontend {
     std::vector<ImageInput> images;
   };
   virtual bool supports_images() const { return false; }
+  virtual bool supports_video() const { return false; }
   virtual ChatInput prepare_chat(const minijson::Value& globals) const {
     return {encode_text(render_chat(globals)), {}};
   }
@@ -272,6 +273,10 @@ class GenerationService : public HttpHandler,
     std::vector<dgpp::sched::SchedulerRequest> submits;
     std::vector<std::string> cancels;
     std::vector<std::string> stops;  // the stop-string retires
+    // The NVMe cold tier's commits (issue #26): the ops every rank has
+    // reported, with the world's verdict, applied to the scheduler BEFORE
+    // this tick on every rank (rank 0 collects, the record carries them).
+    std::vector<dgpp::sched::Scheduler::DiskCommit> disk_commits;
     // The prefix cache's decision digest after the previous tick (M7): the
     // record carries it so every peer compares before applying this one.
     bool has_prefix_digest = false;
@@ -294,6 +299,18 @@ class GenerationService : public HttpHandler,
   // sleep when false; the pending-admission queue is drained first, so
   // arrivals always make the next pass productive).
   bool engine_pass(const PreTickHook& pre_tick = nullptr);
+  // The NVMe cold tier's hooks (issue #26), rank 0 of a fabric: `source`
+  // returns the commits ready for this pass (the world's verdicts the
+  // collector has assembled) and `sink` takes this rank's own completions
+  // after the tick (for the collector). Without hooks — a world of one —
+  // a pass commits its own completions directly.
+  using DiskCommitSource = std::function<std::vector<dgpp::sched::Scheduler::DiskCommit>()>;
+  using DiskCompletionSink =
+      std::function<void(const std::vector<dgpp::sched::SchedulerEngine::DiskCompletion>&)>;
+  void set_disk_hooks(DiskCommitSource source, DiskCompletionSink sink) {
+    disk_source_ = std::move(source);
+    disk_sink_ = std::move(sink);
+  }
 
   // Optional audit tap on the engine event stream (tokens + retires,
   // engine thread). The fabric verification hashes the per-rank streams
@@ -712,6 +729,9 @@ class GenerationService : public HttpHandler,
   std::vector<std::shared_ptr<StreamRecord>> records_;
   dgpp::sched::Scheduler::Meters meters_;  // engine-published, mutex-guarded
   dgpp::sched::SchedulerEngine::PrefixEngineStats prefix_stats_;
+  dgpp::sched::SchedulerEngine::DiskEngineStats disk_stats_;
+  DiskCommitSource disk_source_;
+  DiskCompletionSink disk_sink_;
   std::chrono::steady_clock::time_point meters_published_ = std::chrono::steady_clock::now();
   // The step-time histogram's watermark: the decode steps and step wall
   // time already observed (engine pass, under mutex_).

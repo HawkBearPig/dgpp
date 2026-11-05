@@ -278,7 +278,7 @@ FileInputs::~FileInputs() {
 bool FileInputs::needed(const HttpRequest& request) {
   if (request.body.find("file") == std::string::npos && request.body.find('\\') == std::string::npos) return false;
   try {
-    auto parsed = minijson::parse(request.body);
+    auto parsed = minijson::parse_document(request.body);
     const auto* messages = parsed.root.find("messages");
     if (!messages || !messages->is_array()) return false;
     for (const auto& msg : messages->items()) {
@@ -376,7 +376,12 @@ std::string FileInputs::extract(const std::string& data, const std::string& file
 }
 
 HttpRequest FileInputs::prepare(HttpRequest request) {
-  const auto parsed = minijson::parse(request.body);
+  minijson::ParseResult parsed;
+  try {
+    parsed = minijson::parse_document(request.body);
+  } catch (const std::exception& e) {
+    throw FileInputError(std::string("invalid JSON body: ") + e.what(), "body");
+  }
   const auto* messages = parsed.root.find("messages");
   if (!messages || !messages->is_array()) throw FileInputError("messages must be an array", "messages");
   std::vector<V> normalized;

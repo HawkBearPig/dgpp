@@ -24,11 +24,13 @@
 // See DESIGN §11 and docs/operations.md for the journal and resource policy.
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
+#include "sched/disk_cache.hpp"
 #include "sched/prefix_cache.hpp"
 #include "sched/prefill_latency.hpp"
 #include "common/prefill_progress.hpp"
@@ -82,6 +84,7 @@ class SchedulerEngine {
   // generated token. Returns a token id in [0, vocab).
   virtual int32_t prefill(int req, const std::vector<int64_t>& prompt) = 0;
   virtual bool supports_images() const { return false; }
+  virtual bool supports_video() const { return false; }
   // The checkpoint's image delimiters, for the frontend that renders them.
   virtual ImageTokens image_token_ids() const { return {}; }
   virtual bool supports_image_prefix_cache() const { return false; }
@@ -395,6 +398,165 @@ class SchedulerEngine {
     int64_t snapshot_bytes = 0;  // one slot's state bytes
   };
   virtual PrefixEngineStats prefix_engine_stats() const { return {}; }
+
+  // ---- the NVMe cold tier (issue #26) ---------------------------------------
+  // An engine with a slab advertises it; the scheduler then keeps the disk
+  // index (sched/disk_cache.hpp) and drives these ops — the decisions
+  // identically on every rank, the bytes each rank's own. A spill copies
+  // an arena entry (its blob and the cache blocks its metadata pins) to
+  // slab pages; a restore reads records into fresh pool blocks and an
+  // arena slot. Both run asynchronously on the engine's side and report
+  // through disk_poll(); rank 0 journals the outcome once every rank has
+  // reported, and the scheduler commits or aborts on that record.
+  struct DiskInfo {
+    bool enabled = false;
+    int64_t pages = 0;        // slab records this rank holds
+    size_t page_bytes = 0;    // one cache block's planes, rounded to 4 KiB
+    int64_t blob_pages = 0;   // pages one snapshot blob spans
+    int64_t min_tokens = 0;   // entries below this position are not spilled
+    int max_ops = 4;          // spills and restores started but not committed
+    bool persist = false;     // the slab outlives the process (its index is kept beside it)
+    int op_timeout_s = 0;     // an op without progress this long fails (0: never)
+  };
+  virtual DiskInfo disk_info() const { return {}; }
+  // Opens the tier: the slab file (created, sized to the capacity), the
+  // staging buffers and the worker. Before the scheduler is built (it reads
+  // disk_info() then) and before any capture. Throws when the file cannot
+  // be made or the capacity cannot hold one blob and one block.
+  struct DiskEnable {
+    std::string slab_path;        // this rank's slab file
+    size_t capacity_bytes = 0;    // the slab's size (pages x page bytes below it)
+    // One staging buffer (two device + two pinned): two slices of it move
+    // per tick, so 64 MiB is 128 MiB of cache state per tick.
+    size_t chunk_bytes = size_t{64} << 20;
+    int64_t min_tokens = 0;
+    int max_ops = 4;              // ops in flight at most (the scheduler's bound)
+    int rank = 0;
+    // The slab outlives the process: its index and CRC table are kept
+    // beside it under `binding` (the checkpoint, the settings, the slab
+    // geometry), and a start under the same binding offers them back.
+    bool persist = false;
+    std::string binding;
+    // Explicit reuse must refuse an incompatible/missing index or a world
+    // disagreement without clearing the cache the operator selected.
+    bool require_existing = false;
+    // Explicit allowance for tests/experiments: RAM-backed storage and buffered
+    // I/O would otherwise consume memory outside the model's budget.
+    bool allow_buffered = false;
+    std::string required_mount;  // local placement assertion, checked again before slab mutation
+    // An op that makes no progress this long fails — its buffers held by a
+    // stuck read or write come back when the worker does — so the requests
+    // waiting on a restore admit cold instead of never (0: never).
+    int op_timeout_s = 0;
+    // A test hook on every page read (write=false) or write: 0 proceeds,
+    // a positive value sleeps that many milliseconds first, a negative one
+    // fails the I/O.
+    std::function<int(bool write, int64_t page)> io_hook;
+  };
+  virtual void disk_enable(const DiskEnable& enable) {
+    (void)enable;
+    throw std::logic_error("SchedulerEngine: this engine has no cold tier");
+  }
+  // An arena entry's cache blocks by physical identity (the pool's block
+  // id and the generation of its contents), the partial block's identity
+  // (0: none) and the draft block's position.
+  struct DiskBlocks {
+    std::vector<uint64_t> identities;
+    uint64_t partial_identity = 0;
+    int64_t mtp_position = 0;
+  };
+  virtual DiskBlocks disk_entry_blocks(int slot) const {
+    (void)slot;
+    throw std::logic_error("SchedulerEngine: this engine has no cold tier");
+  }
+  // Writes arena slot `slot`: the blob to pages [blob_page, +blob_pages),
+  // full block i to pages[i] (-1: already on disk, skipped) and the partial
+  // block to partial_page (-1: none).
+  struct DiskSpill {
+    uint64_t op = 0;
+    int slot = -1;
+    int64_t blob_page = -1;
+    std::vector<int64_t> pages;
+    int64_t partial_page = -1;
+    // The entry's token ids, to the run of `ids_pages` pages at `ids_page`
+    // (right behind the blob): the slab describes its entries itself.
+    std::vector<int64_t> ids;
+    int64_t ids_page = -1;
+    int ids_pages = 0;
+  };
+  virtual void disk_spill_begin(const DiskSpill& spill) {
+    (void)spill;
+    throw std::logic_error("SchedulerEngine: this engine has no cold tier");
+  }
+  // Reads an entry back into arena slot `slot`: acquires one fresh pool
+  // block per page (the scheduler made them free), adopts the slot's
+  // metadata at `position`, and reads the records asynchronously. Returns
+  // the fresh blocks' identities. The slot reads as filled from here on; a
+  // failed restore is released with prefix_release like any entry.
+  struct DiskRestore {
+    uint64_t op = 0;
+    int slot = -1;
+    int64_t position = 0;
+    int64_t mtp_position = 0;
+    int64_t blob_page = -1;
+    std::vector<int64_t> pages;
+    int64_t partial_page = -1;
+  };
+  virtual DiskBlocks disk_restore_begin(const DiskRestore& restore) {
+    (void)restore;
+    throw std::logic_error("SchedulerEngine: this engine has no cold tier");
+  }
+  // The tier's per-tick pump: issues the next bounded slice of an op's
+  // device work on the model stream (the engine thread's alone — nothing
+  // runs on a second stream beside the fabric's collectives) and hands
+  // finished slices to the file worker. Called at every tick's top.
+  virtual void disk_pump() {}
+  // The ops completed on this rank since the last poll, in completion order.
+  struct DiskCompletion {
+    uint64_t op = 0;
+    bool ok = false;
+  };
+  virtual std::vector<DiskCompletion> disk_poll() { return {}; }
+  struct DiskEngineStats {
+    int64_t spills = 0, restores = 0, failures = 0;
+    int64_t bytes_written = 0, bytes_read = 0;
+    double spill_ms = 0, restore_ms = 0;
+    int64_t pending = 0;  // ops queued or running on the tier's worker
+  };
+  virtual DiskEngineStats disk_engine_stats() const { return {}; }
+  // ---- across restarts (nvme_cache.persist) ------------------------------
+  // The previous run's index the world adopted (empty: none), read at the
+  // scheduler's construction; each adopted entry's token ids come back
+  // through disk_read_pages (count pages from page into dst, CRC-checked).
+  virtual std::vector<uint8_t> disk_adopted_index() const { return {}; }
+  virtual bool disk_read_pages(int64_t page, int64_t count, void* dst) {
+    (void)page;
+    (void)count;
+    (void)dst;
+    return false;
+  }
+  // The committed index after every change, for the tier to keep beside
+  // the slab.
+  // ... with the entries' content digests in the index's order (this
+  // rank's: the digest of its pages' checksums at commit).
+  virtual void disk_persist_index(const std::vector<uint8_t>& bytes, const std::vector<uint64_t>& digests) {
+    (void)bytes;
+    (void)digests;
+  }
+  // This rank's digest of the pages' checksums as they stand (the index
+  // binds an entry to its content with it; 0: no tier).
+  virtual uint64_t disk_pages_digest(const std::vector<int64_t>& pages, uint64_t position) const {
+    (void)pages;
+    (void)position;
+    return 0;
+  }
+  // The adopted index's content digests, in its order.
+  virtual std::vector<uint64_t> disk_adopted_digests() const { return {}; }
+  // The warm handshake: this rank's candidate index digest ("0": none),
+  // and the world's verdict — keep the candidate for adoption or start
+  // the slab fresh.
+  virtual std::string disk_candidate_digest() const { return "0"; }
+  virtual void disk_adopt(bool keep) { (void)keep; }
 };
 
 // One request, in arrival (manifest) order. `prompt` ids are validated by
@@ -436,6 +598,11 @@ struct SchedulerRequest {
   // the request out: no attach, no snapshot. Both ride the journal.
   std::vector<int64_t> boundaries;
   bool no_cache = false;
+  // prompt_cache_key: pins the prefix-cache entries this request creates
+  // or attaches to — memory and the NVMe tier evict unpinned entries
+  // first. A priority, never a lookup key (matching stays by exact token
+  // prefix). Rides the journal with the request.
+  std::string cache_key;
   // The logit bias: the request's entries, applied by the
   // engine on every rank; rides the journal.
   std::vector<LogitBias> logit_bias;
@@ -488,6 +655,10 @@ struct AdmissionPolicy {
   // prompt, or the turn after a client compacted its history, attaches.
   int prefix_min_tokens = 0;
   bool prefix_head_snapshots = false;
+  // prompt_cache_key pins protect their entries while the pinned entries
+  // hold at most this share of the arena's slots and of the NVMe slab's
+  // pages; past it a pin protects nothing. 100: always.
+  int prefix_pin_max_pct = 50;
   // Resolved admission policy. Serving resolves automatic admission from the
   // engine's execution capabilities; old journal records retain false.
   // Engines without a shared walk can pay for additional decode passes.
@@ -499,7 +670,8 @@ struct AdmissionPolicy {
            prefill_latency == o.prefill_latency &&
            prefill_budget_automatic == o.prefill_budget_automatic &&
            prefill_early_admission == o.prefill_early_admission &&
-           prefix_min_tokens == o.prefix_min_tokens && prefix_head_snapshots == o.prefix_head_snapshots;
+           prefix_min_tokens == o.prefix_min_tokens && prefix_head_snapshots == o.prefix_head_snapshots &&
+           prefix_pin_max_pct == o.prefix_pin_max_pct;
   }
   bool operator!=(const AdmissionPolicy& o) const { return !(*this == o); }
   static const char* name(Mode m) {
@@ -590,6 +762,30 @@ class Scheduler {
     int64_t prefix_skipped_image_bytes = 0;
     int64_t prefix_image_bytes = 0;
     int64_t prefix_blocks_pinned = 0;
+    int prefix_pinned = 0;       // entries a prompt_cache_key pins
+    // The NVMe cold tier (issue #26): the slab's pages, the entries and
+    // block records it holds, spills and restores begun / committed /
+    // failed, spills skipped for room, disk evictions, the ops in flight
+    // and the prompt tokens restores brought back.
+    bool disk_enabled = false;
+    int64_t disk_pages_total = 0;
+    int64_t disk_pages_used = 0;
+    int64_t disk_page_bytes = 0;
+    int disk_entries = 0;
+    int64_t disk_blocks = 0;
+    int64_t disk_spills = 0;
+    int64_t disk_spilled = 0;
+    int64_t disk_spill_failed = 0;
+    int64_t disk_spill_skipped = 0;
+    int64_t disk_restores = 0;
+    int64_t disk_restored = 0;
+    int64_t disk_restore_failed = 0;
+    int64_t disk_evictions = 0;
+    int64_t disk_blocks_shared = 0;
+    int64_t disk_pending = 0;
+    int64_t disk_tokens_restored = 0;
+    int disk_pinned = 0;         // disk entries a prompt_cache_key pins
+    int64_t disk_adopted = 0;    // entries taken over from the previous run's index
   };
 
   // `eos_token_ids` — the config's end-of-sequence set (empty disables
@@ -620,6 +816,25 @@ class Scheduler {
   int prefix_slots() const { return cache_.slots(); }
   uint64_t prefix_digest() const { return cache_.digest(); }
   const PrefixCache& prefix_cache() const { return cache_; }
+
+  // The NVMe cold tier (issue #26). Spills and restores start as decisions
+  // of the tick (every rank the same); their outcomes are journaled
+  // inputs: rank 0 collects every rank's completion of an op and journals
+  // one commit, and apply_disk_commits() is called with the record's
+  // commits BEFORE the tick that follows them — on every rank in the same
+  // order. poll_disk_completions() returns this rank's own completions
+  // since the last poll (the peers send them to rank 0 on the journal's
+  // return path; rank 0 folds its own in). Every decision folds into the
+  // prefix digest, so the journal's cross-rank check covers the tier.
+  struct DiskCommit {
+    uint64_t op = 0;
+    bool ok = false;
+  };
+  void apply_disk_commits(const std::vector<DiskCommit>& commits);
+  std::vector<SchedulerEngine::DiskCompletion> poll_disk_completions();
+  bool disk_enabled() const { return disk_.enabled(); }
+  int64_t disk_ops_pending() const { return static_cast<int64_t>(disk_ops_.size()); }
+  const DiskCache& disk_cache() const { return disk_; }
 
   // Arrival order = FCFS priority. Throws on an empty/duplicate id, a
   // nonpositive max_steps, or a cancel_after outside [1, max_steps] —
@@ -725,6 +940,11 @@ class Scheduler {
     int64_t rolling_position = -1;
     int64_t hop_armed = -1;    // the aligned position armed for the next step
     bool cache_off = false;    // the pool cannot hold the cache's blocks for it
+    uint64_t restore_op = 0;   // the cold tier restore this queued request waits on (0: none)
+    // Its restore could not start this tick because an op in flight holds
+    // what it needs (a slot busy spilling, another entry's restore): it
+    // waits a tick rather than prefilling cold; re-decided at every tick's top.
+    bool restore_blocked = false;
     PrefixCache::Images cache_images;
     // The retire line's numbers: the admission clock, the
     // prefill's wall and the prompt tokens an attach skipped, and the
@@ -752,6 +972,7 @@ class Scheduler {
     int64_t snap_position = 0;
     int64_t body_snap_position = 0;
     int64_t head_snap_position = 0;
+    int disk_entry = -1;  // a cold tier entry deeper than the memory attach (issue #26)
   };
   bool cache_on(const Request& r) const {
     return cache_.enabled() && !r.spec.no_cache && !r.cache_off &&
@@ -761,9 +982,10 @@ class Scheduler {
   // The structural boundaries the engine's cold prefill cuts at (2026-09-28):
   // only where this deployment can take a snapshot — the cache on and the
   // boundary's aligned image at or past the entry floor — so a cache hit
-  // and a miss are the same walk. A cut a snapshot never stands on served
-  // nothing and made a prompt's cold walk differ from its rows in a group
-  // walk (the DSA sites are not split-invariant).
+  // and a miss are the same walk, and so is a request that opts out. A cut
+  // a snapshot never stands on served nothing and made a prompt's cold walk
+  // differ from its rows in a group walk (the DSA sites are not
+  // split-invariant).
   std::vector<int64_t> cut_boundaries(const Request& r) const;
   void finish_prefill_snapshot(Request& r, int slot, int64_t position, bool taken,
                                bool head = false);
@@ -794,6 +1016,30 @@ class Scheduler {
   // A miss explained at INFO: the cuts probed, the entries held, and where
   // the prompt parts from the entry it shares the most with.
   void log_prefix_miss(const Request& r) const;
+  // The NVMe cold tier (issue #26). A memory entry worth keeping cold
+  // spills as soon as it is inserted (up to the op bound; the tick's top
+  // starts what the bound deferred), so it is busy — never evicted — from
+  // birth to commit;
+  // a restore starts when a queued request's deepest usable state is on
+  // disk. Every start is a decision (the digest folds it); the commits
+  // arrive through apply_disk_commits.
+  void want_spill(int entry, const std::string& id);
+  void start_spills();
+  bool start_spill(int entry, const std::string& id);
+  // At the tick's top, after the spills: every queued request whose deepest
+  // usable state is on disk starts its restore (or waits on the one in
+  // flight for that entry) before any admission path reads the queue —
+  // the chunked begin admits long prompts without next_admissible.
+  void start_restores();
+  bool start_restore(int disk_entry, Request& r);
+  // Evicts one memory entry (LRU, unattached, not busy) and tells the
+  // cold tier when it held the entry's state too. The victim's slot, or -1.
+  int evict_memory_entry();
+  // The committed disk index to the tier's keeping (nvme_cache.persist),
+  // after every change to it.
+  void persist_disk_index();
+  // A memory entry's cold copy went (a disk eviction): drops its link.
+  void drop_disk_link(int memory_entry, int disk_entry);
 
   bool is_eos(int32_t token) const;
   // The reservation an admission pins: the lifetime under full-reserve,
@@ -807,6 +1053,14 @@ class Scheduler {
   void grow_reservations();
   int youngest_active_after(int arrival) const;
   int free_slot() const;
+  // The LRU unattached cache entries give way to a request that needs their
+  // blocks — never a block a live request holds (an in-flight prefill keeps
+  // its own refcount on every reserved block, and a victim only drops the
+  // cache's extra ref). The planned attach is touched first so it is
+  // evicted last; the plan is recomputed after every eviction, because the
+  // victim may have been that entry. True when the request's new blocks
+  // fit; false when nothing evictable remains and they do not.
+  bool evict_to_fit(const Request& r, int64_t& free_blocks);
   // The oldest queued request whose reservation fits a free slot (no
   // head-of-line blocking), or -1. With the prefix cache on it may EVICT
   // unattached entries (LRU) to make the blocks a request needs.
@@ -910,6 +1164,32 @@ class Scheduler {
   SchedulerEngine::PrefixInfo prefix_info_;
   uint64_t ticks_ = 0;             // the LRU clock
   uint64_t execution_epoch_ = 0;   // replicated ordering of prefill/decode starts
+  // The NVMe cold tier (issue #26): the disk index, the engine's slab
+  // geometry, the op counter (identical on every rank: every op is a
+  // decision), the ops awaiting a journaled commit and the memory entries
+  // queued for a spill (their index and hash, so a reused index is not
+  // mistaken for the entry that asked).
+  DiskCache disk_;
+  SchedulerEngine::DiskInfo disk_info_;
+  uint64_t next_disk_op_ = 1;
+  struct DiskOp {
+    uint64_t op = 0;
+    bool restore = false;
+    int disk_entry = -1;
+    int memory_entry = -1;   // spill: the memory entry copied
+    int slot = -1;           // the arena slot involved
+    int64_t position = 0;
+    std::string id;          // the request the decision was made for (the log)
+    SchedulerEngine::DiskBlocks restored;  // restore: the fresh blocks' identities
+  };
+  std::vector<DiskOp> disk_ops_;
+  struct DiskWant {
+    int entry = -1;
+    uint64_t hash = 0;
+    std::string id;
+  };
+  std::vector<DiskWant> disk_wanted_;
+  bool restore_in_flight() const;
 };
 
 // Streaming lifecycle events for the service (SSE). Fired inline on the
@@ -961,8 +1241,12 @@ class SchedulerObserver {
   // (a snapshot captured inside an MTP step), "hop_fallback" (capture was
   // skipped before sampled fallback passed the hop; `position` is the old
   // snapshot or -1), or "hop_mismatch" (inconsistent snapshot dropped;
-  // `position` is what the arena reported). Rank-identical state: the op
-  // stream records every one.
+  // `position` is what the arena reported). The NVMe cold tier (issue #26)
+  // adds "spill" (a copy to disk begun from arena `slot`), "spilled" /
+  // "spill_fail" (its journaled outcome), "restore" (a read back into arena
+  // `slot` begun), "restored" / "restore_fail" (its outcome) and
+  // "disk_evict" (a disk entry freed for room; slot -1). Rank-identical
+  // state: the op stream records every one.
   virtual void on_prefix(const std::string& id, const char* op,
                          int64_t position, int slot) {
     (void)id;

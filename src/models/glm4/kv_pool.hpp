@@ -12,6 +12,7 @@
 
 #include <cuda_runtime.h>
 
+#include "engine/cache_planes.hpp"
 #include "engine/paged_blocks.hpp"
 
 namespace dgpp {
@@ -74,6 +75,10 @@ class Glm4KvPool {
   // Every layer's rows of physical block `src` into `dst`, stream-ordered.
   void copy_block_contents(int32_t src, int32_t dst, cudaStream_t stream);
   int32_t block_refcount(int32_t block) const { return table_.block_refcount(block); }
+  // The NVMe cold tier's view (issue #26): the block's identity and every
+  // plane a block spans (each layer's K rows and V rows).
+  uint64_t block_identity(int32_t block) const { return table_.block_identity(block); }
+  std::vector<CachePlane> planes() const;
 
  private:
   Glm4KvPoolShape shape_;

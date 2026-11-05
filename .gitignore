@@ -38,8 +38,12 @@ venv/
 benchmarks/*
 !benchmarks/micro/
 benchmarks/micro/*
+!benchmarks/micro/minimax_index_bench.cpp
+!benchmarks/micro/minimax_head_bench.cpp
 !benchmarks/micro/qsa_fp8_bench.cu
 !benchmarks/micro/host_penalties_bench.cpp
+!benchmarks/micro/minimax_moe_bench.cpp
+!benchmarks/micro/mxfp8_gemm_bench.cu
 
 # --- Debug residue ---------------------------------------------------------------
 
@@ -57,6 +61,21 @@ glm_tp_fixture_fp4/
 glm_tp_fixture_wide/
 qwen_engine_fixture/
 qwen_engine_prefix_fixture/
+qwen_engine_lookup_fixture/
+qwen_engine_request_bound_fixture/
+qwen_engine_request_bound_depth5_fixture/
+qwen_compact_logits_fixture/
+qwen_tp_fixture/
+qwen_dflash2_target_fixture/
+qwen_dflash2_draft_fixture/
+qwen35_dflash2_target_fixture/
+qwen35_tp_fixture/
+qwen35_tp_mixed_fixture/
+qwen35_moe_tp_fixture/
+qwen35_dflash_target_fixture/
+qwen35_dflash_fixture/
+qwen35_dflash_graph_target_fixture/
+qwen35_dflash_graph_fixture/
 glm_dsa_engine_fixture*/
 glm_dsa_loader_fixture*/
 qwen_loader_fixture/
@@ -96,6 +115,7 @@ mimo_engine_cap_fixture/
 dsv41_model_fixture/
 mimo_decode_fixture/
 mimo_window_fixture/
+dory_forward*_fixture/
 # Serve runtime state (scripts/dgpp_serve.sh STATE_DIR): logs + pid, and the
 # tool-eval-bench .md reports it drops under runs/YYYY/MM/. Never tracked.
 runs/

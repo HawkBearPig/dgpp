@@ -5,7 +5,7 @@
 // and the globals fc, hidden_norm, norm and the candidate_selector
 // (codebooks + hidden projection). No embeddings and no lm head: the
 // draft shares the target's.
-#include "models/qwen/dflash2.hpp"
+#include "models/dflash2/dflash2.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -106,6 +106,25 @@ void upload_bf16(const SafetensorsFile& f, const std::string& name,
 
 }  // namespace
 
+std::string drafter_architecture(const std::string& dir) {
+  const std::string path = dir + "/config.json";
+  std::ifstream in(path, std::ios::binary);
+  if (!in) throw std::invalid_argument("DFlash2: cannot open the drafter config " + path);
+  std::ostringstream ss;
+  ss << in.rdbuf();
+  const std::string text = ss.str();  // values view the input: it must outlive the parse
+  minijson::Value root;
+  try {
+    root = minijson::parse(text).root;
+  } catch (const std::exception&) {
+    throw std::invalid_argument("DFlash2: cannot parse the drafter config " + path);
+  }
+  if (root.find("architectures") && root.at("architectures").is_array() &&
+      !root.at("architectures").items().empty())
+    return std::string(root.at("architectures").items().front().as_string());
+  return "";
+}
+
 DFlash2Config DFlash2Config::from_json_file(const std::string& path) {
   const std::string text = read_file(path);
   minijson::Value root;
@@ -194,7 +213,7 @@ DFlash2Config DFlash2Config::parse(const minijson::Value& root) {
   return c;
 }
 
-void DFlash2Config::validate_against(const Qwen35TextConfig& target) const {
+void DFlash2Config::validate_against(const DFlash2TargetShape& target) const {
   if (hidden_size != target.hidden_size)
     reject("hidden_size", "the draft must share the target's width (fc and the shared head)");
   if (vocab_size != target.vocab_size)
@@ -212,7 +231,7 @@ void DFlash2Config::validate_against(const Qwen35TextConfig& target) const {
   }
   if (sliding_window <= block_size)
     reject("sliding_window", "the window must cover the whole query block");
-  if (max_position_embeddings > target.max_position_embeddings)
+  if (max_position_embeddings > target.context_limit)
     reject("max_position_embeddings", "the draft must not exceed the target's");
 }
 
@@ -355,7 +374,7 @@ DFlash2Weights load_dflash2_weights(const DFlash2Config& cfg, const std::string&
       throw std::runtime_error("DFlash2 candidate_selector codebook shape");
     if (need("candidate_selector.hidden_projection.weight")->shape !=
         std::vector<int64_t>{cfg.selector_rank, H})
-      throw std::runtime_error("DFlash2 candidate_selector.hidden_projection shape");
+      throw std::runtime_error("DFlash2 candidate_selector hidden_projection shape");
   }
 
   // The arena layout: element offsets (uint16_t) with 128-element

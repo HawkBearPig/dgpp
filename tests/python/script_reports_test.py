@@ -12,7 +12,7 @@ import sys
 import tempfile
 import unittest
 from contextlib import redirect_stdout
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -35,6 +35,7 @@ import bench_stream
 import bench_compare
 import serve_load
 import serve_prefill_probe
+import serve_context_matrix
 import fabric_logprob
 
 
@@ -42,6 +43,16 @@ def capture(function, *args):
     with redirect_stdout(io.StringIO()) as output:
         result = function(*args)
     return result, output.getvalue()
+
+
+class MinimalContextTest(unittest.TestCase):
+    def test_bounded_prompt_retains_cold_run_identity(self):
+        tag = 'deployment-with-a-long-label-' * 100
+        prompt = serve_context_matrix.make_prompt(None, 0, tag, 17)
+        self.assertLess(len(prompt), 100)
+        self.assertEqual(prompt, serve_context_matrix.make_prompt(None, 0, tag, 17))
+        self.assertNotEqual(prompt, serve_context_matrix.make_prompt(None, 0, tag + 'next', 17))
+        self.assertNotEqual(prompt, serve_context_matrix.make_prompt(None, 0, tag, 18))
 
 
 def response(request="chatcmpl-a", content="answer", tokens=4):
@@ -136,6 +147,36 @@ class ScriptReportsTest(unittest.TestCase):
             serve_prefill_probe.measured_prefill(before, {**after, "prompt_tokens_computed": 116},
                 {"usage": {"prompt_tokens": 20, "prompt_tokens_details": {"cached_tokens": 4}}})
 
+    def test_prefill_probe_calibrates_large_chat_wrappers(self):
+        for overhead in (230, 30):
+            with self.subTest(overhead=overhead), tempfile.TemporaryDirectory() as directory:
+                data = Path(directory) / "questions.jsonl"
+                output = Path(directory) / "result.json"
+                data.write_text(json.dumps({"question": "sample " * 10000}) + "\n")
+                state = {"active": 0, "queued": 0, "prompts_prefilled": 0,
+                         "prompt_tokens_computed": 0, "prefill_ms": 0}
+
+                def ask(host, port, model, prompt, no_think=False):
+                    # Two body tokens per word, with a separate chat wrapper.
+                    tokens = overhead + 2 * len(prompt.split("\n\n", 1)[1].split())
+                    state["prompts_prefilled"] += 1
+                    state["prompt_tokens_computed"] += tokens
+                    state["prefill_ms"] += 3 * tokens
+                    return {"usage": {"prompt_tokens": tokens,
+                                      "prompt_tokens_details": {"cached_tokens": 0}},
+                            "finish": "length", "text": "", "wall_ms": 3 * tokens, "ttft_ms": None}
+
+                argv = ["serve_prefill_probe.py", "host", "1", "8192", "--repeat", "1",
+                        "--data", str(data), "--model", "fixture", "--json-out", str(output)]
+                with patch.object(sys, "argv", argv), patch.object(serve_prefill_probe, "ask", side_effect=ask), \
+                        patch.object(serve_prefill_probe, "idle_metrics", side_effect=lambda *a, **k: dict(state)):
+                    capture(serve_prefill_probe.main)
+                report = json.loads(output.read_text())
+                self.assertEqual(report["samples"][0]["prompt_tokens"], 8192)
+                self.assertEqual(report["samples"][0]["cached_tokens"], 0)
+                self.assertEqual(report["prompt_overhead_tokens"], overhead)
+                self.assertEqual(report["tokens_per_word"], 2)
+
     def test_prefill_probe_waits_for_retired_metrics_but_rejects_busy_start(self):
         old = {"active": 0, "queued": 0, "prompts_prefilled": 2}
         busy = {"active": 1, "queued": 0, "prompts_prefilled": 2}
@@ -196,6 +237,29 @@ class ScriptReportsTest(unittest.TestCase):
         for prompts in [serve_load.PROMPTS, *serve_load.CLASSES.values()]:
             self.assertEqual(len(prompts), 16)
             self.assertEqual(len(set(prompts)), 16)
+
+    def test_load_reports_actual_thinking_mode_when_switch_is_unsupported(self):
+        first, second = Mock(), Mock()
+        first.getresponse.return_value = Mock(status=400, read=Mock(return_value=b'enable_thinking is unsupported'))
+        second.getresponse.return_value = Mock(status=200)
+        out = {}
+        with patch.object(serve_load.http.client, 'HTTPConnection', side_effect=[first, second]), \
+                patch.object(serve_load, 'read_completion', return_value={'tokens': 1, 'text': 'answer'}):
+            serve_load._stream_one('host', 1, 'model', 'prompt', 1, False, out, 0)
+        self.assertEqual(out['thinking'], 'server_default')
+        self.assertTrue(out['thinking_switch_unsupported'])
+        self.assertNotIn('chat_template_kwargs', json.loads(second.request.call_args.kwargs['body']))
+        first.close.assert_called_once()
+        second.close.assert_called_once()
+
+    def test_load_does_not_retry_an_unrelated_bad_request(self):
+        connection = Mock()
+        connection.getresponse.return_value = Mock(status=400, read=Mock(return_value=b'invalid max_tokens'))
+        with patch.object(serve_load.http.client, 'HTTPConnection', return_value=connection) as factory:
+            with self.assertRaisesRegex(RuntimeError, 'invalid max_tokens'):
+                serve_load._stream_one('host', 1, 'model', 'prompt', 1, False, {}, 0)
+        factory.assert_called_once()
+        connection.close.assert_called_once()
 
     def test_c1_comparison_rejects_regressions_and_unmatched_work(self):
         report = {"schema_version": 1, "model": "fixture", "max_tokens": 320,

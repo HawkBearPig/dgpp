@@ -1,0 +1,30 @@
+{
+  "model": "nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-NVFP4",
+  "world_size": 1,
+  "engine": {
+    "max_concurrency": 8,
+    "kv_capacity": 262144,
+    "dory_loops": 2,
+    "dory_kv_cache": "per_loop",
+    "default_max_tokens": 32768,
+    "queue_limit": 8,
+    "max_connections": 64,
+    "decode_graph": true,
+    "mtp": false,
+    "prefix_cache_gib": 4,
+    "admission": "grow",
+    "admission_window": 256,
+    "prefill_budget_tokens": 2048,
+    "decode_gap_target_ms": 3000,
+    "model_alias": "Dory1.0-4B-NVFP4",
+    "sampling_candidates": 128,
+    "stats_interval_s": 10
+  },
+  "paths": {
+    "resident_cache": ""
+  },
+  "http": {
+    "bind_host": "0.0.0.0",
+    "port": 8000
+  }
+}

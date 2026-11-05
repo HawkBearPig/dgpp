@@ -97,7 +97,7 @@ inline constexpr uint32_t kLetterRanges[][2] = {
     {0x2f800, 0x2fa1d}, {0x30000, 0x3134a}, {0x31350, 0x323af}
 };
 
-// General_Category Ll — the Flint pattern's lowercase class — 658 ranges
+// General_Category Ll — the case classes' lower range (the Flint pattern's, the Nemotron/Dory scanner's L2) — 658 ranges
 inline constexpr uint32_t kLowerRanges[][2] = {
     {0x61, 0x7a}, {0xb5, 0xb5}, {0xdf, 0xf6}, {0xf8, 0xff}, {0x101, 0x101}, {0x103, 0x103}, {0x105, 0x105}, {0x107, 0x107},
     {0x109, 0x109}, {0x10b, 0x10b}, {0x10d, 0x10d}, {0x10f, 0x10f}, {0x111, 0x111}, {0x113, 0x113}, {0x115, 0x115}, {0x117, 0x117},
@@ -184,7 +184,7 @@ inline constexpr uint32_t kLowerRanges[][2] = {
     {0x1df25, 0x1df2a}, {0x1e922, 0x1e943}
 };
 
-// General_Category Lu, Lt — the Flint pattern's uppercase class — 649 ranges
+// General_Category Lu, Lt — the case classes' upper range (the Flint pattern's, the Nemotron/Dory scanner's U) — 649 ranges
 inline constexpr uint32_t kUpperRanges[][2] = {
     {0x41, 0x5a}, {0xc0, 0xd6}, {0xd8, 0xde}, {0x100, 0x100}, {0x102, 0x102}, {0x104, 0x104}, {0x106, 0x106}, {0x108, 0x108},
     {0x10a, 0x10a}, {0x10c, 0x10c}, {0x10e, 0x10e}, {0x110, 0x110}, {0x112, 0x112}, {0x114, 0x114}, {0x116, 0x116}, {0x118, 0x118},
@@ -1046,6 +1046,9 @@ inline bool is_lower(uint32_t cp) {
   return in_ranges(kLowerRanges, std::size(kLowerRanges), cp);
 }
 inline bool is_upper_or_title(uint32_t cp) {
+  return in_ranges(kUpperRanges, std::size(kUpperRanges), cp);
+}
+inline bool is_upper(uint32_t cp) {
   return in_ranges(kUpperRanges, std::size(kUpperRanges), cp);
 }
 inline bool is_punctuation(uint32_t cp) {

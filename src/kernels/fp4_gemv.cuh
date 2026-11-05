@@ -735,11 +735,12 @@ __host__ inline void dispatch_k(int k, F&& f) {
     case 4096: f(std::integral_constant<int, 4096>{}); return;
     case 5120: f(std::integral_constant<int, 5120>{}); return;
     case 6144: f(std::integral_constant<int, 6144>{}); return;
+    case 7168: f(std::integral_constant<int, 7168>{}); return;
     case 12288: f(std::integral_constant<int, 12288>{}); return;
     default:
       throw std::invalid_argument(
           "fp4_gemv: K is not in the compiled set (32..4096 powers of two, "
-          "160, 320, 384, 640, 768, 1536, 2560, 3072, 5120, 6144, 12288)");
+          "160, 320, 384, 640, 768, 1536, 2560, 3072, 5120, 6144, 7168, 12288)");
   }
 }
 // The MXFP4 compiled set (2026-09-13): DeepSeek-V4.1-Flash's widths —
@@ -776,9 +777,10 @@ __host__ __device__ constexpr bool k_compiled_mx(int k) {
 }
 // True when dispatch_k compiles a kernel for k.
 __host__ __device__ constexpr bool k_compiled(int k) {
+  // 7168: the Dory1.0-4B MLP down projection (2026-10-18, docs/dory_plan.md).
   return k == 32 || k == 64 || k == 128 || k == 160 || k == 256 || k == 320 || k == 384 ||
          k == 512 || k == 640 || k == 768 || k == 1024 || k == 1536 || k == 2048 || k == 2560 ||
-         k == 3072 || k == 4096 || k == 5120 || k == 6144 || k == 12288;
+         k == 3072 || k == 4096 || k == 5120 || k == 6144 || k == 7168 || k == 12288;
 }
 // The compiled check for either group.
 __host__ __device__ constexpr bool k_compiled_for(int k, int group) {

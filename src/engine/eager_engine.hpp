@@ -27,6 +27,7 @@
 #include "common/log.hpp"
 #include "engine/decode_outputs.hpp"
 #include "engine/image_prefill.hpp"
+#include "engine/nvme_tier.hpp"
 #include "engine/prefix_arena.hpp"
 #include "engine/prefill_task.hpp"
 #include "engine/mixed_prefill.hpp"
@@ -135,6 +136,10 @@ class EagerEngineAdapter : public sched::SchedulerEngine {
 
   int32_t prefill(int req, const std::vector<int64_t>& prompt) override {
     return open_slot(req, prompt, [&] { return model_->session_prefill(req, prompt); });
+  }
+  bool supports_video() const override {
+    if constexpr (requires { model_->supports_video(); }) return model_->supports_video();
+    return false;
   }
   bool supports_images() const override {
     if constexpr (requires { model_->supports_images(); }) return model_->supports_images();
@@ -417,6 +422,56 @@ class EagerEngineAdapter : public sched::SchedulerEngine {
     st.snapshot_bytes = static_cast<int64_t>(arena_.bytes());
     return st;
   }
+
+  // ---- the NVMe cold tier (issue #26) --------------------------------------
+  void disk_enable(const sched::SchedulerEngine::DiskEnable& enable) override {
+    if (tier_) throw std::logic_error("generation engine: the cold tier is already open");
+    if (arena_.slots() <= 0) throw std::invalid_argument("generation engine: the cold tier needs a prefix arena");
+    tier_ = std::make_unique<NvmeTier<Model>>(model_, &arena_, enable);
+  }
+  sched::SchedulerEngine::DiskInfo disk_info() const override {
+    return tier_ ? tier_->info() : sched::SchedulerEngine::DiskInfo{};
+  }
+  sched::SchedulerEngine::DiskBlocks disk_entry_blocks(int slot) const override {
+    if (!tier_) throw std::logic_error("generation engine: no cold tier");
+    return tier_->entry_blocks(slot);
+  }
+  void disk_spill_begin(const sched::SchedulerEngine::DiskSpill& spill) override {
+    if (!tier_) throw std::logic_error("generation engine: no cold tier");
+    tier_->spill_begin(spill);
+  }
+  sched::SchedulerEngine::DiskBlocks disk_restore_begin(const sched::SchedulerEngine::DiskRestore& restore) override {
+    if (!tier_) throw std::logic_error("generation engine: no cold tier");
+    return tier_->restore_begin(restore);
+  }
+  void disk_pump() override {
+    if (tier_) tier_->pump();
+  }
+  std::vector<sched::SchedulerEngine::DiskCompletion> disk_poll() override {
+    return tier_ ? tier_->poll() : std::vector<sched::SchedulerEngine::DiskCompletion>{};
+  }
+  sched::SchedulerEngine::DiskEngineStats disk_engine_stats() const override {
+    return tier_ ? tier_->stats() : sched::SchedulerEngine::DiskEngineStats{};
+  }
+  std::vector<uint8_t> disk_adopted_index() const override {
+    return tier_ ? tier_->candidate_index() : std::vector<uint8_t>{};
+  }
+  bool disk_read_pages(int64_t page, int64_t count, void* dst) override {
+    return tier_ && tier_->read_pages(page, count, dst);
+  }
+  void disk_persist_index(const std::vector<uint8_t>& bytes, const std::vector<uint64_t>& digests) override {
+    if (tier_) tier_->persist_index(bytes, digests);
+  }
+  uint64_t disk_pages_digest(const std::vector<int64_t>& pages, uint64_t position) const override {
+    return tier_ ? tier_->pages_digest(pages, position) : 0;
+  }
+  std::vector<uint64_t> disk_adopted_digests() const override {
+    return tier_ ? tier_->adopted_digests() : std::vector<uint64_t>{};
+  }
+  std::string disk_candidate_digest() const override { return tier_ ? tier_->candidate_digest() : "0"; }
+  void disk_adopt(bool keep) override {
+    if (tier_) tier_->adopt(keep);
+  }
   void reserve(int req, int64_t tokens) override {
     model_->session_reserve_blocks(req, tokens);
   }
@@ -497,9 +552,20 @@ class EagerEngineAdapter : public sched::SchedulerEngine {
       // scalar kernel sequence. Drafts, judge, rollback and redrafts are
       // unchanged around it; a capture breakage falls back to the eager
       // batch inside the model call.
-      const bool want_graph = model_->dflash_verify_graph() && model_->dflash_graph_verify_available();
-      auto outs = want_graph ? model_->session_verify_batch_graph(reqs, feds, &offs)
-                             : model_->session_verify_batch(reqs, feds, &offs);
+      auto outs = [&] {
+        // Families without the captured static verify (no re-hosted block
+        // graph) take the eager batch; the graph call only instantiates
+        // where the model has session_verify_batch_graph (QwenModel has no
+        // such member, so its block drafts stay on the eager batch).
+        if constexpr (requires { model_->session_verify_batch_graph(reqs, feds, &offs); }) {
+          const bool want_graph =
+              model_->dflash_verify_graph() && model_->dflash_graph_verify_available();
+          return want_graph ? model_->session_verify_batch_graph(reqs, feds, &offs)
+                            : model_->session_verify_batch(reqs, feds, &offs);
+        } else {
+          return model_->session_verify_batch(reqs, feds, &offs);
+        }
+      }();
       const long long ph2 = ph ? ns_now() : 0;
       long long ph3 = 0;
       auto out = finish_verifications(reqs, feds, outs, offs, is_spec, [&] { ph3 = ph ? ns_now() : 0; });
@@ -724,6 +790,7 @@ class EagerEngineAdapter : public sched::SchedulerEngine {
   std::vector<int64_t> pending_;
   std::vector<SlotState> state_;
   PrefixArena<Model> arena_;  // the prefix cache's snapshot slots (M7)
+  std::unique_ptr<NvmeTier<Model>> tier_;  // the NVMe cold tier (issue #26); after the arena
   // DFlash2 drafter drivers, one per slot (only used when the model has a
   // drafter; eager greedy semantics, exact under greedy verify).
   std::vector<std::unique_ptr<DFlash2Speculator<Model>>> spec_;

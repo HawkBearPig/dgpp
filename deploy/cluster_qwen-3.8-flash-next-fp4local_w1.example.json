@@ -36,6 +36,11 @@
     "prefill_attention": "fp8",
     "prefill_dense": "auto"
   },
+  "nvme_cache": {
+    "enabled": false,
+    "path": "~/dgpp/nvme-cache",
+    "capacity_gib": 64
+  },
   "paths": {
     "resident_cache": ""
   },

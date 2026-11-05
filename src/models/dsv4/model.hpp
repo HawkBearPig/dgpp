@@ -111,6 +111,9 @@ class Dsv4Model : public SessionModel<Dsv4Model> {
   using Base::session_snapshot_bytes;
   static Dsv4AttnConfig attn_config(const Dsv4Config& cfg, int tp_world);
   static Dsv4PoolShape pool_shape(const Dsv4Config& cfg, int max_requests, int64_t cache_tokens);
+  // One cache block's bytes across every pool plane (the NVMe cold tier's
+  // record, issue #26) for a shape that is not built yet.
+  static size_t kv_block_bytes_static(const Dsv4Config& cfg);
 
   const Dsv4Config& config() const { return cfg_; }
   const Dsv4StatePool& state_pool() const { return pool_; }

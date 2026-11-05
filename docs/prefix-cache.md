@@ -4,8 +4,25 @@
 `engine.kv_capacity` sizes the separate KV token pool. Increasing the snapshot
 budget helps only when snapshot slots are the limiting resource. Cached
 documents and live requests still need room in the KV pool.
-Evicted entries are not spilled to disk; NVMe-backed retention is tracked
-separately in [enhancement #26](https://github.com/HawkBearPig/dgpp/issues/26).
+Entries evicted from memory are lost unless the
+[NVMe cold tier](nvme-cache.md) is enabled.
+
+## Interrupted answers
+
+Cancellation keeps an existing rolling snapshot only through the committed
+token prefix. It takes no fresh snapshot, and keeps the retained entry in
+memory without starting an NVMe spill, so live requests can reclaim its
+blocks immediately. Earlier prompt snapshots keep their ordinary disk policy.
+
+The next turn must match both the token prefix and a valid cold-prefill cut.
+Keep the delivered content and reasoning in the history; changed templates,
+trimmed whitespace, retokenization or undelivered tokens can shorten the match.
+Retention alone does not guarantee a deeper hit. With one-token snapshot
+alignment, for example, a saved position just before the final delivered
+token is not the next prompt's boundary after that token. A step-limited
+normal answer can have the same limitation. Earlier prompt entries can still
+serve the follow-up. The cache does not add cuts or relax matching to force
+an interrupted answer to attach.
 
 ## Changed questions after a long document
 
@@ -184,3 +201,16 @@ Resolve the site configuration before running a recipe's plan:
 python3 scripts/dgpp-cluster resolve --config deploy/cluster_qwen-3.8-flash-next_nvfp4_w2_yarn512k.example.json > /tmp/qwen-resolved.json
 build-release/dgpp-serve --config /tmp/qwen-resolved.json --rank 0 --memory-plan
 ```
+
+## The NVMe cold tier
+
+With `nvme_cache` enabled, the entries the arena evicts are kept on each
+node's local NVMe and restored for a later matching request, so the arena's
+slot count bounds what is hot, not what is remembered. A restored prefix
+still needs room in the KV pool. [The cold tier](nvme-cache.md) describes
+what is kept, how entries move, persistence across restarts, pins and the
+bounds, and the [configuration reference](configuration.md#nvme-cache)
+lists the keys. Automatic bindings change with the server build and settings.
+Use `nvme_cache.reuse_binding` to select an existing compatible cache across
+upgrades; [reuse across upgrades](nvme-cache.md#across-restarts) explains how
+to find its binding and which checks still apply.

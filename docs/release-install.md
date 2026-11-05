@@ -19,11 +19,13 @@ imply internet access. Peers receive checkpoints from rank 0 over SSH.
    sudo apt-get update
    sudo apt-get install python3 python3-venv rdma-core libibverbs1 \
      ibverbs-providers libnl-3-200 libnl-route-3-200 libstdc++6 \
-     openssh-client openssh-server rsync curl jq zstd iproute2
+     openssh-client openssh-server rsync curl jq zstd iproute2 \
+     libavformat60 libavcodec60 libswscale7
    ```
 
-The package bundles cudart and cuBLASLt; no compiler or CUDA toolkit is needed
-to run it. Install `poppler-utils` on rank 0 to enable PDF file inputs. PCRE2
+The package bundles cudart, cuBLAS and cuBLASLt; no compiler or CUDA toolkit is needed
+to run it. FFmpeg runtime libraries are required for the default video-enabled
+build. Install `poppler-utils` on rank 0 to enable PDF file inputs. PCRE2
 is built statically when system development files are absent; a build using
 system shared PCRE2 also requires that runtime library on every node. The
 PCRE2 license is included under `docs/licenses/`.
@@ -152,3 +154,21 @@ original launcher; unrecorded processes are not adopted or killed.
 
 Source-only benchmarks and reference generators are not included. Resident
 weight caches are built locally at first load; allow additional NVMe space.
+
+## Retain an NVMe prefix cache across upgrades
+
+If the deployment uses persistent `nvme_cache`, automatic cache selection
+changes with the server build. Before upgrading, record the existing
+16-character binding from the startup log or its directory under
+`nvme_cache.path`. Add `"reuse_binding": "<existing binding>"` inside the
+deployment's `nvme_cache` block and keep its capacity unchanged. Leave this
+setting in place on subsequent upgrades to continue using that cache.
+
+This explicitly asserts that the model artifacts and cached-state
+interpretation remain compatible. File formats, geometry, page checksums
+and agreement across ranks are still checked; rejected reuse leaves the
+selected cache intact. The package includes the full guide at
+`docs/nvme-cache.md` and the configuration reference at `docs/configuration.md`.
+The [online example](https://github.com/HawkBearPig/dgpp/blob/master/docs/nvme-cache.md#across-restarts)
+and [upgrade/rollback operations](https://github.com/HawkBearPig/dgpp/blob/master/docs/operations.md#install-upgrade-roll-back)
+also cover this procedure.

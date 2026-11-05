@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise GLM or Qwen image input through the live OpenAI-compatible API.
+"""Exercise image input through the live OpenAI-compatible API.
 
 Uses generated PNG fixtures and the Python standard library. The model must
 identify colors from pixels, with identical text across differently colored
