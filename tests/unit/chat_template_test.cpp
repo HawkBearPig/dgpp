@@ -63,6 +63,13 @@ DGPP_TEST(chat_template_replace_empty_pattern) {
           c.expected);
 }
 
+DGPP_TEST(chat_template_boolean_test_distinguishes_numbers_and_strings) {
+  equal(render("{% for x in [true, false, 0, 1, 'true', none, [], obj] %}"
+               "{{ x is boolean }}:{{ x is not boolean }};{% endfor %}",
+               {{"obj", Value::map_value({})}}),
+        "True:False;True:False;False:True;False:True;False:True;False:True;False:True;False:True;");
+}
+
 DGPP_TEST(chat_template_replace_nonempty_pattern) {
   equal(render("{{ 'aaaa'|replace('aa', 'b') }}"), "bb");
   equal(render("{{ 'abc'|replace('b', '') }}"), "ac");

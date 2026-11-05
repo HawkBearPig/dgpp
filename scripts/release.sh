@@ -10,14 +10,16 @@
 #
 # Layout inside the tarball (dgpp-<version>/):
 #   bin/dgpp-serve                 the server, rpath $ORIGIN/../lib
-#   lib/libcudart.so.13, lib/libcublasLt.so.13   the CUDA runtime it was built against
+#   lib/libcudart.so.13, lib/libcublas.so.13, lib/libcublasLt.so.13
+#                                 the CUDA runtime it was built against
 #   scripts/dgpp-cluster, scripts/site_env.py, scripts/serve_api_check.py
 #   .env.example                   shared site settings (never credentials)
 #   deploy/*.example.json          all model deployment templates
 #   README.md, docs/               packaged setup and network/dependency guides
 #   MANIFEST                       version, git sha, CUDA, host, date
 #   MANIFEST.sha256                sha256 of every other file (sha256sum -c)
-# A node needs only the driver, rdma-core, libnl and libstdc++ beyond this.
+# A node also needs the driver, rdma-core, libnl, libstdc++ and the FFmpeg
+# runtime libraries when video support is enabled.
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 . "$ROOT/scripts/cluster_env.sh" || exit 1
@@ -70,10 +72,10 @@ cmake --install "$BUILD" --prefix "$STAGE" >/dev/null
 (cd "$STAGE" && sha256sum -c --quiet MANIFEST.sha256)
 REPORTED=$("$STAGE/bin/dgpp-serve" --version)
 case "$REPORTED" in *"$VERSION"*) ;; *) echo "version mismatch: binary says '$REPORTED', stamp is $VERSION"; exit 1 ;; esac
-for lib in libcudart.so libcublasLt.so; do
+for lib in libcudart.so libcublas.so libcublasLt.so; do
   RESOLVED=$(ldd "$STAGE/bin/dgpp-serve" | awk -v l="$lib" '$1 ~ l {print $3}' | head -1)
   if [ -z "$RESOLVED" ] || [ "$(readlink -f "$RESOLVED")" != "$(readlink -f "$STAGE"/lib/$lib.*)" ]; then
-    echo "the staged binary does not resolve $lib from its lib/ (got '$RESOLVED'):"; ldd "$STAGE/bin/dgpp-serve" | grep -E "cudart|cublasLt"; exit 1
+    echo "the staged binary does not resolve $lib from its lib/ (got '$RESOLVED'):"; ldd "$STAGE/bin/dgpp-serve" | grep -E "cudart|cublas"; exit 1
   fi
 done
 mkdir -p "$DIST"

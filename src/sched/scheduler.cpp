@@ -459,7 +459,7 @@ void Scheduler::validate_new(const SchedulerRequest& request) const {
   if (request.prompt.empty())
     throw std::invalid_argument("Scheduler: request '" + request.id +
                                "' has an empty prompt");
-  validate_image_inputs(request.images, request.prompt.size());
+  validate_image_inputs(request.images, request.prompt.size(), engine_->supports_video());
   if (!request.images.empty() && !engine_->supports_images())
     throw std::invalid_argument("Scheduler: this engine does not support image inputs");
   if (request.max_steps < 1)

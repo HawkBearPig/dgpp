@@ -14,20 +14,21 @@
 #include "engine/graph_engine.hpp"
 #include "serve/prefill_policy.hpp"
 #endif
-#include "glm4_fixture.hpp"
-#include "dsv4_fixture.hpp"
 #include "dsv41_fixture.hpp"
-#include "models/dsv41/model.hpp"
-#include "qwen35_fixture.hpp"
-#include "models/dsv4/model.hpp"
-#include "models/qwen/model35.hpp"
+#include "dsv4_fixture.hpp"
+#include "glm4_fixture.hpp"
 #include "glm_dsa_fixture.hpp"
 #include "mimo_fixture.hpp"
-#include "models/glm4/forward.hpp"
+#include "models/dsv4/model.hpp"
+#include "models/dsv41/model.hpp"
 #include "models/glm/forward.hpp"
 #include "models/glm/route_audit.hpp"
+#include "models/glm4/forward.hpp"
 #include "models/glm_dsa/model.hpp"
 #include "models/mimo/forward.hpp"
+#include "models/minimax/forward.hpp"
+#include "models/qwen/model35.hpp"
+#include "qwen35_fixture.hpp"
 
 using namespace dgpp;
 GlmTextConfig glm_tp_test_config();
@@ -154,64 +155,76 @@ template <class Model> void check_graph(Model& model, Model& reference, int voca
   DGPP_CUDA_OK(cudaFreeHost(scratch));
 }
 #endif
-template <class Model, class Factory> void check(Factory make, int vocab, int alignment = 1, bool compact_supported = true, bool bounded = false) {
+template <class Model, class Factory>
+void check(Factory make, int vocab, int alignment = 1, bool compact_supported = true,
+           bool bounded = false, bool mtp_supported = true) {
   const int unit = std::max(8, alignment), reserve = 768;
   const auto a = tokens(std::max(77, 2 * alignment + 13), vocab, 3);
   const auto changed = tokens(a.size(), vocab, 9), b = tokens(std::max(53, alignment + 5), vocab, 5);
   for (bool mtp : {false, true}) for (bool compact : {false, true}) {
-    if (compact && !compact_supported) continue;
-    auto model = make(mtp, compact);
-    auto reference = make(mtp, compact);
-    // Same shape and same second request, a different first request. The
-    // second request's target AND draft must be independent of its neighbor.
-    const auto first = model->session_prefill_group({0, 1}, {&a, &b});
-    typename Model::Outputs draft;
-    if (mtp) draft = model->session_draft(1, {7});
-    model->session_close(0); model->session_close(1);
-    const auto second = model->session_prefill_group({0, 1}, {&changed, &b});
-    exact(first[1], second[1], "grouped target reads another request");
-    if (mtp) exact(draft, model->session_draft(1, {7}), "grouped draft reads another request");
-    model->session_close(0); model->session_close(1);
+      if (mtp && !mtp_supported) continue;
+      if (compact && !compact_supported) continue;
+      auto model = make(mtp, compact);
+      auto reference = make(mtp, compact);
+      // Same shape and same second request, a different first request. The
+      // second request's target AND draft must be independent of its neighbor.
+      const auto first = model->session_prefill_group({0, 1}, {&a, &b});
+      typename Model::Outputs draft;
+      if (mtp) draft = model->session_draft(1, {7});
+      model->session_close(0);
+      model->session_close(1);
+      const auto second = model->session_prefill_group({0, 1}, {&changed, &b});
+      exact(first[1], second[1], "grouped target reads another request");
+      if (mtp) exact(draft, model->session_draft(1, {7}), "grouped draft reads another request");
+      model->session_close(0);
+      model->session_close(1);
 
-    // A yielded prefill uses identical cuts to its uninterrupted oracle.
-    std::vector<int64_t> cuts;
-    for (int cut = unit; cut < int(a.size()); cut += unit) cuts.push_back(cut);
-    const auto expected = reference->session_prefill(0, a, cuts);
-    (void)model->session_prefill(1, b);
-    auto cursor = model->session_prefill_begin(0, a, reserve, unit);
-    while (!model->session_prefill_advance(cursor)) (void)model->session_step(1, 11);
-    exact(cursor.output, expected, "interleaved prefill target differs at identical cuts");
-    if (mtp) exact(model->session_draft(0, {7}), reference->session_draft(0, {7}),
-                   "interleaved prefill draft differs at identical cuts");
-    model->session_close(0); model->session_close(1); reference->session_close(0);
+      // A yielded prefill uses identical cuts to its uninterrupted oracle.
+      std::vector<int64_t> cuts;
+      for (int cut = unit; cut < int(a.size()); cut += unit) cuts.push_back(cut);
+      const auto expected = reference->session_prefill(0, a, cuts);
+      (void)model->session_prefill(1, b);
+      auto cursor = model->session_prefill_begin(0, a, reserve, unit);
+      while (!model->session_prefill_advance(cursor)) (void)model->session_step(1, 11);
+      exact(cursor.output, expected, "interleaved prefill target differs at identical cuts");
+      if (mtp)
+        exact(model->session_draft(0, {7}), reference->session_draft(0, {7}),
+              "interleaved prefill draft differs at identical cuts");
+      model->session_close(0);
+      model->session_close(1);
+      reference->session_close(0);
 
-    // Each reader chunk shares one walk with a four-row speculative prefix.
-    // Accept different prefix lengths and compare the next forced decode.
-    (void)model->session_prefill(1, b); (void)reference->session_prefill(1, b);
-    cursor = model->session_prefill_begin(0, a, reserve, 2 * unit);
-    auto oracle = reference->session_prefill_begin(0, a, reserve, unit);
-    oracle.relative_budget = true;  // follow the mixed walk's actual cuts
-    int iteration = 0;
-    while (cursor.next < cursor.end) {
-      const bool full_reader_chunk_fits = iteration == 0 &&
-          model->max_tokens() >= 2 * unit + 4 && cursor.span_end() >= 2 * unit;
-      const auto outputs = model->session_prefill_verify(cursor, 2 * unit, {1}, {{7, 8, 9, 10}});
-      if (full_reader_chunk_fits) {
-        std::printf("mixed reader budget: advanced=%ld expected=%d alignment=%d\n",
-                    cursor.next, 2 * unit, alignment);
-        require(cursor.next == 2 * unit,
-                "decoder rows consume the reader budget despite spare physical capacity");
+      // Each reader chunk shares one walk with a four-row speculative prefix.
+      // Accept different prefix lengths and compare the next forced decode.
+      (void)model->session_prefill(1, b);
+      (void)reference->session_prefill(1, b);
+      cursor = model->session_prefill_begin(0, a, reserve, 2 * unit);
+      auto oracle = reference->session_prefill_begin(0, a, reserve, unit);
+      oracle.relative_budget = true;  // follow the mixed walk's actual cuts
+      int iteration = 0;
+      while (cursor.next < cursor.end) {
+        const bool full_reader_chunk_fits =
+            iteration == 0 && model->max_tokens() >= 2 * unit + 4 && cursor.span_end() >= 2 * unit;
+        const auto outputs = model->session_prefill_verify(cursor, 2 * unit, {1}, {{7, 8, 9, 10}});
+        if (full_reader_chunk_fits) {
+          std::printf("mixed reader budget: advanced=%ld expected=%d alignment=%d\n", cursor.next,
+                      2 * unit, alignment);
+          require(cursor.next == 2 * unit,
+                  "decoder rows consume the reader budget despite spare physical capacity");
+        }
+        (void)reference->session_prefill_advance(
+            oracle, (cursor.next - oracle.next + alignment - 1) / alignment * alignment);
+        const auto verification = reference->session_verify(1, {7, 8, 9, 10});
+        require(cursor.next == oracle.next, "shared physical row budget");
+        if (!bounded || cursor.next == cursor.end)
+          close(cursor.output, oracle.output, "mixed reader");
+        close(outputs[0], verification, "mixed verifier");
+        const int accepted = 1 + iteration++ % 4;
+        model->session_rollback(1, accepted, 4);
+        reference->session_rollback(1, accepted, 4);
+        close(model->session_step(1, 13), reference->session_step(1, 13),
+              "mixed rollback continuation");
       }
-      (void)reference->session_prefill_advance(oracle,
-          (cursor.next - oracle.next + alignment - 1) / alignment * alignment);
-      const auto verification = reference->session_verify(1, {7, 8, 9, 10});
-      require(cursor.next == oracle.next, "shared physical row budget");
-      if (!bounded || cursor.next == cursor.end) close(cursor.output, oracle.output, "mixed reader");
-      close(outputs[0], verification, "mixed verifier");
-      const int accepted = 1 + iteration++ % 4;
-      model->session_rollback(1, accepted, 4); reference->session_rollback(1, accepted, 4);
-      close(model->session_step(1, 13), reference->session_step(1, 13), "mixed rollback continuation");
-    }
     if (mtp) close(model->session_draft(0, {7}), reference->session_draft(0, {7}), "mixed draft history");
     model->session_close(0); model->session_close(1);
     reference->session_close(0); reference->session_close(1);
@@ -489,6 +502,16 @@ DGPP_TEST(shared_prefill_mimo) {
     return std::make_unique<MimoModel>(cfg, dir, 256, 2048, MimoResidency::Resident,
                                       nullptr, 0, 1, 4, mtp, 16, LatentFormat::kBf16, compact);
   }, cfg.vocab_size);
+}
+DGPP_TEST(shared_prefill_minimax) {
+  const std::string dir = "minimax_fixture";
+  const auto cfg = MinimaxConfig::from_json_file(dir + "/config.json");
+  check<MinimaxModel>(
+      [&](bool mtp, bool) {
+        return std::make_unique<MinimaxModel>(cfg, dir, 512, 4096, LoaderResidency::Resident,
+                                              nullptr, 0, 1, 4, mtp, 32);
+      },
+      cfg.vocab_size, 1, true, false, false);
 }
 template <class Factory>
 void check_short_reader_recipe(Factory make, int vocab, const char* label) {

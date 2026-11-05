@@ -137,6 +137,10 @@ class EagerEngineAdapter : public sched::SchedulerEngine {
   int32_t prefill(int req, const std::vector<int64_t>& prompt) override {
     return open_slot(req, prompt, [&] { return model_->session_prefill(req, prompt); });
   }
+  bool supports_video() const override {
+    if constexpr (requires { model_->supports_video(); }) return model_->supports_video();
+    return false;
+  }
   bool supports_images() const override {
     if constexpr (requires { model_->supports_images(); }) return model_->supports_images();
     return false;

@@ -4675,6 +4675,33 @@ DGPP_TEST(prefix_cache_image_identity_and_partial_prefixes) {
           "eviction releases entries without invalidating a request's image key");
 }
 
+DGPP_TEST(prefix_cache_video_future_frames_key_every_segment_token) {
+  using Cache = dgpp::sched::PrefixCache;
+  Cache cache({8, 1, 4});
+  const std::vector<int64_t> ids(40, 200026);
+  std::vector<dgpp::ImageInput> segments{
+      {8, 8, 56, 56, std::vector<uint8_t>(56 * 56 * 3 * 4, 123), 28, 4, {8, 24}}};
+  const auto original = cache.image_keys(segments);
+  const auto hash = [&](const Cache::Images& keys) {
+    return Cache::with_images(Cache::hash_prefix(ids.data(), 9), 9, keys);
+  };
+  const int entry = cache.insert(ids.data(), 9, cache.take_free_slot(), 1, original);
+  require(cache.find_exact(ids.data(), 9, hash(original), original) == entry,
+          "snapshot within first video span can attach");
+  segments[0].rgb.back() ^= 1;
+  auto changed = cache.image_keys(segments);
+  require(cache.find_exact(ids.data(), 9, hash(changed), changed) < 0,
+          "future video frames change the first span's cache identity");
+  changed[0].hash = original[0].hash;
+  require(cache.find_exact(ids.data(), 9, hash(changed), changed) < 0,
+          "video pixel comparison guards a hash collision");
+  segments[0].rgb.back() ^= 1;
+  segments[0].frame_offsets[1] = 25;
+  changed = cache.image_keys(segments);
+  require(cache.find_exact(ids.data(), 9, hash(changed), changed) < 0,
+          "video span layout participates in cache identity");
+}
+
 DGPP_TEST(scheduler_images_reuse_prefill_and_generated_continuations) {
   class CachedImages : public FakeEngine {
    public:

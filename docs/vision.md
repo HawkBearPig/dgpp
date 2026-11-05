@@ -1,6 +1,6 @@
 # Image inputs
 
-GLM-5.3-Flash, Qwen3.8-Flash-Next and Qwen3.8-27B accept images through
+GLM-5.3-Flash, Qwen3.8-Flash-Next, Qwen3.8-27B and MiniMax-M3.1-Flash accept images through
 `POST /v1/chat/completions`. The engine loads the checkpoint's BF16 vision
 encoder and projects image features into the language model's prompt. It
 supports the FP8 and hybrid NVFP4/FP8 checkpoints, streaming, multiple choices
@@ -51,15 +51,15 @@ print(json.load(urlopen(request))["choices"][0]["message"])
 | Size | Up to 20 MiB of decoded PNG/JPEG/WebP file bytes, 32 megapixels and 16,384 pixels per source dimension |
 | History | Image tokens use the ordinary context budget; no separate image-count or aggregate visual-token cap |
 | Decoded data | Up to 256 MiB of resized RGB pixels per request, independently of compressed upload size |
-| Detail | `auto` and `high` allow up to 1,024 visual tokens per image; `low` allows 256 |
+| Detail | `auto` and `high` allow up to 1,024 visual tokens per image (576 for MiniMax); `low` allows 256 |
 | Preprocessing | RGB conversion and an aspect-preserving antialiased bicubic resize onto the family's visual-token grid, then the checkpoint's own normalization — see [per-family preprocessing](#per-family-preprocessing) |
 | Usage | Each merged patch block contributes one prompt token; image delimiters also count. Normal context and admission limits still apply |
 | Prefix cache | Identical image content, geometry and token positions can reuse prompt and generated-continuation snapshots; `cached_tokens` reports reuse |
-| Scheduling | GLM and Qwen graph prefill can yield between bounded chunks for both image and text requests; active decodes run after each chunk |
+| Scheduling | Graph prefill can yield between bounded chunks for both image and text requests; active decodes run after each chunk |
 
 ## Per-family preprocessing
 
-The two served towers disagree about geometry, so the resize policy and the
+The served towers disagree about geometry, so the resize policy and the
 delimiters are per-family data (`serve/image_inputs.hpp`,
 `models/<family>/vision_config.hpp`), not constants in the shared path.
 
@@ -72,6 +72,40 @@ delimiters are per-family data (`serve/image_inputs.hpp`,
 | Delimiters | `image_start_token_id` 154830, `image_token_id` 154854, `image_end_token_id` 154831 | `vision_start_token_id`, `image_token_id`, `vision_end_token_id` (248053, 248056, 248054), rendered from the tokenizer's own vocabulary | same ids (248053, 248056, 248054) |
 | Tower | 24 blocks, RMSNorm, SwiGLU, windowed attention, deepstack injections | 27 blocks, LayerNorm ε 1e-6, GELU MLP, full attention, 2-D axial RoPE with θ 10000, a learned 48×48 position table resampled bilinearly, `deepstack_visual_indexes: []` | same 27-block tower, merger to 5120 (the dense model's width) |
 | Where the rows enter | the embedding and the deepstack layers | the embedding only (no deepstack) | the embedding only (no deepstack) |
+
+MiniMax-M3.1-Flash uses a 28-pixel grid, nearest-grid resize, a minimum
+four-token pixel budget and a maximum 576-token budget (672² pixels), as
+the pinned fast processor does. It uses CLIP normalization and duplicates
+the temporal patch of a still image. Its 32-block tower has LayerNorm,
+exact GELU, partial 3-D RoPE (78 of each head's 80 dimensions), full
+attention, no final LayerNorm, and a projector before the 2×2 merger.
+Image delimiters are `]<]start of image[>[`, `]<]image[>[` and
+`]<]end of image[>[` (200029, 200025 and 200030). Projected rows enter
+the target embedding; DSpark receives the resulting target features.
+Its language-model positions stay one-dimensional, as in the published
+MiniMax decoder.
+
+MiniMax also accepts user content parts of the form
+`{"type":"video_url","video_url":{"url":"data:video/mp4;base64,...","fps":1}}`.
+WebM data URIs work too. Native FFmpeg decoding requires a build with
+`DGPP_ENABLE_VIDEO=ON` (the default); `/v1/models` advertises `video` only
+when both the frontend and model support it. Other model families refuse it.
+The API samples uniformly across the complete clip, using 1 fps by default
+and an optional positive rate up to 30. It selects 4–768 frames, bounded by
+the source frame count, and repeats the last frame when the count is odd.
+Per-frame resolution uses the published 28-pixel grid and 4–768-token
+budget, further bounded by the processor's 57,600-token total pixel budget
+over selected raw frames. Encoded inputs are limited to 32 MiB and decoded
+media across a request to 256 MiB. Remote URLs are not fetched.
+
+Every two frames form a temporal patch. A segment contains at most four
+temporal patches (eight raw frames), with bidirectional attention inside
+that segment and temporal RoPE positions starting at zero for each segment.
+Each pair contributes a timestamp `]<]0.0 seconds[>[`, image start/end
+delimiters, and one `]<]video[>[` token (200026) per merged spatial patch.
+The admission journal carries all RGB frames and the discontiguous token
+spans. Prefix-cache identity includes the whole segment even when a cached
+cut lies inside its first span: later frames can change earlier embeddings.
 
 Qwen3.8-Flash-Next deviations, both recorded here rather than hidden in a
 comment: images are single frames (`video_token_id` is refused, never
@@ -91,7 +125,7 @@ positions land with that split, not before it. Spatially demanding prompts
 re-measure when it does. Until then the served behaviour is a usable but
 degraded reading of the reference.
 
-The processor targets at least 16 visual tokens for small images. Aspect
+The GLM processor targets at least 16 visual tokens for small images. Aspect
 ratio and grid alignment determine the actual count. DGPP's 1,024-token
 per-image ceiling bounds the native encoder's workspace; it is lower than
 the upstream processor's 8,000-token default. Images are decoded and resized
@@ -100,7 +134,8 @@ other HTTP work. PNG/JPEG/WebP decoding does not apply EXIF orientation or color
 profiles. WebP supports lossy and lossless still images; alpha is composited
 on white before resizing, and animated WebP is unsupported. PDF file inputs
 still extract text only; page rasterization is not part of this feature.
-Video and audio inputs are unsupported.
+Audio inputs are unsupported. Video inputs are supported by MiniMax as
+described above; other families reject them.
 
 Images of the same dimensions have identical placeholder token IDs but
 different embeddings. Cache lookups compare processed RGB pixels, geometry
@@ -133,12 +168,59 @@ starts; image requests do not allocate CUDA buffers while another rank may
 be spinning in a collective. Resized RGB bytes and token offsets travel in
 the admission journal so every rank uses the same input.
 
+MiniMax instead reserves 1.615 GiB of visual weights and 1.789 GiB of workspace
+per rank. This includes a 384 MiB cache for eight encoded images or eight-frame
+segments, so interleaved readers can reuse complete embeddings across prompt
+chunks. Cache entries compare geometry and every frame's pixels; prompt offsets
+only control embedding placement. Least-recently-used entries are evicted and
+recomputed without changing the numerical recipe. The retained RGB identities
+use at most another 147 MiB of host memory per rank. It stages up to 513 rows
+per window. The encoder uses
+FP32 SGEMM for the patch projection, FP32 scores with BF16 probabilities,
+and BF16 projections with the validated 1 MiB cuBLASLt workspace recipe.
+The FP32 rotary tables are built on CUDA. These choices preserve the
+reference's rounding across the full 32-layer tower.
+For segments above 9,216 patch rows, attention softmax follows the reference's
+four-value reduction order, including its shared-memory cutoff and scalar
+tail. The shorter still-image reduction cannot be extended unchanged to
+16,384 patch rows without accumulating full-depth error.
+
+For the MiniMax encoder, build `minimax_vision_check` and run the real-weight
+regressions on an idle GPU (the oracle requires NumPy and PyTorch):
+
+```bash
+python3 tools/minimax_vision_regression.py --checkpoint-dir "$CKPT" \
+  --binary build-release/minimax_vision_check --output-dir build-minimax-vision-regression
+```
+
+Eight fixed image cases cover gradients, noise, checkerboards, rectangular images,
+the 128-query tile boundary, the processor's 576-token budget and the
+encoder's 1,024-token allocation limit. All eight final embeddings match
+the CUDA reference bitwise with the pinned real checkpoint. Eight additional
+video cases cover 2/4/6/8-frame segments, temporal coordinates and the
+largest allocated segment. `--media image` or `--media video` selects a
+subset for focused development checks. The numerical
+gate remains relative RMS ≤0.005 and cosine ≥0.99998. See the
+[MiniMax implementation record](minimax_m31_flash_plan.md#native-still-image-encoder)
+for checkpoint and arithmetic details; encoder parity alone does not certify
+end-to-end visual task accuracy.
+
+The lossless API fixtures `tests/data/minimax_video_10frames.mp4` and `.webm`
+contain ten 56×56 constant RGB frames at 2 fps. Frame `i` is
+`[17*i, 255-11*i, 10+7*i]`. They were encoded with FFmpeg 6.1.1 using
+`libx264rgb -crf 0 -preset veryslow -pix_fmt rgb24 -movflags +faststart` and
+`libvpx-vp9 -lossless 1 -pix_fmt gbrp`, respectively. The host regression
+checks exact decoded pixels, frame selection, odd-frame repetition,
+segment boundaries, timestamp text, token spans, and invalid inputs.
+
 On an idle test deployment, run:
 
 ```bash
 python3 scripts/vision_api_check.py --help
 python3 scripts/vision_api_check.py --url http://127.0.0.1:18080
 python3 scripts/vision_prefix_cache_check.py --url http://127.0.0.1:18080
+# MiniMax needs more images to cross the same 12,288-token history gate:
+python3 scripts/vision_prefix_cache_check.py --url http://127.0.0.1:18080 --history-images 24
 python3 scripts/prefill_fairness_check.py --url http://127.0.0.1:18080
 python3 scripts/prefill_fairness_check.py --url http://127.0.0.1:18080 --images
 python3 scripts/prefill_fairness_check.py --url http://127.0.0.1:18080 --images --image-count 12 --decoders 2

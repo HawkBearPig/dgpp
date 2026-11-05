@@ -290,6 +290,78 @@ DGPP_TEST(dflash2_selector_walks_the_reference_scores) {
 // the draw is the inverse-CDF walk on the draft stream's uniform keyed by
 // the draft's position (reproduced here), so equal inputs draw equal chains
 // and a greedy spec walks the argmax with n = 0.
+DGPP_TEST(dflash2_conditioned_candidates_preserve_proposal_distribution) {
+  constexpr int steps = 7, k = 16, rank = 32, vocab = 128;
+  const auto stream = test_stream();
+  std::vector<int32_t> ids(steps * k);
+  std::vector<float> scores(steps * k), hidden(steps * rank, 0.f);
+  std::vector<uint16_t> zeros(vocab * rank, 0);
+  std::vector<int64_t> positions(steps + 1);
+  for (int l = 0; l < steps; ++l) {
+    positions[l] = 2045 + l;
+    for (int c = 0; c < k; ++c) {
+      ids[l * k + c] = l * k + c;
+      scores[l * k + c] = .17f * std::sin(float(l * 11 + c * 7));
+    }
+  }
+  positions.back() = 2045 + steps;
+  const int64_t anchor = 5;
+  DevBuf di(ids.size() * 4), ds(scores.size() * 4), dh(hidden.size() * 4), dz(zeros.size() * 2),
+      da(8), dp(positions.size() * 8), specbuf(sizeof(dgpp::SampleSpec)), a(steps * 4),
+      b(steps * 4), pa(steps * sizeof(dgpp::DraftProposal)),
+      pb(steps * sizeof(dgpp::DraftProposal)), prev(steps * 8), recorded(ids.size() * 4);
+  di.upload(ids.data(), ids.size() * 4);
+  ds.upload(scores.data(), scores.size() * 4);
+  dh.upload(hidden.data(), hidden.size() * 4);
+  dz.upload(zeros.data(), zeros.size() * 2);
+  da.upload(&anchor, 8);
+  dp.upload(positions.data(), positions.size() * 8);
+  for (float temperature : {0.f, .4f, 1.f})
+    for (int truncation = 0; truncation < 2; ++truncation) {
+      dgpp::SampleSpec spec{};
+      spec.temperature = temperature;
+      spec.draft_temperature = .7f;
+      spec.seed = 0x123456789abcdefULL;
+      if (truncation) {
+        spec.top_k = 11;
+        spec.top_p = .7f;
+        spec.min_p = .1f;
+      }
+      specbuf.upload(&spec, sizeof(spec));
+      auto* spa = static_cast<dgpp::DraftProposal*>(pa.p);
+      auto* spb = static_cast<dgpp::DraftProposal*>(pb.p);
+      const auto* sp = static_cast<const dgpp::SampleSpec*>(specbuf.p);
+      dgpp::dflash2_selector_walk(ci32(di), cf32(ds), cf32(dh), cb16(dz), cb16(dz), ci64(da),
+                                  i32(a), steps, k, rank, stream, ci64(dp), sp, spa);
+      for (int step = 0; step < steps; ++step)
+        dgpp::dflash2_sample_candidates(ci32(di) + step * k, cf32(ds) + step * k, k, step,
+                                        i32(b) + step, static_cast<int64_t*>(prev.p) + step,
+                                        i32(recorded) + step * k, stream, ci64(dp) + step + 1, sp,
+                                        spb + step);
+      DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+      std::vector<int32_t> ta(steps), tb(steps), got(ids.size());
+      std::vector<int64_t> previous(steps);
+      std::vector<dgpp::DraftProposal> qa(steps), qb(steps);
+      a.download(ta.data(), steps * 4);
+      b.download(tb.data(), steps * 4);
+      prev.download(previous.data(), steps * 8);
+      recorded.download(got.data(), got.size() * 4);
+      pa.download(qa.data(), pa.bytes);
+      pb.download(qb.data(), pb.bytes);
+      require(ta == tb && got == ids, "conditioned sampler changed the draw or candidate record");
+      for (int step = 0; step < steps; ++step) {
+        require(previous[step] == tb[step],
+                "conditioned sampler did not publish the next predecessor");
+        require(qa[step].n == qb[step].n, "conditioned proposal support differs");
+        if (qa[step].n)
+          require(qa[step].token == qb[step].token &&
+                      std::memcmp(qa[step].ids, qb[step].ids, k * sizeof(int32_t)) == 0 &&
+                      std::memcmp(qa[step].mass, qb[step].mass, k * sizeof(float)) == 0,
+                  "conditioned proposal masses or token differ");
+      }
+    }
+}
+
 DGPP_TEST(dflash2_selector_sampled_walk_proposes_its_draw) {
   cudaStream_t s = test_stream();
   const int steps = 7, k = 16, rank = 256, vocab = 1009;

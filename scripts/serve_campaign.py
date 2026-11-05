@@ -19,12 +19,13 @@ ignored); the doc carries the cells.
 
 What one run measures (docs/benchmarks.md "Workload and timing" is the
 definition of record):
-  serving      timed_load at C1/C2/C4/C8 over the five prompt classes, three
-               repetitions, 256 tokens: the engine's decode-only rate per class
+  serving      timed_load at C1/C2/C4/C8 over the five prompt classes, also C16
+               on a 16-slot deployment. Three repetitions, 256 tokens: the engine's decode-only rate per class
                and concurrency (the headline), the wall rate (prefill and
                queueing included) beside it.
   prefill      serve_prefill_probe at 512 / 2K / 8K / 32K, three distinct cold
-               prefixes each, thinking off: cold prefill seconds.
+               prefixes each, thinking off where supported (otherwise the
+               recorded template default): cold prefill seconds.
   context      serve_context_matrix at 0 / 32K / 64K / 128K / 256K / 512K: cold
                prefill per bucket, decode ms a pass and tok/s from three requests.
   quality      serve_eval on the 300-item HumanEval / GSM8K / extraction set at
@@ -106,7 +107,7 @@ def deployment_from(template, port):
 
 
 DRAFT_KEYS = ("dflash_model", "draft_head", "dflash_weights", "mtp_schedule", "mtp_schedule_row_ms", "mtp_schedule_base_ms",
-              "mtp_schedule_lambda", "mtp_schedule_min_depth", "mtp_schedule_adapt", "mtp_schedule_sampled_scale", "mtp_draft",
+              "mtp_schedule_lambda", "mtp_schedule_min_depth", "mtp_schedule_options", "mtp_schedule_adapt", "mtp_schedule_sampled_scale", "mtp_draft",
               "mtp_draft_temperature", "mtp_verify", "mtp_depth", "lookup_draft", "lookup_tail", "dflash_batch_rows", "dflash_depth")
 
 
@@ -220,7 +221,8 @@ def run_campaign(a):
     try:
         boot.up()
         if "serving" in phases:
-            run(["python3", "scripts/timed_load.py", host, port, "--concurrency", "1,2,4,8", "--classes", "all",
+            concurrencies = "1,2,4,8,16" if slots >= 16 else "1,2,4,8"
+            run(["python3", "scripts/timed_load.py", host, port, "--concurrency", concurrencies, "--classes", "all",
                  "--max-tokens", "256", "--repeat", "3", "--json-out", out / "decode.json"], out / "decode.log", env)
         if "prefill" in phases:
             run(["python3", "scripts/serve_prefill_probe.py", host, port, *map(str, PREFILL_TARGETS), "--repeat", "3",
@@ -444,6 +446,10 @@ def rows(d, label, nodes, options):
                     + " | " + (" / ".join(f"{pf[n]:.3f}" for n in (2048, 8192, 32768)) if pf else "—") + " |"))
         out.append(("wall", f"{head} " + " | ".join(span(s["wall"][n]) for n in (1, 2, 4, 8)) + " |"))
         out.append(("classes", f"{head} " + " | ".join(f"{s['decode'][1][c]:.1f}" for c in CLASSES) + " |"))
+        for n in s["concurrencies"]:
+            if n > 8:
+                out.append(("serving-extra", f"{head} {n} | {span(s['decode'][n])} |"))
+                out.append(("wall-extra", f"{head} {n} | {span(s['wall'][n])} |"))
     if e:
         if e.get("dflash_model"):
             mode = "DFlash2 adaptive ≤7" if e.get("mtp_schedule") else "DFlash2 fixed 7"
@@ -451,7 +457,11 @@ def rows(d, label, nodes, options):
             mode = f"MTP{e.get('mtp_depth', 1)}" + (" scheduled" if e.get("mtp_schedule") else "")
         else:
             mode = "plain"
-        budget = "adaptive (default)" if "prefill_budget_tokens" not in e else f"{e['prefill_budget_tokens']} / {e.get('prefill_idle_budget_tokens', e['prefill_budget_tokens'])}"
+        if e.get("prefill_budget_tokens", -1) < 0:
+            idle = e.get("prefill_idle_budget_tokens", 0)
+            budget = f"adaptive / idle cap {idle}" if idle else "adaptive (default)"
+        else:
+            budget = f"{e['prefill_budget_tokens']} / {e.get('prefill_idle_budget_tokens', e['prefill_budget_tokens'])}"
         out.append(("config", f"{head} {e.get('max_concurrency')} | {int(e.get('kv_capacity', 0)):,} | {e.get('kv_dtype', 'bf16')} | "
                     f"{float(e.get('prefix_cache_gib', 1.5)):g} | {budget} | {mode} | [JSON](<template path>) |"))
     if (d / "context.json").exists():

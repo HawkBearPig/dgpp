@@ -1,7 +1,7 @@
 # DGPP Engine Design
 
 This document describes the implemented serving architecture. The
-shared runtime supports the GLM, Qwen, DeepSeek, MiMo, Flint and Dory architectures listed
+shared runtime supports the GLM, Qwen, DeepSeek, MiMo, MiniMax, Flint and Dory architectures listed
 in the [supported-model guide](README.md), with resident loading, tensor
 parallelism, decode graphs, sampling, prefix caching and speculative decoding.
 World size and memory requirements depend on the model
@@ -11,6 +11,10 @@ The attention, weight-placement and state examples below describe
 GLM-5.3-Flash unless another family is named. Qwen's GDN/QSA/GR/PLE
 operators are documented in [its architecture study](docs/qwen38_flash_next_plan.md),
 and GLM-4.7's GQA and NVFP4 layout in [its implementation notes](docs/glm47_plan.md).
+MiniMax M3.1's per-head sparse block selection, FP32 routing, published
+MXFP8/NVFP4 weights, bundled DSpark and temporal vision encoder are described
+in [its implementation record](docs/minimax_m31_flash_plan.md). It uses the
+same session, prefill, graph, prefix-cache and speculative-decoding contracts.
 Shared session and engine interfaces live in `src/engine/`. A common scheduler
 owns admission, fair reader budgets and request lifecycle. `PrefillTask`,
 `PrefillContinuation`, `PrefillBatch`, `RowRun` and `GraphBatchMapping` share

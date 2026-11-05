@@ -86,9 +86,10 @@ int dflash2_block_attn_splits();
 size_t dflash2_block_attn_partials_bytes(int rows, int heads);
 void dflash2_block_attn_split(const uint16_t* q, int64_t q_row_stride, const uint16_t* k_cache,
                               const uint16_t* v_cache, const int32_t* block_table, int block_tokens,
-                              int blocks_per_request, int block_rows, int64_t window, const int64_t* pos,
-                              int rows, int heads, int kv_heads, int dim, float scale, float* partials,
-                              uint16_t* out, cudaStream_t stream);
+                              int blocks_per_request, int block_rows, int64_t window,
+                              const int64_t* pos, int rows, int heads, int kv_heads, int dim,
+                              float scale, float* partials, uint16_t* out, cudaStream_t stream,
+                              bool fp32_p = false);
 
 // Per-row top-K of fp32 logits (descending by score, ties to the lower id):
 // the candidate sets the selector walks. K <= 32.
@@ -131,6 +132,17 @@ void dflash2_selector_walk(const int32_t* ids, const float* unary, const float* 
                            const int64_t* pos = nullptr, const SampleSpec* spec = nullptr,
                            DraftProposal* proposal = nullptr, DraftProposal* proposal_host = nullptr,
                            float* conf = nullptr);
+
+// Draw from an already conditioned top-K row, or take its greedy maximum.
+// Uses the selector walk's truncation, keyed RNG and exact proposal masses.
+// `step` is the zero-based proposal position; `pos` points to that mask's
+// absolute position. Also publish the selected predecessor for a subsequent
+// Markov projection and retain the candidates for acceptance diagnostics.
+void dflash2_sample_candidates(const int32_t* ids, const float* scores, int k, int step,
+                               int32_t* token, int64_t* next_anchor, int32_t* record_ids,
+                               cudaStream_t stream, const int64_t* pos = nullptr,
+                               const SampleSpec* spec = nullptr, DraftProposal* proposal = nullptr,
+                               DraftProposal* proposal_host = nullptr);
 
 // ---- the recorded block draft (the graph engine's block proposal) -------------
 //

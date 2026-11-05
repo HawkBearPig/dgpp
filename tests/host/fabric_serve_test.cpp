@@ -641,6 +641,7 @@ void test_journal_codec() {
     ws.kv_dtype = "fp8";
     ws.prefill_attention = "fp8";
     ws.decode_attention = "fp8";
+    ws.activations = "native";
     ws.bf16_weights = "bf12";
     ws.compact_batches = true;
     ws.fp8_head = "mma";
@@ -738,6 +739,28 @@ void test_journal_codec() {
           dgpp::serve::encode_journal_settings(settings));
       require(decoded.world_settings.prefill_budget_tokens == budget,
               "automatic, disabled and explicit prefill budgets survive the settings handshake");
+    }
+    for (const std::string mode : {"bf16", "native"}) {
+      auto recipe = ws;
+      recipe.activations = mode;
+      const auto line = dgpp::serve::encode_journal_settings(recipe);
+      require(dgpp::serve::decode_journal_line(line).world_settings.activations == mode,
+              "target activation recipe survives the rank handshake");
+      auto legacy = line;
+      const auto key = std::string(",\"act\":\"") + mode + "\"";
+      const size_t at = legacy.find(key);
+      require(at != std::string::npos, "target activation recipe encoded");
+      legacy.erase(at, key.size());
+      require(dgpp::serve::decode_journal_line(legacy).world_settings.activations == "bf16",
+              "legacy settings preserve BF16 target activations");
+    }
+    {
+      auto bad = ws;
+      bad.activations = "fp4";
+      bool refused = false;
+      try { (void)dgpp::serve::decode_journal_line(dgpp::serve::encode_journal_settings(bad)); }
+      catch (const std::runtime_error&) { refused = true; }
+      require(refused, "bad activation recipe rejected before joining the world");
     }
     for (const std::string mode : {"gemv", "mma"}) {
       auto head = ws;
@@ -2254,6 +2277,35 @@ DGPP_TEST(journal_image_history_exceeds_old_count_and_token_caps) {
     const auto& image = decoded.submits[0].images[i];
     require(image.offset == i * 1024 && image.tokens == 1024 && image.rgb.back() == i,
             "ordered image pixels and context positions roundtrip");
+  }
+}
+
+DGPP_TEST(journal_video_segments_preserve_frames_spans_and_pixels) {
+  dgpp::serve::GenerationService::PassEvents events;
+  dgpp::sched::SchedulerRequest request;
+  request.id = "video";
+  request.prompt.assign(40, 200026);
+  request.images.push_back(
+      {5, 8, 56, 56, std::vector<uint8_t>(56 * 56 * 3 * 4, 123), 28, 4, {5, 20}});
+  events.submits.push_back(request);
+  const auto wire = dgpp::serve::encode_journal_tick(events);
+  const auto decoded = dgpp::serve::decode_journal_line(wire);
+  const auto& im = decoded.submits[0].images.at(0);
+  require(im.frames == 4 && im.frame_offsets == std::vector<int64_t>{5, 20} && im.offset == 5 &&
+              im.tokens == 8 && im.rgb == request.images[0].rgb,
+          "video admission changed across ranks");
+  for (const auto* spans : {"[5]", "[5,7]", "[5,20,30]", "[5,-1]", "[5,20.5]"}) {
+    auto bad = wire;
+    const auto at = bad.find("[5,20]");
+    require(at != std::string::npos, "video spans present in wire format");
+    bad.replace(at, 6, spans);
+    bool threw = false;
+    try {
+      (void)dgpp::serve::decode_journal_line(bad);
+    } catch (const std::exception&) {
+      threw = true;
+    }
+    require(threw, "malformed video span admitted from journal");
   }
 }
 
