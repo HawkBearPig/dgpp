@@ -85,6 +85,7 @@ void audit_draft(dgpp::MinimaxModel& model, const std::vector<DraftAuditCase>& c
       std::vector<int64_t> feed{anchor};
       feed.insert(feed.end(), proposals.begin(), proposals.end());
       out = model.session_verify(0, feed);
+      write(path / "verify-features.f32", draft_audit_copy(df.acc(), size_t(d + 1) * h));
       const auto targets = pick(out);
       write(path / "targets.i32", targets);
       int accepted = 0;

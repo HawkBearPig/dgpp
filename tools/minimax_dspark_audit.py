@@ -89,9 +89,12 @@ def main():
     ap.add_argument('--output', type=Path, required=True)
     ap.add_argument('--world', type=int, default=4)
     ap.add_argument('--sampler-only', action='store_true')
+    ap.add_argument('--projection-backend', choices=('cublas', 'triton-native'), default='cublas')
+    ap.add_argument('--elementwise-backend', choices=('torch', 'triton-fixed'), default='torch')
     ap.add_argument('--blocks', type=int, default=0, help='0 checks every captured block')
     args = ap.parse_args()
-    ref = DraftReference(args.checkpoint_dir/'dspark', args.world, args.sglang_source, native_cache=False)
+    ref = DraftReference(args.checkpoint_dir/'dspark', args.world, args.sglang_source, native_cache=False,
+                         projection_backend=args.projection_backend, elementwise_backend=args.elementwise_backend)
     target = Weights(args.checkpoint_dir)
     def target_tensor(name):
         return torch.from_numpy(np.array(target.raw(name), copy=True)).view(torch.bfloat16).cuda()
@@ -99,7 +102,7 @@ def main():
     embed = None if args.sampler_only else target_tensor('language_model.model.embed_tokens.weight')
     pred = ref.tensor(PREFIX+'markov_head.markov_w1.weight')
     succ = ref.tensor(PREFIX+'markov_head.markov_w2.weight')
-    c, results = ref.c, []
+    c, results, contexts = ref.c, [], []
     rows, hidden = c['dflash_config']['block_size'], c['hidden_size']
     kh, dim = c['num_key_value_heads'], c['head_dim']
     def walk(logits, anchor, mode):
@@ -120,6 +123,25 @@ def main():
             continue
         roots = [case/f'rank{r}' for r in range(args.world)]
         blocks = sorted(roots[0].glob('block-*'), key=lambda p: int(p.name.split('-')[1]))
+        if not args.sampler_only:
+            tokens = len(np.fromfile(roots[0]/'prompt.i64', dtype=np.int64))
+            taps = [load(roots[0]/f'target-layer-{layer}.bf16', np.uint16, (tokens, hidden))
+                    for layer in c['dflash_config']['target_layer_ids']]
+            expected_fc = ref.mm(torch.cat(taps, -1), ref.tensor(PREFIX+'fc.weight'), rounded=False)
+            actual_fc = load(roots[0]/'features.f32', np.float32, (tokens, hidden))
+            context = ref.norm(expected_fc.to(torch.bfloat16), PREFIX+'hidden_norm')
+            context_check = dict(case=case.name, fc_relative_rms=error(actual_fc, expected_fc), kv=[])
+            for layer in range(c['num_hidden_layers']):
+                base = PREFIX+f'layers.{layer}.decoder_layer.self_attn.'
+                ck = ref.qk(ref.linear(context, base+'k_proj'), base+'k_norm', 0, kh)
+                cv = ref.linear(context, base+'v_proj').reshape(tokens, kh, dim)
+                meta0 = json.loads((roots[0]/'block-0/metadata.json').read_text())
+                actual_k, actual_v = tuple(torch.cat([load(root/'block-0'/f'{name}-{layer}.bf16', np.uint16,
+                                (meta0['position']+rows, kh//args.world, dim)) for root in roots], 1)[:tokens]
+                                for name in ('k', 'v'))
+                context_check['kv'].append([error(actual_k, ck), error(actual_v, cv)])
+            contexts.append(context_check)
+            print('CONTEXT', context_check, flush=True)
         for block in blocks[:args.blocks or None]:
             meta = json.loads((block/'metadata.json').read_text())
             actual = load(block/'hidden.bf16', np.uint16, (rows, hidden))
@@ -136,6 +158,23 @@ def main():
                     return tuple(torch.cat([load(root/block.name/f'{name}-{layer}.bf16', np.uint16,
                                (meta['position']+rows, kh//args.world, dim)) for root in roots], 1) for name in ('k','v'))
                 expected, kv_errors = ref.block(embed, meta, cache)
+                prior = roots[0]/f'block-{int(block.name.split("-")[1])-1}'
+                if (prior/'verify-features.f32').exists():
+                    previous = json.loads((prior/'metadata.json').read_text())
+                    count = meta['position'] - previous['position']
+                    if count != previous['accepted'] + 1:
+                        raise ValueError('committed context length disagrees with accepted prefix')
+                    features = load(prior/'verify-features.f32', np.float32, (rows+1, hidden))[:count]
+                    context = ref.norm(features.to(torch.bfloat16), PREFIX+'hidden_norm')
+                    checks = []
+                    for layer in range(c['num_hidden_layers']):
+                        base = PREFIX+f'layers.{layer}.decoder_layer.self_attn.'
+                        k = ref.qk(ref.linear(context, base+'k_proj'), base+'k_norm', previous['position'], kh)
+                        v = ref.linear(context, base+'v_proj').reshape(count, kh, dim)
+                        actual_k, actual_v = cache(layer)
+                        span = slice(previous['position'], meta['position'])
+                        checks.append([error(actual_k[span], k), error(actual_v[span], v)])
+                    record['committed_kv_relative_rms'] = checks
                 record['hidden_relative_rms'] = [error(a, b) for a, b in zip(actual, expected)]
                 record['block_kv_relative_rms'] = kv_errors
                 expected_logits = ref.mm(expected, head, rounded=False)
@@ -146,7 +185,8 @@ def main():
                   'hidden', record.get('hidden_relative_rms'), 'predictions', record['predictions'], flush=True)
             args.output.write_text(json.dumps(dict(upstream_full_stack=False,
                 source='SGLang 58484246 native quantizers; independent PyTorch backbone and Markov arithmetic',
-                cases=results), indent=2)+'\n')
+                projection_backend=args.projection_backend, elementwise_backend=args.elementwise_backend,
+                contexts=contexts, cases=results), indent=2)+'\n')
 
 
 if __name__ == '__main__':
