@@ -431,3 +431,80 @@ baseline exactly. The comparison uses sources `4d2e4574` and `3062ce1f`,
 with the expected executable and zero swap on every rank and matching
 operation streams. These profile timings explain the optimization; the
 separate shipped-template campaign provides deployment throughput rows.
+
+## DSpark early-position acceptance audit
+
+After the anchor-row correction, positions two and three still warranted
+direct prediction checks. Correct final target output cannot validate a
+drafter: rejection can hide a broken proposal path.
+
+`minimax_forward_check --draft-manifest <file> --draft-rounds 32 --dump-dir <dir>`
+captures eager draft hidden states, vocabulary logits, K/V planes, proposals,
+target verification tokens, and the target features committed between blocks.
+The manifest is an array of objects with `name` and integer `ids` fields.
+Use the normal checkpoint/residency/TP arguments and select
+`--activations native --kv-dtype nvfp4` for the native recipe. Place the
+manifest at the same path on all ranks and gather each rank's dump directory
+before running the independent comparison:
+
+```sh
+.venv/bin/python tools/minimax_dspark_audit.py \
+  --checkpoint-dir "$MODEL_DIR" --engine-dir "$AUDIT_DIR" \
+  --sglang-source "$SGLANG_DIR" --world 4 --output "$REPORT_FILE"
+```
+
+This tool uses the pinned upstream MXFP8 producers and independent PyTorch
+products. It checks target feature fusion, initial context K/V, committed
+context positions and K/V, the five-layer draft block, the vocabulary head,
+and the chained Markov selector. `--sampler-only` isolates selection on
+captured hidden states. `--projection-backend triton-native
+--elementwise-backend triton-fixed --blocks 2` provides an additional
+arithmetic control. These reports are diagnostics, not new accuracy gates.
+
+The 2026-11-05 audit used source
+`50cbe346c92f806cae5f428061f6caa8a0170de6`, executable SHA256
+`9104037abd34555da3b85312551476f5c6ac645e8feeb1148a3460181e44a8c4`,
+checkpoint `2f33a8b9ae49ce7b51c994df97166a7fd059bc2e`, and native TP4
+inference. Every rank had the expected executable and zero process swap.
+Production was stopped during capture and reference execution. A repeat
+capture reproduced all 9,760 original snapshot files byte for byte, and
+2,040 replicated-state comparisons agreed across ranks. The diagnostic
+probe also passed its native fixture smoke and CUDA memcheck (zero errors).
+
+Each class used its first `serve_load.py` prompt, the published chat
+template, and 32 full-seven greedy draft blocks. The table counts acceptance
+**conditional on every earlier proposal being accepted**. This shorter
+capture is not interchangeable with the earlier 256-token serving sample.
+
+| Class | Position 2 | Position 3 |
+| --- | ---: | ---: |
+| Prose | 14/20 (70.0%) | 6/14 (42.9%) |
+| Code | 20/25 (80.0%) | 11/20 (55.0%) |
+| JSON | 19/31 (61.3%) | 12/19 (63.2%) |
+| Math | 23/30 (76.7%) | 20/23 (87.0%) |
+| Chat | 12/20 (60.0%) | 8/12 (66.7%) |
+
+The independent FP32 head/Markov calculation reproduced all 1,120 proposals;
+head relative RMS error was at most 5.11e-7. Initial feature-fusion error was
+at most 1.26e-5. Initial context K/V error was below 0.00170, and the 155
+transitions between captured blocks had correctly placed committed rows
+with K/V error below 0.000631.
+
+Upstream rounds base vocabulary logits to BF16. Its fused greedy Markov
+path accumulates the bias and addition in FP32; its generic path rounds the
+bias and sum to BF16 too. Applying either rounding path to the captured
+states repaired none of the 38 position-two failures. The fused-style path
+repaired one of 31 position-three failures; the generic path repaired none.
+Recomputing the backbone independently, then applying fused-style sampling,
+still rejected all 38 position-two failures and 30 of 31 position-three
+failures. Consequently, these checks do not support rounding as the main
+cause of the low early acceptance.
+
+This is not full upstream serving parity or proof of the checkpoint's
+maximum achievable acceptance. The independent backbone's hidden-state
+relative RMS differences span 0.0162–0.0855, and both backbone calculations
+consume the captured context cache, whose construction is checked separately.
+Target labels are valid only along the captured proposal prefix: after a
+changed proposal, later labels cannot be used to claim counterfactual
+acceptance. No runtime precision change or accuracy-limit relaxation follows
+from this audit, and it publishes no throughput row.

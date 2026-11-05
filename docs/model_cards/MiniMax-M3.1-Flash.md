@@ -125,6 +125,13 @@ input. The feature projection, vocabulary head, Markov matrices and confidence
 head retain their checkpoint BF16 operands; draft attention/cache also
 remain BF16. Setting activations to `bf16` selects the projection control.
 
+A fresh [early-position acceptance audit](../minimax_native_precision.md#dspark-early-position-acceptance-audit)
+checks draft predictions and committed context separately from final target
+output. Across 160 full-seven blocks, upstream rounding and an independent
+backbone calculation leave almost all position-two and position-three
+rejections in place. This is a bounded diagnostic, not full upstream serving
+parity or a new throughput campaign.
+
 ## API and media
 
 Text chat uses the checkpoint's template and adaptive `<mm:think>` output.
