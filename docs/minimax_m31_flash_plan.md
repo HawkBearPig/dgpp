@@ -143,15 +143,18 @@ width and GQA geometry, Gemma norms, partial RoPE and a 4096-token sliding
 window. It consumes target features from layers `[3,17,31,45,59]` through
 a BF16 `[6144,30720]` projection. Its two vocabulary-by-256 Markov matrices
 and `[1,6400]` confidence projection remain BF16. It shares the target
-embedding and output head. The configured block is **7 proposals**;
-target verification uses the anchor plus those proposals, up to 8 rows.
+embedding and output head. The configured block is **7 proposals**. With
+the upstream default `sample_from_anchor: true`, the draft executes seven
+queries `[anchor, six masks]` and predicts from rows 0–6. Target verification
+uses the anchor plus those proposals, up to eight rows.
 Noise token ID is 200058.
 [Draft configuration](https://huggingface.co/MiniMaxAI/MiniMax-M3.1-Flash/blob/2f33a8b9ae49ce7b51c994df97166a7fd059bc2e/dspark/config.json).
 
 Reuse the speculation protocol and feature-cache concepts, with a new
-MiniMax draft adapter. `DFlash2Config::block_size` currently counts the
-anchor, whereas this checkpoint's DSpark block size counts proposals;
-passing it through unchanged is an off-by-one defect. DeepSeek's DSpark
+MiniMax draft adapter. `DFlash2Config::block_size` counts target verification
+rows, whereas this checkpoint's DSpark block size counts proposals. Keep
+query count, proposal offset and verification width separate: Qwen DFlash2
+skips the anchor prediction, while MiniMax DSpark uses it. DeepSeek's DSpark
 adapter uses a different backbone and feature representation. MiniMax's
 draft queries attend bidirectionally within the proposal block; target
 verification remains causal. Context KV comes from projected target
@@ -1466,3 +1469,84 @@ restores 46,056 tokens, and has zero failures or skipped spills. Its restored
 continuation matches the memory-hit continuation exactly. Both final cache
 boots have zero swap, the recorded executable on every rank and matching
 operation streams. These cache checks do not add throughput rows.
+
+### DSpark prediction and activation correction (2026-11-05)
+
+The original DSpark integration applied Qwen DFlash2's mask-only prediction
+convention to MiniMax. It executed eight draft queries `[anchor, seven masks]`
+and selected proposals from rows 1–7. The pinned SGLang DSpark configuration
+defaults `sample_from_anchor` to true, and MiniMax does not override it:
+seven queries `[anchor, six masks]` predict seven proposals from rows 0–6.
+The extra query also changed bidirectional block attention. Target
+verification rejected the incorrect proposals, explaining why exact final
+transcripts coexisted with poor acceptance. The old DSpark timing and the
+conclusion drawn from it are withdrawn; plain-target campaign results remain
+applicable to their recorded source.
+
+References at SGLang `58484246d26523eaf1a7f16ab524deee288d2120`:
+[configuration default](https://github.com/sgl-project/sglang/blob/58484246d26523eaf1a7f16ab524deee288d2120/python/sglang/srt/speculative/dspark_components/dspark_config.py),
+[query construction and output selection](https://github.com/sgl-project/sglang/blob/58484246d26523eaf1a7f16ab524deee288d2120/python/sglang/srt/speculative/dspark_components/dspark_draft.py),
+[MiniMax configuration](https://github.com/sgl-project/sglang/blob/58484246d26523eaf1a7f16ab524deee288d2120/python/sglang/srt/configs/minimax_vl.py).
+
+The correction separates query rows, proposal offset and target verification
+width. MiniMax uses seven queries and eight verification rows; Qwen retains
+its existing eight-query behavior. Confidence reads the same corrected
+hidden rows as the proposals. Sampled proposal RNG remains keyed to the
+predicted token's position, one after its query position. Capacity checks
+and graph feeds still reserve all eight target rows.
+
+Native activations now reach DSpark's MXFP8 context K/V and five transformer
+layers. Context projection reuses one quantization across layers; gate/up
+share quantized input, and SwiGLU produces the native down-projection input
+without a separate quantization pass. The planner accounts for the shared
+codes and scales. BF16 activation control remains available. Auxiliary BF16
+matrices and draft attention/cache preserve their existing precision.
+
+Source `5a3a5b7c034897338edae8d0a1e8d80317658a56`, server SHA-256
+`bd23e4b27371d757a2e50555b561eeee2d8fbeb3a0cd5a1849ecf99e40ed5227`, passes
+the rebuilt Release warnings-as-errors targets and all ten selected CTest
+entries. These include eleven sampler/kernel cases, twenty-six shared
+Qwen/MiniMax integration cases, BF16/native draft forward fixtures and their
+independent NumPy oracles. The new native eight-slot TP2 graph cases cover
+greedy and sampled replay with changing verification depths. Both DSpark
+configuration unit cases pass. The corrected oracle rejects the saved old
+eight-query output; native context K/V and hidden-state fixture comparisons
+have zero relative RMS error.
+
+Standalone native draft forward passes CUDA memcheck with zero errors.
+The instrumented TP2 graph harness exceeds its ten-second transport watchdog
+and is not counted as a sanitizer pass; the uninstrumented integration suite
+passes. These checks establish the draft implementation's fixture contract,
+not full upstream serving equivalence.
+
+Fresh real-checkpoint full-seven diagnostics recover first-proposal acceptance
+to 61–90% across prose, code, JSON, math and chat. All 45 C1/C8 replies match
+the recorded plain corpus exactly in text, token count and finish reason.
+The shorter-depth diagnostic adds 45 exact comparisons. Both execute native
+target and draft projections with Q8KV4 target caches. Every rank runs the
+recorded executable with zero swap, and operation streams match at teardown.
+These one-repeat tuning probes are separate from the shipped-template
+benchmark campaign; their timings are not replacement release rows.
+
+A final plain/adaptive pair uses the same executable and eight configured
+slots. All 135 replies from full-seven, depth-three and adaptive speculation
+match its 45 fresh plain controls exactly. Adaptive verification chooses
+depths 1/3/5/7, with native C1 cost estimates of 5.6 ms per row and 51.6 ms
+base, and improves decode throughput in all five measured classes at C1
+and C8. The sixteen-slot plain deployment remains the shipped template;
+these short-context diagnostics do not replace its complete campaign.
+All six cold prefill probes across the pair have zero cached tokens.
+
+The fixed native drafter also passes 9/9 API checks, including sampled
+requests, and all eight video cases match fresh plain controls exactly.
+Video cache reuse, future-frame invalidation and streaming continuation
+pass. All eight completed/cancelled conversation replay comparisons match
+their cold controls, with both following turns reusing completed-answer
+state. All five successful diagnostic boots have matching operation streams,
+the recorded executable and zero swap on every rank. The initial depth-three
+driver invocation fails on argument parsing before measuring anything; its
+corrected rerun supplies the depth-three evidence above.
+
+Production and head swap are restored once after validation. All four
+production processes run the original frozen executable with zero swap;
+HTTP health and a chat smoke request pass.

@@ -86,19 +86,44 @@ selection per index head, and 16 selected blocks including the current block
 inside that budget. The cache retains an index key for every token. The
 implementation does not pool those keys, reduce top-k, or add RoPE scaling.
 
-Plain decoding is the default, with sixteen request slots. Full-seven
-DSpark is slower on all five measured C1 classes: 14.6–20.6 decode tokens/s
-versus plain decoding's 21.6–21.9. The idle prefill cap is 2,048 tokens, with
-adaptive chunking while requests decode.
+Plain decoding is the default, with sixteen request slots. The idle prefill
+cap is 2,048 tokens, with adaptive chunking while requests decode. DSpark is
+an optional eight-slot mode; its benefit depends on proposal acceptance,
+verification depth and concurrency.
 
 `engine.mtp: true` enables the bundled five-layer DSpark model. Limit it to
 eight request slots so its complete draft blocks fit the graph. From the
 launcher, use `--knobs='--mtp --mtp-depth 7 --max-concurrency 8'`. Its learned
-block proposes seven tokens; `engine.mtp_depth` must remain seven. The common
+block uses seven query rows `[anchor, six masks]` and predicts from all
+seven rows, starting at the anchor, as in the pinned upstream
+`sample_from_anchor: true` contract. Target verification consumes eight
+rows `[anchor, seven proposals]`; `engine.mtp_depth` must remain seven. The common
 verification schedule can check fewer proposals without changing the draft
 block; fresh slots still verify the full block until confidence is available.
 Use `--no-mtp` to return to plain decoding. Sampled speculation uses
 the full proposal distribution and rejection correction.
+
+For the four-GB10 short-context diagnostic, confidence scheduling uses the
+following additional launcher knobs:
+
+```text
+--mtp-schedule --mtp-schedule-min-depth 1 --mtp-schedule-options 4
+--mtp-schedule-row-ms 5.6 --mtp-schedule-base-ms 51.6
+--mtp-schedule-lambda 0 --mtp-schedule-adapt
+```
+
+The costs come from native C1 passes at full-seven and reduced verification
+widths. They are a starting point for this hardware, not a calibrated cost
+model for every concurrency or context length. The schedule chooses among
+one, three, five and seven verified proposals; the physical draft still
+produces all seven.
+
+DSpark follows `engine.activations`: native mode uses MXFP8 inputs for
+context K/V, QKV, output and all MLP projections. Context K/V shares one
+quantized input across the five layers, and gate/up share their quantized
+input. The feature projection, vocabulary head, Markov matrices and confidence
+head retain their checkpoint BF16 operands; draft attention/cache also
+remain BF16. Setting activations to `bf16` selects the projection control.
 
 ## API and media
 
@@ -162,12 +187,18 @@ identical task scores to BF16 or to an upstream serving runtime.
 
 All 465 load requests succeed, with 385 exact repeat/batch comparisons.
 The separate three-repeat transcripts are stable in all five classes,
-solo/C16 isolation is exact, and all fifteen full-seven DSpark transcripts
-match plain decoding. The API suite passes 9/9 checks. All eighteen context
+solo/C16 isolation is exact. The API suite passes 9/9 checks. All eighteen context
 requests through 512K succeed; each bucket's three transcripts match and
 all cold probes have zero cached tokens. Both campaign boots run the
 recorded binary with zero swap on all four ranks and matching operation
 streams.
+
+The original campaign's DSpark timing is withdrawn: its predictions skipped
+the anchor row, and its projections used BF16 activations even in native
+mode. Exact final transcripts did not expose this defect because target
+verification rejected the incorrect proposals. The corrected drafter's
+geometry, numerical checks and fresh integration evidence are recorded in
+the [implementation record](../minimax_m31_flash_plan.md).
 
 The Release warnings-as-errors build and rebuilt targeted native tests pass,
 including all four precision combinations, graph replay and generated-prefix

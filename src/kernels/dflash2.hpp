@@ -142,7 +142,7 @@ void dflash2_sample_candidates(const int32_t* ids, const float* scores, int k, i
                                int32_t* token, int64_t* next_anchor, int32_t* record_ids,
                                cudaStream_t stream, const int64_t* pos = nullptr,
                                const SampleSpec* spec = nullptr, DraftProposal* proposal = nullptr,
-                               DraftProposal* proposal_host = nullptr);
+                               DraftProposal* proposal_host = nullptr, int position_offset = 0);
 
 // ---- the recorded block draft (the graph engine's block proposal) -------------
 //

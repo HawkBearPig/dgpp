@@ -123,6 +123,7 @@ MinimaxModel::MinimaxModel(const MinimaxConfig& c, const std::string& checkpoint
     host.vocab_begin = lm_vocab_begin_;
     host.rank = rank;
     host.world = world;
+    host.native_activations = native;
     host.stream = stream_;
     host.max_requests = max_requests_;
     host.max_tokens = max_tokens_;
@@ -231,7 +232,7 @@ MinimaxModel::MemoryPlan MinimaxModel::plan_memory(const MinimaxConfig& c, int t
   if (mtp) {
     std::vector<std::pair<std::string, size_t>> entries;
     DFlash2Drafter::plan_entries(*c.dspark, world, decode, t, slots, V, false, &entries,
-                                 minimax_dspark_weights_bytes(*c.dspark, world));
+                                 minimax_dspark_weights_bytes(*c.dspark, world), native);
     for (const auto& [name, bytes] : entries) plan.add(name, bytes);
   }
   return plan;

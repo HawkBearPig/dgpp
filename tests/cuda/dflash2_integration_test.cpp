@@ -241,13 +241,14 @@ auto check_graph(Factory make, uint16_t port, bool sampled = false, bool screene
   return transcripts[0];
 }
 
-auto minimax_factory(bool draft = true, int slots = 2) {
+auto minimax_factory(bool draft = true, int slots = 2, bool native = false) {
   const std::string dir = "minimax_dspark_target_fixture";
   const auto cfg = dgpp::MinimaxConfig::from_json_file(dir + "/config.json");
   return [=](dgpp::BoundaryReducer* reducer, int rank, int world) {
     return std::make_unique<dgpp::MinimaxModel>(cfg, dir, 256, 1024,
                                                 dgpp::LoaderResidency::Resident, reducer, rank,
-                                                world, slots, draft, slots * 8);
+                                                world, slots, draft, slots * 8,
+                                                dgpp::LatentFormat::kBf16, false, native);
   };
 }
 auto flash_factory() {
@@ -383,6 +384,12 @@ DGPP_TEST(minimax_dspark_eight_slot_graph_tp) {
 }
 DGPP_TEST(minimax_dspark_eight_slot_sampled_graph_tp) {
   check_graph<dgpp::MinimaxModel>(minimax_factory(true, 8), 29978, true, false, nullptr, 8);
+}
+DGPP_TEST(minimax_dspark_native_eight_slot_graph_tp) {
+  check_graph<dgpp::MinimaxModel>(minimax_factory(true, 8, true), 29978, false, false, nullptr, 8);
+}
+DGPP_TEST(minimax_dspark_native_eight_slot_sampled_graph_tp) {
+  check_graph<dgpp::MinimaxModel>(minimax_factory(true, 8, true), 29978, true, false, nullptr, 8);
 }
 DGPP_TEST(minimax_dspark_eight_slot_verify_logits) {
   auto model = minimax_factory(true, 8)(nullptr, 0, 1);
