@@ -34,8 +34,8 @@ class NativeReference(Reference):
         self.native_cache = native_cache
         self.phase = phase
         self.attention_arithmetic = attention_arithmetic
-        if attention_arithmetic == 'triton-fixed' and (phase != 'prefill' or not native_cache):
-            raise ValueError('the fixed native attention control requires the prefill formula and native cache')
+        if attention_arithmetic == 'triton-fixed' and not native_cache:
+            raise ValueError('the fixed native attention control requires native cache')
         if native_activations:
             module, fused = load_producers(sglang_source)
             self.mx_quant = module.mxfp8_quantize_swizzled
@@ -172,9 +172,9 @@ class NativeReference(Reference):
             act = (g / (1 + torch.exp(-c['swiglu_alpha'] * g)) * (u + 1)).to(torch.bfloat16)
         return self.parts(act, base + down, rounded=True)
 
-    def attention(self, n, layer):
+    def attention(self, n, layer, *, prefill_tokens=None):
         if not self.native_cache:
-            return super().attention(n, layer)
+            return super().attention(n, layer, prefill_tokens=prefill_tokens)
         c, rows = self.c, len(n)
         qh, kh, dim = c['num_attention_heads'], c['num_key_value_heads'], c['head_dim']
         ih = c['sparse_attention_config']['sparse_num_index_heads']
@@ -191,10 +191,23 @@ class NativeReference(Reference):
         if self.attention_arithmetic == 'triton-fixed':
             import minimax_native_reference_attention as fixed
             selected = msa.select_blocks(iq, ik, positions, topk, score_fn=fixed.scores)
-            output = fixed.attention(q, k, v, selected, positions)
+            calculate = fixed.attention
         else:
             selected = msa.select_blocks(iq, ik, positions, topk)
-            output = msa.attention(q, k, v, selected, positions, self.phase)
+            calculate = msa.attention
+        if self.phase == 'upstream':
+            if prefill_tokens is None or not 1 <= prefill_tokens <= rows:
+                raise ValueError('upstream phase requires the manifest prompt boundary')
+            # A prompt of P tokens produces the first scored target from row
+            # P-1 using prefill. Rows P onward consume continuation tokens.
+            output = torch.cat([
+                calculate(q[:prefill_tokens], k, v, selected[:prefill_tokens],
+                          positions[:prefill_tokens], phase='prefill'),
+                calculate(q[prefill_tokens:], k, v, selected[prefill_tokens:],
+                          positions[prefill_tokens:], phase='decode')
+            ]) if prefill_tokens < rows else calculate(q, k, v, selected, positions, phase='prefill')
+        else:
+            output = calculate(q, k, v, selected, positions, phase=self.phase)
         return self.fold(self.parts(output.flatten(1), base + 'o_proj'))
 
     def check_stages(self, engine, output, layers=0):
@@ -234,7 +247,8 @@ def main():
     mode.add_argument('--check-engine-dir', type=Path)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--world', type=int, choices=(1, 2, 4), default=4)
-    parser.add_argument('--attention-phase', choices=('prefill', 'decode'), default='prefill')
+    parser.add_argument('--attention-phase', choices=('prefill', 'decode', 'upstream'), default='prefill',
+                        help='upstream uses prefill for the manifest prompt and decode for its continuation')
     parser.add_argument('--attention-arithmetic', choices=('torch', 'triton-fixed'), default='torch')
     parser.add_argument('--bf16-activations', action='store_true')
     parser.add_argument('--bf16-cache', action='store_true')
@@ -243,6 +257,8 @@ def main():
     parser.add_argument('--dump-states', action='store_true')
     parser.add_argument('--check-layers', type=int, default=0)
     args = parser.parse_args()
+    if args.check_engine_dir and args.attention_phase == 'upstream':
+        parser.error('--attention-phase upstream requires --manifest with a prompt boundary')
     reference = NativeReference(args.checkpoint_dir, args.world, args.sglang_source,
                                 args.attention_phase, not args.bf16_activations, not args.bf16_cache,
                                 args.projection_backend, args.elementwise_backend, args.attention_arithmetic)

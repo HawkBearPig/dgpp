@@ -268,6 +268,20 @@ explicitly in the full reference with:
 --attention-arithmetic triton-fixed
 ```
 
+The attention control also supports the upstream online decode formula.
+Its FP8 dot order and FP32 reductions remain fixed while it removes the
+prefill page-output BF16 boundary and uses decode's running maximum and
+accumulator. Both formulas pass the independent mathematical oracle's
+`0.004` RMS gate and preserve results across 1-, 8- and 17-row splits.
+
+For a full-model phase comparison, add `--attention-phase upstream` to a
+manifest run. The manifest's `score_from` is the prompt length: prompt
+rows use prefill, including the last prompt row that predicts the first
+scored token, and subsequent rows use decode. `prefill` and `decode`
+explicitly apply one formula throughout. This comparison isolates the
+phase formulas; it still does not execute or certify the upstream GPU
+serving stack.
+
 With all three controls, the corrected native engine matches all 20
 synthetic sublayer/residual traces bit for bit over 384 positions. Its
 likelihood comparison has zero argmax changes and zero changes over 1 nat.

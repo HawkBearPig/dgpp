@@ -153,7 +153,7 @@ class Reference:
         lo, hi = x[...,:d//2].float(), x[...,d//2:d].float()
         return torch.cat((lo*cs-hi*sn, hi*cs+lo*sn, x[...,d:].float()),dim=-1).to(torch.bfloat16)
 
-    def attention(self, n, layer):
+    def attention(self, n, layer, *, prefill_tokens=None):
         c, t = self.c, n.shape[0]
         qh, kh, d = c['num_attention_heads'], c['num_key_value_heads'], c['head_dim']
         ih = c['sparse_attention_config']['sparse_num_index_heads']
@@ -329,7 +329,7 @@ class Reference:
             for case_index,(x,n) in enumerate(zip(inputs,states)):
                 p = f'language_model.model.layers.{layer}.'
                 record(case_index,'input_norm',layer,n)
-                a = self.attention(n,layer)
+                a = self.attention(n, layer, prefill_tokens=cases[case_index].get('score_from', 1))
                 record(case_index,'attention',layer,a)
                 x,n = self.add_norm(x,a,p+'post_attention_layernorm')
                 record(case_index,'ffn_norm',layer,n)
