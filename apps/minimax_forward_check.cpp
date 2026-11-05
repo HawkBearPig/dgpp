@@ -64,10 +64,11 @@ void score(const dgpp::MinimaxModel::Outputs& out, int row, int step, int64_t ta
       mx + std::log(sum), value);
 }
 }  // namespace
+#include "minimax_draft_audit.hpp"
 int main(int argc, char** argv) {
   try {
-    std::string model, checkpoint, text, teacher, ids_text, dump, peer, images;
-    int rank = 0, world = 1, port = 29950, rows = 1, score_from = 1;
+    std::string model, checkpoint, text, teacher, ids_text, dump, peer, images, draft_manifest;
+    int rank = 0, world = 1, port = 29950, rows = 1, score_from = 1, draft_rounds = 16;
     bool resident = false, native = false;
     dgpp::LatentFormat format = dgpp::LatentFormat::kBf16;
     const auto next = [&](int& i) {
@@ -76,7 +77,11 @@ int main(int argc, char** argv) {
     };
     for (int i = 1; i < argc; ++i) {
       const std::string a = argv[i];
-      if (a == "--model")
+      if (a == "--draft-manifest")
+        draft_manifest = next(i);
+      else if (a == "--draft-rounds")
+        draft_rounds = std::stoi(next(i));
+      else if (a == "--model")
         model = next(i);
       else if (a == "--checkpoint-dir")
         checkpoint = next(i);
@@ -129,6 +134,9 @@ int main(int argc, char** argv) {
         throw std::runtime_error("--teacher-file is exclusive with --text, --ids and --dump-dir");
       text = read(teacher);
     }
+    const auto audit_cases = draft_manifest.empty() ? std::vector<DraftAuditCase>{} : draft_audit_cases(draft_manifest);
+    if (!audit_cases.empty() && (!teacher.empty() || !text.empty() || !ids_text.empty() || draft_rounds < 1 || draft_rounds > 256))
+      throw std::runtime_error("draft audit requires exclusive manifest input and 1..256 rounds");
     std::vector<int64_t> ids;
     if (!text.empty()) {
       const auto tok = dgpp::text::Tokenizer::load(checkpoint + "/tokenizer.json");
@@ -138,6 +146,8 @@ int main(int argc, char** argv) {
       std::string item;
       while (std::getline(input, item, ',')) ids.push_back(std::stoll(item));
     }
+    if (!audit_cases.empty())
+      for (const auto& c : audit_cases) if (c.ids.size() > ids.size()) ids = c.ids;
     if (ids.empty() || (!teacher.empty() && ids.size() < 2))
       throw std::runtime_error("empty token input");
     if (score_from < 1 || static_cast<size_t>(score_from) > ids.size() ||
@@ -158,7 +168,9 @@ int main(int argc, char** argv) {
     cfg.validate_tp(rank, world);
     if (!images.empty())
       dgpp::MinimaxLayerStream::set_resident_image_dir(images == "off" ? "" : images);
-    const int forward_rows = teacher.empty() ? static_cast<int>(ids.size()) : std::max({rows, score_from, 16});
+    const int forward_rows = teacher.empty()
+                                 ? std::max(audit_cases.empty() ? 1 : 16, static_cast<int>(ids.size()))
+                                 : std::max({rows, score_from, 16});
     std::unique_ptr<dgpp::net::CollectiveBus> bus;
     std::unique_ptr<dgpp::BusBoundaryReducer> boundary;
     if (world > 1) {
@@ -171,10 +183,14 @@ int main(int argc, char** argv) {
       boundary = std::make_unique<dgpp::BusBoundaryReducer>(*bus, 600000);
     }
     dgpp::MinimaxModel engine(
-        cfg, checkpoint, forward_rows, ids.size() + 128,
+        cfg, checkpoint, forward_rows, ids.size() + 128 + (audit_cases.empty() ? 0 : 8 * draft_rounds),
         resident ? dgpp::LoaderResidency::Resident : dgpp::LoaderResidency::Streaming,
-        boundary.get(), rank, world, 1, false, std::max(rows, 8), format, false, native);
+        boundary.get(), rank, world, 1, !audit_cases.empty(), std::max(rows, 8), format, false, native);
     if (resident) engine.graph_prepare();
+    if (!audit_cases.empty()) {
+      audit_draft(engine, audit_cases, draft_rounds, dump, bus.get(), rank, world, native, format);
+      return 0;
+    }
     if (!teacher.empty()) {
       std::vector<uint64_t> hashes;
       for (int trial = 0; trial < 2; ++trial) {
