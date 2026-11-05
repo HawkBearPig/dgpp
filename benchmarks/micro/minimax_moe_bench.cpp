@@ -3,6 +3,7 @@
 // not serving throughput or a deployment campaign.
 #include <algorithm>
 #include <cstdio>
+#include <filesystem>
 #include <fstream>
 #include <stdexcept>
 #include <string>
@@ -50,7 +51,8 @@ struct Events {
 
 int main(int argc, char** argv) {
   try {
-    std::string checkpoint, input;
+    std::string checkpoint, input, dump_out;
+    bool native = false;
     int rank = 0, world = 4, layer = 3, iterations = 50;
     const auto next = [&](int& i) {
       if (++i == argc) throw std::runtime_error("missing argument value");
@@ -70,6 +72,10 @@ int main(int argc, char** argv) {
         layer = std::stoi(next(i));
       else if (arg == "--iterations")
         iterations = std::stoi(next(i));
+      else if (arg == "--native-activations")
+        native = true;
+      else if (arg == "--dump-out")
+        dump_out = next(i);
       else
         throw std::runtime_error("unknown option " + arg);
     }
@@ -92,15 +98,17 @@ int main(int argc, char** argv) {
     dgpp::MinimaxLayerStream loader(cfg, checkpoint, rank, world, dgpp::LoaderResidency::Resident,
                                     dgpp::LoaderHeadSharding::VocabSharded);
     const auto& weights = loader.load_layer(layer).moe_w;
-    dgpp::MinimaxMoeLayer moe(cfg, geometry, max_rows);
+    dgpp::MinimaxMoeLayer moe(cfg, geometry, max_rows, native);
     cudaStream_t stream = nullptr;
     DGPP_CUDA_OK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
     moe.prepare_table(layer, weights, stream);
     Device dx(elements), dy(elements);
     DGPP_CUDA_OK(cudaMemcpy(dx.p, x.data(), elements * sizeof(uint16_t), cudaMemcpyHostToDevice));
     Events clock;
-    std::printf("MiniMax MoE kernel diagnostic: rank=%d world=%d layer=%d hidden=%d inter=%lld\n",
-                rank, world, layer, cfg.hidden_size, static_cast<long long>(geometry.local_inter));
+    std::printf("MiniMax MoE kernel diagnostic: rank=%d world=%d layer=%d hidden=%d inter=%lld activations=%s\n",
+                rank, world, layer, cfg.hidden_size, static_cast<long long>(geometry.local_inter),
+                native ? "native" : "bf16");
+    if (!dump_out.empty()) std::filesystem::create_directories(dump_out);
     std::printf("rows,reference_us,compact_us,narrow_us,compact_speedup,narrow_speedup,outputs\n");
     for (int rows : {1, 2, 4, 8, 16, 17, 24, 32, 33, 64}) {
       Graph graphs[3];
@@ -123,6 +131,13 @@ int main(int argc, char** argv) {
           reference = std::move(got);
         else if (got != reference)
           throw std::runtime_error("expert scheduling changed a BF16 output");
+      }
+      if (!dump_out.empty()) {
+        const auto path = std::filesystem::path(dump_out) /
+                          ("layer" + std::to_string(layer) + "-rows" + std::to_string(rows) + ".bf16");
+        std::ofstream file(path, std::ios::binary);
+        file.write(reinterpret_cast<const char*>(reference.data()), reference.size() * sizeof(uint16_t));
+        if (!file) throw std::runtime_error("cannot write benchmark output");
       }
       std::vector<double> times[3];
       for (int trial = 0; trial < 5; ++trial)
