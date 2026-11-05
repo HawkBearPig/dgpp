@@ -16,13 +16,16 @@ struct VisionSpec {
   ImageTokens ids;
   std::string start_text, pad_text, end_text;
   ImagePreprocess preprocess;
+  int64_t video_id = -1;
+  std::string video_text = {};
 };
 
 class VisionFrontend : public TextFrontend {
  public:
   VisionFrontend(const dgpp::text::Tokenizer* tok, const dgpp::text::ChatTemplate* tpl,
-                 VisionSpec spec);
+                 VisionSpec spec, bool model_opens_thinking = false);
   bool supports_images() const override { return true; }
+  bool supports_video() const override;
   ChatInput prepare_chat(const minijson::Value& globals) const override;
   const VisionSpec& spec() const { return spec_; }
 

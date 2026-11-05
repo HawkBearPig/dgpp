@@ -120,3 +120,15 @@ Tokens that decode to no text leave the grammar state unchanged. Argument
 names must remain distinct even when `additionalProperties: true` allows
 undeclared names. Truncated or malformed calls still return as literal
 content; reaching the generation limit retains `finish_reason: length`.
+
+MiniMax M3.1 calls use a namespace before every recursive XML tag. Nested
+objects, arrays and empty containers retain their schema types, including
+numeric-looking strings. All invokes in a block are returned together;
+malformed or truncated blocks remain literal content. Its grammar enforces
+required arguments, typed values and distinct keys, and supports adaptive
+reasoning before a call or JSON answer. The template omits null fields.
+Required schemas without a finite non-null XML spelling, `anyOf` with
+multiple non-null alternatives, and container `enum`/`const` are refused
+with the offending field named. Nullable single-alternative schemas and
+scalar enums are supported; JSON response schemas keep the normal JSON
+grammar's capabilities.

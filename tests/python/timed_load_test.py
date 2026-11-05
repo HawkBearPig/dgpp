@@ -190,7 +190,7 @@ def serving_fixture(delayed, isolation_change=None, require_default_thinking=Fal
         def do_POST(self):
             request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             if require_default_thinking and "chat_template_kwargs" in request:
-                self.send_error(400, "thinking toggle unsupported")
+                self.send_error(400, "enable_thinking is unsupported")
                 return
             tokens = request["max_tokens"]
             text = "fixture answer"
@@ -300,6 +300,9 @@ class TimedLoadCliTest(unittest.TestCase):
                         self.assertEqual(report["schema_version"], 1)
                         self.assertEqual(report["phases"], [])
                         self.assertEqual(report["temperature"], .7)
+                        self.assertEqual(report["thinking"], "server_default" if fallback else False)
+                        self.assertFalse(report["thinking_requested"])
+                        self.assertEqual(report["thinking_switch_unsupported"], fallback)
                         self.assertEqual(len(state["requests"]), 3)
                         isolation = report["isolation"]
                         self.assertFalse(isolation["matched"])

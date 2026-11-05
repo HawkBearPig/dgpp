@@ -280,6 +280,10 @@ ClusterConfig parse_cluster_config(const std::string& json, const std::string& w
           e.prefill_activations = text(x, ek, what);
           if (e.prefill_activations != "bf16" && e.prefill_activations != "native")
             fail(what, "'" + ek + "' must be \"bf16\" or \"native\"");
+        } else if (p.key == "activations") {
+          e.activations = text(x, ek, what);
+          if (e.activations != "bf16" && e.activations != "native")
+            fail(what, "'" + ek + "' must be \"bf16\" or \"native\"");
         } else if (p.key == "prefill_attention") {
           e.prefill_attention = text(x, ek, what);
           if (e.prefill_attention != "bf16" && e.prefill_attention != "fp8")
@@ -424,7 +428,8 @@ ClusterConfig parse_cluster_config(const std::string& json, const std::string& w
         else if (p.key == "dflash_draft_batch") e.dflash_draft_batch = boolean(x, ek, what);
         else if (p.key == "dflash_depth") e.dflash_depth = static_cast<int>(integer(x, ek, what, 0, 7));
         else if (p.key == "mtp_depth") {
-          e.mtp_depth = static_cast<int>(integer(x, ek, what, 1, 5));  // the MTP families' chains; the DFlash2 block is its checkpoint's
+          e.mtp_depth = static_cast<int>(
+              integer(x, ek, what, 1, 7));  // The loaded family validates its own draft width.
           e.mtp_depth_set = true;
         } else if (p.key == "compact_batches")
           e.compact_batches = boolean(x, ek, what);
@@ -439,7 +444,8 @@ ClusterConfig parse_cluster_config(const std::string& json, const std::string& w
         } else if (p.key == "mtp_schedule_lambda") {
           e.mtp_schedule_lambda = number(x, ek, what);
           if (!(e.mtp_schedule_lambda >= 0.0)) fail(what, "'" + ek + "' must be >= 0 (0: the reservation rate)");
-        } else if (p.key == "mtp_schedule_min_depth") e.mtp_schedule_min_depth = static_cast<int>(integer(x, ek, what, 1, 5));
+        } else if (p.key == "mtp_schedule_min_depth")
+          e.mtp_schedule_min_depth = static_cast<int>(integer(x, ek, what, 1, 7));
         else if (p.key == "mtp_schedule_options") e.mtp_schedule_options = static_cast<int>(integer(x, ek, what, 0, 6));
         else if (p.key == "mtp_schedule_adapt") e.mtp_schedule_adapt = boolean(x, ek, what);
         else if (p.key == "mtp_schedule_sampled_scale") {

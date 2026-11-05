@@ -152,7 +152,7 @@ class Tokenizer {
   uint64_t revision_hash_ = 0;
   int64_t max_id_ = -1;
   // The pinned shape this file matched at load.
-  enum class Pattern { Glm, Qwen, Dsv41, Qwen2, Flint, Nemotron };
+  enum class Pattern { Glm, Qwen, Dsv41, Qwen2, Flint, Nemotron, Minimax };
   Pattern pattern_ = Pattern::Glm;
   bool nfc_ = false;           // normalizer NFC (Qwen)
   bool ignore_merges_ = true;  // model.ignore_merges

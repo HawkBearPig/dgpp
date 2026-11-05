@@ -205,6 +205,8 @@ def _stream_one(host, port, model, prompt, max_tokens, think, out, temperature, 
     }
     if not think:
         body["chat_template_kwargs"] = {"enable_thinking": False}
+    out["thinking"] = "server_default" if think else False
+    out["thinking_switch_unsupported"] = False
     conn = http.client.HTTPConnection(host, port, timeout=900)
     t0 = time.perf_counter()
     try:
@@ -212,7 +214,13 @@ def _stream_one(host, port, model, prompt, max_tokens, think, out, temperature, 
                      headers={"Content-Type": "application/json"})
         resp = conn.getresponse()
         if resp.status == 400 and not think:
-            # The template has no thinking knob: plain.
+            # A missing switch may mean adaptive or always-on reasoning.
+            # Retry only this named rejection and report the effective mode.
+            error = resp.read(2048)
+            if b"enable_thinking" not in error:
+                raise RuntimeError(f"HTTP 400: {error!r}")
+            out["thinking"] = "server_default"
+            out["thinking_switch_unsupported"] = True
             conn.close()
             body.pop("chat_template_kwargs", None)
             conn = http.client.HTTPConnection(host, port, timeout=900)
@@ -277,7 +285,7 @@ def main(*, phase_runner=None, settle=None):
     ap.add_argument("--max-tokens", type=int, default=320)
     ap.add_argument("--repeat", type=int, default=1, help="repeat each phase with identical prompts; report medians")
     ap.add_argument("--json-out", help="write raw requests and explicitly scoped rates for regression comparisons")
-    ap.add_argument("--think", action="store_true", help="leave the template's thinking on")
+    ap.add_argument("--think", action="store_true", help="use the server's default reasoning mode")
     ap.add_argument("--warm", type=int, default=1, help="warm requests before the phases")
     ap.add_argument("--isolation", type=int, default=0, metavar="C",
                     help="the transcript-isolation check: prompt 0 alone, then beside C-1 others; its text must match")
@@ -295,8 +303,15 @@ def main(*, phase_runner=None, settle=None):
     isolation = None
     def save():
         if args.json_out:
+            requests = [r for phase in reports for r in phase["requests"]]
+            if isolation is not None:
+                requests += [isolation["alone"]] + isolation["batched"]
+            modes = {r.get("thinking", "server_default" if args.think else False) for r in requests}
+            effective = next(iter(modes)) if len(modes) == 1 else "mixed" if modes else "server_default" if args.think else False
             report = {"schema_version": 1, "model": model, "max_tokens": args.max_tokens,
-                      "temperature": args.temperature, "thinking": args.think,
+                      "temperature": args.temperature, "thinking": effective,
+                      "thinking_requested": "server_default" if args.think else False,
+                      "thinking_switch_unsupported": any(r.get("thinking_switch_unsupported", False) for r in requests),
                       "phases": reports}
             if isolation is not None:
                 report["isolation"] = isolation
