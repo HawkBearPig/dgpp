@@ -393,6 +393,146 @@ __global__ __launch_bounds__(kThreads) void minimax_attn_nvfp4_decode_kernel(
             __bfloat16_as_ushort(__float2bfloat16_rn(result[j][component] / fmaxf(denominators[h], 1.f)));
     }
 }
+// Parallelize the page products without changing the online decode formula.
+// Scratch c first holds QK scores, then raw FP32 PV partials. Page maxima
+// determine the same running maximum before each probability quantizer;
+// the final kernel folds those partials in the original page order.
+__global__ __launch_bounds__(kThreads) void minimax_decode_page_qk_kernel(
+    const uint8_t* q, const uint8_t* k, const int32_t* req, const int64_t* positions,
+    const int32_t* table, int table_stride, const int32_t* selected, int heads, int kv_heads,
+    int topk, float* maxima, float* output) {
+  dgpp_pdl_wait();
+  extern __shared__ __align__(16) uint8_t smem[];
+  uint8_t* keys = smem;
+  uint8_t* queries = smem + kCacheBytes;
+  float* scores = reinterpret_cast<float*>(queries + kQueryBytes);
+  const int row = blockIdx.x, page = blockIdx.y, kv = blockIdx.z;
+  const int hpk = heads / kv_heads, first_head = kv * hpk;
+  const int tid = threadIdx.x, warp = tid / 32, lane = tid % 32;
+  const int block = selected[(static_cast<int64_t>(row) * kv_heads + kv) * topk + page];
+  const int64_t position = positions[row];
+  const int64_t base = (static_cast<int64_t>(row) * topk + page) * heads + first_head;
+  if (block < 0 || position < static_cast<int64_t>(block) * 128) {
+    if (tid < hpk) maxima[base + tid] = -INFINITY;
+    return;
+  }
+  const int physical = table[static_cast<int64_t>(req[row]) * table_stride + block];
+  const int visible = static_cast<int>(min(int64_t(128), position - static_cast<int64_t>(block) * 128 + 1));
+  const int64_t cache_start = static_cast<int64_t>(physical) * 128;
+  for (int i = tid; i < 16 * 128; i += kThreads) {
+    const int h = i / 128, d = i % 128;
+    queries[h * kStride + d] = h < hpk ? q[(static_cast<int64_t>(row) * heads + first_head + h) * 128 + d] : 0;
+  }
+  for (int i = tid; i < 128 * 32; i += kThreads) {
+    const int token = i / 32, d = (i % 32) * 4;
+    *reinterpret_cast<uint32_t*>(keys + token * kStride + d) = token < visible
+        ? minimax_cached_fp8x4(k + ((cache_start + token) * kv_heads + kv) * kMinimaxNvfp4HeadBytes, d) : 0;
+  }
+  __syncthreads();
+  float qk[4][4] = {};
+  product(queries, keys, qk);
+#pragma unroll
+  for (int j = 0; j < 4; ++j)
+#pragma unroll
+    for (int component = 0; component < 4; ++component) {
+      const int h = lane / 4 + (component / 2) * 8;
+      const int token = warp * 32 + j * 8 + (lane % 4) * 2 + component % 2;
+      const float value = token < visible ? qk[j][component] * .08838834764831845f : -INFINITY;
+      scores[h * 128 + token] = value;
+      if (h < hpk) output[(base + h) * 128 + token] = value;
+    }
+  __syncthreads();
+  for (int h = warp; h < hpk; h += 4) {
+    float maximum = -INFINITY;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) maximum = fmaxf(maximum, scores[h * 128 + lane + j * 32]);
+#pragma unroll
+    for (int offset = 16; offset; offset >>= 1)
+      maximum = fmaxf(maximum, __shfl_xor_sync(~0u, maximum, offset));
+    if (lane == 0) maxima[base + h] = maximum;
+  }
+}
+
+__global__ __launch_bounds__(kThreads) void minimax_decode_page_pv_kernel(
+    const uint8_t* v, const int32_t* req, const int64_t* positions, const int32_t* table,
+    int table_stride, const int32_t* selected, int heads, int kv_heads, int topk,
+    const float* maxima, float* sums, float* partial) {
+  dgpp_pdl_wait();
+  extern __shared__ __align__(16) uint8_t smem[];
+  uint8_t* values = smem;
+  uint8_t* probabilities = smem + kCacheBytes;
+  const int row = blockIdx.x, page = blockIdx.y, kv = blockIdx.z;
+  const int hpk = heads / kv_heads, first_head = kv * hpk;
+  const int tid = threadIdx.x, warp = tid / 32, lane = tid % 32;
+  const int block = selected[(static_cast<int64_t>(row) * kv_heads + kv) * topk + page];
+  const int64_t position = positions[row];
+  const int64_t base = (static_cast<int64_t>(row) * topk + page) * heads + first_head;
+  if (block < 0 || position < static_cast<int64_t>(block) * 128) {
+    if (tid < hpk) sums[base + tid] = 0;
+    for (int i = tid; i < hpk * 128; i += kThreads) partial[base * 128 + i] = 0;
+    return;
+  }
+  const int physical = table[static_cast<int64_t>(req[row]) * table_stride + block];
+  const int visible = static_cast<int>(min(int64_t(128), position - static_cast<int64_t>(block) * 128 + 1));
+  const int64_t cache_start = static_cast<int64_t>(physical) * 128;
+  for (int h = warp; h < 16; h += 4) {
+    float maximum = -INFINITY;
+    if (h < hpk)
+      for (int p = 0; p <= page; ++p)
+        maximum = fmaxf(maximum, maxima[(static_cast<int64_t>(row) * topk + p) * heads + first_head + h]);
+    float total = 0;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const int token = lane + j * 32;
+      const float probability = h < hpk ? expf(partial[(base + h) * 128 + token] - maximum) * 448.f : 0.f;
+      total += probability;
+      probabilities[h * kStride + token] = __nv_fp8_e4m3(probability).__x;
+    }
+#pragma unroll
+    for (int offset = 16; offset; offset >>= 1) total += __shfl_xor_sync(~0u, total, offset);
+    if (lane == 0 && h < hpk) sums[base + h] = total;
+  }
+  for (int i = tid; i < 128 * 32; i += kThreads) {
+    const int token = i / 32, d = (i % 32) * 4;
+    const uint32_t packed = token < visible
+        ? minimax_cached_fp8x4(v + ((cache_start + token) * kv_heads + kv) * kMinimaxNvfp4HeadBytes, d) : 0;
+#pragma unroll
+    for (int j = 0; j < 4; ++j)
+      values[(d + j) * kStride + token] = static_cast<uint8_t>(packed >> (j * 8));
+  }
+  // All QK reads must finish before reusing partial for PV output.
+  __syncthreads();
+  float pv[4][4] = {};
+  product(probabilities, values, pv);
+#pragma unroll
+  for (int j = 0; j < 4; ++j)
+#pragma unroll
+    for (int component = 0; component < 4; ++component) {
+      const int h = lane / 4 + (component / 2) * 8;
+      const int d = warp * 32 + j * 8 + (lane % 4) * 2 + component % 2;
+      if (h < hpk) partial[(base + h) * 128 + d] = pv[j][component];
+    }
+}
+
+__global__ void minimax_decode_combine_kernel(const float* maxima, const float* sums,
+                                              const float* partial, int heads, int topk,
+                                              uint16_t* output) {
+  dgpp_pdl_wait();
+  const int row = blockIdx.x, head = blockIdx.y, d = threadIdx.x;
+  float maximum = -INFINITY, denominator = 0, result = 0;
+  for (int page = 0; page < topk; ++page) {
+    const int64_t base = (static_cast<int64_t>(row) * topk + page) * heads + head;
+    const float page_max = maxima[base];
+    if (page_max == -INFINITY) continue;
+    const float next = fmaxf(page_max, maximum);
+    const float correction = expf(maximum - next);
+    denominator = __fadd_rn(__fmul_rn(denominator, correction), sums[base]);
+    result = __fadd_rn(__fmul_rn(result, correction), partial[base * 128 + d]);
+    maximum = next;
+  }
+  output[(static_cast<int64_t>(row) * heads + head) * 128 + d] =
+      __bfloat16_as_ushort(__float2bfloat16_rn(result / fmaxf(denominator, 1.f)));
+}
 }  // namespace
 
 void minimax_query_fp8(const uint16_t* input, uint8_t* output, int64_t count, cudaStream_t stream) {
@@ -454,6 +594,26 @@ void minimax_attn_nvfp4_decode(const uint8_t* q, const uint8_t* k, const uint8_t
     throw std::invalid_argument("MiniMax Q8KV4 decode geometry");
   minimax_attn_nvfp4_decode_kernel<<<dim3(rows, kv_heads), kThreads, kAttentionSmem, stream>>>(
       q, k, v, req, positions, table, stride, selected, heads, kv_heads, topk, out);
+  DGPP_CUDA_OK(cudaGetLastError());
+}
+
+void minimax_attn_nvfp4_decode_parallel(const uint8_t* q, const uint8_t* k, const uint8_t* v,
+                                        const int32_t* req, const int64_t* positions,
+                                        const int32_t* table, int stride, const int32_t* selected,
+                                        int rows, int heads, int kv_heads, int topk, float* m,
+                                        float* l, float* c, uint16_t* out, cudaStream_t stream) {
+  if (rows <= 0) return;
+  if (kv_heads <= 0 || heads <= 0 || heads % kv_heads || heads / kv_heads > 16 || topk <= 0 ||
+      topk > 16 || stride <= 0)
+    throw std::invalid_argument("MiniMax Q8KV4 parallel decode geometry");
+  const dim3 grid(rows, topk, kv_heads);
+  minimax_decode_page_qk_kernel<<<grid, kThreads, kAttentionSmem, stream>>>(
+      q, k, req, positions, table, stride, selected, heads, kv_heads, topk, m, c);
+  DGPP_CUDA_OK(cudaGetLastError());
+  minimax_decode_page_pv_kernel<<<grid, kThreads, kCacheBytes + kQueryBytes, stream>>>(
+      v, req, positions, table, stride, selected, heads, kv_heads, topk, m, l, c);
+  DGPP_CUDA_OK(cudaGetLastError());
+  minimax_decode_combine_kernel<<<dim3(rows, heads), 128, 0, stream>>>(m, l, c, heads, topk, out);
   DGPP_CUDA_OK(cudaGetLastError());
 }
 }  // namespace dgpp

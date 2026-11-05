@@ -396,3 +396,19 @@ diagnostics. The regression test additionally checks padded outputs, tail
 columns, short reductions, FP64 error bounds and 1/8/17-row splits across
 all four column tiles. Full-model graph smokes pass in all four precision
 combinations; CUDA memcheck and racecheck pass with no errors or hazards.
+
+## Parallel native decode pages
+
+A C1 diagnostic at roughly 7K context found the serial online attention
+kernel used 31.7 ms of a 77.9 ms decode step, or 42% of GPU time. The
+replacement computes QK and PV for selected pages in parallel, deriving
+each page's running maximum from the page maxima. A final ordered FP32
+fold preserves the original corrections, denominator and accumulator.
+It reuses existing prefill scratch and adds no cache storage.
+
+All five attention fixtures match the serial kernel bit for bit, including
+row splits, padded rows, physical-page permutations and PDL graph replay.
+The independent phase oracle and all four model precision combinations
+pass. The diagnostic will be repeated on the same prompt before the
+shipped-template serving campaign; these profile timings are not release
+throughput rows.

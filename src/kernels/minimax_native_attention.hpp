@@ -39,4 +39,12 @@ void minimax_attn_nvfp4_decode(const uint8_t* q, const uint8_t* k, const uint8_t
                                const int32_t* block_tables, int table_stride,
                                const int32_t* selected, int rows, int heads, int kv_heads,
                                int topk, uint16_t* out, cudaStream_t);
+// Same decode arithmetic, with page products in parallel and an ordered
+// final fold. Reuses prefill scratch: m/l [rows,topk,heads], c [...,128].
+void minimax_attn_nvfp4_decode_parallel(const uint8_t* q, const uint8_t* k, const uint8_t* v,
+                                        const int32_t* req_ids, const int64_t* positions,
+                                        const int32_t* block_tables, int table_stride,
+                                        const int32_t* selected, int rows, int heads, int kv_heads,
+                                        int topk, float* m, float* l, float* c, uint16_t* out,
+                                        cudaStream_t);
 }  // namespace dgpp

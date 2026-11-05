@@ -4,8 +4,8 @@
   "release": "",
   "engine": {
     "max_concurrency": 16,
-    "kv_capacity": 786432,
-    "kv_dtype": "bf16",
+    "kv_capacity": 2097152,
+    "kv_dtype": "nvfp4",
     "bf16_weights": "bf12+bf16",
     "default_max_tokens": 32768,
     "queue_limit": 32,
@@ -17,7 +17,8 @@
     "admission_window": 256,
     "sampling_candidates": 128,
     "stats_interval_s": 10,
-    "prefill_idle_budget_tokens": 2048
+    "prefill_idle_budget_tokens": 2048,
+    "activations": "native"
   },
   "nvme_cache": {
     "enabled": false,

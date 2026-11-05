@@ -170,9 +170,9 @@ void MinimaxAttentionLayer::enqueue(const MinimaxAttnResident& w, const uint16_t
   minimax_index_select(a.scores, rows.pos, tokens, w.local_index_heads, a.max_blocks,
                        a.cfg.sparse_topk_blocks, a.selected, stream);
   if (a.format == LatentFormat::kFp4 && rows.decode) {
-    minimax_attn_nvfp4_decode(a.q8, cache.k_nvfp4, cache.v_nvfp4, rows.req_ids, rows.pos,
+    minimax_attn_nvfp4_decode_parallel(a.q8, cache.k_nvfp4, cache.v_nvfp4, rows.req_ids, rows.pos,
                               cache.block_tables, cache.blocks_per_request, a.selected, tokens,
-                              w.local_heads, w.local_kv_heads, a.cfg.sparse_topk_blocks, a.attn,
+                              w.local_heads, w.local_kv_heads, a.cfg.sparse_topk_blocks, a.m, a.l, a.c, a.attn,
                               stream);
   } else if (a.format == LatentFormat::kFp4) {
     minimax_attn_nvfp4_partial(a.q8, cache.k_nvfp4, cache.v_nvfp4, rows.req_ids, rows.pos,

@@ -29,20 +29,20 @@ download. All 73 files in the pinned snapshot have been checksum-verified on
 the four development nodes.
 
 The deployment template reserves sixteen request slots and a shared
-786,432-token BF16 pool. Pool capacity is shared by active and cached requests;
+2,097,152-token NVFP4 pool. Pool capacity is shared by active and cached requests;
 it is not a per-request allowance at every concurrency. The checkpoint's
-positional ceiling is 1,048,576, but this template does not reserve that many
-tokens. This pool has loaded successfully on all four nodes with zero
-process swap. The BF16 control passes retrieval, prefix reuse and concurrent
-streams through 512K; validation at the template's maximum remains pending.
+positional ceiling is 1,048,576. The larger shared pool provides concurrency
+headroom; it does not extend that ceiling. The native pool has loaded on all
+four nodes with zero process swap. The BF16 control passes retrieval, prefix
+reuse and concurrent streams through 512K; native long-context quality
+validation remains pending.
 
 ## Numerical recipe and drafting
 
 The published NVFP4 expert and MXFP8 dense weights remain compressed in memory.
-The provisional deployment uses BF16 activations, FP32 routing and attention
-probabilities, and BF16 main K/V and index-key caches. Native activation
-quantization and compressed caches are separate precision choices and are not
-enabled by this template. Lossless BF12 vocabulary-head storage preserves the
+The deployment selects native activations and Q8KV4 attention/cache storage,
+with FP32 routing. BF16 activations and BF16 main/index caches remain available
+through the independent precision controls. Lossless BF12 vocabulary-head storage preserves the
 checkpoint's exact BF16 values; the template retains the BF16 copy as well for
 wider projections and prefill.
 
@@ -51,8 +51,9 @@ and dynamic NVFP4 W4A4 experts. Independently, `engine.kv_dtype: "nvfp4"`
 selects Q8KV4 attention and compressed main/index caches. These paths are
 integrated but remain under release validation. They implement the native
 quantized recipe for which the model was trained; differences from the BF16
-control alone do not establish an accuracy regression. The provisional
-template will be selected after fidelity, task-quality and throughput tests.
+control alone do not establish an accuracy regression. The full native
+likelihood check passes 28,329 positions with zero argmax changes; final
+task-quality and throughput results remain pending.
 
 Native quantizers match the pinned SGLang/FlashInfer GPU producers byte for
 byte. Native-cache attention uses the upstream per-page formula for prompts

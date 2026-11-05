@@ -103,9 +103,10 @@ void check(const fs::path& folder, bool decode) {
                          blocks, topk, selected.p + start * kv_heads * topk, stream);
     const size_t off = static_cast<size_t>(start) * topk * heads;
     if (decode) {
-      minimax_attn_nvfp4_decode(q.p + start * heads * 128, k.p, v.p, req.p + start,
+      minimax_attn_nvfp4_decode_parallel(q.p + start * heads * 128, k.p, v.p, req.p + start,
                                  positions.p + start, table.p, blocks,
                                  selected.p + start * kv_heads * topk, count, heads, kv_heads, topk,
+                                 maximum.p + off, total.p + off, partial.p + off * 128,
                                  out.p + start * heads * 128, stream);
       return;
     }
@@ -120,6 +121,12 @@ void check(const fs::path& folder, bool decode) {
   run(0, rows);
   DGPP_CUDA_OK(cudaStreamSynchronize(stream));
   const auto original = out.get();
+  if (decode) {
+    minimax_attn_nvfp4_decode(q.p, k.p, v.p, req.p, positions.p, table.p, blocks,
+                             selected.p, rows, heads, kv_heads, topk, out.p, stream);
+    DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+    require(out.get() == original, "parallel pages preserve serial online decode exactly");
+  }
   const auto original_scores = scores.get();
   const auto original_selected = selected.get();
   write(folder / "actual_q.u8", q.get());
