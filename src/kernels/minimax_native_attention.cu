@@ -4,6 +4,7 @@
 #include <cuda_fp8.h>
 
 #include "common/cuda_check.hpp"
+#include "kernels/minimax_native_attention.cuh"
 #include "kernels/minimax_native_attention.hpp"
 #include "kernels/pdl.cuh"
 
@@ -15,19 +16,6 @@ constexpr int kAttentionSmem = kCacheBytes + kQueryBytes + 16 * 128 * sizeof(flo
 
 __device__ __forceinline__ float bf16(uint16_t value) {
   return __uint_as_float(static_cast<uint32_t>(value) << 16);
-}
-__device__ __forceinline__ float e4m3(uint8_t value) {
-  __nv_fp8_e4m3 x;
-  x.__x = value;
-  return static_cast<float>(x);
-}
-__device__ __forceinline__ uint8_t cached_fp8(const uint8_t* head, int dim) {
-  const unsigned packed = head[dim / 2];
-  const unsigned code = (packed >> (4 * (dim & 1))) & 15;
-  constexpr float magnitudes[8] = {0.f, .5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
-  const float value =
-      (code & 8 ? -magnitudes[code & 7] : magnitudes[code & 7]) * e4m3(head[64 + dim / 16]);
-  return __nv_fp8_e4m3(value).__x;
 }
 __device__ __forceinline__ uint32_t pack8(const float* x) {
   uint32_t packed;
@@ -106,6 +94,7 @@ __device__ __forceinline__ void product(const uint8_t* a, const uint8_t* b, floa
   }
 }
 
+template <int QueryRows>
 __global__ __launch_bounds__(kThreads) void minimax_index_nvfp4_kernel(
     const uint8_t* q, const uint8_t* cache, const int32_t* req, const int64_t* positions,
     const int32_t* table, int table_stride, int rows, int heads, int blocks, float* output) {
@@ -116,24 +105,25 @@ __global__ __launch_bounds__(kThreads) void minimax_index_nvfp4_kernel(
   __shared__ int requests[16];
   __shared__ int64_t positions_local[16];
   __shared__ float partial[16][4];
-  const int row0 = blockIdx.x * 16, head = blockIdx.y;
+  const int row0 = blockIdx.x * QueryRows, head = blockIdx.y;
   const int tid = threadIdx.x, warp = tid / 32, lane = tid % 32;
   if (tid < 16) {
-    positions_local[tid] = row0 + tid < rows ? positions[row0 + tid] : -1;
+    positions_local[tid] = tid < QueryRows && row0 + tid < rows ? positions[row0 + tid] : -1;
     requests[tid] = positions_local[tid] < 0 ? -1 : req[row0 + tid];
   }
   __syncthreads();
   // Usually all sixteen prefill queries share a request. A mixed tile walks
   // its distinct requests, preserving the same matrix product for each row.
-  for (int owner = 0; owner < 16; ++owner) {
+  for (int owner = 0; owner < QueryRows; ++owner) {
     const int request = requests[owner];
     bool first = request >= 0;
     for (int previous = 0; previous < owner; ++previous) first &= requests[previous] != request;
     if (!first) continue;
     int64_t last = -1;
-    for (int r = owner; r < 16; ++r)
+    for (int r = owner; r < QueryRows; ++r)
       if (requests[r] == request) last = max(last, positions_local[r]);
     const int end = min(blocks, static_cast<int>(last / 128 + 1));
+    if (static_cast<int>(blockIdx.z) >= end) continue;
     for (int i = tid; i < 16 * 128; i += kThreads) {
       const int r = i / 128, d = i % 128;
       queries[r * kStride + d] =
@@ -143,11 +133,11 @@ __global__ __launch_bounds__(kThreads) void minimax_index_nvfp4_kernel(
     for (int block = blockIdx.z; block < end; block += gridDim.z) {
       const int physical = table[static_cast<int64_t>(request) * table_stride + block];
       const int64_t begin = static_cast<int64_t>(physical) * 128;
-      for (int i = tid; i < 128 * 128; i += kThreads) {
-        const int token = i / 128, d = i % 128;
-        keys[token * kStride + d] =
+      for (int i = tid; i < 128 * 32; i += kThreads) {
+        const int token = i / 32, d = (i % 32) * 4;
+        *reinterpret_cast<uint32_t*>(keys + token * kStride + d) =
             static_cast<int64_t>(block) * 128 + token <= last
-                ? cached_fp8(cache + (begin + token) * kMinimaxNvfp4HeadBytes, d)
+                ? minimax_cached_fp8x4(cache + (begin + token) * kMinimaxNvfp4HeadBytes, d)
                 : 0;
       }
       __syncthreads();
@@ -172,7 +162,7 @@ __global__ __launch_bounds__(kThreads) void minimax_index_nvfp4_kernel(
         if ((lane & 3) == 0) partial[lane / 4 + half * 8][warp] = maximum[half];
       }
       __syncthreads();
-      if (tid < 16 && requests[tid] == request &&
+      if (tid < QueryRows && requests[tid] == request &&
           positions_local[tid] >= static_cast<int64_t>(block) * 128) {
         const float score =
             fmaxf(fmaxf(partial[tid][0], partial[tid][1]), fmaxf(partial[tid][2], partial[tid][3]));
@@ -216,11 +206,11 @@ __global__ __launch_bounds__(kThreads) void minimax_attn_nvfp4_kernel(
     q_tile[h * kStride + d] =
         h < hpk ? q[(static_cast<int64_t>(row) * heads + first_head + h) * 128 + d] : 0;
   }
-  for (int i = tid; i < 128 * 128; i += kThreads) {
-    const int token = i / 128, d = i % 128;
-    kv_tile[token * kStride + d] =
+  for (int i = tid; i < 128 * 32; i += kThreads) {
+    const int token = i / 32, d = (i % 32) * 4;
+    *reinterpret_cast<uint32_t*>(kv_tile + token * kStride + d) =
         token < visible
-            ? cached_fp8(k + ((cache_start + token) * kv_heads + kv) * kMinimaxNvfp4HeadBytes, d)
+            ? minimax_cached_fp8x4(k + ((cache_start + token) * kv_heads + kv) * kMinimaxNvfp4HeadBytes, d)
             : 0;
   }
   __syncthreads();
@@ -260,12 +250,15 @@ __global__ __launch_bounds__(kThreads) void minimax_attn_nvfp4_kernel(
     }
   }
   // The key tile becomes transposed V for the second matrix product.
-  for (int i = tid; i < 128 * 128; i += kThreads) {
-    const int token = i / 128, d = i % 128;
-    kv_tile[d * kStride + token] =
+  for (int i = tid; i < 128 * 32; i += kThreads) {
+    const int token = i / 32, d = (i % 32) * 4;
+    const uint32_t values =
         token < visible
-            ? cached_fp8(v + ((cache_start + token) * kv_heads + kv) * kMinimaxNvfp4HeadBytes, d)
+            ? minimax_cached_fp8x4(v + ((cache_start + token) * kv_heads + kv) * kMinimaxNvfp4HeadBytes, d)
             : 0;
+#pragma unroll
+    for (int j = 0; j < 4; ++j)
+      kv_tile[(d + j) * kStride + token] = static_cast<uint8_t>(values >> (j * 8));
   }
   __syncthreads();
   float pv[4][4] = {};
@@ -304,9 +297,18 @@ void minimax_index_nvfp4_score(const uint8_t* q, const uint8_t* cache, const int
   if (rows <= 0) return;
   if (heads <= 0 || blocks <= 0 || stride < blocks)
     throw std::invalid_argument("MiniMax Q8KV4 index geometry");
-  const dim3 grid((rows + 15) / 16, heads, blocks < 64 ? blocks : 64);
-  minimax_index_nvfp4_kernel<<<grid, kThreads, kCacheBytes + kQueryBytes, stream>>>(
-      q, cache, req, positions, table, stride, rows, heads, blocks, scores);
+  // Small decode batches can contain one request per row. Give each its
+  // own CTA instead of walking those requests serially inside a 16-row
+  // tile. Both paths use the same four k32 tensor-core products per score.
+  const unsigned splits = static_cast<unsigned>(blocks < 64 ? blocks : 64);
+  if (rows <= 16)
+    minimax_index_nvfp4_kernel<1><<<dim3(rows, heads, splits), kThreads,
+                                    kCacheBytes + kQueryBytes, stream>>>(
+        q, cache, req, positions, table, stride, rows, heads, blocks, scores);
+  else
+    minimax_index_nvfp4_kernel<16><<<dim3((rows + 15) / 16, heads, splits), kThreads,
+                                     kCacheBytes + kQueryBytes, stream>>>(
+        q, cache, req, positions, table, stride, rows, heads, blocks, scores);
   DGPP_CUDA_OK(cudaGetLastError());
 }
 

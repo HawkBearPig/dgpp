@@ -2545,6 +2545,12 @@ dgpp_set_common(mxfp8_gemm_test)
 add_test(NAME mxfp8_gemm_test COMMAND mxfp8_gemm_test)
 set_tests_properties(mxfp8_gemm_test PROPERTIES SKIP_RETURN_CODE 2 LABELS "cuda")
 
+add_executable(minimax_nvfp4_decode_test tests/cuda/minimax_nvfp4_decode_test.cu)
+target_link_libraries(minimax_nvfp4_decode_test PRIVATE dgpp_kernels CUDA::cudart)
+dgpp_set_common(minimax_nvfp4_decode_test)
+add_test(NAME minimax_nvfp4_decode_test COMMAND minimax_nvfp4_decode_test)
+set_tests_properties(minimax_nvfp4_decode_test PROPERTIES SKIP_RETURN_CODE 2 LABELS "cuda")
+
 add_executable(minimax_native_attention_test tests/cuda/minimax_native_attention_test.cpp)
 target_link_libraries(minimax_native_attention_test PRIVATE dgpp_kernels dgpp_common)
 dgpp_set_common(minimax_native_attention_test)

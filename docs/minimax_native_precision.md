@@ -290,3 +290,21 @@ and all four ranks agree on every recorded hidden-state hash. The binary
 and zero-swap checks pass on every rank. These pilot results extend the
 short-trace evidence; they do not replace the longer corpora or task-quality
 checks, and do not claim to run the complete upstream stack.
+
+## Cache reconstruction and decode scheduling
+
+Cache consumers reconstruct four FP8 values together. E2M1 multiplied by a
+finite nonnegative E4M3 scale fits exactly in FP16, so paired FP16 products
+preserve the required FP8 bytes, including saturation and signed zero. The
+GPU conversion test exhausts all 256 packed code pairs crossed with all
+127 finite nonnegative scales, exercises both word halves and all cache
+groups, and compares with independent scalar FP32 reconstruction.
+
+For at most sixteen query rows, the sparse indexer gives each row its own
+CTA. This avoids serializing independent decode requests inside a shared
+tile. Larger prefill calls retain sixteen-row tiles. Every score uses the
+same four K32 FP8 products, and empty page ranges exit before staging data.
+The existing mixed-request, selected-page, row-split and PDL graph tests
+pass; the packed conversion and attention kernels pass CUDA memcheck, and
+attention racecheck reports no hazards. Full-model native/cache smokes also
+pass. Serving speedups require separate measurement.
