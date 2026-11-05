@@ -157,8 +157,11 @@ def main():
     parser.add_argument("--prompt-lines", type=int, default=96)
     parser.add_argument("--thinking", action="store_true",
                         help="use the template's native thinking mode (also for always-on templates)")
-    parser.add_argument("--require-answer-hit", action="store_true",
-                        help="require at least one cancelled replay to reuse beyond its original prompt")
+    cache_mode = parser.add_mutually_exclusive_group()
+    cache_mode.add_argument("--require-answer-hit", action="store_true",
+                            help="require at least one cancelled replay to reuse beyond its original prompt")
+    cache_mode.add_argument("--prompt-only-cache", action="store_true",
+                            help="require prompt reuse but reject generated-state snapshots and hits")
     parser.add_argument("--tag", default="cancel-prefix-157")
     args = parser.parse_args()
     if min(args.rounds, args.cancel_deltas, args.prompt_lines) < 1 or args.cancel_deltas >= 4096:
@@ -186,7 +189,11 @@ def main():
                 initial_prompt = first["engine"]["prompt_tokens"]
                 if first["engine"]["prompt_tokens_computed"] != initial_prompt:
                     raise RuntimeError("the initial probe was not cold; use a fresh --tag")
-                if first["after"]["prefix_cache"]["close_entries"] <= first["before"]["prefix_cache"]["close_entries"]:
+                close_delta = (first["after"]["prefix_cache"]["close_entries"] -
+                               first["before"]["prefix_cache"]["close_entries"])
+                if args.prompt_only_cache and close_delta:
+                    raise RuntimeError("prompt-only cache retained a generated-state snapshot")
+                if not args.prompt_only_cache and close_delta <= 0:
                     raise RuntimeError("the first answer retained no rolling snapshot")
                 history = messages + [assistant(first), {"role": "user", "content":
                     "Now reply with exactly the words: The observatory is ready."}]
@@ -208,6 +215,8 @@ def main():
                     saved = hot["usage"]["prompt_tokens_details"]["cached_tokens"]
                     if variant == "exact":
                         case["answer_prefix_hit"] = saved > initial_prompt
+                        if args.prompt_only_cache and case["answer_prefix_hit"]:
+                            raise RuntimeError("prompt-only cache reused generated state")
                         if not saved:
                             raise RuntimeError(f"{tag}: unchanged history lost all prefix reuse")
                     if variant == "edited_prompt" and saved:
@@ -223,8 +232,10 @@ def main():
                                                 "hot": later, "cold": later_cold})
                         compare(later, later_cold)
                         later_saved = later["usage"]["prompt_tokens_details"]["cached_tokens"]
+                        if args.prompt_only_cache and later_saved > hot["usage"]["prompt_tokens"]:
+                            raise RuntimeError("prompt-only cache reused generated state on the following turn")
                         if later_saved < saved:
-                            raise RuntimeError("the following conversation turn lost answer-prefix reuse")
+                            raise RuntimeError("the following conversation turn lost prefix reuse")
                         print(f"{tag} following_turn: {later_saved} cached; cold reply matches", flush=True)
         report["cancelled_answer_hits"] = sum(
             case["first"]["cancelled"] and case["answer_prefix_hit"] for case in report["cases"])

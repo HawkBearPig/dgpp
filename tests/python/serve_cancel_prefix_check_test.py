@@ -97,32 +97,34 @@ def fixture(always_on=False):
         thread.join()
 
 
+class PrefixProbe:
+    model = "fixture"
+    rolling = True
+    saved_tokens = 1500
+
+    def __init__(self, *args, **kwargs):
+        self.prefixes = set()
+        self.close_entries = 0
+
+    def chat(self, messages, max_tokens, *, cache=True, cancel_deltas=0, ignore_eos=False):
+        # The cache legitimately shares the system and user prefix
+        # even when the delivered assistant answers differ.
+        key = json.dumps(messages[:2], sort_keys=True)
+        saved = self.saved_tokens if cache and key in self.prefixes else 0
+        before = self.close_entries
+        if cache:
+            self.prefixes.add(key)
+            self.close_entries += int(self.rolling)
+        return {"content": "Observation " * 64, "reasoning_content": "",
+                "finish": "length", "cancelled": bool(cancel_deltas),
+                "usage": {"prompt_tokens": 2000, "completion_tokens": 128,
+                          "prompt_tokens_details": {"cached_tokens": saved}},
+                "engine": {"prompt_tokens": 2000, "prompt_tokens_computed": 2000 - saved},
+                "before": {"prefix_cache": {"close_entries": before}},
+                "after": {"prefix_cache": {"close_entries": self.close_entries}}}
+
 class CancellationProbeTest(unittest.TestCase):
     def test_edited_controls_stay_cold_across_completed_and_cancelled_rounds(self):
-        class PrefixProbe:
-            model = "fixture"
-
-            def __init__(self, *args, **kwargs):
-                self.prefixes = set()
-                self.close_entries = 0
-
-            def chat(self, messages, max_tokens, *, cache=True, cancel_deltas=0, ignore_eos=False):
-                # The cache legitimately shares the system and user prefix
-                # even when the delivered assistant answers differ.
-                key = json.dumps(messages[:2], sort_keys=True)
-                saved = 1500 if cache and key in self.prefixes else 0
-                before = self.close_entries
-                if cache:
-                    self.prefixes.add(key)
-                    self.close_entries += 1
-                return {"content": "Observation " * 64, "reasoning_content": "",
-                        "finish": "length", "cancelled": bool(cancel_deltas),
-                        "usage": {"prompt_tokens": 2000, "completion_tokens": 128,
-                                  "prompt_tokens_details": {"cached_tokens": saved}},
-                        "engine": {"prompt_tokens": 2000, "prompt_tokens_computed": 2000 - saved},
-                        "before": {"prefix_cache": {"close_entries": before}},
-                        "after": {"prefix_cache": {"close_entries": self.close_entries}}}
-
         with tempfile.TemporaryDirectory() as temporary:
             report_path = Path(temporary) / "report.json"
             argv = ["serve_cancel_prefix_check.py", "--url", "http://fixture:18081",
@@ -140,6 +142,31 @@ class CancellationProbeTest(unittest.TestCase):
         self.assertEqual(len({json.dumps(replay["messages"][:2]) for replay in edited}), 4)
         self.assertTrue(all(replay["hot"]["usage"]["prompt_tokens_details"]["cached_tokens"] == 0
                             for replay in edited))
+
+    def test_prompt_only_cache_requires_reuse_without_generated_state(self):
+        for rolling, saved_tokens, error in ((False, 1500, None),
+                                            (True, 1500, "generated-state snapshot"),
+                                            (False, 2500, "reused generated state"),
+                                            (False, 0, "lost all prefix reuse")):
+            with self.subTest(rolling=rolling, saved_tokens=saved_tokens), \
+                    tempfile.TemporaryDirectory() as temporary:
+                report_path = Path(temporary) / "report.json"
+                argv = ["serve_cancel_prefix_check.py", "--url", "http://fixture:18081",
+                        "--out", str(report_path), "--source-revision", "fixture",
+                        "--binary-sha256", "fixture", "--rounds", "1", "--prompt-only-cache"]
+                with patch.object(check, "Probe", PrefixProbe), patch.object(sys, "argv", argv), \
+                        patch.object(PrefixProbe, "rolling", rolling), \
+                        patch.object(PrefixProbe, "saved_tokens", saved_tokens), \
+                        redirect_stdout(io.StringIO()):
+                    if error:
+                        with self.assertRaisesRegex(RuntimeError, error):
+                            check.main()
+                    else:
+                        check.main()
+                        report = json.loads(report_path.read_text())
+                        self.assertTrue(report["passed"])
+                        self.assertEqual(report["cancelled_answer_hits"], 0)
+                        self.assertEqual(sum(len(case["replays"]) for case in report["cases"]), 8)
 
     def test_disconnect_preserves_exact_delivered_history_and_waits_for_retirement(self):
         with fixture() as probe:
