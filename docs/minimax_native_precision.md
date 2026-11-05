@@ -113,8 +113,8 @@ finite E4M3 scales, signed-zero packing, zero groups, causal page boundaries,
 more than sixteen candidate pages, permuted physical pages and query chunk
 invariance within each formula. At 1, 129, 270 and 2,057 keys, both formulas
 match their upstream CPU references exactly. They deliberately produce
-different outputs from each other. The isolated GPU checks below cover the
-prefill formula; full-model validation is still pending.
+different outputs from each other. The GPU checks below cover both phases; full-model results are recorded
+separately from these isolated checks.
 
 ## Initial GB10 projection kernel validation
 
@@ -317,21 +317,26 @@ elementwise arithmetic fixed. This is a material phase-formula mismatch,
 not a BF16-versus-native comparison or a task-quality score. Earlier
 same-formula passes do not certify the former serving path.
 
-The correction also marks native-cache decode snapshots as incompatible
-with cold-prefill prefixes. The scheduler retains prompt snapshots and
-their NVMe storage, while suppressing rolling, hop and retire-time decode
-snapshots for this path. BF16-cache behavior is unchanged. Tests compare
-native decode row splits and graph replay with the decode trajectory, and
-each phase with its independent oracle; they do not require the publisher's
-different phase formulas to be bitwise interchangeable. Broader corrected
-native fidelity and serving validation are pending.
+Generated-state prefix reuse follows upstream's cache policy. The pinned
+SGLang radix cache retains output KV as well as prompt KV, splitting them
+for eviction priority. DGPP likewise retains prompt, rolling and completed
+conversation snapshots. An earlier provisional restriction suppressed
+native generated-state snapshots to force cold/warm equivalence; that
+restriction was removed because it imposed an extra constraint on the
+publisher's phase-dependent recipe without evidence of a task-quality
+benefit. Restore fidelity is checked against the live conversation that
+created the state. Recomputing generated history as prefill can change its
+values; this is reported separately from corruption or nondeterministic
+restoration. See the existing
+[chunk-shape policy](numerics.md#greedy-transcripts-and-chunk-shape) and
+[upstream radix checkpointing](https://github.com/sgl-project/sglang/blob/58484246d26523eaf1a7f16ab524deee288d2120/python/sglang/srt/mem_cache/radix_cache.py).
 
 The corrected kernels pass both phase oracles at all five isolated
 geometries, exact row splits and PDL graph replays, CUDA memcheck with zero
 errors and racecheck with zero hazards. Seven targeted CTest entries pass,
-including the scheduler and all four target precision combinations. The
-scheduler regression retains prompt-cache hits while forbidding decode
-snapshots, including a pool that fits without decode-snapshot headroom.
+including the scheduler and all four target precision combinations.
+Generated-prefix checks additionally compare restored prompt extensions
+and subsequent decode with the same live conversation.
 
 The corrected real-checkpoint TP4 pilot passes against the prompt-aware
 native reference on all 1,057 raw/chat scored positions. There are zero

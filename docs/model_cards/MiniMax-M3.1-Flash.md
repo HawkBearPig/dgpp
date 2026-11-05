@@ -59,9 +59,13 @@ byte. Native-cache attention uses the upstream per-page formula for prompts
 and the online formula for decode and speculative verification. These have
 different rounding boundaries: applying prefill during decode failed the
 numerical gate and was corrected. Each phase preserves its own batch/chunk
-consistency. Prompt-prefix snapshots remain reusable; generated-state
-snapshots are disabled because they are incompatible with cold prefill.
-Full upstream runtime equivalence has not been established. The
+consistency. Prompt and generated-state prefixes remain reusable, as in
+upstream serving. A restored conversation preserves the arithmetic that
+created its cache; recomputing its generated history as cold prefill can
+produce different values. Snapshot validation compares restoration with
+the same live conversation, rather than requiring the two upstream phases
+to be interchangeable. Full upstream runtime equivalence has not been
+established. The
 [native precision contract](../minimax_native_precision.md) records these
 boundaries, independent controls and outstanding comparisons.
 

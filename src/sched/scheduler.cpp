@@ -384,8 +384,7 @@ int64_t Scheduler::new_blocks(const Request& r, const PrefixPlan& plan) const {
   if (plan.snap_position > 0) blocks += snapshot_blocks(plan.snap_position);
   if (plan.body_snap_position > 0) blocks += snapshot_blocks(plan.body_snap_position);
   if (plan.head_snap_position > 0) blocks += snapshot_blocks(plan.head_snap_position);
-  if (cache_on(r) && prefix_info_.decode_snapshots &&
-      bt > std::max<int64_t>(1, prefix_info_.align)) blocks += 1;
+  if (cache_on(r) && bt > std::max<int64_t>(1, prefix_info_.align)) blocks += 1;
   return std::max<int64_t>(blocks, 0);
 }
 
@@ -1329,7 +1328,7 @@ void Scheduler::retire(int arrival, Result::Status status,
   // A step cut short (the request completed on an earlier token of a
   // multi-token pass) leaves the model's state past the committed position
   // — the live snapshot cannot be taken there; the rolling entry stands.
-  if (r.slot >= 0 && cache_on(r) && prefix_info_.decode_snapshots && r.step_tail == 0 &&
+  if (r.slot >= 0 && cache_on(r) && r.step_tail == 0 &&
       (reason == Result::Reason::kEos || reason == Result::Reason::kSteps)) {
     const int64_t align = std::max<int64_t>(1, prefix_info_.align);
     const int64_t committed =
@@ -2045,7 +2044,7 @@ Scheduler::Meters Scheduler::meters() const {
 }
 
 void Scheduler::rolling_snapshots() {
-  if (!cache_.enabled() || !prefix_info_.decode_snapshots) return;
+  if (!cache_.enabled()) return;
   const int64_t align = std::max<int64_t>(1, prefix_info_.align);
   // Blocks the hops armed in this pass will take inside the step, after
   // the snapshots below have taken theirs: each arm reserves its own.

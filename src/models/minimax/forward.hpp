@@ -77,9 +77,6 @@ class MinimaxModel : public SessionModel<MinimaxModel> {
   }
   const MinimaxKvPool& kv_pool() const { return pool_; }
   LatentFormat kv_format() const { return pool_.shape().format; }
-  // Q8KV4's published prefill and decode have different rounding boundaries.
-  // Prompt snapshots remain reusable; generated states are not cold prefixes.
-  bool decode_prefix_compatible() const { return kv_format() != LatentFormat::kFp4; }
   void set_decode_row_traces(bool on) { decode_row_traces_ = on; }
   // Optional diagnostics at replicated BF16 sublayer boundaries. The
   // observer receives device memory and orders any reads on the stream.

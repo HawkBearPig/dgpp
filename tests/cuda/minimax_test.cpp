@@ -734,8 +734,6 @@ void smoke(const std::string& path, const std::string& dump, bool native, Latent
   MinimaxModel m(cfg, path, 512, 1536, LoaderResidency::Resident, nullptr, 0, 1, 3, false, 0,
                    format, false, native);
   require(m.kv_format() == format, "model reports its actual cache format");
-  require(m.decode_prefix_compatible() == (format != LatentFormat::kFp4),
-          "phase-dependent decode cannot produce cold-prefix snapshots");
   size_t block_bytes = 0;
   for (const auto& plane : m.kv_pool().planes()) block_bytes += plane.block_bytes;
   require(block_bytes == MinimaxModel::kv_block_bytes_static(cfg, 0, 1, format),
@@ -863,6 +861,29 @@ void smoke(const std::string& path, const std::string& dump, bool native, Latent
   m.session_close(1);
   m.session_release_snapshot(meta);
   require(m.kv_blocks_in_use() == 0, "closed requests and released prefix leave no blocks");
+  // A conversation prefix can contain both prefilled and generated tokens.
+  // Its restore must preserve that history exactly; a wholly cold prefill
+  // uses different upstream phase arithmetic in the native KV4 recipe.
+  (void)m.session_prefill(0, {tokens.begin(), tokens.begin() + 129});
+  for (size_t at = 129; at < 257; at += 8) {
+    (void)m.session_verify(0, {tokens.begin() + at, tokens.begin() + at + 8});
+    m.session_rollback(0, 8, 8);
+  }
+  meta = m.session_snapshot(0, snapshot.p);
+  const std::vector<int64_t> suffix(tokens.begin() + 257, tokens.end());
+  const auto live_turn = m.session_prefill_resume(0, suffix, {257});
+  const auto live_step = m.session_step(0, 7);
+  m.session_close(0);
+  m.session_attach(1, snapshot.p, meta);
+  const auto restored_turn = m.session_prefill_resume(1, suffix, {257});
+  require(live_turn.logits == restored_turn.logits,
+          "generated-prefix restore preserves the live conversation's prefill");
+  const auto restored_step = m.session_step(1, 7);
+  require(live_step.logits == restored_step.logits,
+          "generated-prefix restore preserves the following decode");
+  m.session_close(1);
+  m.session_release_snapshot(meta);
+  require(m.kv_blocks_in_use() == 0, "generated-prefix snapshots release all blocks");
   // Grouped requests exercise distinct cache rows at different lengths.
   std::vector<int64_t> a(tokens.begin(), tokens.begin() + 129),
       b_(tokens.begin() + 17, tokens.begin() + 34);
