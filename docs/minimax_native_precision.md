@@ -476,7 +476,7 @@ template, and 32 full-seven greedy draft blocks. The table counts acceptance
 **conditional on every earlier proposal being accepted**. This shorter
 capture is not interchangeable with the earlier 256-token serving sample.
 
-| Class | Position 2 | Position 3 |
+| Prompt class (generated tokens are thinking) | Position 2 | Position 3 |
 | --- | ---: | ---: |
 | Prose | 14/20 (70.0%) | 6/14 (42.9%) |
 | Code | 20/25 (80.0%) | 11/20 (55.0%) |
@@ -508,3 +508,102 @@ Target labels are valid only along the captured proposal prefix: after a
 changed proposal, later labels cannot be used to claim counterfactual
 acceptance. No runtime precision change or accuracy-limit relaxation follows
 from this audit, and it publishes no throughput row.
+
+### Actual upstream draft-model comparison
+
+The follow-up uses the actual SGLang `DSparkMiniMaxDraftModel.forward`, feature
+projection, native linear methods, Gemma norms, RoPE, shared vocabulary head,
+and `MarkovGreedyStep` from revision
+`58484246d26523eaf1a7f16ab524deee288d2120`. It rebuilds the draft context from
+the raw five target-layer taps for both prefill and generated tokens. It does
+not reuse DGPP's feature projection or context K/V in the default mode.
+
+On SM121, the harness selects FlashInfer's B12x MXFP8 GEMM backend and uses
+noncausal FA2 attention over contiguous K/V. Those are hardware/allocation
+adapters; the model forward and sampler are imported from the pinned source.
+This is a one-GPU draft replay against DGPP's fixed target trajectory, not an
+end-to-end distributed SGLang serving run or a throughput measurement. The
+offline attention adapter rejects contexts that exceed the sliding window.
+
+The new capture used source `3ddb36fd45d2fc79f96ab3ae16817f8baf5beda6` and
+executable SHA256
+`25c5b9d1b4e9eeb137c97c2558e233a5df05fd013b1cb150d704523f58302e71`,
+with the same checkpoint, native TP4 recipe, five prompts and 32 blocks per
+prompt. All four ranks had the expected binary and zero process swap. The
+2,560 pre-existing rank-zero block files reproduced byte for byte in the new
+capture. The final reusable tool reproduced all 160 upstream proposal blocks
+from its initial run. The environment used Torch `2.14.1+cu130`, FlashInfer
+`0.7.2`, and `sglang-kernel` `0.4.10`.
+
+Acceptance is scored against the **committed greedy continuation**, not
+verification logits conditioned on a rejected proposal. This permits a valid
+comparison after either drafter changes its proposal. Unobserved continuation
+tails are excluded at each position. Counts below are conditional on all
+earlier proposals being accepted:
+
+| Prompt class | DGPP position 2 | Upstream position 2 | DGPP position 3 | Upstream position 3 |
+| --- | ---: | ---: | ---: | ---: |
+| Prose | 14/20 | 14/20 | 6/14 | 7/14 |
+| Code | 20/25 | 20/25 | 11/20 | 11/20 |
+| JSON | 19/31 | 19/31 | 12/19 | 12/19 |
+| Math | 23/30 | 23/30 | 20/23 | 20/23 |
+| Chat | 12/20 | 12/20 | 8/12 | 8/12 |
+| Total | 88/126 (69.8%) | 88/126 (69.8%) | 57/88 (64.8%) | 58/88 (65.9%) |
+
+Across positions 1–7, the respective accepted-token counts are
+`126, 88, 57, 41, 35, 28, 25` for DGPP and
+`126, 88, 58, 41, 36, 29, 26` for upstream. An additional arithmetic control
+partitions O/down GEMMs four ways, uses upstream native producers and
+FlashInfer GEMMs for each partition, then folds the BF16 local outputs in
+FP32. It preserves the same position-two and position-three accepted counts
+as the one-GPU upstream run; its position-one count is 124 rather than 126.
+This control is not presented as actual four-rank SGLang execution.
+
+**Every scored token is inside `<mm:think>`; none is answer-phase code or
+JSON.** The class describes the user's prompt, not the generated token type.
+For example, both drafters predict ` carefully` after `Let me design this` in
+the code prompt, whereas the greedy target chooses ` well`. In the math
+prompt both predict `=` where the target chooses ` =`. These remain legitimate
+greedy rejections. They do not establish code/JSON answer-phase acceptance.
+The new report separates thinking, answer and unmarked positions so that a
+longer continuation can measure those phases without conflating them.
+
+The operation-level diagnostic in `tools/minimax_dspark_stages.py` compares
+identical inputs with the independent native arithmetic reference. Across ten
+blocks, its projections, norms, RoPE and TP folds agree exactly; attention
+differs in 1,083 of 2,867,200 BF16 elements, with relative RMS at most 8.47e-5.
+Small changes can cross later MXFP8 rounding boundaries. This trace localizes
+the first difference against that arithmetic reference; it is not a claim of
+bitwise SGLang parity. Actual upstream final hidden-state relative RMS is
+0.0488–0.0877, despite the similar acceptance counts.
+
+This evidence does not show a large remaining drafter-specific acceptance
+loss on these prefixes. It also does not establish a universal acceptance
+ceiling, answer-phase rates, or upstream target-model parity. No serving
+precision change, accuracy-limit relaxation, or throughput claim follows.
+
+To reproduce, install the pinned SGLang runtime dependencies in a separate
+environment with the versions above, expose its complete checkout, and use
+an ignored output directory for the JIT caches and reports:
+
+```sh
+TRITON_CACHE_DIR="$RUN_DIR/triton" \
+FLASHINFER_WORKSPACE_BASE="$RUN_DIR/flashinfer" \
+python tools/minimax_dspark_upstream.py \
+  --checkpoint-dir "$MODEL_DIR" --sglang-source "$SGLANG_DIR" \
+  --engine-dir "$AUDIT_DIR" --capture-receipt "$CAPTURE_RECEIPT" \
+  --output "$REPORT_FILE"
+```
+
+The capture receipt records `source_revision`, `binary_sha256`, `command`
+(including `--dump-dir`), `complete`, `returncode`, and per-rank `first`/`last`
+samples with `sha256` and `swap_kib`. The tool verifies these, hashes the
+complete upstream Python tree, validates anchors and original acceptance
+against the continuation, and writes library versions and phase-specific
+counts. `--context captured` isolates the backbone with DGPP K/V;
+`--emulate-tp 4` enables the additional row-parallel arithmetic control.
+
+Validation includes the eight DSpark CTest cases, the native three-round
+capture fixture, CPU accounting tests for changed proposals and truncated
+tails, and the full real-checkpoint upstream replays above. Production is
+restored to its original frozen executable after the hardware window.
