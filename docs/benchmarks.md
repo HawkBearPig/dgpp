@@ -18,7 +18,7 @@ change again, keep each row's recorded configuration with its numbers.
 
 | Measurement set | Date (UTC) | Source revision | Scope |
 |---|---|---|---|
-| MiniMax-M3.1-Flash NVFP4/MXFP8, four nodes | 2026-11-05 | `3062ce1f05d9` (binary `d84fd564456f90c8f01cd66be8b21683a53429ab8f51f33796402e70e7829621`) | One shipped-template campaign: five classes at C1/C2/C4/C8/C16, twelve cold prefill probes, context timing through 512K, 164 HumanEval / 300 GSM8K / 100 extraction cases, API and transcript isolation, plus the full-seven DSpark C1 control. All ranks ran the recorded binary with zero swap (head swap disabled for the window; swap-limited serving scopes), all cold probes had zero cached tokens, operation streams matched, the fabric was otherwise idle, and production and head swap were restored once after validation. |
+| MiniMax-M3.1-Flash NVFP4/MXFP8, four nodes | 2026-11-05 | `3062ce1f05d9` (binary `d84fd564456f90c8f01cd66be8b21683a53429ab8f51f33796402e70e7829621`) | One shipped-template campaign: five classes at C1/C2/C4/C8/C16, twelve cold prefill probes, context timing through 512K, 164 HumanEval / 300 GSM8K / 100 extraction cases, API and transcript isolation, plus a full-seven DSpark C1 control whose timing is now withdrawn (see MiniMax DSpark below). All ranks ran the recorded binary with zero swap (head swap disabled for the window; swap-limited serving scopes), all cold probes had zero cached tokens, operation streams matched, the fabric was otherwise idle, and production and head swap were restored once after validation. |
 | GLM-5.3-Flash NVFP4/FP8, four nodes | 2026-10-29 | `11fe1807`, the 0.1.0 release build (binary `1960b127b308e83e`), tree at `8216f398` (documentation commits only beyond the build) | The four-node template as shipped, every row from one `serve_campaign.py run` (00:59 to 01:51 UTC): five classes at C1/C2/C4/C8, three cold probes each at 512/2K/8K/32K, the context matrix through 512K on the 768K pool, the 300-item quality set, the API, greedy-transcript and isolation checks, and the plain boot (5/5 classes matched). Every rank at zero swap before and after, zero cached tokens in the twelve cold probes, matching operation streams. Replaces the 2026-10-06/07 and 2026-10-13 rows, which ran with fixed prefill budgets and kept only the C1 decode rate |
 | GLM-5.3-Flash NVFP4/FP8, two nodes | 2026-10-28/29 | `11fe1807`, the 0.1.0 release build (binary `1960b127b308e83e`), tree at `acd81cf1` (documentation commits only beyond the build) | The two-node template as shipped, every row from one `serve_campaign.py run` (23:21 to 00:15 UTC): five classes at C1/C2/C4/C8, three cold probes each at 512/2K/8K/32K, the context matrix to the 160K pool, the 300-item quality set, the API, greedy-transcript and isolation checks, and the plain boot (5/5 classes matched). Both ranks at zero swap before and after, zero cached tokens in the twelve cold probes, matching operation streams. Replaces the 2026-10-06/07 row, which ran with fixed prefill budgets and kept only its C1 decode rate |
 | DeepSeek-V4.1-Flash-1017 EXL3 3.5bpw | 2026-10-23 | `b423d5db` plus the day's second program in the working tree (binary `9a179b15a6de02fa`) | The EXL3 3.5 bpw template as shipped on four nodes after the day's second program — sixteen slots on the family's 96-row decode batch (the morning's twelve on 64), the balanced expert slices, the fused split reduce, the deep slot ring, the 128-row dense tile, a 4,096-token first prefill chunk, the expert-run slot form with its 64-row run groups, the attention split groups merged in L2, the tiled router and mHC dots from sixteen rows, the tensor-core GEMV's one split chain to 128 rows, the verify schedule's row and base costs measured on the pack (2.95 / 19.9 ms) and the five-draft DSpark block under the schedule's three options (1, 3, 5; `engine.mtp_depth` 5, `engine.mtp_schedule_options` 3) — in one `serve_campaign.py run` on 2026-10-24 00:06–00:54 UTC (with the five DSpark mode boots: plain and fixed depths 1/2/3/5 through `--no-mtp-schedule`): five classes at C1/C2/C4/C8, three cold probes each at 512/2K/8K/32K, the context matrix to 512K, the 300-item quality set, the API, greedy-transcript and isolation checks, every rank at zero swap, zero cached tokens in the 12 cold probes, matching operation streams in 7/7 launches. The day's earlier campaigns (six slots on `c7efb833f88a06e3`, twelve on `dde85abfaa953cc1` and `6f8bccfa5b70efef`, sixteen at depth 4 on `9a179b15a6de02fa`) are superseded by this row set; the [model card](model_cards/DeepSeek-V4.1-Flash-1017-EXL3-3.5bpw.md) keeps them beside the release's |
@@ -490,14 +490,16 @@ C1 engine tokens/s; each range spans the five class medians. **MTP1**, **MTP2** 
 
 ### MiniMax DSpark
 
-The template uses plain decoding with sixteen slots. Its additional DSpark
-boot has eight slots and verifies all seven proposals; both columns measure
-C1 on the same five classes and binary. All fifteen draft-mode transcripts
-match the plain requests exactly.
+The template uses plain decoding with sixteen slots. The original DSpark
+measurement is withdrawn: the drafter skipped the anchor prediction and
+used BF16 projection inputs despite the native activation setting. Its exact
+final transcripts established target verification correctness, not draft
+prediction correctness. The plain-template rows above are unaffected.
 
-| Model / weights | Nodes | Options | Plain (default) | DSpark full 7 |
-| --- | --- | --- | --- | --- |
-| MiniMax-M3.1-Flash NVFP4/MXFP8 | 4 | native activations, 2M NVFP4 KV | 21.6–21.9 | 14.6–20.6 |
+The corrected DSpark uses seven query rows, predicts from the anchor and
+honors native activations. Its current tuning diagnostics are not replacement
+campaign rows. See the [implementation record](minimax_m31_flash_plan.md)
+for the defect, checks and scope of those measurements.
 
 <!-- END modes -->
 

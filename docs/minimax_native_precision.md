@@ -199,7 +199,12 @@ dynamic NVFP4 routed experts for every target-model row, including decode.
 `engine.kv_dtype: "nvfp4"` independently selects the Q8KV4 attention path.
 Both settings default to `bf16`; the shipped deployment explicitly selects
 `native` activations and `nvfp4` cache after native fidelity validation. The
-vision encoder and optional DSpark drafter retain their existing precision.
+vision encoder retains its existing precision. The optional DSpark drafter
+also follows the activation setting: native MXFP8 inputs feed its context
+K/V, QKV, output and MLP projections. Its BF16 feature projection, vocabulary
+head, Markov matrices, confidence head and attention/cache retain their
+checkpoint precision. The independent draft fixture checks the native and
+BF16 projection recipes separately.
 
 The cache pool exposes format-specific planes, and its memory planner,
 partial-block prefix copies and NVMe byte counts use the actual storage
