@@ -220,6 +220,7 @@ def _stream_one(host, port, model, prompt, max_tokens, think, out, temperature, 
             conn.request("POST", "/v1/chat/completions", body=json.dumps(body),
                          headers={"Content-Type": "application/json"})
             resp = conn.getresponse()
+        out["request"] = body
         out.update(read_completion(resp, on_update=on_update))
     finally:
         conn.close()
@@ -291,12 +292,16 @@ def main(*, phase_runner=None, settle=None):
             or any(c < 1 or c > 16 for c in cs)):
         ap.error("repeat/max-tokens must be positive; concurrency in [1, 16]; isolation in [0, 16]; warm >= 0")
     reports = []
+    isolation = None
     def save():
         if args.json_out:
+            report = {"schema_version": 1, "model": model, "max_tokens": args.max_tokens,
+                      "temperature": args.temperature, "thinking": args.think,
+                      "phases": reports}
+            if isolation is not None:
+                report["isolation"] = isolation
             with open(args.json_out, "w") as output:
-                json.dump({"schema_version": 1, "model": model, "max_tokens": args.max_tokens,
-                           "temperature": args.temperature, "thinking": args.think,
-                           "phases": reports}, output, indent=2, allow_nan=False)
+                json.dump(report, output, indent=2, allow_nan=False)
     if args.classes:
         check_corpus()
     model = served_model(args.host, args.port)
@@ -331,12 +336,19 @@ def main(*, phase_runner=None, settle=None):
         if settle is not None:
             settle(args.host, args.port, outs)
         same = alone["text"] == outs[0]["text"] and alone["tokens"] == outs[0]["tokens"]
+        a, b = alone["text"], outs[0]["text"]
+        k = 0
+        while k < len(a) and k < len(b) and a[k] == b[k]: k += 1
+        isolation = {"concurrency": args.isolation, "matched": same,
+                     "text_match": a == b, "token_count_match": alone["tokens"] == outs[0]["tokens"],
+                     "first_difference_char": k if a != b else None,
+                     "alone": alone, "batched": outs}
+        # Keep diagnostic requests separate from measured throughput phases.
+        # Persist before the failure exits, and retain this section on later saves.
+        save()
         print(f"== isolation: prompt 0 alone ({alone['tokens']} tokens) vs beside {args.isolation - 1} others "
               f"({outs[0]['tokens']} tokens): {'IDENTICAL' if same else 'DIFFERENT'}")
         if not same:
-            a, b = alone["text"], outs[0]["text"]
-            k = 0
-            while k < len(a) and k < len(b) and a[k] == b[k]: k += 1
             print(f"   first difference at char {k}: alone {a[k:k+60]!r} | batched {b[k:k+60]!r}")
             raise SystemExit("transcript isolation failed")
     draw = "greedy" if args.temperature == 0 else f"sampled T={args.temperature}"

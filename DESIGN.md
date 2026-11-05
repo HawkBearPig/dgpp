@@ -2732,6 +2732,10 @@ Performance depends on model, occupancy, context and MTP acceptance.
 Use [the benchmark tables](docs/benchmarks.md) for measured comparisons;
 the graph and session tests check numerical behavior across these shapes.
 
+The load clients retain transcript comparison diagnostics separately from
+throughput phases in JSON reports, including on a comparison failure.
+The exact text and token-count check remains a failure gate.
+
 ### Shutdown, admission and failure handling
 
 **Shutdown.** A signal sets a flag that the engine loop reads at a pass

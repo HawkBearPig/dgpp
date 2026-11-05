@@ -1,5 +1,10 @@
 # DGPP implementation status
 
+Load-client JSON reports preserve solo and batched isolation responses and
+effective request bodies before a mismatch exits. Local HTTP fixture tests
+cover text and token-count mismatches and successful comparisons. This
+diagnostic coverage does not establish model-level batching equivalence.
+
 NVMe slab startup acquires its exclusive lock before truncation. Duplicate-open
 regressions check size and content preservation for fresh persistent and
 nonpersistent slabs, then verify that both modes clear stale contents after
