@@ -315,9 +315,6 @@ class PortabilityTest(unittest.TestCase):
         # without a draft head (2026-10-22) keep MTP off the same way.
         draftless_models = {"nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-NVFP4",
                             "HawkBearPig/flint-FP8-NVFP4"}
-        # MiniMax's measured throughput default is plain, although its bundled
-        # DSpark remains available as a knob (docs/minimax_m31_flash_plan.md).
-        plain_default_models = {"MiniMaxAI/MiniMax-M3.1-Flash"}
         values = {**site_env.DEFAULTS, "DGPP_NODES": "head peer1 peer2 peer3", "DGPP_SSH_USER": "ops"}
         templates = list((ROOT / "deploy").glob("*.example.json"))
         self.assertTrue(templates)
@@ -341,9 +338,6 @@ class PortabilityTest(unittest.TestCase):
                     self.assertTrue(engine["decode_graph"], "the drafter's block proposal is recorded in the graph step")
                 elif cfg["model"] in draftless_models:
                     self.assertFalse(engine.get("mtp", False), "a draftless family's template runs plain")
-                    self.assertTrue(engine["decode_graph"])
-                elif cfg["model"] in plain_default_models:
-                    self.assertFalse(engine["mtp"], "this family's measured default is plain")
                     self.assertTrue(engine["decode_graph"])
                 else:
                     self.assertTrue(engine["mtp"], "this family's template enables MTP (plain is --no-mtp)")

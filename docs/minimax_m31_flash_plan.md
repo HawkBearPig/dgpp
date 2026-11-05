@@ -1429,11 +1429,11 @@ zero swap on every rank and matching operation streams.
 
 ### Final native deployment validation (2026-11-05)
 
-The shipped four-node template selects native activations, Q8KV4 attention,
+At this stage the four-node template selected native activations, Q8KV4 attention,
 a 2,097,152-token shared pool, sixteen slots, plain decoding and a 2,048-token
 idle prefill cap. Source `3062ce1f05d92513b1b0b6e384d01ed93db72477`, server
 SHA-256 `d84fd564456f90c8f01cd66be8b21683a53429ab8f51f33796402e70e7829621`.
-The [benchmark tables](benchmarks.md) contain its single-campaign row set.
+The adaptive promotion below supersedes this campaign's published row set.
 C1 decode is 21.6–21.9 tokens/s, C16 106.2–121.1, and cold 2K/8K/32K prefill
 is 2.104/7.634/30.694 seconds. All 465 requests succeed; 385 repeat/batch
 comparisons, fifteen DSpark/plain comparisons and solo/C16 isolation are exact.
@@ -1533,8 +1533,8 @@ slots. All 135 replies from full-seven, depth-three and adaptive speculation
 match its 45 fresh plain controls exactly. Adaptive verification chooses
 depths 1/3/5/7, with native C1 cost estimates of 5.6 ms per row and 51.6 ms
 base, and improves decode throughput in all five measured classes at C1
-and C8. The sixteen-slot plain deployment remains the shipped template;
-these short-context diagnostics do not replace its complete campaign.
+and C8. The sixteen-slot plain deployment remained the shipped template at
+this stage; these short-context diagnostics did not replace its complete campaign.
 All six cold prefill probes across the pair have zero cached tokens.
 
 The fixed native drafter also passes 9/9 API checks, including sampled
@@ -1550,3 +1550,42 @@ corrected rerun supplies the depth-three evidence above.
 Production and head swap are restored once after validation. All four
 production processes run the original frozen executable with zero swap;
 HTTP health and a chat smoke request pass.
+
+### Adaptive template promotion (2026-11-05)
+
+The four-node example now ships native DSpark with eight request slots,
+seven proposals and adaptive verification at 1/3/5/7. The schedule uses
+the measured 5.6 ms row / 51.6 ms base costs and adapts its time-value
+estimate. The automatic draft policy schedules greedy requests; sampled
+requests retain full-seven verification with rejection correction.
+
+The complete `serve_campaign.py run`, including fresh plain and full-seven
+C1 controls, ran from 18:34 to 20:18 UTC at source
+`a40e587a860848cb581cc78dec913bd7c987aa27`, server SHA-256
+`718a59bf8356b19c7d3ec63cd5bba644561cee2069ab4d3ac7fabb682ba6dbe3`.
+Its [benchmark rows](benchmarks.md) replace the earlier plain template's.
+Adaptive decode reaches 28.8–48.2 tokens/s at C1 and 85.7–99.7 at C8;
+cold 2K/8K/32K prefill takes 2.176/7.816/33.341 seconds. Plain C1 is
+21.5–21.7 and full-seven is 22.9–44.9 tokens/s. Adaptive is faster in all
+five C1 classes. These measurements apply to the eight-slot configuration.
+
+All 225 load requests succeed, with 150 exact repeat/batch comparisons and
+thirty exact timing-control comparisons. Fresh plain/default transcripts
+match all five classes, solo/C8 isolation is exact, and the API passes 9/9.
+All eighteen context requests through 512K succeed with identical repeats
+per bucket and zero cached tokens in each cold request. The twelve short
+cold-prefill probes also have zero cached tokens.
+
+Quality remains 151/164 HumanEval, 294/300 GSM8K and 99/100 extraction;
+three of six capped HumanEval retries complete and pass at 8,192 tokens.
+All 564 standard replies and six retries exactly match the earlier plain
+campaign in text, finish reason and completion/reasoning token counts.
+Numerical accuracy limits and runtime arithmetic are unchanged by this
+template promotion.
+
+All four campaign boots have matching operation streams, the recorded
+executable and zero swap on all four ranks, on an otherwise idle fabric.
+Production and head swap were restored once after validation; all four
+production processes run the original frozen executable with zero swap,
+and health and chat smoke checks pass. The Release warnings-as-errors
+server build, campaign tests, launcher tests and documentation checks pass.

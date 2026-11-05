@@ -24,7 +24,7 @@ The download includes the bundled draft. `--sync-only` reuses the head node's
 download. All 73 files in the pinned snapshot have been checksum-verified on
 the four development nodes.
 
-The deployment template reserves sixteen request slots and a shared
+The deployment template reserves eight request slots and a shared
 2,097,152-token NVFP4 pool. Pool capacity is shared by active and cached requests;
 it is not a per-request allowance at every concurrency. The checkpoint's
 positional ceiling is 1,048,576. The larger shared pool provides concurrency
@@ -86,25 +86,27 @@ selection per index head, and 16 selected blocks including the current block
 inside that budget. The cache retains an index key for every token. The
 implementation does not pool those keys, reduce top-k, or add RoPE scaling.
 
-Plain decoding is the default, with sixteen request slots. The idle prefill
-cap is 2,048 tokens, with adaptive chunking while requests decode. DSpark is
-an optional eight-slot mode; its benefit depends on proposal acceptance,
-verification depth and concurrency.
+Native DSpark with confidence-based adaptive verification is the default,
+with eight request slots. The idle prefill cap is 2,048 tokens, with adaptive
+chunking while requests decode. Speculative speedup depends on proposal
+acceptance, verification depth and concurrency.
 
-`engine.mtp: true` enables the bundled five-layer DSpark model. Limit it to
-eight request slots so its complete draft blocks fit the graph. From the
-launcher, use `--knobs='--mtp --mtp-depth 7 --max-concurrency 8'`. Its learned
+The template's `engine.mtp: true` enables the bundled five-layer DSpark model.
+Keep it at no more than eight request slots so its complete draft blocks fit
+the graph. Its learned
 block uses seven query rows `[anchor, six masks]` and predicts from all
 seven rows, starting at the anchor, as in the pinned upstream
 `sample_from_anchor: true` contract. Target verification consumes eight
 rows `[anchor, seven proposals]`; `engine.mtp_depth` must remain seven. The common
 verification schedule can check fewer proposals without changing the draft
 block; fresh slots still verify the full block until confidence is available.
-Use `--no-mtp` to return to plain decoding. Sampled speculation uses
-the full proposal distribution and rejection correction.
+Use `--no-mtp` to return to plain decoding. With the template's automatic
+draft policy, adaptive verification applies to greedy requests. Sampled
+requests retain full-seven verification using the full proposal distribution
+and rejection correction.
 
-For the four-GB10 short-context diagnostic, confidence scheduling uses the
-following additional launcher knobs:
+The four-node template enables confidence scheduling with the following
+settings (shown as equivalent launcher knobs):
 
 ```text
 --mtp-schedule --mtp-schedule-min-depth 1 --mtp-schedule-options 4
@@ -112,11 +114,13 @@ following additional launcher knobs:
 --mtp-schedule-lambda 0 --mtp-schedule-adapt
 ```
 
-The costs come from native C1 passes at full-seven and reduced verification
-widths. They are a starting point for this hardware, not a calibrated cost
-model for every concurrency or context length. The schedule chooses among
-one, three, five and seven verified proposals; the physical draft still
-produces all seven.
+The row and base costs are 5.6 and 51.6 ms, derived from native C1 passes at
+full-seven and reduced verification widths. The schedule adapts its time-value
+estimate and chooses among one, three, five and seven verified proposals;
+the physical draft still produces all seven. These costs are specific to
+four GB10 nodes. Use `--no-mtp-schedule` to verify all seven proposals or
+`--no-mtp` for plain decoding; `--no-mtp --max-concurrency 16` selects the
+earlier sixteen-slot plain shape.
 
 DSpark follows `engine.activations`: native mode uses MXFP8 inputs for
 context K/V, QKV, output and all MLP projections. Context K/V shares one
@@ -169,16 +173,24 @@ explicit arithmetic controls, not a full upstream serving execution.
 The BF16 activation/cache control passes the same corpora with zero argmax
 changes and a maximum absolute mean-NLL difference below `2.2e-7` nat.
 
-The shipped-template campaign uses source `3062ce1f05d9` and server SHA-256
-`d84fd564456f90c8f01cd66be8b21683a53429ab8f51f33796402e70e7829621`.
-Decode throughput is 21.6–21.9 tokens/s at C1 and 106.2–121.1 at C16;
+The native adaptive-DSpark shipped-template campaign uses source
+`a40e587a8608` and server SHA-256
+`718a59bf8356b19c7d3ec63cd5bba644561cee2069ab4d3ac7fabb682ba6dbe3`.
+Decode throughput is 28.8–48.2 tokens/s at C1 and 85.7–99.7 at C8;
 these ranges span the five class medians. Cold prefill takes
-2.104 / 7.634 / 30.694 seconds at approximately 2K / 8K / 32K tokens.
-At 512K, cold prefill takes 893.523 seconds and median decode throughput
-is 11.6 tokens/s. Index selection scans token keys: its work grows linearly
+2.176 / 7.816 / 33.341 seconds at approximately 2K / 8K / 32K tokens.
+At 512K, cold prefill takes 919.523 seconds and median decode throughput
+is 31.8 tokens/s. Index selection scans token keys: its work grows linearly
 per decode query and quadratically over a complete cold prompt. See the
 [benchmark tables](../benchmarks.md) for all concurrency and context rows,
-with wall throughput reported separately.
+with wall throughput reported separately. Context timing and repeatability
+through 512K do not establish retrieval accuracy or validate the 1M ceiling.
+
+Fresh C1 controls on the same binary and eight-slot configuration measure
+21.5–21.7 tokens/s for plain decoding and 22.9–44.9 for full-seven DSpark.
+Adaptive verification is faster in all five measured classes, at
+1.33–2.23× the plain rate. This campaign replaces the earlier sixteen-slot
+plain template's published rows.
 
 | Task | Standard-cap result | Output cap | Larger-cap retry |
 | --- | --- | --- | --- |
@@ -192,13 +204,19 @@ miss changes `Esme` to `EsmE`; its JSON schema and other fields are correct.
 Scores retain all misses and the standard-cap verdicts. They do not claim
 identical task scores to BF16 or to an upstream serving runtime.
 
-All 465 load requests succeed, with 385 exact repeat/batch comparisons.
+All 225 load requests succeed, with 150 exact repeat/batch comparisons.
 The separate three-repeat transcripts are stable in all five classes,
-solo/C16 isolation is exact. The API suite passes 9/9 checks. All eighteen context
+fresh plain/default transcripts match 5/5 classes, and solo/C8 isolation is
+exact. All thirty timing-control replies match the adaptive sweep in text,
+token count and finish reason. The 564 standard-cap quality replies and six
+retries also match the earlier plain campaign exactly, including reasoning
+token counts; task scores are unchanged. The API suite passes 9/9 checks.
+All eighteen context
 requests through 512K succeed; each bucket's three transcripts match and
-all cold probes have zero cached tokens. Both campaign boots run the
+all cold probes have zero cached tokens. All four campaign boots run the
 recorded binary with zero swap on all four ranks and matching operation
-streams.
+streams. Production and head swap are restored once after validation, with
+the original executable on all four ranks and successful health/chat checks.
 
 The original campaign's DSpark timing is withdrawn: its predictions skipped
 the anchor row, and its projections used BF16 activations even in native

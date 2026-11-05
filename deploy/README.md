@@ -58,9 +58,11 @@ never its own template: `--dflash-model DIR_OR_ID` selects the drafter on a
 template that names MTP (it takes the MTP draft's settings back to their
 defaults unless the command line names them) and `--no-dflash` runs plain,
 so one model, quant and world has one file however many worlds it serves.
-MiniMax M3.1 Flash instead ships plain decoding with sixteen slots, selected
-by the throughput controls. Its bundled DSpark remains a knob, with a
-seven-proposal block and at most eight request slots.
+MiniMax M3.1 Flash ships its bundled DSpark with eight request slots and
+native activations. It drafts seven proposals and adaptively verifies one,
+three, five or seven for greedy requests; sampled requests verify all seven.
+Use `--no-mtp-schedule` for full-seven verification or `--no-mtp` for plain
+decoding.
 
 The long-context templates also carry a top-level `nvme_cache` block, off by
 default: set `enabled` to true and size `capacity_gib` to the node's free
@@ -87,7 +89,7 @@ planner adds a separate 4 GiB headroom allowance to these totals.
 
 | Template | Deployment | The shapes it replaced, as knobs |
 |---|---|---|
-| [cluster_minimax-m3.1-flash_nvfp4-mxfp8_w4.example.json](cluster_minimax-m3.1-flash_nvfp4-mxfp8_w4.example.json) | MiniMax M3.1 Flash on four nodes: published NVFP4 experts and MXFP8 dense weights, native activations and Q8KV4 attention, sixteen request slots, a 2M shared token pool (1M request ceiling), plain decoding, optional seven-proposal DSpark, images and video. Measured throughput, quality and validation scope are in the [model card](../docs/model_cards/MiniMax-M3.1-Flash.md). | enable DSpark: `--mtp --mtp-depth 7 --max-concurrency 8`; return to plain decoding: `--no-mtp` |
+| [cluster_minimax-m3.1-flash_nvfp4-mxfp8_w4.example.json](cluster_minimax-m3.1-flash_nvfp4-mxfp8_w4.example.json) | MiniMax M3.1 Flash on four nodes: published NVFP4 experts and MXFP8 dense weights, native activations and Q8KV4 attention, eight request slots, a 2M shared token pool (1M request ceiling), seven-proposal DSpark with adaptive verification at 1/3/5/7, images and video. Measured throughput, quality and validation scope are in the [model card](../docs/model_cards/MiniMax-M3.1-Flash.md). | full-seven verification: `--no-mtp-schedule`; plain decoding: `--no-mtp`; sixteen plain slots: `--no-mtp --max-concurrency 16` |
 | [cluster_glm-5.3-flash_nvfp4-fp8_w4.example.json](cluster_glm-5.3-flash_nvfp4-fp8_w4.example.json) | GLM-5.3-Flash hybrid on four nodes: MTP depth 1, bf16 latent cache, 768K context, a 22 GiB prefix arena (639 snapshots), four request slots | the 8K-context template: `--kv-capacity 8192 --prefix-cache-gib 1.5`; T=1: `--no-mtp` |
 | [cluster_glm-5.3-flash_nvfp4-fp8_w2.example.json](cluster_glm-5.3-flash_nvfp4-fp8_w2.example.json) | the same hybrid on two nodes: MTP depth 1, FP8 latent cache, 160K context, four request slots; the BF16 decode weights resident in their 12-bit form alone (`"bf12"`: 110.0 GiB per rank with its 4.5 GiB prefix arena of 65 snapshots, 1.8 GiB of the node left at boot) | both forms resident (no prefill cost, 132K context): `--bf16-weights bf12+bf16 --kv-capacity 135168`; the 256K-context two-slot shape: `--max-concurrency 2 --kv-capacity 262144 --prefix-cache-gib 2` |
 | [cluster_qwen-3.8-flash-next_fp8_w4.example.json](cluster_qwen-3.8-flash-next_fp8_w4.example.json) | Qwen3.8-Flash-Next FP8 on four nodes: MTP depth 1, 256K context, four request slots, a 1,052,672-token shared KV pool and a 40 GiB prefix arena (1476 snapshots) | T=1: `--no-mtp`; depth 2: `--mtp-depth 2` |
