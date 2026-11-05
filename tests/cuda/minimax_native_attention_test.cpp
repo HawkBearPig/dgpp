@@ -58,7 +58,7 @@ struct Device {
   }
 };
 
-void check(const fs::path& folder) {
+void check(const fs::path& folder, bool decode) {
   int rows, appends, requests, blocks, heads, kv_heads, topk;
   std::ifstream params(folder / "params.txt");
   params >> rows >> appends >> requests >> blocks >> heads >> kv_heads >> topk;
@@ -102,6 +102,13 @@ void check(const fs::path& folder) {
     minimax_index_select(scores.p + start * kv_heads * blocks, positions.p + start, count, kv_heads,
                          blocks, topk, selected.p + start * kv_heads * topk, stream);
     const size_t off = static_cast<size_t>(start) * topk * heads;
+    if (decode) {
+      minimax_attn_nvfp4_decode(q.p + start * heads * 128, k.p, v.p, req.p + start,
+                                 positions.p + start, table.p, blocks,
+                                 selected.p + start * kv_heads * topk, count, heads, kv_heads, topk,
+                                 out.p + start * heads * 128, stream);
+      return;
+    }
     minimax_attn_nvfp4_partial(q.p + start * heads * 128, k.p, v.p, req.p + start,
                                positions.p + start, table.p, blocks,
                                selected.p + start * kv_heads * topk, count, heads, kv_heads, topk,
@@ -122,7 +129,7 @@ void check(const fs::path& folder) {
   write(folder / "actual_ik.u8", ik.get());
   write(folder / "actual_scores.f32", original_scores);
   write(folder / "actual_selected.i32", original_selected);
-  write(folder / "actual_out.bf16", original);
+  write(folder / (decode ? "actual_decode.bf16" : "actual_out.bf16"), original);
   for (int chunk : {1, 8, 17}) {
     for (int start = 0; start < rows; start += chunk) run(start, std::min(chunk, rows - start));
     DGPP_CUDA_OK(cudaStreamSynchronize(stream));
@@ -149,7 +156,8 @@ void check(const fs::path& folder) {
   DGPP_CUDA_OK(cudaGraphExecDestroy(executable));
   DGPP_CUDA_OK(cudaGraphDestroy(graph));
   DGPP_CUDA_OK(cudaStreamDestroy(stream));
-  std::printf("Q8KV4 %s: row geometry and PDL graph replay exact\n", folder.filename().c_str());
+  std::printf("Q8KV4 %s %s: row geometry and PDL graph replay exact\n",
+              folder.filename().c_str(), decode ? "decode" : "prefill");
 }
 }  // namespace
 
@@ -162,7 +170,8 @@ int main(int argc, char** argv) {
         folders.push_back(entry.path());
     require(!folders.empty(), "no native attention fixtures");
     std::sort(folders.begin(), folders.end());
-    for (const auto& folder : folders) check(folder);
+    for (const auto& folder : folders)
+      for (const bool decode : {false, true}) check(folder, decode);
     return 0;
   } catch (const std::exception& e) {
     std::fprintf(stderr, "minimax_native_attention_test: %s\n", e.what());

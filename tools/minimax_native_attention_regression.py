@@ -87,7 +87,9 @@ def check_case(folder):
     selected = load(folder / 'actual_selected.i32', np.int32, (rows, kv_heads, topk))
     scores = load(folder / 'actual_scores.f32', np.float32, (rows, kv_heads, blocks))
     actual = load(folder / 'actual_out.bf16', np.uint16, (rows, heads, 128)).view(torch.bfloat16)
+    actual_decode = load(folder / 'actual_decode.bf16', np.uint16, actual.shape).view(torch.bfloat16)
     expected = torch.zeros_like(actual)
+    expected_decode = torch.zeros_like(actual)
     max_index_error = 0.0
     unit = torch.finfo(torch.float32).eps / 2
     gamma = 128 * unit / (1 - 128 * unit)
@@ -110,15 +112,21 @@ def check_case(folder):
                 assert torch.all(error <= bound[item, :, begin:end].amax(-1) + 1e-10), 'FP64 index error bound'
                 max_index_error = max(max_index_error, float(error.max()))
         expected[at] = reference.attention(qs, k, v, chosen, pos[at], 'prefill')
+        expected_decode[at] = reference.attention(qs, k, v, chosen, pos[at], 'decode')
     assert torch.equal(selected[pos < 0], torch.full_like(selected[pos < 0], -1)), 'padding selected pages'
     assert torch.count_nonzero(actual[pos < 0]) == 0, 'padding attention output'
+    assert torch.count_nonzero(actual_decode[pos < 0]) == 0, 'padding decode output'
     relative = float(torch.linalg.vector_norm(actual.double() - expected.double()) /
                      torch.linalg.vector_norm(expected.double()).clamp_min(1e-30))
     # The existing MiniMax isolated attention gate; the formula already
     # includes query/cache/probability quantization and page BF16 rounding.
     assert torch.isfinite(actual).all() and relative <= .004, ('attention formula', relative)
-    print(f'{folder.name}: cache/query bytes exact, index selections exact, attention relRMS={relative:.7g}', flush=True)
-    return dict(**shape, max_index_abs_error=max_index_error, attention_relative_rms=relative)
+    decode_relative = float(torch.linalg.vector_norm(actual_decode.double() - expected_decode.double()) /
+                            torch.linalg.vector_norm(expected_decode.double()).clamp_min(1e-30))
+    assert torch.isfinite(actual_decode).all() and decode_relative <= .004, ('decode formula', decode_relative)
+    print(f'{folder.name}: cache/query bytes exact, index selections exact, prefill relRMS={relative:.7g}, decode relRMS={decode_relative:.7g}', flush=True)
+    return dict(**shape, max_index_abs_error=max_index_error, attention_relative_rms=relative,
+                decode_relative_rms=decode_relative)
 
 
 def run(args):

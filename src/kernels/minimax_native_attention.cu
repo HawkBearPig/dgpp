@@ -274,6 +274,125 @@ __global__ __launch_bounds__(kThreads) void minimax_attn_nvfp4_kernel(
             __bfloat162float(__float2bfloat16_rn(pv[j][component] / denominators[h]));
     }
 }
+__global__ __launch_bounds__(kThreads) void minimax_attn_nvfp4_decode_kernel(
+    const uint8_t* q, const uint8_t* k, const uint8_t* v, const int32_t* req,
+    const int64_t* positions, const int32_t* table, int table_stride, const int32_t* selected,
+    int heads, int kv_heads, int topk, uint16_t* output) {
+  dgpp_pdl_wait();
+  extern __shared__ __align__(16) uint8_t smem[];
+  uint8_t* kv_tile = smem;
+  uint8_t* q_tile = smem + kCacheBytes;
+  float* scores = reinterpret_cast<float*>(q_tile + kQueryBytes);
+  __shared__ float maxima[16], denominators[16], corrections[16];
+  const int row = blockIdx.x, kv = blockIdx.y;
+  const int hpk = heads / kv_heads, first_head = kv * hpk;
+  const int tid = threadIdx.x, warp = tid / 32, lane = tid % 32;
+  const int64_t position = positions[row];
+  const int64_t out_base = (static_cast<int64_t>(row) * heads + first_head) * 128;
+  if (position < 0) {
+    for (int i = tid; i < hpk * 128; i += kThreads) output[out_base + i] = 0;
+    return;
+  }
+  if (tid < 16) {
+    maxima[tid] = -INFINITY;
+    denominators[tid] = 0;
+  }
+  float result[4][4] = {};
+  __syncthreads();
+  for (int page = 0; page < topk; ++page) {
+    const int block = selected[(static_cast<int64_t>(row) * kv_heads + kv) * topk + page];
+    if (block < 0 || position < static_cast<int64_t>(block) * 128) continue;
+    const int physical = table[static_cast<int64_t>(req[row]) * table_stride + block];
+    const int visible =
+        static_cast<int>(min(int64_t(128), position - static_cast<int64_t>(block) * 128 + 1));
+    const int64_t cache_start = static_cast<int64_t>(physical) * 128;
+    for (int i = tid; i < 16 * 128; i += kThreads) {
+      const int h = i / 128, d = i % 128;
+      q_tile[h * kStride + d] = h < hpk ? q[out_base + h * 128 + d] : 0;
+    }
+    for (int i = tid; i < 128 * 32; i += kThreads) {
+      const int token = i / 32, d = (i % 32) * 4;
+      *reinterpret_cast<uint32_t*>(kv_tile + token * kStride + d) =
+          token < visible
+              ? minimax_cached_fp8x4(k + ((cache_start + token) * kv_heads + kv) * kMinimaxNvfp4HeadBytes, d)
+              : 0;
+    }
+    __syncthreads();
+    float qk[4][4] = {};
+    product(q_tile, kv_tile, qk);
+#pragma unroll
+    for (int j = 0; j < 4; ++j)
+#pragma unroll
+      for (int component = 0; component < 4; ++component) {
+        const int h = lane / 4 + (component / 2) * 8;
+        const int token = warp * 32 + j * 8 + (lane % 4) * 2 + component % 2;
+        scores[h * 128 + token] =
+            token < visible ? qk[j][component] * .08838834764831845f : -INFINITY;
+      }
+    __syncthreads();
+    for (int h = warp; h < hpk; h += 4) {
+      float maximum = -INFINITY;
+#pragma unroll
+      for (int j = 0; j < 4; ++j) maximum = fmaxf(maximum, scores[h * 128 + lane + j * 32]);
+#pragma unroll
+      for (int offset = 16; offset; offset >>= 1)
+        maximum = fmaxf(maximum, __shfl_xor_sync(~0u, maximum, offset));
+      maximum = fmaxf(maximum, maxima[h]);
+      const float correction = expf(maxima[h] - maximum);
+      float total = 0;
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        const float probability = expf(scores[h * 128 + lane + j * 32] - maximum) * 448.f;
+        total += probability;
+        q_tile[h * kStride + lane + j * 32] = __nv_fp8_e4m3(probability).__x;
+      }
+#pragma unroll
+      for (int offset = 16; offset; offset >>= 1) total += __shfl_xor_sync(~0u, total, offset);
+      // Every lane must finish reading the previous running maximum before
+      // lane zero replaces it; independent thread scheduling permits a
+      // delayed correction load even after the probability warp reductions.
+      __syncwarp();
+      if (lane == 0) {
+        denominators[h] = __fadd_rn(__fmul_rn(denominators[h], correction), total);
+        maxima[h] = maximum;
+        corrections[h] = correction;
+      }
+    }
+    for (int i = tid; i < 128 * 32; i += kThreads) {
+      const int token = i / 32, d = (i % 32) * 4;
+      const uint32_t values =
+          token < visible
+              ? minimax_cached_fp8x4(v + ((cache_start + token) * kv_heads + kv) * kMinimaxNvfp4HeadBytes, d)
+              : 0;
+#pragma unroll
+      for (int j = 0; j < 4; ++j)
+        kv_tile[(d + j) * kStride + token] = static_cast<uint8_t>(values >> (j * 8));
+    }
+    __syncthreads();
+    float pv[4][4] = {};
+    product(q_tile, kv_tile, pv);
+#pragma unroll
+    for (int j = 0; j < 4; ++j)
+#pragma unroll
+      for (int component = 0; component < 4; ++component) {
+        const int h = lane / 4 + (component / 2) * 8;
+        if (h < hpk)
+          result[j][component] = __fadd_rn(__fmul_rn(result[j][component], corrections[h]),
+                                          pv[j][component]);
+      }
+    __syncthreads();
+  }
+#pragma unroll
+  for (int j = 0; j < 4; ++j)
+#pragma unroll
+    for (int component = 0; component < 4; ++component) {
+      const int h = lane / 4 + (component / 2) * 8;
+      const int d = warp * 32 + j * 8 + (lane % 4) * 2 + component % 2;
+      if (h < hpk)
+        output[out_base + h * 128 + d] =
+            __bfloat16_as_ushort(__float2bfloat16_rn(result[j][component] / fmaxf(denominators[h], 1.f)));
+    }
+}
 }  // namespace
 
 void minimax_query_fp8(const uint16_t* input, uint8_t* output, int64_t count, cudaStream_t stream) {
@@ -323,6 +442,18 @@ void minimax_attn_nvfp4_partial(const uint8_t* q, const uint8_t* k, const uint8_
     throw std::invalid_argument("MiniMax Q8KV4 attention geometry");
   minimax_attn_nvfp4_kernel<<<dim3(rows, topk, kv_heads), kThreads, kAttentionSmem, stream>>>(
       q, k, v, req, positions, table, stride, selected, heads, kv_heads, topk, m, l, c);
+  DGPP_CUDA_OK(cudaGetLastError());
+}
+void minimax_attn_nvfp4_decode(const uint8_t* q, const uint8_t* k, const uint8_t* v,
+                               const int32_t* req, const int64_t* positions, const int32_t* table,
+                               int stride, const int32_t* selected, int rows, int heads,
+                               int kv_heads, int topk, uint16_t* out, cudaStream_t stream) {
+  if (rows <= 0) return;
+  if (kv_heads <= 0 || heads <= 0 || heads % kv_heads || heads / kv_heads > 16 || topk <= 0 ||
+      topk > 16 || stride <= 0)
+    throw std::invalid_argument("MiniMax Q8KV4 decode geometry");
+  minimax_attn_nvfp4_decode_kernel<<<dim3(rows, kv_heads), kThreads, kAttentionSmem, stream>>>(
+      q, k, v, req, positions, table, stride, selected, heads, kv_heads, topk, out);
   DGPP_CUDA_OK(cudaGetLastError());
 }
 }  // namespace dgpp

@@ -140,11 +140,13 @@ with `tools/minimax_mxfp8_quantization_check.py`, providing the built
 
 ## Initial GB10 Q8KV4 kernel validation
 
-The new native attention kernels implement NVFP4 cache append, FP8 query
-conversion, sparse index scoring and the upstream **prefill** attention
-formula. They use that formula for every query geometry, including single
-rows. This preserves DGPP's batch/chunk invariance; it does not establish
-equivalence to the upstream online decode formula.
+The initial native attention kernels implemented NVFP4 cache append, FP8
+query conversion, sparse index scoring and the upstream **prefill** formula
+at every query geometry. The subsequent full-model phase comparison below
+found that applying this formula during decode fails the numerical gate.
+The corrected path selects the published formula by execution phase:
+prefill for prompt rows, online decode for generated and verification rows.
+Batch size does not select the formula.
 
 Five cases cover 1 through 65 query rows, mixed requests, permuted physical
 pages, 1 through 4 KV heads, causal boundaries, more than sixteen candidate
@@ -304,6 +306,32 @@ and all four ranks agree on every recorded hidden-state hash. The binary
 and zero-swap checks pass on every rank. These pilot results extend the
 short-trace evidence; they do not replace the longer corpora or task-quality
 checks, and do not claim to run the complete upstream stack.
+
+The prompt-aware phase comparison fails the unchanged numerical gate on
+both pilots. Applying prefill throughout, compared with prefill for the
+prompt and decode for the continuation, raises mean NLL by `0.20743` nat
+on raw text and `0.01922` nat on chat. Changes exceeding 1 nat occur at
+128/528 (24.24%) and 60/529 (11.34%) positions; argmax changes number 129
+and 66. The comparison holds native producers, matrix products and
+elementwise arithmetic fixed. This is a material phase-formula mismatch,
+not a BF16-versus-native comparison or a task-quality score. Earlier
+same-formula passes do not certify the former serving path.
+
+The correction also marks native-cache decode snapshots as incompatible
+with cold-prefill prefixes. The scheduler retains prompt snapshots and
+their NVMe storage, while suppressing rolling, hop and retire-time decode
+snapshots for this path. BF16-cache behavior is unchanged. Tests compare
+native decode row splits and graph replay with the decode trajectory, and
+each phase with its independent oracle; they do not require the publisher's
+different phase formulas to be bitwise interchangeable. Broader corrected
+native fidelity and serving validation are pending.
+
+The corrected kernels pass both phase oracles at all five isolated
+geometries, exact row splits and PDL graph replays, CUDA memcheck with zero
+errors and racecheck with zero hazards. Seven targeted CTest entries pass,
+including the scheduler and all four target precision combinations. The
+scheduler regression retains prompt-cache hits while forbidding decode
+snapshots, including a pool that fits without decode-snapshot headroom.
 
 ## Cache reconstruction and decode scheduling
 

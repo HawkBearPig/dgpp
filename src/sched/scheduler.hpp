@@ -257,6 +257,7 @@ class SchedulerEngine {
     int step_tokens_max = 1;   // tokens one step may commit (2: the MTP step)
     bool prefill_lookahead = false;  // MTP prefill snapshots also depend on prompt[position]
     bool body_snapshots = true;      // extra snapshots must preserve the prefill's computation
+    bool decode_snapshots = true;    // decode state can be reused as a cold-prefill prefix
   };
   virtual PrefixInfo prefix_info() const { return {}; }
   // The hop (M7 under a multi-token step): the request's next step may

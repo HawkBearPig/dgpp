@@ -734,6 +734,8 @@ void smoke(const std::string& path, const std::string& dump, bool native, Latent
   MinimaxModel m(cfg, path, 512, 1536, LoaderResidency::Resident, nullptr, 0, 1, 3, false, 0,
                    format, false, native);
   require(m.kv_format() == format, "model reports its actual cache format");
+  require(m.decode_prefix_compatible() == (format != LatentFormat::kFp4),
+          "phase-dependent decode cannot produce cold-prefix snapshots");
   size_t block_bytes = 0;
   for (const auto& plane : m.kv_pool().planes()) block_bytes += plane.block_bytes;
   require(block_bytes == MinimaxModel::kv_block_bytes_static(cfg, 0, 1, format),
@@ -759,17 +761,37 @@ void smoke(const std::string& path, const std::string& dump, bool native, Latent
   require(first.logits == m.forward(tokens, false).logits,
           "diagnostic layer capture must not change arithmetic");
   m.set_observer({});
+  std::vector<uint16_t> decoded_hidden;
   {
     auto decoded = m.session_prefill(0, {tokens.front()});
     require(std::equal(decoded.final_hidden_bits.begin(), decoded.final_hidden_bits.end(),
                        first.final_hidden_bits.begin()),
             "first decode hidden differs from full prefill");
+    decoded_hidden = decoded.final_hidden_bits;
     for (size_t at = 1; at < tokens.size();) {
       const int rows = std::min<size_t>(8, tokens.size() - at);
       decoded = m.session_verify(0, {tokens.begin() + at, tokens.begin() + at + rows});
+      if (format != LatentFormat::kFp4)
+        require(std::equal(decoded.final_hidden_bits.begin(), decoded.final_hidden_bits.end(),
+                           first.final_hidden_bits.begin() + at * cfg.hidden_size),
+                "incremental verification hidden differs from full prefill at " + std::to_string(at));
+      decoded_hidden.insert(decoded_hidden.end(), decoded.final_hidden_bits.begin(), decoded.final_hidden_bits.end());
+      m.session_rollback(0, rows, rows);
+      at += rows;
+    }
+    m.session_close(0);
+  }
+  // The native cache has distinct published phase formulas. Verify decode
+  // chunk invariance against its own trajectory, retaining the cold-prefill
+  // equality gate for the BF16 cache.
+  for (int chunk : {1, 4}) {
+    (void)m.session_prefill(0, {tokens.front()});
+    for (size_t at = 1; at < tokens.size();) {
+      const int rows = std::min<size_t>(chunk, tokens.size() - at);
+      const auto decoded = m.session_verify(0, {tokens.begin() + at, tokens.begin() + at + rows});
       require(std::equal(decoded.final_hidden_bits.begin(), decoded.final_hidden_bits.end(),
-                         first.final_hidden_bits.begin() + at * cfg.hidden_size),
-              "incremental verification hidden differs from full prefill at " + std::to_string(at));
+                         decoded_hidden.begin() + at * cfg.hidden_size),
+              "verification hidden changes with row geometry at " + std::to_string(at));
       m.session_rollback(0, rows, rows);
       at += rows;
     }
@@ -793,8 +815,8 @@ void smoke(const std::string& path, const std::string& dump, bool native, Latent
       DGPP_CUDA_OK(cudaStreamSynchronize(m.stream()));
       const auto replay = m.session_graph_collect(0);
       require(std::equal(replay.final_hidden_bits.begin(), replay.final_hidden_bits.end(),
-                         first.final_hidden_bits.begin() + at * cfg.hidden_size),
-              "target graph hidden differs from full prefill at " + std::to_string(at));
+                         decoded_hidden.begin() + at * cfg.hidden_size),
+              "target graph hidden differs from eager decode at " + std::to_string(at));
     }
     DGPP_CUDA_OK(cudaGraphExecDestroy(exec));
     DGPP_CUDA_OK(cudaGraphDestroy(graph));

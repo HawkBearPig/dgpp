@@ -158,7 +158,7 @@ int main(int argc, char** argv) {
     cfg.validate_tp(rank, world);
     if (!images.empty())
       dgpp::MinimaxLayerStream::set_resident_image_dir(images == "off" ? "" : images);
-    const int forward_rows = teacher.empty() ? static_cast<int>(ids.size()) : std::max(rows, 16);
+    const int forward_rows = teacher.empty() ? static_cast<int>(ids.size()) : std::max({rows, score_from, 16});
     std::unique_ptr<dgpp::net::CollectiveBus> bus;
     std::unique_ptr<dgpp::BusBoundaryReducer> boundary;
     if (world > 1) {
@@ -189,10 +189,10 @@ int main(int argc, char** argv) {
                 std::to_string(offset));
           ++chunk;
         };
-        auto out = engine.session_prefill(0, {ids.front()});
+        auto out = engine.session_prefill(0, {ids.begin(), ids.begin() + score_from});
         check_repeat(out, 0);
-        if (trial == 0) score_row(out, 0, 0);
-        for (size_t at = 1; at + 1 < ids.size();) {
+        if (trial == 0) score_row(out, 0, score_from - 1);
+        for (size_t at = score_from; at + 1 < ids.size();) {
           const int n = std::min<size_t>(rows, ids.size() - at - 1);
           out = engine.session_verify(0, {ids.begin() + at, ids.begin() + at + n});
           check_repeat(out, at);

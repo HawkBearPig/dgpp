@@ -31,4 +31,12 @@ void minimax_attn_nvfp4_partial(const uint8_t* q, const uint8_t* k, const uint8_
                                 const int32_t* block_tables, int table_stride,
                                 const int32_t* selected, int rows, int heads, int kv_heads,
                                 int topk, float* m, float* l, float* c, cudaStream_t);
+// MSA's decode formula: online maximum, FP8 probabilities, FP32 denominator
+// and accumulator, with only the final output rounded to BF16. Row count
+// does not select the phase; verification rows use this formula too.
+void minimax_attn_nvfp4_decode(const uint8_t* q, const uint8_t* k, const uint8_t* v,
+                               const int32_t* req_ids, const int64_t* positions,
+                               const int32_t* block_tables, int table_stride,
+                               const int32_t* selected, int rows, int heads, int kv_heads,
+                               int topk, uint16_t* out, cudaStream_t);
 }  // namespace dgpp

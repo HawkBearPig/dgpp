@@ -170,6 +170,7 @@ class FakeEngine : public SchedulerEngine {
     info.chunk_tokens = arena_chunk_;
     info.step_tokens_max = step_tokens_max_;
     info.prefill_lookahead = prefill_lookahead_;
+    info.decode_snapshots = decode_snapshots;
     return info;
   }
   // The two-token step's hop (M7): the fake commits whatever its script
@@ -189,6 +190,7 @@ class FakeEngine : public SchedulerEngine {
   }
   int step_tokens_max_ = 1;
   bool prefill_lookahead_ = false;
+  bool decode_snapshots = true;
   std::map<int, std::pair<int, int64_t>> hop_armed_;
   std::map<int, PrefixHopResult> hop_results_;
   int32_t prefill_cached(int req, const std::vector<int64_t>& prompt,
@@ -4480,6 +4482,36 @@ DGPP_TEST(scheduler_prefixCache_entryFloorKeepsShortPromptsOutOfTheArena) {
                   m.prefix_hits == 1 && m.prefix_misses == 1 && m.prefix_tokens_saved == 12,
               "above the floor the cached run is unchanged: " + ops);
     }
+  }
+}
+
+DGPP_TEST(scheduler_prefixCache_distinctDecodeFormulaKeepsOnlyPromptSnapshots) {
+  // A phase-dependent model can reuse prefills, but generated state would
+  // give different results when attached to a later cold-prefill request.
+  for (int step_tokens : {1, 2}) {
+    // Five eight-token blocks fit the live reservation plus its prompt
+    // snapshot exactly; no unused decode-snapshot headroom is needed.
+    FakeEngine engine(/*slots=*/2, /*total_blocks=*/step_tokens == 1 ? 100 : 5,
+                      /*block_tokens=*/step_tokens == 1 ? 4 : 8);
+    engine.set_prefix_arena(/*slots=*/4, /*align=*/4);
+    engine.decode_snapshots = false;
+    engine.set_step_tokens_max(step_tokens);
+    engine.arm(0, {1, 2, 3, 4, 5, 6, 7, 8}, 8);
+    engine.arm(0, {1, 2, 3, 4, 5, 6, 7, 8}, 8);
+    dgpp::sched::AdmissionPolicy policy;
+    policy.prefix_min_tokens = 8;
+    Scheduler sched(&engine, {kEos}, 0, policy);
+    sched.submit(make_cached_request("a", counted_prompt(21), {5, 13}, 8));
+    sched.run_to_completion();
+    sched.submit(make_cached_request("b", counted_prompt(21), {5, 13}, 8));
+    sched.run_to_completion();
+    const auto m = sched.meters();
+    require(m.prefix_snapshots == 1 && m.prefix_hits == 1 && m.prefix_tokens_saved == 12,
+            "phase-dependent decode preserves prompt-prefix reuse");
+    require(m.prefix_rolling == 0 && m.prefix_hops == 0 && m.prefix_close_entries == 0,
+            "decode state must not become a cold-prefix entry");
+    require(engine.op_stream().find("RS:") == std::string::npos,
+            "incompatible decode takes no rolling snapshots");
   }
 }
 

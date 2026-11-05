@@ -342,6 +342,8 @@ class EagerEngineAdapter : public sched::SchedulerEngine {
       info.prefill_lookahead = info.prefill_lookahead || model_->dflash2_enabled();
     if constexpr (requires { model_->prefill_bounded(); })
       info.body_snapshots = !model_->prefill_bounded();
+    if constexpr (requires { model_->decode_prefix_compatible(); })
+      info.decode_snapshots = model_->decode_prefix_compatible();
     return info;
   }
   int32_t prefill_cached(int req, const std::vector<int64_t>& prompt,
