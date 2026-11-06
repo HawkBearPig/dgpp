@@ -818,6 +818,18 @@ void GlmDsaModel::enqueue_layer(const GlmDsaLayerResident& r, int pool_layer, ui
   gemm_.set_bf12_wide(rows.decode);
   if (rows.decode) prefetch_attention_side(r.layer + 1);
   fold(ffn_out, T, H, rows.capture);  // block boundary 2: the sliced down projections
+  if constexpr (Research) {
+    // Dense outputs have the same replicated BF16 boundary as attention.
+    // Shared-expert outputs stay separate FP32 partials for the coordinator.
+    if (!r.moe && tp_world() > 1) {
+      std::vector<uint16_t> output(H);
+      DGPP_CUDA_OK(cudaStreamSynchronize(stream_));
+      DGPP_CUDA_OK(cudaMemcpy(output.data(), ffn_out + static_cast<size_t>(T - 1) * H,
+                              H * sizeof(uint16_t), cudaMemcpyDeviceToHost));
+      for (int i = 0; i < H; ++i)
+        research->projections.back().output[i] = bf16_bits_to_float(output[i]);
+    }
+  }
   // The closing add is deferred into the next norm's first pass (the next
   // layer's input norm, the final norm or the draft head's); nothing reads
   // the residual before that, and the next stage() handout is taken after it.
@@ -983,8 +995,7 @@ GlmDsaModel::ResearchOutputs GlmDsaModel::research_forward(const std::vector<int
                                                            bool enabled) {
   if (!enabled)
     throw std::invalid_argument("research capture requires engine.heretic_research=true");
-  if (tp_world() != 1 || mtp_)
-    throw std::invalid_argument("research capture currently requires world 1 and MTP off");
+  if (mtp_) throw std::invalid_argument("research capture requires MTP off");
   if (ids.empty() || ids.size() > static_cast<size_t>(max_tokens_) ||
       ids.size() > static_cast<size_t>(max_context_))
     throw std::invalid_argument("research capture: prompt exceeds bounds or is empty");

@@ -5,9 +5,10 @@
 The opt-in Heretic inspection command describes GLM-5.3's modifiable
 projections and their input-column partitions without loading weights.
 The versioned catalog matches Heretic's attention, dense MLP and shared-expert
-capture indices. A separate local worker now provides baseline logits, greedy
-generation, and last-token residual/projection capture, with native int8 and
-Mixed346 fixture checks. Distributed execution, candidate lifecycle, complete
+capture indices. A separate worker provides baseline logits, greedy
+generation, and last-token residual/projection capture on worlds 1, 2 and 4,
+with native int8/Mixed346 fixture checks and a four-node full-checkpoint probe.
+Candidate lifecycle, complete
 Heretic workflow integration, and independent runtime artifact loading remain
 pending. See the [integration guide](docs/heretic.md) for commands, capability
 limits, and the default-off feature gate.

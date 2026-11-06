@@ -1250,8 +1250,20 @@ add_executable(dgpp_heretic_worker apps/dgpp_heretic_worker.cpp)
 target_link_libraries(dgpp_heretic_worker PRIVATE dgpp_models_glm_dsa_layers dgpp_serve CUDA::cudart Threads::Threads)
 set_target_properties(dgpp_heretic_worker PROPERTIES OUTPUT_NAME dgpp-heretic-worker)
 dgpp_set_common(dgpp_heretic_worker)
+if(TARGET dgpp_bus)
+  target_link_libraries(dgpp_heretic_worker PRIVATE dgpp_bus)
+  target_compile_definitions(dgpp_heretic_worker PRIVATE DGPP_HERETIC_FABRIC=1)
+  add_dependencies(dgpp_heretic_worker dgpp_version)
+  target_include_directories(dgpp_heretic_worker PRIVATE ${CMAKE_BINARY_DIR}/generated)
+  add_test(NAME heretic_distributed_host COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/python/heretic_distributed_check.py host
+    $<TARGET_FILE:dgpp_heretic_worker> ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/heretic_glm_dsa_config.json)
+endif()
 add_test(NAME heretic_worker_host COMMAND ${Python3_EXECUTABLE}
   ${CMAKE_CURRENT_SOURCE_DIR}/tests/python/heretic_worker_check.py host
+  $<TARGET_FILE:dgpp_heretic_worker> ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/heretic_glm_dsa_config.json)
+add_test(NAME heretic_launcher_host COMMAND ${Python3_EXECUTABLE}
+  ${CMAKE_CURRENT_SOURCE_DIR}/tests/python/heretic_launcher_check.py
   $<TARGET_FILE:dgpp_heretic_worker> ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/heretic_glm_dsa_config.json)
 add_test(NAME heretic_inspect_test COMMAND ${Python3_EXECUTABLE}
   ${CMAKE_CURRENT_SOURCE_DIR}/tests/python/heretic_inspect_test.py
@@ -1963,6 +1975,13 @@ foreach(_format int8 m346)
     $<TARGET_FILE:dgpp_heretic_worker> ${CMAKE_CURRENT_BINARY_DIR}/heretic_${_format}_fixture)
   set_tests_properties(heretic_worker_${_format} PROPERTIES
     FIXTURES_REQUIRED heretic_${_format} RUN_SERIAL TRUE TIMEOUT 120)
+  if(TARGET dgpp_bus)
+    add_test(NAME heretic_distributed_${_format} COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/python/heretic_distributed_check.py gpu
+      $<TARGET_FILE:dgpp_heretic_worker> ${CMAKE_CURRENT_BINARY_DIR}/heretic_${_format}_fixture)
+    set_tests_properties(heretic_distributed_${_format} PROPERTIES
+      FIXTURES_REQUIRED heretic_${_format} RUN_SERIAL TRUE TIMEOUT 180)
+  endif()
 endforeach()
 target_include_directories(glm_dsa_forward_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
 target_link_libraries(glm_dsa_forward_test PRIVATE dgpp_models_glm_dsa_layers dgpp_models_glm_loader CUDA::cudart Threads::Threads)
@@ -2883,8 +2902,12 @@ endforeach()
 set_tests_properties(tokenizer_patterns_test word_cache_test bpe_test unit unit_tests http_server_test nvme_cache_test cache_storage_test serve_test serve_test_wake fabric_serve_test fabric_serve_test_wake scheduler_test shutdown_watchdog_test engine_watchdog_test
   qwen_yarn_fixture_test qwen_w4a4_plan_default qwen_w4a4_plan_mode_0 qwen_w4a4_plan_mode_1
   qwen_w4a4_plan_mode_empty qwen_w4a4_plan_mode_invalid PROPERTIES LABELS "host")
-set_tests_properties(heretic_worker_host heretic_inspect_test checkpoint_audit_test chat_template_generator_test route_trace_test sampling_profile_test spec_ab_probe_test
+set_tests_properties(heretic_launcher_host heretic_worker_host heretic_inspect_test checkpoint_audit_test chat_template_generator_test route_trace_test sampling_profile_test spec_ab_probe_test
   site_env_test script_reports_test timed_load_test serve_admission_bench_test serve_cancel_prefix_check_test qwen_yarn_release_check_test qwen_head_compare_test portability_test spark_cross_test setup_tools_test bootstrap_test launcher_test cluster_process_swap_test PROPERTIES LABELS "host;python")
+if(TARGET dgpp_bus)
+  set_tests_properties(heretic_distributed_host PROPERTIES LABELS "host;python" TIMEOUT 60)
+  set_tests_properties(heretic_distributed_int8 heretic_distributed_m346 PROPERTIES LABELS "gpu;rdma")
+endif()
 set_tests_properties(cluster_process_swap_systemd_test PROPERTIES LABELS "systemd" TIMEOUT 180)
 if(TARGET dgpp_serve_app)
   set_tests_properties(serve_startup_test PROPERTIES LABELS "host;python" TIMEOUT 180)

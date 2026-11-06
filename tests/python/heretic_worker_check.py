@@ -109,7 +109,7 @@ def host(binary, metadata):
             assert process.wait(timeout=5) == 0
         cases = [
             (lambda c: c["engine"].update(heretic_research=False), "research is disabled"),
-            (lambda c: (c.pop("world_size"), c.update(nodes=["rank0", "rank1", "rank2", "rank3"])), "world_size=1"),
+            (lambda c: (c.pop("world_size"), c.update(nodes=["rank0", "rank1", "rank2"])), "world size 1, 2 or 4"),
             (lambda c: c["engine"].update(mtp=True), "mtp=false"),
             (lambda c: c["engine"].update(max_concurrency=2), "max_concurrency=1"),
             (lambda c: c["engine"].update(kv_dtype="fp8"), "BF16 KV"),

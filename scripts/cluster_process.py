@@ -63,11 +63,13 @@ def send_signal(path, number):
         return False
 
 
-def launch(state, command, log, cwd, env=None):
+def launch(state, command, log, cwd, env=None, pass_fds=()):
     no_swap = (os.environ if env is None else env).get("DGPP_NO_SWAP", "0")
     if no_swap not in ("0", "1"):
         raise ValueError("DGPP_NO_SWAP must be 0 or 1")
     if no_swap == "1":
+        if pass_fds:
+            raise ValueError("inherited control descriptors require a direct process launch (DGPP_NO_SWAP=0)")
         command = ["systemd-run", "--user", "--scope", "--quiet",
                    "--property=MemorySwapMax=0", "--", *command]
     state = Path(state)
@@ -79,7 +81,7 @@ def launch(state, command, log, cwd, env=None):
         with open(log, "ab") as output:
             proc = subprocess.Popen(command, cwd=cwd, env=env, stdout=output,
                                     stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-                                    start_new_session=True)
+                                    start_new_session=True, pass_fds=pass_fds)
         try:
             record = identity(proc.pid)
             if record is None:

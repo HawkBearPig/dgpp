@@ -122,8 +122,8 @@ class GlmDsaModel : public SessionModel<GlmDsaModel> {
   Outputs forward(const std::vector<int64_t>& token_ids, bool capture_layers = false);
   struct ProjectionCapture {
     std::string id;
-    std::vector<uint16_t> input;
-    std::vector<float> output;  // shared: actual FP32 down output; other targets: widened BF16
+    std::vector<uint16_t> input;  // this rank's input-column slice
+    std::vector<float> output;    // shared: FP32 local partial; others: replicated widened BF16
   };
   struct ResearchOutputs {
     Outputs prediction;  // raw last-prompt-position logits only

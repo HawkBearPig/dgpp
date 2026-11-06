@@ -371,7 +371,7 @@ commands.
 | [Deployment templates](deploy/README.md) | the template catalogue, naming, shared defaults and launcher flags |
 | [Configuration](docs/configuration.md) | every site and deployment setting, its default and its effect |
 | [Operations](docs/operations.md) | booting, stopping and watching a world, memory on a node, failure semantics, health |
-| [Heretic integration](docs/heretic.md) | opt-in GLM-5.3 target inspection, local research execution/capture, and remaining backend work |
+| [Heretic integration](docs/heretic.md) | opt-in GLM-5.3 target inspection, distributed research execution/capture, and remaining backend work |
 | [Release and install](docs/release-install.md) | the packaged release on a fresh cluster |
 | [Tools](docs/tools.md) | serving, diagnostic and validation commands |
 | [OpenAI API compatibility](docs/openai-compatibility.md) | the request and response contract, extensions, limits and live metrics |

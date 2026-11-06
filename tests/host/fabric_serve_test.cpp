@@ -2073,6 +2073,55 @@ DGPP_TEST(journal_disk_commit_collector_waits_for_every_rank) {
   require(threw, "a rank reporting twice is a divergence");
 }
 
+DGPP_TEST(journal_research_binary_roundtrip_is_rank_ordered_and_bounded) {
+  dgpp::serve::JournalWriter writer(0);
+  dgpp::serve::JournalReader second("127.0.0.1", writer.port(), 5000, 2);
+  dgpp::serve::JournalReader first("127.0.0.1", writer.port(), 5000, 1);
+  writer.accept_peers(3, 5000);
+  std::string a(1048576, '\0'), b(65537, '\xff');
+  a[8193] = '\n';
+  bool ok1 = false, ok2 = false;
+  std::jthread t1([&] { ok1 = first.send_payload(a, 5000); });
+  std::jthread t2([&] { ok2 = second.send_payload(b, 5000); });
+  const auto values = writer.gather_peer_payloads(2 * 1048576, 5000);
+  t1.join();
+  t2.join();
+  require(ok1 && ok2 && values.size() == 2, "binary gather completes");
+  require(values[0] == std::make_pair(1, a) && values[1] == std::make_pair(2, b),
+          "rank order and binary bytes");
+  require(first.send_payload({}, 5000) && second.send_payload({}, 5000), "empty barrier replies");
+  require(writer.gather_peer_payloads(16, 5000).size() == 2, "second phase has no leftover bytes");
+  require(second.send_payload(std::string(17, 'x'), 5000), "oversized reply writes");
+  bool refused = false;
+  try {
+    (void)writer.gather_peer_payloads(16, 5000);
+  } catch (const std::runtime_error& e) {
+    refused = std::string(e.what()).find("exceeds budget") != std::string::npos;
+  }
+  require(refused, "oversized reply rejected before body allocation");
+}
+
+DGPP_TEST(journal_research_binary_deadline_and_truncation) {
+  for (bool truncate : {false, true}) {
+    dgpp::serve::JournalWriter writer(0);
+    auto raw = dgpp::net::TcpConn::connect("127.0.0.1", writer.port(), 5000);
+    require(raw.write_all("hello 1\n", 8), "raw hello");
+    writer.accept_peers(2, 5000);
+    const unsigned char partial[] = {10, 0, 0, 0, 'a'};
+    require(raw.write_all(partial, sizeof(partial)), "partial body");
+    if (truncate) raw.close();
+    const auto begin = std::chrono::steady_clock::now();
+    bool refused = false;
+    try {
+      (void)writer.gather_peer_payloads(1024, 100);
+    } catch (const std::runtime_error&) {
+      refused = true;
+    }
+    require(refused && std::chrono::steady_clock::now() - begin < std::chrono::seconds(2),
+            "truncated or stalled reply must fail within its deadline");
+  }
+}
+
 DGPP_TEST(journal_return_path_carries_peer_status_lines) {
   // A writer and one peer over loopback: the peer's status line reaches
   // the writer's poll without blocking; the death watch is undisturbed.

@@ -4,12 +4,11 @@ Heretic owns scoring plugins, modifier algorithms, optimization studies, and
 exports. DGPP supplies execution for its supported checkpoint formats and will
 apply the resulting runtime artifacts alongside the original weights.
 
-The integration provides a GLM-5.3 projection catalog and a persistent local
+The integration provides a GLM-5.3 projection catalog and a persistent
 research worker for baseline logits, greedy generation, and last-token tensor
-capture. Distributed execution, candidate installation, and serving-time
-adapter loading remain to be implemented. The worker is not yet a complete
-Heretic optimization backend and cannot run the full Mixed346 checkpoint on
-one GB10.
+capture on one, two, or four nodes. The four-node worker can load the full
+Mixed346 checkpoint. Candidate installation and serving-time adapter loading
+remain to be implemented; this is not yet a complete Heretic optimization backend.
 
 ## Configuration and performance isolation
 
@@ -22,9 +21,9 @@ digest because serving performs no research operations.
 Capture is a separate model walk compiled with a research template parameter.
 The normal walk has no capture conditionals, copies, synchronization, or host
 capture allocations. The worker checks the cluster flag before model access
-or CUDA initialization. Keep future trial controls and research listeners
-behind this flag. Before adding distributed execution,
-carry its effective state through the rank journal and configuration digest.
+or CUDA initialization. The distributed worker includes the effective flag,
+resolved settings, checkpoint metadata/revision, binary fingerprint, and
+numerical environment overrides in its startup agreement over the rank journal.
 Runtime adapter execution in ordinary serving will require a separate explicit
 configuration opt-in. Disabled features must not allocate their buffers,
 enqueue their kernels or collectives, or alter the existing cache policy.
@@ -66,7 +65,7 @@ projections. Fused routed experts and the draft block are excluded. The shared
 expert uses Heretic's logical `mlp.down_proj` component, with its distinct
 checkpoint module path retained in the descriptor.
 
-## Local baseline worker
+## Baseline worker
 
 Build `dgpp_heretic_worker` to produce `build-release/dgpp-heretic-worker`.
 Use a separate config for a supported checkpoint that fits the local device:
@@ -85,12 +84,14 @@ Use a separate config for a supported checkpoint that fits the local device:
 }
 ```
 
-The initial worker requires world 1, MTP and decode graphs off, no prefix
+The worker supports worlds of size 1, 2 and 4, with MTP and decode graphs off, no prefix
 cache, BF16 KV, and checkpoint weight formats. Other explicitly supplied
 engine options are rejected rather than silently ignored. Prompts are bounded
 by the smaller of 2048 tokens and context capacity; continuations must fit the
 remaining context and `default_max_tokens`. Model construction is lazy, after
-a memory-plan check with an 8 GiB reserve on both host and device. This guard
+a memory-plan check with an 8 GiB reserve on both host and device. On an
+integrated GPU, reclaimable host file cache counts toward the shared memory
+budget. This guard
 rejects the full checkpoint on one GB10 before weight allocation. `describe`
 needs only checkpoint metadata and works with CUDA hidden.
 
@@ -100,11 +101,62 @@ The owner creates an AF_UNIX stream socket pair and launches:
 dgpp-heretic-worker --config research.json --control-fd <inherited-socket-fd>
 ```
 
-There is no listening socket, HTTP endpoint, or connection to a serving
-process. The local Heretic branch provides `heretic.backends.dgpp_worker` as
+The owner channel has no listening socket or HTTP endpoint and never connects
+to a serving process. The local Heretic branch provides `heretic.backends.dgpp_worker` as
 the Python owner, including deadlines, tensor validation, and child cleanup.
 Tokenization and chat templates remain with the caller. This interface does
 not yet select DGPP in the main Heretic optimization CLI.
+
+### Launch a distributed world
+
+Use `scripts/dgpp-heretic-cluster` as the Python client's worker executable.
+It accepts a deployment JSON with `world_size`, resolves the existing site
+settings, and stages the same worker and resolved config on every node. Rank 0
+runs locally: invoke it on the first node in `DGPP_NODES`. Peers need batch-mode
+SSH access, the same checkpoint revision in their configured cache, CUDA and
+the existing RoCE setup. A multi-node worker requires an IBV-enabled build.
+
+For the Mixed346 checkpoint, create a separate research JSON:
+
+```json
+{
+  "model": "HawkBearPig/GLM-5.3-Mixed346-GPTQ-H32-A8-g128",
+  "world_size": 4,
+  "engine": {
+    "heretic_research": true,
+    "max_concurrency": 1,
+    "prefix_cache_gib": 0,
+    "kv_capacity": 512,
+    "default_max_tokens": 16
+  }
+}
+```
+
+From the local Heretic branch, use the pinned tokenizer to prepare IDs and run:
+
+```python
+from heretic.backends.dgpp_worker import ResearchWorker
+
+with ResearchWorker("research.json", "../dgpp/scripts/dgpp-heretic-cluster", timeout=600) as worker:
+    logits = worker.first_token_logits(prompt_ids)
+    captures = worker.capture(prompt_ids)
+    tokens = worker.generate(prompt_ids, max_new_tokens=16, stop_token_ids=eos_ids)
+```
+
+Reserve idle hardware. Set `DGPP_FABRIC_PORT` and `DGPP_JOURNAL_PORT` to unused
+ports for the research world. The launcher owns a unique staging directory and
+process records; close, cancellation and failures terminate only those processes.
+Rank logs and operation streams are retained under `DGPP_LOG_DIR/heretic/<run-id>`.
+The inherited control descriptor currently requires a direct head launch
+(`DGPP_NO_SWAP=0` on rank 0); a requested swap-limited scope is rejected rather
+than silently bypassed. Monitor worker `VmSwap` and host memory during a run.
+
+The journal coordinates startup, commands, bounded binary capture replies,
+and a barrier after all models load. Existing DGPP collectives execute tensor
+parallel model operations and full-vocabulary greedy selection. Capture joins
+input-column slices, checks replicated residuals and attention/dense outputs,
+and sums shared-expert FP32 partials in rank order. A failed owner or rank aborts
+the world, including during a collective; no partial result becomes a score.
 
 ### Protocol version 1
 
@@ -167,7 +219,18 @@ logit parity, residual boundary order, repeatability, session isolation, and
 generation against direct model sessions. An independent pure-Python matrix
 product checks every captured projection against checkpoint weights: relative
 L2 below 0.004 for BF16 output paths and 0.00002 for the shared FP32 output.
-These are correctness checks, not full-checkpoint or throughput measurements.
+Distributed tests cover worlds 2 and 4, startup disagreement (settings,
+binary, runtime environment), peer failure, and identical operation streams.
+Projection oracle limits are 0.008 for distributed BF16 output paths and
+0.00002 for shared FP32 outputs. Launcher tests cover flag rejection and
+normal close, owner disconnect, and cancellation without CUDA or SSH.
+
+A four-node probe of revision `824aedb0c783832223dab78a826bec7442ddea23`
+validated all 154880 logits, 314 capture tensors, a 16-token continuation,
+bitwise baseline restoration, zero process swap on every rank, and matching
+operation streams. It tests execution and capture, not modification quality
+or throughput. The model memory plan with the research configuration is about
+93.6 GiB per rank; Python, captures and future optimizer buffers are additional.
 
 ```sh
 cmake --build build-release --target dgpp_heretic_worker dgpp_heretic_inspect heretic_capture_test -j 4

@@ -7,10 +7,11 @@ Other model templates use the same launcher with their own memory and
 engine settings. See the [configuration reference](configuration.md) for
 settings, defaults and their effects.
 
-For offline projection discovery or local baseline tensor capture, use the
+For offline projection discovery or baseline tensor capture, use the
 separate [Heretic research tools](heretic.md). Both require an explicit
-research flag. Inspection reads model metadata only; the world-1 worker
-loads a fitting checkpoint on demand and never attaches to a serving world.
+research flag. Inspection reads model metadata only; the worker loads a
+checkpoint on demand across one, two or four nodes and never attaches to a
+serving world. Its launcher owns separate process records and research ports.
 
 ## Sampling penalty defaults
 
