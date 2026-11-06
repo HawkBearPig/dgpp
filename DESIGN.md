@@ -2432,6 +2432,14 @@ the same machine from the journal and its tokenizer.
 
 ## 11. Runtime and API
 
+Heretic research uses a separate, opt-in tool path. The host-only GLM-5.3
+target catalog maps Heretic's capture IDs to checkpoint modules, full weight
+shapes, and each rank's input-column interval. `dgpp-heretic-inspect` requires
+`engine.heretic_research=true` and advertises only target discovery. It does
+not attach to the serving process or initialize a model. See
+[Heretic integration](docs/heretic.md) for the boundary and pending execution
+and artifact capabilities.
+
 The shared JSON parser validates number grammar before conversion, retaining exact
 signed integers when representable and the existing double fallback otherwise.
 Its prefix-parsing API remains available; `parse_document` additionally requires

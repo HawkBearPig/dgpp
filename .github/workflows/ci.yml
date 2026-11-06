@@ -29,13 +29,13 @@ jobs:
       - name: Compile every Python source
         run: python -m compileall -q scripts tools tests/python
       - name: Run the host suites
-        # qwen_head_check_test needs a built binary and a checkpoint, so it
-        # runs under CTest on a Spark instead.
+        # These checks need built C++ binaries, so they run under CTest
+        # on a Spark instead of in the Python-only job.
         run: |
           set -eu
           for t in tests/python/*_test.py; do
             case "$(basename "$t")" in
-              qwen_head_check_test.py) continue ;;
+              qwen_head_check_test.py|heretic_inspect_test.py) continue ;;
             esac
             echo "== $t"
             python "$t"

@@ -43,6 +43,21 @@ DGPP_TEST(cluster_config_rejects_malformed_number_syntax) {
   require(config.engine.repetition_penalty == 1.0f, "valid exponent remains accepted");
 }
 
+DGPP_TEST(cluster_config_heretic_research_requires_explicit_boolean_opt_in) {
+  require(!dgpp::serve::parse_cluster_config(engine_json("{}"), "t").engine.heretic_research,
+          "research tools disabled by default");
+  require(dgpp::serve::parse_cluster_config(engine_json(R"({"heretic_research":true})"), "t")
+              .engine.heretic_research,
+          "explicit opt in");
+  require(!dgpp::serve::parse_cluster_config(engine_json(R"({"heretic_research":false})"), "t")
+               .engine.heretic_research,
+          "explicit opt out");
+  for (const char* bad : {"null", "1", "0", "\"true\"", "[]", "{}"})
+    require(refusal(engine_json("{\"heretic_research\":" + std::string(bad) + "}"))
+                    .find("engine.heretic_research") != std::string::npos,
+            "strict flag type with actionable error");
+}
+
 DGPP_TEST(cluster_config_penalty_defaults_preserve_omission_and_explicit_neutral_values) {
   const auto absent = dgpp::serve::parse_cluster_config(engine_json("{}"), "t").engine;
   require(!absent.repetition_penalty && !absent.frequency_penalty && !absent.presence_penalty,
