@@ -56,9 +56,13 @@ ModelArchitecture detect_architecture(const minijson::Value& root) {
   // Flint (2026-10-22, docs/flint_plan.md): `FlintForCausalLM` / `flint`.
   if (arch.rfind("Flint", 0) == 0 || (arch.empty() && type == "flint"))
     return ModelArchitecture::Flint;
+  if (arch == "MiniMaxM3SparseForConditionalGeneration" ||
+      (arch.empty() && type == "minimax_m3_vl"))
+    return ModelArchitecture::MinimaxM3;
   throw std::runtime_error(
-      "config.json: unsupported architecture '" + arch + "' (model_type '" +
-      type + "'); the engine implements Glm5*, Qwen4Exp*, Glm4Moe*, GlmMoeDsa*, DeepseekV41*, DeepseekV4*, MiMoV2*, Qwen3_5*, Flint* and Dory*");
+      "config.json: unsupported architecture '" + arch + "' (model_type '" + type +
+      "'); the engine implements Glm5*, Qwen4Exp*, Glm4Moe*, GlmMoeDsa*, DeepseekV41*, "
+      "DeepseekV4*, MiMoV2*, Qwen3_5*, Flint*, MiniMaxM3Sparse* and Dory*");
 }
 
 ModelArchitecture detect_architecture_file(const std::string& path) {

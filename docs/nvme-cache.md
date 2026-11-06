@@ -21,6 +21,70 @@ Enable it with a top-level `nvme_cache` block in the deployment:
 The [configuration reference](configuration.md#nvme-cache) lists every key.
 Every long-context template in `deploy/` carries the block, off.
 
+## Storage placement and containers
+
+Startup and `--memory-plan` report the absolute resolved cache directory,
+the existing directory probed, the containing mountpoint and the filesystem
+type on each rank. Before creating the directory or allocating a slab, the
+preflight checks placement, writability and capacity. A missing cache
+directory is checked through its nearest existing ancestor. `--memory-plan`
+does not create directories or probe files, and does not test direct I/O;
+the slab opener checks that separately during normal startup.
+
+In a container, `nvme_cache.path` is a path **inside the container**. Mount
+the intended host storage there. Without that mount, cache files can consume
+the container's writable layer and disappear when the container is removed,
+even if restarting the same container preserved them. For example, after
+creating `/mnt/local-nvme/dgpp-cache` on the intended host filesystem and
+giving the container's serving user write access, add this to `docker run`:
+
+```sh
+--mount type=bind,src=/mnt/local-nvme/dgpp-cache,dst=/var/lib/dgpp-cache
+```
+
+Set the deployment's cache block to:
+
+```json
+"nvme_cache": {
+  "enabled": true,
+  "path": "/var/lib/dgpp-cache",
+  "required_mount": "/var/lib/dgpp-cache",
+  "capacity_gib": 64
+}
+```
+
+Docker's `--mount` rejects a missing host source by default; `-v` can create
+it on the fallback filesystem. See [Docker bind mounts](https://docs.docker.com/engine/storage/bind-mounts/).
+A named Docker volume also works if its actual host backing is appropriate;
+the volume name alone does not establish local NVMe storage. Configure the
+mount on every rank's node and keep the same mount when replacing containers.
+Cache adoption still requires a compatible [binding](#across-restarts).
+
+`required_mount` is optional. When set, it names the exact containing
+mountpoint after resolving existing symlinks. A cache subdirectory under
+that mount is allowed. An ordinary directory at the expected mountpoint,
+a symlink escaping it, or a nested mount with a different identity is
+refused. Bind mounts are recognized even when their device number matches
+the parent filesystem. An unavailable mount identity also refuses an explicit
+assertion. Without an assertion, unavailable mount metadata is reported as a
+warning; filesystem checks still run. Placement policy is local to each rank
+and does not change the cache binding or numerical settings shared by rank 0.
+
+Known RAM-backed filesystems (tmpfs, ramfs and hugetlbfs) are refused by
+default, even on kernels that accept `O_DIRECT` there. The existing
+`allow_buffered` option permits them for tests and experiments, with a warning.
+OverlayFS, aufs and fuse-overlayfs produce a warning rather than a default
+refusal: they can indicate a container writable layer but do not prove one.
+Neither filesystem detection nor a mount assertion proves physical NVMe
+backing, persistence, or that a host-side disk mount is present behind a bind
+mount. Check the host storage too. Filesystems layered over RAM devices or
+other hidden backing are outside this check's detection guarantees.
+
+The slab opener rechecks placement before opening the cache and checks the
+opened descriptor before truncation or preallocation. Placement refusals
+preserve existing local cache files. This is a startup check, not a monitor
+for mount changes during serving or a transaction across ranks.
+
 ## What it keeps and what it pays
 
 An entry on disk is complete: the snapshot blob with the recurrent, ring and
@@ -54,6 +118,11 @@ never grows past it: a spill that finds no room after evicting every unused
 entry is skipped. A memory entry stays attachable while its copy is written,
 an entry being written or read is never evicted, and at most `max_ops`
 operations are in flight.
+
+Cancellation can retain an existing committed answer snapshot in memory,
+but does not start a new spill for it. Its blocks remain evictable when
+live requests need capacity; a disk write would pin them until completion.
+Earlier prefill entries retain their ordinary disk-cache behavior.
 
 A restore starts when a queued request's deepest usable state is on disk. It
 reads into fresh pool blocks and a free arena slot, then the request attaches

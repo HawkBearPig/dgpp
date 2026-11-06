@@ -88,6 +88,19 @@ class PortabilityTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "nvme_cache.reuse_binding"):
                     site_env.resolve_config(self.config, self.values)
 
+    def test_nvme_required_mount_survives_resolution(self):
+        for mount in ("", "/", "/mnt/cache", "/mnt/space tab\tback\\line\n"):
+            cache = {"enabled": True, "capacity_gib": 64, "required_mount": mount}
+            self.config.write_text(json.dumps({"model": "org/model", "world_size": 1, "nvme_cache": cache}))
+            resolved = site_env.server_config(site_env.resolve_config(self.config, self.values))
+            self.assertEqual(resolved["nvme_cache"], cache)
+        for mount in (True, None, 1, [], "relative", "~/cache", "/cache\0suffix"):
+            with self.subTest(mount=mount):
+                self.config.write_text(json.dumps({"model": "org/model", "world_size": 1,
+                                                  "nvme_cache": {"required_mount": mount}}))
+                with self.assertRaisesRegex(ValueError, "nvme_cache.required_mount"):
+                    site_env.resolve_config(self.config, self.values)
+
     def test_http_types_and_ports_rejected(self):
         for http in ({"bind_host": 0}, {"bind_host": "localhost"}, {"port": True}, {"port": 0}, {"host": "a"}):
             with self.subTest(http=http):
@@ -294,6 +307,7 @@ class PortabilityTest(unittest.TestCase):
             "kaushikvira/Qwen3.8-Flash-Next-swift15-nvfp4-dgpp": "qwen-3.8-flash-next_nvfp4-swift15",
             "nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-NVFP4": "dory1.0-4b_nvfp4",
             "HawkBearPig/flint-FP8-NVFP4": "flint_fp8-nvfp4",
+            "MiniMaxAI/MiniMax-M3.1-Flash": "minimax-m3.1-flash_nvfp4-mxfp8",
         }
         # Families whose checkpoint ships no draft layer: their templates run
         # plain (the spec keys are refused by name at boot, not merely off) —
@@ -306,7 +320,8 @@ class PortabilityTest(unittest.TestCase):
         self.assertTrue(templates)
         index = (ROOT / "deploy/README.md").read_text()
         # One template per model, quant and world (2026-09-14): every template
-        # enables the decode graph and MTP, except a DFlash2-drafter variant
+        # enables the decode graph, with the measured draft or plain default.
+        # A DFlash2-drafter variant
         # (2026-10-01): it names engine.dflash_model instead of MTP, the
         # drafter replacing the MTP draft one-for-one, its block proposal
         # recorded in the graph step (2026-10-05; the eager engine is the
@@ -325,7 +340,7 @@ class PortabilityTest(unittest.TestCase):
                     self.assertFalse(engine.get("mtp", False), "a draftless family's template runs plain")
                     self.assertTrue(engine["decode_graph"])
                 else:
-                    self.assertTrue(engine["mtp"], "every template enables MTP (the plain world is --no-mtp)")
+                    self.assertTrue(engine["mtp"], "this family's template enables MTP (plain is --no-mtp)")
                     self.assertTrue(engine["decode_graph"])
                 # The name is the shape: cluster_<model>_<quant>_w<n>, with an
                 # optional trailing _<variant> for a template that deviates from

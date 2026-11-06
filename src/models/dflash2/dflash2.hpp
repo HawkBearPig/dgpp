@@ -9,13 +9,11 @@
 // candidates. The embeddings and lm head are the target's (the draft
 // checkpoint ships neither); the draft planes live in the target's KV pool
 // so block tables, prefix sharing and rollback ride the existing protocol
-// (models/dflash2/draft_planes.hpp). The drafter's own backbone is always
-// Qwen3 (parse enforces it) whatever the TARGET family is; the target-side
-// integration (the taps, the head dispatch, the pool planes) is the host
-// model's — models/dflash2/drafter.hpp carries the shared execution.
-//
-// v1 scope: eager greedy C1 (the plan's implementation sequence); graph
-// capture, batching and sampled verification stay open.
+// (models/dflash2/draft_planes.hpp). The DFlash2 parser enforces the Qwen3
+// checkpoint architecture. MiniMax supplies a separately validated native
+// DSpark configuration and weights through models/minimax/dspark.hpp.
+// The host owns the feature tap locations, output head and pool planes;
+// models/dflash2/drafter.hpp carries eager, batched and graph execution.
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -38,8 +36,13 @@ struct DFlash2TargetShape {
 };
 
 struct DFlash2Config {
+  enum class Backbone { Qwen3, MiniMaxM3 };
+  Backbone backbone = Backbone::Qwen3;
+  int rotary_dim = 128;
+  float swiglu_alpha = 1.702f, swiglu_limit = 7.0f;
   // dflash_config.
-  int block_size = 8;             // query rows per draft: 1 anchor + (block_size - 1) mask rows
+  int block_size = 8;             // target verification rows: anchor + proposals
+  bool sample_from_anchor = false;  // DSpark predicts from row 0; DFlash2 from row 1.
   int mask_token_id = -1;
   int conv_taps = 2;
   int conv_group_size = 16;
@@ -63,7 +66,8 @@ struct DFlash2Config {
   static DFlash2Config parse(const minijson::Value& root);
 
   int drafts() const { return block_size - 1; }
-  int query_rows() const { return block_size; }
+  int query_rows() const { return block_size - (sample_from_anchor ? 1 : 0); }
+  int proposal_row_offset() const { return sample_from_anchor ? 0 : 1; }
   int kv_row() const { return num_key_value_heads * head_dim; }
   int q_row() const { return num_attention_heads * head_dim; }
   // The tensor-parallel slices (2026-10-04): the attention heads, the kv
@@ -123,6 +127,9 @@ struct DFlash2LayerWeights {
   const uint8_t* gate_fp8 = nullptr;  const float* gate_scales = nullptr;
   const uint8_t* up_fp8 = nullptr;    const float* up_scales = nullptr;
   const uint8_t* down_fp8 = nullptr;  const float* down_scales = nullptr;
+  // Native MiniMax MXFP8 uses one E8M0 byte per row and 32 columns.
+  const uint8_t *qkv_e8m0 = nullptr, *o_e8m0 = nullptr, *gate_e8m0 = nullptr, *up_e8m0 = nullptr,
+                *down_e8m0 = nullptr;
 };
 
 struct DFlash2Weights {
@@ -133,6 +140,8 @@ struct DFlash2Weights {
   const uint16_t* pred_codebook = nullptr;  // [vocab, rank]
   const uint16_t* succ_codebook = nullptr;  // [vocab, rank]
   const uint16_t* hidden_projection = nullptr;  // [rank, H]
+  const float* confidence_weight = nullptr;     // [hidden + selector_rank]
+  const float* confidence_bias = nullptr;       // [1]
   void* arena = nullptr;
   size_t bytes = 0;
   void* fp8_arena = nullptr;  // the fp8 payloads + scales (engine.dflash_weights fp8)
@@ -142,10 +151,19 @@ struct DFlash2Weights {
   DFlash2Weights(const DFlash2Weights&) = delete;
   DFlash2Weights& operator=(const DFlash2Weights&) = delete;
   DFlash2Weights(DFlash2Weights&& o) noexcept
-      : layers(std::move(o.layers)), fc(o.fc), hidden_norm(o.hidden_norm), norm(o.norm),
-        pred_codebook(o.pred_codebook), succ_codebook(o.succ_codebook),
-        hidden_projection(o.hidden_projection), arena(o.arena), bytes(o.bytes),
-        fp8_arena(o.fp8_arena), fp8_bytes(o.fp8_bytes) {
+      : layers(std::move(o.layers)),
+        fc(o.fc),
+        hidden_norm(o.hidden_norm),
+        norm(o.norm),
+        pred_codebook(o.pred_codebook),
+        succ_codebook(o.succ_codebook),
+        hidden_projection(o.hidden_projection),
+        confidence_weight(o.confidence_weight),
+        confidence_bias(o.confidence_bias),
+        arena(o.arena),
+        bytes(o.bytes),
+        fp8_arena(o.fp8_arena),
+        fp8_bytes(o.fp8_bytes) {
     o.arena = nullptr;
     o.bytes = 0;
     o.fp8_arena = nullptr;
@@ -162,6 +180,8 @@ struct DFlash2Weights {
       pred_codebook = o.pred_codebook;
       succ_codebook = o.succ_codebook;
       hidden_projection = o.hidden_projection;
+      confidence_weight = o.confidence_weight;
+      confidence_bias = o.confidence_bias;
       arena = o.arena;
       bytes = o.bytes;
       fp8_arena = o.fp8_arena;

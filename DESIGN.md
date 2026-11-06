@@ -1,7 +1,7 @@
 # DGPP Engine Design
 
 This document describes the implemented serving architecture. The
-shared runtime supports the GLM, Qwen, DeepSeek, MiMo, Flint and Dory architectures listed
+shared runtime supports the GLM, Qwen, DeepSeek, MiMo, MiniMax, Flint and Dory architectures listed
 in the [supported-model guide](README.md), with resident loading, tensor
 parallelism, decode graphs, sampling, prefix caching and speculative decoding.
 World size and memory requirements depend on the model
@@ -11,6 +11,10 @@ The attention, weight-placement and state examples below describe
 GLM-5.3-Flash unless another family is named. Qwen's GDN/QSA/GR/PLE
 operators are documented in [its architecture study](docs/qwen38_flash_next_plan.md),
 and GLM-4.7's GQA and NVFP4 layout in [its implementation notes](docs/glm47_plan.md).
+MiniMax M3.1's per-head sparse block selection, FP32 routing, published
+MXFP8/NVFP4 weights, bundled DSpark and temporal vision encoder are described
+in [its implementation record](docs/minimax_m31_flash_plan.md). It uses the
+same session, prefill, graph, prefix-cache and speculative-decoding contracts.
 Shared session and engine interfaces live in `src/engine/`. A common scheduler
 owns admission, fair reader budgets and request lifecycle. `PrefillTask`,
 `PrefillContinuation`, `PrefillBatch`, `RowRun` and `GraphBatchMapping` share
@@ -1835,6 +1839,15 @@ the next conversation turn. Reuse requires the next prompt to contain
 the same token prefix, including the rendered answer and relevant
 reasoning/template content.
 
+Cancellation may retain an existing rolling snapshot only when its position
+is within the committed response prefix (prompt plus generated tokens,
+excluding the pending last token). It does not take a fresh retirement
+snapshot. A client that received fewer tokens or changed the rendered
+history still has to match the stored prefix and a valid cut. Retained
+entries use the ordinary arena, block accounting and eviction policy. They
+remain in memory only: cancellation must not start an NVMe spill that pins
+their blocks and prevents live requests from reclaiming capacity.
+
 MTP can commit past an aligned position in one step. The scheduler can
 arm a post-row snapshot for that position; the engine reconstructs it
 from speculative state snapshots and the corresponding cache references.
@@ -2276,8 +2289,11 @@ At positive temperature, logprobs describe the final filtered and
 renormalized sampling distribution. At temperature zero they describe
 the raw distribution used by the greedy reporting path. Chat requests
 can ask for `logprobs` and up to 20 `top_logprobs`; the legacy
-route uses its integer logprobs field. Each returned token carries its
-corresponding report through scheduler events and the HTTP response.
+route uses its integer logprobs field. These reports cover generated tokens;
+prompt scoring is not implemented. Both routes reject non-null
+`prompt_logprobs` explicitly, while null is treated as omission.
+Each returned token carries its corresponding report through scheduler
+events and the HTTP response.
 
 The common greedy path avoids the full sampling calculation. Greedy
 requests needing penalties or logprobs use the reporting path while

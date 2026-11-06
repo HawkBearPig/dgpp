@@ -32,6 +32,7 @@
 // ascending k; the output rotation in fp32, times the scale and svh in
 // fp32; the site's rounding last.
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -394,7 +395,7 @@ inline void exl3_oracle_row(const Exl3HostMatrix& m, const std::vector<double>& 
     const double* wrow = inner.data() + static_cast<size_t>(k) * N;
     for (int64_t n = 0; n < N; ++n) y[n] += a * wrow[n];
   }
-  std::vector<double> v(kExl3Block), tmp(kExl3Block);
+  std::array<double, kExl3Block> v{}, tmp{};
   const double scale = 1.0 / std::sqrt(static_cast<double>(kExl3Block));
   for (int64_t nb = 0; nb < N; nb += kExl3Block) {
     for (int j = 0; j < kExl3Block; ++j) v[j] = y[nb + j];

@@ -11,13 +11,14 @@ rows below have not been re-measured since, so they describe deployments
 with the fixed prefill budgets listed per row, not a current default
 deployment. The Qwen3.8-Flash-Next QAD row (2026-10-14), the six
 Qwen3.8-27B rows (2026-10-16), the Swift 1.5 two-node row (2026-10-17),
-and the FP4-Local row (2026-10-21) are measured with the adaptive defaults.
+the FP4-Local row (2026-10-21), and MiniMax (2026-11-05) are measured with the adaptive defaults.
 The measurements behind that change are in
 [PR #112](https://github.com/HawkBearPig/dgpp/pull/112). When defaults
 change again, keep each row's recorded configuration with its numbers.
 
 | Measurement set | Date (UTC) | Source revision | Scope |
 |---|---|---|---|
+| MiniMax-M3.1-Flash NVFP4/MXFP8, four nodes | 2026-11-05 | `a40e587a8608` (binary `718a59bf8356b19c7d3ec63cd5bba644561cee2069ab4d3ac7fabb682ba6dbe3`) | One shipped-template campaign (18:34–20:18 UTC): native DSpark with adaptive verification and eight slots, five classes at C1/C2/C4/C8, twelve cold prefill probes, context timing through 512K, 164 HumanEval / 300 GSM8K / 100 extraction cases plus capped-response retries, API and transcript isolation, and fresh plain/full-seven C1 controls. All four boots ran the recorded binary with zero swap on every rank (head swap disabled for the window; swap-limited serving scopes), all cold probes had zero cached tokens, operation streams matched, the fabric was otherwise idle, and production and head swap were restored once after validation. Replaces the earlier sixteen-slot plain template's row set. |
 | GLM-5.3-Flash NVFP4/FP8, four nodes | 2026-10-29 | `11fe1807`, the 0.1.0 release build (binary `1960b127b308e83e`), tree at `8216f398` (documentation commits only beyond the build) | The four-node template as shipped, every row from one `serve_campaign.py run` (00:59 to 01:51 UTC): five classes at C1/C2/C4/C8, three cold probes each at 512/2K/8K/32K, the context matrix through 512K on the 768K pool, the 300-item quality set, the API, greedy-transcript and isolation checks, and the plain boot (5/5 classes matched). Every rank at zero swap before and after, zero cached tokens in the twelve cold probes, matching operation streams. Replaces the 2026-10-06/07 and 2026-10-13 rows, which ran with fixed prefill budgets and kept only the C1 decode rate |
 | GLM-5.3-Flash NVFP4/FP8, two nodes | 2026-10-28/29 | `11fe1807`, the 0.1.0 release build (binary `1960b127b308e83e`), tree at `acd81cf1` (documentation commits only beyond the build) | The two-node template as shipped, every row from one `serve_campaign.py run` (23:21 to 00:15 UTC): five classes at C1/C2/C4/C8, three cold probes each at 512/2K/8K/32K, the context matrix to the 160K pool, the 300-item quality set, the API, greedy-transcript and isolation checks, and the plain boot (5/5 classes matched). Both ranks at zero swap before and after, zero cached tokens in the twelve cold probes, matching operation streams. Replaces the 2026-10-06/07 row, which ran with fixed prefill budgets and kept only its C1 decode rate |
 | DeepSeek-V4.1-Flash-1017 EXL3 3.5bpw | 2026-10-23 | `b423d5db` plus the day's second program in the working tree (binary `9a179b15a6de02fa`) | The EXL3 3.5 bpw template as shipped on four nodes after the day's second program — sixteen slots on the family's 96-row decode batch (the morning's twelve on 64), the balanced expert slices, the fused split reduce, the deep slot ring, the 128-row dense tile, a 4,096-token first prefill chunk, the expert-run slot form with its 64-row run groups, the attention split groups merged in L2, the tiled router and mHC dots from sixteen rows, the tensor-core GEMV's one split chain to 128 rows, the verify schedule's row and base costs measured on the pack (2.95 / 19.9 ms) and the five-draft DSpark block under the schedule's three options (1, 3, 5; `engine.mtp_depth` 5, `engine.mtp_schedule_options` 3) — in one `serve_campaign.py run` on 2026-10-24 00:06–00:54 UTC (with the five DSpark mode boots: plain and fixed depths 1/2/3/5 through `--no-mtp-schedule`): five classes at C1/C2/C4/C8, three cold probes each at 512/2K/8K/32K, the context matrix to 512K, the 300-item quality set, the API, greedy-transcript and isolation checks, every rank at zero swap, zero cached tokens in the 12 cold probes, matching operation streams in 7/7 launches. The day's earlier campaigns (six slots on `c7efb833f88a06e3`, twelve on `dde85abfaa953cc1` and `6f8bccfa5b70efef`, sixteen at depth 4 on `9a179b15a6de02fa`) are superseded by this row set; the [model card](model_cards/DeepSeek-V4.1-Flash-1017-EXL3-3.5bpw.md) keeps them beside the release's |
@@ -96,6 +97,7 @@ underlying quadratic cold-prefill work remains (see the
 
 | Model / weights | Nodes | Options | C1 decode tok/s | C2 decode tok/s | C4 decode tok/s | C8 decode tok/s | Cold prefill s: ~2K / ~8K / ~32K |
 | --- | --- | --- | --- | --- | --- | --- | --- |
+| MiniMax-M3.1-Flash NVFP4/MXFP8 | 4 | native activations, DSpark adaptive 1/3/5/7, 2M NVFP4 KV, 8 slots | 28.8–48.2 | 42.1–66.1 | 59.0–83.0 | 85.7–99.7 | 2.176 / 7.816 / 33.341 |
 | GLM-5.3-Flash NVFP4/FP8 | 2 | 160K FP8 KV, 4 slots | 31.2–36.7 | 44.8–49.1 | 59.7–65.3 | 58.4–61.7 | 2.217 / 7.142 / 29.634 |
 | GLM-5.3-Flash NVFP4/FP8 | 2 | 256K FP8 KV, 2 slots | 30.7–36.1 | — | — | — | 1.976 / 8.178 / 35.025 |
 | GLM-5.3-Flash NVFP4/FP8 | 4 | 768K BF16 KV, 4 slots | 59.0–64.7 | 82.1–91.3 | 111.1–120.4 | 103.9–112.9 | 1.174 / 4.627 / 20.493 |
@@ -147,6 +149,7 @@ Request wall throughput, the service-level view: total completed output over the
 
 | Model / weights | Nodes | Options | C1 wall tok/s | C2 wall tok/s | C4 wall tok/s | C8 wall tok/s |
 | --- | --- | --- | --- | --- | --- | --- |
+| MiniMax-M3.1-Flash NVFP4/MXFP8 | 4 | native activations, DSpark adaptive 1/3/5/7, 2M NVFP4 KV, 8 slots | 27.0–42.8 | 39.6–61.4 | 56.3–77.4 | 79.5–92.5 |
 | GLM-5.3-Flash NVFP4/FP8 | 2 | 160K FP8 KV, 4 slots | 30.1–35.2 | 43.3–47.1 | 57.9–63.1 | 57.7–60.8 |
 | GLM-5.3-Flash NVFP4/FP8 | 2 | 256K FP8 KV, 2 slots | 29.6–34.6 | 43.1–46.9 | 44.7–48.1 | 44.5–47.2 |
 | GLM-5.3-Flash NVFP4/FP8 | 4 | 768K BF16 KV, 4 slots | 56.9–61.8 | 79.3–87.3 | 107.4–116.4 | 102.6–111.3 |
@@ -246,6 +249,7 @@ a row exactly.
 
 | Model / weights | Nodes | Options | Slots | KV pool tokens | KV format | Prefix cache GiB | Prefill tokens/tick (busy / idle) | Recorded decode mode | Template at measurement |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| MiniMax-M3.1-Flash NVFP4/MXFP8 | 4 | native activations, DSpark adaptive 1/3/5/7, 2M NVFP4 KV, 8 slots | 8 | 2,097,152 | nvfp4 | 2 | adaptive / idle cap 2048 | DSpark adaptive 1/3/5/7 | [JSON](../deploy/cluster_minimax-m3.1-flash_nvfp4-mxfp8_w4.example.json) |
 | GLM-5.3-Flash NVFP4/FP8 | 2 | 160K FP8 KV, 4 slots | 4 | 163,840 | fp8 | 4.5 | adaptive (default) | MTP1 | [JSON](../deploy/cluster_glm-5.3-flash_nvfp4-fp8_w2.example.json) |
 | GLM-5.3-Flash NVFP4/FP8 | 2 | 256K FP8 KV, 2 slots | 2 | 262,144 | fp8 | 2 | 256 / 2,048 | MTP1 | — |
 | GLM-5.3-Flash NVFP4/FP8 | 4 | 768K BF16 KV, 4 slots | 4 | 786,432 | bf16 | 22 | adaptive (default) | MTP1 | [JSON](../deploy/cluster_glm-5.3-flash_nvfp4-fp8_w4.example.json) |
@@ -317,9 +321,9 @@ a row exactly.
 | Repetitions | Three per class and concurrency | One cold request, then two identical requests |
 | Sampling | Greedy, temperature zero | Greedy, temperature zero |
 | Thinking | Disabled where supported; full GLM-5.3 uses its reasoning mode | Server default |
-| Cold-prefill thinking | GLM probes use the server default; other families disable thinking | Server default |
+| Cold-prefill thinking | Disabled where supported; GLM and MiniMax probes use the recorded server default | Server default |
 | Prefix cache | Enabled; repetitions reuse prompts | Enabled; first request must report zero cached tokens |
-| Concurrency | C1/C2/C4/C8; mode comparisons use C1 | C1 |
+| Concurrency | C1/C2/C4/C8, plus C16 on 16-slot templates; mode comparisons use C1 | C1 |
 | Summary | Range across five class medians | Median across three requests; cold prefill is the first request |
 
 - Each concurrency phase uses distinct prompts. Different concurrency levels use different subsets of the same class corpus.
@@ -334,12 +338,23 @@ One template, measured as shipped on the bench port, yields every row the tables
 
 | Table | Measurement | Client |
 |---|---|---|
-| Decode throughput by concurrency; request wall throughput; single-request decode by class | C1/C2/C4/C8 over the five prompt classes, three repetitions, 256 tokens; the engine's decode-only rate and the wall rate per phase | `timed_load.py` |
-| Cold prefill | 512 / 2K / 8K / 32K, three distinct uncached prefixes each, thinking off | `serve_prefill_probe.py` |
+| Decode throughput by concurrency; request wall throughput; single-request decode by class | C1/C2/C4/C8, plus C16 on 16-slot templates, over the five prompt classes, three repetitions, 256 tokens; the engine's decode-only rate and the wall rate per phase | `timed_load.py` |
+| Cold prefill | 512 / 2K / 8K / 32K, three distinct uncached prefixes each, thinking off where supported; otherwise the recorded template default | `serve_prefill_probe.py` |
 | Long context (decode at context, prefill per bucket) | 0 / 32K / 64K / 128K / 256K / 512K parcel documents: one cold request, two identical | `serve_context_matrix.py` |
-| Quality | the 300-item HumanEval / GSM8K / extraction set at the deployment's slot count; a response cut at the standard cap is asked once more at the 8,192 retry cap (counted in its own column, never scored) | `serve_eval.py` |
+| Quality | 164 HumanEval, 300 GSM8K and 100 extraction items (564 total) at the deployment's slot count; a response cut at the standard cap is asked once more at the 8,192 retry cap (counted in its own column, never scored) | `serve_eval.py` |
 | Transcript checks | the API check; five classes × three greedy transcripts in the shipped mode and again in a second boot without the drafter (the plain/default match); prompt 0 alone against beside slots−1 others (the isolation check) | `serve_api_check.py`, `serve_load.py` |
-| Decode modes | a boot per extra mode (`--mode NAME="<knobs>"`): the C1 sweep; the DSpark columns boot with `--mtp-depth N --no-mtp-schedule` (a fixed verify depth; a scheduled template refuses a fixed depth without the second flag) and the plain column with `--no-mtp` | `timed_load.py` |
+| Decode modes | a boot per extra mode (`--mode NAME="<knobs>"`): the C1 sweep; DeepSeek DSpark columns boot with `--mtp-depth N --no-mtp-schedule` (a fixed verify depth; a scheduled template refuses a fixed depth without the second flag) and the plain column with `--no-mtp` | `timed_load.py` |
+
+MiniMax ships native DSpark with eight slots, adaptive verification at
+1/3/5/7, and a learned block of seven proposals (`--mtp-depth 7`). To measure a
+fixed smaller verification depth N, use `--mtp-schedule
+--mtp-schedule-min-depth N --mtp-schedule-options 2
+--mtp-schedule-lambda 1000000 --mtp-schedule-fixed-lambda`; the large fixed
+penalty selects the smaller option. `--no-mtp-schedule` verifies all seven,
+and `--no-mtp` is plain decode. Do not change the learned block length to
+produce these controls. Fresh slots and slots requiring a new eager draft
+still take the scheduler's mandatory full-block verification; the smaller
+depth applies once their confidence is available.
 
 ### Validity
 
@@ -357,6 +372,7 @@ Engine tokens/s, greedy; median of three repetitions.
 
 | Model / weights | Nodes | Options | Prose | Code | JSON | Math | Chat |
 | --- | --- | --- | --- | --- | --- | --- | --- |
+| MiniMax-M3.1-Flash NVFP4/MXFP8 | 4 | native activations, DSpark adaptive 1/3/5/7, 2M NVFP4 KV, 8 slots | 33.3 | 37.5 | 41.7 | 48.2 | 28.8 |
 | GLM-5.3-Flash NVFP4/FP8 | 2 | 160K FP8 KV, 4 slots | 34.9 | 36.6 | 36.7 | 35.3 | 31.2 |
 | GLM-5.3-Flash NVFP4/FP8 | 2 | 256K FP8 KV, 2 slots | 34.2 | 36.0 | 36.1 | 34.8 | 30.7 |
 | GLM-5.3-Flash NVFP4/FP8 | 4 | 768K BF16 KV, 4 slots | 61.6 | 63.2 | 64.7 | 62.4 | 59.0 |
@@ -402,7 +418,7 @@ Engine tokens/s, greedy; median of three repetitions.
 
 ## Decode modes
 
-C1 engine tokens/s; each range spans the five class medians. **MTP1**, **MTP2** and **MTP3** mean fixed chains of one, two and three draft tokens. DSpark is DeepSeek's block drafter; its numbered columns specify the number of drafts verified. DFlash2 is the separate Qwen 27B drafter. Adaptive columns use the deployment's confidence-based depth schedule.
+C1 engine tokens/s; each range spans the five class medians. **MTP1**, **MTP2** and **MTP3** mean fixed chains of one, two and three draft tokens. DSpark is the block drafter used by DeepSeek and MiniMax; its numbered columns specify the number of drafts verified. DFlash2 is the separate Qwen 27B drafter. Adaptive columns use the deployment's confidence-based depth schedule.
 
 **Not swept** identifies MTP4 where it is neither a default mode nor part of the earlier AutoRound comparison; MTP1/MTP2/MTP3 are tested for every native-MTP deployment. Exact settings, pass times and tokens per pass remain in each raw record.
 
@@ -460,11 +476,43 @@ C1 engine tokens/s; each range spans the five class medians. **MTP1**, **MTP2** 
 | Qwen3.8-27B FP8 | 2 | DFlash2 drafter, FP8 head, 256K BF16 KV, 8 slots | DFlash2 adaptive ≤7 | 15.0–15.3 | 25.5–28.5 | 28.4–38.8 | 31.1–45.8 | 33.0–84.2 | 33.3–82.3 |
 | Qwen3.8-27B FP8 | 4 | DFlash2 drafter, FP8 head, 256K BF16 KV, 8 slots | DFlash2 adaptive ≤7 | 28.4–28.5 | 46.2–52.4 | 50.7–69.1 | 50.6–80.5 | 48.6–133.0 | 49.9–131.5 |
 
+### MiniMax DSpark
+
+The template ships native DSpark with eight slots and adaptive verification.
+All three modes below use the same executable, eight-slot configuration and
+five-class C1 sweep from the campaign recorded above. The plain control uses
+`--no-mtp`; full-seven uses `--no-mtp-schedule`.
+
+| Model / weights | Nodes | Options | Default | Plain | DSpark full 7 | DSpark adaptive |
+| --- | --- | --- | --- | --- | --- | --- |
+| MiniMax-M3.1-Flash NVFP4/MXFP8 | 4 | native activations, 2M NVFP4 KV, 8 slots | DSpark adaptive 1/3/5/7 | 21.5–21.7 | 22.9–44.9 | 28.8–48.2 |
+
+Adaptive verification is faster than both controls in every measured C1
+class: 1.33–2.23× the plain rate. All thirty control replies match the
+adaptive sweep exactly. The serving table retains the adaptive template's
+complete C1–C8 sweep; this comparison does not establish an optimum for
+every workload or slot count.
+
+The drafter always produces seven proposals from seven query rows
+`[anchor, six masks]`, including the anchor prediction. Adaptive verification
+chooses one, three, five or seven proposals; fresh slots verify all seven
+until confidence is available. Under the template's automatic draft policy,
+the schedule applies to greedy requests; sampled requests use full-seven
+verification with rejection correction. Target and draft projections honor
+native activations. See the [model card](model_cards/MiniMax-M3.1-Flash.md)
+for precision boundaries and schedule settings.
+
+The original DSpark timing remains withdrawn because it skipped the anchor
+prediction and used BF16 projection inputs despite the native setting.
+The new campaign measures the corrected implementation. The
+[implementation record](minimax_m31_flash_plan.md) preserves the defect and
+its validation history.
+
 <!-- END modes -->
 
 ## Quality and correctness
 
-These are the original campaigns' quality results, retained separately from the performance refresh; the six Qwen3.8-27B rows are from the 2026-10-17/18 refresh, and FP4-Local is from the 2026-10-21 campaign on its shipped template. Scores apply to their saved configurations, prompts, evaluator and output limits; current deployment settings may differ.
+These are the original campaigns' quality results, retained separately from the performance refresh; the six Qwen3.8-27B rows are from the 2026-10-17/18 refresh, FP4-Local is from the 2026-10-21 campaign, and MiniMax is from the 2026-11-05 campaign, each on its shipped template. Scores apply to their saved configurations, prompts, evaluator and output limits; current deployment settings may differ.
 
 | Evaluation setting | Value |
 |---|---|
@@ -480,6 +528,7 @@ These are the original campaigns' quality results, retained separately from the 
 
 | Model / weights | Nodes | Options | HumanEval | GSM8K | Schema extraction | Responses at token cap | Completed at the 8,192 retry (passed) |
 |---|---|---|---|---|---|---|---|
+| MiniMax-M3.1-Flash NVFP4/MXFP8 | 4 | native activations, DSpark adaptive 1/3/5/7, 2M NVFP4 KV, 8 slots | 151/164 | 294/300 | 99/100 | 6 | 3 (3 pass) |
 | GLM-5.3-Flash NVFP4/FP8 | 2 | 160K FP8 KV, 4 slots | 159/164 | 293/300 | 100/100 | 0 | 0 |
 | GLM-5.3-Flash NVFP4/FP8 | 2 | 256K FP8 KV, 2 slots | 158/164 | 292/300 | 100/100 | 0 | 0 |
 | GLM-5.3-Flash NVFP4/FP8 | 4 | 768K BF16 KV, 4 slots | 159/164 | 294/300 | 100/100 | 0 | 0 |
@@ -564,6 +613,7 @@ DeepSeek-V4's strict HumanEval scores count responses with unclosed code fences 
 
 | Model / weights | Nodes | Options | Rank checks passed | Plain/default greedy match | Solo/batched greedy text |
 |---|---|---|---|---|---|
+| MiniMax-M3.1-Flash NVFP4/MXFP8 | 4 | native activations, DSpark adaptive 1/3/5/7, 2M NVFP4 KV, 8 slots | 9/9 | 5/5 classes | identical |
 | GLM-5.3-Flash NVFP4/FP8 | 2 | 160K FP8 KV, 4 slots | 9/9 | 5/5 classes | identical |
 | GLM-5.3-Flash NVFP4/FP8 | 2 | 256K FP8 KV, 2 slots | 3/3 | 5/5 classes | identical |
 | GLM-5.3-Flash NVFP4/FP8 | 4 | 768K BF16 KV, 4 slots | 9/9 | 5/5 classes | identical |
@@ -603,7 +653,7 @@ DeepSeek-V4's strict HumanEval scores count responses with unclosed code fences 
 | Plain/default greedy match | All three repetitions in both modes produced identical text and token counts for a class |
 | Solo/batched greedy text | Exact transcript agreement for the recorded workload; floating-point reduction order can change with batch shape |
 
-Recorded operation streams matched for 54/54 launches in the original campaign, 11/11 in MiMo, 12/12 in DeepSeek-V4, 8/8 in the 2026-10-17/18 Qwen3.8-27B refresh, 2/2 in the 2026-10-18 DeepSeek-V4.1-Flash-1017 set and 7/7 in the 2026-10-23 DeepSeek-V4.1-Flash-1017 EXL3 3.5bpw set (the template, its plain boot and the five mode boots). Single-node launches have only one stream.
+Recorded operation streams matched for 54/54 launches in the original campaign, 11/11 in MiMo, 12/12 in DeepSeek-V4, 8/8 in the 2026-10-17/18 Qwen3.8-27B refresh, 2/2 in the 2026-10-18 DeepSeek-V4.1-Flash-1017 set, 7/7 in the 2026-10-23 DeepSeek-V4.1-Flash-1017 EXL3 3.5bpw set (the template, its plain boot and the five mode boots), and 4/4 in the 2026-11-05 MiniMax adaptive set (the template, its plain transcript boot and two timing controls). Single-node launches have only one stream.
 
 Later checks do not replace the historical verdicts above.
 
@@ -667,6 +717,7 @@ The original matrix refresh fixed the three bottlenecks below. The completion ca
 
 | Model / weights | Nodes | Options | Context length (limit) | Cold prefill (s), 32K | Decode ms/pass (0) | Engine tok/s (0) | Decode ms/pass (32K) | Engine tok/s (32K) | Decode ms/pass (64K) | Engine tok/s (64K) | Decode ms/pass (128K) | Engine tok/s (128K) | Decode ms/pass (256K) | Engine tok/s (256K) | Decode ms/pass (512K) | Engine tok/s (512K) |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| MiniMax-M3.1-Flash NVFP4/MXFP8 | 4 | native activations, DSpark adaptive 1/3/5/7, 2M NVFP4 KV, 8 slots | — | 32.829 | 91.39 | 82.1 | 104.69 | 56.6 | 107.95 | 53.7 | 134.93 | 43.0 | 146.79 | 39.5 | 178.44 | 31.8 |
 | GLM-5.3-Flash NVFP4/FP8 | 2 | 160K FP8 KV, 4 slots | 163,840 | 29.798 | 54.18 | 33.4 | 55.93 | 35.1 | 56.60 | 34.4 | 58.15 | 33.7 | Limit | Limit | Limit | Limit |
 | GLM-5.3-Flash NVFP4/FP8 | 2 | 256K FP8 KV, 2 slots | 262,144 | 33.915 | 55.09 | 34.0 | 57.24 | 34.3 | 58.80 | 33.4 | 59.63 | 32.6 | 62.62 | 31.3 | Limit | Limit |
 | GLM-5.3-Flash NVFP4/FP8 | 4 | 768K BF16 KV, 4 slots | 786,432 | 20.980 | 30.74 | 61.5 | 32.24 | 60.8 | 33.80 | 58.0 | 34.67 | 56.1 | 37.88 | 51.8 | 44.64 | 44.3 |
@@ -717,6 +768,7 @@ Engine prefill seconds at each context bucket, one uncached sample per cell:
 
 | Model / weights | Nodes | Options | 0 | 32K | 64K | 128K | 256K | 512K |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| MiniMax-M3.1-Flash NVFP4/MXFP8 | 4 | native activations, DSpark adaptive 1/3/5/7, 2M NVFP4 KV, 8 slots | 0.414 | 32.829 | 66.025 | 148.503 | 360.874 | 919.523 |
 | GLM-5.3-Flash NVFP4/FP8 | 2 | 160K FP8 KV, 4 slots | 0.421 | 29.798 | 63.974 | 149.373 | Limit | Limit |
 | GLM-5.3-Flash NVFP4/FP8 | 2 | 256K FP8 KV, 2 slots | 0.389 | 33.915 | 72.716 | 162.731 | 395.664 | Limit |
 | GLM-5.3-Flash NVFP4/FP8 | 4 | 768K BF16 KV, 4 slots | 0.233 | 20.980 | 45.567 | 109.315 | 302.679 | 939.798 |
@@ -821,6 +873,16 @@ The whole row set for one template, in one command (records under the ignored `b
 python3 scripts/serve_campaign.py run --config deploy/cluster_qwen3.8-27b_fp8_w1.example.json \
   --out benchmarks/results/$(date -u +%Y%m%d)-qwen27b-fp8-w1
 python3 scripts/serve_campaign.py rows benchmarks/results/<dir> --label "Qwen3.8-27B FP8" --nodes 1 --options "..."
+```
+
+For MiniMax, include both timing controls to reproduce its decode-mode table
+alongside the adaptive template's serving, context and quality rows:
+
+```bash
+python3 scripts/serve_campaign.py run \
+  --config deploy/cluster_minimax-m3.1-flash_nvfp4-mxfp8_w4.example.json \
+  --out benchmarks/results/minimax-adaptive \
+  --mode plain=--no-mtp --mode full7=--no-mtp-schedule
 ```
 
 Measure an already running server with the maintained clients:

@@ -10,7 +10,7 @@
 // DFlash2Host (the pool's block table and draft planes, the session and
 // graph state, the embeddings, the head dispatch and the block GEMMs) and
 // reads the taps out of the feature accumulator (acc / tap_gemm_out) at
-// its own layer outputs.
+// the checkpoint's target tap sites (MiniMax uses completed layer outputs).
 //
 // The recorded walk may be ARMED to draw for the sampled requests
 // (arm_proposals, the Qwen35 family's rule): null specs keep every walk
@@ -51,6 +51,7 @@ struct DFlash2Host {
   int max_context = 0;      // the session's cache bound (the staging gates)
   int64_t position_limit = 0;  // the target config's position ceiling (the config cross-check's domain)
   bool weights_fp8 = false; // engine.dflash_weights fp8
+  bool native_activations = false;  // MiniMax MXFP8 projections, including context K/V.
   const RopeScaling* rope = nullptr;  // the target's ramp (null: the draft's own theta)
   int64_t* session_pos = nullptr;     // device [max_requests]: the committed ends
   int64_t* decode_tokens = nullptr;   // device d_tokens_: the fixed batch's feeds sit behind the decode rows
@@ -109,6 +110,8 @@ class DFlash2Drafter {
   // head_dim over the pool's token slots and block size) must be ready —
   // the drafter addresses them through h.plane.
   void init(const DFlash2Host& h, const std::string& dir);
+  // Native family loaders supply an already validated checkpoint.
+  void init(const DFlash2Host&, const DFlash2Config&, DFlash2Weights);
   void free();
   bool on() const { return on_; }
   const DFlash2Config& cfg() const { return cfg_; }
@@ -118,6 +121,13 @@ class DFlash2Drafter {
   int tap(int layer) const;
   float* acc() const { return df_acc_; }
   float* tap_gemm_out() const { return df_t32_; }
+  // Read-only diagnostic views, valid until the next draft or feature run.
+  const uint16_t* block_hidden() const { return df_h_; }
+  const float* block_logits() const { return df_logits_; }
+  const uint16_t* context_norm() const { return df_norm_; }
+  // Eager diagnostics only; observers never execute during graph capture.
+  using Observer = std::function<void(int, const char*, const uint16_t*, int, int, cudaStream_t)>;
+  void set_observer(Observer observer) { observer_ = std::move(observer); }
   int drafts() const { return cfg_.drafts(); }
   int query_rows() const { return cfg_.query_rows(); }
   int batch_slots() const { return df_batch_; }
@@ -162,19 +172,24 @@ class DFlash2Drafter {
   // and the block scratch exactly as init allocates them.
   static void plan_entries(const DFlash2Config& cfg, int world, int decode_rows, int max_tokens,
                            int max_requests, int64_t vocab_count, bool weights_fp8,
-                           std::vector<std::pair<std::string, size_t>>* out);
+                           std::vector<std::pair<std::string, size_t>>* out,
+                           size_t native_weight_bytes = 0, bool native_activations = false);
 
  private:
   // The block forward's layers over `slots` stacked [bonus, mask x D]
   // blocks (row-wise ops over every row at once; each slot's K/V appends
   // and attention at its row offset against its own block table).
   void block_layers(int slots, const int* reqs, bool capture);
+  void minimax_block_layers(int slots, const int* reqs, bool capture);
   // The mask rows' head rows and top-K per slot (world > 1: this rank's
   // slice lists staged, folded and merged into the global top-K), the
   // hidden projection and the selector walk into df_tok_ (D per slot).
   void block_select(int slots, const int* reqs, bool capture);
+  void gather_candidates(int rows, int32_t* ids, float* scores, bool capture);
+  void minimax_select(int slots, const int* reqs, bool capture);
 
   DFlash2Host h_{};
+  Observer observer_;
   DFlash2CaptureCtx cap_{};  // bound per family at the capture calls
   bool on_ = false;
   DFlash2Config cfg_;
@@ -188,6 +203,8 @@ class DFlash2Drafter {
   float* df_t32_ = nullptr;     // [max_tokens, H] one tap's GEMM out (F32)
   uint16_t* df_norm_ = nullptr; // [rows_cap, H] hidden_norm
   uint16_t* df_kv_ = nullptr;   // [rows_cap, 2*kvr]
+  uint8_t* df_native_codes_ = nullptr;  // shared context/block MXFP8 input scratch
+  uint8_t* df_native_scales_ = nullptr;
   float* df_inv_freq_ = nullptr;  // [head_dim / 2] the draft's rope
   // Block forward (draft / draft_batch / the captures) at BR = df_batch_ *
   // query_rows stacked rows.
@@ -212,6 +229,10 @@ class DFlash2Drafter {
   int32_t* df_ids_ = nullptr;     // [BR, top_k]
   float* df_sc_ = nullptr;        // [BR, top_k]
   int32_t* df_tok_ = nullptr;     // [df_batch_ * drafts] the proposals
+  float* df_markov_logits_ = nullptr;  // MiniMax: [df_batch_, local_vocab]
+  int32_t* df_markov_ids_ = nullptr;   // MiniMax: [df_batch_, top_k]
+  float* df_markov_scores_ = nullptr;  // MiniMax: [df_batch_, top_k]
+  int64_t* df_markov_prev_ = nullptr;  // MiniMax: [df_batch_], sequential predecessors
   uint16_t* df_table_ = nullptr;  // world > 1: the slice top-K fold
   int32_t* df_mirror_h_ = nullptr;  // pinned [max_requests, drafts]: the recorded drafts
   int32_t* df_cands_h_ = nullptr;   // pinned [max_requests, drafts, top_k]: the walked candidates

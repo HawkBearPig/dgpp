@@ -47,7 +47,7 @@ struct Fixture {
     char path[] = "/tmp/dgpp-nvme-reuse-XXXXXX";
     require(::mkdtemp(path) != nullptr, "temporary directory");
     root = path;
-    plan = dgpp::serve::plan_nvme_cache(root.string(), gib, 0, 4096, 4096, 4, 8, true, 0, binding);
+    plan = dgpp::serve::plan_nvme_cache(root.string(), gib, 0, 4096, 4096, 4, 8, true, 0, binding, 0, "", true);
     require(plan.error.empty(), plan.error);
     index_path = fs::path(plan.directory) / "rank0.index";
     crc_path = fs::path(plan.directory) / "rank0.crc";

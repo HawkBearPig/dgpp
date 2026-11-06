@@ -115,11 +115,14 @@ class FakeEngine : public SchedulerEngine {
   MtpAcceptance mtp_acceptance() const override { return mtp_counters(mtp_fixture.load()); }
 
   std::atomic<bool> images_available{false};
+  std::atomic<bool> video_available{false};
   std::atomic<int> image_prefills{0};
   bool supports_images() const override { return images_available; }
+  bool supports_video() const override { return video_available; }
   bool supports_image_prefix_cache() const override { return images_available; }
   int32_t prefill_images(int req, const std::vector<int64_t>& prompt, const std::vector<dgpp::ImageInput>& images) override {
-    require(!images.empty() && images[0].rgb.size() == 112 * 112 * 3, "decoded image reaches the engine");
+    require(!images.empty(), "decoded media reaches the engine");
+    dgpp::validate_image_inputs(images, prompt.size(), video_available);
     ++image_prefills;
     return prefill(req, prompt);
   }
@@ -225,8 +228,8 @@ class FakeEngine : public SchedulerEngine {
   int32_t prefill_cached(int req, const std::vector<int64_t>& prompt,
                          dgpp::sched::SchedulerEngine::PrefixPrefill* plan) override {
     if (plan->images && !plan->images->empty()) {
-      require(images_available && plan->images->front().rgb.size() == 112 * 112 * 3,
-              "image payload survives cached admission");
+      require(images_available, "image payload survives cached admission");
+      dgpp::validate_image_inputs(*plan->images, prompt.size(), video_available);
       ++image_prefills;
     }
     if (plan->attach_slot >= 0) {
@@ -447,7 +450,9 @@ class FakeFrontend : public ModelFrontend {
   std::function<std::string(const dgpp::minijson::Value&)> render_hook;
   mutable std::atomic<size_t> decoded_ids{0};
   std::atomic<bool> images_available{false};
+  std::atomic<bool> video_available{false};
   bool supports_images() const override { return images_available; }
+  bool supports_video() const override { return video_available; }
   ChatInput prepare_chat(const dgpp::minijson::Value& globals) const override {
     auto input = ModelFrontend::prepare_chat(globals);
     const auto& messages = globals.at("messages").items();
@@ -455,6 +460,13 @@ class FakeFrontend : public ModelFrontend {
       const auto* content = messages[i].find("content");
       if (!content || !content->is_array()) continue;
       for (size_t j = 0; j < content->items().size(); ++j) {
+        if (content->items()[j].find("video_url")) {
+          const int64_t offset = input.tokens.size();
+          input.images.push_back(
+              {offset, 2, 28, 56, std::vector<uint8_t>(28 * 56 * 3 * 2), 28, 2, {offset}});
+          input.tokens.insert(input.tokens.end(), 2, 200026);
+          continue;
+        }
         const auto* image = content->items()[j].find("image_url");
         if (!image) continue;
         auto im = dgpp::serve::prepare_glm_image(*image,
@@ -4390,6 +4402,100 @@ std::string post_legacy(ServiceRig& rig, const std::string& body,
              std::to_string(body.size()) + "\r\n\r\n" + body);
   return c.read_until(until, budget_ms);
 }
+DGPP_TEST(serve_promptLogprobs_rejectsUnsupportedScoringOnBothRoutes) {
+  ServiceRig rig(8, model_defaults(), true);
+  for (bool chat : {false, true}) {
+    for (bool stream : {false, true}) {
+      for (const std::string value :
+           {"0", "1", "-1", "1.5", "true", "false", "\"0\"", "[]", "{}"}) {
+        const std::string extra =
+            ",\"prompt_logprobs\":" + value + (stream ? ",\"stream\":true" : "");
+        const std::string body = chat ? chat_body("abcd", 2, extra)
+                                      : "{\"model\":\"" + kModel +
+                                            "\",\"prompt\":\"abcd\",\"max_tokens\":2" + extra + "}";
+        const auto response = chat ? post_chat(rig, body, "unsupported_parameter")
+                                   : post_legacy(rig, body, "unsupported_parameter");
+        expect_invalid_request(response, "prompt_logprobs");
+        require(response.find("\"code\":\"unsupported_parameter\"") != std::string::npos,
+                "prompt scoring is explicitly unsupported, not silently ignored");
+        require(response.find("text/event-stream") == std::string::npos,
+                "reject before starting a stream");
+      }
+    }
+  }
+  require(rig.engine.armed().empty(), "unsupported scoring never reaches generation");
+}
+
+DGPP_TEST(serve_promptLogprobs_nullAndOmissionPreserveGeneratedLogprobs) {
+  ServiceRig rig(8, model_defaults(), true);
+  for (bool chat : {false, true}) {
+    for (bool stream : {false, true}) {
+      for (bool explicit_null : {false, true}) {
+        const std::string extra = std::string(chat ? ",\"logprobs\":true" : ",\"logprobs\":1") +
+                                  (explicit_null ? ",\"prompt_logprobs\":null" : "") +
+                                  (stream ? ",\"stream\":true" : "");
+        const std::string body = chat ? chat_body("abcd", 2, extra)
+                                      : "{\"model\":\"" + kModel +
+                                            "\",\"prompt\":\"abcd\",\"max_tokens\":2" + extra + "}";
+        const std::string until = stream ? "[DONE]" : "usage";
+        const auto response = chat ? post_chat(rig, body, until) : post_legacy(rig, body, until);
+        require(response.starts_with("HTTP/1.1 200 OK"), "null is omission on both routes");
+        require(response.find(chat ? "\"logprob\":-0.25" : "\"token_logprobs\":[-0.25") !=
+                    std::string::npos,
+                "generated-token logprobs remain available");
+      }
+    }
+  }
+}
+
+DGPP_TEST(serve_parameters_duplicateFieldsRejectBeforeGeneration) {
+  ServiceRig rig(8, model_defaults(), true);
+  for (bool chat : {false, true}) {
+    for (bool stream : {false, true}) {
+      Client client(rig.port());
+      const auto post = [&](const std::string& extra) {
+        const std::string options = extra + (stream ? ",\"stream\":true" : "");
+        const std::string body = chat ? chat_body("abcd", 2, options)
+                                      : "{\"model\":\"" + kModel +
+                                            "\",\"prompt\":\"abcd\",\"max_tokens\":2" + options +
+                                            "}";
+        client.send_all(
+            std::string("POST ") + (chat ? "/v1/chat/completions" : "/v1/completions") +
+            " HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\nContent-Length: " +
+            std::to_string(body.size()) + "\r\n\r\n" + body);
+        return client.read_response(5000);
+      };
+      const size_t armed = rig.engine.armed().size();
+      const auto admitted = rig.service.stats().requests_total;
+      for (const auto& [extra, param] :
+           {std::pair{R"(,"prompt_logprobs":null,"prompt_logprobs":0)", "prompt_logprobs"},
+            std::pair{R"(,"prompt_logprobs":0,"prompt_logprobs":null)", "prompt_logprobs"},
+            std::pair{R"(,"prompt_logprobs":null,"prompt_logprobs":null)", "prompt_logprobs"},
+            std::pair{R"(,"prompt_logprobs":null,"\u0070rompt_logprobs":1)", "prompt_logprobs"},
+            std::pair{R"(,"max_tokens":3)", "max_tokens"},
+            std::pair{R"(,"model":"glm-5.3-flash-fp8")", "model"},
+            std::pair{R"(,"logprobs":null,"logprobs":1)", "logprobs"},
+            std::pair{R"(,"client_extension":null,"client_extension":{})", "client_extension"}}) {
+        const auto response = post(extra);
+        expect_invalid_request(response, param);
+        require(response.find("text/event-stream") == std::string::npos,
+                "duplicate fields never start SSE");
+        if (!chat)
+          require(response.find("\"code\":\"invalid_parameter\"") != std::string::npos,
+                  "legacy duplicate fields use the invalid_parameter code");
+      }
+      require(rig.engine.armed().size() == armed && rig.service.stats().requests_total == admitted,
+              "duplicate fields never reach admission or generation");
+      const auto response =
+          post(std::string(R"(,"prompt_logprobs":null,"logprobs":)") + (chat ? "true" : "1"));
+      require(response.starts_with("HTTP/1.1 200 OK") &&
+                  response.find(chat ? "\"logprob\":-0.25" : "\"token_logprobs\":[-0.25") !=
+                      std::string::npos,
+              "the same connection still serves valid null and generated logprobs after refusals");
+    }
+  }
+}
+
 // A one-shot chat read through the usage object's last key.
 std::string post_full(ServiceRig& rig, const std::string& body) {
   return post_chat(rig, body, "reasoning_tokens\":", 5000);
@@ -5360,6 +5466,31 @@ DGPP_TEST(serve_images_capability_validation_and_streaming) {
   response = post_chat(rig, body("data:image/png;base64,AAAA", false), "invalid_image");
   require(response.find("messages[0].content[1].image_url.url") != std::string::npos,
           "invalid image names the precise field");
+}
+
+DGPP_TEST(serve_video_requires_both_capabilities_and_reaches_the_engine) {
+  ServiceRig rig;
+  const std::string body =
+      R"({"model":"glm-5.3-flash-fp8","max_tokens":1,"messages":[{"role":"user","content":[{"type":"video_url","video_url":{"url":"fixture"}}]}]})";
+  auto response = post_chat(rig, body, "unsupported_content_type");
+  require(response.find("400 Bad Request") != std::string::npos, "text frontend refuses video");
+  rig.frontend.video_available = true;
+  response = post_chat(rig, body, "unsupported_content_type");
+  require(response.find("400 Bad Request") != std::string::npos, "image-only engine refuses video");
+  rig.engine.images_available = true;
+  rig.engine.video_available = true;
+  response = post_chat(rig, body, "usage");
+  require(response.find("200 OK") != std::string::npos && rig.engine.image_prefills == 1,
+          "video payload reaches prefill");
+  Client models(rig.port());
+  models.send_all("GET /v1/models HTTP/1.1\r\nHost: t\r\n\r\n");
+  require(models.read_available(800).find("\"input_modalities\":[\"text\",\"video\"]") !=
+              std::string::npos,
+          "model capabilities report the effective video modality");
+  auto wrong_role = body;
+  wrong_role.replace(wrong_role.find("user"), 4, "assistant");
+  response = post_chat(rig, wrong_role, "unsupported_content_type");
+  require(response.find("400 Bad Request") != std::string::npos, "video requires a user message");
 }
 
 DGPP_TEST(serve_models_reports_the_active_rope_and_the_effective_limit) {

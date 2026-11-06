@@ -1,0 +1,39 @@
+{
+  "model": "MiniMaxAI/MiniMax-M3.1-Flash",
+  "world_size": 4,
+  "release": "",
+  "engine": {
+    "max_concurrency": 8,
+    "kv_capacity": 2097152,
+    "kv_dtype": "nvfp4",
+    "bf16_weights": "bf12+bf16",
+    "default_max_tokens": 32768,
+    "queue_limit": 32,
+    "max_connections": 64,
+    "decode_graph": true,
+    "mtp": true,
+    "mtp_depth": 7,
+    "mtp_schedule": true,
+    "mtp_schedule_min_depth": 1,
+    "mtp_schedule_options": 4,
+    "mtp_schedule_row_ms": 5.6,
+    "mtp_schedule_base_ms": 51.6,
+    "mtp_schedule_lambda": 0,
+    "mtp_schedule_adapt": true,
+    "prefix_cache_gib": 2,
+    "admission": "full",
+    "admission_window": 256,
+    "sampling_candidates": 128,
+    "stats_interval_s": 10,
+    "prefill_idle_budget_tokens": 2048,
+    "activations": "native"
+  },
+  "nvme_cache": {
+    "enabled": false,
+    "path": "~/dgpp/nvme-cache",
+    "capacity_gib": 64
+  },
+  "paths": {
+    "resident_cache": ""
+  }
+}

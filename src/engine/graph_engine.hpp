@@ -1240,6 +1240,10 @@ class GraphEngineAdapter final : public sched::SchedulerEngine {
   int32_t prefill(int req, const std::vector<int64_t>& prompt) override {
     return open_slot(req, prompt, [&] { return model_->session_prefill(req, prompt); });
   }
+  bool supports_video() const override {
+    if constexpr (requires { model_->supports_video(); }) return model_->supports_video();
+    return false;
+  }
   bool supports_images() const override {
     if constexpr (requires { model_->supports_images(); }) return model_->supports_images();
     return false;
@@ -2309,8 +2313,10 @@ class GraphEngineAdapter final : public sched::SchedulerEngine {
       DGPP_CUDA_OK(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
       cudaGraphDestroy(graph);
       (void)cudaMemGetInfo(&free_after, &total);
-      DGPP_LOG_INFO("rank {}: graph variant {} instantiated — {:.1f} MiB of device memory ({:.1f} GiB free)", rank_,
-                    variant, static_cast<double>(free_before - free_after) / (1024.0 * 1024.0),
+      // Free memory can increase during instantiation on unified-memory
+      // systems. Convert before subtracting to preserve that signed delta.
+      DGPP_LOG_INFO("rank {}: graph variant {} instantiated — {:.1f} MiB device-memory delta ({:.1f} GiB free)", rank_,
+                    variant, (static_cast<double>(free_before) - static_cast<double>(free_after)) / (1024.0 * 1024.0),
                     static_cast<double>(free_after) / (1024.0 * 1024.0 * 1024.0));
       return exec;
     } catch (...) {

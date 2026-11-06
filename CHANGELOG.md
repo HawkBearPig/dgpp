@@ -5,6 +5,25 @@ project procedures and design guidance live in `docs/`.
 
 ## Unreleased
 
+- **Correct MiniMax DSpark predictions and native activations**: predict from
+  the anchor row and use seven draft queries for seven proposals, while
+  retaining eight target verification rows. The previous mask-only convention
+  shifted every proposal and depressed acceptance. DSpark's MXFP8 projections
+  now honor the native activation setting, including context K/V and fused
+  SwiGLU quantization. The invalid DSpark performance comparison is withdrawn;
+  see the [implementation record](docs/minimax_m31_flash_plan.md).
+
+- **MiniMax M3.1 Flash**: native text, image and MP4/WebM video input,
+  recursive tool calls and the bundled seven-proposal DSpark on the shared
+  engine. The loader preserves the published NVFP4 expert and MXFP8 dense
+  weights; the serving recipe uses native MXFP8/NVFP4 activations, Q8KV4
+  attention and FP32 routing, with BF16 controls available. Parallel decode
+  pages, tensor-core vocabulary projections and reusable conversation and
+  visual prefixes reduce repeated work. The four-node
+  deployment passes native reference and serving validation; see the
+  [model card](docs/model_cards/MiniMax-M3.1-Flash.md) and
+  [numerical evidence](docs/minimax_m31_flash_plan.md).
+
 - **Keep an existing NVMe cache across upgrades**: set
   `nvme_cache.reuse_binding` to the previous cache's 16-character binding to
   bypass automatic build/settings invalidation. This selects the existing

@@ -257,7 +257,7 @@ DGPP_TEST(cluster_config_parses_fills_defaults_and_derives_the_world) {
               c.engine.fp8_head == "gemv" && c.engine.draft_head == "exact" && c.engine.draft_head_blocks == 32 &&
               !c.engine.prefill_bf16_partials && !c.engine.prefill_fold_scales &&
               !c.engine.prefill_fp8_gemm && !c.engine.prefill_fp8_per_tensor && c.engine.prefill_activations == "bf16" &&
-              c.engine.prefill_attention == "bf16" && c.engine.decode_attention == "bf16" &&
+              c.engine.prefill_attention == "bf16" && c.engine.decode_attention == "bf16" && c.engine.activations == "bf16" &&
               c.engine.dflash_model.empty() &&
               c.engine.dflash_verify_graph && c.engine.dflash_draft_batch && c.engine.dflash_depth == 0 &&
               c.engine.expert_gemm == "wide" && c.engine.expert_gemm_prefetch == 3 &&
@@ -295,6 +295,18 @@ DGPP_TEST(cluster_config_parses_fills_defaults_and_derives_the_world) {
   const auto na = dgpp::serve::parse_cluster_config(
       R"({"model":"m","nodes":["h"],"engine":{"prefill_activations":"native"}})", "t");
   require(na.engine.prefill_activations == "native", "engine.prefill_activations native parses");
+  const auto all_rows = dgpp::serve::parse_cluster_config(
+      R"({"model":"m","nodes":["h"],"engine":{"activations":"native","kv_dtype":"nvfp4"}})", "t");
+  require(all_rows.engine.activations == "native" && all_rows.engine.prefill_activations == "bf16" &&
+              all_rows.engine.kv_dtype == "nvfp4", "target activation recipe and native KV parse independently");
+  for (const auto* value : {"fp8", "mixed", ""}) {
+    bool refused = false;
+    try {
+      (void)dgpp::serve::parse_cluster_config(
+          std::string(R"({"model":"m","nodes":["h"],"engine":{"activations":")") + value + R"("}})", "t");
+    } catch (const std::exception&) { refused = true; }
+    require(refused, "unsupported target activation recipe rejected");
+  }
   // The prefill attention's arithmetic on the fp8 K/V pool (2026-10-16): "bf16" (the default) or "fp8".
   const auto pa = dgpp::serve::parse_cluster_config(
       R"({"model":"m","nodes":["h"],"engine":{"kv_dtype":"fp8","prefill_attention":"fp8"}})", "t");
@@ -515,14 +527,16 @@ DGPP_TEST(cluster_config_refusesUnknownKeysAndBadValuesByName) {
        "'engine.max_concurrency' must be in [1,"},
       {R"({"model":"m","nodes":["h"],"engine":{"mtp":"yes"}})",
        "'engine.mtp' must be true or false"},
-      {R"({"model":"m","nodes":["h"],"engine":{"mtp_depth":6}})",
-       "'engine.mtp_depth' must be in [1, 5]"},
+      {R"({"model":"m","nodes":["h"],"engine":{"mtp_depth":8}})",
+       "'engine.mtp_depth' must be in [1, 7]"},
+      {R"({"model":"m","nodes":["h"],"engine":{"mtp_schedule_min_depth":8}})",
+       "'engine.mtp_schedule_min_depth' must be in [1, 7]"},
       {R"({"model":"m","nodes":["h"],"engine":{"dflash_depth":8}})",
        "'engine.dflash_depth' must be in [0, 7]"},
       {R"({"model":"m","nodes":["h"],"engine":{"dflash_verify_graph":"yes"}})",
        "'engine.dflash_verify_graph' must be true or false"},
       {R"({"model":"m","nodes":["h"],"engine":{"mtp_depth":0}})",
-       "'engine.mtp_depth' must be in [1, 5]"},
+       "'engine.mtp_depth' must be in [1, 7]"},
       {R"({"model":"m","nodes":["h"],"engine":{"mtp_draft":"beam"}})",
        "'engine.mtp_draft' must be auto, sampled or greedy"},
       {R"({"model":"m","nodes":["h"],"engine":{"mtp_draft_temperature":0}})",
@@ -840,7 +854,8 @@ DGPP_TEST(cluster_config_parses_nvme_cache) {
   const dgpp::serve::ClusterConfig off =
       dgpp::serve::parse_cluster_config(engine_json("{\"kv_capacity\":8192}"), "t");
   require(!off.nvme_cache.enabled && off.nvme_cache.capacity_gib == 0.0 &&
-              off.nvme_cache.path == "~/dgpp/nvme-cache" && off.nvme_cache.min_tokens == 0,
+              off.nvme_cache.path == "~/dgpp/nvme-cache" && off.nvme_cache.min_tokens == 0 &&
+              off.nvme_cache.required_mount.empty(),
           "off by default");
   // The top-level block: on, a path, a capacity, a minimum.
   const dgpp::serve::ClusterConfig on = dgpp::serve::parse_cluster_config(
@@ -871,6 +886,15 @@ DGPP_TEST(cluster_config_parses_nvme_cache) {
       "{\"model\":\"m\",\"nodes\":[\"h\"],\"nvme_cache\":{\"allow_buffered\":true,\"op_timeout_s\":30}}", "t");
   require(bounded.nvme_cache.allow_buffered && bounded.nvme_cache.op_timeout_s == 30,
           "allow_buffered and op_timeout_s parse");
+  require(dgpp::serve::parse_cluster_config(
+              R"({"model":"m","world_size":1,"nvme_cache":{"required_mount":"/mnt/cache"}})", "t")
+              .nvme_cache.required_mount == "/mnt/cache", "local required mount parses");
+  require(dgpp::serve::parse_cluster_config(
+              R"({"model":"m","world_size":1,"nvme_cache":{"required_mount":""}})", "t")
+              .nvme_cache.required_mount.empty(), "empty disables required mount");
+  for (const char* bad : {R"(true)", R"(null)", R"("relative")", R"("~/cache")", R"("/cache\u0000suffix")"})
+    require(refusal(std::string(R"({"model":"m","world_size":1,"nvme_cache":{"required_mount":)") + bad + "}}")
+                .find("nvme_cache.required_mount") != std::string::npos, "invalid required mount refused by name");
   for (const char* bad : {"\"allow_buffered\":1", "\"op_timeout_s\":-1", "\"op_timeout_s\":90000", "\"op_timeout_s\":1.5"})
     require(refusal(std::string("{\"model\":\"m\",\"nodes\":[\"h\"],\"nvme_cache\":{") + bad + "}}")
                     .find("nvme_cache.") != std::string::npos,
@@ -901,4 +925,15 @@ DGPP_TEST(cluster_config_parses_nvme_cache) {
   require(refusal("{\"model\":\"m\",\"nodes\":[\"h\"],\"nvme_cache\":{\"path\":\"\"}}")
                   .find("nvme_cache.path") != std::string::npos,
           "an empty path is refused");
+}
+
+DGPP_TEST(cluster_config_accepts_seven_draft_block) {
+  const auto c = dgpp::serve::parse_cluster_config(
+      engine_json(
+          R"({"mtp":true,"decode_graph":true,"mtp_depth":7,"mtp_schedule":true,"mtp_schedule_min_depth":6})"),
+      "MiniMax DSpark");
+  require(c.engine.mtp && c.engine.mtp_depth_set && c.engine.mtp_depth == 7,
+          "the seven-proposal MiniMax block must survive deployment parsing");
+  require(c.engine.mtp_schedule && c.engine.mtp_schedule_min_depth == 6,
+          "the MiniMax schedule must accept a six-draft minimum");
 }

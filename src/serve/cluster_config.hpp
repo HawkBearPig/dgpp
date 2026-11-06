@@ -190,6 +190,9 @@ struct ClusterConfig {
     bool prefill_fp8_gemm = false;
     bool prefill_fp8_per_tensor = false;
     std::string prefill_activations = "bf16";
+    // MiniMax: the activation recipe on every target row, including decode.
+    // Independent of kv_dtype, so both precision controls can be measured.
+    std::string activations = "bf16";
     std::string prefill_attention = "bf16";
     // Flash-Next QSA decode arithmetic over its fp8 pool. Independent of
     // prefill_attention so either phase can retain bf16 compute.
@@ -265,8 +268,9 @@ struct ClusterConfig {
     bool compact_batches = true;
     bool decode_graph = false;
     bool mtp = false;
-    int mtp_depth = 1;             // draft tokens per step (1..5); needs mtp
-    bool mtp_depth_set = false;    // the file named it (else a family may default it: DSpark's block is 5)
+    int mtp_depth = 1;  // draft tokens per step (1..7); family-specific limits apply
+    bool mtp_depth_set =
+        false;  // the file named it (else a family may default it from its checkpoint)
     // The DFlash2 block drafter (Qwen3.5-family, eager path only): a
     // checkpoint directory or HF id whose config.json names the drafter.
     // Replaces mtp (mutually exclusive); the draft width is the
@@ -397,6 +401,9 @@ struct ClusterConfig {
   struct NvmeCache {
     bool enabled = false;
     std::string path = "~/dgpp/nvme-cache";
+    // Local placement assertion, independent of cache identity and rank 0's
+    // numerical settings. Empty disables it; otherwise an absolute mountpoint.
+    std::string required_mount;
     double capacity_gib = 0.0;
     int64_t min_tokens = 0;
     // One staging slice in MiB: two slices of device work move per tick, so
@@ -415,8 +422,8 @@ struct ClusterConfig {
     // Select an existing binding across build/settings changes. This is
     // the operator's compatibility assertion; structural checks still run.
     std::string reuse_binding;
-    // A filesystem that refuses direct I/O (tmpfs) is refused unless this
-    // allows buffered I/O: the page cache would grow into the model's memory.
+    // Tests/experiments only: permits RAM-backed storage and filesystems that
+    // refuse direct I/O. Neither is suitable for the normal memory budget.
     bool allow_buffered = false;
     // An op without progress for this long fails, so a request waiting on
     // its restore admits cold instead of never (0: never).

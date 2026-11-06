@@ -41,16 +41,16 @@
 #include <algorithm>
 #include <atomic>
 #include <charconv>
-#include <cstdlib>
 #include <chrono>
 #include <cmath>
-#include <cstdint>
 #include <csignal>
+#include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <exception>
 #include <filesystem>
-#include <functional>
 #include <format>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -63,62 +63,65 @@
 #include "common/cuda_check.hpp"
 #include "common/log.hpp"
 #include "common/process_memory.hpp"
-#include "kernels/l2_prefetch.hpp"
-#include "kernels/draft_head.hpp"
-#include "kernels/bf12_companions.hpp"
-#include "kernels/latent_format.hpp"
-#include "loaders/hf_cache.hpp"
-#include "serve/cluster_config.hpp"
-#include "serve/rank_metrics.hpp"
-#include "serve/nvme_cache_check.hpp"
 #include "dgpp_version.hpp"
-#include "text/chat_template.hpp"
 #include "engine/eager_engine.hpp"
 #include "engine/graph_engine.hpp"
-#include "engine/verify_schedule.hpp"
 #include "engine/memory_plan.hpp"
-#include "loaders/architecture.hpp"
-#include "models/glm/fabric_engine.hpp"
-#include "models/glm/moe_layer.hpp"
+#include "engine/verify_schedule.hpp"
+#include "kernels/bf12_companions.hpp"
+#include "kernels/draft_head.hpp"
+#include "kernels/l2_prefetch.hpp"
+#include "kernels/latent_format.hpp"
 #include "kernels/packq_gemm.hpp"
-#include "models/glm/forward.hpp"
-#include "models/glm/gen_engine.hpp"
-#include "models/qwen/config.hpp"
-#include "models/qwen/forward.hpp"
-#include "models/qwen/model35.hpp"
-#include "models/glm4/config.hpp"
-#include "models/glm4/forward.hpp"
-#include "models/glm_dsa/config.hpp"
-#include "models/dsv41/config.hpp"
-#include "models/dsv41/loader.hpp"
-#include "models/dsv41/model.hpp"
-#include "models/dsv4/config.hpp"
-#include "models/dsv4/loader.hpp"
-#include "models/dsv4/model.hpp"
-#include "text/dsv41_prompt.hpp"
-#include "text/dsv4_prompt.hpp"
-#include "models/glm_dsa/model.hpp"
-#include "models/mimo/config.hpp"
-#include "models/mimo/forward.hpp"
+#include "loaders/architecture.hpp"
+#include "loaders/hf_cache.hpp"
 #include "models/dory/binding.hpp"
 #include "models/dory/config.hpp"
 #include "models/dory/forward.hpp"
 #include "models/dory/loader.hpp"
+#include "models/dsv4/config.hpp"
+#include "models/dsv4/loader.hpp"
+#include "models/dsv4/model.hpp"
+#include "models/dsv41/config.hpp"
+#include "models/dsv41/loader.hpp"
+#include "models/dsv41/model.hpp"
 #include "models/flint/config.hpp"
 #include "models/flint/forward.hpp"
+#include "models/glm/fabric_engine.hpp"
+#include "models/glm/forward.hpp"
+#include "models/glm/gen_engine.hpp"
+#include "models/glm/moe_layer.hpp"
+#include "models/glm4/config.hpp"
+#include "models/glm4/forward.hpp"
+#include "models/glm_dsa/config.hpp"
+#include "models/glm_dsa/model.hpp"
+#include "models/mimo/config.hpp"
+#include "models/mimo/forward.hpp"
+#include "models/minimax/dspark.hpp"
+#include "models/minimax/forward.hpp"
+#include "models/qwen/config.hpp"
+#include "models/qwen/forward.hpp"
+#include "models/qwen/model35.hpp"
+#include "net/collective_bus.hpp"
 #include "sched/scheduler.hpp"
+#include "serve/cluster_config.hpp"
+#include "serve/engine_watchdog.hpp"
+#include "serve/fabric_serve.hpp"
+#include "serve/frontend.hpp"
+#include "serve/generation_service.hpp"
+#include "serve/glm_vision_frontend.hpp"
+#include "serve/http_server.hpp"
+#include "serve/minimax_vision_frontend.hpp"
+#include "serve/nvme_cache_check.hpp"
+#include "serve/prefill_policy.hpp"
+#include "serve/qwen_vision_frontend.hpp"
+#include "serve/rank_metrics.hpp"
+#include "serve/shutdown_watchdog.hpp"
+#include "text/chat_template.hpp"
+#include "text/dsv41_prompt.hpp"
+#include "text/dsv4_prompt.hpp"
 #include "text/tokenizer.hpp"
 #include "text/tool_grammar.hpp"
-#include "net/collective_bus.hpp"
-#include "serve/fabric_serve.hpp"
-#include "serve/generation_service.hpp"
-#include "serve/frontend.hpp"
-#include "serve/glm_vision_frontend.hpp"
-#include "serve/qwen_vision_frontend.hpp"
-#include "serve/http_server.hpp"
-#include "serve/prefill_policy.hpp"
-#include "serve/shutdown_watchdog.hpp"
-#include "serve/engine_watchdog.hpp"
 
 namespace fs = std::filesystem;
 
@@ -369,6 +372,10 @@ struct ServeFamily {
   // acceptance collapses with no diagnostic, so the combination is refused at
   // startup instead. Opt-in: the capture is what earns the flag.
   virtual bool block_draft_graph_ok() const { return false; }
+  virtual void check_mtp_depth(int depth) const {
+    if (depth > 5)
+      throw std::invalid_argument("engine.mtp_depth: this family supports at most 5 drafts");
+  }
 };
 
 // GLM-5.3-Flash: the DSA pool's block and pool-id geometry, the latent
@@ -1147,6 +1154,88 @@ struct FlintFamily final : ServeFamily {
   }
 };
 
+struct MinimaxFamily final : ServeFamily {
+  dgpp::MinimaxConfig cfg;
+  std::string ckpt;
+  dgpp::LatentFormat kv_format = dgpp::LatentFormat::kBf16;
+  bool native_activations = false;
+  std::unique_ptr<dgpp::MinimaxModel> model;
+  MinimaxFamily(const std::string& checkpoint, dgpp::LatentFormat fmt, bool native)
+      : cfg(dgpp::MinimaxConfig::from_json_file((fs::path(checkpoint) / "config.json").string())),
+        ckpt(checkpoint),
+        kv_format(fmt), native_activations(native) {
+    (void)dgpp::MinimaxKvPool::head_bytes(fmt);
+  }
+  const char* name() const override { return "minimax_m3"; }
+  // The shipped template leaves adaptive <mm:think> emission to the model.
+  bool model_opens_thinking() const override { return true; }
+  int64_t vocab_size() const override { return cfg.vocab_size; }
+  const std::vector<int64_t>& eos_token_ids() const override { return cfg.eos_token_ids; }
+  // The checkpoint's positional ceiling: a larger pool seats more
+  // requests, a single request never passes it.
+  int64_t position_limit() const override { return cfg.max_position_embeddings; }
+  int64_t block_tokens() const override { return dgpp::MinimaxModel::kv_block_tokens_static(); }
+  int prefill_chunk_tokens() const override { return dgpp::MinimaxModel::prefill_chunk_tokens(); }
+  std::string pool_check(int64_t) const override { return ""; }
+  const char* kv_format_name() const override { return dgpp::latent_format_name(kv_format); }
+  int decode_rows_cap() const override { return dgpp::MinimaxModel::decode_rows_cap(); }
+  // The widest fold the decode graph records: a block output [rows, hidden].
+  size_t lat_slot_bytes(int decode_rows) const override {
+    return static_cast<size_t>(decode_rows) * static_cast<size_t>(cfg.hidden_size) * 2;
+  }
+  void check_mtp_depth(int depth) const override {
+    if (!cfg.dspark)
+      throw std::invalid_argument("engine.mtp: MiniMax requires its bundled dspark/config.json");
+    if (depth != cfg.dspark->drafts())
+      throw std::invalid_argument("engine.mtp_depth: MiniMax requires its checkpoint block width " +
+                                  std::to_string(cfg.dspark->drafts()) +
+                                  "; engine.mtp_schedule can select fewer verification rows");
+  }
+  dgpp::MemoryPlan plan(int forward_rows, int64_t context, int rank, int world_, bool fabric,
+                        int slots, bool mtp, int decode_rows) const override {
+    return dgpp::MinimaxModel::plan_memory(
+        cfg, forward_rows, context, fabric ? rank : 0, fabric ? world_ : 1,
+        fabric ? dgpp::LoaderResidency::Resident : dgpp::LoaderResidency::Streaming, slots, mtp,
+        decode_rows, kv_format, /*serving_logits=*/true, native_activations);
+  }
+  size_t snapshot_bytes(int world_, bool mtp) const override {
+    return dgpp::MinimaxModel::session_snapshot_bytes(cfg, world_, mtp);
+  }
+  size_t cache_block_bytes(int world_, bool mtp) const override {
+    return dgpp::MinimaxModel::kv_block_bytes_static(cfg, 0, world_, kv_format, mtp);
+  }
+  void build_model(dgpp::BoundaryReducer* reducer, int rank, int world_, bool fabric,
+                   int forward_rows, int64_t pool_tokens, int slots, bool mtp,
+                   int decode_rows) override {
+    dgpp::MinimaxLayerStream::set_resident_image_dir(dgpp::GlmLayerStream::resident_image_dir());
+    model = std::make_unique<dgpp::MinimaxModel>(
+        cfg, ckpt, forward_rows, pool_tokens,
+        fabric ? dgpp::LoaderResidency::Resident : dgpp::LoaderResidency::Streaming, reducer,
+        fabric ? rank : 0, fabric ? world_ : 1, slots, mtp, decode_rows, kv_format,
+        /*serving_logits=*/true, native_activations);
+  }
+  void destroy_model() override { model.reset(); }
+  size_t model_snapshot_bytes() const override {
+    return model ? model->session_snapshot_bytes() : 0;
+  }
+  std::unique_ptr<ServeGraphEngine> make_graph_engine(
+      dgpp::net::CollectiveBus* bus, int rank, int world_, uint16_t* pick_scratch,
+      int batch_min_live, uint16_t* prefix_scratch, uint16_t* gather_scratch, int candidates,
+      const dgpp::text::GrammarVocab* grammar, int prefix_slots, int mtp_depth,
+      bool compact_batches, int lookup_tail = 0) override {
+    return std::make_unique<ServeGraphEngineOf<dgpp::MinimaxModel>>(
+        model.get(), bus, rank, world_, pick_scratch, cfg.vocab_size, /*pick_timeout_ms=*/60000,
+        batch_min_live, prefix_scratch, gather_scratch, candidates, grammar, prefix_slots,
+        mtp_depth, compact_batches, lookup_tail);
+  }
+  std::unique_ptr<dgpp::sched::SchedulerEngine> make_eager_engine(
+      int slots, dgpp::DecodePick pick, dgpp::DecodeSample sample,
+      const dgpp::text::GrammarVocab* grammar, int prefix_slots) override {
+    return std::make_unique<dgpp::EagerEngineAdapter<dgpp::MinimaxModel>>(
+        model.get(), slots, std::move(pick), std::move(sample), grammar, prefix_slots);
+  }
+};
+
 // Qwen3.8-27B dense family (FP8 text-only, bf16 K/V pool, the MTP draft layer).
 // engine.dense_weights = fp8 requantizes its BF16 lm head to block FP8 and
 // engine.prefill_fp8_per_tensor selects the per-tensor prefill recipe; both
@@ -1273,9 +1362,13 @@ std::unique_ptr<ServeFamily> make_family(const std::string& ckpt, int world,
                                          dgpp::LatentFormat kv_format,
                                          const std::optional<dgpp::RopeScaling>& rope_scaling,
                                          bool fp8_head_mma, int index_topk, int candidate_topk_blocks,
-                                         int candidate_block_size) {
+                                         int candidate_block_size, const std::string& activations) {
   const dgpp::ModelArchitecture arch =
       dgpp::detect_architecture_file((fs::path(ckpt) / "config.json").string());
+  if (activations != "bf16" && activations != "native")
+    throw std::invalid_argument("engine.activations must be bf16 or native");
+  if (activations == "native" && arch != dgpp::ModelArchitecture::MinimaxM3)
+    throw std::invalid_argument("engine.activations native is currently supported only for MiniMax");
   if (arch == dgpp::ModelArchitecture::DeepseekV41)
     return std::make_unique<Dsv41Family>(ckpt, index_topk, candidate_topk_blocks, candidate_block_size);
   // The index budget is the DeepSeek-V4.1 indexer's: no other family has a
@@ -1288,6 +1381,8 @@ std::unique_ptr<ServeFamily> make_family(const std::string& ckpt, int world,
   if (arch == dgpp::ModelArchitecture::MimoV2) return std::make_unique<MimoFamily>(ckpt, kv_format);
   if (arch == dgpp::ModelArchitecture::Dory) return std::make_unique<DoryFamily>(ckpt, world);
   if (arch == dgpp::ModelArchitecture::Flint) return std::make_unique<FlintFamily>(ckpt, kv_format);
+  if (arch == dgpp::ModelArchitecture::MinimaxM3)
+    return std::make_unique<MinimaxFamily>(ckpt, kv_format, activations == "native");
   if (arch == dgpp::ModelArchitecture::Qwen4Exp)
     return std::make_unique<QwenFamily>(ckpt, rope_scaling, fp8_head_mma, kv_format);
   if (arch == dgpp::ModelArchitecture::Qwen3_5)
@@ -1426,6 +1521,8 @@ int serve_openai(dgpp::sched::SchedulerEngine* engine, int64_t vocab_size,
         vision_frontend = std::make_unique<dgpp::serve::GlmVisionFrontend>(&tok, &*tpl, ids);
       else if (family_name == "qwen4_exp" || family_name == "qwen3_5")
         vision_frontend = std::make_unique<dgpp::serve::QwenVisionFrontend>(&tok, &*tpl, ids);
+      else if (family_name == "minimax_m3")
+        vision_frontend = std::make_unique<dgpp::serve::MinimaxVisionFrontend>(&tok, &*tpl, ids);
     }
     frontend = vision_frontend ? std::move(vision_frontend)
                                : std::make_unique<dgpp::serve::TextFrontend>(&tok, &*tpl, model_opens_thinking);
@@ -1739,7 +1836,7 @@ int main(int argc, char** argv) {
       "    [--graph-batch-min-live N (default min(2, max-concurrency);\n"
       "      must be in [1, max-concurrency])]\n"
       "      (the row batch needs max-concurrency * (1 + mtp depth) <= 8)\n"
-      "    [--mtp-depth N]  draft tokens per step (1..5; the verify runs 1+N rows)\n"
+      "    [--mtp-depth N]  draft tokens per step (1..7; family-specific limits apply)\n"
       "    [--prefill-fp8-per-tensor]  Qwen3.8-27B: prefill GEMMs on cuBLASLt's per-tensor e4m3 kernels\n"
       "      (engine.prefill_fp8_per_tensor; ~2x the prefill rate, +23 GiB, changes greedy output)\n"
       "    [--dflash-model DIR_OR_ID]  DFlash2 block drafter checkpoint: the drafter's world. It\n"
@@ -1843,6 +1940,7 @@ int main(int argc, char** argv) {
   bool prefill_fp8_gemm = false;
   bool prefill_fp8_per_tensor = false;  // the Qwen3.8-27B per-tensor prefill recipe (opt-in)
   std::string prefill_activations = "bf16";  // "native": the checkpoint's activation recipe on prefill rows
+  std::string activations = "bf16";  // MiniMax target: every row, including decode
   std::string prefill_attention = "bf16";    // Qwen3.5 / Flash-Next attention over an fp8 pool
   std::string decode_attention = "bf16";     // Flash-Next QSA: bf16 or native fp8 compute
   std::string expert_gemm = "wide";         // the packed expert GEMM's form and companions (engine.expert_*)
@@ -1896,7 +1994,7 @@ int main(int argc, char** argv) {
   int max_connections = 64;
   int world = 1, rank = 0, rendezvous_timeout_ms = 120000;
   bool no_eos = false, decode_graph = false, mtp = false;
-  int mtp_depth = 1;  // draft tokens per step (needs --mtp; 1..5)
+  int mtp_depth = 1;  // draft tokens per step (needs --mtp; family-specific limit)
   bool no_mtp_cli = false, mtp_depth_cli = false, mtp_schedule_cli = false;  // given on the command line
   bool no_dflash_cli = false, dflash_model_cli = false, mtp_cli = false;
   bool lookup_draft_cli = false, lookup_tail_cli = false, draft_head_cli = false;
@@ -1922,6 +2020,7 @@ int main(int argc, char** argv) {
   // record, the path is each rank's own.
   bool nvme_cache = false;
   std::string nvme_cache_path = "~/dgpp/nvme-cache";
+  std::string nvme_cache_required_mount;
   double nvme_cache_gib = 0.0;
   int64_t nvme_cache_min_tokens = 0;
   int64_t nvme_cache_chunk_mib = 64;
@@ -1999,6 +2098,7 @@ int main(int argc, char** argv) {
     prefill_fp8_gemm = e.prefill_fp8_gemm;
     prefill_fp8_per_tensor = e.prefill_fp8_per_tensor;
     prefill_activations = e.prefill_activations;
+    activations = e.activations;
     prefill_attention = e.prefill_attention;
     decode_attention = e.decode_attention;
     expert_gemm = e.expert_gemm;
@@ -2072,6 +2172,7 @@ int main(int argc, char** argv) {
     prefix_cache_gib = e.prefix_cache_gib;
     nvme_cache = c.nvme_cache.enabled;
     nvme_cache_path = c.nvme_cache.path;
+    nvme_cache_required_mount = c.nvme_cache.required_mount;
     nvme_cache_gib = c.nvme_cache.capacity_gib;
     nvme_cache_min_tokens = c.nvme_cache.min_tokens;
     nvme_cache_chunk_mib = c.nvme_cache.chunk_mib;
@@ -2421,7 +2522,12 @@ int main(int argc, char** argv) {
   if (mtp && !mtp_depth_explicit && !ckpt.empty()) {
     const dgpp::ModelArchitecture arch =
         dgpp::detect_architecture_file((fs::path(ckpt) / "config.json").string());
-    if (arch == dgpp::ModelArchitecture::DeepseekV41) {
+    if (arch == dgpp::ModelArchitecture::MinimaxM3) {
+      const auto draft =
+          dgpp::minimax_dspark_config_file((fs::path(ckpt) / "dspark" / "config.json").string());
+      mtp_depth = draft.drafts();
+      DGPP_LOG_INFO("serve: --mtp on MiniMax: the DSpark block's {} drafts", mtp_depth);
+    } else if (arch == dgpp::ModelArchitecture::DeepseekV41) {
       mtp_depth = dgpp::Dsv41TextConfig::from_json_file((fs::path(ckpt) / "config.json").string()).dspark_block_size;
       DGPP_LOG_INFO("serve: --mtp without --mtp-depth on DeepSeek-V4.1: the DSpark block's {} drafts", mtp_depth);
     } else if (arch == dgpp::ModelArchitecture::DeepseekV4) {
@@ -2447,7 +2553,7 @@ int main(int argc, char** argv) {
     const int effective_batch_min_live =
         graph_batch_min_live == 0 ? std::min(2, max_concurrency) : graph_batch_min_live;
     return std::format(
-        "model={} world={} fabric={} journal={} conc={} kv={} kvdt={} pfattn={} dcattn={} ngt={} dw={} mtpef={} bfw={} "
+        "model={} world={} fabric={} journal={} conc={} kv={} kvdt={} act={} pfattn={} dcattn={} ngt={} dw={} mtpef={} bfw={} "
         "fp8head={} dh={} dhb={} mtph={} attw={} itopk={} ctb={} cbs={} pf={} pfd={} pfo={} pfw={} dcw={} ctr={} pdl={} dlp={} dkv={} "
         "emsh={} maxtok={} queue={} "
         "eos={} graph={} compact={} mtp={} mtpd={} mss={} msrow={} msbase={} mslam={} msmin={} msopt={} "
@@ -2457,7 +2563,7 @@ int main(int argc, char** argv) {
         "reasoning_in_content={} "
         "rs={} dflash={} dfw={} lk={} lkn={} lks={} lka={} lkt={} nvme={}",
         model_id.empty() ? ckpt : model_id, world, fabric_port, journal_port, max_concurrency,
-        kv_capacity, kv_dtype, prefill_attention, decode_attention, ngram_table, dense_weights, mtp_expert_format, bf16_weights, fp8_head,
+        kv_capacity, kv_dtype, activations, prefill_attention, decode_attention, ngram_table, dense_weights, mtp_expert_format, bf16_weights, fp8_head,
         draft_head,
         draft_head_blocks, mtp_head,
         attention_weights, index_topk, candidate_topk_blocks, candidate_block_size, prefill, prefill_dense,
@@ -2549,6 +2655,7 @@ int main(int argc, char** argv) {
         ws.prefill_fp8_gemm = prefill_fp8_gemm;
         ws.prefill_fp8_per_tensor = prefill_fp8_per_tensor;
         ws.prefill_activations = prefill_activations;
+        ws.activations = activations;
         ws.prefill_attention = prefill_attention;
         ws.decode_attention = decode_attention;
         ws.dflash_model = dflash_model;
@@ -2671,6 +2778,7 @@ int main(int argc, char** argv) {
         prefill_fold_scales = ws.prefill_fold_scales;
         prefill_fp8_gemm = ws.prefill_fp8_gemm;
         prefill_fp8_per_tensor = ws.prefill_fp8_per_tensor;
+        activations = ws.activations;
         prefill_attention = ws.prefill_attention;
         decode_attention = ws.decode_attention;
         dflash_model = ws.dflash_model;
@@ -3137,8 +3245,8 @@ int main(int argc, char** argv) {
     DGPP_LOG_ERROR("--mtp-schedule-sampled-scale must be in [0, 1], got {}", mtp_schedule_sampled_scale);
     return 2;
   }
-  if (mtp_depth < 1 || mtp_depth > 5) {
-    DGPP_LOG_ERROR("--mtp-depth must be in [1, 5], got {}", mtp_depth);
+  if (mtp_depth < 1 || mtp_depth > 7) {
+    DGPP_LOG_ERROR("--mtp-depth must be in [1, 7], got {}", mtp_depth);
     return 2;
   }
   if (!mtp && mtp_depth != 1) {
@@ -3214,7 +3322,7 @@ int main(int argc, char** argv) {
     // everything below the engine interface comes from it.
     std::unique_ptr<ServeFamily> family =
         make_family(ckpt, world, kv_format, rope_scaling, fp8_head == "mma", index_topk, candidate_topk_blocks,
-                    candidate_block_size);
+                    candidate_block_size, activations);
     if (!dflash_dir.empty()) {
       try {
         family->set_draft_model(dflash_dir);
@@ -3235,6 +3343,7 @@ int main(int argc, char** argv) {
       return 1;
     }
     const std::string family_name = std::string(family->name());
+    if (mtp) family->check_mtp_depth(mtp_depth);
     // The Dory family's two keys (docs/dory_plan.md D1, D2) and its two
     // refusals (plan D4): no draft layer, so speculation is refused by name,
     // and the loop keys belong to no other family.
@@ -3541,7 +3650,8 @@ int main(int argc, char** argv) {
                                                snapshot_bytes, block_tokens, context_limit,
                                                /*create_directory=*/!memory_plan_only && nvme_cache_reuse_binding.empty(),
                                                static_cast<size_t>(nvme_cache_reserve_gib * 1024.0 * 1024.0 * 1024.0),
-                                               nvme_binding, kNvmeChunkBytes);
+                                               nvme_binding, kNvmeChunkBytes,
+                                               nvme_cache_required_mount, nvme_cache_allow_buffered);
       if (nvme_plan.error.empty() && !nvme_cache_reuse_binding.empty()) {
         nvme_plan.error = dgpp::serve::check_nvme_cache_reuse(nvme_plan, nvme_binding, rank, block_tokens);
         if (nvme_plan.error.empty())
@@ -3549,8 +3659,11 @@ int main(int argc, char** argv) {
                         "format, geometry, checksums and world agreement still checked", rank, nvme_binding);
       }
       DGPP_LOG_INFO("rank {}: {}", rank, nvme_plan.describe());
+      DGPP_LOG_INFO("rank {}: {}", rank, nvme_plan.storage.describe());
+      if (const auto warning = nvme_plan.storage.warning(nvme_cache_allow_buffered); !warning.empty())
+        DGPP_LOG_WARN("rank {}: {}", rank, warning);
       if (!nvme_plan.error.empty()) {
-        DGPP_LOG_ERROR("rank {}: the NVMe cache does not fit — {}", rank, nvme_plan.error);
+        DGPP_LOG_ERROR("rank {}: NVMe cache preflight refused — {}", rank, nvme_plan.error);
         return 1;
       }
       if (arena_slots <= 0) {
@@ -3569,6 +3682,7 @@ int main(int argc, char** argv) {
       if (!nvme_cache) return;
       dgpp::sched::SchedulerEngine::DiskEnable en;
       en.slab_path = nvme_plan.slab;
+      en.required_mount = nvme_cache_required_mount;
       en.capacity_bytes = nvme_plan.capacity_bytes;
       en.chunk_bytes = kNvmeChunkBytes;
       en.min_tokens = nvme_cache_min_tokens;  // 0: every entry memory keeps (engine.prefix_min_tokens floors them)

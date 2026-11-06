@@ -1,7 +1,8 @@
 # Build for DGX Spark from x86 Linux
 
 The cross-build container uses Ubuntu 24.04, GCC 13's AArch64 cross compiler,
-CUDA 13.0's x86 compiler, ARM64 SBSA CUDA libraries, and ARM64 libibverbs.
+CUDA 13.0's x86 compiler, ARM64 SBSA CUDA libraries, ARM64 libibverbs and
+ARM64 FFmpeg development libraries for native video input.
 It requires Docker but no local NVIDIA driver, GPU, QEMU, or privileged container.
 The output targets Linux/aarch64 and GB10 (`sm_121a`). The target needs compatible
 DGX OS drivers and system libraries; Ubuntu 24.04 is the repository's tested ABI.

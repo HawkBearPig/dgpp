@@ -41,7 +41,7 @@ graph decode for MTP; the GLM diagnostic tool also has an eager speculative
 path. Graph serving works on one node when the model fits, using identity
 collectives.
 
-`engine.mtp_depth` accepts 1–5 and defaults to 1 (DeepSeek-V4.1 defaults
+`engine.mtp_depth` accepts 1–5 for MTP chains and defaults to 1 (DeepSeek-V4.1 defaults
 to its DSpark depth). Each step verifies `1 + depth` rows. GLM-5.3 uses
 scalar graphs beyond depth 1; Qwen and GLM-4.7 run batched draft chains at
 every depth within their row limits (Qwen: sixteen slots at depth 3, the
@@ -455,3 +455,9 @@ recorded coherent-text workload. It produced 1.89 tokens per 42.4 ms step:
 layer added about 7.3 GiB per rank. These figures describe that checkpoint
 and workload; acceptance fell on the post-EOS text generated with
 `--no-eos`.
+
+MiniMax M3.1 uses the bundled DSpark block with seven proposals. Set
+`engine.mtp_depth` to 7 or omit it to use the checkpoint width. The
+verification scheduler can select fewer rows while keeping the complete
+physical draft block. The deployment parser accepts 1–7; the loaded model
+checks its supported width before allocating weights.

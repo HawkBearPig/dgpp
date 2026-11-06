@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check image prefix reuse, continuation and pixel isolation on an idle GLM or Qwen server."""
+"""Check image prefix reuse, continuation and pixel isolation on an idle server."""
 import argparse
 import base64
 from concurrent.futures import ThreadPoolExecutor
@@ -14,7 +14,11 @@ from vision_api_check import png
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--url', default='http://127.0.0.1:18080')
+    parser.add_argument('--history-images', type=int, default=12,
+                        help='Large-image history count; use 24 for MiniMax\'s 576-token image budget')
     args = parser.parse_args()
+    if args.history_images < 9:
+        parser.error('--history-images must exceed the former eight-image limit')
     with urllib.request.urlopen(args.url + '/v1/models', timeout=10) as response:
         model = json.load(response)['data'][0]['id']
     marker = 'Cache regression ' + uuid.uuid4().hex
@@ -89,17 +93,17 @@ def main():
 
     # Both old history limits: more than eight images and 8192 visual tokens.
     history = [{'role': 'system', 'content': marker + ' extended history'}]
-    for _ in range(12):
+    for _ in range(args.history_images):
         # Reach the 1024-token cap on both the 28-pixel GLM grid and the
         # 32-pixel Qwen grid (896 pixels yields only 784 Qwen tokens).
         history.append({'role': 'user', 'content': [image(blue, 1024, 1024)]})
         history.append({'role': 'assistant', 'content': 'Image received.'})
     history.append({'role': 'user', 'content': [question]})
-    many = request('twelve-full-size-images', history, 'blue')
+    many = request('full-size-image-history', history, 'blue')
     assert many['usage']['prompt_tokens'] > 12288, many
-    many_warm = request('twelve-image-history-reuse', history, 'blue')
+    many_warm = request('image-history-reuse', history, 'blue')
     assert cached(many_warm) > 0.95 * many_warm['usage']['prompt_tokens'], many_warm
-    request('twelve-image-history-cache-disabled', history, 'blue', cache=False)
+    request('image-history-cache-disabled', history, 'blue', cache=False)
 
     # Mixed small-image history checks ordering/content separately. The model
     # misidentifies the final color in 12 full-size mixed-image turns under

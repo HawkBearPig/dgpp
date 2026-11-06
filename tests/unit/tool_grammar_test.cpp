@@ -1145,6 +1145,43 @@ DGPP_TEST(tool_grammar_jsonModeSpellsOneTextThenEos) {
   require(same == typed, "equal specs");
 }
 
+DGPP_TEST(tool_grammar_jsonClosedKeyMasksAdvanceAcrossTokens) {
+  const GrammarVocab v = fake_vocab();
+  GrammarSpec spec;
+  spec.mode = GrammarSpec::Mode::kJson;
+  spec.json_schema =
+      R"({"type":"object","properties":{"city":{"type":"string"}},"required":["city"],"additionalProperties":false})";
+  // Real tokenizers may encode city as one id. Force the split spelling too,
+  // so checking every piece against the initial mask cannot pass unnoticed.
+  for (const std::vector<int64_t>& key :
+       {std::vector<int64_t>{'c', 'i', 't', 'y'}, std::vector<int64_t>{kCity}}) {
+    GrammarState g(&v, spec, false);
+    const auto accept = [&](int64_t id) {
+      TokenMask m;
+      g.mask(&m);
+      require(m.constrained() && m.allows(id),
+              "closed key mask admits token " + std::to_string(id));
+      require(g.allows(id), "pointwise acceptance admits token " + std::to_string(id));
+      g.advance(id);
+    };
+    accept('{');
+    accept('"');
+    TokenMask initial;
+    g.mask(&initial);
+    require(initial.allows('c') && initial.allows(kCity) && !initial.allows('i') &&
+                !initial.allows('z') && !initial.allows('"'),
+            "the initial key mask admits the declared prefix, not a suffix or foreign key");
+    for (const int64_t id : key) accept(id);
+    TokenMask complete;
+    g.mask(&complete);
+    require(complete.allows('"') && !complete.allows('c') && !complete.allows('z'),
+            "a complete key admits its closing quote, not extra key bytes");
+    for (const char c : std::string("\":\"Paris\"}")) accept(static_cast<unsigned char>(c));
+    accept(kEosText);
+    require(std::string(g.state_name()) == "done", "the split or whole key completes the document");
+  }
+}
+
 DGPP_TEST(tool_grammar_jsonOrToolsCommitsToOneBranch) {
   for (const GrammarVocab& v : {fake_vocab(), qwen_vocab(), dsml_vocab()}) {
     const bool dsml = v.markers().tool_format() == dgpp::text::ToolFormat::kDsml;

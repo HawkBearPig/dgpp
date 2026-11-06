@@ -17,11 +17,15 @@ from timed_load import COUNTERS, reconciled_metrics
 
 
 def make_prompt(tokenizer, target, tag, seed):
+    if target == 0:
+        # Keep the minimal context below 256 tokens even with MiniMax's
+        # approximately 190-token chat wrapper. A bounded tag keeps long
+        # deployment labels from turning this into a larger context bucket.
+        identity = hashlib.sha256(f'{tag}:{seed}'.encode()).hexdigest()[:12]
+        return f'Context {identity}. Write numbers 1 through 200, one per line.'
     prefix = f"Context measurement {tag}, bucket {target}.\n"
     suffix = ("\nWrite a numbered list describing the first 200 parcels and their cities. "
               "Continue until you have listed all 200.")
-    if target == 0:
-        return prefix + filler(seed, 1)[0] + suffix
     # Reserve space for the chat wrapper, the 256 output tokens and draft
     # verification. This also lets a 256K pool run the 256K bucket safely.
     budget = target - 512
