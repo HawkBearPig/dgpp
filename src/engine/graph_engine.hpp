@@ -3365,7 +3365,10 @@ class GraphEngineAdapter final : public sched::SchedulerEngine {
     const sample::Params& p = params_[static_cast<size_t>(req)];
     const int count = model_->lm_vocab_count();
     const int begin = model_->lm_vocab_begin();
-    const int T = rows_per_request_;
+    // The fallback finishes only the rows this replay verified. The full
+    // draft width still determines storage strides and the next draft, but
+    // a reduced replay has fewer block draws and an earlier plain last row.
+    const int T = replay_rows;
     const int t0 = o.fallback_row;
 
     // The device's draws: one per draft that stood before row t0 (the
@@ -3378,7 +3381,9 @@ class GraphEngineAdapter final : public sched::SchedulerEngine {
           "graph engine: a row-" + std::to_string(t0) +
           " fallback must commit the rows before it (" +
           std::to_string(verify.accepted) + " committed) with their draws "
-          "consumed (" + std::to_string(o.counter - rng.counter) + ")");
+          "consumed (" + std::to_string(o.counter - rng.counter) +
+          ", expected " + std::to_string(device_draws) + " for " +
+          std::to_string(T) + " replay rows)");
     rng.counter = o.counter;
     // The draft block ran on the provisional rows: back to its snapshot (a
     // block drafter keeps no state: its planes are overwritten by position).

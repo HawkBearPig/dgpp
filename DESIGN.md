@@ -2273,6 +2273,11 @@ appropriate fed tokens. The commit updates counts for accepted rows.
 On fallback, the adapter gathers the saved verifier logits, completes
 sampling on the host and replaces the provisional feed and draft state.
 Verifier logits are saved before the draft head reuses their buffer.
+Fallback decisions use the replay's actual verification width: its last
+row is a plain sample, and block verification consumes one uniform per
+draft verified in that replay. The configured maximum width still sets
+the scalar snapshot stride and the number of drafts prepared for the
+next step.
 The sampled-MTP oracle gates follow scheduler token and retirement events,
 compare every live transcript through its final token, and cover grouped
 admission, staggered arrival and reused slots. Stored request results are

@@ -723,7 +723,8 @@ struct SampledSchedOutcome {
 };
 
 void rank_work_sampled_sched(int r, const Dsv4Config& cfg, const std::string& dir, const std::vector<int64_t>& A,
-                             CollectiveBus* bus, ConstructBarrier* barrier, SampledSchedOutcome* out) {
+                             CollectiveBus* bus, ConstructBarrier* barrier, SampledSchedOutcome* out,
+                             bool block_verify) {
   bool arrived = false;
   uint16_t* scratch = nullptr;
   uint16_t* prefix_scratch = nullptr;
@@ -747,6 +748,7 @@ void rank_work_sampled_sched(int r, const Dsv4Config& cfg, const std::string& di
                                          /*batch_min_live=*/2, prefix_scratch, gather_scratch, /*candidates=*/32,
                                          /*grammar=*/nullptr, /*prefix_slots=*/0, /*mtp_depth=*/depth);
       eng.set_proposal_drafts(false);
+      eng.set_block_verify(block_verify);
       eng.set_sampled_schedule_scale(0.93f);
       eng.configure_verify_schedule(true, /*row_ms=*/9.0f, dgpp::verify_reservation_lambda(20.0f, 9.0f),
                                     /*min_depth=*/1);
@@ -819,7 +821,7 @@ void rank_work_sampled_sched(int r, const Dsv4Config& cfg, const std::string& di
   if (gather_scratch) cudaFreeHost(gather_scratch);
 }
 
-void check_sampled_sched_world(uint16_t port) {
+void check_sampled_sched_world(uint16_t port, bool block_verify = false) {
   const Dsv4Config cfg = dsv4fx::tiny_config();
   const std::string dir = (fs::current_path() / "dsv4_engine_fixture").string();
   dsv4fx::write_fixture(cfg, dir);
@@ -831,7 +833,7 @@ void check_sampled_sched_world(uint16_t port) {
   std::vector<std::thread> workers;
   for (int r = 0; r < kWorld; ++r)
     workers.emplace_back(rank_work_sampled_sched, r, std::cref(cfg), std::cref(dir), std::cref(A),
-                         buses[static_cast<size_t>(r)].get(), &barrier, &outs[static_cast<size_t>(r)]);
+                         buses[static_cast<size_t>(r)].get(), &barrier, &outs[static_cast<size_t>(r)], block_verify);
   for (auto& t : workers) t.join();
   for (int r = 0; r < kWorld; ++r) require(outs[static_cast<size_t>(r)].error.empty(), outs[static_cast<size_t>(r)].error);
   const SampledSchedOutcome& o = outs[0];
@@ -1039,6 +1041,10 @@ DGPP_TEST(dsv4_engines_loopback_world_2_dspark_depth_2_matches_plain_decode) { c
 DGPP_TEST(dsv4_engines_loopback_world_2_scheduled_verify_depth_is_exact) { check_sched_world(kPort + 3); }
 
 DGPP_TEST(dsv4_engines_loopback_world_2_sampled_slot_follows_the_schedule) { check_sampled_sched_world(30005); }
+
+DGPP_TEST(dsv4_engines_loopback_world_2_sampled_block_follows_the_schedule) {
+  check_sampled_sched_world(30014, true);
+}
 
 DGPP_TEST(dsv4_engines_loopback_world_2_six_slots_at_depth_4_batched_scheduled_is_exact) { check_wide_world(kPort + 4); }
 
