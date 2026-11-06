@@ -2432,8 +2432,8 @@ the same machine from the journal and its tokenizer.
 
 ## 11. Runtime and API
 
-Heretic research uses a separate, opt-in tool path. The host-only GLM-5.3
-target catalog maps Heretic's capture IDs to checkpoint modules, full weight
+Research inference uses a separate, opt-in tool path. The host-only GLM-5.3
+target catalog maps capture IDs to checkpoint modules, full weight
 shapes, and each rank's input-column interval. `dgpp-heretic-inspect` requires
 `engine.heretic_research=true` and advertises only target discovery. It does
 not attach to the serving process or initialize a model. The separately gated
@@ -2465,7 +2465,9 @@ every session to be idle. The contract is worlds 1/2/4, BF16 KV/checkpoint
 weights, no drafts or prefix cache. Serving checks artifact identity during
 its settings handshake and includes it in the configuration digest; the
 launcher stages only the manifest and factor file. See
-[Heretic integration](docs/heretic.md) for the contract and usage.
+[runtime adapters and research inference](docs/runtime-adapters.md) for the
+contract and usage, and the [worker protocol](docs/heretic.md#protocol-version-2)
+for framing and operations.
 
 The shared JSON parser validates number grammar before conversion, retaining exact
 signed integers when representable and the existing double fallback otherwise.

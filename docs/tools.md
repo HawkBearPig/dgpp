@@ -29,6 +29,9 @@ modules to see their arguments. Their offline regression tests run with
 
 | command | purpose |
 |---|---|
+| `dgpp-heretic-inspect --config FILE` | inspect supported projection targets without loading model weights; requires `engine.heretic_research=true` |
+| `dgpp-heretic-worker --config FILE --control-fd FD` | expose logits, last-position activations, generation and token scores through an inherited Unix socket; requires `engine.heretic_research=true` |
+| `scripts/dgpp-heretic-cluster --config FILE --control-fd FD` | launch a separate research worker world on one, two or four nodes; see [runtime adapters and research inference](runtime-adapters.md) for configuration and protocol details |
 | `dgppctl info` | CUDA and platform facts |
 | `micro_mem_bw -s 4096` | LPDDR5x streaming patterns |
 | `micro_gemm_peak` | best-of-cuBLASLt-heuristics FP8/BF16 shape sweep |

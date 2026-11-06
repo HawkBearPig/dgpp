@@ -7,14 +7,19 @@ Other model templates use the same launcher with their own memory and
 engine settings. See the [configuration reference](configuration.md) for
 settings, defaults and their effects.
 
-For offline projection discovery or baseline tensor capture, use the
-separate [Heretic research tools](heretic.md). Both require an explicit
-research flag. Inspection reads model metadata only; the worker loads a
-checkpoint on demand across one, two or four nodes and never attaches to a
-serving world. Its launcher owns separate process records and research ports.
-Compact artifacts load through `engine.runtime_adapters=true` and
-`engine.runtime_adapter_path`; see the integration guide for the eager serving
-contract, checkpoint validation and launcher staging.
+For LoRA adapter loading or access to logits and activations, see
+[runtime adapters and research inference](runtime-adapters.md). Adapter serving
+uses `engine.runtime_adapters=true` and `engine.runtime_adapter_path`; the
+launcher stages the bundle on every node, and each server validates it against
+the base checkpoint. Changing the adapter requires restarting the serving world.
+Current execution restrictions include eager decode, BF16 KV and disabled
+speculation and prefix caching; check them before adapting a serving template.
+
+Inspection and tensor capture use a separate worker with
+`engine.heretic_research=true`. Inspection reads metadata only; the worker
+loads the checkpoint on demand across one, two or four nodes. Its launcher
+owns separate process records and research ports. Reserve the participating
+nodes for the worker and stop it before starting a serving deployment there.
 
 ## Sampling penalty defaults
 

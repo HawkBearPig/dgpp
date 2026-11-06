@@ -1,11 +1,11 @@
 # DGPP implementation status
 
-## Heretic backend integration
+## Runtime adapters and research inference
 
-The opt-in Heretic inspection command describes GLM-5.3's modifiable
+The opt-in inspection command describes GLM-5.3's modifiable
 projections and their input-column partitions without loading weights.
-The versioned catalog matches Heretic's attention, dense MLP and shared-expert
-capture indices. A separate worker provides baseline logits, greedy
+The versioned catalog describes attention, dense MLP and shared-expert
+capture targets. A separate worker provides baseline logits, greedy
 generation, and last-token residual/projection capture on worlds 1, 2 and 4,
 with native int8/Mixed346 fixture checks and a four-node full-checkpoint probe.
 Protocol v2 supplies bounded weight reads, likelihood scoring and atomic
@@ -13,12 +13,11 @@ low-rank candidate activation/reset. Ordinary serving loads checkpoint-bound
 adapter bundles behind `engine.runtime_adapters`, using the existing eager
 serving concurrency and grouped/mixed model walks;
 the adapter does not impose a separate request-slot limit. The fitting worker
-remains serial. The local Heretic backend
-supports both bundled modifiers, managed scorer plugins, Evaluation Harness,
-Optuna studies and reproduction. Bounded fitting trials and ordinary-serving
+remains serial. Bounded fitting trials and ordinary-serving
 adapter reload pass on the full four-node checkpoint; adapter quality needs
 representative training and held-out evaluation.
-See the [integration guide](docs/heretic.md) for commands, capability limits,
+See [runtime adapters and research inference](docs/runtime-adapters.md) for
+configuration, capability limits,
 and the default-off feature gates.
 
 ## Serving status

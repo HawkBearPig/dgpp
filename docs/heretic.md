@@ -225,71 +225,17 @@ checkpoint, tokenizer, runtime recipe, prompt tokens, and adapter identity.
 
 ## Runtime artifact and ordinary serving
 
-The bundle contains `dgpp_adapter.json` and `adapter_model.safetensors`.
-Heretic also writes a PEFT adapter config with scale one and canonical LoRA
-tensor names. DGPP validates its own manifest; a generic PEFT loader does not
-enforce this additional execution contract.
+The exported bundle contains `dgpp_adapter.json`, `adapter_model.safetensors`
+and a PEFT `adapter_config.json` with scale one and canonical LoRA tensor names.
+For the serving configuration, supported execution settings, bundle validation
+and startup costs, see [runtime adapters and research inference](runtime-adapters.md).
+The same runtime applies factors during candidate evaluation and serving.
 
-Manifest version 1 identifies operation `additive_low_rank`, runtime
-`glm_dsa_eager_fp32_v1`, fitted world size, target IDs/modules/dimensions,
-per-factor SHA-256 hashes, the numerical environment hash, and the base content fingerprint. Fingerprinting
-reads every weight shard, index, configuration, external quantization sidecar,
-and present tokenizer/template/generation files. This can add minutes to
-cold startup for a large checkpoint. It occurs only with runtime opt-in;
-trial activation reuses the identity and checks that base files have not changed.
-The numerical hash covers sorted `DGPP_*` overrides, excluding transport
-addresses, paths, logging and test controls. Loading under different overrides
-fails. The supported recipe also fixes the default expert GEMM/prefill options,
-replicated embeddings and write transport; configuration and CLI overrides
-cannot silently change those choices. Heretic records the worker binary SHA-256
-and execution limits for study resume and reproduction. Reproducing fitted
-factors requires the same worker build and Python fitting environment.
-
-Factors are FP32 A `[rank,input]` and B `[hidden,rank]`, with rank 1–256
-and a 1 GiB global factor budget. Each rank stores its A columns and replicated
-B. The runtime computes A times the captured BF16 projection input, gathers
-FP32 partials losslessly, sums in rank order, and adds B times that sum once
-to the already-folded BF16 branch output, rounding to BF16. Shared-expert
-corrections enter the combined MLP branch. Research capture retains the shared
-projection's separate FP32 output plus correction. Zero factors skip the
-addition, preserving identity exactly. Base and routed-expert weights stay
-unchanged. This contract does not promise bitwise equivalence to a merged
-checkpoint or to another runtime's LoRA kernels.
-
-For ordinary serving, omit the research flag and add these engine settings
-to a separate cluster config using the same model and world size:
-
-```json
-{
-  "runtime_adapters": true,
-  "runtime_adapter_path": "/path/to/exported/adapter",
-  "max_concurrency": 8,
-  "kv_capacity": 131072,
-  "default_max_tokens": 8192,
-  "mtp": false,
-  "decode_graph": false,
-  "prefix_cache_gib": 0,
-  "kv_dtype": "bf16",
-  "bf16_weights": "checkpoint",
-  "attention_weights": "checkpoint"
-}
-```
-
-Run `scripts/dgpp-cluster up --config serving.json`. The launcher stages the
-manifest and factors to each peer. A relative adapter path is resolved beside
-the deployment JSON. Direct binary launches require the bundle on every node.
-The manifest identity participates in the settings handshake and serving
-configuration digest. Different artifacts or missing opt-in reject startup.
-Serving supports the engine's existing request-slot range (1–16), worlds
-1/2/4, eager execution, no drafts, and no prefix/NVMe cache. The research worker
-still processes one fitting request at a time; its execution limits do not
-restrict the exported adapter's serving concurrency or context. `kv_capacity`
-is the shared token pool across active requests, not a per-request reservation.
-Size it for available memory and the combined prompt/output lengths you need.
-`default_max_tokens` is the default output length and can be overridden per
-request. The engine's existing admission policy determines which requests fit.
-Default deployments retain their normal paths and
-allocate no adapter factors, scratch, synchronization, or collectives.
+Heretic records the worker binary SHA-256 and execution limits for study
+resume and reproduction. Reproducing fitted factors requires the same worker
+build and Python fitting environment. Exported adapters use ordinary serving's
+request slots and context settings; the research worker's serial execution
+and prompt bound do not become serving limits.
 
 ## Validation
 
