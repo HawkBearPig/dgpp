@@ -2,11 +2,13 @@
 
 #include "common/cuda_check.hpp"
 #include "kernels/low_rank.hpp"
+#include "kernels/pdl.cuh"
 
 namespace dgpp {
 namespace {
 __global__ void project(const uint16_t* x, int stride, const float* a, float* z, int inputs,
                         int rank) {
+  dgpp_pdl_wait();
   const int factor = blockIdx.x, row = blockIdx.y;
   float sum = 0;
   for (int c = threadIdx.x; c < inputs; c += blockDim.x) {
@@ -27,6 +29,7 @@ __global__ void project(const uint16_t* x, int stride, const float* a, float* z,
 template <bool Add>
 __global__ void finish(const float* z, const float* b, uint16_t* output, float* delta, int rows,
                        int outputs, int rank) {
+  dgpp_pdl_wait();
   const int column = blockIdx.x * blockDim.x + threadIdx.x;
   const int row = Add ? blockIdx.y : rows - 1;
   if (column >= outputs) return;
