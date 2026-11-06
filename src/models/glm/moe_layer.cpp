@@ -816,6 +816,15 @@ void GlmMoeLayer::enqueue_prefill(const uint16_t* hidden, uint16_t* out,
   }
 }
 
+GlmMoeLayer::SharedPrefillRow GlmMoeLayer::research_shared_prefill_last_row(int tokens) const {
+  if (tokens <= 0 || tokens > max_tokens_ || !has_shared() || !w_.shared_packq() || down_bf16_)
+    throw std::logic_error("research shared capture requires packed GLM unmixed prefill");
+  const int width = static_cast<int>(w_.shared_packed[0].rows);
+  const int stride = std::max(routed_inter_of(w_, cfg_.n_experts), width);
+  const size_t row = static_cast<size_t>(tokens) * (cfg_.top_k + 1) - 1;
+  return {d_act_ + row * stride, d_down_ + row * cfg_.hidden, width};
+}
+
 void GlmMoeLayer::route_prefill_rows(const uint16_t* hidden, int r0, int rows, cudaStream_t stream) {
   if (rows <= 0) return;
   if (r0 < 0 || r0 + rows > max_tokens_) throw std::invalid_argument("GlmMoeLayer: router rows exceed max_tokens");

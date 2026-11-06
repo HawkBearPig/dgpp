@@ -1,5 +1,19 @@
 # DGPP implementation status
 
+## Heretic backend integration
+
+The opt-in Heretic inspection command describes GLM-5.3's modifiable
+projections and their input-column partitions without loading weights.
+The versioned catalog matches Heretic's attention, dense MLP and shared-expert
+capture indices. A separate local worker now provides baseline logits, greedy
+generation, and last-token residual/projection capture, with native int8 and
+Mixed346 fixture checks. Distributed execution, candidate lifecycle, complete
+Heretic workflow integration, and independent runtime artifact loading remain
+pending. See the [integration guide](docs/heretic.md) for commands, capability
+limits, and the default-off feature gate.
+
+## Serving status
+
 Load-client JSON reports preserve solo and batched isolation responses and
 effective request bodies before a mismatch exits. Local HTTP fixture tests
 cover text and token-count mismatches and successful comparisons. This
@@ -344,6 +358,9 @@ Sampled MTP now preserves the drafts each request verified before settling
 another request's fallback. Live observer-based oracle checks cover grouped
 and staggered admission, reused slots, final transcripts and counters, with
 pipelining enabled and disabled.
+Reduced-depth fallbacks use the scheduled replay's width for RNG accounting
+and the final sample. Scalar and batched oracle checks cover both token
+and block verification at one draft within a maximum-depth-three graph.
 
 Other work includes request-level observability, additional API fields,
 silent-node-loss detection, wider batching for GLM-5.3-Flash, arbitrary

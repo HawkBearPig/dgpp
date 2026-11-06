@@ -36,7 +36,7 @@ cluster launcher and the deployment templates.
   with speculative decoding on or off. Reduced-precision levers are
   explicit keys, off by default and named in the startup log.
 - **Fast where it counts.** Graph decode, speculative decoding with MTP
-  layers, DeepSeek's DSpark blocks or the DFlash2 drafter, continuous
+  layers, DeepSeek and MiniMax DSpark blocks or the DFlash2 drafter, continuous
   batching with latency-adaptive prefill, exact prefix caching with an
   NVMe cold tier, KV pools up to 2M tokens and YaRN ramps to 768K
   positions.
@@ -67,6 +67,7 @@ prompt classes, and C is the number of concurrent client requests.
 | Qwen3.8-27B FP8 | 4 | 58-137 | 219-406 | 1.25 / 4.39 / 17.6 |
 | DeepSeek-V4.1-Flash-1017 MXFP4/FP8 | 4 | 54-89 | 84-139 | 1.01 / 2.64 / 10.0 |
 | DeepSeek-V4.1-Flash-1017 EXL3 3.5 bpw | 4 | 70-134 | 165-248 | 1.19 / 3.45 / 13.3 |
+| MiniMax-M3.1-Flash NVFP4/MXFP8 | 4 | 28.8-48.2 | 85.7-99.7 | 2.176 / 7.816 / 33.341 |
 
 Rows with every cell filled were measured on the shipped templates at the
 current scheduler defaults. Rows with an empty C8 cell were measured
@@ -80,7 +81,10 @@ revision, binary hash and configuration. One command reproduces a
 template's rows:
 
 ```bash
-scripts/serve_campaign.py run --config deploy/<template>.json
+scripts/serve_campaign.py run \
+  --config deploy/cluster_minimax-m3.1-flash_nvfp4-mxfp8_w4.example.json \
+  --out benchmarks/results/minimax-adaptive \
+  --mode plain=--no-mtp --mode full7=--no-mtp-schedule
 ```
 
 ## How it works
@@ -143,7 +147,7 @@ mechanism and depth the template ships with.
 | [DeepSeek-V4.1-Flash-1017](docs/model_cards/DeepSeek-V4.1-Flash-1017.md) | [deepseek-ai/DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017) | MXFP4 experts, FP8 dense | [4](deploy/cluster_deepseek-v4.1-flash-1017_mxfp4-fp8_w4.example.json) | 1M | DSpark 4 | |
 | [DeepSeek-V4.1-Flash-1017](docs/model_cards/DeepSeek-V4.1-Flash-1017-EXL3-3.5bpw.md) | [LibertAIDAI/DeepSeek-V4.1-Flash-1017-EXL3-3.5bpw](https://huggingface.co/LibertAIDAI/DeepSeek-V4.1-Flash-1017-EXL3-3.5bpw) | EXL3 3.5 bpw | [4](deploy/cluster_deepseek-v4.1-flash-1017_exl3-3.5bpw_w4.example.json) | 1M | DSpark 5 | |
 | [DeepSeek-V4-Flash](docs/model_cards/DeepSeek-V4-Flash.md) | [deepseek-ai/DeepSeek-V4-Flash-0731](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731) | MXFP4 experts, FP8 dense | [2](deploy/cluster_deepseek-v4-flash_mxfp4-fp8_w2.example.json), [4](deploy/cluster_deepseek-v4-flash_mxfp4-fp8_w4.example.json) | 1M | DSpark 5 | |
-| [MiniMax M3.1 Flash](docs/model_cards/MiniMax-M3.1-Flash.md) | [MiniMaxAI/MiniMax-M3.1-Flash](https://huggingface.co/MiniMaxAI/MiniMax-M3.1-Flash) | NVFP4 experts, MXFP8 dense | [4](deploy/cluster_minimax-m3.1-flash_nvfp4-mxfp8_w4.example.json) | 1M | none (DSpark optional) | yes |
+| [MiniMax M3.1 Flash](docs/model_cards/MiniMax-M3.1-Flash.md) | [MiniMaxAI/MiniMax-M3.1-Flash](https://huggingface.co/MiniMaxAI/MiniMax-M3.1-Flash) | NVFP4 experts, MXFP8 dense | [4](deploy/cluster_minimax-m3.1-flash_nvfp4-mxfp8_w4.example.json) | 1M | DSpark adaptive 1/3/5/7 | yes |
 | [MiMo-V2.6-Flash](docs/model_cards/MiMo-V2.6-Flash.md) | [XiaomiMiMo/MiMo-V2.6-Flash-RL](https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Flash-RL) | MXFP4 experts, FP8 dense | [2](deploy/cluster_mimo-v2.6-flash_mxfp4-fp8_w2.example.json), [4](deploy/cluster_mimo-v2.6-flash_mxfp4-fp8_w4.example.json) | 256K on two, 128K on four | MTP 1 | |
 | [Flint](docs/model_cards/Flint-FP8-NVFP4.md) | [HawkBearPig/flint-FP8-NVFP4](https://huggingface.co/HawkBearPig/flint-FP8-NVFP4) | FP8 and NVFP4 experts, BF16 rest | [1](deploy/cluster_flint_fp8-nvfp4_w1.example.json), [2](deploy/cluster_flint_fp8-nvfp4_w2.example.json), [4](deploy/cluster_flint_fp8-nvfp4_w4.example.json) | 256K | none | |
 | [Dory1.0-4B](docs/model_cards/Dory1.0-4B-NVFP4.md) | [nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-NVFP4](https://huggingface.co/nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-NVFP4) | NVFP4 W4A16 | [1](deploy/cluster_dory1.0-4b_nvfp4_w1.example.json) | 256K | none | |
@@ -367,6 +371,7 @@ commands.
 | [Deployment templates](deploy/README.md) | the template catalogue, naming, shared defaults and launcher flags |
 | [Configuration](docs/configuration.md) | every site and deployment setting, its default and its effect |
 | [Operations](docs/operations.md) | booting, stopping and watching a world, memory on a node, failure semantics, health |
+| [Heretic integration](docs/heretic.md) | opt-in GLM-5.3 target inspection, local research execution/capture, and remaining backend work |
 | [Release and install](docs/release-install.md) | the packaged release on a fresh cluster |
 | [Tools](docs/tools.md) | serving, diagnostic and validation commands |
 | [OpenAI API compatibility](docs/openai-compatibility.md) | the request and response contract, extensions, limits and live metrics |

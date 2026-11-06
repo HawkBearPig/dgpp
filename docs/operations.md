@@ -7,6 +7,11 @@ Other model templates use the same launcher with their own memory and
 engine settings. See the [configuration reference](configuration.md) for
 settings, defaults and their effects.
 
+For offline projection discovery or local baseline tensor capture, use the
+separate [Heretic research tools](heretic.md). Both require an explicit
+research flag. Inspection reads model metadata only; the world-1 worker
+loads a fitting checkpoint on demand and never attaches to a serving world.
+
 ## Sampling penalty defaults
 
 Set `engine.repetition_penalty`, `engine.frequency_penalty` and

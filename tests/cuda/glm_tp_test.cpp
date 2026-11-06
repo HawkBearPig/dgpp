@@ -4495,7 +4495,29 @@ DGPP_TEST(glm_tp_serving_mtp_depth3_graph_matches_plain_and_eager_feed) {
   run_mtp_depth_gate(3, 29934);
 }
 
-static void run_mtp_depth_sampling_gate(int depth, int port, bool prefix_cache = false, bool long_phases = false) {
+// Supply fixed confidence to the real GLM fixture so the depth hook also
+// applies immediately after prefill and host redrafting. Without a native
+// confidence head those steps deliberately verify the full block.
+class SamplingConfidenceGlmModel : public GlmDiagnosticModel {
+ public:
+  using GlmDiagnosticModel::GlmDiagnosticModel;
+  static constexpr bool kVerifyConfidence = true;
+  int confidence_rows() const { return 3; }
+  const float* device_confidence() const { return confidence_; }
+  ~SamplingConfidenceGlmModel() { cudaFree(confidence_); }
+
+ private:
+  float* confidence_ = [] {
+    float* p = nullptr;
+    DGPP_CUDA_OK(cudaMalloc(reinterpret_cast<void**>(&p), 2 * 3 * sizeof(float)));
+    DGPP_CUDA_OK(cudaMemset(p, 0, 2 * 3 * sizeof(float)));
+    return p;
+  }();
+};
+
+template <class Model = GlmDiagnosticModel>
+static void run_mtp_depth_sampling_gate(int depth, int port, bool prefix_cache = false, bool long_phases = false,
+                                         bool scheduled = false, bool block_verify = false) {
   const GlmTextConfig cfg = glm_tp_test_config();
   const std::string dir = "glm_tp_fixture";
   glm_tp_write_fixture(dir);
@@ -4503,10 +4525,11 @@ static void run_mtp_depth_sampling_gate(int depth, int port, bool prefix_cache =
   constexpr int kWorld = 2;
   constexpr int kSlots = 2;
   constexpr int kCap = 24;
+  const int verify_depth = scheduled ? 1 : depth;
   const int max_tokens = static_cast<int>(prompt.size()) + (prefix_cache || long_phases ? 72 : 16);
   dgpp::sample::Params params;
   params.temperature = 1.0f;
-  params.top_p = 0.95f;
+  params.top_p = block_verify ? 1.0f : 0.95f;
   params.frequency_penalty = 0.2f;
   params.presence_penalty = 0.1f;
   struct Spec {
@@ -4555,7 +4578,7 @@ static void run_mtp_depth_sampling_gate(int depth, int port, bool prefix_cache =
                                  kWorld, GlmResidency::Streaming,
                                  GlmHeadSharding::VocabSharded, kSlots,
                                  /*mtp=*/true);
-        GlmDiagnosticModel graph(cfg, dir, max_tokens, prefix_cache ? 2048 : 256, &reducer, r,
+        Model graph(cfg, dir, max_tokens, prefix_cache ? 2048 : 256, &reducer, r,
                                  kWorld, GlmResidency::Resident,
                                  GlmHeadSharding::VocabSharded, kSlots,
                                  /*mtp=*/true);
@@ -4582,10 +4605,17 @@ static void run_mtp_depth_sampling_gate(int depth, int port, bool prefix_cache =
         const dgpp::SpecRow0 row0 = dgpp::make_fabric_spec_row0(
             &bus, r, kWorld, prefix_scratch, gather_scratch, cfg.vocab_size,
             test_wait_timeout_ms());
-        dgpp::GlmGraphEngineAdapter engine(
+        dgpp::GraphEngineAdapter<Model> engine(
             &graph, &bus, r, kWorld, scratch, cfg.vocab_size,
             test_wait_timeout_ms(), /*batch_min_live=*/kSlots, prefix_scratch,
             gather_scratch, kCap, nullptr, /*prefix_slots=*/prefix_cache ? 4 : 0, depth);
+        engine.set_block_verify(block_verify);
+        if (scheduled) {
+          engine.set_proposal_drafts(false);
+          engine.set_sampled_schedule_scale(1.0f);
+          engine.configure_verify_schedule(true, 1.0f, 0.5f, 1);
+          engine.set_verify_depth_hook([](int, int, const float*, int) { return 1; });
+        }
         if (!engine.supports_sampling() || engine.sampling_candidates() != kCap)
           throw std::runtime_error("the MTP graph engine did not arm the "
                                    "device sampler at the capped width");
@@ -4618,7 +4648,7 @@ static void run_mtp_depth_sampling_gate(int depth, int port, bool prefix_cache =
             row1(pre, params, rng, prompt_context, nullptr, nullptr).token;
             specs.push_back(std::make_unique<dgpp::GlmSampledSpeculator>(
                 eager, static_cast<int>(i), pick_rows, row0, row1, params, rng,
-                prompt, depth));
+                prompt, verify_depth));
             specs.back()->start(first);
           }
           for (size_t i = 0; i < n; ++i) {
@@ -4645,7 +4675,7 @@ static void run_mtp_depth_sampling_gate(int depth, int port, bool prefix_cache =
               const std::vector<int32_t> committed = specs[i]->step();
               // The eager oracle counts final accepted drafts before response
               // length trimming, including positions resolved by the host.
-              for (int p = 0; p < expected.depth; ++p) {
+              for (int p = 0; p < verify_depth; ++p) {
                 ++expected.attempts[p];
                 ++slot_expected[i].attempts[p];
                 if (committed.size() > static_cast<size_t>(p + 1)) {
@@ -4683,6 +4713,8 @@ static void run_mtp_depth_sampling_gate(int depth, int port, bool prefix_cache =
                 finished[i] = true;
                 continue;
               }
+              require(engine.rng(static_cast<int>(i)).counter == specs[i]->rng().counter,
+                      "graph RNG counter matches the eager sampled speculator");
               const auto slot = engine.mtp_acceptance(static_cast<int>(i));
               for (int p = 0; p < expected.depth; ++p)
                 require(slot.attempts[p] == slot_expected[i].attempts[p] &&
@@ -4717,6 +4749,12 @@ static void run_mtp_depth_sampling_gate(int depth, int port, bool prefix_cache =
         // Both depths batch the co-admitted slots since 2026-10-14 (the
         // batched draft chain): the 2-slot family at depth 2 is six rows.
         require(batch.replays_by_slots[kSlots] > 0, "the co-admitted slots batch at every depth");
+        if (scheduled) {
+          require(engine.verify_depth_histogram().front() > 0,
+                  "the scalar graph must replay at reduced depth");
+          require(engine.verify_depth_histogram_batch(0).front() > 0,
+                  "the batched graph must replay at reduced depth");
+        }
         fallbacks[static_cast<size_t>(r)] = engine.fallbacks();
         if (prefix_cache) {
           const auto m = sched.meters();
@@ -4781,6 +4819,18 @@ DGPP_TEST(glm_tp_serving_mtp_depth1_graph_sampling_counts_fallback) {
 // SampledSpeculator at depth 2 decides.
 DGPP_TEST(glm_tp_serving_mtp_depth2_graph_sampling_matches_eager_speculator) {
   run_mtp_depth_sampling_gate(2, 29935);
+}
+
+// A maximum-depth-three graph verifies only one draft. Its host fallback
+// must stop at that replay's last row and consume the depth-one oracle's
+// draws, including under block verification (equivalent at one draft).
+// Both scalar and batched replays exercise the capped candidate prefix.
+DGPP_TEST(glm_tp_serving_mtp_scheduled_fallback_matches_eager_speculator) {
+  run_mtp_depth_sampling_gate<SamplingConfidenceGlmModel>(3, 30014, false, true, true);
+}
+
+DGPP_TEST(glm_tp_serving_mtp_scheduled_fallback_block_matches_eager_speculator) {
+  run_mtp_depth_sampling_gate<SamplingConfidenceGlmModel>(3, 30015, false, true, true, true);
 }
 
 

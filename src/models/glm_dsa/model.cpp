@@ -685,8 +685,9 @@ void GlmDsaModel::enqueue_dense(const GlmDsaDenseMlpResident& d, const uint16_t*
                gemm_ws_bytes_, stream_);
 }
 
-void GlmDsaModel::enqueue_layer(const GlmDsaLayerResident& r, int pool_layer, uint16_t* resid, int T,
-                                const WalkRows& rows) {
+template <bool Research>
+void GlmDsaModel::enqueue_layer(const GlmDsaLayerResident& r, int pool_layer, uint16_t* resid,
+                                int T, const WalkRows& rows, ResearchOutputs* research) {
   const int H = cfg_.hidden_size;
   const float eps = cfg_.rms_norm_eps;
   build_layer_objects(r);
@@ -729,6 +730,22 @@ void GlmDsaModel::enqueue_layer(const GlmDsaLayerResident& r, int pool_layer, ui
   }
   if (rows.decode) prefetch_ffn_side(r);
   fold(attn_out, T, H, rows.capture);  // block boundary 1: o_proj's partial
+  if constexpr (Research) {
+    const size_t width =
+        static_cast<size_t>(cfg_.num_attention_heads / tp_world()) * cfg_.v_head_dim;
+    ProjectionCapture capture;
+    capture.id = std::to_string(r.layer) + "/attn.o_proj/0";
+    capture.input.resize(width);
+    std::vector<uint16_t> output(H);
+    DGPP_CUDA_OK(cudaStreamSynchronize(stream_));
+    DGPP_CUDA_OK(cudaMemcpy(capture.input.data(),
+                            static_cast<const uint16_t*>(dsa_->debug_attn_out()) + (T - 1) * width,
+                            width * 2, cudaMemcpyDeviceToHost));
+    DGPP_CUDA_OK(cudaMemcpy(output.data(), attn_out + static_cast<size_t>(T - 1) * H, H * 2,
+                            cudaMemcpyDeviceToHost));
+    for (auto v : output) capture.output.push_back(bf16_bits_to_float(v));
+    research->projections.push_back(std::move(capture));
+  }
   // ---- the MLP / MoE block ----------------------------------------------------
   // The attention residual add rides the post norm's first pass.
   if (r.moe && moe_->hidden_codes()) {
@@ -762,6 +779,32 @@ void GlmDsaModel::enqueue_layer(const GlmDsaLayerResident& r, int pool_layer, ui
       gemm_.set_bf12_wide(decode);
       enqueue_dense(r.dense, x_ + offset, count, ffn_out + offset);
     }
+    if constexpr (Research) {
+      if (row0 + count == T) {
+        ProjectionCapture capture;
+        capture.id = std::to_string(r.layer) + "/mlp.down_proj/0";
+        DGPP_CUDA_OK(cudaStreamSynchronize(stream_));
+        if (r.moe) {
+          const auto shared = moe_->research_shared_prefill_last_row(count);
+          capture.input.resize(shared.input_features);
+          capture.output.resize(H);
+          DGPP_CUDA_OK(cudaMemcpy(capture.input.data(), shared.input, capture.input.size() * 2,
+                                  cudaMemcpyDeviceToHost));
+          DGPP_CUDA_OK(
+              cudaMemcpy(capture.output.data(), shared.output, H * 4, cudaMemcpyDeviceToHost));
+        } else {
+          const size_t width = cfg_.intermediate_size / tp_world();
+          capture.input.resize(width);
+          std::vector<uint16_t> output(H);
+          DGPP_CUDA_OK(cudaMemcpy(capture.input.data(), dense_act_ + (count - 1) * width, width * 2,
+                                  cudaMemcpyDeviceToHost));
+          DGPP_CUDA_OK(cudaMemcpy(output.data(), ffn_out + static_cast<size_t>(T - 1) * H, H * 2,
+                                  cudaMemcpyDeviceToHost));
+          for (auto v : output) capture.output.push_back(bf16_bits_to_float(v));
+        }
+        research->projections.push_back(std::move(capture));
+      }
+    }
   };
   if (rows.run) {
     const int combined_from = r.moe ? kPackqMmaFromRows
@@ -787,7 +830,8 @@ void GlmDsaModel::flush_pending_add(uint16_t* resid, int T) {
   pending_add_ = nullptr;
 }
 
-GlmDsaModel::Outputs GlmDsaModel::run_rows(const RowRun& run) {
+template <bool Research>
+GlmDsaModel::Outputs GlmDsaModel::run_rows_impl(const RowRun& run, ResearchOutputs* research) {
   const int T = run.T, req = run.req;
   if (pending_add_ != nullptr) throw std::logic_error("run_rows: a residual add is pending from an earlier walk");
   // The packed companions' wide launches are the decode batch's alone (a
@@ -799,6 +843,17 @@ GlmDsaModel::Outputs GlmDsaModel::run_rows(const RowRun& run) {
   const int H = cfg_.hidden_size;
   const RowInputs in = begin_run(run);
   gather_embedding(in.tokens, resid_, T, run.capture);
+  const auto capture_residual = [&](const uint16_t* values) {
+    if constexpr (Research) {
+      const size_t offset = research->residuals.size();
+      research->residuals.resize(offset + H);
+      DGPP_CUDA_OK(cudaStreamSynchronize(stream_));
+      DGPP_CUDA_OK(cudaMemcpy(research->residuals.data() + offset,
+                              values + static_cast<size_t>(T - 1) * H, H * 2,
+                              cudaMemcpyDeviceToHost));
+    }
+  };
+  if constexpr (Research) capture_residual(resid_);
   Outputs out;
   const bool traces = !run.decode && route_traces_;
   const size_t K = static_cast<size_t>(cfg_.num_experts_per_tok);
@@ -840,7 +895,13 @@ GlmDsaModel::Outputs GlmDsaModel::run_rows(const RowRun& run) {
         out.route_weights.emplace_back();
       }
     }
-    enqueue_layer(r, layer, resid_, T, rows);
+    enqueue_layer<Research>(r, layer, resid_, T, rows, research);
+    if constexpr (Research) {
+      if (layer + 1 < cfg_.num_hidden_layers) {
+        flush_pending_add(resid_, T);
+        capture_residual(resid_);
+      }
+    }
     if (capture_layers) {
       flush_pending_add(resid_, T);  // the snapshot reads the residual itself
       DGPP_CUDA_OK(cudaStreamSynchronize(stream_));
@@ -863,6 +924,7 @@ GlmDsaModel::Outputs GlmDsaModel::run_rows(const RowRun& run) {
   } else {
     glm_rmsnorm_bf16(resid_, globals_.final_norm, h_, T, H, cfg_.rms_norm_eps, stream_);
   }
+  if constexpr (Research) capture_residual(h_);
   const bool packed_logits = project_head_rows(run, [&](int input_row, int output_row, int rows) {
     gemm_.set_bf12_wide(run.decode || input_row < run.decode_rows());
     gemm_.matmul(h_ + static_cast<size_t>(input_row) * H, globals_.lm_head,
@@ -911,6 +973,42 @@ GlmDsaModel::Outputs GlmDsaModel::forward(const std::vector<int64_t>& token_ids,
   Outputs out = run_rows(run);
   session_close(0);
   return out;
+}
+
+GlmDsaModel::Outputs GlmDsaModel::run_rows(const RowRun& run) {
+  return run_rows_impl<false>(run, nullptr);
+}
+
+GlmDsaModel::ResearchOutputs GlmDsaModel::research_forward(const std::vector<int64_t>& ids,
+                                                           bool enabled) {
+  if (!enabled)
+    throw std::invalid_argument("research capture requires engine.heretic_research=true");
+  if (tp_world() != 1 || mtp_)
+    throw std::invalid_argument("research capture currently requires world 1 and MTP off");
+  if (ids.empty() || ids.size() > static_cast<size_t>(max_tokens_) ||
+      ids.size() > static_cast<size_t>(max_context_))
+    throw std::invalid_argument("research capture: prompt exceeds bounds or is empty");
+  for (auto id : ids)
+    if (id < 0 || id >= cfg_.vocab_size)
+      throw std::invalid_argument("research capture: invalid token ID");
+  if (session_pos_[0] != 0) throw std::logic_error("research capture: slot 0 is in use");
+  open_slot(0);
+  try {
+    if (!pool_.ensure_request_blocks(0, ids.size(), stream_))
+      throw std::runtime_error("research capture: insufficient KV capacity");
+    RowRun run;
+    run.req = 0;
+    run.ids = ids.data();
+    run.T = static_cast<int>(ids.size());
+    run.pos0 = 0;
+    ResearchOutputs result;
+    result.prediction = run_rows_impl<true>(run, &result);
+    session_close(0);
+    return result;
+  } catch (...) {
+    session_close(0);
+    throw;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -989,7 +1087,7 @@ void GlmDsaModel::mtp_run_rows(int req, const int64_t* tokens, int64_t first_pos
   rows.capture = capture;
   rows.moe_table_slot = capture ? cfg_.num_moe_layers() : -1;
   rows.trace = nullptr;
-  enqueue_layer(r, cfg_.num_hidden_layers, mtp_r_, T, rows);
+  enqueue_layer<false>(r, cfg_.num_hidden_layers, mtp_r_, T, rows);
   flush_pending_add(mtp_r_, T);  // every draft row's residual (the chain reads them), not only the head's
   if (head_rows == 0) {  // prefill rows fill the cache; no head
     if (decode_row) prefetch_.join(stream_);

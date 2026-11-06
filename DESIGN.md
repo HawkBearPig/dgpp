@@ -2273,6 +2273,11 @@ appropriate fed tokens. The commit updates counts for accepted rows.
 On fallback, the adapter gathers the saved verifier logits, completes
 sampling on the host and replaces the provisional feed and draft state.
 Verifier logits are saved before the draft head reuses their buffer.
+Fallback decisions use the replay's actual verification width: its last
+row is a plain sample, and block verification consumes one uniform per
+draft verified in that replay. The configured maximum width still sets
+the scalar snapshot stride and the number of drafts prepared for the
+next step.
 The sampled-MTP oracle gates follow scheduler token and retirement events,
 compare every live transcript through its final token, and cover grouped
 admission, staggered arrival and reused slots. Stored request results are
@@ -2426,6 +2431,20 @@ schemas fall back to JSON-object mode with a warning. Each peer builds
 the same machine from the journal and its tokenizer.
 
 ## 11. Runtime and API
+
+Heretic research uses a separate, opt-in tool path. The host-only GLM-5.3
+target catalog maps Heretic's capture IDs to checkpoint modules, full weight
+shapes, and each rank's input-column interval. `dgpp-heretic-inspect` requires
+`engine.heretic_research=true` and advertises only target discovery. It does
+not attach to the serving process or initialize a model. The separately gated
+`dgpp-heretic-worker` owns a world-1 resident model and an inherited Unix socket
+for bounded baseline logits, greedy generation, and last-token capture. Its
+research model walk is a distinct template instantiation; the ordinary walk
+does not compile capture branches or copies. Capture reads the shared expert's
+BF16 input and FP32 down accumulator before routed accumulation. No serving
+listener, adapter execution, or multi-rank protocol is added. See
+[Heretic integration](docs/heretic.md) for the wire contract and remaining
+distributed execution and artifact capabilities.
 
 The shared JSON parser validates number grammar before conversion, retaining exact
 signed integers when representable and the existing double fallback otherwise.
