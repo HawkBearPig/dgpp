@@ -3335,13 +3335,14 @@ int main(int argc, char** argv) {
   // that they did. Rank-0-only knobs (the HTTP port, the connection cap,
   // the sampling defaults) are left out.
   if (runtime_adapters &&
-      (max_concurrency != 1 || mtp || decode_graph || prefix_cache_gib != 0 || kv_dtype != "bf16" ||
+      (mtp || decode_graph || prefix_cache_gib != 0 || kv_dtype != "bf16" ||
        bf16_weights != "checkpoint" || attention_weights != "checkpoint" || !dflash_model.empty() ||
        nvme_cache || lookup_draft || prefill_bf16_partials || prefill_fold_scales ||
        expert_gemm != "wide" || expert_gemm_prefetch != 3 || !expert_tile_list ||
        expert_gemm_pair || embed_sharding != "replicated" || collective_transport != "write")) {
     DGPP_LOG_ERROR(
-        "engine.runtime_adapters requires eager C1, no drafts/prefix cache, BF16 KV and checkpoint "
+        "engine.runtime_adapters requires eager execution, no drafts/prefix cache, BF16 KV and "
+        "checkpoint "
         "weights, and the default expert/prefill/embedding/transport recipe");
     return 2;
   }
@@ -3497,7 +3498,6 @@ int main(int argc, char** argv) {
     if (mtp && family->draft_block_rows() > 0)
       decode_rows = std::max(decode_rows,
                              std::min(family->decode_rows_cap(), max_concurrency * family->draft_block_rows()));
-    if (runtime_adapters) decode_rows = 1;  // Match the research worker's eager C1 recipe.
     DGPP_LOG_INFO("serve: decode rows {} ({} slot(s) x {} row(s) per request, floor {}, the {} family's cap {})",
                   decode_rows, max_concurrency, graph_rows_per_request, dgpp::kDecodeRows, family->name(),
                   family->decode_rows_cap());

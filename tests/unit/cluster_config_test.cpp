@@ -956,9 +956,16 @@ DGPP_TEST(cluster_config_accepts_seven_draft_block) {
 DGPP_TEST(cluster_config_runtime_adapters_are_explicit_and_eager) {
   require(!dgpp::serve::parse_cluster_config(engine_json("{}"), "t").engine.runtime_adapters,
           "runtime adapters default off");
-  const std::string enabled = R"("runtime_adapters":true,"max_concurrency":1,"prefix_cache_gib":0)";
+  const std::string enabled = R"("runtime_adapters":true,"prefix_cache_gib":0)";
   const auto cfg = dgpp::serve::parse_cluster_config(engine_json("{" + enabled + "}"), "t");
   require(cfg.engine.runtime_adapters, "runtime adapter explicit opt in");
+  require(cfg.engine.max_concurrency == 8, "adapters retain the normal concurrency default");
+  for (int concurrency : {1, 8, 16}) {
+    const auto batched = dgpp::serve::parse_cluster_config(
+        engine_json("{" + enabled + ",\"max_concurrency\":" + std::to_string(concurrency) + "}"),
+        "t");
+    require(batched.engine.max_concurrency == concurrency, "adapters preserve configured slots");
+  }
   for (const std::string extra :
        {R"("mtp":true)", R"("decode_graph":true)", R"("kv_dtype":"fp8")",
         R"("prefill_bf16_partials":true)", R"("prefill_fold_scales":true)",
