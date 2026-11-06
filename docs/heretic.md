@@ -1,14 +1,17 @@
 # Heretic integration
 
 Heretic owns scoring plugins, modifier algorithms, optimization studies, and
-exports. DGPP supplies execution for its supported checkpoint formats and will
-apply the resulting runtime artifacts alongside the original weights.
+exports. DGPP supplies execution for its supported checkpoint formats and applies the resulting runtime artifacts alongside the original weights.
 
 The integration provides a GLM-5.3 projection catalog and a persistent
 research worker for baseline logits, greedy generation, and last-token tensor
 capture on one, two, or four nodes. The four-node worker can load the full
-Mixed346 checkpoint. Candidate installation and serving-time adapter loading
-remain to be implemented; this is not yet a complete Heretic optimization backend.
+Mixed346 checkpoint. Protocol version 2 adds bounded projection weight reads,
+teacher-forced likelihoods, and atomic candidate installation/reset. An opt-in
+serving loader uses the same compact adapter files and execution code. The
+Heretic backend remains on a local development branch. Bounded fitting trials
+on the full checkpoint validate the integration; adapter quality still requires
+representative training prompts and held-out evaluation.
 
 ## Configuration and performance isolation
 
@@ -24,8 +27,8 @@ capture allocations. The worker checks the cluster flag before model access
 or CUDA initialization. The distributed worker includes the effective flag,
 resolved settings, checkpoint metadata/revision, binary fingerprint, and
 numerical environment overrides in its startup agreement over the rank journal.
-Runtime adapter execution in ordinary serving will require a separate explicit
-configuration opt-in. Disabled features must not allocate their buffers,
+Runtime adapter execution requires the separate `engine.runtime_adapters=true`
+flag in both the worker and ordinary serving. Disabled features must not allocate their buffers,
 enqueue their kernels or collectives, or alter the existing cache policy.
 
 ## Inspect the target projections
@@ -104,8 +107,12 @@ dgpp-heretic-worker --config research.json --control-fd <inherited-socket-fd>
 The owner channel has no listening socket or HTTP endpoint and never connects
 to a serving process. The local Heretic branch provides `heretic.backends.dgpp_worker` as
 the Python owner, including deadlines, tensor validation, and child cleanup.
-Tokenization and chat templates remain with the caller. This interface does
-not yet select DGPP in the main Heretic optimization CLI.
+Tokenization and chat templates remain with the caller. This interface
+selects DGPP in the main Heretic CLI with `--backend dgpp`,
+`--dgpp-cluster-config research.json`, and
+`--dgpp-worker-binary ../dgpp/scripts/dgpp-heretic-cluster`. Modification also
+requires `engine.runtime_adapters=true`. Set `engine.default_max_tokens` at
+least as high as Heretic's `--max-response-length`.
 
 ### Launch a distributed world
 
@@ -149,7 +156,11 @@ process records; close, cancellation and failures terminate only those processes
 Rank logs and operation streams are retained under `DGPP_LOG_DIR/heretic/<run-id>`.
 The inherited control descriptor currently requires a direct head launch
 (`DGPP_NO_SWAP=0` on rank 0); a requested swap-limited scope is rejected rather
-than silently bypassed. Monitor worker `VmSwap` and host memory during a run.
+than silently bypassed. To prevent head swapping, launch the Python owner under
+`systemd-run --user --scope --property=MemorySwapMax=0 -- ...` while retaining
+`DGPP_NO_SWAP=0` for its direct worker launch. Children inherit that outer scope.
+Monitor worker `VmSwap` and host memory during a run; configure peer swap policy
+through the existing site settings.
 
 The journal coordinates startup, commands, bounded binary capture replies,
 and a barrier after all models load. Existing DGPP collectives execute tensor
@@ -158,13 +169,14 @@ input-column slices, checks replicated residuals and attention/dense outputs,
 and sums shared-expert FP32 partials in rank order. A failed owner or rank aborts
 the world, including during a collective; no partial result becomes a score.
 
-### Protocol version 1
+### Protocol version 2
 
 Each frame starts with two little-endian uint32 lengths: JSON header bytes
 and binary payload bytes. Headers are at most 64 KiB and response payloads
-at most 64 MiB. Requests have no payload. Every request includes
-`schema: "dgpp.heretic.rpc"`, `version: 1`, a consecutive `seq` starting at 1,
-and `op`. Responses repeat those fields, identify `state: "baseline"`, and
+at most 64 MiB. Candidate manifests and factors use bounded request payloads.
+Every request includes
+`schema: "dgpp.heretic.rpc"`, `version: 2`, a consecutive `seq` starting at 1,
+and `op`. Responses repeat those fields, identify `state` (`baseline` or `candidate`), `epoch`, and `candidate_id`, and
 list tensors with `name`, `dtype`, `shape`, `offset`, and `nbytes`. Tensor
 bytes are contiguous, row-major, little-endian BF16, FP32, or int64.
 
@@ -174,10 +186,19 @@ bytes are contiguous, row-major, little-endian BF16, FP32, or int64.
 | `first_token_logits` | `token_ids` | Raw FP32 logits `[vocab]` at the last prompt position |
 | `capture` | `token_ids` | Logits, BF16 residuals `[layers+1, hidden]`, then each catalog target's `.input` and `.output` |
 | `generate` | `token_ids`, `max_new_tokens`, `stop_token_ids` | Greedy continuation IDs and `stop_reason` (`length` or `stop_token`) |
+| `read_projection_rows` | `target_id`, `row_begin`, `row_count` | Immutable global FP32 weight rows, at most 32 MiB |
+| `score_tokens` | `token_ids`, `continuation_ids` | FP32 token log probabilities and int64 greedy-match flags; at most 2048 continuation tokens |
+| `checkpoint_identity` | none | Full SHA-256 identity for the base files; requires runtime opt-in |
+| `begin_candidate` | manifest as binary payload | Stage the declared target list; inference is blocked until activation or abort |
+| `stage_projection` | `index`; global FP32 A then B as payload | Validate hashes, dimensions, finite values, and single staging |
+| `activate_candidate` | none | Install all factors on every rank, clear session state, increment epoch |
+| `abort_candidate` | none | Discard staging and retain the current candidate/epoch |
+| `reset` | none | Remove active/staged factors, clear session state, increment epoch |
 | `close` | none | Empty acknowledgement, then process exit |
 
 Advertised capabilities are `describe_targets`, `first_token_logits`,
-`capture_last_token`, and `generate_greedy`. Requests execute sequentially.
+`capture_last_token`, `generate_greedy`, `read_projection_rows`, and `score_tokens`.
+`runtime_adapters` is advertised only with its cluster flag. Requests execute sequentially.
 Every prompt starts with fresh KV state and closes its session afterwards.
 Greedy ties choose the lowest token ID; a matching stop token is included in
 the returned IDs. The caller must supply its tokenizer's EOS/stop IDs; an empty
@@ -197,8 +218,69 @@ errors terminate the worker with an error on stderr. They never leave a
 partially failed worker available for another trial. Clean owner disconnect
 also exits and frees model resources. The owner must enforce request deadlines
 and reap/terminate its child on cancellation; stdout/stderr carry logs only.
-This baseline-only protocol has no adapter epochs or reusable baseline hashes
-yet, and does not authorize persistent score caches across worker lifetimes.
+Activation acknowledgements follow all-rank barriers. A missing factor, a failed
+rank, or a stale epoch never yields a score. Heretic validates each reply's
+candidate identity and epoch. Persistent caches must additionally bind the
+checkpoint, tokenizer, runtime recipe, prompt tokens, and adapter identity.
+
+## Runtime artifact and ordinary serving
+
+The bundle contains `dgpp_adapter.json` and `adapter_model.safetensors`.
+Heretic also writes a PEFT adapter config with scale one and canonical LoRA
+tensor names. DGPP validates its own manifest; a generic PEFT loader does not
+enforce this additional execution contract.
+
+Manifest version 1 identifies operation `additive_low_rank`, runtime
+`glm_dsa_eager_fp32_v1`, fitted world size, target IDs/modules/dimensions,
+per-factor SHA-256 hashes, the numerical environment hash, and the base content fingerprint. Fingerprinting
+reads every weight shard, index, configuration, external quantization sidecar,
+and present tokenizer/template/generation files. This can add minutes to
+cold startup for a large checkpoint. It occurs only with runtime opt-in;
+trial activation reuses the identity and checks that base files have not changed.
+The numerical hash covers sorted `DGPP_*` overrides, excluding transport
+addresses, paths, logging and test controls. Loading under different overrides
+fails. The supported recipe also fixes the default expert GEMM/prefill options,
+replicated embeddings and write transport; configuration and CLI overrides
+cannot silently change those choices. Heretic records the worker binary SHA-256
+and execution limits for study resume and reproduction. Reproducing fitted
+factors requires the same worker build and Python fitting environment.
+
+Factors are FP32 A `[rank,input]` and B `[hidden,rank]`, with rank 1–256
+and a 1 GiB global factor budget. Each rank stores its A columns and replicated
+B. The runtime computes A times the captured BF16 projection input, gathers
+FP32 partials losslessly, sums in rank order, and adds B times that sum once
+to the already-folded BF16 branch output, rounding to BF16. Shared-expert
+corrections enter the combined MLP branch. Research capture retains the shared
+projection's separate FP32 output plus correction. Zero factors skip the
+addition, preserving identity exactly. Base and routed-expert weights stay
+unchanged. This contract does not promise bitwise equivalence to a merged
+checkpoint or to another runtime's LoRA kernels.
+
+For ordinary serving, omit the research flag and add these engine settings
+to a separate cluster config using the same model and world size:
+
+```json
+{
+  "runtime_adapters": true,
+  "runtime_adapter_path": "/path/to/exported/adapter",
+  "max_concurrency": 1,
+  "mtp": false,
+  "decode_graph": false,
+  "prefix_cache_gib": 0,
+  "kv_dtype": "bf16",
+  "bf16_weights": "checkpoint",
+  "attention_weights": "checkpoint"
+}
+```
+
+Run `scripts/dgpp-cluster up --config serving.json`. The launcher stages the
+manifest and factors to each peer. A relative adapter path is resolved beside
+the deployment JSON. Direct binary launches require the bundle on every node.
+The manifest identity participates in the settings handshake and serving
+configuration digest. Different artifacts or missing opt-in reject startup.
+The initial contract supports eager concurrency one, worlds 1/2/4, no drafts,
+and no prefix/NVMe cache. Default deployments retain their normal paths and
+allocate no adapter factors, scratch, synchronization, or collectives.
 
 ## Validation
 
@@ -224,13 +306,32 @@ binary, runtime environment), peer failure, and identical operation streams.
 Projection oracle limits are 0.008 for distributed BF16 output paths and
 0.00002 for shared FP32 outputs. Launcher tests cover flag rejection and
 normal close, owner disconnect, and cancellation without CUDA or SSH.
+Runtime tests compare attention, dense and shared corrections with independent
+matrix calculations on int8 and Mixed346 fixtures, for worlds 1/2/4 and prompt
+lengths 1/3/16/33. They check zero-adapter bitwise identity, staged abort,
+generation/likelihood consistency, and exact reset. Host tests reject bad
+fingerprints, shapes, ranks, hashes and configuration, and load artifact files
+without CUDA.
 
 A four-node probe of revision `824aedb0c783832223dab78a826bec7442ddea23`
 validated all 154880 logits, 314 capture tensors, a 16-token continuation,
 bitwise baseline restoration, zero process swap on every rank, and matching
 operation streams. It tests execution and capture, not modification quality
 or throughput. The model memory plan with the research configuration is about
-93.6 GiB per rank; Python, captures and future optimizer buffers are additional.
+93.6 GiB per rank; Python, captures, adapters and optimizer buffers are additional.
+
+A subsequent four-node runtime pilot completed two Heretic ARA/Optuna trials
+with KL, keyword and response-length scoring. It fitted rank-three factors for
+eight attention/dense/shared projections in the first four layers and exported
+a 1.86 MB bundle. Disabling or resetting the candidate restored baseline logits
+exactly; restoring it recovered the adapted logits exactly. Teacher-forced
+likelihood scoring also passed. Ordinary serving loaded that bundle beside the
+full checkpoint and matched both recorded 16-token completions, with zero
+cached tokens. Both worlds had zero process swap on all ranks and matching
+operation streams. This bounded pilot used four neutral prompts to check the
+workflow; it does not establish adapter quality or throughput. Independent
+native fixtures also exercise CLI study resume and byte-identical reproduction
+through the local Heretic backend.
 
 ```sh
 cmake --build build-release --target dgpp_heretic_worker dgpp_heretic_inspect heretic_capture_test -j 4

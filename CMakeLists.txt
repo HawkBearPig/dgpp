@@ -62,6 +62,7 @@ target_include_directories(dgpp_common INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/src
 
 find_package(CUDAToolkit 13 REQUIRED COMPONENTS cudart cublasLt)
 find_package(Threads REQUIRED)
+find_package(OpenSSL REQUIRED COMPONENTS Crypto)
 find_package(Python3 3.10 REQUIRED COMPONENTS Interpreter)
 
 include(cmake/pcre2.cmake)
@@ -160,6 +161,7 @@ target_link_libraries(dgpp_device_ranges PUBLIC CUDA::cudart CUDA::cuda_driver)
 dgpp_set_common(dgpp_device_ranges)
 
 add_library(dgpp_kernels STATIC
+  src/kernels/low_rank.cu
   src/kernels/gemm_cublaslt.cpp
   src/kernels/kernels.cu
   src/kernels/doll_attention.cu
@@ -444,10 +446,11 @@ dgpp_set_common(dgpp_models_flint_layers)
 
 # The full GLM-5.3 model on the session core (docs/glm53_plan.md G5).
 add_library(dgpp_models_glm_dsa_layers STATIC
-  src/models/glm_dsa/model.cpp)
+  src/models/glm_dsa/model.cpp
+  src/adapters/runtime.cpp)
 target_include_directories(dgpp_models_glm_dsa_layers PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(dgpp_models_glm_dsa_layers
-  PUBLIC dgpp_models_glm_dsa dgpp_models_glm_dsa_loader dgpp_models_dsa dgpp_models_moe dgpp_models_glm dgpp_kernels CUDA::cudart)
+  PUBLIC dgpp_adapters dgpp_models_glm_dsa dgpp_models_glm_dsa_loader dgpp_models_dsa dgpp_models_moe dgpp_models_glm dgpp_kernels CUDA::cudart)
 dgpp_set_common(dgpp_models_glm_dsa_layers)
 
 # Full GLM-5.3 (2026-09-12, docs/glm53_plan.md): the host-side model description.
@@ -458,6 +461,10 @@ add_library(dgpp_models_glm_dsa STATIC
 target_include_directories(dgpp_models_glm_dsa PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(dgpp_models_glm_dsa PUBLIC dgpp_loaders dgpp_common)
 dgpp_set_common(dgpp_models_glm_dsa)
+
+add_library(dgpp_adapters STATIC src/adapters/artifact.cpp)
+target_link_libraries(dgpp_adapters PUBLIC dgpp_models_glm_dsa OpenSSL::Crypto)
+dgpp_set_common(dgpp_adapters)
 
 # The full GLM-5.3 resident loader (G3): the shared weight builder at the
 # family's TP geometry, the packed-int slices, the draft's requant.
@@ -1034,6 +1041,7 @@ add_executable(unit_tests
   tests/unit/json_grammar_test.cpp
   tests/unit/net_test.cpp
   tests/unit/cluster_config_test.cpp
+  tests/unit/runtime_adapter_test.cpp
   tests/unit/qwen_config_test.cpp
   tests/unit/qwen_csf_test.cpp
   tests/unit/qwen_image_stage_test.cpp
@@ -1070,7 +1078,7 @@ add_executable(unit_tests
   tests/unit/lookup_draft_test.cpp
   src/core/trace.cpp)
 target_include_directories(unit_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(unit_tests PRIVATE CUDA::cudart dgpp_loaders
+target_link_libraries(unit_tests PRIVATE CUDA::cudart dgpp_loaders dgpp_adapters
                                         dgpp_models_glm dgpp_models_qwen dgpp_models_qwen_loader
                                         dgpp_models_glm4
                                         dgpp_models_glm_dsa dgpp_models_dsv41 dgpp_models_dsv4 dgpp_models_mimo

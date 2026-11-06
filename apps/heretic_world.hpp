@@ -18,15 +18,15 @@
 #include <thread>
 #include <vector>
 
-extern char** environ;
-
+#include "adapters/environment.hpp"
+#include "adapters/sha256.hpp"
 #include "loaders/minijson.hpp"
 #include "serve/cluster_config.hpp"
 #include "serve/fabric_serve.hpp"
 #include "serve/json_out.hpp"
 
 namespace dgpp::heretic {
-constexpr int kWorldDeadlineMs = 600000;
+constexpr int kWorldDeadlineMs = 900000;
 constexpr size_t kWorldPayloadLimit = 64 * 1024 * 1024;
 
 inline std::string file_bytes(const std::string& path, bool optional = false) {
@@ -53,43 +53,6 @@ inline std::string binary_digest() {
   return std::to_string(hash);
 }
 
-inline std::string numerical_environment() {
-  // Runtime overrides must agree too. Host transport/cache/log locations are
-  // intentionally rank-local; every other DGPP override joins the identity.
-  const std::set<std::string> local = {"DGPP_ROCE_DEVICES",
-                                       "DGPP_ROCE_GID_INDICES",
-                                       "DGPP_RESIDENT_CACHE_DIR",
-                                       "DGPP_RESIDENT_CACHE_VERIFY",
-                                       "DGPP_LOG_LEVEL",
-                                       "DGPP_MLOCK",
-                                       "DGPP_NO_SWAP",
-                                       "DGPP_NODES",
-                                       "DGPP_SSH_USER",
-                                       "DGPP_CLUSTER_CONFIG",
-                                       "DGPP_HTTP_PORT",
-                                       "DGPP_FABRIC_PORT",
-                                       "DGPP_JOURNAL_PORT",
-                                       "DGPP_LOG_DIR",
-                                       "DGPP_STAGE_DIR",
-                                       "DGPP_RELEASE_DIR",
-                                       "DGPP_HTTP_BIND",
-                                       "DGPP_NODE_OVERRIDES",
-                                       "DGPP_BUILD_DIR",
-                                       "DGPP_DATA_DIR",
-                                       "DGPP_ENV_FILE"};
-  std::set<std::string> values;
-  for (char** entry = environ; entry && *entry; ++entry) {
-    const std::string value(*entry);
-    if (value.starts_with("DGPP_") && !local.count(value.substr(0, value.find('='))))
-      values.insert(value);
-  }
-  std::string out;
-  for (const auto& value : values) {
-    out += value;
-    out += '\0';
-  }
-  return out;
-}
 
 class ResearchWorld {
  public:
@@ -162,7 +125,9 @@ class ResearchWorld {
   bool head() const { return rank_ == 0; }
   // Called once by every rank for the same external request. Rank zero has
   // received the owner frame; peers wait for its escaped journal record.
-  bool command(std::string* header) {
+  bool command(std::string* header, std::string* payload) {
+    if (payload->size() > kWorldPayloadLimit)
+      throw std::runtime_error("research request exceeds payload budget");
     if (reader_) {
       std::string line;
       if (!reader_->read_line([] { return false; }, &line)) return false;
@@ -172,15 +137,21 @@ class ResearchWorld {
       if (!parsed.root.at("request").is_string())
         throw std::runtime_error("invalid research request record");
       *header = std::string(parsed.root.at("request").as_string());
+      const auto& bytes = parsed.root.at("payload_bytes");
+      if (bytes.kind() != minijson::Value::Kind::Int || bytes.as_int() < 0 ||
+          static_cast<uint64_t>(bytes.as_int()) > kWorldPayloadLimit)
+        throw std::runtime_error("research request payload size invalid");
+      *payload = reader_->read_payload(bytes.as_int(), kWorldDeadlineMs);
     } else if (writer_) {
       std::string line = "{\"request\":";
       serve::append_json_string(&line, *header);
-      writer_->broadcast(line + "}");
+      writer_->broadcast(line + ",\"payload_bytes\":" + std::to_string(payload->size()) + "}");
+      writer_->broadcast_payload(*payload, kWorldDeadlineMs);
     }
     if (header->size() > 65536) throw std::runtime_error("research command exceeds header budget");
     ++sequence_;
     phase_ = 0;
-    command_digest_ = serve::config_digest(*header);
+    command_digest_ = serve::config_digest(*header + adapters::sha256(*payload));
     audit("command " + command_digest_);
     return true;
   }

@@ -32,6 +32,7 @@ class TcpConn {
 
   // Exact-length helpers; false on timeout, peer close, or error.
   bool write_all(const void* data, size_t len);
+  bool write_all_bounded(const void* data, size_t len, int timeout_ms);
   bool read_exact(void* dst, size_t len);
 
   // One recv, no fill: n>0 bytes read, 0 = orderly peer close, -1 =

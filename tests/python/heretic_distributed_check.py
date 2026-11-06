@@ -10,7 +10,7 @@ import subprocess
 import sys
 import tempfile
 
-from heretic_worker_check import Client, config_data
+from heretic_worker_check import Client, config_data, check_weight_reads, check_runtime
 from glm_dsa_reference_dump import load_linear, read_safetensors_index
 
 
@@ -25,6 +25,7 @@ def world(binary, model, count, gpu, mismatch=False):
     with tempfile.TemporaryDirectory(prefix="heretic-world-") as tmp:
         root = Path(tmp)
         config = config_data(model)
+        config["engine"]["runtime_adapters"] = gpu
         config.pop("world_size")
         config["nodes"] = ["127.0.0.1"] * count
         config["ports"] = {"fabric": free_port(), "journal": free_port()}
@@ -116,6 +117,7 @@ def gpu(binary, fixture):
             desc = client.call("describe")[0]
             targets = desc["catalog"]["targets"]
             weights = {t["id"]: load_linear(entries, t["module"], t["output_features"], t["input_features"]) for t in targets}
+            check_weight_reads(client, targets, weights)
             for length in (1, 3, 16, 33):
                 ids = [(i * 17 + 11) % desc["vocab_size"] for i in range(length)]
                 _, base, base_bytes = client.call("first_token_logits", token_ids=ids)
@@ -135,6 +137,7 @@ def gpu(binary, fixture):
                 assert client.call("generate", token_ids=ids, max_new_tokens=4, stop_token_ids=[generated[0]])[1]["token_ids"] == generated[:1]
                 assert client.call("first_token_logits", token_ids=ids)[2] == base_bytes
                 print(f"TP{count} {Path(fixture).name} tokens={length}: full logits, captures, projection oracle, generation/reset passed")
+            check_runtime(client, desc)
             client.call("close")
             assert all(p.wait(timeout=10) == 0 for p in processes)
             assert len({(root / f"r{r}.ops").read_bytes() for r in range(count)}) == 1, "operation streams diverged"

@@ -59,6 +59,9 @@
 
 #include <cuda_runtime.h>
 
+#include "adapters/artifact.hpp"
+#include "adapters/bus_sum.hpp"
+#include "adapters/sha256.hpp"
 #include "common/bf16_residency.hpp"
 #include "common/cuda_check.hpp"
 #include "common/log.hpp"
@@ -1994,6 +1997,10 @@ int main(int argc, char** argv) {
   int max_connections = 64;
   int world = 1, rank = 0, rendezvous_timeout_ms = 120000;
   bool no_eos = false, decode_graph = false, mtp = false;
+  bool runtime_adapters = false;
+  std::string runtime_adapter_path, runtime_adapter_id;
+  std::optional<dgpp::adapters::CheckpointIdentity> adapter_base;
+  std::optional<dgpp::adapters::Manifest> runtime_manifest;
   int mtp_depth = 1;  // draft tokens per step (needs --mtp; family-specific limit)
   bool no_mtp_cli = false, mtp_depth_cli = false, mtp_schedule_cli = false;  // given on the command line
   bool no_dflash_cli = false, dflash_model_cli = false, mtp_cli = false;
@@ -2080,6 +2087,8 @@ int main(int argc, char** argv) {
     metrics_port = static_cast<uint16_t>(c.metrics_port);
     if (rank >= 0 && rank < world) metrics_bind = c.nodes[rank];
     const dgpp::serve::ClusterConfig::Engine& e = c.engine;
+    runtime_adapters = e.runtime_adapters;
+    runtime_adapter_path = e.runtime_adapter_path;
     max_concurrency = e.max_concurrency;
     kv_capacity = e.kv_capacity;
     kv_dtype = e.kv_dtype;
@@ -2535,6 +2544,24 @@ int main(int argc, char** argv) {
       DGPP_LOG_INFO("serve: --mtp without --mtp-depth on DeepSeek-V4: the DSpark block's {} drafts", mtp_depth);
     }
   }
+  if (runtime_adapters) {
+    try {
+      if (runtime_adapter_path.empty())
+        throw std::runtime_error(
+            "engine.runtime_adapters requires engine.runtime_adapter_path for serving");
+      if (dgpp::detect_architecture_file((fs::path(ckpt) / "config.json").string()) !=
+          dgpp::ModelArchitecture::GlmMoeDsa)
+        throw std::runtime_error("engine.runtime_adapters currently requires GLM DSA");
+      const auto manifest_path = fs::path(runtime_adapter_path) / "dgpp_adapter.json";
+      if (fs::file_size(manifest_path) > dgpp::adapters::kMaxManifestBytes)
+        throw std::runtime_error("runtime adapter manifest exceeds budget");
+      runtime_adapter_id = dgpp::adapters::file_sha256(manifest_path.string());
+      rendezvous_timeout_ms = std::max(rendezvous_timeout_ms, 900000);
+    } catch (const std::exception& e) {
+      DGPP_LOG_ERROR("runtime adapter startup: {}", e.what());
+      return 2;
+    }
+  }
   // Admission remains automatic/on/off through the settings handshake.
   // Resolve it from the constructed engine before publishing the warm record.
   // ---- the fabric's first handshake: the head pushes the
@@ -2553,47 +2580,57 @@ int main(int argc, char** argv) {
     const int effective_batch_min_live =
         graph_batch_min_live == 0 ? std::min(2, max_concurrency) : graph_batch_min_live;
     return std::format(
-        "model={} world={} fabric={} journal={} conc={} kv={} kvdt={} act={} pfattn={} dcattn={} ngt={} dw={} mtpef={} bfw={} "
-        "fp8head={} dh={} dhb={} mtph={} attw={} itopk={} ctb={} cbs={} pf={} pfd={} pfo={} pfw={} dcw={} ctr={} pdl={} dlp={} dkv={} "
-        "emsh={} maxtok={} queue={} "
-        "eos={} graph={} compact={} mtp={} mtpd={} mss={} msrow={} msbase={} mslam={} msmin={} msopt={} "
-        "msad={} msss={} mdr={} mdt={} mvf={} dbr={} "
-        "batchmin={} cand={} "
-        "pcgib={} adm={} win={} pfbudget={} pfidle={} gapms={} ttftms={} pfhr={} pfgrow={} pfrec={} pfstart={} pfifloor={} pfearly={} pmin={} phead={} pace={} inflight={} "
-        "reasoning_in_content={} "
-        "rs={} dflash={} dfw={} lk={} lkn={} lks={} lka={} lkt={} nvme={}",
-        model_id.empty() ? ckpt : model_id, world, fabric_port, journal_port, max_concurrency,
-        kv_capacity, kv_dtype, activations, prefill_attention, decode_attention, ngram_table, dense_weights, mtp_expert_format, bf16_weights, fp8_head,
-        draft_head,
-        draft_head_blocks, mtp_head,
-        attention_weights, index_topk, candidate_topk_blocks, candidate_block_size, prefill, prefill_dense,
-        prefill_fold_overlap ? 1 : 0, prefill_window, decode_window, collective_transport, decode_pdl ? 1 : 0,
-        dory_loops, dory_kv_cache, embed_sharding,
-        default_max_tokens, queue_limit, no_eos ? 0 : 1, decode_graph ? 1 : 0,
-        compact_batches ? 1 : 0, mtp ? 1 : 0, mtp_depth, mtp_schedule ? 1 : 0, mtp_schedule_row_ms,
-        mtp_schedule_base_ms, mtp_schedule_lambda, mtp_schedule_min_depth, mtp_schedule_options,
-        mtp_schedule_adapt ? 1 : 0, mtp_schedule_sampled_scale, mtp_draft, mtp_draft_temperature,
-        mtp_verify, dflash_batch_rows, effective_batch_min_live,
-        sampling_candidates, prefix_cache_gib,
-        admission_mode, admission_window, prefill_budget_tokens, prefill_idle_budget_tokens,
-        decode_gap_target_ms, first_token_target_ms,
-        prefill_latency.headroom_pct, prefill_latency.growth_factor, prefill_latency.recovery_pct,
-        prefill_latency.initial_tokens, prefill_latency.idle_floor_tokens,
-        prefill_early_admission_override.has_value() ? (*prefill_early_admission_override ? 1 : 0) : -1,
-        prefix_min_tokens, prefix_head_snapshots ? 1 : 0, prefix_pin_max_pct,
-        bulk_pace_gbps, bulk_inflight, reasoning_in_content ? 1 : 0,
-        rope_scaling ? std::format("yarn:{}:{}:{}:{}:{}:{}", rope_scaling->factor,
-                                   rope_scaling->original_max_position_embeddings,
-                                   rope_scaling->beta_fast, rope_scaling->beta_slow,
-                                   rope_scaling->attn_factor, rope_scaling->mrope_cache_factor)
-                     : "off",
-        dflash_model.empty() ? "off" : dflash_model, dflash_weights, lookup_draft ? 1 : 0,
-        lookup_nmin, lookup_nstrong, lookup_agree, lookup_tail,
-        nvme_cache ? std::format("{}:{}:{}:{}:{}:{}:{}", nvme_cache_gib, nvme_cache_min_tokens, nvme_cache_chunk_mib,
-                                 nvme_cache_max_ops, nvme_cache_reserve_gib, nvme_cache_persist ? 1 : 0,
-                                 nvme_cache_op_timeout_s)
+               "model={} world={} fabric={} journal={} conc={} kv={} kvdt={} act={} pfattn={} "
+               "dcattn={} ngt={} dw={} mtpef={} bfw={} "
+               "fp8head={} dh={} dhb={} mtph={} attw={} itopk={} ctb={} cbs={} pf={} pfd={} pfo={} "
+               "pfw={} dcw={} ctr={} pdl={} dlp={} dkv={} "
+               "emsh={} maxtok={} queue={} "
+               "eos={} graph={} compact={} mtp={} mtpd={} mss={} msrow={} msbase={} mslam={} "
+               "msmin={} msopt={} "
+               "msad={} msss={} mdr={} mdt={} mvf={} dbr={} "
+               "batchmin={} cand={} "
+               "pcgib={} adm={} win={} pfbudget={} pfidle={} gapms={} ttftms={} pfhr={} pfgrow={} "
+               "pfrec={} pfstart={} pfifloor={} pfearly={} pmin={} phead={} pace={} inflight={} "
+               "reasoning_in_content={} "
+               "rs={} dflash={} dfw={} lk={} lkn={} lks={} lka={} lkt={} nvme={}",
+               model_id.empty() ? ckpt : model_id, world, fabric_port, journal_port,
+               max_concurrency, kv_capacity, kv_dtype, activations, prefill_attention,
+               decode_attention, ngram_table, dense_weights, mtp_expert_format, bf16_weights,
+               fp8_head, draft_head, draft_head_blocks, mtp_head, attention_weights, index_topk,
+               candidate_topk_blocks, candidate_block_size, prefill, prefill_dense,
+               prefill_fold_overlap ? 1 : 0, prefill_window, decode_window, collective_transport,
+               decode_pdl ? 1 : 0, dory_loops, dory_kv_cache, embed_sharding, default_max_tokens,
+               queue_limit, no_eos ? 0 : 1, decode_graph ? 1 : 0, compact_batches ? 1 : 0,
+               mtp ? 1 : 0, mtp_depth, mtp_schedule ? 1 : 0, mtp_schedule_row_ms,
+               mtp_schedule_base_ms, mtp_schedule_lambda, mtp_schedule_min_depth,
+               mtp_schedule_options, mtp_schedule_adapt ? 1 : 0, mtp_schedule_sampled_scale,
+               mtp_draft, mtp_draft_temperature, mtp_verify, dflash_batch_rows,
+               effective_batch_min_live, sampling_candidates, prefix_cache_gib, admission_mode,
+               admission_window, prefill_budget_tokens, prefill_idle_budget_tokens,
+               decode_gap_target_ms, first_token_target_ms, prefill_latency.headroom_pct,
+               prefill_latency.growth_factor, prefill_latency.recovery_pct,
+               prefill_latency.initial_tokens, prefill_latency.idle_floor_tokens,
+               prefill_early_admission_override.has_value()
+                   ? (*prefill_early_admission_override ? 1 : 0)
+                   : -1,
+               prefix_min_tokens, prefix_head_snapshots ? 1 : 0, prefix_pin_max_pct, bulk_pace_gbps,
+               bulk_inflight, reasoning_in_content ? 1 : 0,
+               rope_scaling
+                   ? std::format("yarn:{}:{}:{}:{}:{}:{}", rope_scaling->factor,
+                                 rope_scaling->original_max_position_embeddings,
+                                 rope_scaling->beta_fast, rope_scaling->beta_slow,
+                                 rope_scaling->attn_factor, rope_scaling->mrope_cache_factor)
+                   : "off",
+               dflash_model.empty() ? "off" : dflash_model, dflash_weights, lookup_draft ? 1 : 0,
+               lookup_nmin, lookup_nstrong, lookup_agree, lookup_tail,
+               nvme_cache
+                   ? std::format("{}:{}:{}:{}:{}:{}:{}", nvme_cache_gib, nvme_cache_min_tokens,
+                                 nvme_cache_chunk_mib, nvme_cache_max_ops, nvme_cache_reserve_gib,
+                                 nvme_cache_persist ? 1 : 0, nvme_cache_op_timeout_s)
                    : std::string("off")) +
-        (nvme_cache_reuse_binding.empty() ? std::string() : " nvme_reuse=" + nvme_cache_reuse_binding);
+           (nvme_cache_reuse_binding.empty() ? std::string()
+                                             : " nvme_reuse=" + nvme_cache_reuse_binding) +
+           (runtime_adapter_id.empty() ? "" : " runtime_adapter=" + runtime_adapter_id);
   };
   // Dory1.0-4B is a one-rank family (the reference refuses
   // tensor_parallel_size != 1; docs/dory_plan.md §2): refuse a world > 1
@@ -2635,6 +2672,7 @@ int main(int argc, char** argv) {
           graph_batch_min_live = std::min(2, max_concurrency);
         dgpp::serve::WorldSettings ws;
         ws.version = DGPP_VERSION;
+        ws.runtime_adapter_id = runtime_adapter_id;
         ws.model = model_id;
         ws.checkpoint = ckpt;
         ws.world = world;
@@ -2759,6 +2797,8 @@ int main(int argc, char** argv) {
           return 0;
         }
         const std::string own = canonical();
+        if (ws.runtime_adapter_id != runtime_adapter_id)
+          throw std::runtime_error("runtime adapter opt-in/content differs across ranks");
         model_id = ws.model;
         if (model_id.empty()) ckpt = ws.checkpoint;
         world = ws.world;
@@ -3294,6 +3334,17 @@ int main(int argc, char** argv) {
   // the digests agree by construction; the check stays as the assertion
   // that they did. Rank-0-only knobs (the HTTP port, the connection cap,
   // the sampling defaults) are left out.
+  if (runtime_adapters &&
+      (max_concurrency != 1 || mtp || decode_graph || prefix_cache_gib != 0 || kv_dtype != "bf16" ||
+       bf16_weights != "checkpoint" || attention_weights != "checkpoint" || !dflash_model.empty() ||
+       nvme_cache || lookup_draft || prefill_bf16_partials || prefill_fold_scales ||
+       expert_gemm != "wide" || expert_gemm_prefetch != 3 || !expert_tile_list ||
+       expert_gemm_pair || embed_sharding != "replicated" || collective_transport != "write")) {
+    DGPP_LOG_ERROR(
+        "engine.runtime_adapters requires eager C1, no drafts/prefix cache, BF16 KV and checkpoint "
+        "weights, and the default expert/prefill/embedding/transport recipe");
+    return 2;
+  }
   const std::string effective_config = canonical();
   const std::string config_digest = dgpp::serve::config_digest(effective_config);
   DGPP_LOG_INFO("config: {} (digest {})", effective_config, config_digest);
@@ -3323,6 +3374,15 @@ int main(int argc, char** argv) {
     std::unique_ptr<ServeFamily> family =
         make_family(ckpt, world, kv_format, rope_scaling, fp8_head == "mma", index_topk, candidate_topk_blocks,
                     candidate_block_size, activations);
+    if (runtime_adapters) {
+      const auto* glm = dynamic_cast<GlmDsaFamily*>(family.get());
+      if (!glm) throw std::runtime_error("runtime adapter requires GLM DSA");
+      adapter_base = dgpp::adapters::fingerprint_checkpoint(ckpt);
+      runtime_manifest =
+          dgpp::adapters::load_bundle(runtime_adapter_path, glm->cfg, *adapter_base, world);
+      if (runtime_manifest->id != runtime_adapter_id)
+        throw std::runtime_error("runtime adapter manifest changed during startup");
+    }
     if (!dflash_dir.empty()) {
       try {
         family->set_draft_model(dflash_dir);
@@ -3437,6 +3497,7 @@ int main(int argc, char** argv) {
     if (mtp && family->draft_block_rows() > 0)
       decode_rows = std::max(decode_rows,
                              std::min(family->decode_rows_cap(), max_concurrency * family->draft_block_rows()));
+    if (runtime_adapters) decode_rows = 1;  // Match the research worker's eager C1 recipe.
     DGPP_LOG_INFO("serve: decode rows {} ({} slot(s) x {} row(s) per request, floor {}, the {} family's cap {})",
                   decode_rows, max_concurrency, graph_rows_per_request, dgpp::kDecodeRows, family->name(),
                   family->decode_rows_cap());
@@ -3672,9 +3733,36 @@ int main(int argc, char** argv) {
         return 1;
       }
     }
+    const auto install_runtime = [&](dgpp::net::CollectiveBus* bus) {
+      if (!runtime_manifest) return;
+      adapter_base->check_unchanged(ckpt);
+      auto* glm = dynamic_cast<GlmDsaFamily*>(family.get());
+      if (!glm || !glm->model)
+        throw std::logic_error("runtime adapter requires a loaded GLM DSA model");
+      dgpp::adapters::SumFp32 sum;
+      if (world > 1) {
+        if (!bus) throw std::logic_error("runtime adapter has no fabric");
+        sum = dgpp::adapters::bus_sum(
+            *bus, rank, world,
+            std::max<size_t>(forward_rows * dgpp::adapters::kMaxAdapterRank, glm->cfg.hidden_size),
+            60000);
+      }
+      glm->model->set_runtime_adapter(
+          std::make_unique<dgpp::adapters::Runtime>(
+              *runtime_manifest, rank, world, forward_rows, glm->cfg.hidden_size,
+              glm->cfg.num_hidden_layers, std::move(sum), runtime_adapters),
+          runtime_adapters);
+      DGPP_LOG_INFO("rank {}: runtime adapter {} installed", rank, runtime_manifest->id);
+      runtime_manifest->projections.clear();  // factors now reside on the device
+    };
+    const size_t adapter_bytes =
+        runtime_manifest
+            ? dgpp::adapters::Runtime::factor_bytes(*runtime_manifest, world) + (size_t{64} << 20)
+            : 0;
     const size_t engine_bytes =
         static_cast<size_t>(max_concurrency) * static_cast<size_t>(family->vocab_size()) * 8 +
-        static_cast<size_t>(pool_tokens) * 16 + (size_t{64} << 20) + nvme_staging_bytes;
+        static_cast<size_t>(pool_tokens) * 16 + (size_t{64} << 20) + nvme_staging_bytes +
+        adapter_bytes;
     // The tier's opening (issue #26), once the engine exists and before any
     // capture: the slab file at the planned capacity, the worker, the
     // staging buffers.
@@ -3889,6 +3977,7 @@ int main(int argc, char** argv) {
         dgpp::log_memory_ledger(std::format("rank {} after the bus", rank));
         family->build_model(model_reducer, rank, world, /*fabric=*/true, forward_rows, pool_tokens,
                             max_concurrency, mtp, decode_rows);
+        install_runtime(bus.get());
         dgpp::log_memory_ledger(std::format("rank {} after the model", rank));
         DGPP_LOG_INFO(
             "rank {}: model constructed in {:.1f}s (resident, {} request "
@@ -4204,6 +4293,7 @@ int main(int argc, char** argv) {
     const auto t_model = std::chrono::steady_clock::now();
     family->build_model(/*reducer=*/nullptr, /*rank=*/0, /*world=*/1, /*fabric=*/false, forward_rows,
                         pool_tokens, max_concurrency, /*mtp=*/false, decode_rows);
+    install_runtime(nullptr);
     DGPP_LOG_INFO(
         "serve: model constructed in {:.1f}s (streaming, {} request slots, "
         "{}-token pool in {}, {}-row forwards)",

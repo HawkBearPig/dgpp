@@ -140,7 +140,7 @@ and troubleshooting.
 
    ```bash
    sudo apt-get update
-   sudo apt-get install python3 rdma-core libibverbs1 ibverbs-providers \
+   sudo apt-get install python3 rdma-core libssl3t64 libibverbs1 ibverbs-providers \
      libnl-3-200 libnl-route-3-200 libstdc++6 openssh-client openssh-server \
      rsync curl jq zstd iproute2 libavformat60 libavcodec60 libswscale7
    ```
@@ -149,7 +149,7 @@ and troubleshooting.
 
    ```bash
    sudo apt-get install git build-essential cmake pkg-config python3-venv \
-     libibverbs-dev poppler-utils libavformat-dev libavcodec-dev libswscale-dev
+     libssl-dev libibverbs-dev poppler-utils libavformat-dev libavcodec-dev libswscale-dev
    ```
 
    PDF file inputs use `pdftotext` from `poppler-utils` on rank 0.
@@ -519,4 +519,4 @@ These are not needed to serve a model:
 | HumanEval | Use an isolated evaluation environment and explicitly pass `--allow-code-execution`. Generated Python runs without a security sandbox. |
 | Profiling | Install Nsight Systems (`nsys`). |
 | Formatting | Install clang-format to enable the CMake formatting targets. |
-| Release packaging | `tar`, `zstd`, `sha256sum`, Git and the CUDA toolkit on the packaging host. The package bundles cudart/cuBLASLt; peers still need the driver, verbs providers, libnl, libstdc++ and glibc. |
+| Release packaging | `tar`, `zstd`, `sha256sum`, Git and the CUDA toolkit on the packaging host. The package bundles cudart/cuBLASLt; peers still need the driver, verbs providers, libnl, OpenSSL libcrypto, libstdc++ and glibc. |

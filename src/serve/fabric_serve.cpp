@@ -451,6 +451,10 @@ std::string encode_journal_settings(const WorldSettings& s) {
   append_json_string(&out, s.model);
   out += ",\"ckpt\":";
   append_json_string(&out, s.checkpoint);
+  if (!s.runtime_adapter_id.empty()) {
+    out += ",\"runtime_adapter_id\":";
+    append_json_string(&out, s.runtime_adapter_id);
+  }
   out += std::format(
       ",\"world\":{},\"fabric\":{},\"conc\":{},\"kv\":{},\"maxtok\":{},\"queue\":{},"
       "\"eos\":{},\"graph\":{},\"mtp\":{},\"mtpd\":{},\"batchmin\":{},\"cand\":{},\"pcgib\":{:.17g},"
@@ -702,6 +706,12 @@ JournalRecord decode_journal_line(std::string_view line) {
   if (op == "settings") {
     rec.settings = true;
     WorldSettings& s = rec.world_settings;
+    if (const auto* adapter = v.find("runtime_adapter_id")) {
+      if (!adapter->is_string() || adapter->as_string().size() != 64 ||
+          adapter->as_string().find_first_not_of("0123456789abcdef") != std::string_view::npos)
+        throw std::runtime_error("journal: invalid runtime_adapter_id");
+      s.runtime_adapter_id = std::string(adapter->as_string());
+    }
     const auto num = [&](const char* key) -> const dgpp::minijson::Value& {
       const dgpp::minijson::Value& f = field(v, key, "settings");
       if (!f.is_number())
@@ -1448,6 +1458,20 @@ void JournalWriter::broadcast(const std::string& line) {
   }
 }
 
+void JournalWriter::broadcast_payload(const std::string& payload, int timeout_ms) {
+  if (payload.size() > 64u * 1024u * 1024u || timeout_ms <= 0)
+    throw std::invalid_argument("journal: invalid broadcast payload bounds");
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+  for (auto& peer : peers_) {
+    const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          deadline - std::chrono::steady_clock::now())
+                          .count();
+    if (left <= 0 ||
+        !peer.write_all_bounded(payload.data(), payload.size(), static_cast<int>(left)))
+      throw std::runtime_error("journal: binary broadcast failed");
+  }
+}
+
 bool JournalWriter::wait_peers_ready(int timeout_ms, const std::function<bool()>& should_stop,
                                      std::vector<std::pair<int, std::string>>* notes) {
   const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
@@ -1609,6 +1633,28 @@ bool JournalReader::send_payload(const std::string& payload, int timeout_ms) {
       static_cast<unsigned char>(n >> 16), static_cast<unsigned char>(n >> 24)};
   conn_.set_io_deadline_ms(timeout_ms);
   return conn_.write_all(length, sizeof(length)) && conn_.write_all(payload.data(), payload.size());
+}
+
+std::string JournalReader::read_payload(size_t expected_bytes, int timeout_ms) {
+  if (expected_bytes > 64u * 1024u * 1024u || timeout_ms <= 0)
+    throw std::invalid_argument("journal: invalid broadcast payload bounds");
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+  std::string result(expected_bytes, '\0');
+  size_t copied = std::min(expected_bytes, pending_.size());
+  std::copy_n(pending_.data(), copied, result.data());
+  pending_.erase(0, copied);
+  while (copied < expected_bytes) {
+    const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          deadline - std::chrono::steady_clock::now())
+                          .count();
+    if (left <= 0 || !conn_.wait_readable(static_cast<int>(left)))
+      throw std::runtime_error("journal: binary broadcast deadline");
+    const auto got =
+        conn_.read_some(result.data() + copied, std::min<size_t>(65536, expected_bytes - copied));
+    if (got <= 0) throw std::runtime_error("journal: truncated binary broadcast");
+    copied += got;
+  }
+  return result;
 }
 
 void JournalReader::send_ready(const std::string& note) {

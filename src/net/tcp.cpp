@@ -1,17 +1,17 @@
 #include "net/tcp.hpp"
 
 #include <arpa/inet.h>
+#include <cerrno>
+#include <chrono>
+#include <cstring>
 #include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
+#include <stdexcept>
 #include <sys/socket.h>
 #include <unistd.h>
-
-#include <cerrno>
-#include <cstring>
-#include <stdexcept>
 #include <utility>
 
 #include "common/log.hpp"
@@ -147,6 +147,27 @@ bool TcpConn::write_all(const void* data, size_t len) {
     }
     if (n == 0) return false;
     done += static_cast<size_t>(n);
+  }
+  return true;
+}
+
+bool TcpConn::write_all_bounded(const void* data, size_t len, int timeout_ms) {
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+  const auto* bytes = static_cast<const char*>(data);
+  while (len) {
+    const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          deadline - std::chrono::steady_clock::now())
+                          .count();
+    if (left <= 0) return false;
+    pollfd poller{fd_, POLLOUT, 0};
+    const auto ready = ::poll(&poller, 1, static_cast<int>(left));
+    if (ready < 0 && errno == EINTR) continue;
+    if (ready <= 0) return false;
+    const auto n = ::send(fd_, bytes, len, MSG_NOSIGNAL | MSG_DONTWAIT);
+    if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) continue;
+    if (n <= 0) return false;
+    bytes += n;
+    len -= n;
   }
   return true;
 }

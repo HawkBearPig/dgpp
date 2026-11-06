@@ -37,6 +37,7 @@ import hashlib
 import json
 import os
 import signal
+import shutil
 import subprocess
 import sys
 import threading
@@ -290,8 +291,33 @@ class Cluster:
         # DGPP_NO_SWAP controls the launcher, not the engine. Older binaries
         # reject unknown node_env keys, so keep this policy in the launch
         # environment without changing the server's configuration schema.
+        config = {**server_config(self.cfg), "engine": dict(self.cfg.get("engine", {}))}
+        artifact_files = []
+        engine = config.get("engine", {})
+        source_path = engine.get("runtime_adapter_path")
+        if source_path:
+            if engine.get("runtime_adapters") is not True:
+                raise ValueError("engine.runtime_adapter_path requires engine.runtime_adapters=true")
+            source = Path(expand(source_path))
+            if not source.is_absolute():
+                source = Path(self.deployment_path).parent / source
+            manifest = source / "dgpp_adapter.json"
+            tensors = source / "adapter_model.safetensors"
+            if manifest.stat().st_size > 1024**2 or tensors.stat().st_size > 1024**3 + 1024**2:
+                raise ValueError("runtime adapter exceeds staging budget")
+            identity = hashlib.sha256(manifest.read_bytes()).hexdigest()
+            destination = Path(expand(self.stage_dir)).resolve() / "runtime-adapters" / identity
+            destination.mkdir(parents=True, exist_ok=True)
+            for file in (manifest, tensors):
+                local = destination / file.name
+                if file.resolve() != local:
+                    temporary = local.with_suffix(local.suffix + ".staging")
+                    shutil.copyfile(file, temporary)
+                    os.replace(temporary, local)
+                artifact_files.append(local)
+            engine["runtime_adapter_path"] = str(destination)
         with tempfile.NamedTemporaryFile(mode="w", dir=self.log_dir, delete=False) as resolved:
-            json.dump(server_config(self.cfg), resolved, indent=2)
+            json.dump(config, resolved, indent=2)
             resolved.write("\n")
         os.replace(resolved.name, self.config_path)
         # The namespace is a hash of the deployment file's path; the scan
@@ -316,6 +342,14 @@ class Cluster:
             if self.installed and not self.ssh(host, f"test -x {self.peer_bin}"):
                 say(f"STAGE FAILED: {host} has no {self.peer_bin} (run `dgpp-cluster install` there)")
                 return False
+            if artifact_files:
+                remote = str(artifact_files[0].parent)
+                if not self.ssh(host, "mkdir -p " + shlex.quote(remote)):
+                    return False
+                for file in artifact_files:
+                    if not self.scp_to(host, str(file), str(file), timeout=180):
+                        say(f"STAGE FAILED to {host} (runtime adapter)")
+                        return False
             if not self.scp_to(host, self.config_path, f"{self.stage_dir}/cluster.json"):
                 say(f"STAGE FAILED to {host}")
                 return False
@@ -425,7 +459,8 @@ class Cluster:
             for rank, host in self.peers:
                 if not self.remote_control("status", rank, host):
                     say(f"WARN: peer rank {rank} not observed on {host}")
-        if not self.wait_log(r0, f"listening on :{self.http}", 600, "rank 0 serving", proc):
+        ready_timeout = 1200 if self.cfg.get("engine", {}).get("runtime_adapters") else 600
+        if not self.wait_log(r0, f"listening on :{self.http}", ready_timeout, "rank 0 serving", proc):
             raise RuntimeError("rank 0 did not become ready")
         bind = self.cfg["http"]["bind_host"]
         client_host = self.nodes[0] if bind == "0.0.0.0" else bind

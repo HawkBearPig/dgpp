@@ -952,3 +952,28 @@ DGPP_TEST(cluster_config_accepts_seven_draft_block) {
   require(c.engine.mtp_schedule && c.engine.mtp_schedule_min_depth == 6,
           "the MiniMax schedule must accept a six-draft minimum");
 }
+
+DGPP_TEST(cluster_config_runtime_adapters_are_explicit_and_eager) {
+  require(!dgpp::serve::parse_cluster_config(engine_json("{}"), "t").engine.runtime_adapters,
+          "runtime adapters default off");
+  const std::string enabled = R"("runtime_adapters":true,"max_concurrency":1,"prefix_cache_gib":0)";
+  const auto cfg = dgpp::serve::parse_cluster_config(engine_json("{" + enabled + "}"), "t");
+  require(cfg.engine.runtime_adapters, "runtime adapter explicit opt in");
+  for (const std::string extra :
+       {R"("mtp":true)", R"("decode_graph":true)", R"("kv_dtype":"fp8")",
+        R"("prefill_bf16_partials":true)", R"("prefill_fold_scales":true)",
+        R"("expert_gemm":"wide4")", R"("expert_gemm_prefetch":4)", R"("expert_tile_list":false)",
+        R"("expert_gemm_pair":true)", R"("embed_sharding":"vocab")",
+        R"("collective_transport":"send")"})
+    require(
+        refusal(engine_json("{" + enabled + "," + extra + "}")).find("engine.runtime_adapters") !=
+            std::string::npos,
+        "runtime adapters reject unsupported numerical recipes");
+  require(refusal(engine_json(R"({"runtime_adapter_path":"/tmp/adapter"})"))
+                  .find("runtime_adapters=true") != std::string::npos,
+          "a path never implicitly enables runtime adapters");
+  for (const std::string bad : {"null", "1", "[]", "\"true\""})
+    require(refusal(engine_json("{\"runtime_adapters\":" + bad + "}"))
+                    .find("engine.runtime_adapters") != std::string::npos,
+            "runtime flag is strictly boolean");
+}

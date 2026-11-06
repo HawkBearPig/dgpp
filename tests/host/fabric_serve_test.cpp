@@ -2525,3 +2525,41 @@ DGPP_TEST(fabric_serve_peer_requires_and_replays_leader_budget) {
             "peer executes leader's limit, regardless of its local estimate");
   }
 }
+
+DGPP_TEST(fabric_serve_binary_broadcast_preserves_buffered_lines) {
+  dgpp::serve::JournalWriter writer(0);
+  dgpp::serve::JournalReader reader("127.0.0.1", writer.port(), 5000, 1);
+  writer.accept_peers(2, 5000);
+  const std::string payload("binary\nwith\0bytes", 17);
+  writer.broadcast("begin");
+  writer.broadcast_payload(payload, 1000);
+  writer.broadcast("after");
+  std::string line;
+  require(reader.read_line([] { return false; }, &line) && line == "begin", "payload announcement");
+  require(reader.read_payload(payload.size(), 1000) == payload, "coalesced binary bytes preserved");
+  require(reader.read_line([] { return false; }, &line) && line == "after",
+          "following line preserved");
+  bool timed_out = false;
+  try {
+    (void)reader.read_payload(1, 10);
+  } catch (const std::runtime_error&) {
+    timed_out = true;
+  }
+  require(timed_out, "incomplete binary payload obeys deadline");
+}
+
+DGPP_TEST(fabric_serve_runtime_adapter_settings_identity) {
+  dgpp::serve::WorldSettings settings;
+  settings.runtime_adapter_id = std::string(64, 'a');
+  // Fill the standard required capacity fields used by the settings decoder.
+  settings.version = "test";
+  settings.world = 2;
+  settings.fabric_port = 29970;
+  settings.max_concurrency = 1;
+  settings.kv_capacity = 128;
+  settings.admission = "full";
+  const auto wire = dgpp::serve::encode_journal_settings(settings);
+  const auto decoded = dgpp::serve::decode_journal_line(wire);
+  require(decoded.world_settings.runtime_adapter_id == settings.runtime_adapter_id,
+          "runtime adapter identity survives settings handshake");
+}

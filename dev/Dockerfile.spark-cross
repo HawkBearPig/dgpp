@@ -11,7 +11,7 @@ RUN sed -i '/^Types: deb/a Architectures: amd64' /etc/apt/sources.list.d/ubuntu.
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
        ca-certificates curl gnupg cmake ninja-build git python3 file pkg-config \
        gcc-13-aarch64-linux-gnu g++-13-aarch64-linux-gnu \
-        libibverbs-dev:arm64 libavformat-dev:arm64 libavcodec-dev:arm64 libswscale-dev:arm64 \
+       libibverbs-dev:arm64 libssl-dev:arm64 libavformat-dev:arm64 libavcodec-dev:arm64 libswscale-dev:arm64 \
     && rm -rf /var/lib/apt/lists/*
 
 # x86 nvcc generates device code; SBSA packages supply ARM64 target libraries.
