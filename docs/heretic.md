@@ -9,8 +9,9 @@ capture on one, two, or four nodes. The four-node worker can load the full
 Mixed346 checkpoint. Protocol version 2 adds bounded projection weight reads,
 teacher-forced likelihoods, and atomic candidate installation/reset. An opt-in
 serving loader uses the same compact adapter files and execution code. The
-Heretic backend remains on a local development branch; full-model optimization
-and quality validation are still in progress.
+Heretic backend remains on a local development branch. Bounded fitting trials
+on the full checkpoint validate the integration; adapter quality still requires
+representative training prompts and held-out evaluation.
 
 ## Configuration and performance isolation
 
@@ -318,6 +319,19 @@ bitwise baseline restoration, zero process swap on every rank, and matching
 operation streams. It tests execution and capture, not modification quality
 or throughput. The model memory plan with the research configuration is about
 93.6 GiB per rank; Python, captures, adapters and optimizer buffers are additional.
+
+A subsequent four-node runtime pilot completed two Heretic ARA/Optuna trials
+with KL, keyword and response-length scoring. It fitted rank-three factors for
+eight attention/dense/shared projections in the first four layers and exported
+a 1.86 MB bundle. Disabling or resetting the candidate restored baseline logits
+exactly; restoring it recovered the adapted logits exactly. Teacher-forced
+likelihood scoring also passed. Ordinary serving loaded that bundle beside the
+full checkpoint and matched both recorded 16-token completions, with zero
+cached tokens. Both worlds had zero process swap on all ranks and matching
+operation streams. This bounded pilot used four neutral prompts to check the
+workflow; it does not establish adapter quality or throughput. Independent
+native fixtures also exercise CLI study resume and byte-identical reproduction
+through the local Heretic backend.
 
 ```sh
 cmake --build build-release --target dgpp_heretic_worker dgpp_heretic_inspect heretic_capture_test -j 4
