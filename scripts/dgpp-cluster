@@ -459,7 +459,8 @@ class Cluster:
             for rank, host in self.peers:
                 if not self.remote_control("status", rank, host):
                     say(f"WARN: peer rank {rank} not observed on {host}")
-        ready_timeout = 1200 if self.cfg.get("engine", {}).get("runtime_adapters") else 600
+        verify_weights = self.cfg.get("engine", {}).get("runtime_adapter_verify_weights", False)
+        ready_timeout = 1200 if verify_weights else 600
         if not self.wait_log(r0, f"listening on :{self.http}", ready_timeout, "rank 0 serving", proc):
             raise RuntimeError("rank 0 did not become ready")
         bind = self.cfg["http"]["bind_host"]

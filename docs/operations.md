@@ -12,6 +12,9 @@ For LoRA adapter loading or access to logits and activations, see
 uses `engine.runtime_adapters=true` and `engine.runtime_adapter_path`; the
 launcher stages the bundle on every node, and each server validates it against
 the base checkpoint. Changing the adapter requires restarting the serving world.
+Startup verifies metadata and factor hashes without scanning base weight contents.
+Set `engine.runtime_adapter_verify_weights=true` for full base-weight hashing on
+every rank, with per-shard progress logs; this can add minutes to startup.
 The shipped Mixed346 template retains its graphs, MTP, prefix caching and
 memory formats with the adapter flag and path added. The guide lists other
 supported settings and compatibility bounds.

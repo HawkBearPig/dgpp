@@ -2474,7 +2474,14 @@ model's state. Worlds 1/2/4 support the shipped Mixed346 template's graph/MTP
 execution, FP8 KV, BF12 weights, vocabulary embeddings and prefix caching.
 Serving checks artifact identity during
 its settings handshake and includes it in the configuration digest; the
-launcher stages only the manifest and factor file. See
+launcher stages only the manifest and factor file. By default, each serving rank
+hashes the checkpoint metadata and sidecars, checks the revision and weight file names/sizes,
+and validates adapter factors and geometry without reading base weight contents.
+`engine.runtime_adapter_verify_weights` explicitly enables full base-weight
+hashing with per-shard progress logs. Only full inspection produces an exportable
+checkpoint fingerprint; research workers retain that path. Metadata inspection
+cannot detect same-sized weight-content changes. Both modes check file sizes
+and modification times again before installation. See
 [runtime adapters and research inference](docs/runtime-adapters.md) for the
 contract and usage, and the [worker protocol](docs/heretic.md#protocol-version-2)
 for framing and operations.

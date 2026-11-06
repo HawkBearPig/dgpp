@@ -2,6 +2,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -13,19 +14,26 @@ constexpr int kMaxAdapterRank = 256;
 constexpr size_t kMaxManifestBytes = 1024u * 1024u;
 
 struct CheckpointFile {
+  // sha256 is empty only for weights inspected without reading their contents.
   std::string name, sha256;
   uint64_t size;
   std::filesystem::file_time_type modified;
 };
 struct CheckpointIdentity {
+  // A metadata inspection has no aggregate sha256 and cannot be exported.
   std::string sha256, revision;
+  bool weight_contents_verified = false;
   std::vector<CheckpointFile> files;
   std::string json() const;
   void check_unchanged(const std::string& checkpoint) const;
 };
-// Full content hashes, including quantization sidecars and every weight shard.
-// Cold path only: callers must authorize research or runtime adapters first.
-CheckpointIdentity fingerprint_checkpoint(const std::string& checkpoint);
+// Serving default: hash metadata/sidecars and stat weights without reading them.
+CheckpointIdentity inspect_checkpoint_metadata(const std::string& checkpoint);
+// Full content hashes for export or explicit verification. The optional callback
+// runs before hashing each weight file so callers can report startup progress.
+CheckpointIdentity fingerprint_checkpoint(
+    const std::string& checkpoint,
+    const std::function<void(const std::string&, uint64_t)>& on_weight_file = {});
 
 struct ProjectionFactors {
   GlmDsaModificationTarget target;

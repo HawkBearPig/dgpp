@@ -398,6 +398,8 @@ ClusterConfig parse_cluster_config(const std::string& json, const std::string& w
         else if (p.key == "heretic_research") e.heretic_research = boolean(x, ek, what);
         else if (p.key == "runtime_adapters")
           e.runtime_adapters = boolean(x, ek, what);
+        else if (p.key == "runtime_adapter_verify_weights")
+          e.runtime_adapter_verify_weights = boolean(x, ek, what);
         else if (p.key == "runtime_adapter_path")
           e.runtime_adapter_path = expand_home(text(x, ek, what));
         else if (p.key == "decode_graph") e.decode_graph = boolean(x, ek, what);
@@ -589,6 +591,8 @@ ClusterConfig parse_cluster_config(const std::string& json, const std::string& w
     fail(what, "'ports.metrics' must differ from 'ports.fabric' and 'ports.journal'");
   if (!c.engine.runtime_adapter_path.empty() && !c.engine.runtime_adapters)
     fail(what, "engine.runtime_adapter_path requires engine.runtime_adapters=true");
+  if (c.engine.runtime_adapter_verify_weights && !c.engine.runtime_adapters)
+    fail(what, "engine.runtime_adapter_verify_weights requires engine.runtime_adapters=true");
   if (c.engine.runtime_adapters &&
       ((c.engine.kv_dtype != "bf16" && c.engine.kv_dtype != "fp8") ||
        (c.engine.bf16_weights != "checkpoint" && c.engine.bf16_weights != "bf12") ||

@@ -1998,6 +1998,7 @@ int main(int argc, char** argv) {
   int world = 1, rank = 0, rendezvous_timeout_ms = 120000;
   bool no_eos = false, decode_graph = false, mtp = false;
   bool runtime_adapters = false;
+  bool runtime_adapter_verify_weights = false;
   std::string runtime_adapter_path, runtime_adapter_id;
   std::optional<dgpp::adapters::CheckpointIdentity> adapter_base;
   std::optional<dgpp::adapters::Manifest> runtime_manifest;
@@ -2088,6 +2089,7 @@ int main(int argc, char** argv) {
     if (rank >= 0 && rank < world) metrics_bind = c.nodes[rank];
     const dgpp::serve::ClusterConfig::Engine& e = c.engine;
     runtime_adapters = e.runtime_adapters;
+    runtime_adapter_verify_weights = e.runtime_adapter_verify_weights;
     runtime_adapter_path = e.runtime_adapter_path;
     max_concurrency = e.max_concurrency;
     kv_capacity = e.kv_capacity;
@@ -3379,11 +3381,26 @@ int main(int argc, char** argv) {
     if (runtime_adapters) {
       const auto* glm = dynamic_cast<GlmDsaFamily*>(family.get());
       if (!glm) throw std::runtime_error("runtime adapter requires GLM DSA");
-      adapter_base = dgpp::adapters::fingerprint_checkpoint(ckpt);
+      if (runtime_adapter_verify_weights) {
+        DGPP_LOG_INFO("rank {}: runtime adapter: verifying full checkpoint contents", rank);
+        adapter_base = dgpp::adapters::fingerprint_checkpoint(
+            ckpt, [rank](const std::string& name, uint64_t size) {
+              DGPP_LOG_INFO("rank {}: runtime adapter: hashing {} ({} bytes)", rank, name, size);
+            });
+      } else {
+        DGPP_LOG_INFO(
+            "rank {}: runtime adapter: checking checkpoint metadata and weight sizes "
+            "(full weight verification disabled)",
+            rank);
+        adapter_base = dgpp::adapters::inspect_checkpoint_metadata(ckpt);
+      }
       runtime_manifest =
           dgpp::adapters::load_bundle(runtime_adapter_path, glm->cfg, *adapter_base, world);
       if (runtime_manifest->id != runtime_adapter_id)
         throw std::runtime_error("runtime adapter manifest changed during startup");
+      DGPP_LOG_INFO("rank {}: runtime adapter: bundle verified ({}), {} projections", rank,
+                    runtime_adapter_verify_weights ? "full checkpoint" : "metadata and factors",
+                    runtime_manifest->projections.size());
     }
     if (!dflash_dir.empty()) {
       try {

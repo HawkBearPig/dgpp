@@ -959,6 +959,16 @@ DGPP_TEST(cluster_config_runtime_adapters_preserve_native_serving_settings) {
   const std::string enabled = R"("runtime_adapters":true)";
   const auto cfg = dgpp::serve::parse_cluster_config(engine_json("{" + enabled + "}"), "t");
   require(cfg.engine.runtime_adapters, "runtime adapter explicit opt in");
+  require(!cfg.engine.runtime_adapter_verify_weights,
+          "enabling adapters must not enable a full weight scan");
+  require(
+      dgpp::serve::parse_cluster_config(
+          engine_json(R"({"runtime_adapters":true,"runtime_adapter_verify_weights":true})"), "t")
+          .engine.runtime_adapter_verify_weights,
+      "full weight verification requires explicit opt in");
+  require(refusal(engine_json(R"({"runtime_adapter_verify_weights":true})"))
+                  .find("engine.runtime_adapter_verify_weights requires") != std::string::npos,
+          "weight verification requires runtime adapters");
   require(cfg.engine.max_concurrency == 8, "adapters retain the normal concurrency default");
   std::ifstream file(DGPP_SOURCE_DIR "/deploy/cluster_glm-5.3_mixed346_w4.example.json");
   require(file.good(), "read shipped Mixed346 deployment");
@@ -998,8 +1008,12 @@ DGPP_TEST(cluster_config_runtime_adapters_preserve_native_serving_settings) {
   require(refusal(engine_json(R"({"runtime_adapter_path":"/tmp/adapter"})"))
                   .find("runtime_adapters=true") != std::string::npos,
           "a path never implicitly enables runtime adapters");
-  for (const std::string bad : {"null", "1", "[]", "\"true\""})
+  for (const std::string bad : {"null", "1", "[]", "\"true\""}) {
     require(refusal(engine_json("{\"runtime_adapters\":" + bad + "}"))
                     .find("engine.runtime_adapters") != std::string::npos,
             "runtime flag is strictly boolean");
+    require(refusal(engine_json("{" + enabled + ",\"runtime_adapter_verify_weights\":" + bad + "}"))
+                    .find("engine.runtime_adapter_verify_weights") != std::string::npos,
+            "verification flag is strictly boolean");
+  }
 }

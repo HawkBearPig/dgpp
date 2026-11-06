@@ -13,8 +13,10 @@ low-rank candidate activation/reset. Ordinary serving loads checkpoint-bound
 adapter bundles behind `engine.runtime_adapters`, using the existing eager and
 graph serving paths, MTP, prefix caching and grouped/mixed model walks;
 the adapter does not impose a separate request-slot limit. The fitting worker
-remains serial. Bounded fitting trials and ordinary-serving
-adapter reload pass on the full four-node checkpoint; adapter quality needs
+evaluates one candidate request at a time. Serving checks checkpoint metadata
+and adapter factors by default; full base-weight hashing requires the separate
+`engine.runtime_adapter_verify_weights` flag. Bounded fitting trials and
+ordinary-serving adapter reload pass on the full four-node checkpoint; adapter quality needs
 representative training and held-out evaluation.
 See [runtime adapters and research inference](docs/runtime-adapters.md) for
 configuration, capability limits,

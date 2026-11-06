@@ -110,11 +110,23 @@ dense/shared MLP down projections. Routed-expert weights remain unchanged.
 Manifest version 1 identifies operation `additive_low_rank`, runtime
 `glm_dsa_fp32_v1`, the fitted world size, target IDs/modules/dimensions,
 per-factor SHA-256 hashes, the numerical environment hash and the base content
-fingerprint. Fingerprinting reads every weight shard, index, configuration,
-external quantization sidecar and present tokenizer/template/generation files.
-This can add minutes to cold startup for large checkpoints. It occurs only
-with runtime opt-in; research trials reuse the identity and check that the base
-files have not changed. The numerical hash covers sorted `DGPP_*` overrides,
+fingerprint. Serving checks the revision, file names and sizes, configuration,
+index, external quantization sidecars and present tokenizer/template/generation
+file hashes by default. Adapter factor hashes, target shapes, world size and
+the numerical environment are also checked. This verification does not read
+base weight contents and cannot detect changes that preserve their file sizes.
+
+Set `engine.runtime_adapter_verify_weights=true` to also recompute every base
+weight hash. This explicit option reads the entire checkpoint on each rank,
+can add minutes to startup, and logs progress before each shard. Leave it
+unset or false for normal serving startup. Model loading still reads the
+weights required by the existing loader and cache policy. Both verification
+modes check that checkpoint file sizes and modification times remain unchanged
+before adapter installation. Existing version 1 bundles support both modes.
+
+Research workers compute full fingerprints for export, reuse them across trials
+and check that the base files have not changed. The numerical hash covers sorted
+`DGPP_*` overrides,
 excluding transport addresses, paths, logging and test controls. Different
 numerical overrides reject loading. Bundles using the original runtime name
 `glm_dsa_eager_fp32_v1` remain compatible with the same factor arithmetic in
