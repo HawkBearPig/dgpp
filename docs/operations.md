@@ -13,7 +13,7 @@ research flag. Inspection reads model metadata only; the worker loads a
 checkpoint on demand across one, two or four nodes and never attaches to a
 serving world. Its launcher owns separate process records and research ports.
 Compact artifacts load through `engine.runtime_adapters=true` and
-`engine.runtime_adapter_path`; see the integration guide for the eager C1
+`engine.runtime_adapter_path`; see the integration guide for the eager serving
 contract, checkpoint validation and launcher staging.
 
 ## Sampling penalty defaults

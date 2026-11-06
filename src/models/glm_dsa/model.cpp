@@ -411,11 +411,12 @@ std::vector<float> GlmDsaModel::research_projection_rows(const std::string& targ
 void GlmDsaModel::set_runtime_adapter(std::unique_ptr<adapters::Runtime> adapter, bool enabled) {
   if (!enabled)
     throw std::invalid_argument("runtime adapters require engine.runtime_adapters=true");
-  if (mtp_ || max_session_requests() != 1 || session_pos_[0] != 0)
+  if (mtp_ || kv_blocks_in_use() != 0 ||
+      std::any_of(session_pos_.begin(), session_pos_.end(), [](int64_t pos) { return pos != 0; }))
     throw std::invalid_argument(
-        "runtime adapter installation requires idle concurrency one and MTP off");
+        "runtime adapter installation requires all sessions idle and MTP off");
   DGPP_CUDA_OK(cudaStreamSynchronize(stream_));
-  session_close(0);
+  for (int req = 0; req < max_session_requests(); ++req) session_close(req);
   runtime_adapter_ = std::move(adapter);
 }
 
@@ -774,10 +775,20 @@ void GlmDsaModel::enqueue_layer(const GlmDsaLayerResident& r, int pool_layer, ui
     glm_rmsnorm_bf16(resid, r.input_norm, x_, T, H, eps, stream_);
   }
   uint16_t* attn_out = stage(y_, T, H, rows.capture);
+  const auto project_attention = [&](int row0, int count) {
+    if constexpr (Adapted) {
+      // DSA reuses its projection input scratch for each span. Consume it
+      // before the next call, retaining rank-space rows in the walk's order.
+      const int width = cfg_.num_attention_heads / tp_world() * cfg_.v_head_dim;
+      runtime_adapter_->project(r.layer, true, static_cast<const uint16_t*>(dsa_->debug_attn_out()),
+                                width, row0, count, stream_);
+    }
+  };
   if (!dsa_->prepare(T)) throw std::runtime_error("run_rows: DSA GEMM plans unavailable");
   if (rows.decode) {
     dsa_->enqueue_decode(x_, pool_, pool_layer, rows.req_ids, rows.pos, rows.spans, rows.num_requests, T,
                          attn_out, stream_, &prefetch_, /*tail_snapshots=*/nullptr);
+    project_attention(0, T);
   } else if (rows.num_spans > 0) {
     // The group's spans one by one: each span's rows attend to their own
     // request's cache and publish to it (the DSA layer's scratch is
@@ -789,6 +800,7 @@ void GlmDsaModel::enqueue_layer(const GlmDsaLayerResident& r, int pool_layer, ui
       gemm_.set_bf12_wide(true);
       dsa_->enqueue_decode(x_, pool_, pool_layer, rows.req_ids, rows.pos, rows.spans,
                            rows.decode_spans, static_cast<int>(row0), attn_out, stream_, nullptr, nullptr);
+      project_attention(0, static_cast<int>(row0));
       gemm_.set_bf12_wide(false);
     }
     for (int s = rows.decode_spans; s < rows.num_spans; ++s) {
@@ -796,17 +808,16 @@ void GlmDsaModel::enqueue_layer(const GlmDsaLayerResident& r, int pool_layer, ui
       if (!dsa_->prepare(len)) throw std::runtime_error("run_rows: DSA GEMM plans unavailable");
       dsa_->enqueue_prefill(x_ + static_cast<size_t>(row0) * H, pool_, pool_layer, rows.span_reqs[s], rows.span_pos0[s],
                             len, attn_out + static_cast<size_t>(row0) * H, stream_, static_cast<int>(row0));
+      project_attention(static_cast<int>(row0), len);
       row0 += len;
     }
   } else {
     dsa_->enqueue_prefill(x_, pool_, pool_layer, rows.req, rows.pos0, T, attn_out, stream_);
+    project_attention(0, T);
   }
   if (rows.decode) prefetch_ffn_side(r);
   fold(attn_out, T, H, rows.capture);  // block boundary 1: o_proj's partial
   if constexpr (Adapted) {
-    const int width = cfg_.num_attention_heads / tp_world() * cfg_.v_head_dim;
-    runtime_adapter_->project(r.layer, true, static_cast<const uint16_t*>(dsa_->debug_attn_out()),
-                              width, 0, T, stream_);
     runtime_adapter_->add(r.layer, true, attn_out, T, stream_);
   }
   if constexpr (Research) {
@@ -941,9 +952,7 @@ void GlmDsaModel::flush_pending_add(uint16_t* resid, int T) {
 template <bool Research, bool Adapted>
 GlmDsaModel::Outputs GlmDsaModel::run_rows_impl(const RowRun& run, ResearchOutputs* research) {
   if constexpr (Adapted) {
-    if (run.capture || run.num_spans > 1 || run.decode_spans > 0)
-      throw std::invalid_argument(
-          "runtime adapters require eager execution and one request per walk");
+    if (run.capture) throw std::invalid_argument("runtime adapters require eager execution");
   }
   const int T = run.T, req = run.req;
   if (pending_add_ != nullptr) throw std::logic_error("run_rows: a residual add is pending from an earlier walk");

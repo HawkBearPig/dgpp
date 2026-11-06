@@ -1973,11 +1973,19 @@ add_executable(heretic_capture_test tests/cuda/heretic_capture_test.cpp)
 target_include_directories(heretic_capture_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
 target_link_libraries(heretic_capture_test PRIVATE dgpp_models_glm_dsa_layers CUDA::cudart Threads::Threads)
 dgpp_set_common(heretic_capture_test)
+add_executable(heretic_batch_test tests/cuda/heretic_batch_test.cpp)
+target_include_directories(heretic_batch_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
+target_link_libraries(heretic_batch_test PRIVATE dgpp_models_glm_dsa_layers CUDA::cudart Threads::Threads)
+dgpp_set_common(heretic_batch_test)
 foreach(_format int8 m346)
   add_test(NAME heretic_capture_${_format} COMMAND heretic_capture_test
     ${CMAKE_CURRENT_BINARY_DIR}/heretic_${_format}_fixture ${_format})
   set_tests_properties(heretic_capture_${_format} PROPERTIES
     FIXTURES_SETUP heretic_${_format} RUN_SERIAL TRUE TIMEOUT 120)
+  add_test(NAME heretic_batch_${_format} COMMAND heretic_batch_test
+    ${CMAKE_CURRENT_BINARY_DIR}/heretic_${_format}_fixture ${_format})
+  set_tests_properties(heretic_batch_${_format} PROPERTIES
+    FIXTURES_REQUIRED heretic_${_format} LABELS "gpu" RUN_SERIAL TRUE TIMEOUT 180)
   add_test(NAME heretic_worker_${_format} COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/python/heretic_worker_check.py gpu
     $<TARGET_FILE:dgpp_heretic_worker> ${CMAKE_CURRENT_BINARY_DIR}/heretic_${_format}_fixture)

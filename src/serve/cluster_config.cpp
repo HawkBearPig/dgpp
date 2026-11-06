@@ -590,11 +590,11 @@ ClusterConfig parse_cluster_config(const std::string& json, const std::string& w
   if (!c.engine.runtime_adapter_path.empty() && !c.engine.runtime_adapters)
     fail(what, "engine.runtime_adapter_path requires engine.runtime_adapters=true");
   if (c.engine.runtime_adapters &&
-      (c.engine.max_concurrency != 1 || c.engine.mtp || c.engine.decode_graph ||
-       c.engine.prefix_cache_gib != 0 || c.engine.kv_dtype != "bf16" ||
-       c.engine.bf16_weights != "checkpoint" || c.engine.attention_weights != "checkpoint"))
+      (c.engine.mtp || c.engine.decode_graph || c.engine.prefix_cache_gib != 0 ||
+       c.engine.kv_dtype != "bf16" || c.engine.bf16_weights != "checkpoint" ||
+       c.engine.attention_weights != "checkpoint"))
     fail(what,
-         "engine.runtime_adapters requires max_concurrency=1, mtp=false, "
+         "engine.runtime_adapters requires mtp=false, "
          "decode_graph=false, prefix_cache_gib=0, BF16 KV and checkpoint weights");
   if (c.engine.runtime_adapters &&
       (c.engine.prefill_bf16_partials || c.engine.prefill_fold_scales ||

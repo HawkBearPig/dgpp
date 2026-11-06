@@ -2457,7 +2457,11 @@ research and ordinary serving. A is partitioned by input columns, B is
 replicated, and FP32 rank-space values are gathered losslessly and summed in
 rank order before a single BF16 boundary addition. Zero factors skip that
 addition. The ordinary disabled walk has no adapter kernels, scratch or
-collectives. The first contract is eager C1, worlds 1/2/4, BF16 KV/checkpoint
+collectives. Serving uses the existing eager request slots (1–16), while the
+research worker remains serial. Attention factors consume each span's DSA
+input before its scratch is reused, retaining rank-space rows in walk order;
+MLP factors follow the existing kernel groups. Adapter installation requires
+every session to be idle. The contract is worlds 1/2/4, BF16 KV/checkpoint
 weights, no drafts or prefix cache. Serving checks artifact identity during
 its settings handshake and includes it in the configuration digest; the
 launcher stages only the manifest and factor file. See

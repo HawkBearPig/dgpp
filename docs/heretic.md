@@ -263,7 +263,9 @@ to a separate cluster config using the same model and world size:
 {
   "runtime_adapters": true,
   "runtime_adapter_path": "/path/to/exported/adapter",
-  "max_concurrency": 1,
+  "max_concurrency": 8,
+  "kv_capacity": 131072,
+  "default_max_tokens": 8192,
   "mtp": false,
   "decode_graph": false,
   "prefix_cache_gib": 0,
@@ -278,8 +280,15 @@ manifest and factors to each peer. A relative adapter path is resolved beside
 the deployment JSON. Direct binary launches require the bundle on every node.
 The manifest identity participates in the settings handshake and serving
 configuration digest. Different artifacts or missing opt-in reject startup.
-The initial contract supports eager concurrency one, worlds 1/2/4, no drafts,
-and no prefix/NVMe cache. Default deployments retain their normal paths and
+Serving supports the engine's existing request-slot range (1–16), worlds
+1/2/4, eager execution, no drafts, and no prefix/NVMe cache. The research worker
+still processes one fitting request at a time; its execution limits do not
+restrict the exported adapter's serving concurrency or context. `kv_capacity`
+is the shared token pool across active requests, not a per-request reservation.
+Size it for available memory and the combined prompt/output lengths you need.
+`default_max_tokens` is the default output length and can be overridden per
+request. The engine's existing admission policy determines which requests fit.
+Default deployments retain their normal paths and
 allocate no adapter factors, scratch, synchronization, or collectives.
 
 ## Validation
@@ -312,6 +321,16 @@ lengths 1/3/16/33. They check zero-adapter bitwise identity, staged abort,
 generation/likelihood consistency, and exact reset. Host tests reject bad
 fingerprints, shapes, ranks, hashes and configuration, and load artifact files
 without CUDA.
+
+The adapter batch tests cover 8 and 16 request slots on int8 and Mixed346
+fixtures: zero-factor identity, nonzero adapters against isolated requests,
+neighbor isolation, mixed prefill/decode, cancellation, slot reuse, and idle
+replacement. Attention inputs are projected before each span's DSA scratch is
+reused; the resulting rank-space rows follow the engine's existing row order.
+Same-geometry isolation and identity are bitwise, including sparse attention
+and routing. Cross-shape arithmetic uses a dense-attention, all-expert fixture
+and the existing relative-L2 and near-tie numerical checks, matching the bulk
+prefill numerical fixture's method.
 
 A four-node probe of revision `824aedb0c783832223dab78a826bec7442ddea23`
 validated all 154880 logits, 314 capture tensors, a 16-token continuation,
