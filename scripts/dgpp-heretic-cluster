@@ -1,0 +1,157 @@
+#!/usr/bin/env python3
+"""Own an opt-in Heretic worker world; accepts the native owner's socket FD.
+
+Uses the serving launcher's site resolver and process-identity helper, with a
+unique research namespace. Does not stop or modify any serving deployment.
+"""
+import argparse
+from concurrent.futures import ThreadPoolExecutor
+import json
+import os
+from pathlib import Path
+import shlex
+import signal
+import subprocess
+import sys
+import uuid
+
+import cluster_process
+from site_env import SITE_KEYS, resolve_config, server_config, settings, shell_prefix
+
+ROOT = Path(__file__).resolve().parents[1]
+SSH = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]
+
+
+def checked(argv, timeout=60):
+    result = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+    if result.returncode:
+        raise RuntimeError(f"command failed: {shlex.join(argv)}\n{result.stderr[-4000:]}")
+    return result.stdout
+
+
+def run(args):
+    # Gate before SSH, staging, binding ports, or starting any child.
+    source = json.loads(Path(args.config).read_text())
+    if source.get("engine", {}).get("heretic_research") is not True:
+        raise ValueError("Heretic research is disabled; set engine.heretic_research=true")
+    cfg = resolve_config(args.config)
+    if len(cfg["nodes"]) not in (1, 2, 4):
+        raise ValueError("research requires 1, 2 or 4 nodes")
+    if len(set(cfg["nodes"])) != len(cfg["nodes"]):
+        raise ValueError("cluster launcher requires a distinct host for each rank")
+    binary = Path(args.worker_binary).resolve()
+    if not binary.is_file():
+        raise ValueError(f"build the worker first: {binary}")
+    token = uuid.uuid4().hex
+    log_base = Path(settings()["DGPP_LOG_DIR"]).expanduser()
+    directory = log_base / "heretic" / token
+    directory.mkdir(parents=True)
+    stage = f"/tmp/dgpp-heretic-{token}"
+    resolved = directory / "cluster.json"
+    resolved.write_text(json.dumps(server_config(cfg), sort_keys=True, indent=2) + "\n")
+    (directory / "deployment.path").write_text(str(Path(args.config).resolve()) + "\n")
+    print(f"Heretic research run: {directory}", file=sys.stderr, flush=True)
+    peers = list(enumerate(cfg["nodes"]))[1:]
+    state = directory / "r0.state.json"
+    head = None
+    staged = []
+
+    def target(host):
+        return cfg["ssh_user"] + "@" + host
+
+    def remote(host, command, timeout=20):
+        return checked(["ssh", *SSH, target(host), command], timeout)
+
+    def scp_to(host, path, name):
+        checked(["scp", "-q", *SSH, str(path), target(host) + ":" + stage + "/" + name])
+
+    def stage_peer(item):
+        rank, host = item
+        remote(host, shlex.join(["mkdir", "-p", stage]))
+        staged.append(item)
+        for path, name in ((binary, "worker"), (resolved, "cluster.json"),
+                           (ROOT / "scripts/cluster_process.py", "cluster_process.py")):
+            scp_to(host, path, name)
+        argv = ["python3", stage + "/cluster_process.py", "launch", "--state", stage + "/state.json",
+                "--log", stage + "/worker.log", "--cwd", stage, "--", stage + "/worker",
+                "--config", stage + "/cluster.json", "--rank", str(rank), "--op-log", stage + "/worker.ops"]
+        shared = {k: v for k, v in os.environ.items() if k.startswith("DGPP_") and k not in SITE_KEYS}
+        remote(host, shell_prefix({**shared, **cfg["node_env"][rank]}) + " " + shlex.join(argv))
+
+    def cleanup_peer(item):
+        rank, host = item
+        helper = ["python3", stage + "/cluster_process.py", "signal", "--state", stage + "/state.json"]
+        # A partial stage may not have copied the helper yet. No worker can
+        # have started until all three files arrived.
+        try:
+            exists = remote(host, shlex.join(["test", "-f", stage + "/cluster_process.py"]) + " && echo yes || true").strip()
+            if not exists:
+                remote(host, shlex.join(["rm", "-rf", "--", stage]))
+                return
+            remote(host, shlex.join([*helper, "--signal", "TERM"]))
+            # A process record names PID + boot + start time + owner. This
+            # fallback can never target an unrelated process after PID reuse.
+            remote(host, shlex.join([*helper, "--signal", "KILL"]))
+        except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
+            print(f"rank {rank} cleanup: {error}", file=sys.stderr)
+            return  # Keep the state record if process termination was uncertain.
+        for source_name, name in (("worker.log", f"r{rank}.log"), ("worker.ops", f"r{rank}.ops")):
+            try:
+                checked(["scp", "-q", *SSH, target(host) + ":" + stage + "/" + source_name, str(directory / name)], 15)
+            except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
+                print(f"rank {rank} log retrieval: {error}", file=sys.stderr)
+        try:
+            remote(host, shlex.join(["rm", "-rf", "--", stage]))
+        except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
+            print(f"rank {rank} stage cleanup: {error}", file=sys.stderr)
+
+    def stop_signal(number, _frame):
+        raise SystemExit(128 + number)
+
+    signal.signal(signal.SIGTERM, stop_signal)
+    signal.signal(signal.SIGINT, stop_signal)
+    try:
+        environment = {**os.environ, **{k: os.path.expanduser(v) for k, v in cfg["node_env"][0].items()}}
+        head = cluster_process.launch(state, [str(binary), "--config", str(resolved), "--rank", "0",
+            "--control-fd", str(args.control_fd), "--op-log", str(directory / "r0.ops")],
+            directory / "r0.log", directory, environment, pass_fds=(args.control_fd,))
+        os.close(args.control_fd)
+        with ThreadPoolExecutor(max_workers=max(1, len(peers))) as pool:
+            list(pool.map(stage_peer, peers))
+        result = head.wait()
+        return result
+    finally:
+        # A second signal cannot interrupt process-identity cleanup halfway.
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        if head is not None and head.poll() is None:
+            cluster_process.send_signal(state, signal.SIGTERM)
+            try:
+                head.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                cluster_process.send_signal(state, signal.SIGKILL)
+                head.wait(timeout=2)
+        if head is not None and head.returncode:
+            print((directory / "r0.log").read_text()[-8000:], file=sys.stderr, flush=True)
+        with ThreadPoolExecutor(max_workers=max(1, len(staged))) as pool:
+            list(pool.map(cleanup_peer, staged))
+        audits = [directory / f"r{rank}.ops" for rank in range(len(cfg["nodes"]))]
+        if all(p.exists() and p.stat().st_size for p in audits) and len({p.read_bytes() for p in audits}) == 1:
+            print("Heretic operation streams agree across all ranks", file=sys.stderr)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", required=True)
+    parser.add_argument("--control-fd", required=True, type=int)
+    parser.add_argument("--worker-binary", default=str(ROOT / "build-release/dgpp-heretic-worker"))
+    args = parser.parse_args()
+    return run(args)
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as error:
+        print(f"Heretic cluster: {error}", file=sys.stderr)
+        raise SystemExit(1)

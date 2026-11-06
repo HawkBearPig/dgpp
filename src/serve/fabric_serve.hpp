@@ -357,6 +357,10 @@ class JournalWriter {
   // written since the last poll, as (rank, line), without blocking. The
   // engine thread's alone (broadcast's too); the death watch only peeks.
   std::vector<std::pair<int, std::string>> poll_peer_lines();
+  // Separate research protocol phase: bounded binary replies on the existing
+  // journal star. Do not mix with readiness/line replies in the same phase.
+  // A shared deadline covers the complete gather, including partial reads.
+  std::vector<std::pair<int, std::string>> gather_peer_payloads(size_t max_bytes, int timeout_ms);
   ~JournalWriter();
 
  private:
@@ -402,6 +406,9 @@ class JournalReader {
   // The return path (issue #26): one status line to rank 0. False when
   // the connection is gone (the loop sees the EOF next).
   bool send_line(const std::string& line);
+  // Counterpart to gather_peer_payloads. The caller's control record selects
+  // the binary phase; ordinary serving never calls these operations.
+  bool send_payload(const std::string& payload, int timeout_ms);
 
  private:
   dgpp::net::TcpConn conn_;

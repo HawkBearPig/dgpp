@@ -1562,6 +1562,55 @@ JournalReader::JournalReader(const std::string& host, uint16_t port,
     throw std::runtime_error("journal: could not send the hello to rank 0");
 }
 
+std::vector<std::pair<int, std::string>> JournalWriter::gather_peer_payloads(size_t max_bytes,
+                                                                             int timeout_ms) {
+  if (max_bytes == 0 || max_bytes > 128u * 1024u * 1024u || timeout_ms <= 0)
+    throw std::invalid_argument("journal: invalid binary gather bounds");
+  for (const auto& pending : peer_pending_)
+    if (!pending.empty()) throw std::logic_error("journal: binary phase has pending line data");
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+  std::vector<std::pair<int, std::string>> out;
+  for (size_t i = 0; i < peers_.size(); ++i) {
+    auto read = [&](char* dst, size_t size) {
+      while (size) {
+        const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              deadline - std::chrono::steady_clock::now())
+                              .count();
+        if (left <= 0 || !peers_[i].wait_readable(static_cast<int>(left)))
+          throw std::runtime_error("journal: binary reply deadline on rank " +
+                                   std::to_string(peer_ranks_[i]));
+        const int got = peers_[i].read_some(dst, std::min<size_t>(size, 65536));
+        if (got <= 0)
+          throw std::runtime_error("journal: truncated binary reply on rank " +
+                                   std::to_string(peer_ranks_[i]));
+        dst += got;
+        size -= got;
+      }
+    };
+    unsigned char length[4];
+    read(reinterpret_cast<char*>(length), sizeof(length));
+    const uint32_t bytes = uint32_t{length[0]} | (uint32_t{length[1]} << 8) |
+                           (uint32_t{length[2]} << 16) | (uint32_t{length[3]} << 24);
+    if (bytes > max_bytes) throw std::runtime_error("journal: binary reply exceeds budget");
+    std::string payload(bytes, '\0');
+    read(payload.data(), payload.size());
+    out.emplace_back(peer_ranks_[i], std::move(payload));
+  }
+  std::sort(out.begin(), out.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+  return out;
+}
+
+bool JournalReader::send_payload(const std::string& payload, int timeout_ms) {
+  if (payload.size() > 128u * 1024u * 1024u || timeout_ms <= 0)
+    throw std::invalid_argument("journal: invalid binary reply bounds");
+  const auto n = static_cast<uint32_t>(payload.size());
+  const unsigned char length[4] = {
+      static_cast<unsigned char>(n), static_cast<unsigned char>(n >> 8),
+      static_cast<unsigned char>(n >> 16), static_cast<unsigned char>(n >> 24)};
+  conn_.set_io_deadline_ms(timeout_ms);
+  return conn_.write_all(length, sizeof(length)) && conn_.write_all(payload.data(), payload.size());
+}
+
 void JournalReader::send_ready(const std::string& note) {
   if (note.find_first_of(" \n") != std::string::npos)
     throw std::invalid_argument("journal: a readiness note is one token");

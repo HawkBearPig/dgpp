@@ -2437,14 +2437,19 @@ target catalog maps Heretic's capture IDs to checkpoint modules, full weight
 shapes, and each rank's input-column interval. `dgpp-heretic-inspect` requires
 `engine.heretic_research=true` and advertises only target discovery. It does
 not attach to the serving process or initialize a model. The separately gated
-`dgpp-heretic-worker` owns a world-1 resident model and an inherited Unix socket
+`dgpp-heretic-worker` owns a resident model partition and an inherited Unix socket
 for bounded baseline logits, greedy generation, and last-token capture. Its
 research model walk is a distinct template instantiation; the ordinary walk
 does not compile capture branches or copies. Capture reads the shared expert's
-BF16 input and FP32 down accumulator before routed accumulation. No serving
-listener, adapter execution, or multi-rank protocol is added. See
+BF16 input and FP32 down accumulator before routed accumulation. Worlds 2 and 4
+reuse the rank journal for settings/build agreement, commands and bounded
+capture replies; tensor parallel inference uses the existing CollectiveBus.
+The head assembles full-vocabulary logits and capture columns, verifies
+replicated tensors and sums shared FP32 outputs. The research launcher stages
+identical binaries and cleans only its recorded processes; owner/peer failure
+aborts the world. Serving listeners and adapter execution are unchanged. See
 [Heretic integration](docs/heretic.md) for the wire contract and remaining
-distributed execution and artifact capabilities.
+artifact capabilities.
 
 The shared JSON parser validates number grammar before conversion, retaining exact
 signed integers when representable and the existing double fallback otherwise.
