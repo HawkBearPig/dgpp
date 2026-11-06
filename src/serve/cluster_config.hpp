@@ -52,6 +52,7 @@ struct ClusterConfig {
     // not allocate capture/adapter buffers or change its execution path.
     bool heretic_research = false;
     bool runtime_adapters = false;
+    bool runtime_adapter_verify_weights = false;
     std::string runtime_adapter_path;
     int max_concurrency = 8;
     int64_t kv_capacity = 8192;

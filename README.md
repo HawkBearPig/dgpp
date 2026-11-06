@@ -50,6 +50,8 @@ cluster launcher and the deployment templates.
   activations and token scores to external optimization tools. Both features
   require explicit cluster flags. Current support covers GLM-5.3 DSA on one,
   two or four nodes with the [documented execution limits](docs/runtime-adapters.md).
+  Adapter startup checks metadata and factors. Full base-weight hashing requires
+  the separate `engine.runtime_adapter_verify_weights` flag (default false).
 
 ## Performance
 

@@ -57,9 +57,19 @@ void filename(const std::string& name) {
               std::filesystem::path(name).filename().string() == name,
           "checkpoint references must be simple filenames");
 }
+void append_file_identity(Sha256& combined, const std::string& name, uint64_t size,
+                          const std::string& digest) {
+  combined.update(name);
+  combined.update(std::string_view("\0", 1));
+  combined.update(std::to_string(size));
+  combined.update(std::string_view("\0", 1));
+  combined.update(digest);
+  combined.update("\n");
+}
 }  // namespace
 
 std::string CheckpointIdentity::json() const {
+  require(weight_contents_verified, "metadata inspection cannot be exported as a fingerprint");
   std::string out =
       "{\"sha256\":" + quote(sha256) + ",\"revision\":" + quote(revision) + ",\"files\":[";
   for (size_t i = 0; i < files.size(); ++i) {
@@ -75,11 +85,14 @@ void CheckpointIdentity::check_unchanged(const std::string& checkpoint) const {
     const auto path = std::filesystem::path(checkpoint) / f.name;
     require(std::filesystem::file_size(path) == f.size &&
                 std::filesystem::last_write_time(path) == f.modified,
-            "checkpoint changed after fingerprinting: " + f.name);
+            "checkpoint changed after inspection: " + f.name);
   }
 }
 
-CheckpointIdentity fingerprint_checkpoint(const std::string& checkpoint) {
+namespace {
+CheckpointIdentity inspect_checkpoint(
+    const std::string& checkpoint, bool verify_weights,
+    const std::function<void(const std::string&, uint64_t)>& on_weight_file = {}) {
   namespace fs = std::filesystem;
   std::set<std::string> names{"config.json"};
   for (const auto* name : {"tokenizer.json", "tokenizer_config.json", "special_tokens_map.json",
@@ -100,18 +113,22 @@ CheckpointIdentity fingerprint_checkpoint(const std::string& checkpoint) {
       }
     }
   }
+  std::set<std::string> weights;
   if (fs::exists(checkpoint + "/model.safetensors.index.json")) {
     names.insert("model.safetensors.index.json");
     const auto bytes = read_text(checkpoint + "/model.safetensors.index.json", 64 * 1024 * 1024);
     const auto parsed = minijson::parse_document(bytes);
     const auto& map = parsed.root.at("weight_map");
     require(map.is_object() && !map.members().empty(), "empty checkpoint weight map");
-    for (const auto& entry : map.members()) names.insert(str(entry.value));
+    for (const auto& entry : map.members()) weights.insert(str(entry.value));
   } else {
-    names.insert("model.safetensors");
+    weights.insert("model.safetensors");
   }
+  for (const auto& name : weights)
+    require(names.insert(name).second, "weight file overlaps checkpoint metadata: " + name);
   require(names.size() <= 512, "too many checkpoint files");
   CheckpointIdentity identity;
+  identity.weight_contents_verified = verify_weights;
   const auto revision = fs::path(checkpoint).filename().string();
   if (revision.size() == 40 && revision.find_first_not_of("0123456789abcdef") == std::string::npos)
     identity.revision = revision;
@@ -121,19 +138,27 @@ CheckpointIdentity fingerprint_checkpoint(const std::string& checkpoint) {
     const auto path = (fs::path(checkpoint) / name).string();
     const auto size = fs::file_size(path);
     const auto modified = fs::last_write_time(path);
-    const auto digest = file_sha256(path);
+    const bool weight = weights.count(name) != 0;
+    if (weight && verify_weights && on_weight_file) on_weight_file(name, size);
+    const auto digest = weight && !verify_weights ? std::string{} : file_sha256(path);
     require(size == fs::file_size(path) && modified == fs::last_write_time(path),
-            "checkpoint changed while hashing " + name);
+            "checkpoint changed while inspecting " + name);
     identity.files.push_back({name, digest, size, modified});
-    combined.update(name);
-    combined.update(std::string_view("\0", 1));
-    combined.update(std::to_string(size));
-    combined.update(std::string_view("\0", 1));
-    combined.update(digest);
-    combined.update("\n");
+    if (verify_weights) append_file_identity(combined, name, size, digest);
   }
-  identity.sha256 = combined.finish();
+  if (verify_weights) identity.sha256 = combined.finish();
   return identity;
+}
+}  // namespace
+
+CheckpointIdentity inspect_checkpoint_metadata(const std::string& checkpoint) {
+  return inspect_checkpoint(checkpoint, false);
+}
+
+CheckpointIdentity fingerprint_checkpoint(
+    const std::string& checkpoint,
+    const std::function<void(const std::string&, uint64_t)>& on_weight_file) {
+  return inspect_checkpoint(checkpoint, true, on_weight_file);
 }
 
 Manifest parse_manifest(const std::string& bytes, const GlmDsaTextConfig& config,
@@ -155,20 +180,28 @@ Manifest parse_manifest(const std::string& bytes, const GlmDsaTextConfig& config
           "world size differs from the fitted adapter");
   const auto& declared = root.at("base");
   fields(declared, {"sha256", "revision", "files"});
-  require(
-      str(declared.at("sha256")) == base.sha256 && str(declared.at("revision")) == base.revision,
-      "base checkpoint fingerprint/revision mismatch");
+  const auto declared_sha256 = str(declared.at("sha256"));
+  require(hex_digest(declared_sha256), "invalid base SHA-256");
+  require(str(declared.at("revision")) == base.revision, "base checkpoint revision mismatch");
+  if (base.weight_contents_verified)
+    require(declared_sha256 == base.sha256, "base checkpoint fingerprint mismatch");
   const auto& files = declared.at("files");
   require(files.is_array() && files.items().size() == base.files.size(), "base file set mismatch");
+  Sha256 declared_combined;
   for (size_t i = 0; i < base.files.size(); ++i) {
     const auto& file = files.items()[i];
     fields(file, {"name", "size", "sha256"});
+    const auto digest = str(file.at("sha256"));
+    require(hex_digest(digest), "invalid base file SHA-256");
     require(str(file.at("name")) == base.files[i].name && integer(file.at("size")) >= 0 &&
                 static_cast<uint64_t>(integer(file.at("size"))) == base.files[i].size &&
-                str(file.at("sha256")) == base.files[i].sha256,
-            "base file identity mismatch");
+                ((!base.weight_contents_verified && base.files[i].sha256.empty()) ||
+                 digest == base.files[i].sha256),
+            "base file identity mismatch: " + base.files[i].name);
+    append_file_identity(declared_combined, base.files[i].name, base.files[i].size, digest);
   }
-  Manifest result{sha256(bytes), bytes, base.sha256, world, {}};
+  require(declared_combined.finish() == declared_sha256, "inconsistent base fingerprint");
+  Manifest result{sha256(bytes), bytes, declared_sha256, world, {}};
   const auto targets = glm_dsa_modification_targets(config, 0, world);
   const auto& projections = root.at("projections");
   require(projections.is_array() && projections.items().size() <= targets.size(),

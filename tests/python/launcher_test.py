@@ -465,6 +465,19 @@ class LauncherScanTest(unittest.TestCase):
         self.assertEqual((Path(staged) / "adapter_model.safetensors").read_bytes(), b"factors")
         self.assertTrue(any(call.args[1] == str(Path(staged) / "adapter_model.safetensors") for call in scp.call_args_list))
 
+    def test_long_startup_timeout_requires_explicit_weight_verification(self):
+        cluster = self.cluster(self.namespace("verify", "org/model"))
+        for settings, expected in (({}, 600), ({"runtime_adapters": True}, 600),
+                                   ({"runtime_adapters": True,
+                                     "runtime_adapter_verify_weights": True}, 1200)):
+            with self.subTest(settings=settings):
+                cluster.cfg["engine"] = settings
+                with patch.object(cluster, "boot_head", return_value=object()), \
+                        patch.object(cluster, "wait_log", return_value=True) as wait, \
+                        redirect_stdout(io.StringIO()):
+                    self.assertEqual(cluster.start_ranks(), 0)
+                self.assertEqual(wait.call_args.args[2], expected)
+
     def test_peer_staging_cleans_stale_streams_in_bash(self):
         self.check_peer_staging(["bash"])
 
