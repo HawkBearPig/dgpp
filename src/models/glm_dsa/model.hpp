@@ -120,6 +120,19 @@ class GlmDsaModel : public SessionModel<GlmDsaModel> {
   // closed), fresh state, every row's logits; the slot is closed after.
   // capture_layers: every layer's residual output [T, H] in layer_states.
   Outputs forward(const std::vector<int64_t>& token_ids, bool capture_layers = false);
+  struct ProjectionCapture {
+    std::string id;
+    std::vector<uint16_t> input;
+    std::vector<float> output;  // shared: actual FP32 down output; other targets: widened BF16
+  };
+  struct ResearchOutputs {
+    Outputs prediction;  // raw last-prompt-position logits only
+    std::vector<ProjectionCapture> projections;
+    std::vector<uint16_t> residuals;  // [layers + 1, hidden]: embedding, boundaries, final norm
+  };
+  // A separate compiled walk: no capture branches/allocations in normal
+  // serving. The caller passes the explicit cluster research flag.
+  ResearchOutputs research_forward(const std::vector<int64_t>& token_ids, bool enabled);
   // A test's capture of the session walks too (the Qwen families' form):
   // every session prefill / step keeps its layer rows and DSA selections
   // (a sync per layer — diagnostics only). Process-wide.
@@ -219,7 +232,11 @@ class GlmDsaModel : public SessionModel<GlmDsaModel> {
     const int32_t* span_lens = nullptr;
     int num_spans = 0;
   };
-  void enqueue_layer(const GlmDsaLayerResident& r, int pool_layer, uint16_t* resid, int T, const WalkRows& rows);
+  template <bool Research>
+  Outputs run_rows_impl(const RowRun& run, ResearchOutputs* research);
+  template <bool Research>
+  void enqueue_layer(const GlmDsaLayerResident& r, int pool_layer, uint16_t* resid, int T,
+                     const WalkRows& rows, ResearchOutputs* research = nullptr);
   // A layer's closing residual add (its folded FFN output) is deferred into
   // the next norm that reads the residual — the next layer's input norm,
   // the final norm or the draft head's — as one fused kernel
