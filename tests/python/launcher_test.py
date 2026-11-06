@@ -446,6 +446,25 @@ class LauncherScanTest(unittest.TestCase):
                 for path in preserved:
                     self.assertEqual(path.read_text(), "previous run\n")
 
+    def test_runtime_adapter_stages_only_with_explicit_opt_in(self):
+        cluster = self.cluster(self.namespace("adapter", "org/model"), peers=1)
+        source = self.root / "source adapter"
+        source.mkdir()
+        (source / "dgpp_adapter.json").write_text('{"fixture":1}')
+        (source / "adapter_model.safetensors").write_bytes(b"factors")
+        cluster.cfg["engine"] = {"runtime_adapter_path": str(source)}
+        with self.assertRaisesRegex(ValueError, "runtime_adapters=true"), patch.object(cluster, "ssh") as ssh:
+            cluster.stage()
+        ssh.assert_not_called()
+        cluster.cfg["engine"]["runtime_adapters"] = True
+        with patch.object(cluster, "ssh", return_value=True), patch.object(cluster, "scp_to", return_value=True) as scp:
+            self.assertTrue(cluster.stage())
+        staged = json.loads(Path(cluster.config_path).read_text())["engine"]["runtime_adapter_path"]
+        self.assertNotEqual(staged, str(source))
+        self.assertEqual(cluster.cfg["engine"]["runtime_adapter_path"], str(source))
+        self.assertEqual((Path(staged) / "adapter_model.safetensors").read_bytes(), b"factors")
+        self.assertTrue(any(call.args[1] == str(Path(staged) / "adapter_model.safetensors") for call in scp.call_args_list))
+
     def test_peer_staging_cleans_stale_streams_in_bash(self):
         self.check_peer_staging(["bash"])
 

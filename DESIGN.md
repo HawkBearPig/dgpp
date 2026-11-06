@@ -2447,9 +2447,21 @@ capture replies; tensor parallel inference uses the existing CollectiveBus.
 The head assembles full-vocabulary logits and capture columns, verifies
 replicated tensors and sums shared FP32 outputs. The research launcher stages
 identical binaries and cleans only its recorded processes; owner/peer failure
-aborts the world. Serving listeners and adapter execution are unchanged. See
-[Heretic integration](docs/heretic.md) for the wire contract and remaining
-artifact capabilities.
+aborts the world. Protocol v2 adds bounded global weight reads, teacher-forced
+likelihoods, and candidate epochs. Adapter manifests bind exact checkpoint,
+quantization, tokenizer and factor hashes. Staging, activation and reset use
+all-rank barriers; no partially installed candidate can be evaluated.
+
+`engine.runtime_adapters` independently gates the low-rank execution path in
+research and ordinary serving. A is partitioned by input columns, B is
+replicated, and FP32 rank-space values are gathered losslessly and summed in
+rank order before a single BF16 boundary addition. Zero factors skip that
+addition. The ordinary disabled walk has no adapter kernels, scratch or
+collectives. The first contract is eager C1, worlds 1/2/4, BF16 KV/checkpoint
+weights, no drafts or prefix cache. Serving checks artifact identity during
+its settings handshake and includes it in the configuration digest; the
+launcher stages only the manifest and factor file. See
+[Heretic integration](docs/heretic.md) for the contract and usage.
 
 The shared JSON parser validates number grammar before conversion, retaining exact
 signed integers when representable and the existing double fallback otherwise.

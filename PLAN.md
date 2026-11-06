@@ -8,9 +8,10 @@ The versioned catalog matches Heretic's attention, dense MLP and shared-expert
 capture indices. A separate worker provides baseline logits, greedy
 generation, and last-token residual/projection capture on worlds 1, 2 and 4,
 with native int8/Mixed346 fixture checks and a four-node full-checkpoint probe.
-Candidate lifecycle, complete
-Heretic workflow integration, and independent runtime artifact loading remain
-pending. See the [integration guide](docs/heretic.md) for commands, capability
+Protocol v2 supplies bounded weight reads, likelihood scoring and atomic
+low-rank candidate activation/reset. Ordinary serving loads checkpoint-bound
+adapter bundles behind `engine.runtime_adapters`. Local Heretic workflow
+integration and full-model modification/quality validation are in progress. See the [integration guide](docs/heretic.md) for commands, capability
 limits, and the default-off feature gate.
 
 ## Serving status

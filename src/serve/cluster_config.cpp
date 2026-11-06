@@ -396,6 +396,10 @@ ClusterConfig parse_cluster_config(const std::string& json, const std::string& w
         else if (p.key == "max_connections") e.max_connections = static_cast<int>(integer(x, ek, what, 1, 1 << 20));
         else if (p.key == "no_eos") e.no_eos = boolean(x, ek, what);
         else if (p.key == "heretic_research") e.heretic_research = boolean(x, ek, what);
+        else if (p.key == "runtime_adapters")
+          e.runtime_adapters = boolean(x, ek, what);
+        else if (p.key == "runtime_adapter_path")
+          e.runtime_adapter_path = expand_home(text(x, ek, what));
         else if (p.key == "decode_graph") e.decode_graph = boolean(x, ek, what);
         else if (p.key == "mtp") e.mtp = boolean(x, ek, what);
         else if (p.key == "dflash_model") e.dflash_model = text(x, ek, what);
@@ -583,6 +587,22 @@ ClusterConfig parse_cluster_config(const std::string& json, const std::string& w
     fail(what, "'ports.fabric' and 'ports.journal' must differ");
   if (c.metrics_port != 0 && (c.metrics_port == c.fabric_port || c.metrics_port == c.journal_port))
     fail(what, "'ports.metrics' must differ from 'ports.fabric' and 'ports.journal'");
+  if (!c.engine.runtime_adapter_path.empty() && !c.engine.runtime_adapters)
+    fail(what, "engine.runtime_adapter_path requires engine.runtime_adapters=true");
+  if (c.engine.runtime_adapters &&
+      (c.engine.max_concurrency != 1 || c.engine.mtp || c.engine.decode_graph ||
+       c.engine.prefix_cache_gib != 0 || c.engine.kv_dtype != "bf16" ||
+       c.engine.bf16_weights != "checkpoint" || c.engine.attention_weights != "checkpoint"))
+    fail(what,
+         "engine.runtime_adapters requires max_concurrency=1, mtp=false, "
+         "decode_graph=false, prefix_cache_gib=0, BF16 KV and checkpoint weights");
+  if (c.engine.runtime_adapters &&
+      (c.engine.prefill_bf16_partials || c.engine.prefill_fold_scales ||
+       c.engine.expert_gemm != "wide" || c.engine.expert_gemm_prefetch != 3 ||
+       !c.engine.expert_tile_list || c.engine.expert_gemm_pair ||
+       c.engine.embed_sharding != "replicated" || c.engine.collective_transport != "write"))
+    fail(what,
+         "engine.runtime_adapters requires the default expert/prefill/embedding/transport recipe");
   return c;
 }
 

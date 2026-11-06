@@ -123,6 +123,7 @@ std::string encode_journal_warm(
 // when they differed). The effective-config digest on the warm record
 // then holds by construction and stays as an assertion.
 struct WorldSettings {
+  std::string runtime_adapter_id;  // empty keeps ordinary serving unchanged
   std::string version;     // rank 0's dgpp version: a mixed-version world refuses to form
   std::string model;       // the HF model id ("" when rank 0 ran from a directory)
   std::string checkpoint;  // rank 0's checkpoint directory (a peer without an id uses it)
@@ -338,6 +339,7 @@ class JournalWriter {
   // member of a live-serving world — the fabric is broken, and this
   // says so loudly.
   void broadcast(const std::string& line);
+  void broadcast_payload(const std::string& payload, int timeout_ms);
 
   // The peer liveness watch (the death discipline above): a thread
   // polling every peer connection each `poll_ms`; the first closed or
@@ -409,6 +411,7 @@ class JournalReader {
   // Counterpart to gather_peer_payloads. The caller's control record selects
   // the binary phase; ordinary serving never calls these operations.
   bool send_payload(const std::string& payload, int timeout_ms);
+  std::string read_payload(size_t expected_bytes, int timeout_ms);
 
  private:
   dgpp::net::TcpConn conn_;

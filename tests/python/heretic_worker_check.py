@@ -4,6 +4,7 @@ Host mode needs only model config metadata and runs with CUDA hidden. GPU mode
 uses the tiny fixture from heretic_capture_test and pure-Python weight math.
 """
 import contextlib
+import hashlib
 import json
 import math
 import os
@@ -35,16 +36,16 @@ class Client:
 
     def request(self, op, **extra):
         self.seq += 1
-        return dict(schema="dgpp.heretic.rpc", version=1, seq=self.seq, op=op, **extra)
+        return dict(schema="dgpp.heretic.rpc", version=2, seq=self.seq, op=op, **extra)
 
-    def call(self, op, **extra):
+    def call(self, op, payload=b"", **extra):
         request = self.request(op, **extra)
         data = json.dumps(request).encode()
-        self.sock.sendall(struct.pack("<II", len(data), 0) + data)
+        self.sock.sendall(struct.pack("<II", len(data), len(payload)) + data + payload)
         nh, np = struct.unpack("<II", read(self.sock, 8))
         assert 0 < nh <= 65536 and np <= 64 * 1024 * 1024
         header, payload = json.loads(read(self.sock, nh)), read(self.sock, np)
-        assert header["seq"] == self.seq and header["op"] == op and header["state"] == "baseline"
+        assert header["seq"] == self.seq and header["op"] == op and header["state"] in ("baseline", "candidate")
         values, raw = {}, {}
         offset = 0
         for t in header["tensors"]:
@@ -127,7 +128,7 @@ def host(binary, metadata):
         path.write_text(json.dumps(config))
         malformed = [
             (struct.pack("<II", 65537, 0), "frame lengths"),
-            (struct.pack("<II", 1, 1), "frame lengths"),
+            (struct.pack("<II", 1, 64 * 1024 * 1024 + 1), "frame lengths"),
             ({"op": "capture", "token_ids": []}, "prompt token count"),
             ({"op": "capture", "token_ids": [True]}, "integer"),
             ({"op": "capture", "token_ids": [-1]}, "token ID"),
@@ -136,8 +137,12 @@ def host(binary, metadata):
             ({"op": "generate", "token_ids": [1], "max_new_tokens": 1, "stop_token_ids": [999999]}, "stop token"),
             ({"op": "install_adapter"}, "unsupported operation"),
             ({"op": "describe", "seq": 2}, "sequence mismatch"),
-            ({"op": "describe", "version": 2}, "version/schema"),
+            ({"op": "describe", "version": 1}, "version/schema"),
             ({"op": "describe", "surprise": True}, "unknown or duplicate"),
+            ({"op": "read_projection_rows", "target_id": "0/attn.o_proj/0", "row_begin": -1, "row_count": 1}, "outside target"),
+            ({"op": "read_projection_rows", "target_id": "0/attn.o_proj/0", "row_begin": 0, "row_count": 0}, "outside target"),
+            ({"op": "read_projection_rows", "target_id": "0/attn.o_proj/0", "row_begin": 0, "row_count": True}, "integer"),
+            ({"op": "read_projection_rows", "target_id": "0/router/0", "row_begin": 0, "row_count": 1}, "unknown projection"),
         ]
         for bad, error in malformed:
             with worker(binary, path) as (client, process, logs):
@@ -152,7 +157,145 @@ def host(binary, metadata):
                 assert process.wait(timeout=5) != 0
                 logs.seek(0)
                 assert error in logs.read().decode(), error
+        # Fingerprinting/staging validation stays host-only, before CUDA/model loading.
+        (model / "model.safetensors").write_bytes(b"immutable checkpoint fixture")
+        config["engine"]["runtime_adapters"] = True
+        path.write_text(json.dumps(config))
+        with worker(binary, path) as (client, process, logs):
+            desc = client.call("describe")[0]
+            base = client.call("checkpoint_identity")[0]["base"]
+            combined = b""
+            for entry in base["files"]:
+                content = (model / entry["name"]).read_bytes()
+                digest = hashlib.sha256(content).hexdigest()
+                assert entry["sha256"] == digest and entry["size"] == len(content)
+                combined += entry["name"].encode() + b"\0" + str(len(content)).encode() + b"\0" + digest.encode() + b"\n"
+            assert base["sha256"] == hashlib.sha256(combined).hexdigest()
+            manifest, payload, _, _ = candidate(desc, base, desc["catalog"]["targets"][0])
+            client.call("begin_candidate", payload=manifest)
+            client.call("stage_projection", index=0, payload=payload)
+            assert client.call("abort_candidate")[0]["epoch"] == 0
+            client.call("close")
+            assert process.wait(timeout=5) == 0
+        for mutation, error in (
+            (lambda m: m.update(world_size=4), "world size"),
+            (lambda m: m.update(environment_sha256="0"*64), "numerical environment"),
+            (lambda m: m["base"].update(sha256="0"*64), "fingerprint"),
+            (lambda m: m["projections"][0].update(rank=257), "rank must"),
+            (lambda m: m["projections"][0].update(input_features=1), "shape/module"),
+            (lambda m: m["projections"].append(m["projections"][0]), "unordered target"),
+            (lambda m: m.update(surprise=1), "unknown or duplicate"),
+        ):
+            broken = json.loads(manifest)
+            mutation(broken)
+            with worker(binary, path) as (client, process, logs):
+                try:
+                    client.call("begin_candidate", payload=json.dumps(broken).encode())
+                    raise AssertionError("invalid manifest accepted")
+                except (EOFError, ConnectionError):
+                    pass
+                assert process.wait(timeout=5) != 0
+                logs.seek(0)
+                assert error in logs.read().decode(), error
+        with worker(binary, path) as (client, process, logs):
+            client.call("begin_candidate", payload=manifest)
+            try:
+                client.call("stage_projection", index=0, payload=bytes(len(payload)))
+                raise AssertionError("corrupt factors accepted")
+            except (EOFError, ConnectionError):
+                pass
+            assert process.wait(timeout=5) != 0
+            logs.seek(0)
+            assert "SHA-256 mismatch" in logs.read().decode()
         print("worker host: opt-in, no CUDA, capabilities, bounds, sequences, fail-closed and owner cleanup passed")
+
+
+def check_weight_reads(client, targets, weights):
+    for t in targets:
+        height = t["output_features"]
+        result = []
+        for begin, count in ((0, 3), (3, height - 4), (height - 1, 1)):
+            result.extend(client.call("read_projection_rows", target_id=t["id"],
+                                      row_begin=begin, row_count=count)[1]["weight"])
+        assert result == [v for row in weights[t["id"]] for v in row], t["id"]
+
+
+def candidate(description, base, target, zero=False):
+    # Sparse dyadic factors hit every TP shard, with odd rank to exercise tails.
+    rank, width, height = 3, target["input_features"], target["output_features"]
+    a = [[0.0] * width for _ in range(rank)]
+    for r in range(rank):
+        for shard in range(description["catalog"]["world"]):
+            a[r][shard * (width // description["catalog"]["world"]) + r] = 0.5
+    b = [[0.0 if zero else (0.25 if (c + r) % 2 else -0.5) for r in range(rank)] for c in range(height)]
+    ab, bb = (struct.pack(f"<{len(m) * len(m[0])}f", *(v for row in m for v in row)) for m in (a, b))
+    p = dict(id=target["id"], module=target["module"], input_features=width, output_features=height,
+             rank=rank, a_name="base_model.model." + target["module"] + ".lora_A.weight",
+             b_name="base_model.model." + target["module"] + ".lora_B.weight",
+             a_sha256=hashlib.sha256(ab).hexdigest(), b_sha256=hashlib.sha256(bb).hexdigest())
+    manifest = json.dumps(dict(schema="dgpp.runtime_adapter", version=1, operation="additive_low_rank",
+        runtime="glm_dsa_eager_fp32_v1", environment_sha256=description["environment_sha256"], world_size=description["catalog"]["world"], base=base, projections=[p]),
+        separators=(",", ":")).encode()
+    return manifest, ab + bb, a, b
+
+
+def install(client, manifest, payload):
+    prior = client.call("begin_candidate", payload=manifest)[0]
+    staged = client.call("stage_projection", index=0, payload=payload)[0]
+    assert prior["epoch"] == staged["epoch"] and prior["candidate_id"] == staged["candidate_id"]
+    active = client.call("activate_candidate")[0]
+    assert active["epoch"] == prior["epoch"] + 1
+    assert active["candidate_id"] == hashlib.sha256(manifest).hexdigest() and active["state"] == "candidate"
+
+
+def check_runtime(client, desc):
+    base = client.call("checkpoint_identity")[0]["base"]
+    targets = desc["catalog"]["targets"]
+    selected = [targets[0], targets[1], next(t for t in targets if "shared_experts" in t["module"])]
+    for target in selected:
+        manifest, payload, a, b = candidate(desc, base, target)
+        zero_manifest, zero_payload, _, _ = candidate(desc, base, target, zero=True)
+        for length in (1, 3, 16, 33):
+            ids = [(i * 17 + 11) % desc["vocab_size"] for i in range(length)]
+            baseline = client.call("capture", token_ids=ids)
+            install(client, zero_manifest, zero_payload)
+            assert client.call("capture", token_ids=ids)[2] == baseline[2], "zero adapter changed capture"
+            client.call("reset")
+            install(client, manifest, payload)
+            adapted = client.call("capture", token_ids=ids)
+            key = target["id"]
+            assert adapted[2][key + ".input"] == baseline[2][key + ".input"], "adapter changed its own input"
+            x = baseline[1][key + ".input"]
+            z = [sum(v * w for v, w in zip(x, row)) for row in a]
+            delta = [sum(v * w for v, w in zip(z, row)) for row in b]
+            expected = [y + d for y, d in zip(baseline[1][key + ".output"], delta)]
+            if "shared_experts" not in target["module"]:
+                def bf16(v):
+                    bits = struct.unpack("<I", struct.pack("<f", v))[0]
+                    return bf16_from_bits((bits + 0x7fff + ((bits >> 16) & 1)) >> 16)
+                expected = [bf16(v) for v in expected]
+            actual = adapted[1][key + ".output"]
+            assert max(abs(x-y) for x,y in zip(expected, actual)) < 2e-6, (key, length, expected[:4], actual[:4])
+            assert adapted[2]["logits"] != baseline[2]["logits"], "nonzero adapter had no effect"
+            assert client.call("first_token_logits", token_ids=ids)[2]["logits"] == adapted[2]["logits"], "capture differs from serving walk"
+            generated = client.call("generate", token_ids=ids, max_new_tokens=4, stop_token_ids=[])[1]["token_ids"]
+            assert generated[0] == max(range(desc["vocab_size"]), key=adapted[1]["logits"].__getitem__)
+            assert client.call("generate", token_ids=ids, max_new_tokens=4, stop_token_ids=[])[1]["token_ids"] == generated
+            scores = client.call("score_tokens", token_ids=ids, continuation_ids=generated)[1]
+            assert all(scores["greedy"]), "scoring own greedy continuation disagrees"
+            logits = adapted[1]["logits"]
+            maximum = max(logits)
+            want = logits[generated[0]] - maximum - math.log(sum(math.exp(v - maximum) for v in logits))
+            assert abs(scores["logprobs"][0] - want) < 1e-6
+            # Aborting replacement retains the active candidate and epoch.
+            before = client.call("begin_candidate", payload=zero_manifest)[0]
+            after = client.call("abort_candidate")[0]
+            assert (before["epoch"], before["candidate_id"]) == (after["epoch"], after["candidate_id"])
+            assert client.call("capture", token_ids=ids)[2] == adapted[2]
+            reset = client.call("reset")[0]
+            assert reset["state"] == "baseline" and reset["candidate_id"] == ""
+            assert client.call("capture", token_ids=ids)[2] == baseline[2], "reset failed to restore baseline exactly"
+        print(f"runtime TP{desc['catalog']['world']} {key}: independent low-rank oracle, identity, abort, decode, reset passed")
 
 
 def gpu(binary, model):
@@ -160,12 +303,15 @@ def gpu(binary, model):
     oracle = json.loads((Path(model) / "worker_oracle.json").read_text())
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "cluster.json"
-        path.write_text(json.dumps(config_data(model)))
+        config = config_data(model)
+        config["engine"]["runtime_adapters"] = True
+        path.write_text(json.dumps(config))
         with worker(binary, path, gpu=True) as (client, process, logs):
             try:
                 description = client.call("describe")[0]
                 targets = description["catalog"]["targets"]
                 weights = {t["id"]: load_linear(entries, t["module"], t["output_features"], t["input_features"]) for t in targets}
+                check_weight_reads(client, targets, weights)
                 embed_shape, embeddings = load_bf16(entries, "model.embed_tokens.weight")
                 for length in (1, 3, 16, 33):
                     ids = [(i * 17 + 11) % description["vocab_size"] for i in range(length)]
@@ -189,6 +335,7 @@ def gpu(binary, model):
                     assert stopped[0]["stop_reason"] == "stop_token" and stopped[1]["token_ids"] == generated[:1]
                     assert client.call("first_token_logits", token_ids=ids)[2] == baseline[2]
                     print(f"worker fixture {Path(model).name}, tokens={length}: exact logits, projection oracle, generation and reset passed")
+                check_runtime(client, description)
                 client.call("close")
                 assert process.wait(timeout=10) == 0
             except BaseException:

@@ -51,6 +51,8 @@ struct ClusterConfig {
     // Opt in to the separate Heretic research tools. Ordinary serving does
     // not allocate capture/adapter buffers or change its execution path.
     bool heretic_research = false;
+    bool runtime_adapters = false;
+    std::string runtime_adapter_path;
     int max_concurrency = 8;
     int64_t kv_capacity = 8192;
     // The cache format: GLM-5.3's latent cache bf16 | fp8 | fp4; MiMo's

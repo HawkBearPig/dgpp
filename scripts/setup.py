@@ -30,10 +30,10 @@ import site_env
 ROOT = Path(__file__).resolve().parents[1]
 SSH_OPTIONS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "-o", "StrictHostKeyChecking=yes"]
 RUNTIME_PACKAGES = ["python3", "rdma-core", "libibverbs1", "ibverbs-providers", "libnl-3-200",
-                    "libnl-route-3-200", "libstdc++6", "libpcre2-8-0", "openssh-client",
+                    "libnl-route-3-200", "libstdc++6", "libssl3t64", "libpcre2-8-0", "openssh-client",
                     "openssh-server", "rsync", "curl", "jq", "iproute2", "coreutils"]
 BUILD_PACKAGES = ["git", "build-essential", "cmake", "pkg-config", "python3-venv",
-                  "libibverbs-dev", "libpcre2-dev", "poppler-utils"]
+                  "libibverbs-dev", "libssl-dev", "libpcre2-dev", "poppler-utils"]
 
 
 def ask(label, default=""):

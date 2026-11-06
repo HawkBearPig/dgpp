@@ -9,13 +9,16 @@
 #include <stdexcept>
 #include <string>
 
+#include "adapters/runtime.hpp"
 #include "common/cuda_check.hpp"
 #include "kernels/bf12_companions.hpp"
 #include "kernels/dsa.hpp"
 #include "kernels/glm_norm.hpp"
+#include "kernels/kernels.hpp"
 #include "kernels/packq_gemm.hpp"
 #include "kernels/scale_gemm.hpp"
-#include "kernels/kernels.hpp"
+#include "loaders/packq_quant.hpp"
+#include "models/glm_dsa/modification_targets.hpp"
 
 namespace dgpp {
 namespace {
@@ -350,7 +353,77 @@ size_t GlmDsaModel::bf12_plan_bytes(const GlmDsaTextConfig& cfg, int tp_rank, in
   return bytes;
 }
 
+std::vector<float> GlmDsaModel::research_projection_rows(const std::string& target_id,
+                                                         int row_begin, int row_count,
+                                                         bool enabled) {
+  if (!enabled) throw std::invalid_argument("weight reads require engine.heretic_research=true");
+  const auto targets = glm_dsa_modification_targets(cfg_, tp_rank(), tp_world());
+  const auto found = std::find_if(targets.begin(), targets.end(),
+                                  [&](const auto& t) { return t.id == target_id; });
+  if (found == targets.end())
+    throw std::invalid_argument("unknown projection target: " + target_id);
+  const auto& target = *found;
+  if (row_begin < 0 || row_count <= 0 || row_begin > target.output_features - row_count ||
+      static_cast<size_t>(row_count) * target.input_features >
+          (32u * 1024u * 1024u) / sizeof(float))
+    throw std::invalid_argument("projection row slice exceeds bounds or 32 MiB budget");
+  const auto& layer = loader_.load_layer(target.layer);
+  const uint16_t* bf16 = nullptr;
+  GlmPackedMatrix packed;
+  if (target.component == "attn.o_proj") {
+    bf16 = layer.attn.o_proj;
+    packed = layer.attn.o_proj_packed;
+  } else if (layer.moe) {
+    packed = layer.moe_w.shared[2];
+  } else {
+    bf16 = layer.dense.down;
+  }
+  const int64_t cols = target.input_end - target.input_begin;
+  std::vector<float> result(static_cast<size_t>(row_count) * cols);
+  DGPP_CUDA_OK(cudaStreamSynchronize(stream_));
+  if (packed.packed) {
+    if (packed.rows != target.output_features || packed.cols != cols ||
+        packed.bits != target.weight_bits || packed.scale_fmt != kPackedScaleBf16G64)
+      throw std::runtime_error("resident projection does not match the checkpoint catalog");
+    const size_t words_per_row = cols * packed.bits / 32;
+    const size_t scales_per_row = cols / packed_scale_group(packed.scale_fmt);
+    std::vector<uint32_t> words(row_count * words_per_row);
+    std::vector<uint16_t> scales(row_count * scales_per_row);
+    DGPP_CUDA_OK(cudaMemcpy(words.data(), packed.packed + row_begin * words_per_row,
+                            words.size() * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+    DGPP_CUDA_OK(cudaMemcpy(scales.data(), packed.scales + row_begin * scales_per_row,
+                            scales.size() * sizeof(uint16_t), cudaMemcpyDeviceToHost));
+    for (int r = 0; r < row_count; ++r)
+      for (int64_t c = 0; c < cols; ++c)
+        result[static_cast<size_t>(r) * cols + c] =
+            packq_decode(words.data(), scales.data(), cols, packed.bits, r, c, packed.scale_fmt);
+  } else {
+    if (!bf16 || target.weight_bits != 0)
+      throw std::runtime_error("resident projection has no checkpoint BF16 weight");
+    std::vector<uint16_t> bits(result.size());
+    DGPP_CUDA_OK(cudaMemcpy(bits.data(), bf16 + static_cast<size_t>(row_begin) * cols,
+                            bits.size() * sizeof(uint16_t), cudaMemcpyDeviceToHost));
+    std::transform(bits.begin(), bits.end(), result.begin(), bf16_bits_to_float);
+  }
+  return result;
+}
+
+void GlmDsaModel::set_runtime_adapter(std::unique_ptr<adapters::Runtime> adapter, bool enabled) {
+  if (!enabled)
+    throw std::invalid_argument("runtime adapters require engine.runtime_adapters=true");
+  if (mtp_ || max_session_requests() != 1 || session_pos_[0] != 0)
+    throw std::invalid_argument(
+        "runtime adapter installation requires idle concurrency one and MTP off");
+  DGPP_CUDA_OK(cudaStreamSynchronize(stream_));
+  session_close(0);
+  runtime_adapter_ = std::move(adapter);
+}
+
 GlmDsaModel::~GlmDsaModel() {
+  if (runtime_adapter_) {
+    cudaStreamSynchronize(stream_);
+    runtime_adapter_.reset();
+  }
   cudaFree(resid_);
   cudaFree(x_);
   cudaFree(y_);
@@ -685,7 +758,7 @@ void GlmDsaModel::enqueue_dense(const GlmDsaDenseMlpResident& d, const uint16_t*
                gemm_ws_bytes_, stream_);
 }
 
-template <bool Research>
+template <bool Research, bool Adapted>
 void GlmDsaModel::enqueue_layer(const GlmDsaLayerResident& r, int pool_layer, uint16_t* resid,
                                 int T, const WalkRows& rows, ResearchOutputs* research) {
   const int H = cfg_.hidden_size;
@@ -730,6 +803,12 @@ void GlmDsaModel::enqueue_layer(const GlmDsaLayerResident& r, int pool_layer, ui
   }
   if (rows.decode) prefetch_ffn_side(r);
   fold(attn_out, T, H, rows.capture);  // block boundary 1: o_proj's partial
+  if constexpr (Adapted) {
+    const int width = cfg_.num_attention_heads / tp_world() * cfg_.v_head_dim;
+    runtime_adapter_->project(r.layer, true, static_cast<const uint16_t*>(dsa_->debug_attn_out()),
+                              width, 0, T, stream_);
+    runtime_adapter_->add(r.layer, true, attn_out, T, stream_);
+  }
   if constexpr (Research) {
     const size_t width =
         static_cast<size_t>(cfg_.num_attention_heads / tp_world()) * cfg_.v_head_dim;
@@ -779,6 +858,18 @@ void GlmDsaModel::enqueue_layer(const GlmDsaLayerResident& r, int pool_layer, ui
       gemm_.set_bf12_wide(decode);
       enqueue_dense(r.dense, x_ + offset, count, ffn_out + offset);
     }
+    if constexpr (Adapted) {
+      if (runtime_adapter_->has(r.layer, false)) {
+        if (r.moe) {
+          const auto shared = moe_->shared_projection_input(count, rows.decode || decode);
+          runtime_adapter_->project(r.layer, false, shared.data, shared.stride, row0, count,
+                                    stream_);
+        } else {
+          runtime_adapter_->project(r.layer, false, dense_act_, cfg_.intermediate_size / tp_world(),
+                                    row0, count, stream_);
+        }
+      }
+    }
     if constexpr (Research) {
       if (row0 + count == T) {
         ProjectionCapture capture;
@@ -818,10 +909,15 @@ void GlmDsaModel::enqueue_layer(const GlmDsaLayerResident& r, int pool_layer, ui
   gemm_.set_bf12_wide(rows.decode);
   if (rows.decode) prefetch_attention_side(r.layer + 1);
   fold(ffn_out, T, H, rows.capture);  // block boundary 2: the sliced down projections
+  if constexpr (Adapted) runtime_adapter_->add(r.layer, false, ffn_out, T, stream_);
   if constexpr (Research) {
     // Dense outputs have the same replicated BF16 boundary as attention.
     // Shared-expert outputs stay separate FP32 partials for the coordinator.
-    if (!r.moe && tp_world() > 1) {
+    if constexpr (Adapted) {
+      if (r.moe)
+        runtime_adapter_->shared_capture(r.layer, research->projections.back().output, T, stream_);
+    }
+    if (!r.moe && (tp_world() > 1 || Adapted)) {
       std::vector<uint16_t> output(H);
       DGPP_CUDA_OK(cudaStreamSynchronize(stream_));
       DGPP_CUDA_OK(cudaMemcpy(output.data(), ffn_out + static_cast<size_t>(T - 1) * H,
@@ -842,8 +938,13 @@ void GlmDsaModel::flush_pending_add(uint16_t* resid, int T) {
   pending_add_ = nullptr;
 }
 
-template <bool Research>
+template <bool Research, bool Adapted>
 GlmDsaModel::Outputs GlmDsaModel::run_rows_impl(const RowRun& run, ResearchOutputs* research) {
+  if constexpr (Adapted) {
+    if (run.capture || run.num_spans > 1 || run.decode_spans > 0)
+      throw std::invalid_argument(
+          "runtime adapters require eager execution and one request per walk");
+  }
   const int T = run.T, req = run.req;
   if (pending_add_ != nullptr) throw std::logic_error("run_rows: a residual add is pending from an earlier walk");
   // The packed companions' wide launches are the decode batch's alone (a
@@ -907,7 +1008,7 @@ GlmDsaModel::Outputs GlmDsaModel::run_rows_impl(const RowRun& run, ResearchOutpu
         out.route_weights.emplace_back();
       }
     }
-    enqueue_layer<Research>(r, layer, resid_, T, rows, research);
+    enqueue_layer<Research, Adapted>(r, layer, resid_, T, rows, research);
     if constexpr (Research) {
       if (layer + 1 < cfg_.num_hidden_layers) {
         flush_pending_add(resid_, T);
@@ -988,6 +1089,7 @@ GlmDsaModel::Outputs GlmDsaModel::forward(const std::vector<int64_t>& token_ids,
 }
 
 GlmDsaModel::Outputs GlmDsaModel::run_rows(const RowRun& run) {
+  if (runtime_adapter_) return run_rows_impl<false, true>(run, nullptr);
   return run_rows_impl<false>(run, nullptr);
 }
 
@@ -1013,7 +1115,8 @@ GlmDsaModel::ResearchOutputs GlmDsaModel::research_forward(const std::vector<int
     run.T = static_cast<int>(ids.size());
     run.pos0 = 0;
     ResearchOutputs result;
-    result.prediction = run_rows_impl<true>(run, &result);
+    result.prediction = runtime_adapter_ ? run_rows_impl<true, true>(run, &result)
+                                         : run_rows_impl<true>(run, &result);
     session_close(0);
     return result;
   } catch (...) {

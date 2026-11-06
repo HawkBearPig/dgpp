@@ -825,6 +825,21 @@ GlmMoeLayer::SharedPrefillRow GlmMoeLayer::research_shared_prefill_last_row(int 
   return {d_act_ + row * stride, d_down_ + row * cfg_.hidden, width};
 }
 
+GlmMoeLayer::SharedProjectionInput GlmMoeLayer::shared_projection_input(int tokens,
+                                                                        bool decode) const {
+  if (tokens <= 0 || tokens > max_tokens_ || !has_shared() || !w_.shared_packq())
+    throw std::logic_error("runtime adapters require packed GLM shared-expert inputs");
+  const int width = static_cast<int>(w_.shared_packed[0].rows);
+  const int routed = routed_inter_of(w_, cfg_.n_experts);
+  if (decode) {
+    if (width > routed) throw std::logic_error("shared projection exceeds decode slot stride");
+    return {d_slot_act_ + static_cast<size_t>(cfg_.top_k) * routed, (cfg_.top_k + 1) * routed,
+            width};
+  }
+  const int stride = std::max(routed, width);
+  return {d_act_ + static_cast<size_t>(tokens) * cfg_.top_k * stride, stride, width};
+}
+
 void GlmMoeLayer::route_prefill_rows(const uint16_t* hidden, int r0, int rows, cudaStream_t stream) {
   if (rows <= 0) return;
   if (r0 < 0 || r0 + rows > max_tokens_) throw std::invalid_argument("GlmMoeLayer: router rows exceed max_tokens");

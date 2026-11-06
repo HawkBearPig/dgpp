@@ -73,6 +73,9 @@
 #include "models/glm_dsa/loader.hpp"
 
 namespace dgpp {
+namespace adapters {
+class Runtime;
+}
 
 class GlmDsaModel : public SessionModel<GlmDsaModel> {
  public:
@@ -133,6 +136,12 @@ class GlmDsaModel : public SessionModel<GlmDsaModel> {
   // A separate compiled walk: no capture branches/allocations in normal
   // serving. The caller passes the explicit cluster research flag.
   ResearchOutputs research_forward(const std::vector<int64_t>& token_ids, bool enabled);
+  // A bounded row slice of one immutable target, in this rank's input columns.
+  // Decode the resident representation to FP32 without rounding through BF16.
+  std::vector<float> research_projection_rows(const std::string& target_id, int row_begin,
+                                              int row_count, bool enabled);
+  void set_runtime_adapter(std::unique_ptr<adapters::Runtime> adapter, bool enabled);
+  bool has_runtime_adapter() const { return runtime_adapter_ != nullptr; }
   // A test's capture of the session walks too (the Qwen families' form):
   // every session prefill / step keeps its layer rows and DSA selections
   // (a sync per layer — diagnostics only). Process-wide.
@@ -191,6 +200,7 @@ class GlmDsaModel : public SessionModel<GlmDsaModel> {
   void restore_chain_state(int) {}
 
  private:
+  std::unique_ptr<adapters::Runtime> runtime_adapter_;
   static constexpr int kBlockTokens = 128;
   static constexpr int kPrefillChunkTokens = 2048;
   // No state families beside the pool's blocks: a 16-byte zero stamp keeps
@@ -232,9 +242,9 @@ class GlmDsaModel : public SessionModel<GlmDsaModel> {
     const int32_t* span_lens = nullptr;
     int num_spans = 0;
   };
-  template <bool Research>
+  template <bool Research, bool Adapted = false>
   Outputs run_rows_impl(const RowRun& run, ResearchOutputs* research);
-  template <bool Research>
+  template <bool Research, bool Adapted = false>
   void enqueue_layer(const GlmDsaLayerResident& r, int pool_layer, uint16_t* resid, int T,
                      const WalkRows& rows, ResearchOutputs* research = nullptr);
   // A layer's closing residual add (its folded FFN output) is deferred into

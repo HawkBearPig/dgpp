@@ -226,6 +226,12 @@ class GlmMoeLayer {
   // shared segment follows the routed segments; its down output is FP32
   // before accumulation. Valid only until the next enqueue on this scratch.
   SharedPrefillRow research_shared_prefill_last_row(int tokens) const;
+  struct SharedProjectionInput {
+    const uint16_t* data;
+    int stride, width;
+  };
+  // Existing packed shared-expert activation rows, consumed only by an adapter.
+  SharedProjectionInput shared_projection_input(int tokens, bool decode) const;
 
  private:
   void check_expert_geometry() const;

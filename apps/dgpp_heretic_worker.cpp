@@ -8,18 +8,23 @@
 #include <cstdio>
 #include <fstream>
 #include <memory>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <string>
 #include <sys/socket.h>
+#include <tuple>
 #include <unistd.h>
 #include <vector>
 
+#include "adapters/artifact.hpp"
+#include "adapters/runtime.hpp"
 #include "common/cuda_check.hpp"
 #include "common/process_memory.hpp"
 #include "heretic_metadata.hpp"
 #include "heretic_world.hpp"
 #ifdef DGPP_HERETIC_FABRIC
+#include "adapters/bus_sum.hpp"
 #include "dgpp_version.hpp"
 #include "engine/graph_engine.hpp"
 #endif
@@ -88,10 +93,13 @@ struct Reply {
     const auto* begin = reinterpret_cast<const uint8_t*>(data.data());
     payload.insert(payload.end(), begin, begin + bytes);
   }
-  void send_to(int fd, int64_t seq, const std::string& op) {
-    auto header = "{\"schema\":\"dgpp.heretic.rpc\",\"version\":1,\"seq\":" + std::to_string(seq) +
-                  ",\"op\":" + quoted(op) + ",\"state\":\"baseline\",\"tensors\":[" + tensors +
-                  "]" + extra + "}";
+  void send_to(int fd, int64_t seq, const std::string& op, int64_t epoch,
+               const std::string& candidate_id) {
+    auto header = "{\"schema\":\"dgpp.heretic.rpc\",\"version\":2,\"seq\":" + std::to_string(seq) +
+                  ",\"op\":" + quoted(op) + ",\"epoch\":" + std::to_string(epoch) +
+                  ",\"candidate_id\":" + quoted(candidate_id) +
+                  ",\"state\":" + quoted(candidate_id.empty() ? "baseline" : "candidate") +
+                  ",\"tensors\":[" + tensors + "]" + extra + "}";
     require(header.size() <= kHeaderLimit, "response header exceeds budget");
     std::array<uint32_t, 2> lengths{static_cast<uint32_t>(header.size()),
                                     static_cast<uint32_t>(payload.size())};
@@ -101,7 +109,7 @@ struct Reply {
   }
 };
 Reply assemble_prediction(const std::vector<std::string>& pieces, const dgpp::GlmDsaTextConfig& cfg,
-                          int world, bool capture) {
+                          int world, bool capture, bool adapted) {
   require(pieces.size() == static_cast<size_t>(world), "incomplete research world reply");
   const auto targets = dgpp::glm_dsa_modification_targets(cfg, 0, world);
   std::vector<float> logits;
@@ -132,7 +140,7 @@ Reply assemble_prediction(const std::vector<std::string>& pieces, const dgpp::Gl
         auto y = reader.take<float>(t.output_features);
         if (rank == 0)
           outputs[i] = std::move(y);
-        else if (t.module.find(".shared_experts.") != std::string::npos) {
+        else if (!adapted && t.module.find(".shared_experts.") != std::string::npos) {
           // Canonical FP32 rank-order sum of actual shared down partials.
           for (size_t j = 0; j < y.size(); ++j) outputs[i][j] += y[j];
         } else
@@ -176,8 +184,9 @@ void validate_config(const std::string& path, const dgpp::serve::ClusterConfig& 
   const std::string bytes{std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>()};
   const auto parsed = dgpp::minijson::parse_document(bytes);
   fields(parsed.root.at("engine"),
-         {"heretic_research", "max_concurrency", "mtp", "decode_graph", "prefix_cache_gib",
-          "kv_capacity", "kv_dtype", "bf16_weights", "attention_weights", "default_max_tokens"});
+         {"heretic_research", "runtime_adapters", "max_concurrency", "mtp", "decode_graph",
+          "prefix_cache_gib", "kv_capacity", "kv_dtype", "bf16_weights", "attention_weights",
+          "default_max_tokens"});
 }
 }  // namespace
 
@@ -237,12 +246,30 @@ int main(int argc, char** argv) {
         dgpp::heretic::file_bytes(config_path) +
         dgpp::heretic::file_bytes(checkpoint + "/config.json") +
         dgpp::heretic::file_bytes(checkpoint + "/model.safetensors.index.json", true);
+    const auto raw_config =
+        dgpp::minijson::parse_document(dgpp::heretic::file_bytes(checkpoint + "/config.json"));
+    if (const auto* quant = raw_config.root.find("quantization_config");
+        quant && quant->is_object()) {
+      const auto* method = quant->find("quant_method");
+      if (method && string(*method) == "dgpp_mixed346") {
+        for (const auto& [block, key, fallback] :
+             {std::tuple{"baseline", "baseline_config_file", "baseline-quantization-config.json"},
+              std::tuple{"recipe", "recipe_file", "quantization-recipe.json"}}) {
+          if (const auto* inline_value = quant->find(block);
+              inline_value && !inline_value->is_null())
+            continue;
+          const auto* name = quant->find(key);
+          identity_material +=
+              dgpp::heretic::file_bytes(checkpoint + "/" + (name ? string(*name) : fallback));
+        }
+      }
+    }
     const auto revision = std::filesystem::path(checkpoint).filename().string();
     if (revision.size() == 40 &&
         revision.find_first_not_of("0123456789abcdef") == std::string::npos)
       identity_material += revision;
     identity_material += dgpp::heretic::binary_digest();
-    identity_material += dgpp::heretic::numerical_environment();
+    identity_material += dgpp::adapters::numerical_environment();
 #ifdef DGPP_HERETIC_FABRIC
     identity_material += DGPP_VERSION;
     identity_material += DGPP_GIT_SHA;
@@ -258,8 +285,26 @@ int main(int argc, char** argv) {
     dgpp::heretic::ResearchWorld ranks(rank, world, fd, cluster,
                                        dgpp::serve::config_digest(identity_material), op_log);
     std::unique_ptr<dgpp::GlmDsaModel> model;
+    std::optional<dgpp::adapters::CheckpointIdentity> base_identity;
+    std::optional<dgpp::adapters::Manifest> staged;
+    int64_t epoch = 0;
+    std::string candidate_id;
+    auto identity = [&]() -> const dgpp::adapters::CheckpointIdentity& {
+      require(cluster.engine.runtime_adapters,
+              "checkpoint identity requires engine.runtime_adapters=true");
+      if (!base_identity) {
+        base_identity = dgpp::adapters::fingerprint_checkpoint(checkpoint);
+        const auto peers = ranks.gather(base_identity->sha256);
+        for (const auto& peer : peers)
+          require(peer == base_identity->sha256, "checkpoint bytes disagree across ranks");
+        ranks.barrier();
+      }
+      base_identity->check_unchanged(checkpoint);
+      return *base_identity;
+    };
     auto load = [&]() -> dgpp::GlmDsaModel& {
       if (!model) {
+        if (cluster.engine.runtime_adapters) (void)identity();
         const auto plan = dgpp::GlmDsaModel::plan_memory(cfg, max_prompt, context, rank, world,
                                                          dgpp::GlmDsaResidency::Resident, 1, false,
                                                          1, dgpp::LatentFormat::kBf16, true);
@@ -302,6 +347,7 @@ int main(int argc, char** argv) {
         model = std::make_unique<dgpp::GlmDsaModel>(
             cfg, checkpoint, max_prompt, context, dgpp::GlmDsaResidency::Resident, boundary, rank,
             world, 1, false, 1, dgpp::LatentFormat::kBf16, true);
+        if (base_identity) base_identity->check_unchanged(checkpoint);
         ranks.barrier();  // no rank enters its first collective until every model is loaded
         dgpp::log_memory_ledger("heretic rank " + std::to_string(rank) + " ready");
       }
@@ -309,7 +355,7 @@ int main(int argc, char** argv) {
     };
     try {
       for (int64_t sequence = 1;; ++sequence) {
-        std::string header;
+        std::string header, payload;
         if (ranks.head()) {
           std::array<uint32_t, 2> lengths{};
           char peek;
@@ -319,45 +365,149 @@ int main(int argc, char** argv) {
           } while (n < 0 && errno == EINTR);
           if (n == 0) return 0;
           transfer(fd, lengths.data(), sizeof(lengths), false);
-          require(lengths[0] > 0 && lengths[0] <= kHeaderLimit && lengths[1] == 0,
+          require(lengths[0] > 0 && lengths[0] <= kHeaderLimit && lengths[1] <= kPayloadLimit,
                   "invalid request frame lengths");
           header.resize(lengths[0]);
           transfer(fd, header.data(), header.size(), false);
+          payload.resize(lengths[1]);
+          transfer(fd, payload.data(), payload.size(), false);
         }
-        if (!ranks.command(&header)) return 0;
+        if (!ranks.command(&header, &payload)) return 0;
         ranks.active(true);
         const auto parsed = dgpp::minijson::parse_document(header);
         const auto& request = parsed.root;
         const auto op = string(request.at("op"));
         auto allowed = std::set<std::string>{"schema", "version", "seq", "op"};
-        if (op == "first_token_logits" || op == "capture" || op == "generate")
+        if (op == "first_token_logits" || op == "capture" || op == "generate" ||
+            op == "score_tokens")
           allowed.insert("token_ids");
+        if (op == "score_tokens") allowed.insert("continuation_ids");
         if (op == "generate") {
           allowed.insert("max_new_tokens");
           allowed.insert("stop_token_ids");
         }
+        if (op == "read_projection_rows") {
+          allowed.insert("target_id");
+          allowed.insert("row_begin");
+          allowed.insert("row_count");
+        }
+        if (op == "stage_projection") allowed.insert("index");
         fields(request, allowed);
+        require(payload.empty() || op == "begin_candidate" || op == "stage_projection",
+                "unexpected request payload");
+        require(!staged || op == "stage_projection" || op == "activate_candidate" ||
+                    op == "abort_candidate" || op == "reset" || op == "close",
+                "candidate staging must finish before another operation");
         require(string(request.at("schema")) == "dgpp.heretic.rpc" &&
-                    integer(request.at("version")) == 1 && integer(request.at("seq")) == sequence,
+                    integer(request.at("version")) == 2 && integer(request.at("seq")) == sequence,
                 "protocol version/schema/sequence mismatch");
         Reply reply;
         if (op == "describe") {
           (void)ranks.gather({});
-          reply.extra = ",\"catalog\":" + catalog +
-                        ",\"capabilities\":[\"describe_targets\",\"first_token_logits\","
-                        "\"capture_last_token\",\"generate_greedy\"],\"vocab_size\":" +
-                        std::to_string(cfg.vocab_size) +
-                        ",\"hidden_size\":" + std::to_string(cfg.hidden_size) +
-                        ",\"context_limit\":" + std::to_string(context) +
-                        ",\"max_prompt_tokens\":" + std::to_string(max_prompt) +
-                        ",\"max_new_tokens\":" + std::to_string(cluster.engine.default_max_tokens);
+          reply.extra =
+              ",\"catalog\":" + catalog +
+              ",\"capabilities\":[\"describe_targets\",\"first_token_logits\","
+              "\"capture_last_token\",\"generate_greedy\",\"read_projection_rows\",\"score_"
+              "tokens\"" +
+              std::string(cluster.engine.runtime_adapters ? ",\"runtime_adapters\"" : "") +
+              "],\"vocab_size\":" + std::to_string(cfg.vocab_size) +
+              ",\"hidden_size\":" + std::to_string(cfg.hidden_size) +
+              ",\"context_limit\":" + std::to_string(context) +
+              ",\"max_prompt_tokens\":" + std::to_string(max_prompt) +
+              ",\"max_new_tokens\":" + std::to_string(cluster.engine.default_max_tokens) +
+              ",\"environment_sha256\":" +
+              quoted(dgpp::adapters::sha256(dgpp::adapters::numerical_environment())) +
+              ",\"worker_sha256\":" + quoted(dgpp::adapters::file_sha256("/proc/self/exe"));
+        } else if (op == "checkpoint_identity") {
+          reply.extra = ",\"base\":" + identity().json();
+          ranks.barrier();
+        } else if (op == "begin_candidate") {
+          staged = dgpp::adapters::parse_manifest(payload, cfg, identity(), world);
+          ranks.barrier();
+        } else if (op == "stage_projection") {
+          require(cluster.engine.runtime_adapters && staged.has_value(), "no candidate is staged");
+          const auto index = integer(request.at("index"));
+          require(index >= 0 && static_cast<size_t>(index) < staged->projections.size(),
+                  "invalid projection index");
+          auto& p = staged->projections[index];
+          const size_t a_bytes = p.rank * p.target.input_features * sizeof(float);
+          const size_t b_bytes = p.rank * p.target.output_features * sizeof(float);
+          require(payload.size() == a_bytes + b_bytes, "projection payload size mismatch");
+          dgpp::adapters::set_factors(p, payload.data(), a_bytes, payload.data() + a_bytes,
+                                      b_bytes);
+          ranks.barrier();
+        } else if (op == "activate_candidate") {
+          require(cluster.engine.runtime_adapters && staged.has_value(), "no candidate is staged");
+          auto& m = load();
+          (void)identity();
+          const size_t bytes = dgpp::adapters::Runtime::factor_bytes(*staged, world);
+          const size_t available = dgpp::host_memory_available_bytes();
+          require(available > kMemoryReserve && bytes < available - kMemoryReserve,
+                  "runtime adapter exceeds available memory reserve");
+          dgpp::adapters::SumFp32 sum;
+#ifdef DGPP_HERETIC_FABRIC
+          if (bus)
+            sum = dgpp::adapters::bus_sum(
+                *bus, rank, world,
+                std::max<size_t>(max_prompt * dgpp::adapters::kMaxAdapterRank, cfg.hidden_size),
+                dgpp::heretic::kWorldDeadlineMs);
+#endif
+          auto adapter = std::make_unique<dgpp::adapters::Runtime>(
+              *staged, rank, world, max_prompt, cfg.hidden_size, cfg.num_hidden_layers,
+              std::move(sum), cluster.engine.runtime_adapters);
+          ranks.barrier();
+          m.set_runtime_adapter(std::move(adapter), cluster.engine.runtime_adapters);
+          candidate_id = staged->id;
+          staged.reset();
+          ++epoch;
+          ranks.barrier();
+        } else if (op == "abort_candidate" || op == "reset") {
+          require(cluster.engine.runtime_adapters, "runtime adapters are disabled");
+          staged.reset();
+          if (op == "reset") {
+            if (model) model->set_runtime_adapter(nullptr, cluster.engine.runtime_adapters);
+            candidate_id.clear();
+            ++epoch;
+          }
+          ranks.barrier();
+        } else if (op == "read_projection_rows") {
+          const auto id = string(request.at("target_id"));
+          const auto targets = dgpp::glm_dsa_modification_targets(cfg, 0, world);
+          const auto t = std::find_if(targets.begin(), targets.end(),
+                                      [&](const auto& t) { return t.id == id; });
+          require(t != targets.end(), "unknown projection target");
+          const auto begin = integer(request.at("row_begin")),
+                     rows = integer(request.at("row_count"));
+          require(begin >= 0 && rows > 0 && rows <= t->output_features &&
+                      begin <= t->output_features - rows,
+                  "projection row slice outside target");
+          require(rows <= (32 * 1024 * 1024) / (4 * t->input_features),
+                  "projection slice exceeds 32 MiB budget");
+          std::string wire;
+          dgpp::heretic::append_values(wire, load().research_projection_rows(
+                                                 id, begin, rows, cluster.engine.heretic_research));
+          const auto pieces = ranks.gather(wire);
+          if (ranks.head()) {
+            const size_t cols = t->input_features / world;
+            std::vector<float> weights(rows * t->input_features);
+            for (int peer = 0; peer < world; ++peer) {
+              dgpp::heretic::TensorReader reader(pieces[peer]);
+              const auto local = reader.take<float>(rows * cols);
+              reader.finish();
+              for (int64_t r = 0; r < rows; ++r)
+                std::copy_n(local.data() + r * cols, cols,
+                            weights.data() + r * t->input_features + peer * cols);
+            }
+            reply.tensor("weight", "float32", weights, {rows, t->input_features});
+          }
         } else if (op == "close") {
           ranks.active(false);
           (void)ranks.gather({});
-          if (ranks.head()) reply.send_to(fd, sequence, op);
+          if (ranks.head()) reply.send_to(fd, sequence, op, epoch, candidate_id);
           return 0;
         } else {
-          require(op == "first_token_logits" || op == "capture" || op == "generate",
+          require(op == "first_token_logits" || op == "capture" || op == "generate" ||
+                      op == "score_tokens",
                   "unsupported operation");
           const auto& tokens = request.at("token_ids");
           require(tokens.is_array() && !tokens.items().empty() &&
@@ -369,7 +519,58 @@ int main(int argc, char** argv) {
             require(id >= 0 && id < cfg.vocab_size, "invalid token ID");
             ids.push_back(id);
           }
-          if (op == "generate") {
+          if (op == "score_tokens") {
+            const auto& continuation = request.at("continuation_ids");
+            require(continuation.is_array() && !continuation.items().empty() &&
+                        continuation.items().size() <= 2048 &&
+                        continuation.items().size() <= static_cast<size_t>(context) - ids.size(),
+                    "continuation exceeds score token budget");
+            std::vector<int64_t> expected;
+            for (const auto& value : continuation.items()) {
+              const auto token = integer(value);
+              require(token >= 0 && token < cfg.vocab_size, "invalid continuation token ID");
+              expected.push_back(token);
+            }
+            auto& m = load();
+            auto out = m.session_prefill(0, ids);
+            std::vector<float> logprobs;
+            std::vector<int64_t> greedy;
+            for (size_t i = 0; i < expected.size(); ++i) {
+              std::string wire;
+              dgpp::heretic::append_values(wire, out.logits);
+              const auto pieces = ranks.gather(wire);
+              if (ranks.head()) {
+                std::vector<float> logits;
+                for (int peer = 0; peer < world; ++peer) {
+                  const auto sharding = world == 1 ? dgpp::GlmDsaHeadSharding::Full
+                                                   : dgpp::GlmDsaHeadSharding::VocabSharded;
+                  dgpp::heretic::TensorReader tensor(pieces[peer]);
+                  const auto shard = tensor.take<float>(
+                      dgpp::GlmDsaLayerStream::lm_vocab_count(cfg, peer, world, sharding));
+                  tensor.finish();
+                  logits.insert(logits.end(), shard.begin(), shard.end());
+                }
+                require(logits.size() == static_cast<size_t>(cfg.vocab_size),
+                        "score logits shape mismatch");
+                for (float v : logits) require(std::isfinite(v), "non-finite score logits");
+                const auto best = std::max_element(logits.begin(), logits.end());
+                double sum = 0;
+                for (float value : logits) sum += std::exp(static_cast<double>(value) - *best);
+                logprobs.push_back(static_cast<double>(logits[expected[i]]) - *best -
+                                   std::log(sum));
+                greedy.push_back(best - logits.begin() == expected[i]);
+              }
+              ranks.token(expected[i]);
+              if (i + 1 < expected.size()) out = m.session_step(0, expected[i]);
+            }
+            m.session_close(0);
+            ranks.barrier();
+            if (ranks.head()) {
+              reply.tensor("logprobs", "float32", logprobs,
+                           {static_cast<int64_t>(expected.size())});
+              reply.tensor("greedy", "int64", greedy, {static_cast<int64_t>(expected.size())});
+            }
+          } else if (op == "generate") {
             const auto count = integer(request.at("max_new_tokens"));
             require(count > 0 && count <= cluster.engine.default_max_tokens &&
                         count <= context - static_cast<int64_t>(ids.size()),
@@ -432,11 +633,13 @@ int main(int argc, char** argv) {
               dgpp::heretic::append_values(wire, out.logits);
             }
             const auto pieces = ranks.gather(wire);
-            if (ranks.head()) reply = assemble_prediction(pieces, cfg, world, op == "capture");
+            if (ranks.head())
+              reply =
+                  assemble_prediction(pieces, cfg, world, op == "capture", m.has_runtime_adapter());
           }
         }
         ranks.active(false);
-        if (ranks.head()) reply.send_to(fd, sequence, op);
+        if (ranks.head()) reply.send_to(fd, sequence, op, epoch, candidate_id);
       }
     } catch (const std::exception& e) {
       // Never unwind through a CUDA destructor after a rank/collective failure:
