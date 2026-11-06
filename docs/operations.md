@@ -12,8 +12,9 @@ For LoRA adapter loading or access to logits and activations, see
 uses `engine.runtime_adapters=true` and `engine.runtime_adapter_path`; the
 launcher stages the bundle on every node, and each server validates it against
 the base checkpoint. Changing the adapter requires restarting the serving world.
-Current execution restrictions include eager decode, BF16 KV and disabled
-speculation and prefix caching; check them before adapting a serving template.
+The shipped Mixed346 template retains its graphs, MTP, prefix caching and
+memory formats with the adapter flag and path added. The guide lists other
+supported settings and compatibility bounds.
 
 Inspection and tensor capture use a separate worker with
 `engine.heretic_research=true`. Inspection reads metadata only; the worker

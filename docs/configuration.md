@@ -205,12 +205,11 @@ logits does not require `runtime_adapters`. The research flag has no effect on
 ordinary serving execution. With runtime adapters disabled, serving allocates
 no adapter buffers and runs no adapter kernels or collectives.
 
-Adapter serving currently requires eager execution, no speculative decoding or
-prefix/NVMe caching, BF16 KV, checkpoint weight formats and replicated
-embeddings. Adding the two adapter settings to an optimized deployment may
-therefore require changing its execution settings as well. The adapter does
-not impose the research worker's concurrency or prompt-length limits on
-serving; size the serving slots and shared KV pool below for the workload.
+Adapter serving supports CUDA graphs, MTP, prefix caching, FP8 KV, BF12 weight
+storage and vocabulary-sharded embeddings. The shipped Mixed346 deployment
+needs only the adapter flag and path added; its other settings stay unchanged.
+The adapter does not impose the research worker's concurrency or prompt-length
+limits on serving. Size the serving slots and shared KV pool below for the workload.
 
 ## Request capacity and memory
 

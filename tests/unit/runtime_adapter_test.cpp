@@ -53,6 +53,13 @@ DGPP_TEST(runtime_adapter_fingerprint_and_bundle_roundtrip) {
   const auto loaded = load_bundle(dir.string(), cfg, base, 1);
   require(loaded.id == sha256(manifest) && loaded.projections.size() == 1, "bundle identity");
   require(loaded.projections[0].a == a && loaded.projections[0].b == b, "bundle factors unchanged");
+  auto native_manifest = manifest;
+  native_manifest.replace(native_manifest.find("glm_dsa_eager_fp32_v1"),
+                          std::string("glm_dsa_eager_fp32_v1").size(), "glm_dsa_fp32_v1");
+  write(dir / "dgpp_adapter.json", native_manifest);
+  const auto native = load_bundle(dir.string(), cfg, base, 1);
+  require(native.projections[0].a == a && native.projections[0].b == b,
+          "native and legacy runtime names load identical factors");
   auto corrupt = tensors;
   corrupt.back() ^= 1;
   write(dir / "adapter_model.safetensors", corrupt);

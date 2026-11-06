@@ -58,7 +58,12 @@ inline const char* tiny_config_json(int layers = 5, int dense = 1, bool mtp = tr
                                     bool m346 = false) {
   static std::string s;
   const std::string last = std::to_string(layers - 1);
-  const std::string range = "[" + std::to_string(dense) + "-" + last + "]";
+  std::string range = "(?:";
+  for (int layer = dense; layer < layers; ++layer) {
+    if (layer > dense) range += "|";
+    range += std::to_string(layer);
+  }
+  range += ")";
   const std::string attn_bits = std::to_string(attention_bits);
   if (moe_inter == 0) moe_inter = (nf4i8 || m346) ? 512 : 256;
   const std::string head = std::string(R"json({

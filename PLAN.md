@@ -10,8 +10,8 @@ generation, and last-token residual/projection capture on worlds 1, 2 and 4,
 with native int8/Mixed346 fixture checks and a four-node full-checkpoint probe.
 Protocol v2 supplies bounded weight reads, likelihood scoring and atomic
 low-rank candidate activation/reset. Ordinary serving loads checkpoint-bound
-adapter bundles behind `engine.runtime_adapters`, using the existing eager
-serving concurrency and grouped/mixed model walks;
+adapter bundles behind `engine.runtime_adapters`, using the existing eager and
+graph serving paths, MTP, prefix caching and grouped/mixed model walks;
 the adapter does not impose a separate request-slot limit. The fitting worker
 remains serial. Bounded fitting trials and ordinary-serving
 adapter reload pass on the full four-node checkpoint; adapter quality needs

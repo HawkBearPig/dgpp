@@ -21,13 +21,31 @@ size_t Runtime::factor_bytes(const Manifest& manifest, int world) {
     bytes += p.rank * (p.target.input_features / world + p.target.output_features) * sizeof(float);
   return bytes;
 }
+size_t Runtime::serving_scratch_bytes(const Manifest& manifest, int world, int max_rows,
+                                      int hidden) {
+  int max_rank = 1;
+  for (const auto& p : manifest.projections) max_rank = std::max(max_rank, p.rank);
+  const size_t values = static_cast<size_t>(max_rows) * max_rank;
+  return values * sizeof(float) + static_cast<size_t>(hidden) * sizeof(float) +
+         (world > 1 ? values * world * 4 * sizeof(uint16_t) : 0);
+}
+int Runtime::extra_graph_nodes(const Manifest& manifest, int world, int hidden) {
+  if (world == 1) return 0;
+  int nodes = 0;
+  for (const auto& p : manifest.projections) nodes += (world * 4 * p.rank + hidden - 1) / hidden;
+  return nodes;
+}
 Runtime::Runtime(const Manifest& manifest, int rank, int world, int max_rows, int hidden,
-                 int layers, SumFp32 sum, bool enabled)
-    : id_(manifest.id), max_rows_(max_rows), hidden_(hidden), sum_(std::move(sum)) {
+                 int layers, SumFp32 sum, bool enabled, SumFp32Stream stream_sum)
+    : id_(manifest.id),
+      max_rows_(max_rows),
+      hidden_(hidden),
+      sum_(std::move(sum)),
+      stream_sum_(std::move(stream_sum)) {
   if (!enabled)
     throw std::invalid_argument("runtime adapters require engine.runtime_adapters=true");
-  if (rank < 0 || rank >= world || manifest.world != world || max_rows < 1 || max_rows > 2048 ||
-      hidden < 1 || layers < 1 || (world > 1 && !sum_))
+  if (rank < 0 || rank >= world || manifest.world != world || max_rows < 1 || hidden < 1 ||
+      layers < 1 || (world > 1 && !sum_ && !stream_sum_))
     throw std::invalid_argument("invalid runtime adapter geometry/transport");
   factors_.resize(static_cast<size_t>(layers) * 2);
   int max_rank = 1;
@@ -86,11 +104,18 @@ void Runtime::project(int layer, bool attention, const uint16_t* x, int stride, 
   low_rank_project(x, stride, f->a, device_z_ + static_cast<size_t>(row_begin) * f->rank, rows,
                    f->inputs, f->rank, stream);
 }
-void Runtime::add(int layer, bool attention, uint16_t* output, int rows, cudaStream_t stream) {
+void Runtime::add(int layer, bool attention, uint16_t* output, int rows, cudaStream_t stream,
+                  bool capture) {
   const auto* f = factor(layer, attention);
   if (!f) return;
-  DGPP_CUDA_OK(cudaStreamSynchronize(stream));
-  if (sum_) sum_(host_z_, static_cast<size_t>(rows) * f->rank);
+  if (rows < 1 || rows > max_rows_) throw std::invalid_argument("runtime adapter output rows");
+  if (stream_sum_) {
+    stream_sum_(device_z_, static_cast<size_t>(rows) * f->rank, stream, capture);
+  } else if (sum_) {
+    if (capture) throw std::invalid_argument("runtime adapter transport cannot record a graph");
+    DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+    sum_(host_z_, static_cast<size_t>(rows) * f->rank);
+  }
   low_rank_add(device_z_, f->b, output, rows, hidden_, f->rank, stream);
 }
 void Runtime::shared_capture(int layer, std::vector<float>& output, int rows, cudaStream_t stream) {

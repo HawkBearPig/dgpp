@@ -3335,15 +3335,16 @@ int main(int argc, char** argv) {
   // that they did. Rank-0-only knobs (the HTTP port, the connection cap,
   // the sampling defaults) are left out.
   if (runtime_adapters &&
-      (mtp || decode_graph || prefix_cache_gib != 0 || kv_dtype != "bf16" ||
-       bf16_weights != "checkpoint" || attention_weights != "checkpoint" || !dflash_model.empty() ||
-       nvme_cache || lookup_draft || prefill_bf16_partials || prefill_fold_scales ||
-       expert_gemm != "wide" || expert_gemm_prefetch != 3 || !expert_tile_list ||
-       expert_gemm_pair || embed_sharding != "replicated" || collective_transport != "write")) {
+      ((kv_dtype != "bf16" && kv_dtype != "fp8") ||
+       (bf16_weights != "checkpoint" && bf16_weights != "bf12") ||
+       attention_weights != "checkpoint" || !dflash_model.empty() || nvme_cache || lookup_draft ||
+       prefill_bf16_partials || prefill_fold_scales || expert_gemm != "wide" ||
+       expert_gemm_prefetch != 3 || !expert_tile_list || expert_gemm_pair ||
+       collective_transport != "write")) {
     DGPP_LOG_ERROR(
-        "engine.runtime_adapters requires eager execution, no drafts/prefix cache, BF16 KV and "
-        "checkpoint "
-        "weights, and the default expert/prefill/embedding/transport recipe");
+        "engine.runtime_adapters requires BF16/FP8 KV, checkpoint/BF12 weights, checkpoint "
+        "attention, no external/lookup drafts or NVMe cache, and the default "
+        "expert/prefill/transport recipe");
     return 2;
   }
   const std::string effective_config = canonical();
@@ -3733,31 +3734,46 @@ int main(int argc, char** argv) {
         return 1;
       }
     }
+    const int adapter_graph_nodes =
+        runtime_manifest && decode_graph
+            ? dgpp::adapters::Runtime::extra_graph_nodes(
+                  *runtime_manifest, world,
+                  dynamic_cast<GlmDsaFamily*>(family.get())->cfg.hidden_size)
+            : 0;
     const auto install_runtime = [&](dgpp::net::CollectiveBus* bus) {
       if (!runtime_manifest) return;
       adapter_base->check_unchanged(ckpt);
       auto* glm = dynamic_cast<GlmDsaFamily*>(family.get());
       if (!glm || !glm->model)
         throw std::logic_error("runtime adapter requires a loaded GLM DSA model");
-      dgpp::adapters::SumFp32 sum;
+      dgpp::adapters::SumFp32Stream sum;
       if (world > 1) {
         if (!bus) throw std::logic_error("runtime adapter has no fabric");
-        sum = dgpp::adapters::bus_sum(
-            *bus, rank, world,
-            std::max<size_t>(forward_rows * dgpp::adapters::kMaxAdapterRank, glm->cfg.hidden_size),
-            60000);
+        int max_rank = 1;
+        for (const auto& projection : runtime_manifest->projections)
+          max_rank = std::max(max_rank, projection.rank);
+        sum = dgpp::adapters::bus_sum_stream(*bus, rank, world,
+                                             static_cast<size_t>(forward_rows) * max_rank, 60000);
       }
       glm->model->set_runtime_adapter(
           std::make_unique<dgpp::adapters::Runtime>(
               *runtime_manifest, rank, world, forward_rows, glm->cfg.hidden_size,
-              glm->cfg.num_hidden_layers, std::move(sum), runtime_adapters),
+              glm->cfg.num_hidden_layers, dgpp::adapters::SumFp32{}, runtime_adapters,
+              std::move(sum)),
           runtime_adapters);
       DGPP_LOG_INFO("rank {}: runtime adapter {} installed", rank, runtime_manifest->id);
       runtime_manifest->projections.clear();  // factors now reside on the device
     };
     const size_t adapter_bytes =
         runtime_manifest
-            ? dgpp::adapters::Runtime::factor_bytes(*runtime_manifest, world) + (size_t{64} << 20)
+            ? dgpp::adapters::Runtime::factor_bytes(*runtime_manifest, world) +
+                  dgpp::adapters::Runtime::serving_scratch_bytes(
+                      *runtime_manifest, world, forward_rows,
+                      dynamic_cast<GlmDsaFamily*>(family.get())->cfg.hidden_size) +
+                  static_cast<size_t>(adapter_graph_nodes) * dgpp::net::kBusMaxGraphVariants *
+                      (sizeof(dgpp::net::BusAllReduceCtl) +
+                       dgpp::net::kBusWriteMaxBlocks * sizeof(dgpp::net::BusWriteBlockRecord)) +
+                  (size_t{64} << 20)
             : 0;
     const size_t engine_bytes =
         static_cast<size_t>(max_concurrency) * static_cast<size_t>(family->vocab_size()) * 8 +
@@ -3927,6 +3943,7 @@ int main(int argc, char** argv) {
       try {
         dgpp::net::BusOptions bus_options = dgpp::fabric_bus_options(
             rank, world, fabric_port, peer, rendezvous_timeout_ms, family->lat_slot_bytes(decode_rows));
+        bus_options.graph_nodes_per_variant += adapter_graph_nodes;
         if (bulk_pace_gbps >= 0) bus_options.bulk_pace_gbps = bulk_pace_gbps;
         if (bulk_inflight >= 0) bus_options.bulk_inflight_per_lane = bulk_inflight;
         bus_options.latency_transport = collective_transport == "write"

@@ -273,17 +273,23 @@ struct CollectiveBus::Impl {
   // The one-sided transport's per-block records (pinned): one array of
   // kBusWriteMaxBlocks per graph cell, then per stream cell.
   BusWriteBlockRecord* write_recs = nullptr;
-  static constexpr size_t kWriteRecCells =
-      static_cast<size_t>(kBusMaxGraphVariants) * kBusMaxGraphGens + kBusStreamRing;
+  size_t write_record_cells() const {
+    return static_cast<size_t>(kBusMaxGraphVariants) * opt.graph_nodes_per_variant + kBusStreamRing;
+  }
   BusWriteBlockRecord* write_recs_of(int variant, int node) const {
-    return write_recs + (static_cast<size_t>(variant) * kBusMaxGraphGens + static_cast<size_t>(node)) * kBusWriteMaxBlocks;
+    return write_recs + (static_cast<size_t>(variant) * opt.graph_nodes_per_variant +
+                         static_cast<size_t>(node)) *
+                            kBusWriteMaxBlocks;
   }
   BusWriteBlockRecord* write_recs_of_stream(int cell) const {
-    return write_recs + (static_cast<size_t>(kBusMaxGraphVariants) * kBusMaxGraphGens + static_cast<size_t>(cell)) * kBusWriteMaxBlocks;
+    return write_recs + (static_cast<size_t>(kBusMaxGraphVariants) * opt.graph_nodes_per_variant +
+                         static_cast<size_t>(cell)) *
+                            kBusWriteMaxBlocks;
   }
   // The records of a cell, graph or stream (the cell arrays are contiguous).
   BusWriteBlockRecord* write_recs_of_cell(const BusAllReduceCtl* cell) const {
-    if (cell >= graph_cells && cell < graph_cells + static_cast<size_t>(kBusMaxGraphVariants) * kBusMaxGraphGens)
+    if (cell >= graph_cells && cell < graph_cells + static_cast<size_t>(kBusMaxGraphVariants) *
+                                                        opt.graph_nodes_per_variant)
       return write_recs + static_cast<size_t>(cell - graph_cells) * kBusWriteMaxBlocks;
     return write_recs_of_stream(static_cast<int>(cell - strm.cells));
   }
@@ -606,12 +612,12 @@ struct CollectiveBus::Impl {
     return strm.active ||
            strm.issued.load(std::memory_order_acquire) > strm.walked.load(std::memory_order_relaxed);
   }
-  // Per-generation cells, one kBusMaxGraphGens slab per variant, pinned for
+  // Per-generation cells, one configured slab per variant, pinned for
   // the bus's lifetime (baked into each recorded graph's kernel launches).
   BusAllReduceCtl* graph_cells = nullptr;
 
   BusAllReduceCtl* graph_variant_cells(int variant) const {
-    return graph_cells + static_cast<size_t>(variant) * kBusMaxGraphGens;
+    return graph_cells + static_cast<size_t>(variant) * opt.graph_nodes_per_variant;
   }
 
   BusRankExchange ex_{};  // our frame, built once during start()
@@ -3219,6 +3225,11 @@ bool CollectiveBus::start(std::string* error) {
   Impl& impl = *impl_;
   const BusOptions& opt = options_;
 
+  if (opt.graph_nodes_per_variant < 1 || opt.graph_nodes_per_variant > 4096) {
+    *error = "graph_nodes_per_variant must be in 1..4096";
+    return false;
+  }
+
   if (opt.world_size == 1) {
     if (opt.my_rank != 0) {
       *error = "a world of one has rank 0 only";
@@ -3435,7 +3446,7 @@ bool CollectiveBus::start(std::string* error) {
   // stream that serializes per-collective kernels. Allocated regardless of
   // use — two pointers and one cache line, and teardown stays symmetric.
   // The graph era's per-generation cells ride along: one
-  // kBusMaxGraphGens slab per selectable variant, pinned for the bus's
+  // configured slab per selectable variant, pinned for the bus's
   // lifetime (baked into recorded kernel launches).
   {
     const cudaError_t ctl_err =
@@ -3449,8 +3460,7 @@ bool CollectiveBus::start(std::string* error) {
     *impl.ar_ctl = BusAllReduceCtl{};
     const cudaError_t cells_err = cudaMallocHost(
         reinterpret_cast<void**>(&impl.graph_cells),
-        kBusMaxGraphVariants * kBusMaxGraphGens *
-            sizeof(BusAllReduceCtl));
+        kBusMaxGraphVariants * opt.graph_nodes_per_variant * sizeof(BusAllReduceCtl));
     if (cells_err != cudaSuccess || impl.graph_cells == nullptr) {
       cudaFreeHost(impl.ar_ctl);
       impl.ar_ctl = nullptr;
@@ -3458,7 +3468,7 @@ bool CollectiveBus::start(std::string* error) {
                cudaGetErrorString(cells_err);
       return false;
     }
-    for (int i = 0; i < kBusMaxGraphVariants * kBusMaxGraphGens; ++i)
+    for (int i = 0; i < kBusMaxGraphVariants * opt.graph_nodes_per_variant; ++i)
       impl.graph_cells[i] = BusAllReduceCtl{};
     const cudaError_t strm_err = cudaMallocHost(
         reinterpret_cast<void**>(&impl.strm.cells), kBusStreamRing * sizeof(BusAllReduceCtl));
@@ -3492,7 +3502,7 @@ bool CollectiveBus::start(std::string* error) {
     // record carries its generation, so stale values never match).
     const cudaError_t recs_err = cudaMallocHost(
         reinterpret_cast<void**>(&impl.write_recs),
-        Impl::kWriteRecCells * kBusWriteMaxBlocks * sizeof(BusWriteBlockRecord));
+        impl.write_record_cells() * kBusWriteMaxBlocks * sizeof(BusWriteBlockRecord));
     if (recs_err != cudaSuccess || impl.write_recs == nullptr) {
       cudaFree(impl.bulk_scratch);
       impl.bulk_scratch = nullptr;
@@ -3505,7 +3515,8 @@ bool CollectiveBus::start(std::string* error) {
       *error = std::string("write record alloc failed: ") + cudaGetErrorString(recs_err);
       return false;
     }
-    for (size_t i = 0; i < Impl::kWriteRecCells * kBusWriteMaxBlocks; ++i) impl.write_recs[i] = BusWriteBlockRecord{};
+    for (size_t i = 0; i < impl.write_record_cells() * kBusWriteMaxBlocks; ++i)
+      impl.write_recs[i] = BusWriteBlockRecord{};
     const cudaError_t stream_err = cudaStreamCreateWithFlags(
         &impl.collective_stream, cudaStreamNonBlocking);
     if (stream_err != cudaSuccess) {
@@ -4612,9 +4623,9 @@ bool CollectiveBus::allreduce_record(cudaStream_t capture_stream,
     return false;
   }
   Impl::GraphState::Variant& shape = impl.graph.variants[variant];
-  if (shape.gens >= kBusMaxGraphGens) {
+  if (shape.gens >= options_.graph_nodes_per_variant) {
     *error = "graph generation budget exceeded (" +
-             std::to_string(kBusMaxGraphGens) + " collective nodes)";
+             std::to_string(options_.graph_nodes_per_variant) + " collective nodes)";
     return false;
   }
 

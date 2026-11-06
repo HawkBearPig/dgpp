@@ -15,33 +15,33 @@ for each setting's default and dependencies.
 
 ## Load an adapter for serving
 
-Create a deployment JSON using the same base checkpoint and world size as the
-adapter. For example, with an exported bundle in `adapters/example` beside the
-deployment JSON:
+Copy the model's shipped deployment template, keeping the same base checkpoint
+and world size as the adapter. Add only these two fields to its `engine` object:
 
 ```json
 {
-  "model": "HawkBearPig/GLM-5.3-Mixed346-GPTQ-H32-A8-g128",
-  "world_size": 4,
-  "engine": {
-    "runtime_adapters": true,
-    "runtime_adapter_path": "adapters/example",
-    "max_concurrency": 8,
-    "kv_capacity": 131072,
-    "default_max_tokens": 8192,
-    "mtp": false,
-    "decode_graph": false,
-    "prefix_cache_gib": 0,
-    "kv_dtype": "bf16",
-    "bf16_weights": "checkpoint",
-    "attention_weights": "checkpoint",
-    "embed_sharding": "replicated"
-  },
-  "nvme_cache": {"enabled": false}
+  "runtime_adapters": true,
+  "runtime_adapter_path": "/path/to/adapter"
 }
 ```
 
-Use the usual site settings and launcher:
+For example, create `serving.json` from the shipped four-node Mixed346 template:
+
+```bash
+python3 - <<'PY'
+import json
+from pathlib import Path
+
+config = json.loads(Path("deploy/cluster_glm-5.3_mixed346_w4.example.json").read_text())
+config["engine"]["runtime_adapters"] = True
+config["engine"]["runtime_adapter_path"] = "/path/to/adapter"
+Path("serving.json").write_text(json.dumps(config, indent=2) + "\n")
+PY
+```
+
+All other settings remain those of the shipped template, including CUDA graphs,
+MTP, FP8 KV, BF12 weight storage, vocabulary-sharded embeddings, prefix caching,
+concurrency, scheduling and output budgets. Use the usual site settings and launcher:
 
 ```bash
 python3 scripts/dgpp-cluster up --config serving.json
@@ -53,9 +53,8 @@ binary launches require both files to be present on every node. Startup checks
 the bundle against the checkpoint and execution settings; every rank must
 agree on its identity before serving. Switching or removing a serving adapter
 requires a restart. To return to ordinary serving, remove the bundle path,
-disable `runtime_adapters`, and restore the desired base deployment settings.
+disable `runtime_adapters`.
 
-The example's concurrency, KV pool and default output budget are sizing choices.
 Serving supports the existing 1–16 request slots. `kv_capacity` is shared across
 all active requests, and both prompt and output tokens consume it.
 `default_max_tokens` applies when a client omits its output limit. Set these
@@ -66,20 +65,23 @@ or concurrency.
 
 ## Supported execution settings
 
-The current adapter runtime uses eager execution with the following settings.
-An optimized serving template may require several changes in addition to the
-adapter flag and path. Unsupported combinations fail validation.
+Adapters support the same eager and graph execution paths as the model, with
+the following compatibility bounds. The shipped Mixed346 configuration fits
+these bounds without changing any of its settings. Unsupported combinations
+fail validation.
 
 | Setting | Required value with runtime adapters |
 |---|---|
 | Model and world size | GLM-5.3 DSA; 1, 2 or 4 ranks, matching the bundle |
-| `engine.decode_graph` | `false` |
-| `engine.mtp`, `engine.lookup_draft` | `false` |
+| `engine.decode_graph`, `engine.mtp` | Either value |
+| `engine.lookup_draft` | `false` |
 | `engine.dflash_model` | Empty |
-| `engine.prefix_cache_gib`, `nvme_cache.enabled` | `0`, `false` |
-| `engine.kv_dtype` | `bf16` |
-| `engine.bf16_weights`, `engine.attention_weights` | `checkpoint` |
-| `engine.embed_sharding` | `replicated` |
+| `engine.prefix_cache_gib` | Existing serving cache budget |
+| `nvme_cache.enabled` | `false` |
+| `engine.kv_dtype` | `bf16` or `fp8` |
+| `engine.bf16_weights` | `checkpoint` or `bf12` |
+| `engine.attention_weights` | `checkpoint` |
+| `engine.embed_sharding` | `replicated` or `vocab` |
 | `engine.prefill_bf16_partials`, `engine.prefill_fold_scales` | `false` |
 | `engine.expert_gemm`, `engine.expert_gemm_prefetch` | `wide`, `3` |
 | `engine.expert_tile_list`, `engine.expert_gemm_pair` | `true`, `false` |
@@ -88,8 +90,9 @@ adapter flag and path. Unsupported combinations fail validation.
 Checkpoint weight formats leave the original packed and quantized tensors
 intact. Adapter execution does not produce a dequantized or merged checkpoint.
 It adds factor storage, scratch buffers and computation, including collectives
-across ranks. Disabling graphs, speculation or caching can also change serving
-performance; ordinary-serving benchmark results do not measure this mode.
+across ranks. Graph bookkeeping grows only for an enabled adapter, and the
+startup memory plan includes its factors, scratch and additional graph records.
+Ordinary-serving benchmark results do not measure adapter overhead.
 With `runtime_adapters=false`, serving allocates no adapter buffers and runs no
 adapter kernels or collectives. The research flag does not enable capture in
 ordinary serving.
@@ -105,7 +108,7 @@ is not sufficient. Supported targets are attention output projections and
 dense/shared MLP down projections. Routed-expert weights remain unchanged.
 
 Manifest version 1 identifies operation `additive_low_rank`, runtime
-`glm_dsa_eager_fp32_v1`, the fitted world size, target IDs/modules/dimensions,
+`glm_dsa_fp32_v1`, the fitted world size, target IDs/modules/dimensions,
 per-factor SHA-256 hashes, the numerical environment hash and the base content
 fingerprint. Fingerprinting reads every weight shard, index, configuration,
 external quantization sidecar and present tokenizer/template/generation files.
@@ -113,14 +116,21 @@ This can add minutes to cold startup for large checkpoints. It occurs only
 with runtime opt-in; research trials reuse the identity and check that the base
 files have not changed. The numerical hash covers sorted `DGPP_*` overrides,
 excluding transport addresses, paths, logging and test controls. Different
-numerical overrides reject loading.
+numerical overrides reject loading. Bundles using the original runtime name
+`glm_dsa_eager_fp32_v1` remain compatible with the same factor arithmetic in
+both eager and graph serving. Serving precision and cache settings remain
+controlled by the deployment configuration.
 
 Each rank stores its A columns and replicated B. The runtime computes A times
 the BF16 projection input, gathers FP32 partials losslessly, sums in rank order
 and adds B times that sum once to the already-folded BF16 branch output,
 rounding to BF16. Shared-expert corrections enter the combined MLP branch;
 research capture retains the shared projection's separate FP32 output plus
-correction. Zero factors skip the addition, preserving identity exactly.
+correction. Graph execution packs FP32 partials into disjoint byte-digit slices
+for the existing collective, then reconstructs and sums them on the GPU in
+rank order. The MTP draft remains a proposer; the adapted main model verifies
+its proposals. Prefix snapshots hold state produced by that same installed
+adapter. Zero factors skip the addition, preserving identity exactly.
 This execution contract does not promise bitwise equivalence to merged
 weights or another runtime's LoRA kernels.
 
