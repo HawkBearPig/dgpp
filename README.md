@@ -45,6 +45,11 @@ cluster launcher and the deployment templates.
   Metrics as JSON and Prometheus. A setup wizard, a cluster launcher,
   versioned releases, a startup memory plan and fast boot from a resident
   image cache. No Python at serving time.
+- **Runtime adapters and research inference.** Load compatible LoRA adapters
+  alongside the original weights, or use a separate worker to expose logits,
+  activations and token scores to external optimization tools. Both features
+  require explicit cluster flags. Current support covers GLM-5.3 DSA on one,
+  two or four nodes with the [documented execution limits](docs/runtime-adapters.md).
 
 ## Performance
 
@@ -371,7 +376,7 @@ commands.
 | [Deployment templates](deploy/README.md) | the template catalogue, naming, shared defaults and launcher flags |
 | [Configuration](docs/configuration.md) | every site and deployment setting, its default and its effect |
 | [Operations](docs/operations.md) | booting, stopping and watching a world, memory on a node, failure semantics, health |
-| [Heretic integration](docs/heretic.md) | opt-in GLM-5.3 research execution, reversible candidates, and runtime adapter loading |
+| [Runtime adapters and research inference](docs/runtime-adapters.md) | LoRA bundles, logits and activation access, configuration and compatibility limits |
 | [Release and install](docs/release-install.md) | the packaged release on a fresh cluster |
 | [Tools](docs/tools.md) | serving, diagnostic and validation commands |
 | [OpenAI API compatibility](docs/openai-compatibility.md) | the request and response contract, extensions, limits and live metrics |

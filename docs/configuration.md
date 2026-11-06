@@ -16,6 +16,7 @@ Restart the deployment after changing either file.
 | Choose nodes, network addresses or disk locations | [Site settings](#site-settings) |
 | Change the API address, model name or streaming behavior | [Deployment and endpoint](#deployment-and-endpoint) |
 | Accept larger file uploads or keep them across restarts | [File inputs](#file-inputs) |
+| Load a LoRA adapter or expose logits and activations to research tools | [Runtime adapters and research inference](#runtime-adapters-and-research-inference) |
 | Serve longer prompts or more simultaneous requests | [Request capacity and memory](#request-capacity-and-memory) |
 | Reuse work from earlier prompts | [Prefix caching](#prefix-caching) |
 | Keep evicted prefix entries on local NVMe | [NVMe cache](#nvme-cache) |
@@ -185,6 +186,32 @@ token capacity; a request must satisfy all applicable limits.
 See [file inputs](openai-compatibility.md#file-inputs) for supported formats and
 request examples.
 
+## Runtime adapters and research inference
+
+DGPP can load compatible low-rank adapters alongside the base checkpoint and
+expose logits and activations through a separate research worker. These features
+currently support GLM-5.3 DSA on one, two or four ranks and default to disabled.
+The [adapter guide](runtime-adapters.md) covers the bundle format, serving
+example, worker interface and required execution settings.
+
+| Key | What it controls and what to expect | Default |
+|---|---|---|
+| `engine.heretic_research` | Enables target inspection and the separate research worker for full-vocabulary logits, last-position activations, generation and token scoring. The worker processes one request at a time. This flag does not expose raw tensors through the serving HTTP API. | false |
+| `engine.runtime_adapters` | Enables low-rank adapter execution in serving or candidate installation in a research worker. Adapter buffers, kernels and collectives require this flag. Serving retains the existing 1–16 request slots. Requires the [supported execution settings](runtime-adapters.md#supported-execution-settings). | false |
+| `engine.runtime_adapter_path` | Bundle directory containing `dgpp_adapter.json` and `adapter_model.safetensors`. Required for serving with `runtime_adapters=true`; a nonempty path requires that flag. The cluster launcher resolves relative paths beside the deployment JSON and stages both files on every node. Research workers receive candidates through their control protocol instead of this path. | Empty |
+
+Serving an adapter does not require `heretic_research`. Capturing baseline
+logits does not require `runtime_adapters`. The research flag has no effect on
+ordinary serving execution. With runtime adapters disabled, serving allocates
+no adapter buffers and runs no adapter kernels or collectives.
+
+Adapter serving currently requires eager execution, no speculative decoding or
+prefix/NVMe caching, BF16 KV, checkpoint weight formats and replicated
+embeddings. Adding the two adapter settings to an optimized deployment may
+therefore require changing its execution settings as well. The adapter does
+not impose the research worker's concurrency or prompt-length limits on
+serving; size the serving slots and shared KV pool below for the workload.
+
 ## Request capacity and memory
 
 Four separate limits matter: open connections, queued requests, active request
@@ -194,9 +221,6 @@ the others. Startup checks the combined memory plan before loading the model.
 | Key | What it controls and what to expect | Default |
 |---|---|---|
 | `engine.max_concurrency` | Maximum actively executing requests, from 1 to 16, subject to the model and speculation limits below. More slots can improve total throughput but need more working memory and can increase each request's latency. | 8 |
-| `engine.heretic_research` | Enables the separate [Heretic research tools](heretic.md): target inspection and execution/capture workers on 1, 2 or 4 ranks. It does not enable capture in ordinary serving. | false |
-| `engine.runtime_adapters` | Enables reversible low-rank candidates in research workers and [runtime artifact loading](heretic.md#runtime-artifact-and-ordinary-serving) in ordinary GLM-5.3 serving. Serving retains the existing 1–16 request slots; the research worker is serial. Requires eager execution, no drafts or prefix/NVMe cache, BF16 KV and checkpoint weights. All adapter allocations and collectives require this flag. | false |
-| `engine.runtime_adapter_path` | Directory containing `dgpp_adapter.json` and `adapter_model.safetensors`. Requires `runtime_adapters=true`. The cluster launcher resolves relative paths beside the deployment JSON and stages the bundle on every node. Research workers receive candidates through their control protocol instead. | Empty |
 | `engine.kv_capacity` | Shared context-token pool on each rank, used by all active requests. Prompt and answer tokens both consume space. Increase for longer contexts or more simultaneous context, at the cost of memory. Allocation is rounded to model block boundaries. This does not extend the model's positional limit. | 8192 tokens |
 | `engine.default_max_tokens` | Answer-token budget when a request omits `max_tokens`. Clients can set their own value. Under `full` admission, the prompt plus this budget must fit the context allowance or the request is rejected. Templates generally use much larger defaults to allow long answers and reasoning. | 256 tokens |
 | `engine.queue_limit` | Maximum requests waiting for a slot or memory. Further arrivals receive HTTP 503 `overloaded`. A larger queue absorbs bursts but allows longer waits without adding processing capacity. | 64 |

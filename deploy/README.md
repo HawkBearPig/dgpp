@@ -4,12 +4,19 @@ Choose a template here, then use the [configuration reference](../docs/configura
 for site setup, defaults and the effect of each setting. Templates set model-specific
 values that can differ from the program defaults.
 
-The separate [Heretic research tools](../docs/heretic.md) require
-`engine.heretic_research: true` in a research config. This defaults to `false`
-and is omitted from all serving templates. It enables metadata inspection and
-a local baseline execution/capture worker, with no change to serving execution.
-The worker needs a dedicated world-1 config with the restrictions in its guide;
-serving templates are not worker configs.
+[LoRA adapter loading](../docs/runtime-adapters.md) uses
+`engine.runtime_adapters: true` and `engine.runtime_adapter_path`. Adapter
+serving retains the existing request-slot range, but currently requires eager
+execution, BF16 KV, checkpoint weights, replicated embeddings, and disabled
+speculation and prefix/NVMe caching. Follow the guide's configuration example
+and compatibility table when creating a deployment from an optimized template.
+Relative bundle paths are resolved beside the deployment JSON and staged to
+every node.
+
+Logits and activation capture require `engine.heretic_research: true` in a
+separate research config for one, two or four nodes. The worker is serial and
+has its own allowed settings and token limits. Both feature flags default to
+`false` and are omitted from the standard serving templates.
 
 One template per model, quantization and world size:
 `cluster_<model>_<quant>_w<n>.example.json`. An optional trailing
