@@ -4,6 +4,11 @@ Choose a template here, then use the [configuration reference](../docs/configura
 for site setup, defaults and the effect of each setting. Templates set model-specific
 values that can differ from the program defaults.
 
+The separate [Heretic inspection tool](../docs/heretic.md) requires
+`engine.heretic_research: true` in a research config. This defaults to `false`
+and is omitted from all serving templates; it currently enables metadata
+inspection only, with no change to serving execution.
+
 One template per model, quantization and world size:
 `cluster_<model>_<quant>_w<n>.example.json`. An optional trailing
 `_<variant>` names a template that deviates from that shape in one documented

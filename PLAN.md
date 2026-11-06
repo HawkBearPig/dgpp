@@ -1,5 +1,16 @@
 # DGPP implementation status
 
+## Heretic backend integration
+
+The opt-in Heretic inspection command describes GLM-5.3's modifiable
+projections and their input-column partitions without loading weights.
+The versioned catalog matches Heretic's attention, dense MLP and shared-expert
+capture indices. Research execution, tensor capture, candidate lifecycle, and
+independent runtime artifact loading remain pending. See the
+[integration guide](docs/heretic.md) for the current command and feature gate.
+
+## Serving status
+
 MiniMax M3.1 Flash is implemented on the shared engine with its published
 NVFP4/MXFP8 weights, native activations and Q8KV4 attention, seven-proposal
 DSpark, recursive tools, images and native video. BF16 activations and caches

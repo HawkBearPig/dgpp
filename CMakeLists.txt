@@ -453,6 +453,7 @@ dgpp_set_common(dgpp_models_glm_dsa_layers)
 # Full GLM-5.3 (2026-09-12, docs/glm53_plan.md): the host-side model description.
 add_library(dgpp_models_glm_dsa STATIC
   src/models/glm_dsa/config.cpp
+  src/models/glm_dsa/modification_targets.cpp
   src/models/glm_dsa/binding.cpp)
 target_include_directories(dgpp_models_glm_dsa PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(dgpp_models_glm_dsa PUBLIC dgpp_loaders dgpp_common)
@@ -1048,6 +1049,7 @@ add_executable(unit_tests
   tests/unit/glm4_binding_test.cpp
   tests/unit/glm_dsa_config_test.cpp
   tests/unit/glm_dsa_binding_test.cpp
+  tests/unit/glm_dsa_modification_targets_test.cpp
   tests/unit/dsv41_config_test.cpp
   tests/unit/dsv41_binding_test.cpp
   tests/unit/dsv4_config_test.cpp
@@ -1239,6 +1241,15 @@ if(DGPP_ENABLE_VIDEO)
   target_compile_definitions(dgpp_serve PRIVATE DGPP_ENABLE_VIDEO=1)
 endif()
 dgpp_set_common(dgpp_serve)
+
+add_executable(dgpp_heretic_inspect apps/dgpp_heretic_inspect.cpp)
+target_link_libraries(dgpp_heretic_inspect PRIVATE dgpp_models_glm_dsa dgpp_serve)
+set_target_properties(dgpp_heretic_inspect PROPERTIES OUTPUT_NAME dgpp-heretic-inspect)
+dgpp_set_common(dgpp_heretic_inspect)
+add_test(NAME heretic_inspect_test COMMAND ${Python3_EXECUTABLE}
+  ${CMAKE_CURRENT_SOURCE_DIR}/tests/python/heretic_inspect_test.py
+  $<TARGET_FILE:dgpp_heretic_inspect>
+  ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/heretic_glm_dsa_config.json)
 
 add_executable(http_server_test tests/host/http_server_test.cpp)
 target_link_libraries(http_server_test PRIVATE dgpp_serve Threads::Threads)
@@ -2850,7 +2861,7 @@ endforeach()
 set_tests_properties(tokenizer_patterns_test word_cache_test bpe_test unit unit_tests http_server_test nvme_cache_test cache_storage_test serve_test serve_test_wake fabric_serve_test fabric_serve_test_wake scheduler_test shutdown_watchdog_test engine_watchdog_test
   qwen_yarn_fixture_test qwen_w4a4_plan_default qwen_w4a4_plan_mode_0 qwen_w4a4_plan_mode_1
   qwen_w4a4_plan_mode_empty qwen_w4a4_plan_mode_invalid PROPERTIES LABELS "host")
-set_tests_properties(checkpoint_audit_test chat_template_generator_test route_trace_test sampling_profile_test spec_ab_probe_test
+set_tests_properties(heretic_inspect_test checkpoint_audit_test chat_template_generator_test route_trace_test sampling_profile_test spec_ab_probe_test
   site_env_test script_reports_test timed_load_test serve_admission_bench_test serve_cancel_prefix_check_test qwen_yarn_release_check_test qwen_head_compare_test portability_test spark_cross_test setup_tools_test bootstrap_test launcher_test cluster_process_swap_test PROPERTIES LABELS "host;python")
 set_tests_properties(cluster_process_swap_systemd_test PROPERTIES LABELS "systemd" TIMEOUT 180)
 if(TARGET dgpp_serve_app)

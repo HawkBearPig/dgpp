@@ -7,6 +7,10 @@ Other model templates use the same launcher with their own memory and
 engine settings. See the [configuration reference](configuration.md) for
 settings, defaults and their effects.
 
+For offline projection discovery, use the separate
+[Heretic research tool](heretic.md). It requires an explicit research flag
+and reads model metadata without starting a serving world.
+
 ## Sampling penalty defaults
 
 Set `engine.repetition_penalty`, `engine.frequency_penalty` and

@@ -395,6 +395,7 @@ ClusterConfig parse_cluster_config(const std::string& json, const std::string& w
         else if (p.key == "admission_gather_ms") e.admission_gather_ms = static_cast<int>(integer(x, ek, what, 0, 1000));
         else if (p.key == "max_connections") e.max_connections = static_cast<int>(integer(x, ek, what, 1, 1 << 20));
         else if (p.key == "no_eos") e.no_eos = boolean(x, ek, what);
+        else if (p.key == "heretic_research") e.heretic_research = boolean(x, ek, what);
         else if (p.key == "decode_graph") e.decode_graph = boolean(x, ek, what);
         else if (p.key == "mtp") e.mtp = boolean(x, ek, what);
         else if (p.key == "dflash_model") e.dflash_model = text(x, ek, what);

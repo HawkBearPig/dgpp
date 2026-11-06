@@ -194,6 +194,7 @@ the others. Startup checks the combined memory plan before loading the model.
 | Key | What it controls and what to expect | Default |
 |---|---|---|
 | `engine.max_concurrency` | Maximum actively executing requests, from 1 to 16, subject to the model and speculation limits below. More slots can improve total throughput but need more working memory and can increase each request's latency. | 8 |
+| `engine.heretic_research` | Enables the separate [Heretic research tools](heretic.md). Currently permits metadata-only target inspection; it does not enable capture or adapter execution in serving. | false |
 | `engine.kv_capacity` | Shared context-token pool on each rank, used by all active requests. Prompt and answer tokens both consume space. Increase for longer contexts or more simultaneous context, at the cost of memory. Allocation is rounded to model block boundaries. This does not extend the model's positional limit. | 8192 tokens |
 | `engine.default_max_tokens` | Answer-token budget when a request omits `max_tokens`. Clients can set their own value. Under `full` admission, the prompt plus this budget must fit the context allowance or the request is rejected. Templates generally use much larger defaults to allow long answers and reasoning. | 256 tokens |
 | `engine.queue_limit` | Maximum requests waiting for a slot or memory. Further arrivals receive HTTP 503 `overloaded`. A larger queue absorbs bursts but allows longer waits without adding processing capacity. | 64 |
