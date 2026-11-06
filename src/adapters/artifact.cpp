@@ -146,7 +146,8 @@ Manifest parse_manifest(const std::string& bytes, const GlmDsaTextConfig& config
   require(str(root.at("schema")) == "dgpp.runtime_adapter" && integer(root.at("version")) == 1,
           "unsupported manifest schema/version");
   require(str(root.at("operation")) == "additive_low_rank" &&
-              str(root.at("runtime")) == "glm_dsa_eager_fp32_v1",
+              (str(root.at("runtime")) == "glm_dsa_fp32_v1" ||
+               str(root.at("runtime")) == "glm_dsa_eager_fp32_v1"),
           "unsupported execution contract");
   require(str(root.at("environment_sha256")) == sha256(numerical_environment()),
           "numerical environment differs from the fitted adapter");

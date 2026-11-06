@@ -44,6 +44,32 @@ __global__ void finish(const float* z, const float* b, uint16_t* output, float* 
   } else
     delta[column] = sum;
 }
+__global__ void pack_digits(const float* values, __nv_bfloat16* digits, size_t count, int rank,
+                            int world) {
+  dgpp_pdl_wait();
+  const size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= count * world * 4) return;
+  const size_t value = i / 4;
+  const unsigned byte = value / count == static_cast<size_t>(rank)
+                            ? (__float_as_uint(values[value % count]) >> (8 * (i % 4))) & 255u
+                            : 0;
+  digits[i] = __float2bfloat16_rn(static_cast<float>(byte));
+}
+__global__ void sum_digits(const __nv_bfloat16* digits, float* values, size_t count, int world) {
+  dgpp_pdl_wait();
+  const size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= count) return;
+  float sum = 0;
+  for (int rank = 0; rank < world; ++rank) {
+    uint32_t bits = 0;
+    for (int byte = 0; byte < 4; ++byte)
+      bits |= static_cast<uint32_t>(__bfloat162float(digits[(rank * count + i) * 4 + byte]))
+              << (8 * byte);
+    const float value = __uint_as_float(bits);
+    sum = rank == 0 ? value : __fadd_rn(sum, value);
+  }
+  values[i] = sum;
+}
 }  // namespace
 void low_rank_project(const uint16_t* x, int stride, const float* a, float* z, int rows, int inputs,
                       int rank, cudaStream_t stream) {
@@ -60,6 +86,18 @@ void low_rank_delta_last(const float* z, const float* b, float* delta, int rows,
                          int rank, cudaStream_t stream) {
   finish<false>
       <<<(outputs + 127) / 128, 128, 0, stream>>>(z, b, nullptr, delta, rows, outputs, rank);
+  DGPP_CUDA_OK(cudaGetLastError());
+}
+void low_rank_pack_digits(const float* values, uint16_t* digits, size_t count, int rank, int world,
+                          cudaStream_t stream) {
+  pack_digits<<<(count * world * 4 + 255) / 256, 256, 0, stream>>>(
+      values, reinterpret_cast<__nv_bfloat16*>(digits), count, rank, world);
+  DGPP_CUDA_OK(cudaGetLastError());
+}
+void low_rank_sum_digits(const uint16_t* digits, float* values, size_t count, int world,
+                         cudaStream_t stream) {
+  sum_digits<<<(count + 255) / 256, 256, 0, stream>>>(
+      reinterpret_cast<const __nv_bfloat16*>(digits), values, count, world);
   DGPP_CUDA_OK(cudaGetLastError());
 }
 }  // namespace dgpp

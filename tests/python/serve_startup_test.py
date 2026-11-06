@@ -17,7 +17,7 @@ class ServeStartupTest(unittest.TestCase):
             raise unittest.SkipTest("set DGPP_SERVE_TEST_BINARY to the freshly built server")
         cls.binary = str(Path(binary).resolve(strict=True))
 
-    def test_runtime_adapter_cli_cannot_change_fitted_numerical_recipe(self):
+    def test_runtime_adapter_cli_rejects_unsupported_execution_options(self):
         with tempfile.TemporaryDirectory(prefix="dgpp-runtime-recipe-") as directory:
             root = Path(directory)
             fixture = Path(__file__).parents[1] / "fixtures/heretic_glm_dsa_config.json"
@@ -28,14 +28,14 @@ class ServeStartupTest(unittest.TestCase):
                 "engine":{"runtime_adapters":True, "runtime_adapter_path":directory,
                           "max_concurrency":1, "prefix_cache_gib":0}}))
             for flags in (["--prefill-bf16-partials"], ["--prefill-fold-scales"],
-                          ["--expert-gemm", "wide4"], ["--embed-sharding", "vocab"]):
+                          ["--expert-gemm", "wide4"]):
                 with self.subTest(flags=flags):
                     result = subprocess.run([self.binary, "--config", str(cluster),
                         "--model", "", "--checkpoint-dir", directory, *flags],
                         env={**os.environ, "CUDA_VISIBLE_DEVICES":""},
                         text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=10)
                     self.assertEqual(result.returncode, 2, result.stdout)
-                    self.assertIn("default expert/prefill/embedding/transport recipe", result.stdout)
+                    self.assertIn("expert/prefill/transport recipe", result.stdout)
 
     def test_tokenizer_cache_config_rejected_before_loading(self):
         with tempfile.TemporaryDirectory(prefix="dgpp-tokenizer-cache-") as directory:

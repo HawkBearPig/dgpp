@@ -6,10 +6,9 @@ values that can differ from the program defaults.
 
 [LoRA adapter loading](../docs/runtime-adapters.md) uses
 `engine.runtime_adapters: true` and `engine.runtime_adapter_path`. Adapter
-serving retains the existing request-slot range, but currently requires eager
-execution, BF16 KV, checkpoint weights, replicated embeddings, and disabled
-speculation and prefix/NVMe caching. Follow the guide's configuration example
-and compatibility table when creating a deployment from an optimized template.
+serving retains the shipped Mixed346 template's graphs, MTP, prefix cache,
+memory formats and request limits. Copy that template and add only the two
+adapter fields. The guide's compatibility table covers other execution settings.
 Relative bundle paths are resolved beside the deployment JSON and staged to
 every node.
 

@@ -2457,12 +2457,22 @@ research and ordinary serving. A is partitioned by input columns, B is
 replicated, and FP32 rank-space values are gathered losslessly and summed in
 rank order before a single BF16 boundary addition. Zero factors skip that
 addition. The ordinary disabled walk has no adapter kernels, scratch or
-collectives. Serving uses the existing eager request slots (1–16), while the
-research worker remains serial. Attention factors consume each span's DSA
-input before its scratch is reused, retaining rank-space rows in walk order;
+collectives. Serving uses the existing request slots (1–16). The separate
+fitting worker processes one evaluation request at a time. Attention factors
+consume each span's DSA input before its scratch is reused, retaining
+rank-space rows in walk order;
 MLP factors follow the existing kernel groups. Adapter installation requires
-every session to be idle. The contract is worlds 1/2/4, BF16 KV/checkpoint
-weights, no drafts or prefix cache. Serving checks artifact identity during
+every session to be idle. Graph serving packs each rank's FP32 partials into
+disjoint numeric byte-digit slices and records the existing BF16 collectives;
+GPU reconstruction sums the original FP32 values in rank order. The adapter's
+scratch is separate from the model's recorded boundary buffer. Only an enabled
+adapter increases the bus's graph-node allocation, sized from its projection
+count and ranks; the serving memory plan includes those additional records.
+The normal graph budget and allocation remain unchanged. MTP proposals
+are verified by the adapted main model, and prefix snapshots retain that
+model's state. Worlds 1/2/4 support the shipped Mixed346 template's graph/MTP
+execution, FP8 KV, BF12 weights, vocabulary embeddings and prefix caching.
+Serving checks artifact identity during
 its settings handshake and includes it in the configuration digest; the
 launcher stages only the manifest and factor file. See
 [runtime adapters and research inference](docs/runtime-adapters.md) for the

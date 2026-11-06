@@ -953,13 +953,33 @@ DGPP_TEST(cluster_config_accepts_seven_draft_block) {
           "the MiniMax schedule must accept a six-draft minimum");
 }
 
-DGPP_TEST(cluster_config_runtime_adapters_are_explicit_and_eager) {
+DGPP_TEST(cluster_config_runtime_adapters_preserve_native_serving_settings) {
   require(!dgpp::serve::parse_cluster_config(engine_json("{}"), "t").engine.runtime_adapters,
           "runtime adapters default off");
-  const std::string enabled = R"("runtime_adapters":true,"prefix_cache_gib":0)";
+  const std::string enabled = R"("runtime_adapters":true)";
   const auto cfg = dgpp::serve::parse_cluster_config(engine_json("{" + enabled + "}"), "t");
   require(cfg.engine.runtime_adapters, "runtime adapter explicit opt in");
   require(cfg.engine.max_concurrency == 8, "adapters retain the normal concurrency default");
+  std::ifstream file(DGPP_SOURCE_DIR "/deploy/cluster_glm-5.3_mixed346_w4.example.json");
+  require(file.good(), "read shipped Mixed346 deployment");
+  std::string shipped{std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
+  // Deployment templates receive site addresses from the launcher before
+  // reaching the C++ parser; supply an isolated four-rank site here.
+  shipped.insert(shipped.find('{') + 1,
+                 R"("nodes":["127.0.0.1","127.0.0.2","127.0.0.3","127.0.0.4"],)");
+  shipped = std::regex_replace(shipped, std::regex(R"("world_size"\s*:\s*4\s*,)"), "");
+  const auto engine = shipped.find("\"engine\"");
+  require(engine != std::string::npos, "shipped deployment has engine settings");
+  shipped.insert(shipped.find('{', engine) + 1,
+                 R"("runtime_adapters":true,"runtime_adapter_path":"/tmp/adapter",)");
+  const auto optimized = dgpp::serve::parse_cluster_config(shipped, "shipped Mixed346 + adapter");
+  require(
+      optimized.engine.mtp && optimized.engine.decode_graph &&
+          optimized.engine.prefix_cache_gib == 1 && optimized.engine.kv_dtype == "fp8" &&
+          optimized.engine.bf16_weights == "bf12" && optimized.engine.embed_sharding == "vocab" &&
+          optimized.engine.kv_capacity == 278528 && optimized.engine.default_max_tokens == 32768 &&
+          optimized.engine.l2_prefetch_full_form == "48x4",
+      "adapter loading must preserve optimized serving options");
   for (int concurrency : {1, 8, 16}) {
     const auto batched = dgpp::serve::parse_cluster_config(
         engine_json("{" + enabled + ",\"max_concurrency\":" + std::to_string(concurrency) + "}"),
@@ -967,10 +987,9 @@ DGPP_TEST(cluster_config_runtime_adapters_are_explicit_and_eager) {
     require(batched.engine.max_concurrency == concurrency, "adapters preserve configured slots");
   }
   for (const std::string extra :
-       {R"("mtp":true)", R"("decode_graph":true)", R"("kv_dtype":"fp8")",
-        R"("prefill_bf16_partials":true)", R"("prefill_fold_scales":true)",
-        R"("expert_gemm":"wide4")", R"("expert_gemm_prefetch":4)", R"("expert_tile_list":false)",
-        R"("expert_gemm_pair":true)", R"("embed_sharding":"vocab")",
+       {R"("kv_dtype":"fp4")", R"("attention_weights":"int4")", R"("prefill_bf16_partials":true)",
+        R"("prefill_fold_scales":true)", R"("expert_gemm":"wide4")", R"("expert_gemm_prefetch":4)",
+        R"("expert_tile_list":false)", R"("expert_gemm_pair":true)",
         R"("collective_transport":"send")"})
     require(
         refusal(engine_json("{" + enabled + "," + extra + "}")).find("engine.runtime_adapters") !=

@@ -411,10 +411,9 @@ std::vector<float> GlmDsaModel::research_projection_rows(const std::string& targ
 void GlmDsaModel::set_runtime_adapter(std::unique_ptr<adapters::Runtime> adapter, bool enabled) {
   if (!enabled)
     throw std::invalid_argument("runtime adapters require engine.runtime_adapters=true");
-  if (mtp_ || kv_blocks_in_use() != 0 ||
+  if (kv_blocks_in_use() != 0 ||
       std::any_of(session_pos_.begin(), session_pos_.end(), [](int64_t pos) { return pos != 0; }))
-    throw std::invalid_argument(
-        "runtime adapter installation requires all sessions idle and MTP off");
+    throw std::invalid_argument("runtime adapter installation requires all sessions idle");
   DGPP_CUDA_OK(cudaStreamSynchronize(stream_));
   for (int req = 0; req < max_session_requests(); ++req) session_close(req);
   runtime_adapter_ = std::move(adapter);
@@ -818,7 +817,7 @@ void GlmDsaModel::enqueue_layer(const GlmDsaLayerResident& r, int pool_layer, ui
   if (rows.decode) prefetch_ffn_side(r);
   fold(attn_out, T, H, rows.capture);  // block boundary 1: o_proj's partial
   if constexpr (Adapted) {
-    runtime_adapter_->add(r.layer, true, attn_out, T, stream_);
+    runtime_adapter_->add(r.layer, true, attn_out, T, stream_, rows.capture);
   }
   if constexpr (Research) {
     const size_t width =
@@ -920,7 +919,7 @@ void GlmDsaModel::enqueue_layer(const GlmDsaLayerResident& r, int pool_layer, ui
   gemm_.set_bf12_wide(rows.decode);
   if (rows.decode) prefetch_attention_side(r.layer + 1);
   fold(ffn_out, T, H, rows.capture);  // block boundary 2: the sliced down projections
-  if constexpr (Adapted) runtime_adapter_->add(r.layer, false, ffn_out, T, stream_);
+  if constexpr (Adapted) runtime_adapter_->add(r.layer, false, ffn_out, T, stream_, rows.capture);
   if constexpr (Research) {
     // Dense outputs have the same replicated BF16 boundary as attention.
     // Shared-expert outputs stay separate FP32 partials for the coordinator.
@@ -951,9 +950,6 @@ void GlmDsaModel::flush_pending_add(uint16_t* resid, int T) {
 
 template <bool Research, bool Adapted>
 GlmDsaModel::Outputs GlmDsaModel::run_rows_impl(const RowRun& run, ResearchOutputs* research) {
-  if constexpr (Adapted) {
-    if (run.capture) throw std::invalid_argument("runtime adapters require eager execution");
-  }
   const int T = run.T, req = run.req;
   if (pending_add_ != nullptr) throw std::logic_error("run_rows: a residual add is pending from an earlier walk");
   // The packed companions' wide launches are the decode batch's alone (a

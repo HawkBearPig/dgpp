@@ -590,19 +590,18 @@ ClusterConfig parse_cluster_config(const std::string& json, const std::string& w
   if (!c.engine.runtime_adapter_path.empty() && !c.engine.runtime_adapters)
     fail(what, "engine.runtime_adapter_path requires engine.runtime_adapters=true");
   if (c.engine.runtime_adapters &&
-      (c.engine.mtp || c.engine.decode_graph || c.engine.prefix_cache_gib != 0 ||
-       c.engine.kv_dtype != "bf16" || c.engine.bf16_weights != "checkpoint" ||
+      ((c.engine.kv_dtype != "bf16" && c.engine.kv_dtype != "fp8") ||
+       (c.engine.bf16_weights != "checkpoint" && c.engine.bf16_weights != "bf12") ||
        c.engine.attention_weights != "checkpoint"))
     fail(what,
-         "engine.runtime_adapters requires mtp=false, "
-         "decode_graph=false, prefix_cache_gib=0, BF16 KV and checkpoint weights");
+         "engine.runtime_adapters requires BF16/FP8 KV, checkpoint/BF12 weights and "
+         "checkpoint attention weights");
   if (c.engine.runtime_adapters &&
       (c.engine.prefill_bf16_partials || c.engine.prefill_fold_scales ||
        c.engine.expert_gemm != "wide" || c.engine.expert_gemm_prefetch != 3 ||
        !c.engine.expert_tile_list || c.engine.expert_gemm_pair ||
-       c.engine.embed_sharding != "replicated" || c.engine.collective_transport != "write"))
-    fail(what,
-         "engine.runtime_adapters requires the default expert/prefill/embedding/transport recipe");
+       c.engine.collective_transport != "write"))
+    fail(what, "engine.runtime_adapters requires the default expert/prefill/transport recipe");
   return c;
 }
 

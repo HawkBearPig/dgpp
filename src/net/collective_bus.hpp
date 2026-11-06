@@ -88,6 +88,9 @@ struct BusOptions {
   int debug_pass_delay_us = 0;
 
   BusLatencyTransport latency_transport = BusLatencyTransport::kSend;
+  // Optional extra graph nodes, for model extensions that record additional
+  // collectives. The normal serving allocation remains kBusMaxGraphGens.
+  int graph_nodes_per_variant = kBusMaxGraphGens;
 
   int qp_depth = 1024;
   int completion_timeout_ms = 5000;  // engine watchdog per request
@@ -253,7 +256,7 @@ class CollectiveBus {
   //                              are bitwise the eager machine's.
   //   graph_record_end()      — close and publish to the engine. At least
   //                              one node required; at most
-  //                              kBusMaxGraphGens nodes.
+  //                              BusOptions::graph_nodes_per_variant nodes.
   //
   // Replay (per step):
   //   graph_replay_arm(error, variant) — select a recorded variant, reset

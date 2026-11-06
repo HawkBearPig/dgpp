@@ -2111,9 +2111,25 @@ target_include_directories(glm_dsa_engine_test PRIVATE ${CMAKE_CURRENT_SOURCE_DI
 target_link_libraries(glm_dsa_engine_test PRIVATE dgpp_models_glm_dsa_layers dgpp_bus dgpp_loaders dgpp_sched dgpp_text CUDA::cudart Threads::Threads)
 dgpp_set_common(glm_dsa_engine_test)
 add_test(NAME glm_dsa_engine_test COMMAND glm_dsa_engine_test)
+add_executable(runtime_adapter_native_test tests/cuda/runtime_adapter_native_test.cpp)
+target_include_directories(runtime_adapter_native_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
+target_link_libraries(runtime_adapter_native_test PRIVATE dgpp_models_glm_dsa_layers dgpp_bus dgpp_loaders dgpp_sched dgpp_text CUDA::cudart Threads::Threads)
+dgpp_set_common(runtime_adapter_native_test)
+foreach(_format int8 m346)
+  foreach(_world 1 2 4)
+    add_test(NAME runtime_adapter_native_${_format}_w${_world}
+      COMMAND runtime_adapter_native_test ${CMAKE_CURRENT_BINARY_DIR}/adapter_native_${_format}_fixture ${_format} ${_world})
+    set_tests_properties(runtime_adapter_native_${_format}_w${_world} PROPERTIES
+      RUN_SERIAL TRUE LABELS "gpu" TIMEOUT 240 ENVIRONMENT "CUDA_MODULE_LOADING=EAGER")
+  endforeach()
+endforeach()
 add_test(NAME glm_dsa_engine_test_draft_screen
   COMMAND ${CMAKE_COMMAND} -E env DGPP_TEST_DRAFT_SCREEN=2 $<TARGET_FILE:glm_dsa_engine_test>)
 set_tests_properties(glm_dsa_engine_test_draft_screen PROPERTIES RUN_SERIAL TRUE LABELS "gpu" SKIP_RETURN_CODE 2)
+add_test(NAME runtime_adapter_native_m346_w4_full_layers
+  COMMAND runtime_adapter_native_test ${CMAKE_CURRENT_BINARY_DIR}/adapter_native_full_fixture m346 4 78)
+set_tests_properties(runtime_adapter_native_m346_w4_full_layers PROPERTIES
+  RUN_SERIAL TRUE LABELS "gpu" TIMEOUT 300 ENVIRONMENT "CUDA_MODULE_LOADING=EAGER")
 # The wide gate at eight slots x depth 2 (24 rows; the cap is 32 since 2026-10-13).
 add_test(NAME glm_dsa_engine_test_twenty_four_rows
   COMMAND ${CMAKE_COMMAND} -E env DGPP_WIDE_SLOTS=8 DGPP_WIDE_DEPTH=2 $<TARGET_FILE:glm_dsa_engine_test>)
