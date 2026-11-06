@@ -1246,6 +1246,13 @@ add_executable(dgpp_heretic_inspect apps/dgpp_heretic_inspect.cpp)
 target_link_libraries(dgpp_heretic_inspect PRIVATE dgpp_models_glm_dsa dgpp_serve)
 set_target_properties(dgpp_heretic_inspect PROPERTIES OUTPUT_NAME dgpp-heretic-inspect)
 dgpp_set_common(dgpp_heretic_inspect)
+add_executable(dgpp_heretic_worker apps/dgpp_heretic_worker.cpp)
+target_link_libraries(dgpp_heretic_worker PRIVATE dgpp_models_glm_dsa_layers dgpp_serve CUDA::cudart Threads::Threads)
+set_target_properties(dgpp_heretic_worker PROPERTIES OUTPUT_NAME dgpp-heretic-worker)
+dgpp_set_common(dgpp_heretic_worker)
+add_test(NAME heretic_worker_host COMMAND ${Python3_EXECUTABLE}
+  ${CMAKE_CURRENT_SOURCE_DIR}/tests/python/heretic_worker_check.py host
+  $<TARGET_FILE:dgpp_heretic_worker> ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/heretic_glm_dsa_config.json)
 add_test(NAME heretic_inspect_test COMMAND ${Python3_EXECUTABLE}
   ${CMAKE_CURRENT_SOURCE_DIR}/tests/python/heretic_inspect_test.py
   $<TARGET_FILE:dgpp_heretic_inspect>
@@ -1942,6 +1949,21 @@ set_tests_properties(flint_forward_test PROPERTIES DEPENDS flint_forward_generat
 # The full GLM-5.3 forward (docs/glm53_plan.md G5): fixture -> smoke; the
 # python reference -> the dump parity.
 add_executable(glm_dsa_forward_test tests/cuda/glm_dsa_forward_test.cpp)
+add_executable(heretic_capture_test tests/cuda/heretic_capture_test.cpp)
+target_include_directories(heretic_capture_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
+target_link_libraries(heretic_capture_test PRIVATE dgpp_models_glm_dsa_layers CUDA::cudart Threads::Threads)
+dgpp_set_common(heretic_capture_test)
+foreach(_format int8 m346)
+  add_test(NAME heretic_capture_${_format} COMMAND heretic_capture_test
+    ${CMAKE_CURRENT_BINARY_DIR}/heretic_${_format}_fixture ${_format})
+  set_tests_properties(heretic_capture_${_format} PROPERTIES
+    FIXTURES_SETUP heretic_${_format} RUN_SERIAL TRUE TIMEOUT 120)
+  add_test(NAME heretic_worker_${_format} COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/python/heretic_worker_check.py gpu
+    $<TARGET_FILE:dgpp_heretic_worker> ${CMAKE_CURRENT_BINARY_DIR}/heretic_${_format}_fixture)
+  set_tests_properties(heretic_worker_${_format} PROPERTIES
+    FIXTURES_REQUIRED heretic_${_format} RUN_SERIAL TRUE TIMEOUT 120)
+endforeach()
 target_include_directories(glm_dsa_forward_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
 target_link_libraries(glm_dsa_forward_test PRIVATE dgpp_models_glm_dsa_layers dgpp_models_glm_loader CUDA::cudart Threads::Threads)
 dgpp_set_common(glm_dsa_forward_test)
@@ -2861,7 +2883,7 @@ endforeach()
 set_tests_properties(tokenizer_patterns_test word_cache_test bpe_test unit unit_tests http_server_test nvme_cache_test cache_storage_test serve_test serve_test_wake fabric_serve_test fabric_serve_test_wake scheduler_test shutdown_watchdog_test engine_watchdog_test
   qwen_yarn_fixture_test qwen_w4a4_plan_default qwen_w4a4_plan_mode_0 qwen_w4a4_plan_mode_1
   qwen_w4a4_plan_mode_empty qwen_w4a4_plan_mode_invalid PROPERTIES LABELS "host")
-set_tests_properties(heretic_inspect_test checkpoint_audit_test chat_template_generator_test route_trace_test sampling_profile_test spec_ab_probe_test
+set_tests_properties(heretic_worker_host heretic_inspect_test checkpoint_audit_test chat_template_generator_test route_trace_test sampling_profile_test spec_ab_probe_test
   site_env_test script_reports_test timed_load_test serve_admission_bench_test serve_cancel_prefix_check_test qwen_yarn_release_check_test qwen_head_compare_test portability_test spark_cross_test setup_tools_test bootstrap_test launcher_test cluster_process_swap_test PROPERTIES LABELS "host;python")
 set_tests_properties(cluster_process_swap_systemd_test PROPERTIES LABELS "systemd" TIMEOUT 180)
 if(TARGET dgpp_serve_app)

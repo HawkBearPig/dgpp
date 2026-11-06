@@ -217,6 +217,16 @@ class GlmMoeLayer {
   // and segmentation buffers are shape-keyed and unaffected.
   void rebind(const GlmMoeWeights& w) { w_ = w; }
 
+  struct SharedPrefillRow {
+    const uint16_t* input = nullptr;
+    const float* output = nullptr;
+    int input_features = 0;
+  };
+  // Research-only view after an unmixed packed-GLM enqueue_prefill. The
+  // shared segment follows the routed segments; its down output is FP32
+  // before accumulation. Valid only until the next enqueue on this scratch.
+  SharedPrefillRow research_shared_prefill_last_row(int tokens) const;
+
  private:
   void check_expert_geometry() const;
   void copy_route_trace(MoeTraceStaging* trace, int tokens, cudaStream_t stream, int output_row = 0);
