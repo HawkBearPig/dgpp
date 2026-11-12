@@ -279,7 +279,7 @@ class MimoModel : public SessionModel<MimoModel> {
   // The early (normal-priority) prefetch of the next layer's projection
   // from fold 1 on, sized to the fold's idle DRAM time (0: off; an
   // experiment behind DGPP_MIMO_EARLY_QKV_MB together with the fp4 slot
-  // kernels' streaming loads, -DDGPP_FP4_SLOT_STREAMING=1).
+  // kernels' streaming loads, the gate/up launcher's `streaming`).
   size_t early_qkv_bytes_ = 0;
   void prefetch_ffn_side(const MimoLayerResident& r);
   void prefetch_attention_side(int layer);

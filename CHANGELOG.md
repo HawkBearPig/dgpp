@@ -5,6 +5,19 @@ project procedures and design guidance live in `docs/`.
 
 ## Unreleased
 
+- **Faster decode expert launches on every MoE family**: the shared
+  expert's slots run beside the first routed slots instead of as each
+  launch's tail, in every family that computes the shared expert in the slot
+  launches. The FP4 down launch prefetches a block's next unit while the
+  block computes the current one, and a one-row launch reads its routed gate
+  and up weights as streaming lines. No value changes. On four nodes at one
+  request the decode step is 7 to 8 percent shorter on
+  DeepSeek-V4.1-Flash-1017, 3 to 5 percent shorter on GLM-5.3-Flash
+  NVFP4-FP8 and 3 percent shorter on GLM-5.3 Mixed346, with identical
+  transcripts. The
+  [DeepSeek-V4.1 model card](docs/model_cards/DeepSeek-V4.1-Flash-1017.md)
+  has the measurements.
+
 - **Correct MiniMax DSpark predictions and native activations**: predict from
   the anchor row and use seven draft queries for seven proposals, while
   retaining eight target verification rows. The previous mask-only convention

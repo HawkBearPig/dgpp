@@ -1394,6 +1394,13 @@ void GlmMoeLayer::enqueue_decode_f32(const uint16_t* hidden, float* out,
   enqueue_decode_impl(hidden, nullptr, out, tokens, trace, stream, table_slot, accumulate);
 }
 
+// A one-row decode launch with the shared expert in its slots reads the
+// routed gate/up weights as streaming lines (the fp4 slot kernel's
+// `streaming`, bitwise): the ffn-side prefetch window's shared expert then
+// stays in L2 under the routed traffic. Rows that share experts want plain
+// loads (the kernel's comment has the measurement), so one row only.
+constexpr bool kSlotStreamingAtOneRow = true;
+
 // Whether this decode launch runs the shared expert aside: the family's
 // opt-in, an FP8 shared expert on launch arguments, and shapes the
 // tensor-core GEMV takes (else the slots keep it).
@@ -1548,10 +1555,10 @@ void GlmMoeLayer::enqueue_decode_impl(const uint16_t* hidden, uint16_t* out_bf16
   // computes the run's rows as one tile (kernels/exl3_gemv.hpp).
   const int32_t* order = nullptr;
   const int32_t* runs = nullptr;
-  // ... and a family's opt-in puts the shared expert's slots beside the
-  // first routed ones (one token included: its shared slot would be the
-  // launch's tail too).
-  const bool shared_early = cfg_.shared_slots_early && slot_shared;
+  // ... and the shared expert's slots run beside the first routed ones
+  // (one token included: its shared slot would be the launch's tail too),
+  // except in the EXL3 chain, whose run form wants them adjacent.
+  const bool shared_early = cfg_.shared_slots_early && slot_shared && !exl3;
   if (tokens > 1 || shared_early) {
     launch_moe_slot_order(d_ids_, d_slot_order_, slots, K, E, stream, shared_early,
                           exl3 ? d_slot_runs_ : nullptr);
@@ -1641,7 +1648,7 @@ void GlmMoeLayer::enqueue_decode_impl(const uint16_t* hidden, uint16_t* out_bf16
       launch_moe_slot_gate_up_swiglu_fp4(
           hidden, H, d_ids_, order, table, I_r, H, I_s, K_s, sh_gate_p, sh_gate_s,
           sh_up_p, sh_up_s, d_slot_act_, I_r, slots, K, cfg_.swiglu_limit, stream,
-          shared_view_base, fp4_group, sh_rs, sh_cs);
+          shared_view_base, fp4_group, sh_rs, sh_cs, /*streaming=*/kSlotStreamingAtOneRow && tokens == 1 && slot_shared);
     } else if (!gate_fp4 && !up_fp4) {
       launch_moe_slot_gate_up_swiglu(
           hidden, H, d_ids_, order, table, I_r, H, I_s, K_s, sh_gate_p, sh_gate_s,

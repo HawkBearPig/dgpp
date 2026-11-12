@@ -2650,19 +2650,21 @@ DGPP_TEST(moe_decode_slot_path_is_bitwise_host_path_mxfp4) {
     std::memcpy(fused.data(), c.d_out, fused.size() * 2);
     require(std::memcmp(gemv_host.data(), fused.data(), host.size() * 2) == 0,
             "mxfp4 decode slot path must be bitwise-identical to the GEMV host path");
-    // The shared expert's slots early in the execution order
-    // (GlmMoeConfig::shared_slots_early, the DeepSeek-V4-Flash decode): the
-    // order alone moves — every row bitwise the default order's, one row
-    // (which launches the order kernel only under this flag) included.
+    // The shared expert's slots run early in the execution order by default
+    // (GlmMoeConfig::shared_slots_early). The order alone moves: every row
+    // is bitwise the expert order's with the shared slots last, one row
+    // (which launches the order kernel only under the early order, and
+    // reads its gate/up weights as streaming lines) included.
     {
-      dgpp::GlmMoeConfig early_cfg = c.cfg;
-      early_cfg.shared_slots_early = true;
-      GlmMoeLayer early(c.dev_w, early_cfg, std::max(cs.M, 1), /*decode_slots=*/cs.M);
+      require(c.cfg.shared_slots_early, "the decode launches run the shared slots early by default");
+      dgpp::GlmMoeConfig late_cfg = c.cfg;
+      late_cfg.shared_slots_early = false;
+      GlmMoeLayer late(c.dev_w, late_cfg, std::max(cs.M, 1), /*decode_slots=*/cs.M);
       DGPP_CUDA_OK(cudaMemset(c.d_out, 0x7F, host.size() * 2));
-      early.enqueue_decode(c.d_hidden, c.d_out, cs.M, nullptr, nullptr);
+      late.enqueue_decode(c.d_hidden, c.d_out, cs.M, nullptr, nullptr);
       DGPP_CUDA_OK(cudaDeviceSynchronize());
       require(std::memcmp(c.d_out, fused.data(), host.size() * 2) == 0,
-              "mxfp4 decode: the early shared-slot order must be bitwise the default order");
+              "mxfp4 decode: the early shared-slot order must be bitwise the expert order");
     }
     // The prefill path takes the tile kernel's MXFP4 form: bitwise the
     // host path through it (MoeExpertKernel::kMma), within budget of the oracle.

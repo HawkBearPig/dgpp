@@ -353,9 +353,8 @@ GlmMoeConfig Dsv4Config::moe_config(int local_inter) const {
   m.swiglu_limit = swiglu_limit;
   m.router_mode = MoeRouterMode::SqrtSoftplusBias;
   // The decode walk's shared expert: aside on the tensor cores where the
-  // shapes allow (GlmMoeConfig::shared_mma_aside), else its slots beside
-  // the first routed ones (the order alone moves: bitwise).
-  m.shared_slots_early = true;
+  // shapes allow (GlmMoeConfig::shared_mma_aside), else in the slots, beside
+  // the first routed ones as in every family.
   m.shared_mma_aside = true;
   GlmMoeConfig::validate_config(m);
   return m;
