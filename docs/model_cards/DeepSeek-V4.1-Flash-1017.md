@@ -140,7 +140,12 @@ conversion instruction. The FP8 GEMV core, which computes the shared expert,
 and the tensor-core GEMV, which computes the attention projections, round
 two weights with one pack instruction. Host code keeps the integer form of
 the same rounding. The two agree on every float that is not a NaN, and
-`scale_gemm_test` compares them on all 2^32 bit patterns. A NaN stays a NaN.
+`scale_gemm_test` compares them on all 2^32 bit patterns. A NaN stays a NaN
+with the instruction's bit pattern. In the two dequantization loops that
+pattern does not reach an output: the rounded weight only feeds a
+multiply-add or the tensor-core multiply, which return the same NaN
+whatever the operand's pattern was, and `scale_gemm_test` holds the loop's
+accumulators to the integer form's with NaN weights.
 
 The integer form is eight instructions per value. In the FP8 GEMV core that
 was about 130 of the 330 instructions a 16-byte chunk of weights cost, and
