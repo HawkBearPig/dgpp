@@ -356,7 +356,7 @@ class GlmMoeLayer {
   cudaStream_t sh_lane_ = nullptr;
   cudaEvent_t sh_lane_fork_ = nullptr;
   cudaEvent_t sh_lane_join_ = nullptr;
-  int sh_lane_blocks_ = 0;  // the lane's grid bound: two blocks an SM
+  int sh_lane_blocks_ = 0;  // the lane's grid bound: one block an SM
   int* d_router_counters_ = nullptr;  // [decode_slots] fused-select tickets    // [slots, hidden] fp32 partial dots
   // The device expert-view table, re-uploaded per enqueue_decode call.
   // NO CACHE, DELIBERATELY: the streaming loader refills one

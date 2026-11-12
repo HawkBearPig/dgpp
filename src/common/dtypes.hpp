@@ -8,6 +8,7 @@
 #include <string_view>
 
 #if defined(__CUDACC__)
+#include <cuda_bf16.h>
 #define DGPP_HD __host__ __device__
 #else
 #define DGPP_HD
@@ -85,6 +86,15 @@ DGPP_HD inline float bf16_bits_to_float(uint16_t b) {
 }
 
 DGPP_HD inline uint16_t float_to_bf16_bits(float f) {
+#if defined(__CUDA_ARCH__)
+  // Device code: the float-to-bf16 conversion instruction, round to nearest
+  // even. One instruction where the integer form below is eight, and the
+  // rounding sits in a kernel's inner loop or its epilogue. Every float that
+  // is not a NaN gives the integer form's bits (scale_gemm_test compares the
+  // two on all 2^32 patterns). A NaN stays a NaN and carries the
+  // instruction's payload, not the canonical one of the integer form.
+  return __bfloat16_as_ushort(__float2bfloat16_rn(f));
+#else
   // Round-to-nearest-even. NaN needs an explicit path: the integer rounding
   // below assumes a finite exponent, but hardware NaN payloads (e.g. the
   // all-ones NaN that FMUL produces on some paths) carry far enough that
@@ -97,6 +107,7 @@ DGPP_HD inline uint16_t float_to_bf16_bits(float f) {
   uint32_t lsb = (u >> 16) & 1;
   u += 0x7fffu + lsb;
   return static_cast<uint16_t>(u >> 16);
+#endif
 }
 
 // IEEE binary16 (F16) — the GPTQ / AutoRound scale dtype (2026-09-28,

@@ -132,6 +132,54 @@ expert once per row. At one request the shared launches still cost part of
 what they save: they share the processors with the router and delay the
 routed launch's start by 20 to 30 microseconds a layer.
 
+## The bf16 rounding in device code (2026-11-12)
+
+Dequantizing an FP8 weight rounds the product of its code and its block
+scale to bf16. Device code does that rounding with the GPU's float-to-bf16
+conversion instruction. The FP8 GEMV core, which computes the shared expert,
+and the tensor-core GEMV, which computes the attention projections, round
+two weights with one pack instruction. Host code keeps the integer form of
+the same rounding. The two agree on every float that is not a NaN, and
+`scale_gemm_test` compares them on all 2^32 bit patterns. A NaN stays a NaN.
+
+The integer form is eight instructions per value. In the FP8 GEMV core that
+was about 130 of the 330 instructions a 16-byte chunk of weights cost, and
+the core is bound by instruction issue whenever its weights come from L2.
+With its weights in L2 the shared expert's first launch takes 11.6
+microseconds at two rows, against 16.4 with the integer form. The prefill
+expert kernels round every weight through the same helper. The prefill gain
+below appears with the instruction in every device kernel and not with the
+two dequantization loops alone.
+
+The shared expert's two launches run one block per SM, which leaves room on
+each SM for the routed launches' blocks, and they issue no prefetch requests
+of their own. Lines requested with the bulk L2 prefetch instruction do not
+stay in L2. A launch 10 microseconds behind the requests found most of them
+gone.
+
+Measured on four nodes against the same tree without these changes, in
+bracketed legs, on the engine's decode steps:
+
+| Load | Before | After | Change |
+|---|---|---|---|
+| One request, prose | 32.5 ms a pass | 30.9 ms | 60.4 → 63.5 tok/s (+5.1 %) |
+| One request, chat | 34.3 ms | 32.8 ms | 62.7 → 65.7 tok/s (+4.8 %) |
+| One request, code | 39.3 ms | 37.5 ms | 90.2 → 94.4 tok/s (+4.6 %) |
+| One request, JSON | 42.0 ms | 40.0 ms | 99.5 → 104.5 tok/s (+5.1 %) |
+| One request, math | 38.1 ms | 36.4 ms | 95.5 → 100.0 tok/s (+4.7 %) |
+| Plain decode, one row, five classes | 22.3 ms | 21.5 to 21.6 ms | +3.2 to +3.7 % |
+| Eight requests, five classes | 96 to 137 tok/s | 104 to 143 tok/s | +0.3 to +7.8 % |
+
+Cold prefill, engine time, the same binaries:
+
+| Prompt | Before | After | Change |
+|---|---|---|---|
+| 2K tokens | 1.08 s | 1.07 s | −1.4 % |
+| 8K tokens | 3.25 s | 3.14 s | −3.4 % |
+| 32K tokens | 12.77 s | 12.24 s | −4.1 % |
+
+The transcripts are identical in every class of every leg.
+
 ## Decode levers (2026-10-18)
 
 **The L2 prefetch windows.** The decode step is one serial chain of

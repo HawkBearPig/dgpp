@@ -278,7 +278,7 @@ GlmMoeLayer::GlmMoeLayer(const GlmMoeWeights& weights, const GlmMoeConfig& cfg,
       int dev = 0, sms = 0;
       DGPP_CUDA_OK(cudaGetDevice(&dev));
       DGPP_CUDA_OK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
-      sh_lane_blocks_ = 2 * sms;
+      sh_lane_blocks_ = sms;  // one block an SM (the kernels' comment)
     }
     // The fused router selection's tickets: one per decode row, zero at
     // rest (the last block of each launch resets its own).
@@ -1540,11 +1540,10 @@ void GlmMoeLayer::enqueue_decode_impl(const uint16_t* hidden, uint16_t* out_bf16
     DGPP_CUDA_OK(cudaStreamWaitEvent(sh_lane_, sh_lane_fork_));
     launch_moe_shared_run_gate_up_swiglu(hidden, static_cast<size_t>(H), g.payload, g.scales, u.payload, u.scales, sh_act,
                                          act_step, tokens, I_sh, H, cfg_.swiglu_limit, run, sh_lane_blocks_, sh_lane_,
-                                         log2_of(g.scale_block_rows), log2_of(g.scale_block_cols), d.payload,
-                                         static_cast<size_t>(H) * I_sh, /*threads=*/256);
+                                         log2_of(g.scale_block_rows), log2_of(g.scale_block_cols));
     launch_moe_shared_run_down(sh_act, act_step, d.payload, d.scales, d_slot_down_ + static_cast<size_t>(K) * H,
                                static_cast<size_t>(K + 1) * H, tokens, H, I_sh, run, sh_lane_blocks_, sh_lane_,
-                               log2_of(d.scale_block_rows), log2_of(d.scale_block_cols), /*threads=*/256);
+                               log2_of(d.scale_block_rows), log2_of(d.scale_block_cols));
     DGPP_CUDA_OK(cudaEventRecord(sh_lane_join_, sh_lane_));
   }
   // 2. Route traces ride ASYNC copies into the caller's pinned staging;
