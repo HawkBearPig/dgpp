@@ -5,6 +5,18 @@ project procedures and design guidance live in `docs/`.
 
 ## Unreleased
 
+- **The shared expert computed once for the rows of a decode pass**: a
+  decode launch of two rows or more computes the FP8 shared expert in two
+  launches of its own beside the router, each weight row decoded once for up
+  to four rows, and the routed expert launches run without it. The FP4 down
+  launch issues a block's own loads before its look-ahead. No value changes.
+  On four nodes the DeepSeek-V4.1-Flash-1017 decode step is 2 to 3 percent
+  shorter at one request and the decode rate 5 to 12 percent higher at eight
+  requests. GLM-5.3-Flash NVFP4-FP8 is 0.5 percent shorter and GLM-5.3
+  Mixed346 is unchanged. Transcripts are identical. The
+  [DeepSeek-V4.1 model card](docs/model_cards/DeepSeek-V4.1-Flash-1017.md)
+  has the measurements.
+
 - **Faster decode expert launches on every MoE family**: the shared
   expert's slots run beside the first routed slots instead of as each
   launch's tail, in every family that computes the shared expert in the slot

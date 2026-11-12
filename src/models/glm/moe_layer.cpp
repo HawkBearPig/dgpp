@@ -271,6 +271,15 @@ GlmMoeLayer::GlmMoeLayer(const GlmMoeWeights& weights, const GlmMoeConfig& cfg,
       DGPP_CUDA_OK(cudaEventCreateWithFlags(&sh_up_done_, cudaEventDisableTiming));
       DGPP_CUDA_OK(cudaEventCreateWithFlags(&sh_join_, cudaEventDisableTiming));
     }
+    if (cfg_.shared_run_lane && cfg_.n_shared_experts > 0) {
+      DGPP_CUDA_OK(cudaStreamCreateWithFlags(&sh_lane_, cudaStreamNonBlocking));
+      DGPP_CUDA_OK(cudaEventCreateWithFlags(&sh_lane_fork_, cudaEventDisableTiming));
+      DGPP_CUDA_OK(cudaEventCreateWithFlags(&sh_lane_join_, cudaEventDisableTiming));
+      int dev = 0, sms = 0;
+      DGPP_CUDA_OK(cudaGetDevice(&dev));
+      DGPP_CUDA_OK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
+      sh_lane_blocks_ = 2 * sms;
+    }
     // The fused router selection's tickets: one per decode row, zero at
     // rest (the last block of each launch resets its own).
     DGPP_CUDA_OK(cudaMalloc(&d_router_counters_,
@@ -350,6 +359,9 @@ GlmMoeLayer::~GlmMoeLayer() {
   if (sh_fork_) cudaEventDestroy(sh_fork_);
   if (sh_up_done_) cudaEventDestroy(sh_up_done_);
   if (sh_join_) cudaEventDestroy(sh_join_);
+  if (sh_lane_fork_) cudaEventDestroy(sh_lane_fork_);
+  if (sh_lane_join_) cudaEventDestroy(sh_lane_join_);
+  if (sh_lane_) cudaStreamDestroy(sh_lane_);
   for (cudaStream_t st : sh_side_)
     if (st) {
       cudaStreamSynchronize(st);
@@ -1419,6 +1431,29 @@ bool GlmMoeLayer::shared_aside_takes(bool with_shared, int tokens) const {
          (reinterpret_cast<uintptr_t>(d.payload) & 15u) == 0;
 }
 
+// Whether this decode launch runs the shared expert in its own launches
+// (GlmMoeConfig::shared_run_lane): two rows or more, an FP8 shared expert
+// on launch arguments, and shapes the fp8 core takes.
+bool GlmMoeLayer::shared_lane_takes(bool with_shared, int tokens) const {
+  if (!cfg_.shared_run_lane || !with_shared || sh_lane_ == nullptr || tokens < 2) return false;
+  if (w_.shared_nvfp4() || w_.packq() || w_.exl3() || w_.shared[0].payload == nullptr) return false;
+  const auto pow2 = [](int b) { return b > 0 && (b & (b - 1)) == 0; };
+  for (int m = 0; m < 3; ++m) {
+    const GlmQuantMatrix& q = w_.shared[m];
+    if (q.payload == nullptr || q.scales == nullptr || (reinterpret_cast<uintptr_t>(q.payload) & 15u) != 0 ||
+        !pow2(q.scale_block_rows) || !pow2(q.scale_block_cols) || q.scale_block_cols < 16)
+      return false;
+  }
+  const int I_s = static_cast<int>(w_.shared[0].rows);
+  if (w_.shared[1].rows != I_s || I_s <= 0 || I_s > routed_inter_of(w_, cfg_.n_experts)) return false;
+  if (w_.shared[0].scale_block_rows != w_.shared[1].scale_block_rows ||
+      w_.shared[0].scale_block_cols != w_.shared[1].scale_block_cols)
+    return false;
+  // One staged row within the default shared memory, k a multiple of 16.
+  return (cfg_.hidden % 16) == 0 && (I_s % 16) == 0 &&
+         static_cast<size_t>(cfg_.hidden) * 2 <= size_t{48} * 1024;
+}
+
 void GlmMoeLayer::enqueue_decode_impl(const uint16_t* hidden, uint16_t* out_bf16,
                                       float* out_f32, int tokens,
                                       MoeTraceStaging* trace, cudaStream_t stream,
@@ -1478,9 +1513,40 @@ void GlmMoeLayer::enqueue_decode_impl(const uint16_t* hidden, uint16_t* out_bf16
     DGPP_CUDA_OK(cudaEventRecord(sh_join_, sh_side_[0]));
   }
 
+  // 0b. The shared expert's lane (GlmMoeConfig::shared_run_lane): forked
+  //     here, at the layer's input, and launched behind the router's own
+  //     launches so the router's blocks are placed first; its rows go into
+  //     the shared slots of d_slot_act_ and d_slot_down_.
+  const bool shared_lane = !shared_aside && shared_lane_takes(with_shared, tokens);
+  if (shared_lane) DGPP_CUDA_OK(cudaEventRecord(sh_lane_fork_, stream));
+
   // 1. Router, dots and selection in one launch — ids ASCENDING per row,
   //    on device.
   route(hidden, tokens, stream, d_router_counters_);
+  if (shared_lane) {
+    const GlmQuantMatrix& g = w_.shared[0];
+    const GlmQuantMatrix& u = w_.shared[1];
+    const GlmQuantMatrix& d = w_.shared[2];
+    const int I_sh = static_cast<int>(g.rows);
+    const int I_row = routed_inter_of(w_, cfg_.n_experts);  // the slot launches' act stride
+    const auto log2_of = [](int b) {
+      int sft = 0;
+      while ((1 << sft) < b) ++sft;
+      return sft;
+    };
+    const int run = moe_shared_run_rows(tokens, H);
+    uint16_t* sh_act = d_slot_act_ + static_cast<size_t>(K) * I_row;
+    const size_t act_step = static_cast<size_t>(K + 1) * I_row;
+    DGPP_CUDA_OK(cudaStreamWaitEvent(sh_lane_, sh_lane_fork_));
+    launch_moe_shared_run_gate_up_swiglu(hidden, static_cast<size_t>(H), g.payload, g.scales, u.payload, u.scales, sh_act,
+                                         act_step, tokens, I_sh, H, cfg_.swiglu_limit, run, sh_lane_blocks_, sh_lane_,
+                                         log2_of(g.scale_block_rows), log2_of(g.scale_block_cols), d.payload,
+                                         static_cast<size_t>(H) * I_sh, /*threads=*/256);
+    launch_moe_shared_run_down(sh_act, act_step, d.payload, d.scales, d_slot_down_ + static_cast<size_t>(K) * H,
+                               static_cast<size_t>(K + 1) * H, tokens, H, I_sh, run, sh_lane_blocks_, sh_lane_,
+                               log2_of(d.scale_block_rows), log2_of(d.scale_block_cols), /*threads=*/256);
+    DGPP_CUDA_OK(cudaEventRecord(sh_lane_join_, sh_lane_));
+  }
   // 2. Route traces ride ASYNC copies into the caller's pinned staging;
   //    the caller materializes them after its next stream sync (the
   //    decode step's final sync). No round-trip on the hot path.
@@ -1525,7 +1591,7 @@ void GlmMoeLayer::enqueue_decode_impl(const uint16_t* hidden, uint16_t* out_bf16
   const bool shared_fp4 = with_shared && w_.shared_nvfp4();
   const int shared_view_base = shared_fp4 ? E * 3 : -1;
   // (Aside: the slot kernels see no shared slot — its blocks find n == 0.)
-  const bool slot_shared = with_shared && !shared_aside;
+  const bool slot_shared = with_shared && !shared_aside && !shared_lane;
   const bool exl3 = w_.exl3();
   const int I_s = slot_shared ? static_cast<int>(shared_fp4 ? w_.shared_fp4[0].rows
                                                  : packq   ? w_.shared_packed[0].rows
@@ -1565,6 +1631,11 @@ void GlmMoeLayer::enqueue_decode_impl(const uint16_t* hidden, uint16_t* out_bf16
     order = d_slot_order_;
     if (exl3) runs = d_slot_runs_;
   }
+  // Without the shared expert in the slots the order's first tokens * K
+  // positions are the routed slots (the expert order sorts the shared ones
+  // last; one row's identity order has them first too): the fp4 launches'
+  // grids cover those alone.
+  const int live_slots = slot_shared ? slots : tokens * K;
   // Gate + up + swiglu in one launch (bit-identical to the three-launch
   // chain — see the launcher). Per-slot bounds are consumed downstream
   // (the down GEMV reads only k=I_s of the shared slot).
@@ -1648,7 +1719,8 @@ void GlmMoeLayer::enqueue_decode_impl(const uint16_t* hidden, uint16_t* out_bf16
       launch_moe_slot_gate_up_swiglu_fp4(
           hidden, H, d_ids_, order, table, I_r, H, I_s, K_s, sh_gate_p, sh_gate_s,
           sh_up_p, sh_up_s, d_slot_act_, I_r, slots, K, cfg_.swiglu_limit, stream,
-          shared_view_base, fp4_group, sh_rs, sh_cs, /*streaming=*/kSlotStreamingAtOneRow && tokens == 1 && slot_shared);
+          shared_view_base, fp4_group, sh_rs, sh_cs, /*streaming=*/kSlotStreamingAtOneRow && tokens == 1 && slot_shared,
+          live_slots);
     } else if (!gate_fp4 && !up_fp4) {
       launch_moe_slot_gate_up_swiglu(
           hidden, H, d_ids_, order, table, I_r, H, I_s, K_s, sh_gate_p, sh_gate_s,
@@ -1662,7 +1734,7 @@ void GlmMoeLayer::enqueue_decode_impl(const uint16_t* hidden, uint16_t* out_bf16
     if (down_fp4)
       launch_moe_slot_down_fp4(d_slot_act_, I_r, d_ids_, order, table, H, I_r, N_s,
                                I_s, sh_down_p, sh_down_s, d_slot_down_, H, slots, K,
-                               stream, shared_view_base, fp4_group, sh_rs, sh_cs, d_tile_counter_);
+                               stream, shared_view_base, fp4_group, sh_rs, sh_cs, d_tile_counter_, live_slots);
     else
       launch_moe_slot_down(d_slot_act_, I_r, d_ids_, order, table, H, I_r, N_s,
                            I_s, sh_down_p, sh_down_s, d_slot_down_, H, slots, K,
@@ -1677,6 +1749,7 @@ void GlmMoeLayer::enqueue_decode_impl(const uint16_t* hidden, uint16_t* out_bf16
                          stream, sh_rs, sh_cs);
   }
   if (shared_aside) DGPP_CUDA_OK(cudaStreamWaitEvent(stream, sh_join_));
+  if (shared_lane) DGPP_CUDA_OK(cudaStreamWaitEvent(stream, sh_lane_join_));
   if (with_shared)
     launch_moe_slot_accum(out_bf16, d_slot_down_, d_weights_, tokens, H, K, stream);
   else if (accumulate)

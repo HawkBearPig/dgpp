@@ -131,6 +131,11 @@ class GlmMoeLayer {
   // (cfg.n_shared_experts == 1). Without it the prefill and decode fast
   // paths are not wired yet (they refuse; the Qwen engine's milestone).
   bool has_shared() const { return cfg_.n_shared_experts == 1; }
+  // Whether a decode launch of `tokens` rows with the shared expert in its
+  // chain runs it in its own launches (GlmMoeConfig::shared_run_lane).
+  bool decode_shared_lane(int tokens) const {
+    return !shared_aside_takes(true, tokens) && shared_lane_takes(true, tokens);
+  }
 
   // The decode fast path: same contract, no host round-trip. tokens
   // must fit decode_slots. Bitwise-equal to enqueue() at the same
@@ -282,6 +287,7 @@ class GlmMoeLayer {
              int token_row = 0);
   void prefill_chain(const uint16_t* hidden, int tokens, cudaStream_t stream, int route_row = 0);
   bool shared_aside_takes(bool with_shared, int tokens) const;
+  bool shared_lane_takes(bool with_shared, int tokens) const;
   const int32_t* hash_tid2eid_ = nullptr;
   const int64_t* hash_tokens_ = nullptr;
   int hash_vocab_ = 0;
@@ -345,6 +351,12 @@ class GlmMoeLayer {
   cudaEvent_t sh_fork_ = nullptr;
   cudaEvent_t sh_up_done_ = nullptr;
   cudaEvent_t sh_join_ = nullptr;
+  // GlmMoeConfig::shared_run_lane: the shared expert's side stream, its
+  // fork at the layer's input and its join before the accumulation.
+  cudaStream_t sh_lane_ = nullptr;
+  cudaEvent_t sh_lane_fork_ = nullptr;
+  cudaEvent_t sh_lane_join_ = nullptr;
+  int sh_lane_blocks_ = 0;  // the lane's grid bound: two blocks an SM
   int* d_router_counters_ = nullptr;  // [decode_slots] fused-select tickets    // [slots, hidden] fp32 partial dots
   // The device expert-view table, re-uploaded per enqueue_decode call.
   // NO CACHE, DELIBERATELY: the streaming loader refills one
