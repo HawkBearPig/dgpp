@@ -72,8 +72,15 @@ __device__ __forceinline__ float dequant(float w, float s) {
 // form of float_to_bf16_bits was eight instructions a weight here, 130 of
 // the 330 a 16-byte chunk cost, and the core is instruction-bound whenever
 // its bytes come from L2. Every product that is not a NaN gives the integer
-// form's bits (scale_gemm_test checks every float). A NaN stays a NaN and
-// carries the instruction's payload.
+// form's bits (scale_gemm_test checks every float).
+// A NaN product comes out as the instruction's NaN, 0x7FFF, where the
+// integer form gives the quiet NaN with the product's sign. No output can
+// tell: the value only feeds an FMA or the tensor-core multiply, and
+// neither carries a NaN operand's payload or sign into its result.
+// scale_gemm_test holds consume_chunk's accumulators to the integer form's
+// with NaN codes and scales that are not finite. (A test for the NaN after
+// each pair, to restore the integer form's pattern, cost 37 percent of a
+// shared-expert launch.)
 __device__ __forceinline__ uint32_t dequant_bf16x2(float2 w, float s) {
   const __nv_bfloat162 b = __floats2bfloat162_rn(w.x * s, w.y * s);
   return static_cast<uint32_t>(__bfloat16_as_ushort(b.x)) | (static_cast<uint32_t>(__bfloat16_as_ushort(b.y)) << 16);

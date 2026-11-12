@@ -632,48 +632,54 @@ __host__ __device__ inline uint16_t integer_round_bf16(float f) {
   return static_cast<uint16_t>(u >> 16);
 }
 
-// Every float through the device's two roundings, float_to_bf16_bits (one
-// conversion instruction in device code) and the fp8 core's pair form
-// (fp8_gemv::dequant_bf16x2, the pack instruction), against the integer
-// form: 2^32 bit patterns, each as the pair's low half with a mixed partner
-// in the high half. out[0] counts the values that are not NaN and round to
-// other bits, out[1] the NaNs that do not stay NaN, out[2] holds one
-// offending pattern.
+// Every float through the device's two roundings against the integer form:
+// 2^32 bit patterns, each as the pair's low half with a mixed partner in the
+// high half. float_to_bf16_bits (the conversion instruction in device code)
+// and fp8_gemv::dequant_bf16x2 (the pack instruction) must give the integer
+// form's bits on every pattern that is not a NaN, and the instruction's one
+// NaN, 0x7FFF, on every NaN.
+// out[0] counts the scalar form's mismatches, out[1] the pair form's, both
+// on values that are not NaN, out[2] the NaNs either form does not return
+// as 0x7FFF, out[3] holds one offending pattern.
 __global__ void bf16_rounding_all_floats_kernel(unsigned long long* out) {
   const uint32_t base = (static_cast<uint32_t>(blockIdx.x) << 16) | (static_cast<uint32_t>(threadIdx.x) << 8);
-  unsigned bad = 0, bad_nan = 0;
+  unsigned bad_scalar = 0, bad_pair = 0, bad_pair_nan = 0;
   uint32_t witness = 0;
   for (uint32_t i = 0; i < 256; ++i) {
     const uint32_t ua = base | i, ub = ua ^ 0xA5A5A5A5u;
     const float2 w = make_float2(__uint_as_float(ua), __uint_as_float(ub));
     const uint32_t pair = dgpp::fp8_gemv::dequant_bf16x2(w, 1.0f);
-    const uint32_t got[2][2] = {{pair & 0xFFFFu, dgpp::float_to_bf16_bits(w.x)}, {pair >> 16, dgpp::float_to_bf16_bits(w.y)}};
+    const uint32_t pair_half[2] = {pair & 0xFFFFu, pair >> 16};
+    const uint32_t scalar[2] = {dgpp::float_to_bf16_bits(w.x), dgpp::float_to_bf16_bits(w.y)};
     const uint32_t in[2] = {ua, ub};
 #pragma unroll
     for (int h = 0; h < 2; ++h) {
       const bool nan = (in[h] & 0x7FFFFFFFu) > 0x7F800000u;
       const uint32_t want = integer_round_bf16(__uint_as_float(in[h]));
-#pragma unroll
-      for (int form = 0; form < 2; ++form) {
-        if (nan) {
-          if (!((got[h][form] & 0x7FFFu) > 0x7F80u)) ++bad_nan;
-        } else if (got[h][form] != want) {
-          ++bad;
+      if (nan) {
+        if (pair_half[h] != 0x7FFFu) ++bad_pair_nan;
+        if (scalar[h] != 0x7FFFu) ++bad_pair_nan;
+      } else {
+        if (scalar[h] != want) {
+          ++bad_scalar;
+          witness = in[h];
+        }
+        if (pair_half[h] != want) {
+          ++bad_pair;
           witness = in[h];
         }
       }
     }
   }
-  if (bad) {
-    atomicAdd(out, static_cast<unsigned long long>(bad));
-    out[2] = witness;
-  }
-  if (bad_nan) atomicAdd(out + 1, static_cast<unsigned long long>(bad_nan));
+  if (bad_scalar) atomicAdd(out, static_cast<unsigned long long>(bad_scalar));
+  if (bad_pair) atomicAdd(out + 1, static_cast<unsigned long long>(bad_pair));
+  if (bad_pair_nan) atomicAdd(out + 2, static_cast<unsigned long long>(bad_pair_nan));
+  if (bad_scalar || bad_pair) out[3] = witness;
 }
 
 DGPP_TEST(device_bf16_rounding_matches_the_integer_form_on_every_float) {
   // The integer form here is the host's float_to_bf16_bits: a pattern in
-  // every 251 across the whole range.
+  // every 251 across the whole range, and every NaN exponent's edges.
   for (uint64_t u = 0; u < (uint64_t{1} << 32); u += 251) {
     float f;
     const uint32_t bits = static_cast<uint32_t>(u);
@@ -681,17 +687,104 @@ DGPP_TEST(device_bf16_rounding_matches_the_integer_form_on_every_float) {
     require(dgpp::float_to_bf16_bits(f) == integer_round_bf16(f), "the test's integer form is the host's float_to_bf16_bits");
   }
   unsigned long long* out = nullptr;
-  DGPP_CUDA_OK(cudaMallocManaged(&out, 3 * sizeof(unsigned long long)));
-  out[0] = out[1] = out[2] = 0;
+  DGPP_CUDA_OK(cudaMallocManaged(&out, 4 * sizeof(unsigned long long)));
+  out[0] = out[1] = out[2] = out[3] = 0;
   // 65536 blocks x 256 threads x 256 values = 2^32.
   bf16_rounding_all_floats_kernel<<<65536, 256>>>(out);
   DGPP_CUDA_OK(cudaDeviceSynchronize());
   char msg[200];
-  std::snprintf(msg, sizeof msg, "the device rounds %llu non-NaN floats to other bits than the integer form (one: %#010llx)", out[0], out[2]);
+  std::snprintf(msg, sizeof msg, "device float_to_bf16_bits rounds %llu non-NaN floats to other bits than the integer form (one: %#010llx)", out[0],
+                out[3]);
   require(out[0] == 0, msg);
-  require(out[1] == 0, "a NaN must stay a NaN through the device's bf16 rounding");
+  std::snprintf(msg, sizeof msg, "the pack instruction rounds %llu non-NaN floats to other bits than the integer form (one: %#010llx)", out[1], out[3]);
+  require(out[1] == 0, msg);
+  require(out[2] == 0, "the device's bf16 NaN is 0x7FFF for every NaN input, scalar and pair");
   DGPP_CUDA_OK(cudaFree(out));
-  std::printf("[ OK ] device bf16 rounding (scalar and pair) == the integer form on every non-NaN float, NaN stays NaN\n");
+  std::printf("[ OK ] device bf16 rounding (scalar and pair) == the integer form on every non-NaN float, every NaN -> 0x7FFF\n");
+}
+
+// The fp8 core's chunk arithmetic with the pair rounding (consume_chunk)
+// against the same chain with the integer form's rounding (its canonical
+// NaN with the sign): the accumulators bit for bit, over chunks with NaN codes,
+// scales that are zero, huge, infinite or NaN, activations and starting
+// accumulators with the special values. The pair form leaves a NaN weight
+// as the instruction's NaN (0x7FFF, the sign gone), and this holds that no
+// accumulator can tell.
+// out[0] cases whose accumulators differ, out[1] cases with a NaN weight,
+// out[2] cases whose result is a NaN, out[3] one offending case index.
+__global__ void consume_chunk_pair_vs_scalar_kernel(unsigned long long* out, int rounds) {
+  __shared__ __align__(16) uint16_t sx[256 * 16];
+  const uint32_t specials[8] = {0x00000000u, 0x80000000u, 0x3F800000u, 0xBF800000u, 0x7F800000u, 0xFF800000u, 0x7FC00000u, 0xFFC00001u};
+  const uint32_t scales[12] = {0x3F800000u, 0x3F000000u, 0x40000000u, 0x406CCCCDu, 0x00000000u, 0x80000000u, 0x0DA24260u,
+                               0x7149F2CAu, 0x7F800000u, 0xFF800000u, 0x7FC00000u, 0x3A800000u};
+  uint16_t* x = sx + threadIdx.x * 16;
+  uint32_t h = (blockIdx.x * 256u + threadIdx.x) * 2654435761u + 0x9E3779B9u;
+  const auto rnd = [&h] { h ^= h << 13; h ^= h >> 17; h ^= h << 5; return h; };
+  unsigned bad = 0, with_nan = 0, nan_out = 0;
+  uint32_t witness = 0;
+  for (int it = 0; it < rounds; ++it) {
+    uint4 chunk = make_uint4(rnd(), rnd(), rnd(), rnd());
+    const uint32_t sel = rnd();
+    if ((sel & 3u) == 0u) {  // a NaN code (0x7F or 0xFF) in one byte of a quarter of the chunks
+      const uint32_t code = (sel & 4u) ? 0xFFu : 0x7Fu, sh = ((sel >> 3) & 3u) * 8u;
+      chunk.y = (chunk.y & ~(0xFFu << sh)) | (code << sh);
+    }
+    const float s = __uint_as_float(((sel >> 8) % 16u) < 12u ? scales[(sel >> 8) % 16u] : (rnd() & 0x7FFFFFFFu) % 0x7F000000u);
+#pragma unroll 1
+    for (int j = 0; j < 16; ++j) {
+      const uint32_t r = rnd();
+      x[j] = static_cast<uint16_t>(((r & 15u) < 2u ? specials[(r >> 4) & 7u] : r) >> 16);
+    }
+    const uint32_t r0 = rnd();
+    const float acc0 = __uint_as_float((r0 & 3u) == 0u ? specials[(r0 >> 2) & 7u] : (r0 & 3u) == 1u ? r0 : 0u);
+    float acc[1] = {acc0};
+    dgpp::fp8_gemv::consume_chunk<1>(chunk, s, x, 16, 0, acc);
+    float ref = acc0;
+    bool nan_weight = false;
+    const uint32_t words[4] = {chunk.x, chunk.y, chunk.z, chunk.w};
+#pragma unroll
+    for (int q = 0; q < 4; ++q) {
+      const float2 w01 = dgpp::fp8_gemv::e4m3x2_to_float2(static_cast<uint16_t>(words[q] & 0xFFFFu));
+      const float2 w23 = dgpp::fp8_gemv::e4m3x2_to_float2(static_cast<uint16_t>(words[q] >> 16));
+      const float d[4] = {dgpp::bf16_bits_to_float(integer_round_bf16(w01.x * s)), dgpp::bf16_bits_to_float(integer_round_bf16(w01.y * s)),
+                          dgpp::bf16_bits_to_float(integer_round_bf16(w23.x * s)), dgpp::bf16_bits_to_float(integer_round_bf16(w23.y * s))};
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        nan_weight |= d[j] != d[j];
+        ref = __fmaf_rn(d[j], dgpp::bf16_bits_to_float(x[q * 4 + j]), ref);
+      }
+    }
+    with_nan += nan_weight ? 1u : 0u;
+    nan_out += ref != ref ? 1u : 0u;
+    if (__float_as_uint(ref) != __float_as_uint(acc[0])) {
+      ++bad;
+      witness = (blockIdx.x * 256u + threadIdx.x) * static_cast<uint32_t>(rounds) + static_cast<uint32_t>(it);
+    }
+  }
+  if (bad) {
+    atomicAdd(out, static_cast<unsigned long long>(bad));
+    out[3] = witness;
+  }
+  atomicAdd(out + 1, static_cast<unsigned long long>(with_nan));
+  atomicAdd(out + 2, static_cast<unsigned long long>(nan_out));
+}
+
+DGPP_TEST(fp8_gemv_pair_rounding_gives_the_integer_forms_accumulators_with_nan_weights) {
+  unsigned long long* out = nullptr;
+  DGPP_CUDA_OK(cudaMallocManaged(&out, 4 * sizeof(unsigned long long)));
+  out[0] = out[1] = out[2] = out[3] = 0;
+  const int blocks = 4096, rounds = 256;  // 2^28 chunks
+  consume_chunk_pair_vs_scalar_kernel<<<blocks, 256>>>(out, rounds);
+  DGPP_CUDA_OK(cudaDeviceSynchronize());
+  const unsigned long long cases = static_cast<unsigned long long>(blocks) * 256 * rounds;
+  char msg[200];
+  std::snprintf(msg, sizeof msg, "the pair rounding's accumulator differs from the integer form's in %llu of %llu chunks (one: case %llu)", out[0],
+                cases, out[3]);
+  require(out[0] == 0, msg);
+  require(out[1] > cases / 8, "the sample holds NaN weights: the claim is not vacuous");
+  require(out[2] > out[1] / 2 && out[2] < cases, "the sample holds NaN and finite results");
+  std::printf("[ OK ] consume_chunk (pair rounding) == the integer form's accumulator in %llu chunks, %llu with a NaN weight\n", cases, out[1]);
+  DGPP_CUDA_OK(cudaFree(out));
 }
 
 // The multi-problem GEMV: several [n_i, k] matrices against
