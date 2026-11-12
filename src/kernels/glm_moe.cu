@@ -1850,17 +1850,24 @@ void launch_moe_slot_accum(uint16_t* out, const float* contrib,
 // at the shared width n_shared and the routed K.
 namespace {
 
-// The decode slot kernels' weight loads as streaming (evict-first) lines
-// (2026-09-22 experiment, docs/mimo_v26_flash_plan.md §7.1: the expert
-// bytes are read once per step; evict-first keeps the L2 for the
-// prefetcher's lines). -DDGPP_FP4_SLOT_STREAMING=1 builds it; off until a
-// fabric A/B decides.
-#ifndef DGPP_FP4_SLOT_STREAMING
-#define DGPP_FP4_SLOT_STREAMING 0
-#endif
-constexpr bool kFp4SlotStreaming = DGPP_FP4_SLOT_STREAMING != 0;
+// The decode slot kernels' weight loads as streaming (evict-first) lines:
+// the gate/up kernel's `kStream` (the launcher's `streaming`). The expert
+// bytes are read once per slot, and marking them evict-first keeps the L2
+// for what the ffn-side prefetch window staged (the fp8 shared expert:
+// plain loads pushed its down rows out before the down kernel ran, and the
+// shared slot's own gate/up reads out from under it). Measured 2026-11-10
+// on the DeepSeek-V4.1 world-4 shape against a pure stream of the same
+// bytes: with the shared expert staged the phase gains 8 us at one row and
+// 6 at two; with it cold the one-row phase is even and the two-row phase
+// loses 7; from three rows on it loses either way (five rows: 530 -> 551
+// us staged, 549 -> 577 cold), because an expert two rows share is served
+// to its second slot from L2 only while its lines are not the first
+// evicted. So the layer asks for it at one row with the shared expert in
+// the slots (GlmMoeLayer's decode). The loads' values are the same either
+// way: bitwise. The mixed pair and the down kernel keep plain loads.
+constexpr bool kFp4SlotStreaming = false;
 
-template <int K, bool kSharedFp4, int kGroup = fp4_gemv::kGroup>
+template <int K, bool kSharedFp4, int kGroup = fp4_gemv::kGroup, bool kStream = false>
 __global__ void moe_slot_gate_up_swiglu_fp4_kernel(
     const uint16_t* __restrict__ x, size_t x_stride,
     const int32_t* __restrict__ ids, const int32_t* __restrict__ order,
@@ -1920,12 +1927,12 @@ __global__ void moe_slot_gate_up_swiglu_fp4_kernel(
   // The first pass's weight loads in flight before the activations are
   // staged (fp4_gemv.cuh: PassLoads).
   fp4_gemv::PassLoads<G::pass_chunks(0)> L0, L1;
-  fp4_gemv::issue_pass_pair<K, 0, G::pass_chunks(0), kGroup, kFp4SlotStreaming>(
+  fp4_gemv::issue_pass_pair<K, 0, G::pass_chunks(0), kGroup, kStream>(
       vg.payload, vg.fp4_scales, vu.payload, vu.fp4_scales, n0, n, L0, L1);
   fp8_gemv::stage_activations<1>(x + static_cast<size_t>(t) * x_stride, x_stride, k, sx);
   __syncthreads();
   float acc_g[fp4_gemv::kSteps][1], acc_u[fp4_gemv::kSteps][1];
-  fp4_gemv::warp_row_dots_pair_issued<K, 1, kGroup, kFp4SlotStreaming>(
+  fp4_gemv::warp_row_dots_pair_issued<K, 1, kGroup, kStream>(
       L0, L1, vg.payload, vg.fp4_scales, vu.payload, vu.fp4_scales, sx, n0, n, acc_g, acc_u);
   // MXFP4 (kGroup 32) has no global: the dots stand undivided.
   const float gg = kGroup == fp4_gemv::kGroup ? *vg.fp4_global : 1.f;
@@ -2058,6 +2065,13 @@ __global__ void moe_slot_gate_up_swiglu_mixed_kernel(
   }
 }
 
+// The down kernel's look-ahead (see the kernel): on, and the prefetch piece.
+#ifndef DGPP_FP4_SLOT_DOWN_LOOKAHEAD
+#define DGPP_FP4_SLOT_DOWN_LOOKAHEAD 1
+#endif
+constexpr bool kSlotDownLookahead = DGPP_FP4_SLOT_DOWN_LOOKAHEAD != 0;
+constexpr size_t kSlotDownPiece = 512;
+
 template <int K, bool kSharedFp4, int kGroup = fp4_gemv::kGroup>
 __global__ void moe_slot_down_fp4_kernel(
     const uint16_t* __restrict__ act, size_t act_stride,
@@ -2079,13 +2093,24 @@ __global__ void moe_slot_down_fp4_kernel(
   // chain whoever takes it: bitwise the static grid. The counter pair
   // (units taken, blocks done) is zero at rest: the last block out
   // resets both for the next launch, so no other kernel zeroes it.
+  // THE LOOK-AHEAD (2026-11-10): a block takes its next unit before it
+  // computes the one it holds and prefetches that unit's rows into L2,
+  // one bulk prefetch a 512-byte piece a thread. Without it every byte of
+  // a unit was requested at the unit's start and nothing was in flight
+  // while the block computed, synchronized its warps and took the next
+  // unit: at the DeepSeek-V4.1 down projection the memory idled a third
+  // of the kernel (128 to 140 GB/s on the bytes at one to five rows,
+  // against a pure stream's 208 to 227). The unit's own loads then find
+  // the lines in L2 or in flight. The units, the chain and the counter's
+  // protocol are unchanged (every block still takes exactly one unit past
+  // the end): bitwise.
   __shared__ int s_unit;
   const int total = tiles * slots;
+  __syncthreads();
+  if (threadIdx.x == 0) s_unit = atomicAdd(tile_counter, 1);
+  __syncthreads();
+  int unit = s_unit;
   for (;;) {
-    __syncthreads();  // the previous unit's readers of sx and s_unit are done
-    if (threadIdx.x == 0) s_unit = atomicAdd(tile_counter, 1);
-    __syncthreads();
-    const int unit = s_unit;
     if (unit >= total) {
       // Every block takes one unit past the end before it leaves, so the
       // last block done knows every fetch has happened.
@@ -2099,8 +2124,54 @@ __global__ void moe_slot_down_fp4_kernel(
       }
       return;
     }
-    const int slot_ix = unit / tiles;
-    const int n0 = (unit - slot_ix * tiles) * G::rows_per_block;
+    __syncthreads();  // the previous unit's readers of sx and s_unit are done
+    if (threadIdx.x == 0) s_unit = atomicAdd(tile_counter, 1);
+    __syncthreads();
+    const int next = s_unit;
+    if (kSlotDownLookahead && next < total) {
+      const int p_ix = next / tiles;
+      const int p_n0 = (next - p_ix * tiles) * G::rows_per_block;
+      const int p_slot = order ? order[p_ix] : p_ix;
+      const int p_t = p_slot / (top_k + 1);
+      const int p_j = p_slot - p_t * (top_k + 1);
+      const bool p_shared = p_j == top_k;
+      const int p_n = p_shared ? n_shared : n_routed;
+      const int p_rows = min(G::rows_per_block, p_n - p_n0);
+      const bool p_fp8 = p_shared && !kSharedFp4;
+      // The payload's pieces, then the scales' (the unit's loads read both).
+      const size_t pay_row = p_fp8 ? static_cast<size_t>(k_shared) : static_cast<size_t>(G::row_bytes);
+      const size_t pay_bytes = p_rows > 0 ? static_cast<size_t>(p_rows) * pay_row : 0;
+      const size_t sc_row = static_cast<size_t>(K / kGroup);  // the fp4 scales: one byte a group (the fp8 grid is a line or two: left to the loads)
+      const size_t sc_bytes = (p_rows > 0 && !p_fp8) ? static_cast<size_t>(p_rows) * sc_row : 0;
+      const size_t pay_pieces = (pay_bytes + kSlotDownPiece - 1) / kSlotDownPiece;
+      const size_t piece = threadIdx.x;
+      if (piece < pay_pieces + (sc_bytes + kSlotDownPiece - 1) / kSlotDownPiece) {
+        const uint8_t* base;
+        size_t bytes;
+        if (p_fp8) {
+          base = sh_payload + static_cast<size_t>(p_n0) * pay_row;
+          bytes = pay_bytes;
+        } else {
+          const int vb = (kSharedFp4 && p_shared) ? shared_view_base : ids[static_cast<size_t>(p_t) * top_k + p_j] * 3;
+          const MoeExpertView pv = views[static_cast<size_t>(vb) + 2];
+          const bool pay = piece < pay_pieces;
+          base = pay ? pv.payload + static_cast<size_t>(p_n0) * pay_row : pv.fp4_scales + static_cast<size_t>(p_n0) * sc_row;
+          bytes = pay ? pay_bytes : sc_bytes;
+        }
+        const size_t off = (piece < pay_pieces ? piece : piece - pay_pieces) * kSlotDownPiece;
+        // A 16-byte-aligned span inside the piece (the instruction's unit).
+        const uintptr_t lo = (reinterpret_cast<uintptr_t>(base) + off + 15) & ~static_cast<uintptr_t>(15);
+        const uintptr_t end = reinterpret_cast<uintptr_t>(base) + (off + kSlotDownPiece < bytes ? off + kSlotDownPiece : bytes);
+        if (end >= lo + 16) {
+          const unsigned sz = static_cast<unsigned>((end - lo) & ~static_cast<uintptr_t>(15));
+          asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(lo), "r"(sz) : "memory");
+        }
+      }
+    }
+    const int cur = unit;
+    unit = next;
+    const int slot_ix = cur / tiles;
+    const int n0 = (cur - slot_ix * tiles) * G::rows_per_block;
     const int slot = order ? order[slot_ix] : slot_ix;
     const int t = slot / (top_k + 1);
     const int j = slot - t * (top_k + 1);
@@ -4839,7 +4910,7 @@ void launch_moe_slot_gate_up_swiglu_fp4(
     const float* sh_gate_scales, const uint8_t* sh_up_payload,
     const float* sh_up_scales, uint16_t* act, int act_stride, int slots,
     int top_k, float limit, cudaStream_t stream, int shared_view_base, int fp4_group,
-    int sh_rs, int sh_cs) {
+    int sh_rs, int sh_cs, bool streaming) {
   if (slots <= 0) return;
   check_fp4_slot_args(x, ids, views, act, n_routed, k_routed, n_shared, k_shared,
                       shared_view_base, "moe_slot_gate_up_fp4", fp4_group);
@@ -4859,18 +4930,24 @@ void launch_moe_slot_gate_up_swiglu_fp4(
     constexpr int G = decltype(gc)::value;
     constexpr int rpb = fp4_gemv::Geom<K>::rows_per_block;
     const dim3 grid((max_n + rpb - 1) / rpb, static_cast<unsigned>(slots));
-    if (shared_fp4)
-      moe_slot_gate_up_swiglu_fp4_kernel<K, true, G>
-          <<<grid, fp8_gemv::kThreads, fp8_gemv::smem_bytes(1, max_k), stream>>>(
-              x, x_stride, ids, order, views, n_routed, n_shared, k_shared,
-              sh_gate_payload, sh_gate_scales, sh_up_payload, sh_up_scales, act,
-              act_stride, slots, top_k, limit, shared_view_base, sh_rs, sh_cs);
+    const size_t smem = fp8_gemv::smem_bytes(1, max_k);
+    // The four forms of one kernel: the shared expert's format by the loads' cache policy.
+    if (shared_fp4 && streaming)
+      moe_slot_gate_up_swiglu_fp4_kernel<K, true, G, true><<<grid, fp8_gemv::kThreads, smem, stream>>>(
+          x, x_stride, ids, order, views, n_routed, n_shared, k_shared, sh_gate_payload, sh_gate_scales, sh_up_payload,
+          sh_up_scales, act, act_stride, slots, top_k, limit, shared_view_base, sh_rs, sh_cs);
+    else if (shared_fp4)
+      moe_slot_gate_up_swiglu_fp4_kernel<K, true, G, false><<<grid, fp8_gemv::kThreads, smem, stream>>>(
+          x, x_stride, ids, order, views, n_routed, n_shared, k_shared, sh_gate_payload, sh_gate_scales, sh_up_payload,
+          sh_up_scales, act, act_stride, slots, top_k, limit, shared_view_base, sh_rs, sh_cs);
+    else if (streaming)
+      moe_slot_gate_up_swiglu_fp4_kernel<K, false, G, true><<<grid, fp8_gemv::kThreads, smem, stream>>>(
+          x, x_stride, ids, order, views, n_routed, n_shared, k_shared, sh_gate_payload, sh_gate_scales, sh_up_payload,
+          sh_up_scales, act, act_stride, slots, top_k, limit, -1, sh_rs, sh_cs);
     else
-      moe_slot_gate_up_swiglu_fp4_kernel<K, false, G>
-          <<<grid, fp8_gemv::kThreads, fp8_gemv::smem_bytes(1, max_k), stream>>>(
-              x, x_stride, ids, order, views, n_routed, n_shared, k_shared,
-              sh_gate_payload, sh_gate_scales, sh_up_payload, sh_up_scales, act,
-              act_stride, slots, top_k, limit, -1, sh_rs, sh_cs);
+      moe_slot_gate_up_swiglu_fp4_kernel<K, false, G, false><<<grid, fp8_gemv::kThreads, smem, stream>>>(
+          x, x_stride, ids, order, views, n_routed, n_shared, k_shared, sh_gate_payload, sh_gate_scales, sh_up_payload,
+          sh_up_scales, act, act_stride, slots, top_k, limit, -1, sh_rs, sh_cs);
     DGPP_CUDA_OK(cudaGetLastError());
   };
   if (fp4_group == fp4_gemv::kMxGroup)

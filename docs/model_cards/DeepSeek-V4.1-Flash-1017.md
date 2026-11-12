@@ -52,6 +52,47 @@ the bounded prefill (the model's own SWA-replay recipe), the full
 1M-token context. The tokenizer, prompt renderer (`encoding/encoding.py`,
 no Jinja template) and DSML tool-call format are V4.1-Flash's.
 
+## The expert slot launches (2026-11-10)
+
+A decode pass computes each row's six routed experts and the shared expert
+as slots of two launches, gate and up then down. Three changes to how those
+launches use the memory shorten the pass, and none of them changes a value.
+
+**The shared expert's slots run beside the routed stream.** The slots ran in
+expert order with the shared expert's last, so its blocks ran alone at the
+end of each launch, over weights the routed stream had by then pushed out of
+L2. Every family that computes its shared expert in the slots now interleaves
+them with the first routed slots (`GlmMoeConfig::shared_slots_early`), where
+they compute while the memory streams the routed experts. The EXL3 pack keeps
+the expert order, because its launches compute the shared expert once for all
+rows.
+
+**The down launch keeps the memory busy.** A block of the down launch takes
+a unit of rows, reads it and computes it. It now takes its next unit first
+and prefetches that unit's rows into L2, so the memory streams while the
+block computes.
+
+**One-row launches read the routed gate and up weights as streaming lines.**
+That keeps the prefetched shared expert in L2 under the routed traffic. With
+more rows the launch keeps plain loads, because an expert two rows share is
+served to its second slot from L2.
+
+Measured on four nodes at one request against the same tree without the
+three, in bracketed legs, on the engine's decode steps:
+
+| Class | Pass before | Pass after | Decode tok/s |
+|---|---|---|---|
+| Prose | 35.9 ms | 33.1 ms | 54.7 → 59.2 (+8.3 %) |
+| Chat | 37.8 ms | 35.0 ms | 56.9 → 61.6 (+8.2 %) |
+| Code | 43.7 ms | 40.4 ms | 81.1 → 87.8 (+8.3 %) |
+| JSON | 46.7 ms | 43.1 ms | 89.6 → 97.1 (+8.3 %) |
+| Math | 42.2 ms | 39.1 ms | 86.3 → 93.2 (+8.0 %) |
+| Plain decode, one row | 24.3 ms | 22.6 ms | 41.2 → 44.4 (+7.6 %) |
+
+The accepted rows per pass and the transcripts are identical in every class.
+The streaming loads account for 0.8 percent of the one-row pass. The EXL3
+pack's passes are unchanged.
+
 ## Decode levers (2026-10-18)
 
 **The L2 prefetch windows.** The decode step is one serial chain of

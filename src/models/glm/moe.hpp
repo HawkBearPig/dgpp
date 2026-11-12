@@ -62,9 +62,15 @@ struct GlmMoeConfig {
   float swiglu_limit = 10.0f;  // +inf: no clamps (the Qwen experts)
   // Decode launches run the shared expert's slots beside the first routed
   // ones instead of last (launch_moe_slot_order's shared_early: the order
-  // alone moves, every bit stays). A family opts in after its own fabric
-  // A/B (DeepSeek-V4-Flash, 2026-10-01).
-  bool shared_slots_early = false;
+  // alone moves, every bit stays). Every family that computes the shared
+  // expert in the slots takes it: sorted last, those slots ran as each
+  // launch's tail with the memory idle, over lines the routed stream had
+  // pushed out of L2. The EXL3 chain keeps the expert order whatever this
+  // says (its run form computes the shared expert once for all rows as
+  // one run, which the interleaved order would cut into runs of one).
+  // false: the expert order with the shared slots last, for the order's
+  // own gate.
+  bool shared_slots_early = true;
   // Decode launches run the FP8 shared expert OUTSIDE the slot kernels
   // (2026-10-02): its gate and up as tensor-core GEMVs over all the batch's
   // rows (kernels/mma_gemv.hpp, unsplit: no reduce launches) on two side

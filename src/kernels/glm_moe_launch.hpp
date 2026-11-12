@@ -396,7 +396,10 @@ void launch_moe_slot_gate_up_swiglu_fp4(
     const float* sh_gate_scales, const uint8_t* sh_up_payload,
     const float* sh_up_scales, uint16_t* act, int act_stride, int slots,
     int top_k, float limit, cudaStream_t stream, int shared_view_base = -1,
-    int fp4_group = 16, int sh_rs = 7, int sh_cs = 7);
+    int fp4_group = 16, int sh_rs = 7, int sh_cs = 7, bool streaming = false);
+// `streaming`: the routed weights read as evict-first lines (bitwise; the
+// kernel's comment has the measurement and why the layer asks for it at
+// one row only).
 void launch_moe_slot_down_fp4(const uint16_t* act, size_t act_stride,
                               const int32_t* ids, const int32_t* order,
                               const MoeExpertView* views, int n_routed,
