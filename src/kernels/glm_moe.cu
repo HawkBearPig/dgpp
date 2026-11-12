@@ -1813,44 +1813,35 @@ void launch_moe_slot_gate_up_swiglu(
 // 88 against 56 without it), and a pass of several rows decoded its weights
 // once per row. Here it is a RUN: R <= fp8_gemv::kMaxRows rows of the pass
 // staged together and every weight row decoded once for them through the
-// fp8 core's multi-row form, in two small launches of their own (gate + up +
+// fp8 core's multi-row form, in two launches of their own (gate + up +
 // SwiGLU, then down) that the layer runs on a side stream from the layer's
 // input, beside the router and the routed launches.
-// A block is FOUR warps (128 threads), so one block an SM sits beside two
-// resident routed blocks instead of displacing one (the routed fp4 kernels
-// take 95 registers a thread: two 256-thread blocks leave 16,896 of an SM's
-// 65,536), and the grid is at most one block an SM, each walking its units
-// (block b: units b, b + grid, ...): no counter, nothing queued in front of
-// the routed kernels' blocks.
+// A block is eight warps and the grid is at most `blocks` wide, which the
+// layer sets to ONE block an SM. Two an SM leave no room for a routed block
+// once a run stages three or four rows (about 100 registers a thread here
+// against the lean routed fp4 gate/up's 55: 2 x 256 x 100 + 256 x 55 is
+// over an SM's 65,536), and the routed launch then waited for the run to
+// finish: 26 to 29 us a layer at three and four rows on the DeepSeek-V4.1
+// trace. One block an SM measured 0.4 to 1 percent of a decode step shorter
+// than two. A unit is the launch's weight rows split evenly over the grid,
+// so every block has one unit a run and walks its units statically (block
+// b: units b, b + grid, ...): no counter, nothing queued in front of the
+// routed kernels' blocks.
+// The kernels issue no prefetch requests. cp.async.bulk.prefetch.L2 lines
+// do not stay in L2 (a kernel 10 us behind the requests finds most of them
+// gone again), and a launch that asked for all of its weights at its start
+// ran slower with them cold (41 against 34 us) and with them staged.
 // BITWISE the slot form: a row's chain is the same sequence of FMAs whatever
 // rows share the staging (fp8_gemv.cuh), the SwiGLU is the slot kernel's op
 // for op, and the down's rows are block_rows'.
 namespace {
 namespace shared_run {
-constexpr int kMaxThreads = 256;      // a block is `threads` wide: 128 (four warps) or 256
-constexpr int kGateUpUnitRows = 8;    // weight rows a unit (a row a warp a step)
+constexpr int kThreads = 256;         // eight warps a block
+constexpr int kWarps = kThreads / 32;
 constexpr int kDownRowsPerWarp = 4;   // the slot down kernel's (short rows: four in flight a warp)
-constexpr int kDownUnitRows = 64;     // weight rows a unit
+// The weight rows a unit: the launch's rows split evenly over the grid.
+inline int unit_rows(int n, int blocks) { return std::max(1, (n + blocks - 1) / blocks); }
 }  // namespace shared_run
-
-// A span of weights asked into L2 by the whole grid at once, a 512-byte
-// piece a thread a round (the fp4 down kernel's look-ahead instruction):
-// the launch's bytes are then in flight, or already resident, before its
-// units read them, whatever else is streaming.
-__device__ __forceinline__ void shared_run_prefetch(const uint8_t* __restrict__ base, size_t bytes) {
-  constexpr size_t kPiece = 512;
-  const size_t pieces = (bytes + kPiece - 1) / kPiece;
-  const size_t threads = static_cast<size_t>(gridDim.x) * blockDim.x;
-  for (size_t p = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x; p < pieces; p += threads) {
-    const size_t off = p * kPiece;
-    const uintptr_t lo = (reinterpret_cast<uintptr_t>(base) + off + 15) & ~static_cast<uintptr_t>(15);
-    const uintptr_t end = reinterpret_cast<uintptr_t>(base) + (off + kPiece < bytes ? off + kPiece : bytes);
-    if (end >= lo + 16) {
-      const unsigned sz = static_cast<unsigned>((end - lo) & ~static_cast<uintptr_t>(15));
-      asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(lo), "r"(sz) : "memory");
-    }
-  }
-}
 
 // The run's rows staged as [R][k]; a run of fewer rows repeats its last.
 template <int R>
@@ -1863,27 +1854,23 @@ __device__ __forceinline__ void shared_run_stage(const uint16_t* __restrict__ ro
 }
 
 template <int R>
-__global__ __launch_bounds__(shared_run::kMaxThreads) void moe_shared_run_gate_up_swiglu_kernel(
+__global__ __launch_bounds__(shared_run::kThreads) void moe_shared_run_gate_up_swiglu_kernel(
     const uint16_t* __restrict__ x, size_t x_stride, const uint8_t* __restrict__ gate_p,
     const float* __restrict__ gate_s, const uint8_t* __restrict__ up_p, const float* __restrict__ up_s,
     uint16_t* __restrict__ act, size_t act_step, int tokens, int n, int k, float limit, int rs, int cs,
-    const uint8_t* __restrict__ ahead, size_t ahead_bytes) {
+    int unit_rows) {
   dgpp_pdl_wait();
   extern __shared__ __align__(16) uint16_t sx[];
-  // Its own weights, then the down projection's (`ahead`), asked for first.
-  shared_run_prefetch(gate_p, static_cast<size_t>(n) * k);
-  shared_run_prefetch(up_p, static_cast<size_t>(n) * k);
-  if (ahead) shared_run_prefetch(ahead, ahead_bytes);
-  const int tiles = (n + shared_run::kGateUpUnitRows - 1) / shared_run::kGateUpUnitRows;
+  const int tiles = (n + unit_rows - 1) / unit_rows;
   const int total = tiles * ((tokens + R - 1) / R);
   const int warp = threadIdx.x / 32;
   const int lane = threadIdx.x % 32;
-  const int warps = blockDim.x / 32;
   const int scale_cols = (k + (1 << cs) - 1) >> cs;
   int staged = -1;
   for (int u = blockIdx.x; u < total; u += gridDim.x) {
     const int run = u / tiles;
-    const int n0 = (u - run * tiles) * shared_run::kGateUpUnitRows;
+    const int n0 = (u - run * tiles) * unit_rows;
+    const int n_end = min(n, n0 + unit_rows);
     const int t0 = run * R;
     const int cnt = min(R, tokens - t0);
     if (run != staged) {
@@ -1892,10 +1879,9 @@ __global__ __launch_bounds__(shared_run::kMaxThreads) void moe_shared_run_gate_u
       __syncthreads();
       staged = run;
     }
+    // A weight row a warp a step.
 #pragma unroll 1
-    for (int i = 0; i < shared_run::kGateUpUnitRows / warps; ++i) {
-      const int row = n0 + i * warps + warp;
-      if (row >= n) break;
+    for (int row = n0 + warp; row < n_end; row += shared_run::kWarps) {
       const size_t scale_row = static_cast<size_t>(row >> rs) * scale_cols;
       float g_acc[R], u_acc[R];
       fp8_gemv::row_dots<R>(gate_p + static_cast<size_t>(row) * k, gate_s + scale_row, sx, k, lane, g_acc, cs);
@@ -1917,22 +1903,20 @@ __global__ __launch_bounds__(shared_run::kMaxThreads) void moe_shared_run_gate_u
 }
 
 template <int R>
-__global__ __launch_bounds__(shared_run::kMaxThreads) void moe_shared_run_down_kernel(
+__global__ __launch_bounds__(shared_run::kThreads) void moe_shared_run_down_kernel(
     const uint16_t* __restrict__ act, size_t act_step, const uint8_t* __restrict__ w,
     const float* __restrict__ scales, float* __restrict__ out, size_t out_step, int tokens, int n, int k, int rs,
-    int cs) {
+    int cs, int unit_rows) {
   dgpp_pdl_wait();
   extern __shared__ __align__(16) uint16_t sx[];
-  // (asked for again: the routed stream may have pushed them out since the
-  // gate/up launch asked; resident lines cost nothing)
-  shared_run_prefetch(w, static_cast<size_t>(n) * k);
-  const int tiles = (n + shared_run::kDownUnitRows - 1) / shared_run::kDownUnitRows;
+  const int tiles = (n + unit_rows - 1) / unit_rows;
   const int total = tiles * ((tokens + R - 1) / R);
-  const int step_rows = static_cast<int>(blockDim.x / 32) * shared_run::kDownRowsPerWarp;
+  constexpr int kStepRows = shared_run::kWarps * shared_run::kDownRowsPerWarp;
   int staged = -1;
   for (int u = blockIdx.x; u < total; u += gridDim.x) {
     const int run = u / tiles;
-    const int n0 = (u - run * tiles) * shared_run::kDownUnitRows;
+    const int n0 = (u - run * tiles) * unit_rows;
+    const int n_end = min(n, n0 + unit_rows);
     const int t0 = run * R;
     const int cnt = min(R, tokens - t0);
     if (run != staged) {
@@ -1941,10 +1925,12 @@ __global__ __launch_bounds__(shared_run::kMaxThreads) void moe_shared_run_down_k
       __syncthreads();
       staged = run;
     }
+    // (block_rows_multi's row bound is the unit's end: the rows past it are
+    // another block's.)
 #pragma unroll 1
-    for (int sub = 0; sub < shared_run::kDownUnitRows; sub += step_rows)
+    for (int sub = n0; sub < n_end; sub += kStepRows)
       fp8_gemv::block_rows_multi<R, shared_run::kDownRowsPerWarp>(
-          w, scales, sx, n0 + sub, n, k, out + static_cast<size_t>(t0) * out_step, out_step, rs, cs, cnt);
+          w, scales, sx, sub, n_end, k, out + static_cast<size_t>(t0) * out_step, out_step, rs, cs, cnt);
   }
 }
 
@@ -1965,45 +1951,44 @@ void launch_moe_shared_run_gate_up_swiglu(const uint16_t* x, size_t x_stride, co
                                           const float* gate_scales, const uint8_t* up_payload,
                                           const float* up_scales, uint16_t* act, size_t act_step, int tokens, int n,
                                           int k, float limit, int run_rows, int blocks, cudaStream_t stream, int rs,
-                                          int cs, const uint8_t* ahead, size_t ahead_bytes, int threads) {
+                                          int cs) {
   if (tokens <= 0 || n <= 0) return;
   if (!x || !gate_payload || !gate_scales || !up_payload || !up_scales || !act)
     throw std::invalid_argument("moe_shared_run_gate_up: null pointer");
   if (!fp8_gemv::shape_ok(gate_payload, 1, k) || !fp8_gemv::shape_ok(up_payload, 1, k) || cs < 4)
     throw std::invalid_argument("moe_shared_run_gate_up: payloads must be 16B-aligned with k % 16 == 0");
-  if (act_step < static_cast<size_t>(n) || blocks < 1 || (threads != 128 && threads != 256))
-    throw std::invalid_argument("moe_shared_run_gate_up: act_step below n, no block, or a block not 128 or 256 wide");
+  if (act_step < static_cast<size_t>(n) || blocks < 1)
+    throw std::invalid_argument("moe_shared_run_gate_up: act_step below n or no block");
   const size_t smem = fp8_gemv::smem_bytes(run_rows, k);
   if (smem > gemv::kMaxSmemBytes) throw std::invalid_argument("moe_shared_run_gate_up: the run does not fit shared memory");
   dispatch_shared_run(run_rows, [&](auto rc) {
     constexpr int R = decltype(rc)::value;
-    const int tiles = (n + shared_run::kGateUpUnitRows - 1) / shared_run::kGateUpUnitRows;
-    const int total = tiles * ((tokens + R - 1) / R);
-    moe_shared_run_gate_up_swiglu_kernel<R><<<static_cast<unsigned>(std::min(total, blocks)), threads, smem,
+    const int unit = shared_run::unit_rows(n, blocks);
+    const int total = ((n + unit - 1) / unit) * ((tokens + R - 1) / R);
+    moe_shared_run_gate_up_swiglu_kernel<R><<<static_cast<unsigned>(std::min(total, blocks)), shared_run::kThreads, smem,
                                               stream>>>(x, x_stride, gate_payload, gate_scales, up_payload, up_scales, act,
-                                                        act_step, tokens, n, k, limit, rs, cs, ahead, ahead_bytes);
+                                                        act_step, tokens, n, k, limit, rs, cs, unit);
     DGPP_CUDA_OK(cudaGetLastError());
   });
 }
 
 void launch_moe_shared_run_down(const uint16_t* act, size_t act_step, const uint8_t* payload, const float* scales,
                                 float* out, size_t out_step, int tokens, int n, int k, int run_rows, int blocks,
-                                cudaStream_t stream, int rs, int cs, int threads) {
+                                cudaStream_t stream, int rs, int cs) {
   if (tokens <= 0 || n <= 0) return;
   if (!act || !payload || !scales || !out) throw std::invalid_argument("moe_shared_run_down: null pointer");
   if (!fp8_gemv::shape_ok(payload, 1, k) || cs < 4)
     throw std::invalid_argument("moe_shared_run_down: payload must be 16B-aligned with k % 16 == 0");
-  if (out_step < static_cast<size_t>(n) || act_step < static_cast<size_t>(k) || blocks < 1 ||
-      (threads != 128 && threads != 256))
-    throw std::invalid_argument("moe_shared_run_down: a step below its row, no block, or a block not 128 or 256 wide");
+  if (out_step < static_cast<size_t>(n) || act_step < static_cast<size_t>(k) || blocks < 1)
+    throw std::invalid_argument("moe_shared_run_down: a step below its row or no block");
   const size_t smem = fp8_gemv::smem_bytes(run_rows, k);
   if (smem > gemv::kMaxSmemBytes) throw std::invalid_argument("moe_shared_run_down: the run does not fit shared memory");
   dispatch_shared_run(run_rows, [&](auto rc) {
     constexpr int R = decltype(rc)::value;
-    const int tiles = (n + shared_run::kDownUnitRows - 1) / shared_run::kDownUnitRows;
-    const int total = tiles * ((tokens + R - 1) / R);
-    moe_shared_run_down_kernel<R><<<static_cast<unsigned>(std::min(total, blocks)), threads, smem, stream>>>(
-        act, act_step, payload, scales, out, out_step, tokens, n, k, rs, cs);
+    const int unit = shared_run::unit_rows(n, blocks);
+    const int total = ((n + unit - 1) / unit) * ((tokens + R - 1) / R);
+    moe_shared_run_down_kernel<R><<<static_cast<unsigned>(std::min(total, blocks)), shared_run::kThreads, smem, stream>>>(
+        act, act_step, payload, scales, out, out_step, tokens, n, k, rs, cs, unit);
     DGPP_CUDA_OK(cudaGetLastError());
   });
 }

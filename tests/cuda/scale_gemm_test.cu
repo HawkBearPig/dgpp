@@ -621,6 +621,79 @@ DGPP_TEST(fp8_gemv_hardware_conversion_matches_bridge_on_every_code) {
   std::printf("[ OK ] e4m3 hardware conversion == bridge on all 256 codes\n");
 }
 
+// The integer form of float_to_bf16_bits (common/dtypes.hpp): what host code
+// runs, and the reference the device's conversion instruction is held to.
+__host__ __device__ inline uint16_t integer_round_bf16(float f) {
+  uint32_t u;
+  memcpy(&u, &f, 4);
+  if ((u & 0x7FFFFFFFu) > 0x7F800000u) return static_cast<uint16_t>(((u >> 16) & 0x8000u) | 0x7FC0u);
+  const uint32_t lsb = (u >> 16) & 1;
+  u += 0x7fffu + lsb;
+  return static_cast<uint16_t>(u >> 16);
+}
+
+// Every float through the device's two roundings, float_to_bf16_bits (one
+// conversion instruction in device code) and the fp8 core's pair form
+// (fp8_gemv::dequant_bf16x2, the pack instruction), against the integer
+// form: 2^32 bit patterns, each as the pair's low half with a mixed partner
+// in the high half. out[0] counts the values that are not NaN and round to
+// other bits, out[1] the NaNs that do not stay NaN, out[2] holds one
+// offending pattern.
+__global__ void bf16_rounding_all_floats_kernel(unsigned long long* out) {
+  const uint32_t base = (static_cast<uint32_t>(blockIdx.x) << 16) | (static_cast<uint32_t>(threadIdx.x) << 8);
+  unsigned bad = 0, bad_nan = 0;
+  uint32_t witness = 0;
+  for (uint32_t i = 0; i < 256; ++i) {
+    const uint32_t ua = base | i, ub = ua ^ 0xA5A5A5A5u;
+    const float2 w = make_float2(__uint_as_float(ua), __uint_as_float(ub));
+    const uint32_t pair = dgpp::fp8_gemv::dequant_bf16x2(w, 1.0f);
+    const uint32_t got[2][2] = {{pair & 0xFFFFu, dgpp::float_to_bf16_bits(w.x)}, {pair >> 16, dgpp::float_to_bf16_bits(w.y)}};
+    const uint32_t in[2] = {ua, ub};
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+      const bool nan = (in[h] & 0x7FFFFFFFu) > 0x7F800000u;
+      const uint32_t want = integer_round_bf16(__uint_as_float(in[h]));
+#pragma unroll
+      for (int form = 0; form < 2; ++form) {
+        if (nan) {
+          if (!((got[h][form] & 0x7FFFu) > 0x7F80u)) ++bad_nan;
+        } else if (got[h][form] != want) {
+          ++bad;
+          witness = in[h];
+        }
+      }
+    }
+  }
+  if (bad) {
+    atomicAdd(out, static_cast<unsigned long long>(bad));
+    out[2] = witness;
+  }
+  if (bad_nan) atomicAdd(out + 1, static_cast<unsigned long long>(bad_nan));
+}
+
+DGPP_TEST(device_bf16_rounding_matches_the_integer_form_on_every_float) {
+  // The integer form here is the host's float_to_bf16_bits: a pattern in
+  // every 251 across the whole range.
+  for (uint64_t u = 0; u < (uint64_t{1} << 32); u += 251) {
+    float f;
+    const uint32_t bits = static_cast<uint32_t>(u);
+    memcpy(&f, &bits, 4);
+    require(dgpp::float_to_bf16_bits(f) == integer_round_bf16(f), "the test's integer form is the host's float_to_bf16_bits");
+  }
+  unsigned long long* out = nullptr;
+  DGPP_CUDA_OK(cudaMallocManaged(&out, 3 * sizeof(unsigned long long)));
+  out[0] = out[1] = out[2] = 0;
+  // 65536 blocks x 256 threads x 256 values = 2^32.
+  bf16_rounding_all_floats_kernel<<<65536, 256>>>(out);
+  DGPP_CUDA_OK(cudaDeviceSynchronize());
+  char msg[200];
+  std::snprintf(msg, sizeof msg, "the device rounds %llu non-NaN floats to other bits than the integer form (one: %#010llx)", out[0], out[2]);
+  require(out[0] == 0, msg);
+  require(out[1] == 0, "a NaN must stay a NaN through the device's bf16 rounding");
+  DGPP_CUDA_OK(cudaFree(out));
+  std::printf("[ OK ] device bf16 rounding (scalar and pair) == the integer form on every non-NaN float, NaN stays NaN\n");
+}
+
 // The multi-problem GEMV: several [n_i, k] matrices against
 // the same rows in one launch — every problem's output bitwise its own
 // launch_scale_gemm_bf16, at one to four rows (one chunk) and six (two).

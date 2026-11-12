@@ -253,10 +253,8 @@ __device__ __forceinline__ void chunk_to_bf16x8(const uint4& c, float s, uint32_
   for (int q = 0; q < 4; ++q) {
     const float2 w01 = fp8_gemv::e4m3x2_to_float2(static_cast<uint16_t>(words[q] & 0xFFFFu));
     const float2 w23 = fp8_gemv::e4m3x2_to_float2(static_cast<uint16_t>(words[q] >> 16));
-    const uint32_t d0 = float_to_bf16_bits(w01.x * s), d1 = float_to_bf16_bits(w01.y * s);
-    const uint32_t d2 = float_to_bf16_bits(w23.x * s), d3 = float_to_bf16_bits(w23.y * s);
-    w[2 * q] = d0 | (d1 << 16);
-    w[2 * q + 1] = d2 | (d3 << 16);
+    w[2 * q] = fp8_gemv::dequant_bf16x2(w01, s);
+    w[2 * q + 1] = fp8_gemv::dequant_bf16x2(w23, s);
   }
 }
 

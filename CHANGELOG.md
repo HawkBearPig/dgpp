@@ -5,6 +5,20 @@ project procedures and design guidance live in `docs/`.
 
 ## Unreleased
 
+- **bf16 rounding with one instruction in device code**: device kernels
+  round a float to bf16 with the GPU's conversion instruction, where they ran
+  an eight-instruction integer sequence, and the two FP8 dequantization loops
+  (the FP8 GEMV core and the tensor-core GEMV) round two weights with one
+  pack instruction. Every value that is not a NaN keeps its bits, checked on
+  all 2^32 floats, and a NaN stays a NaN. The shared expert's own launches
+  run one block per SM and issue no prefetch requests. On four nodes the
+  DeepSeek-V4.1-Flash-1017 decode step is 4 to 5 percent shorter at one
+  request and its cold prefill 3 to 4 percent shorter at 8K and 32K tokens.
+  GLM-5.3-Flash NVFP4-FP8 decode is 2 percent shorter and GLM-5.3 Mixed346
+  is unchanged. Transcripts are identical. The
+  [DeepSeek-V4.1 model card](docs/model_cards/DeepSeek-V4.1-Flash-1017.md)
+  has the measurements.
+
 - **The shared expert computed once for the rows of a decode pass**: a
   decode launch of two rows or more computes the FP8 shared expert in two
   launches of its own beside the router, each weight row decoded once for up

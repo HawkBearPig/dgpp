@@ -395,19 +395,16 @@ void launch_moe_grouped_gemv_fp4_f32(const uint16_t* act, size_t act_stride,
 // the pass's rows (stride x_stride); `act` / `out` point at the FIRST row's
 // shared act / partial row and `act_step` / `out_step` are the elements
 // between consecutive rows' (the slot layout: (top_k + 1) rows apart).
-// `blocks`: the grid's bound (one block an SM is the intended lane).
-// `ahead`: bytes the gate/up launch asks into L2 with its own (the down
-// projection's payload, read by the launch behind it).
+// `blocks`: the grid's bound (the layer passes one block an SM).
 // Bitwise the slot kernels' shared slots.
 void launch_moe_shared_run_gate_up_swiglu(const uint16_t* x, size_t x_stride, const uint8_t* gate_payload,
                                           const float* gate_scales, const uint8_t* up_payload,
                                           const float* up_scales, uint16_t* act, size_t act_step, int tokens, int n,
                                           int k, float limit, int run_rows, int blocks, cudaStream_t stream,
-                                          int rs = 7, int cs = 7, const uint8_t* ahead = nullptr,
-                                          size_t ahead_bytes = 0, int threads = 128);
+                                          int rs = 7, int cs = 7);
 void launch_moe_shared_run_down(const uint16_t* act, size_t act_step, const uint8_t* payload, const float* scales,
                                 float* out, size_t out_step, int tokens, int n, int k, int run_rows, int blocks,
-                                cudaStream_t stream, int rs = 7, int cs = 7, int threads = 128);
+                                cudaStream_t stream, int rs = 7, int cs = 7);
 // The rows one shared-expert run computes in a decode launch of `tokens`
 // rows (the launches' `run_rows`): the fewest runs of at most four
 // staged rows (the fp8 core's kMaxRows), evenly filled (five rows: 3 + 2),
