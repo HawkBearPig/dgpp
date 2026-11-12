@@ -93,6 +93,45 @@ The accepted rows per pass and the transcripts are identical in every class.
 The streaming loads account for 0.8 percent of the one-row pass. The EXL3
 pack's passes are unchanged.
 
+## The shared expert's own launches (2026-11-12)
+
+The shared expert's weights are the same for every row of a pass. A decode
+launch of two rows or more computes it in two launches of its own instead of
+in a slot per row. The first computes its gate, up and SwiGLU and the second
+its down projection, each for runs of up to four rows that decode every
+weight row once. The layer forks them at its input on a side stream, so they
+start beside the router, and joins them before the expert sum. The routed
+gate, up and down launches then cover the routed slots alone and run the
+kernel forms without the shared expert's branch. One row keeps its shared
+slot beside the routed stream, where it costs almost nothing.
+
+The FP4 down launch also issues a block's own loads before its look-ahead
+takes and prefetches the next unit, which shortens the launch at every row
+count.
+
+No value changes. The shared runs use the same per-row arithmetic as the
+slot form, and `glm_moe_test` holds the two bitwise at two, three, five and
+eighty rows.
+
+Measured on four nodes against the same tree without the two changes, in
+bracketed legs, on the engine's decode steps:
+
+| Load | Before | After | Change |
+|---|---|---|---|
+| One request, prose | 33.2 ms a pass | 32.4 ms | 59.1 → 60.5 tok/s (+2.3 %) |
+| One request, chat | 34.9 ms | 34.2 ms | 61.6 → 62.9 tok/s (+2.1 %) |
+| One request, code | 40.4 ms | 39.3 ms | 87.8 → 90.2 tok/s (+2.7 %) |
+| One request, JSON | 43.0 ms | 41.9 ms | 97.3 → 99.9 tok/s (+2.7 %) |
+| One request, math | 39.1 ms | 38.1 ms | 93.3 → 95.8 tok/s (+2.6 %) |
+| Plain decode, one row, five classes | 22.4 to 22.7 ms | 22.2 ms | +1.2 to +2.2 % |
+| Eight requests, five classes | 93 to 126 tok/s | 103 to 136 tok/s | +5 to +12 % |
+
+The transcripts are identical in every class of every leg. The gain grows
+with the rows a pass carries, because the slot form computed the shared
+expert once per row. At one request the shared launches still cost part of
+what they save: they share the processors with the router and delay the
+routed launch's start by 20 to 30 microseconds a layer.
+
 ## Decode levers (2026-10-18)
 
 **The L2 prefetch windows.** The decode step is one serial chain of

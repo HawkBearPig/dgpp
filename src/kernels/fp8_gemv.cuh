@@ -236,11 +236,13 @@ __device__ __forceinline__ void block_rows(const uint8_t* __restrict__ w,
 // down kernel's 224 GB/s against gate_up's 295. Each row's chunks are
 // consumed in k order into its own accumulator through consume_chunk, so
 // every row's result is bitwise block_rows'.
+// `live_rows`: the staged rows that are stored (the others' accumulators
+// are dropped: a run of fewer rows than kRows).
 template <int kRows, int R, typename OutT>
 __device__ __forceinline__ void block_rows_multi(
     const uint8_t* __restrict__ w, const float* __restrict__ scales,
     const uint16_t* __restrict__ sx, int n0, int n, int k,
-    OutT* __restrict__ out, size_t out_stride, int rs = 7, int cs = 7) {
+    OutT* __restrict__ out, size_t out_stride, int rs = 7, int cs = 7, int live_rows = kRows) {
   const int warp = threadIdx.x / 32;
   const int lane = threadIdx.x % 32;
   const int row0 = n0 + warp * R;
@@ -284,7 +286,7 @@ __device__ __forceinline__ void block_rows_multi(
     if (lane == 0) {
 #pragma unroll
       for (int a = 0; a < kRows; ++a)
-        store_dot(out + static_cast<size_t>(a) * out_stride + row0 + r, acc[r][a]);
+        if (a < live_rows) store_dot(out + static_cast<size_t>(a) * out_stride + row0 + r, acc[r][a]);
     }
   }
 }

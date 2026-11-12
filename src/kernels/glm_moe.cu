@@ -1804,6 +1804,210 @@ void launch_moe_slot_gate_up_swiglu(
   DGPP_CUDA_OK(cudaGetLastError());
 }
 
+// ---- the fp8 shared expert's own launches (2026-11-12) -------------------
+//
+// The shared expert's weights are the same for every row of a pass, and in
+// the slot launches it was one slot per ROW inside the routed kernels: its
+// blocks took the resident places of blocks that keep the memory streaming,
+// its fp8 branch set the routed kernels' register count (the fp4 down kernel
+// 88 against 56 without it), and a pass of several rows decoded its weights
+// once per row. Here it is a RUN: R <= fp8_gemv::kMaxRows rows of the pass
+// staged together and every weight row decoded once for them through the
+// fp8 core's multi-row form, in two small launches of their own (gate + up +
+// SwiGLU, then down) that the layer runs on a side stream from the layer's
+// input, beside the router and the routed launches.
+// A block is FOUR warps (128 threads), so one block an SM sits beside two
+// resident routed blocks instead of displacing one (the routed fp4 kernels
+// take 95 registers a thread: two 256-thread blocks leave 16,896 of an SM's
+// 65,536), and the grid is at most one block an SM, each walking its units
+// (block b: units b, b + grid, ...): no counter, nothing queued in front of
+// the routed kernels' blocks.
+// BITWISE the slot form: a row's chain is the same sequence of FMAs whatever
+// rows share the staging (fp8_gemv.cuh), the SwiGLU is the slot kernel's op
+// for op, and the down's rows are block_rows'.
+namespace {
+namespace shared_run {
+constexpr int kMaxThreads = 256;      // a block is `threads` wide: 128 (four warps) or 256
+constexpr int kGateUpUnitRows = 8;    // weight rows a unit (a row a warp a step)
+constexpr int kDownRowsPerWarp = 4;   // the slot down kernel's (short rows: four in flight a warp)
+constexpr int kDownUnitRows = 64;     // weight rows a unit
+}  // namespace shared_run
+
+// A span of weights asked into L2 by the whole grid at once, a 512-byte
+// piece a thread a round (the fp4 down kernel's look-ahead instruction):
+// the launch's bytes are then in flight, or already resident, before its
+// units read them, whatever else is streaming.
+__device__ __forceinline__ void shared_run_prefetch(const uint8_t* __restrict__ base, size_t bytes) {
+  constexpr size_t kPiece = 512;
+  const size_t pieces = (bytes + kPiece - 1) / kPiece;
+  const size_t threads = static_cast<size_t>(gridDim.x) * blockDim.x;
+  for (size_t p = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x; p < pieces; p += threads) {
+    const size_t off = p * kPiece;
+    const uintptr_t lo = (reinterpret_cast<uintptr_t>(base) + off + 15) & ~static_cast<uintptr_t>(15);
+    const uintptr_t end = reinterpret_cast<uintptr_t>(base) + (off + kPiece < bytes ? off + kPiece : bytes);
+    if (end >= lo + 16) {
+      const unsigned sz = static_cast<unsigned>((end - lo) & ~static_cast<uintptr_t>(15));
+      asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(lo), "r"(sz) : "memory");
+    }
+  }
+}
+
+// The run's rows staged as [R][k]; a run of fewer rows repeats its last.
+template <int R>
+__device__ __forceinline__ void shared_run_stage(const uint16_t* __restrict__ rows, size_t row_step, int k, int cnt,
+                                                 uint16_t* __restrict__ sx) {
+#pragma unroll 1
+  for (int r = 0; r < R; ++r)
+    fp8_gemv::stage_activations<1>(rows + static_cast<size_t>(r < cnt ? r : cnt - 1) * row_step, row_step, k,
+                                   sx + static_cast<size_t>(r) * k);
+}
+
+template <int R>
+__global__ __launch_bounds__(shared_run::kMaxThreads) void moe_shared_run_gate_up_swiglu_kernel(
+    const uint16_t* __restrict__ x, size_t x_stride, const uint8_t* __restrict__ gate_p,
+    const float* __restrict__ gate_s, const uint8_t* __restrict__ up_p, const float* __restrict__ up_s,
+    uint16_t* __restrict__ act, size_t act_step, int tokens, int n, int k, float limit, int rs, int cs,
+    const uint8_t* __restrict__ ahead, size_t ahead_bytes) {
+  dgpp_pdl_wait();
+  extern __shared__ __align__(16) uint16_t sx[];
+  // Its own weights, then the down projection's (`ahead`), asked for first.
+  shared_run_prefetch(gate_p, static_cast<size_t>(n) * k);
+  shared_run_prefetch(up_p, static_cast<size_t>(n) * k);
+  if (ahead) shared_run_prefetch(ahead, ahead_bytes);
+  const int tiles = (n + shared_run::kGateUpUnitRows - 1) / shared_run::kGateUpUnitRows;
+  const int total = tiles * ((tokens + R - 1) / R);
+  const int warp = threadIdx.x / 32;
+  const int lane = threadIdx.x % 32;
+  const int warps = blockDim.x / 32;
+  const int scale_cols = (k + (1 << cs) - 1) >> cs;
+  int staged = -1;
+  for (int u = blockIdx.x; u < total; u += gridDim.x) {
+    const int run = u / tiles;
+    const int n0 = (u - run * tiles) * shared_run::kGateUpUnitRows;
+    const int t0 = run * R;
+    const int cnt = min(R, tokens - t0);
+    if (run != staged) {
+      if (staged >= 0) __syncthreads();  // the previous run's readers of sx are done
+      shared_run_stage<R>(x + static_cast<size_t>(t0) * x_stride, x_stride, k, cnt, sx);
+      __syncthreads();
+      staged = run;
+    }
+#pragma unroll 1
+    for (int i = 0; i < shared_run::kGateUpUnitRows / warps; ++i) {
+      const int row = n0 + i * warps + warp;
+      if (row >= n) break;
+      const size_t scale_row = static_cast<size_t>(row >> rs) * scale_cols;
+      float g_acc[R], u_acc[R];
+      fp8_gemv::row_dots<R>(gate_p + static_cast<size_t>(row) * k, gate_s + scale_row, sx, k, lane, g_acc, cs);
+      fp8_gemv::row_dots<R>(up_p + static_cast<size_t>(row) * k, up_s + scale_row, sx, k, lane, u_acc, cs);
+      if (lane != 0) continue;
+#pragma unroll
+      for (int r = 0; r < R; ++r) {
+        if (r >= cnt) break;
+        // moe_slot_gate_up_swiglu_kernel's epilogue, op for op.
+        float g = bf16_bits_to_float(float_to_bf16_bits(g_acc[r]));
+        float uu = bf16_bits_to_float(float_to_bf16_bits(u_acc[r]));
+        if (g > limit) g = limit;
+        uu = fminf(fmaxf(uu, -limit), limit);
+        const uint16_t tt = float_to_bf16_bits(g * sigmoidf_acc(g));
+        act[static_cast<size_t>(t0 + r) * act_step + row] = float_to_bf16_bits(bf16_bits_to_float(tt) * uu);
+      }
+    }
+  }
+}
+
+template <int R>
+__global__ __launch_bounds__(shared_run::kMaxThreads) void moe_shared_run_down_kernel(
+    const uint16_t* __restrict__ act, size_t act_step, const uint8_t* __restrict__ w,
+    const float* __restrict__ scales, float* __restrict__ out, size_t out_step, int tokens, int n, int k, int rs,
+    int cs) {
+  dgpp_pdl_wait();
+  extern __shared__ __align__(16) uint16_t sx[];
+  // (asked for again: the routed stream may have pushed them out since the
+  // gate/up launch asked; resident lines cost nothing)
+  shared_run_prefetch(w, static_cast<size_t>(n) * k);
+  const int tiles = (n + shared_run::kDownUnitRows - 1) / shared_run::kDownUnitRows;
+  const int total = tiles * ((tokens + R - 1) / R);
+  const int step_rows = static_cast<int>(blockDim.x / 32) * shared_run::kDownRowsPerWarp;
+  int staged = -1;
+  for (int u = blockIdx.x; u < total; u += gridDim.x) {
+    const int run = u / tiles;
+    const int n0 = (u - run * tiles) * shared_run::kDownUnitRows;
+    const int t0 = run * R;
+    const int cnt = min(R, tokens - t0);
+    if (run != staged) {
+      if (staged >= 0) __syncthreads();
+      shared_run_stage<R>(act + static_cast<size_t>(t0) * act_step, act_step, k, cnt, sx);
+      __syncthreads();
+      staged = run;
+    }
+#pragma unroll 1
+    for (int sub = 0; sub < shared_run::kDownUnitRows; sub += step_rows)
+      fp8_gemv::block_rows_multi<R, shared_run::kDownRowsPerWarp>(
+          w, scales, sx, n0 + sub, n, k, out + static_cast<size_t>(t0) * out_step, out_step, rs, cs, cnt);
+  }
+}
+
+template <class F>
+void dispatch_shared_run(int run_rows, F&& f) {
+  switch (run_rows) {
+    case 1: f(std::integral_constant<int, 1>{}); return;
+    case 2: f(std::integral_constant<int, 2>{}); return;
+    case 3: f(std::integral_constant<int, 3>{}); return;
+    case 4: f(std::integral_constant<int, 4>{}); return;
+    default: throw std::invalid_argument("moe_shared_run: a run is 1..4 rows");
+  }
+}
+
+}  // namespace
+
+void launch_moe_shared_run_gate_up_swiglu(const uint16_t* x, size_t x_stride, const uint8_t* gate_payload,
+                                          const float* gate_scales, const uint8_t* up_payload,
+                                          const float* up_scales, uint16_t* act, size_t act_step, int tokens, int n,
+                                          int k, float limit, int run_rows, int blocks, cudaStream_t stream, int rs,
+                                          int cs, const uint8_t* ahead, size_t ahead_bytes, int threads) {
+  if (tokens <= 0 || n <= 0) return;
+  if (!x || !gate_payload || !gate_scales || !up_payload || !up_scales || !act)
+    throw std::invalid_argument("moe_shared_run_gate_up: null pointer");
+  if (!fp8_gemv::shape_ok(gate_payload, 1, k) || !fp8_gemv::shape_ok(up_payload, 1, k) || cs < 4)
+    throw std::invalid_argument("moe_shared_run_gate_up: payloads must be 16B-aligned with k % 16 == 0");
+  if (act_step < static_cast<size_t>(n) || blocks < 1 || (threads != 128 && threads != 256))
+    throw std::invalid_argument("moe_shared_run_gate_up: act_step below n, no block, or a block not 128 or 256 wide");
+  const size_t smem = fp8_gemv::smem_bytes(run_rows, k);
+  if (smem > gemv::kMaxSmemBytes) throw std::invalid_argument("moe_shared_run_gate_up: the run does not fit shared memory");
+  dispatch_shared_run(run_rows, [&](auto rc) {
+    constexpr int R = decltype(rc)::value;
+    const int tiles = (n + shared_run::kGateUpUnitRows - 1) / shared_run::kGateUpUnitRows;
+    const int total = tiles * ((tokens + R - 1) / R);
+    moe_shared_run_gate_up_swiglu_kernel<R><<<static_cast<unsigned>(std::min(total, blocks)), threads, smem,
+                                              stream>>>(x, x_stride, gate_payload, gate_scales, up_payload, up_scales, act,
+                                                        act_step, tokens, n, k, limit, rs, cs, ahead, ahead_bytes);
+    DGPP_CUDA_OK(cudaGetLastError());
+  });
+}
+
+void launch_moe_shared_run_down(const uint16_t* act, size_t act_step, const uint8_t* payload, const float* scales,
+                                float* out, size_t out_step, int tokens, int n, int k, int run_rows, int blocks,
+                                cudaStream_t stream, int rs, int cs, int threads) {
+  if (tokens <= 0 || n <= 0) return;
+  if (!act || !payload || !scales || !out) throw std::invalid_argument("moe_shared_run_down: null pointer");
+  if (!fp8_gemv::shape_ok(payload, 1, k) || cs < 4)
+    throw std::invalid_argument("moe_shared_run_down: payload must be 16B-aligned with k % 16 == 0");
+  if (out_step < static_cast<size_t>(n) || act_step < static_cast<size_t>(k) || blocks < 1 ||
+      (threads != 128 && threads != 256))
+    throw std::invalid_argument("moe_shared_run_down: a step below its row, no block, or a block not 128 or 256 wide");
+  const size_t smem = fp8_gemv::smem_bytes(run_rows, k);
+  if (smem > gemv::kMaxSmemBytes) throw std::invalid_argument("moe_shared_run_down: the run does not fit shared memory");
+  dispatch_shared_run(run_rows, [&](auto rc) {
+    constexpr int R = decltype(rc)::value;
+    const int tiles = (n + shared_run::kDownUnitRows - 1) / shared_run::kDownUnitRows;
+    const int total = tiles * ((tokens + R - 1) / R);
+    moe_shared_run_down_kernel<R><<<static_cast<unsigned>(std::min(total, blocks)), threads, smem, stream>>>(
+        act, act_step, payload, scales, out, out_step, tokens, n, k, rs, cs);
+    DGPP_CUDA_OK(cudaGetLastError());
+  });
+}
+
 void launch_moe_slot_accum_routed_f32(float* out, const float* contrib,
                                       const float* weights, int tokens,
                                       int hidden, int top_k,
@@ -2069,7 +2273,8 @@ __global__ void moe_slot_gate_up_swiglu_mixed_kernel(
 #ifndef DGPP_FP4_SLOT_DOWN_LOOKAHEAD
 #define DGPP_FP4_SLOT_DOWN_LOOKAHEAD 1
 #endif
-constexpr bool kSlotDownLookahead = DGPP_FP4_SLOT_DOWN_LOOKAHEAD != 0;
+constexpr int kSlotDownDepth = DGPP_FP4_SLOT_DOWN_LOOKAHEAD;  // units ahead; 0: none
+constexpr int kSlotDownQueue = kSlotDownDepth > 0 ? kSlotDownDepth : 1;  // units held past the current one
 constexpr size_t kSlotDownPiece = 512;
 
 template <int K, bool kSharedFp4, int kGroup = fp4_gemv::kGroup>
@@ -2080,7 +2285,7 @@ __global__ void moe_slot_down_fp4_kernel(
     int n_shared, int k_shared, const uint8_t* __restrict__ sh_payload,
     const float* __restrict__ sh_scales, float* __restrict__ out,
     int out_stride, int slots, int top_k, int shared_view_base, int sh_rs, int sh_cs,
-    int tiles, int* __restrict__ tile_counter) {
+    int tiles, int* __restrict__ tile_counter, int live_slots) {
   dgpp_pdl_wait();
   using G = fp4_gemv::Geom<K>;
   extern __shared__ __align__(16) uint16_t sx[];
@@ -2105,15 +2310,24 @@ __global__ void moe_slot_down_fp4_kernel(
   // protocol are unchanged (every block still takes exactly one unit past
   // the end): bitwise.
   __shared__ int s_unit;
-  const int total = tiles * slots;
+  // (live_slots: the order's first positions that hold work — every slot,
+  // or the routed ones of a launch without the shared expert)
+  const int total = tiles * live_slots;
+  // The units this block holds: q[0] the one it computes next, q[1..] the
+  // ones ahead of it, already prefetched.
+  int q[kSlotDownQueue + 1];
+#pragma unroll
+  for (int i = 0; i <= kSlotDownQueue; ++i) q[i] = total;
   __syncthreads();
   if (threadIdx.x == 0) s_unit = atomicAdd(tile_counter, 1);
   __syncthreads();
-  int unit = s_unit;
+  q[0] = s_unit;
+  bool first = true;
   for (;;) {
-    if (unit >= total) {
-      // Every block takes one unit past the end before it leaves, so the
-      // last block done knows every fetch has happened.
+    const int cur = q[0];
+    if (cur >= total) {
+      // The counter only grows, so every unit this block still holds is
+      // past the end too; the last block done resets the pair.
       if (threadIdx.x == 0) {
         __threadfence();
         if (atomicAdd(tile_counter + 1, 1) == static_cast<int>(gridDim.x) - 1) {
@@ -2124,52 +2338,6 @@ __global__ void moe_slot_down_fp4_kernel(
       }
       return;
     }
-    __syncthreads();  // the previous unit's readers of sx and s_unit are done
-    if (threadIdx.x == 0) s_unit = atomicAdd(tile_counter, 1);
-    __syncthreads();
-    const int next = s_unit;
-    if (kSlotDownLookahead && next < total) {
-      const int p_ix = next / tiles;
-      const int p_n0 = (next - p_ix * tiles) * G::rows_per_block;
-      const int p_slot = order ? order[p_ix] : p_ix;
-      const int p_t = p_slot / (top_k + 1);
-      const int p_j = p_slot - p_t * (top_k + 1);
-      const bool p_shared = p_j == top_k;
-      const int p_n = p_shared ? n_shared : n_routed;
-      const int p_rows = min(G::rows_per_block, p_n - p_n0);
-      const bool p_fp8 = p_shared && !kSharedFp4;
-      // The payload's pieces, then the scales' (the unit's loads read both).
-      const size_t pay_row = p_fp8 ? static_cast<size_t>(k_shared) : static_cast<size_t>(G::row_bytes);
-      const size_t pay_bytes = p_rows > 0 ? static_cast<size_t>(p_rows) * pay_row : 0;
-      const size_t sc_row = static_cast<size_t>(K / kGroup);  // the fp4 scales: one byte a group (the fp8 grid is a line or two: left to the loads)
-      const size_t sc_bytes = (p_rows > 0 && !p_fp8) ? static_cast<size_t>(p_rows) * sc_row : 0;
-      const size_t pay_pieces = (pay_bytes + kSlotDownPiece - 1) / kSlotDownPiece;
-      const size_t piece = threadIdx.x;
-      if (piece < pay_pieces + (sc_bytes + kSlotDownPiece - 1) / kSlotDownPiece) {
-        const uint8_t* base;
-        size_t bytes;
-        if (p_fp8) {
-          base = sh_payload + static_cast<size_t>(p_n0) * pay_row;
-          bytes = pay_bytes;
-        } else {
-          const int vb = (kSharedFp4 && p_shared) ? shared_view_base : ids[static_cast<size_t>(p_t) * top_k + p_j] * 3;
-          const MoeExpertView pv = views[static_cast<size_t>(vb) + 2];
-          const bool pay = piece < pay_pieces;
-          base = pay ? pv.payload + static_cast<size_t>(p_n0) * pay_row : pv.fp4_scales + static_cast<size_t>(p_n0) * sc_row;
-          bytes = pay ? pay_bytes : sc_bytes;
-        }
-        const size_t off = (piece < pay_pieces ? piece : piece - pay_pieces) * kSlotDownPiece;
-        // A 16-byte-aligned span inside the piece (the instruction's unit).
-        const uintptr_t lo = (reinterpret_cast<uintptr_t>(base) + off + 15) & ~static_cast<uintptr_t>(15);
-        const uintptr_t end = reinterpret_cast<uintptr_t>(base) + (off + kSlotDownPiece < bytes ? off + kSlotDownPiece : bytes);
-        if (end >= lo + 16) {
-          const unsigned sz = static_cast<unsigned>((end - lo) & ~static_cast<uintptr_t>(15));
-          asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(lo), "r"(sz) : "memory");
-        }
-      }
-    }
-    const int cur = unit;
-    unit = next;
     const int slot_ix = cur / tiles;
     const int n0 = (cur - slot_ix * tiles) * G::rows_per_block;
     const int slot = order ? order[slot_ix] : slot_ix;
@@ -2178,39 +2346,110 @@ __global__ void moe_slot_down_fp4_kernel(
     const bool shared = j == top_k;
     const int n = shared ? n_shared : n_routed;
     const int k = (shared && !kSharedFp4) ? k_shared : K;
-    if (n0 >= n) continue;
-    float* out_row = out + static_cast<size_t>(slot) * out_stride;
-    if (shared && !kSharedFp4) {
-      fp8_gemv::stage_activations<1>(act + static_cast<size_t>(slot) * act_stride,
-                                     act_stride, k, sx);
-      __syncthreads();
-      fp8_gemv::block_rows_multi<1, G::rows_per_warp>(
-          sh_payload, sh_scales, sx, n0, n, k, out_row, static_cast<size_t>(out_stride), sh_rs, sh_cs);
-      continue;
-    }
-    const int base = (kSharedFp4 && shared) ? shared_view_base
-                                            : ids[static_cast<size_t>(t) * top_k + j] * 3;
-    const MoeExpertView v = views[static_cast<size_t>(base) + 2];
-    const float g = kGroup == fp4_gemv::kGroup ? *v.fp4_global : 1.f;
-    // The first pass's weight loads in flight before the activations are
-    // staged (fp4_gemv.cuh: PassLoads); the epilogue is block_rows's.
+    const bool fp8_unit = shared && !kSharedFp4;
+    const bool live = n0 < n;
+    // 1. This unit's own loads first (fp4_gemv.cuh: PassLoads): they are
+    //    ahead of the look-ahead's prefetches in the memory's queue.
     fp4_gemv::PassLoads<G::pass_chunks(0)> L0;
-    fp4_gemv::issue_pass<K, 0, G::pass_chunks(0), kGroup, kFp4SlotStreaming>(v.payload, v.fp4_scales, n0, n, L0);
-    fp8_gemv::stage_activations<1>(act + static_cast<size_t>(slot) * act_stride, act_stride, k, sx);
-    __syncthreads();
-    float acc[fp4_gemv::kSteps][1];
-    fp4_gemv::warp_row_dots_issued<K, 1, kGroup, kFp4SlotStreaming>(L0, v.payload, v.fp4_scales, sx, n0, n, acc);
+    MoeExpertView v;
+    if (live && !fp8_unit) {
+      const int base = (kSharedFp4 && shared) ? shared_view_base
+                                              : ids[static_cast<size_t>(t) * top_k + j] * 3;
+      v = views[static_cast<size_t>(base) + 2];
+      fp4_gemv::issue_pass<K, 0, G::pass_chunks(0), kGroup, kFp4SlotStreaming>(v.payload, v.fp4_scales, n0, n, L0);
+    }
+    // 2. The look-ahead: the block's first turn takes kSlotDownDepth units,
+    //    every later turn one, and prefetches them.
+    if constexpr (kSlotDownDepth > 0) {
+      const int take = first ? kSlotDownDepth : 1;
+      __syncthreads();  // the previous unit's readers of sx and s_unit are done
+      if (threadIdx.x == 0) s_unit = atomicAdd(tile_counter, take);
+      __syncthreads();
+      const int taken = s_unit;
 #pragma unroll
-    for (int st = 0; st < fp4_gemv::kSteps; ++st) {
-      bool mine = false;
-      const int row = fp4_gemv::owned_row<K>(n0, st, mine);
-      if (mine && row < n) {
-        if constexpr (kGroup == fp4_gemv::kGroup)
-          fp4_gemv::store_dot(out_row + row, __fdiv_rn(acc[st][0], g));
-        else
-          fp4_gemv::store_dot(out_row + row, acc[st][0]);
+      for (int i = 0; i < kSlotDownDepth; ++i) {
+        if (i >= take) break;
+        const int next = taken + i;
+        q[first ? i + 1 : kSlotDownDepth] = next;
+        if (next >= total) continue;
+        const int p_ix = next / tiles;
+        const int p_n0 = (next - p_ix * tiles) * G::rows_per_block;
+        const int p_slot = order ? order[p_ix] : p_ix;
+        const int p_t = p_slot / (top_k + 1);
+        const int p_j = p_slot - p_t * (top_k + 1);
+        const bool p_shared = p_j == top_k;
+        const int p_n = p_shared ? n_shared : n_routed;
+        const int p_rows = min(G::rows_per_block, p_n - p_n0);
+        const bool p_fp8 = p_shared && !kSharedFp4;
+        // The payload's pieces, then the scales' (the unit's loads read both).
+        const size_t pay_row = p_fp8 ? static_cast<size_t>(k_shared) : static_cast<size_t>(G::row_bytes);
+        const size_t pay_bytes = p_rows > 0 ? static_cast<size_t>(p_rows) * pay_row : 0;
+        const size_t sc_row = static_cast<size_t>(K / kGroup);  // the fp4 scales: one byte a group (the fp8 grid is a line or two: left to the loads)
+        const size_t sc_bytes = (p_rows > 0 && !p_fp8) ? static_cast<size_t>(p_rows) * sc_row : 0;
+        const size_t pay_pieces = (pay_bytes + kSlotDownPiece - 1) / kSlotDownPiece;
+        const size_t piece = threadIdx.x;
+        if (piece < pay_pieces + (sc_bytes + kSlotDownPiece - 1) / kSlotDownPiece) {
+          const uint8_t* pbase;
+          size_t bytes;
+          if (p_fp8) {
+            pbase = sh_payload + static_cast<size_t>(p_n0) * pay_row;
+            bytes = pay_bytes;
+          } else {
+            const int vb = (kSharedFp4 && p_shared) ? shared_view_base : ids[static_cast<size_t>(p_t) * top_k + p_j] * 3;
+            const MoeExpertView pv = views[static_cast<size_t>(vb) + 2];
+            const bool pay = piece < pay_pieces;
+            pbase = pay ? pv.payload + static_cast<size_t>(p_n0) * pay_row : pv.fp4_scales + static_cast<size_t>(p_n0) * sc_row;
+            bytes = pay ? pay_bytes : sc_bytes;
+          }
+          const size_t off = (piece < pay_pieces ? piece : piece - pay_pieces) * kSlotDownPiece;
+          // A 16-byte-aligned span inside the piece (the instruction's unit).
+          const uintptr_t lo = (reinterpret_cast<uintptr_t>(pbase) + off + 15) & ~static_cast<uintptr_t>(15);
+          const uintptr_t end = reinterpret_cast<uintptr_t>(pbase) + (off + kSlotDownPiece < bytes ? off + kSlotDownPiece : bytes);
+          if (end >= lo + 16) {
+            const unsigned sz = static_cast<unsigned>((end - lo) & ~static_cast<uintptr_t>(15));
+            asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(lo), "r"(sz) : "memory");
+          }
+        }
+      }
+    } else {
+      __syncthreads();
+      if (threadIdx.x == 0) s_unit = atomicAdd(tile_counter, 1);
+      __syncthreads();
+      q[1] = s_unit;  // (depth 0 keeps one slot: the next unit, not prefetched)
+    }
+    first = false;
+    // 3. The unit itself.
+    if (live) {
+      float* out_row = out + static_cast<size_t>(slot) * out_stride;
+      if (fp8_unit) {
+        fp8_gemv::stage_activations<1>(act + static_cast<size_t>(slot) * act_stride,
+                                       act_stride, k, sx);
+        __syncthreads();
+        fp8_gemv::block_rows_multi<1, G::rows_per_warp>(
+            sh_payload, sh_scales, sx, n0, n, k, out_row, static_cast<size_t>(out_stride), sh_rs, sh_cs);
+      } else {
+        const float g = kGroup == fp4_gemv::kGroup ? *v.fp4_global : 1.f;
+        fp8_gemv::stage_activations<1>(act + static_cast<size_t>(slot) * act_stride, act_stride, k, sx);
+        __syncthreads();
+        float acc[fp4_gemv::kSteps][1];
+        fp4_gemv::warp_row_dots_issued<K, 1, kGroup, kFp4SlotStreaming>(L0, v.payload, v.fp4_scales, sx, n0, n, acc);
+#pragma unroll
+        for (int st = 0; st < fp4_gemv::kSteps; ++st) {
+          bool mine = false;
+          const int row = fp4_gemv::owned_row<K>(n0, st, mine);
+          if (mine && row < n) {
+            if constexpr (kGroup == fp4_gemv::kGroup)
+              fp4_gemv::store_dot(out_row + row, __fdiv_rn(acc[st][0], g));
+            else
+              fp4_gemv::store_dot(out_row + row, acc[st][0]);
+          }
+        }
       }
     }
+    // The queue moves up one.
+#pragma unroll
+    for (int i = 0; i < kSlotDownQueue; ++i) q[i] = q[i + 1];
+    q[kSlotDownQueue] = total;
   }
 }
 
@@ -4910,11 +5149,15 @@ void launch_moe_slot_gate_up_swiglu_fp4(
     const float* sh_gate_scales, const uint8_t* sh_up_payload,
     const float* sh_up_scales, uint16_t* act, int act_stride, int slots,
     int top_k, float limit, cudaStream_t stream, int shared_view_base, int fp4_group,
-    int sh_rs, int sh_cs, bool streaming) {
+    int sh_rs, int sh_cs, bool streaming, int live_slots) {
   if (slots <= 0) return;
   check_fp4_slot_args(x, ids, views, act, n_routed, k_routed, n_shared, k_shared,
                       shared_view_base, "moe_slot_gate_up_fp4", fp4_group);
-  const bool shared_fp4 = shared_view_base >= 0;
+  if (live_slots < 0) live_slots = slots;
+  if (live_slots > slots) throw std::invalid_argument("moe_slot_gate_up_fp4: live_slots above slots");
+  // No shared expert in the launch: the instantiation without the fp8
+  // shared branch (its registers are the routed path's alone).
+  const bool shared_fp4 = shared_view_base >= 0 || n_shared == 0;
   if (n_shared > 0 && !shared_fp4 &&
       (!sh_gate_payload || !sh_gate_scales || !sh_up_payload || !sh_up_scales ||
        !fp8_gemv::shape_ok(sh_gate_payload, 1, k_shared) ||
@@ -4929,7 +5172,8 @@ void launch_moe_slot_gate_up_swiglu_fp4(
     constexpr int K = decltype(kc)::value;
     constexpr int G = decltype(gc)::value;
     constexpr int rpb = fp4_gemv::Geom<K>::rows_per_block;
-    const dim3 grid((max_n + rpb - 1) / rpb, static_cast<unsigned>(slots));
+    // (the order's first live_slots positions hold the launch's work)
+    const dim3 grid((max_n + rpb - 1) / rpb, static_cast<unsigned>(live_slots));
     const size_t smem = fp8_gemv::smem_bytes(1, max_k);
     // The four forms of one kernel: the shared expert's format by the loads' cache policy.
     if (shared_fp4 && streaming)
@@ -5005,12 +5249,16 @@ void launch_moe_slot_down_fp4(const uint16_t* act, size_t act_stride,
                               const uint8_t* sh_payload, const float* sh_scales,
                               float* out, int out_stride, int slots, int top_k,
                               cudaStream_t stream, int shared_view_base, int fp4_group,
-                              int sh_rs, int sh_cs, int* tile_counter) {
+                              int sh_rs, int sh_cs, int* tile_counter, int live_slots) {
   if (slots <= 0) return;
   if (tile_counter == nullptr) throw std::invalid_argument("moe_slot_down_fp4: the stealing counter pair is required");
   check_fp4_slot_args(act, ids, views, out, n_routed, k_routed, n_shared, k_shared,
                       shared_view_base, "moe_slot_down_fp4", fp4_group);
-  const bool shared_fp4 = shared_view_base >= 0;
+  if (live_slots < 0) live_slots = slots;
+  if (live_slots > slots) throw std::invalid_argument("moe_slot_down_fp4: live_slots above slots");
+  // No shared expert in the launch: the instantiation without the fp8
+  // shared branch (the gate/up launcher's note).
+  const bool shared_fp4 = shared_view_base >= 0 || n_shared == 0;
   if (n_shared > 0 && !shared_fp4 && (!sh_payload || !sh_scales || !fp8_gemv::shape_ok(sh_payload, 1, k_shared)))
     throw std::invalid_argument(
         "moe_slot_down_fp4: shared payload must be 16B-aligned with k % 16 == 0");
@@ -5034,7 +5282,7 @@ void launch_moe_slot_down_fp4(const uint16_t* act, size_t act_stride,
     constexpr int rpb = fp4_gemv::Geom<K>::rows_per_block;
     const int tiles = (max_n + rpb - 1) / rpb;
     if (tiles <= 0) return;
-    const int total = tiles * slots;
+    const int total = tiles * live_slots;
     static int occ_k[2] = {-1, -1}, occ_blocks[2] = {0, 0};
     const int which = shared_fp4 ? 1 : 0;
     if (occ_k[which] != max_k) {
@@ -5050,11 +5298,11 @@ void launch_moe_slot_down_fp4(const uint16_t* act, size_t act_stride,
     if (shared_fp4)
       moe_slot_down_fp4_kernel<K, true, G><<<grid, fp8_gemv::kThreads, smem, stream>>>(
           act, act_stride, ids, order, views, n_routed, n_shared, k_shared,
-          sh_payload, sh_scales, out, out_stride, slots, top_k, shared_view_base, sh_rs, sh_cs, tiles, tile_counter);
+          sh_payload, sh_scales, out, out_stride, slots, top_k, shared_view_base, sh_rs, sh_cs, tiles, tile_counter, live_slots);
     else
       moe_slot_down_fp4_kernel<K, false, G><<<grid, fp8_gemv::kThreads, smem, stream>>>(
           act, act_stride, ids, order, views, n_routed, n_shared, k_shared,
-          sh_payload, sh_scales, out, out_stride, slots, top_k, -1, sh_rs, sh_cs, tiles, tile_counter);
+          sh_payload, sh_scales, out, out_stride, slots, top_k, -1, sh_rs, sh_cs, tiles, tile_counter, live_slots);
     DGPP_CUDA_OK(cudaGetLastError());
   };
   if (fp4_group == fp4_gemv::kMxGroup)

@@ -1719,6 +1719,8 @@ DGPP_TEST(moe_decode_slot_path_is_bitwise_host_path) {
     dgpp::MoeTraceStaging trace{pin_ids, pin_w, pin_b};
     layer.enqueue_decode(c.d_hidden, c.d_out, cs.M, &trace, nullptr);
     DGPP_CUDA_OK(cudaDeviceSynchronize());
+    // (two rows or more: the shared expert in its own launches, GlmMoeConfig::shared_run_lane)
+    require(layer.decode_shared_lane(cs.M) == (cs.M >= 2), "the shared expert's lane takes two rows or more");
     std::vector<uint16_t> fused(host.size(), 0x7F7F);
     std::memcpy(fused.data(), c.d_out, fused.size() * 2);
     require(std::memcmp(host.data(), fused.data(), host.size() * 2) == 0,
@@ -2665,6 +2667,24 @@ DGPP_TEST(moe_decode_slot_path_is_bitwise_host_path_mxfp4) {
       DGPP_CUDA_OK(cudaDeviceSynchronize());
       require(std::memcmp(c.d_out, fused.data(), host.size() * 2) == 0,
               "mxfp4 decode: the early shared-slot order must be bitwise the expert order");
+    }
+    // Two rows or more run the FP8 shared expert in its own launches by
+    // default (GlmMoeConfig::shared_run_lane: runs of up to four rows on a
+    // side stream, the slot kernels left with the routed slots). Every row
+    // is bitwise the slot form's, five rows (a run of three and one of
+    // two) and eighty (twenty runs) included.
+    {
+      require(c.cfg.shared_run_lane, "the decode launches run the shared expert's lane by default");
+      require(layer.decode_shared_lane(cs.M) == (cs.M >= 2), "the shared expert's lane takes two rows or more");
+      dgpp::GlmMoeConfig slot_cfg = c.cfg;
+      slot_cfg.shared_run_lane = false;
+      GlmMoeLayer in_slots(c.dev_w, slot_cfg, std::max(cs.M, 1), /*decode_slots=*/cs.M);
+      require(!in_slots.decode_shared_lane(cs.M), "the lane is off when the family says so");
+      DGPP_CUDA_OK(cudaMemset(c.d_out, 0x7F, host.size() * 2));
+      in_slots.enqueue_decode(c.d_hidden, c.d_out, cs.M, nullptr, nullptr);
+      DGPP_CUDA_OK(cudaDeviceSynchronize());
+      require(std::memcmp(c.d_out, fused.data(), host.size() * 2) == 0,
+              "mxfp4 decode: the shared expert's lane must be bitwise the slot form");
     }
     // The prefill path takes the tile kernel's MXFP4 form: bitwise the
     // host path through it (MoeExpertKernel::kMma), within budget of the oracle.

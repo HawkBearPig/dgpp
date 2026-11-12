@@ -91,6 +91,23 @@ struct GlmMoeConfig {
   // row's result is still its own whatever rows share the launch). A family
   // opts in after its own fabric A/B (DeepSeek-V4-Flash).
   bool shared_mma_aside = false;
+  // Decode launches of two rows or more run the FP8 shared expert in its
+  // own launches on a side stream (2026-11-12, launch_moe_shared_run_*):
+  // every weight row decoded once for up to four rows of the pass, forked
+  // at the layer's input so the work runs beside the router, and the slot
+  // kernels left with the routed slots alone (the instantiations without
+  // the shared branch, the grids without the shared slots). In the slots
+  // the shared expert was a slot per row: its blocks took resident places
+  // from the routed stream and its lines were pushed out of L2 and re-read
+  // (the DeepSeek-V4.1 world-4 shape: 20 / 35 / 55 us of a two / three /
+  // five-row launch pair). BITWISE the slot form (the fp8 core's multi-row
+  // chains). One row keeps the slots: its shared slot is free beside the
+  // routed stream, and the lane needs the router's time as a head start.
+  // Every family whose shared expert rides the launch arguments takes it;
+  // the NVFP4, packed and EXL3 shared experts keep their slot forms, and a
+  // family on shared_mma_aside keeps that. false: the slot form, for the
+  // lane's own gate.
+  bool shared_run_lane = true;
   // The Mixed346 contract (2026-10-09): the layer keeps the int8 code and
   // scale copies of the routed rows the converted experts multiply
   // (kMoeInputHadamard32Int8), sized with the scratch; off for every other
