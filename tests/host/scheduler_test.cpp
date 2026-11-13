@@ -4763,6 +4763,277 @@ DGPP_TEST(scheduler_prefixCache_roomIsMadeAroundTheEntryARequestOpensInside) {
   }
 }
 
+// ---- randomized workloads on a fake with the real pool's bookkeeping (2026-11-13) ----
+namespace {
+// Every arena slot's token ids and blocks, every open request's ids and
+// blocks, the blocks by identity with reference counts. The fake refuses
+// what the real engine would compute wrongly or could not hold: an attach
+// whose tokens are not the slot's (the token AT an attach inside an entry
+// included: the draft block's last row embeds it), a lookahead token that
+// changed at an entry's own position, a snapshot past what the request has
+// committed, a pool overdrawn.
+class LedgerEngine : public FakeEngine {
+ public:
+  static constexpr int64_t kBlock = 4;
+  LedgerEngine(int slots, int64_t blocks, int arena_slots, bool lookahead, int step_tokens)
+      : FakeEngine(slots, blocks, kBlock), total_(blocks), lookahead_(lookahead) {
+    set_prefix_arena(arena_slots, /*align=*/1);
+    set_attach_within(true);
+    set_step_tokens_max(step_tokens);
+    prefill_lookahead_ = lookahead;
+  }
+  int64_t attaches = 0, within_attaches = 0;
+  int64_t pool_blocks_in_use() const override { return in_use_; }
+
+  int32_t prefill(int req, const std::vector<int64_t>& prompt) override {
+    const int32_t token = FakeEngine::prefill(req, prompt);
+    Row& row = rows_[req];  // opened by an attach, or fresh
+    row.ids = prompt;
+    row.prompt = static_cast<int64_t>(prompt.size());
+    row.ids.push_back(token);
+    grow(row, blocks_for_tokens(row.prompt), "a prompt's blocks");
+    return token;
+  }
+  int32_t prefill_cached(int req, const std::vector<int64_t>& prompt,
+                         dgpp::sched::SchedulerEngine::PrefixPrefill* plan) override {
+    require(rows_.count(req) == 0, "ledger: prefill on an open slot");
+    if (plan->attach_slot >= 0) {
+      require(arena_.count(plan->attach_slot) != 0, "ledger: attach from an empty arena slot");
+      const Snapshot& s = arena_.at(plan->attach_slot);
+      const int64_t p = plan->attach_position;
+      require(p > 0 && p <= s.position && p < static_cast<int64_t>(prompt.size()),
+              "ledger: attach at " + std::to_string(p) + " of a slot at " + std::to_string(s.position) +
+                  " for a prompt of " + std::to_string(prompt.size()));
+      require(std::equal(s.ids.begin(), s.ids.begin() + p, prompt.begin()),
+              "ledger: an attach at " + std::to_string(p) + " whose tokens are not the slot's");
+      if (p < s.position) {
+        ++within_attaches;
+        require(prompt[static_cast<size_t>(p)] == s.ids[static_cast<size_t>(p)],
+                "ledger: the token at an attach inside an entry (" + std::to_string(p) + ") is not the entry's");
+      } else if (s.next >= 0) {
+        require(prompt[static_cast<size_t>(p)] == s.next, "ledger: the lookahead token at the entry's cut changed");
+      }
+      ++attaches;
+      Row row;
+      for (int64_t i = 0; i < p / kBlock; ++i) row.blocks.push_back(share(s.blocks[static_cast<size_t>(i)]));
+      if (p % kBlock != 0) row.blocks.push_back(acquire("an attach's copy of the block its position falls in"));
+      rows_[req] = std::move(row);
+    }
+    const int32_t token = FakeEngine::prefill_cached(req, prompt, plan);
+    if (plan->snap_taken) take(req, plan->snap_slot, plan->snap_position, /*cut=*/true);
+    if (plan->body_snap_taken) take(req, plan->body_snap_slot, plan->body_snap_position, /*cut=*/true);
+    if (plan->head_snap_taken) take(req, plan->head_snap_slot, plan->head_snap_position, /*cut=*/true);
+    return token;
+  }
+  void reserve(int req, int64_t tokens) override {
+    FakeEngine::reserve(req, tokens);
+    grow(rows_.at(req), blocks_for_tokens(tokens), "a reservation");
+  }
+  std::vector<int32_t> step(int req) override {
+    const bool armed = hop_armed_.count(req) != 0;
+    const std::pair<int, int64_t> hop = armed ? hop_armed_.at(req) : std::pair<int, int64_t>{-1, 0};
+    const std::vector<int32_t> out = FakeEngine::step(req);
+    Row& row = rows_.at(req);
+    row.ids.insert(row.ids.end(), out.begin(), out.end());
+    const auto result = hop_results_.find(req);
+    if (armed && result != hop_results_.end() && result->second.status == PrefixHopStatus::kStored)
+      take(req, hop.first, hop.second, /*cut=*/false);
+    return out;
+  }
+  void prefix_snapshot(int req, int slot, int64_t position) override {
+    FakeEngine::prefix_snapshot(req, slot, position);
+    take(req, slot, position, /*cut=*/false);
+  }
+  void prefix_release(int slot) override {
+    FakeEngine::prefix_release(slot);
+    drop(slot);
+  }
+  void close(int req) override {
+    FakeEngine::close(req);
+    for (const int b : rows_.at(req).blocks) unref(b);
+    rows_.erase(req);
+  }
+  bool idle() const { return rows_.empty(); }
+  // Every block in use is one an arena slot or an open request holds.
+  void audit() const {
+    std::set<int> held;
+    for (const auto& [req, row] : rows_) held.insert(row.blocks.begin(), row.blocks.end());
+    for (const auto& [slot, s] : arena_) {
+      held.insert(s.blocks.begin(), s.blocks.end());
+      if (s.partial >= 0) held.insert(s.partial);
+    }
+    require(static_cast<int64_t>(held.size()) == in_use_ && in_use_ <= total_,
+            "ledger: " + std::to_string(in_use_) + " blocks in use, " + std::to_string(held.size()) + " held");
+  }
+
+ private:
+  struct Row {
+    std::vector<int64_t> ids;  // the prompt, then every token returned
+    std::vector<int> blocks;
+    int64_t prompt = 0;
+  };
+  struct Snapshot {
+    std::vector<int64_t> ids;
+    std::vector<int> blocks;  // the whole blocks, by reference
+    int partial = -1;         // its own copy
+    int64_t position = 0;
+    int64_t next = -1;        // the token a prefill cut's draft row consumed
+  };
+  int acquire(const char* what) {
+    require(in_use_ < total_, std::string("ledger: the pool is overdrawn by ") + what);
+    ref_[next_] = 1;
+    ++in_use_;
+    return next_++;
+  }
+  int share(int b) {
+    require(ref_.count(b) != 0, "ledger: sharing a block that is not live");
+    ++ref_[b];
+    return b;
+  }
+  void unref(int b) {
+    if (--ref_.at(b) == 0) {
+      ref_.erase(b);
+      --in_use_;
+    }
+  }
+  void grow(Row& row, int64_t blocks, const char* what) {
+    while (static_cast<int64_t>(row.blocks.size()) < blocks) row.blocks.push_back(acquire(what));
+  }
+  void drop(int slot) {
+    const auto it = arena_.find(slot);
+    if (it == arena_.end()) return;
+    for (const int b : it->second.blocks) unref(b);
+    if (it->second.partial >= 0) unref(it->second.partial);
+    arena_.erase(it);
+  }
+  void take(int req, int slot, int64_t position, bool cut) {
+    const Row& row = rows_.at(req);
+    require(position > 0 && position < static_cast<int64_t>(row.ids.size()),
+            "ledger: a snapshot at " + std::to_string(position) + " past the request's committed tokens");
+    require(static_cast<int64_t>(row.blocks.size()) * kBlock >= position, "ledger: a snapshot past the request's blocks");
+    drop(slot);
+    Snapshot s;
+    s.position = position;
+    s.ids.assign(row.ids.begin(), row.ids.begin() + position);
+    if (cut && lookahead_ && position < row.prompt) s.next = row.ids[static_cast<size_t>(position)];
+    for (int64_t i = 0; i < position / kBlock; ++i) s.blocks.push_back(share(row.blocks[static_cast<size_t>(i)]));
+    if (position % kBlock != 0) s.partial = acquire("a snapshot's copy of its partial block");
+    arena_[slot] = std::move(s);
+  }
+  int64_t total_, in_use_ = 0;
+  bool lookahead_;
+  int next_ = 0;
+  std::map<int, int> ref_;
+  std::map<int, Row> rows_;
+  std::map<int, Snapshot> arena_;
+};
+}  // namespace
+
+DGPP_TEST(scheduler_prefixCache_randomWorkloadsNeverAttachPastTheSharedTokens) {
+  // Prompts that share heads of random length with three long texts and with
+  // each other (repeats, next turns over what was generated, edits), random
+  // boundaries, cancels and opt-outs, one to three slots, small arenas and
+  // pools, one- and two-token steps, with and without the draft's lookahead.
+  // The ledger refuses a wrong attach or an overdrawn pool. A replay makes
+  // the same decisions, the key off attaches inside no entry, and over the
+  // seeds the attaches inside entries save tokens.
+  struct Outcome {
+    std::string ops;
+    uint64_t digest = 0;
+    int64_t saved = 0, within = 0;
+  };
+  const auto run = [](uint32_t seed, bool partial) {
+    std::mt19937 rng(seed);
+    const auto pick = [&](int lo, int hi) { return lo + static_cast<int>(rng() % static_cast<uint32_t>(hi - lo + 1)); };
+    const int kSteps = 12, kPrompt = 120;
+    const int slots = pick(1, 3);
+    const bool lookahead = rng() % 2 != 0, two = rng() % 2 != 0;
+    LedgerEngine engine(slots, slots * 40 + pick(0, 60), pick(3, 12), lookahead, two ? 2 : 1);
+    dgpp::sched::AdmissionPolicy policy;
+    policy.prefix_partial_hits = partial;
+    policy.prefix_head_snapshots = rng() % 2 != 0;
+    policy.prefix_min_tokens = rng() % 2 != 0 ? 8 : 0;
+    Scheduler sched(&engine, {kEos}, 0, policy);
+    int32_t token = 2000;
+    for (int s = 0; s < slots; ++s)
+      for (int e = 0; e < 40; ++e) {
+        std::vector<std::vector<int32_t>> steps;
+        const int eos_at = rng() % 3 == 0 ? pick(1, kSteps) : -1;
+        for (int n = 0; n < kSteps + 2;) {
+          std::vector<int32_t> batch;
+          for (int i = two ? pick(1, 2) : 1; i > 0; --i) batch.push_back(++n == eos_at ? kEos : token++);
+          steps.push_back(std::move(batch));
+        }
+        engine.arm_batches(s, token++, std::move(steps), kSteps + 4);
+      }
+    std::vector<std::vector<int64_t>> texts;
+    for (int b = 0; b < 3; ++b) texts.push_back(counted_prompt(110, 100000 * (b + 1)));
+    std::vector<std::pair<std::string, std::vector<int64_t>>> sent;
+    int64_t fresh = 900000;
+    for (int n = 0; n < 28; ++n) {
+      std::vector<int64_t> prompt;
+      const int kind = sent.empty() ? 0 : static_cast<int>(rng() % 10);
+      if (kind < 5) {  // a text's head
+        const auto& text = texts[rng() % texts.size()];
+        prompt.assign(text.begin(), text.begin() + pick(0, 100));
+      } else {  // an earlier prompt: again as it was, or with some of its answer
+        const auto& [id, earlier] = sent[rng() % sent.size()];
+        prompt = earlier;
+        if (const Scheduler::Result* r = sched.find(id); kind >= 7 && r != nullptr && !r->generated.empty())
+          prompt.insert(prompt.end(), r->generated.begin(),
+                        r->generated.begin() + static_cast<long>(rng() % (r->generated.size() + 1)));
+      }
+      if (kind != 5 && kind != 6)  // its own tail, unless it is a repeat
+        for (int i = pick(1, 16); i > 0; --i) prompt.push_back(fresh++);
+      if (kind == 9 && prompt.size() > 8) prompt[rng() % prompt.size()] += 7;  // an edit somewhere
+      if (prompt.size() > static_cast<size_t>(kPrompt)) prompt.resize(static_cast<size_t>(kPrompt));
+      std::vector<int64_t> boundaries;
+      for (int64_t b = pick(1, 12); b < static_cast<int64_t>(prompt.size()); b += pick(3, 40)) boundaries.push_back(b);
+      const std::string id = "r" + std::to_string(n);
+      auto request = make_cached_request(id, prompt, boundaries, pick(1, kSteps));
+      if (rng() % 6 == 0) request.cancel_after = pick(1, request.max_steps);
+      if (rng() % 12 == 0) request.no_cache = true;
+      sched.submit(request);
+      sent.emplace_back(id, std::move(prompt));
+      if (rng() % 3 != 0)
+        for (int t = pick(1, 30); t > 0; --t) sched.tick();
+    }
+    sched.run_to_completion();
+    for (const auto& [id, prompt] : sent) {
+      const Scheduler::Result* r = sched.find(id);
+      require(r != nullptr && (r->status == Scheduler::Result::Status::kDone ||
+                               r->status == Scheduler::Result::Status::kCancelled),
+              "every request retires: " + id);
+    }
+    require(engine.idle(), "every slot closed");
+    engine.audit();
+    const Scheduler::Meters m = sched.meters();
+    require(partial || engine.within_attaches == 0, "the key off attaches inside no entry");
+    require(m.prefix_partial_hits == engine.within_attaches && m.prefix_hits == engine.attaches,
+            "the meters count the engine's attaches: " + std::to_string(m.prefix_hits) + "/" +
+                std::to_string(m.prefix_partial_hits) + " against " + std::to_string(engine.attaches) + "/" +
+                std::to_string(engine.within_attaches));
+    return Outcome{engine.op_stream(), sched.prefix_digest(), m.prefix_tokens_saved, engine.within_attaches};
+  };
+  int64_t saved_on = 0, saved_off = 0, within = 0;
+  for (uint32_t seed = 1; seed <= 400; ++seed) {
+    try {
+      const Outcome on = run(seed, true), again = run(seed, true), off = run(seed, false);
+      require(on.ops == again.ops && on.digest == again.digest, "a replay makes other decisions");
+      saved_on += on.saved;
+      saved_off += off.saved;
+      within += on.within;
+    } catch (const std::exception& e) {
+      throw std::runtime_error("seed " + std::to_string(seed) + ": " + e.what());
+    }
+  }
+  require(within > 400 && saved_on > saved_off,
+          "over the seeds the attaches inside entries save tokens: " + std::to_string(saved_on) + " against " +
+              std::to_string(saved_off) + " with the key off, " + std::to_string(within) + " inside entries");
+  std::printf("[ .. ] 400 random workloads: %lld tokens saved (%lld with the key off), %lld attaches inside entries\n",
+              static_cast<long long>(saved_on), static_cast<long long>(saved_off), static_cast<long long>(within));
+}
+
 int main() {
   dgpp::set_log_level_from_env("DGPP_LOG_LEVEL");
   return dgpp::test::run_all();

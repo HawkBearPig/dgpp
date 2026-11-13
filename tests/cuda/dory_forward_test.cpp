@@ -306,8 +306,9 @@ DGPP_TEST(dory_attach_inside_a_snapshot_is_the_attach_at_a_cut) {
     return ids;
   };
   for (const DoryKvPolicy policy : {DoryKvPolicy::PerLoop, DoryKvPolicy::LastLoop}) {
-    DoryModel w(fx.cfg, fx.dir, 64, 2048, DoryResidency::Resident, 2, 1, false, policy);
+    DoryModel w(fx.cfg, fx.dir, 64, 4096, DoryResidency::Resident, 3, 1, false, policy);
     dgpp::test::attach_within_gate(w, tokens, fx.cfg.vocab_size, /*mtp=*/false, "dory");
+    dgpp::test::attach_within_decode_gate(w, tokens, fx.cfg.vocab_size, /*mtp=*/false, "dory");
   }
 }
 

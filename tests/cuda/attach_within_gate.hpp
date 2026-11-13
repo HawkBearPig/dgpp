@@ -9,8 +9,9 @@
 // snapshot is untouched by the requests opened inside it, and every block
 // returns to the pool with the snapshots.
 //
-// `m`: two session slots, walks of at most 64 rows per chunk, a cache of at
-// least eight blocks. `tokens(n, seed)`: n ids of the family's vocabulary.
+// `m`: two session slots or more, walks of at most 64 rows per chunk, a cache
+// of at least eight blocks. `tokens(n, seed)`: n ids of the family's
+// vocabulary.
 #include <cuda_runtime.h>
 
 #include <cstdint>
@@ -111,6 +112,119 @@ void attach_within_gate(Model& m, const Tokens& tokens, int64_t vocab, bool mtp,
   }
   for (uint8_t* p : arena) cudaFree(p);
   std::printf("[ OK ] %s: attach inside a snapshot == attach at a cut of the same walk, bitwise, at four positions%s\n",
+              family, mtp ? " (draft block on)" : "");
+}
+
+
+// The same claim over rows a decode wrote, the shape of a cached answer: a
+// walk prefills a prompt and decodes thirty tokens across a block boundary,
+// keeping a live snapshot at six positions on the way and one at the end. A
+// slot opened at each of the six inside the last snapshot is the slot
+// opened on the walk's own snapshot there, bitwise. Then two slots open
+// inside the last snapshot at once, the snapshot is released under them,
+// and both still read what they read alone.
+//
+// `m`: three session slots, walks of at most 64 rows per chunk, a cache of
+// at least 32 blocks. Under mtp the draft block trails the session by one
+// row at every snapshot (the form that resumes with any token).
+template <class Model, class Tokens>
+void attach_within_decode_gate(Model& m, const Tokens& tokens, int64_t vocab, bool mtp, const char* family) {
+  const auto require = [family](bool cond, const std::string& what) {
+    if (cond) return;
+    std::fprintf(stderr, "FAILED (%s, decode): %s\n", family, what.c_str());
+    std::exit(1);
+  };
+  const auto bitwise = [](const typename Model::Outputs& a, const typename Model::Outputs& b) {
+    return a.logits.size() == b.logits.size() &&
+           (a.logits.empty() || std::memcmp(a.logits.data(), b.logits.data(), a.logits.size() * sizeof(float)) == 0) &&
+           a.final_hidden_bits == b.final_hidden_bits;
+  };
+  const int V = m.lm_vocab_count();
+  const auto argmax = [V](const typename Model::Outputs& o) {
+    int best = 0;
+    for (int i = 1; i < V; ++i)
+      if (o.logits[static_cast<size_t>(i)] > o.logits[static_cast<size_t>(best)]) best = i;
+    return static_cast<int64_t>(best);
+  };
+  const auto row_after = [&](int req, const typename Model::Outputs& last) {
+    const int64_t pending = argmax(last);
+    return mtp ? m.session_draft(req, std::vector<int64_t>{pending}) : m.session_step(req, pending);
+  };
+  const int64_t B = m.kv_block_tokens();
+  const int64_t P0 = B - 12, K = 30, P = P0 + K;
+  const size_t bytes = m.session_snapshot_bytes();
+  for (const uint64_t seed : {0x9E3779B97F4A7C15ull, 0xD1B54A32D192ED03ull}) {
+    std::vector<int64_t> ids = tokens(static_cast<int>(P0), seed);
+    const std::vector<int64_t> tail = tokens(20, seed ^ 0x2545F4914F6CDD1Dull);
+    const std::vector<int64_t> spots{P0, P0 + 5, B - 1, B, B + 1, P - 1};
+    std::vector<uint8_t*> arena(spots.size() + 1, nullptr);
+    for (uint8_t*& p : arena)
+      require(cudaMalloc(reinterpret_cast<void**>(&p), bytes) == cudaSuccess, "arena");
+    std::vector<typename Model::SessionSnapshotMeta> metas(spots.size() + 1);
+    typename Model::Outputs out = m.session_prefill(0, ids);
+    for (int64_t q = P0; q < P; ++q) {
+      const int64_t pending = argmax(out);
+      ids.push_back(pending);
+      for (size_t i = 0; i < spots.size(); ++i)
+        if (spots[i] == q) metas[i] = m.session_snapshot(0, arena[i]);
+      if (mtp) (void)m.session_draft(0, std::vector<int64_t>{pending});
+      out = m.session_step(0, pending);
+    }
+    ids.push_back(argmax(out));  // the token the walk would write next
+    typename Model::SessionSnapshotMeta& deep = metas.back();
+    deep = m.session_snapshot(0, arena.back());
+    require(deep.position == P, "the last snapshot stands at the walk's end");
+    m.session_close(0);
+    struct Run {
+      typename Model::Outputs last, next;
+    };
+    const auto suffix_at = [&](int64_t q) {
+      std::vector<int64_t> suffix{ids[static_cast<size_t>(q)]};
+      suffix.insert(suffix.end(), tail.begin(), tail.end());
+      if (suffix[1] == ids[static_cast<size_t>(q) + 1]) suffix[1] = (suffix[1] + 1) % vocab;
+      return suffix;
+    };
+    std::vector<Run> alone(spots.size());
+    for (size_t i = 0; i < spots.size(); ++i) {
+      const int64_t q = spots[i];
+      const std::string at = " at " + std::to_string(q);
+      const auto run = [&](bool within) {
+        if (within) m.session_attach_within(1, deep, q);
+        else m.session_attach(1, arena[i], metas[i]);
+        require(m.session_position(1) == q, "the slot opens at the position" + at);
+        Run r;
+        r.last = m.session_prefill_resume(1, suffix_at(q), {});
+        r.next = row_after(1, r.last);
+        m.session_close(1);
+        return r;
+      };
+      const Run want = run(false);
+      alone[i] = run(true);
+      require(bitwise(alone[i].last, want.last), "the suffix's last row differs from the walk's own snapshot's" + at);
+      require(bitwise(alone[i].next, want.next), "the row after the suffix differs from the walk's own snapshot's" + at);
+    }
+    // Two slots inside the last snapshot at once, on either side of the
+    // block boundary; the snapshot released while both are open.
+    const size_t a = 1, b = 4;
+    m.session_attach_within(1, deep, spots[a]);
+    m.session_attach_within(2, deep, spots[b]);
+    const typename Model::Outputs last_a = m.session_prefill_resume(1, suffix_at(spots[a]), {});
+    const typename Model::Outputs last_b = m.session_prefill_resume(2, suffix_at(spots[b]), {});
+    m.session_release_snapshot(deep);
+    const typename Model::Outputs next_b = row_after(2, last_b);
+    const typename Model::Outputs next_a = row_after(1, last_a);
+    require(bitwise(last_a, alone[a].last) && bitwise(last_b, alone[b].last),
+            "two slots inside one snapshot: a suffix's last row differs from the slot's alone");
+    require(bitwise(next_a, alone[a].next) && bitwise(next_b, alone[b].next),
+            "two slots inside one snapshot, released under them: the next row differs from the slot's alone");
+    m.session_close(1);
+    m.session_close(2);
+    for (size_t i = 0; i < spots.size(); ++i) m.session_release_snapshot(metas[i]);
+    require(m.kv_blocks_in_use() == 0, "every block released with the snapshots and the slots");
+    for (uint8_t* p : arena) cudaFree(p);
+  }
+  std::printf("[ OK ] %s: attach inside a snapshot over decoded rows == attach at the walk's own snapshot, bitwise, "
+              "at six positions; two slots inside one released snapshot%s\n",
               family, mtp ? " (draft block on)" : "");
 }
 

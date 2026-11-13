@@ -575,10 +575,11 @@ int run_fixture(const std::string& dir) {
   run_window_gate(fs::path(dir).parent_path().string());
   // The prefix cache's hit inside an entry (the shared gate).
   {
-    FlintModel w(cfg, dir, /*max_tokens=*/64, /*max_cache_tokens=*/2048, FlintResidency::Resident, nullptr, 0, 1,
-                 /*max_requests=*/2);
-    dgpp::test::attach_within_gate(w, [&](int n, uint64_t seed) { return smoke_tokens(cfg, n, seed); },
-                                   cfg.vocab_size, /*mtp=*/false, "flint");
+    FlintModel w(cfg, dir, /*max_tokens=*/64, /*max_cache_tokens=*/4096, FlintResidency::Resident, nullptr, 0, 1,
+                 /*max_requests=*/3);
+    const auto tokens = [&](int n, uint64_t seed) { return smoke_tokens(cfg, n, seed); };
+    dgpp::test::attach_within_gate(w, tokens, cfg.vocab_size, /*mtp=*/false, "flint");
+    dgpp::test::attach_within_decode_gate(w, tokens, cfg.vocab_size, /*mtp=*/false, "flint");
   }
   std::printf("[ OK ] flint session surface: every fixture gate held\n");
   return 0;
