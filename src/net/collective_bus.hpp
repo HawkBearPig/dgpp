@@ -302,9 +302,15 @@ class CollectiveBus {
   // fails, a post fails) poisons the era: further arm/finish report it,
   // and the eager gate stays closed (the bus must be restarted).
   bool graph_record_begin(std::string* error, int variant = 0);
+  // release_dependents: the node releases the kernel recorded behind it
+  // once the collective is running (kernels/pdl.cuh), for a dependent that
+  // loads its own weights before its wait. Honored only while this bus is
+  // the process's only one. Beside another rank's bus on the same device
+  // (the loopback worlds) the parked blocks of one rank could hold the SM
+  // resources another rank's kernels need to reach the same collective.
   bool allreduce_record(cudaStream_t capture_stream, const void* device_src,
                         void* device_dst, size_t bf16_elems,
-                        std::string* error);
+                        std::string* error, bool release_dependents = false);
   bool graph_record_end(std::string* error);
   bool graph_replay_arm(std::string* error, int variant = 0);
   // %globaltimer - CLOCK_MONOTONIC, calibrated at start() (bus_kernel.hpp).

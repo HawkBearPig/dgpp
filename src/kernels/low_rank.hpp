@@ -8,6 +8,11 @@ namespace dgpp {
 // rounding. Input rows may be strided shared-expert slots.
 void low_rank_project(const uint16_t* x, int x_stride, const float* a, float* z, int rows,
                       int inputs, int rank, cudaStream_t stream);
+// The projection that also writes its values' byte digits (pack_digits'
+// layout) into a boundary's rider of `count` values, its first at value0.
+void low_rank_project_digits(const uint16_t* x, int x_stride, const float* a, float* z, int rows,
+                             int inputs, int rank, uint16_t* digits, size_t value0, size_t count,
+                             int my_rank, int world, cudaStream_t stream);
 // Add the global FP32 Bz once to an already folded BF16 branch output.
 void low_rank_add(const float* z, const float* b, uint16_t* output, int rows, int outputs, int rank,
                   cudaStream_t stream);
@@ -19,4 +24,9 @@ void low_rank_pack_digits(const float* values, uint16_t* digits, size_t count, i
                           cudaStream_t stream);
 void low_rank_sum_digits(const uint16_t* digits, float* values, size_t count, int world,
                          cudaStream_t stream);
+// low_rank_sum_digits then low_rank_add in one kernel that reads B before
+// its wait (kernels/pdl.cuh): the kernel to record behind a collective that
+// carries the digits. z receives the summed rows as sum_digits leaves them.
+void low_rank_add_digits(const uint16_t* digits, int world, float* z, const float* b,
+                         uint16_t* output, int rows, int outputs, int rank, cudaStream_t stream);
 }  // namespace dgpp

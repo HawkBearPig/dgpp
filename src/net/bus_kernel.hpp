@@ -258,6 +258,10 @@ struct BusAllReduceGraphView {
   int send_peers = 0;
   uint32_t stage_ring = 0;      // rows per peer (kBusMaxGraphStageRing)
   uint32_t stage_row_bytes = 0; // == lat_slot_bytes
+  // The collective releases its dependents once it is running
+  // (kernels/pdl.cuh): the kernel behind it parks beside the round trip
+  // with whatever it loaded before its wait.
+  int release_dependents = 0;
 };
 
 // Records one collective node onto `stream` (the caller's capturing

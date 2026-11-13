@@ -741,6 +741,30 @@ void GlmDsaModel::fold(uint16_t* buf, int T, int width, bool capture) {
   boundary_->reduce(buf, T, width);
 }
 
+// A boundary with the runtime adapter's correction. The adapter's rank-space
+// rows must reach every rank before Bz is added. On a transport that can
+// carry a rider (the decode graph's recorded collective) they travel as byte
+// digits behind the boundary partial, in its own collective: adapter_rider
+// names their place before the sublayer runs, the projections write them
+// there, and one kernel behind the collective sums them and adds Bz.
+// Otherwise (a null rider) the adapter folds them in a collective of its
+// own after the boundary's.
+uint16_t* GlmDsaModel::adapter_rider(int layer, bool attention, uint16_t* buf, int T, int width, bool capture) {
+  const size_t elems = (boundary_ && capture) ? runtime_adapter_->rider_elems(layer, attention, T) : 0;
+  return elems ? boundary_->rider(buf, T, width, elems) : nullptr;
+}
+
+void GlmDsaModel::fold_adapted(int layer, bool attention, uint16_t* buf, int T, int width, bool capture,
+                               uint16_t* rider) {
+  if (rider == nullptr) {
+    fold(buf, T, width, capture);
+    runtime_adapter_->add(layer, attention, buf, T, stream_, capture);
+    return;
+  }
+  boundary_->reduce_with_rider(buf, T, width, runtime_adapter_->rider_elems(layer, attention, T));
+  runtime_adapter_->add_from_rider(layer, attention, rider, buf, T, stream_);
+}
+
 // The BF16 dense MLP of the first layers: out = down(silu(gate(x)) * up(x)),
 // this rank's intermediate slice, no clamps (the swiglu kernel at an
 // infinite limit).
@@ -774,13 +798,15 @@ void GlmDsaModel::enqueue_layer(const GlmDsaLayerResident& r, int pool_layer, ui
     glm_rmsnorm_bf16(resid, r.input_norm, x_, T, H, eps, stream_);
   }
   uint16_t* attn_out = stage(y_, T, H, rows.capture);
+  uint16_t* attn_rider = nullptr;
+  if constexpr (Adapted) attn_rider = adapter_rider(r.layer, true, attn_out, T, H, rows.capture);
   const auto project_attention = [&](int row0, int count) {
     if constexpr (Adapted) {
       // DSA reuses its projection input scratch for each span. Consume it
       // before the next call, retaining rank-space rows in the walk's order.
       const int width = cfg_.num_attention_heads / tp_world() * cfg_.v_head_dim;
       runtime_adapter_->project(r.layer, true, static_cast<const uint16_t*>(dsa_->debug_attn_out()),
-                                width, row0, count, stream_);
+                                width, row0, count, stream_, attn_rider, T);
     }
   };
   if (!dsa_->prepare(T)) throw std::runtime_error("run_rows: DSA GEMM plans unavailable");
@@ -815,10 +841,9 @@ void GlmDsaModel::enqueue_layer(const GlmDsaLayerResident& r, int pool_layer, ui
     project_attention(0, T);
   }
   if (rows.decode) prefetch_ffn_side(r);
-  fold(attn_out, T, H, rows.capture);  // block boundary 1: o_proj's partial
-  if constexpr (Adapted) {
-    runtime_adapter_->add(r.layer, true, attn_out, T, stream_, rows.capture);
-  }
+  // block boundary 1: o_proj's partial
+  if constexpr (Adapted) fold_adapted(r.layer, true, attn_out, T, H, rows.capture, attn_rider);
+  else fold(attn_out, T, H, rows.capture);
   if constexpr (Research) {
     const size_t width =
         static_cast<size_t>(cfg_.num_attention_heads / tp_world()) * cfg_.v_head_dim;
@@ -849,6 +874,8 @@ void GlmDsaModel::enqueue_layer(const GlmDsaLayerResident& r, int pool_layer, ui
     glm_residual_add_rmsnorm_bf16(resid, attn_out, r.post_norm, x_, T, H, eps, stream_);
   }
   uint16_t* ffn_out = stage(y_, T, H, rows.capture);
+  uint16_t* ffn_rider = nullptr;
+  if constexpr (Adapted) ffn_rider = adapter_rider(r.layer, false, ffn_out, T, H, rows.capture);
   const auto enqueue = [&](int row0, int count, bool decode, int) {
     const size_t offset = static_cast<size_t>(row0) * H;
     if (r.moe) {
@@ -873,10 +900,10 @@ void GlmDsaModel::enqueue_layer(const GlmDsaLayerResident& r, int pool_layer, ui
         if (r.moe) {
           const auto shared = moe_->shared_projection_input(count, rows.decode || decode);
           runtime_adapter_->project(r.layer, false, shared.data, shared.stride, row0, count,
-                                    stream_);
+                                    stream_, ffn_rider, T);
         } else {
           runtime_adapter_->project(r.layer, false, dense_act_, cfg_.intermediate_size / tp_world(),
-                                    row0, count, stream_);
+                                    row0, count, stream_, ffn_rider, T);
         }
       }
     }
@@ -918,8 +945,9 @@ void GlmDsaModel::enqueue_layer(const GlmDsaLayerResident& r, int pool_layer, ui
   }
   gemm_.set_bf12_wide(rows.decode);
   if (rows.decode) prefetch_attention_side(r.layer + 1);
-  fold(ffn_out, T, H, rows.capture);  // block boundary 2: the sliced down projections
-  if constexpr (Adapted) runtime_adapter_->add(r.layer, false, ffn_out, T, stream_, rows.capture);
+  // block boundary 2: the sliced down projections
+  if constexpr (Adapted) fold_adapted(r.layer, false, ffn_out, T, H, rows.capture, ffn_rider);
+  else fold(ffn_out, T, H, rows.capture);
   if constexpr (Research) {
     // Dense outputs have the same replicated BF16 boundary as attention.
     // Shared-expert outputs stay separate FP32 partials for the coordinator.

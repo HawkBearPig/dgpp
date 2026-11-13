@@ -23,6 +23,22 @@ struct BoundaryReducer {
 
   virtual void reduce(uint16_t* partial, int rows, int hidden) = 0;
 
+  // A rider: `elems` more bf16 elements folded by the SAME collective as the
+  // staged partial, for a small payload that would otherwise be a collective
+  // of its own behind it (the runtime adapter's rank-space rows: a second
+  // round trip a boundary, 21 us on four nodes). rider() returns where to
+  // write them, directly behind the partial, or nullptr when the transport
+  // or its slot cannot carry them. reduce_with_rider() then folds the two as
+  // one message. Element for element it is the same sum as two collectives.
+  // The kernel the caller launches behind reduce_with_rider() may run its
+  // preamble (kernels/pdl.cuh) beside the collective: it consumes the rider.
+  virtual uint16_t* rider(const uint16_t* /*partial*/, int /*rows*/, int /*hidden*/, size_t /*elems*/) {
+    return nullptr;
+  }
+  virtual void reduce_with_rider(uint16_t* partial, int rows, int hidden, size_t /*rider_elems*/) {
+    reduce(partial, rows, hidden);
+  }
+
   // The stream-ordered form (2026-09-14, plan D9): reduce() launches the
   // fold on the model's stream after the producing kernels — the model
   // skips its host drain before the call — and settle() (once per pass,

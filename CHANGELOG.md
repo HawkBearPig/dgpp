@@ -5,6 +5,23 @@ project procedures and design guidance live in `docs/`.
 
 ## Unreleased
 
+- **A runtime adapter's boundary in one collective**: in graph execution a
+  rank's projection writes its rank-space values as byte digits directly
+  behind the boundary's BF16 partial, the boundary's collective folds both as
+  one message, and one kernel behind it sums the digits and adds the
+  correction. The collective releases that kernel once its own data is
+  staged, and the kernel reads its columns of B during the network round
+  trip. The adapter's rank-space rows live in device memory and its dot
+  products issue their loads sixteen at a time. The GLM RMSNorm kernels issue
+  a row's loads together and ask for their weights ahead of the first pass.
+  No value changes. On four nodes the GLM-5.3 Mixed346 decode step with a
+  runtime adapter is 4.7 percent shorter at one request, and the adapter adds
+  under 2 percent to a step where it added 6. Its decode rate at eight
+  requests is 1 percent higher and its cold prefill 4 percent shorter from 2K
+  to 32K tokens. Without an adapter GLM-5.3 Mixed346, GLM-5.3-Flash NVFP4-FP8
+  and DeepSeek-V4.1-Flash-1017 are unchanged. Transcripts are identical.
+  [Runtime adapters](docs/runtime-adapters.md) describes the boundary.
+
 - **bf16 rounding with one instruction in device code**: device kernels
   round a float to bf16 with the GPU's conversion instruction, where they ran
   an eight-instruction integer sequence, and the two FP8 dequantization loops
