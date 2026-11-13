@@ -224,6 +224,7 @@ struct WorldSettings {
   std::optional<bool> prefill_early_admission = false;
   int prefix_min_tokens = 0;          // the prefix cache's entry floor (2026-09-28); absent legacy field = 0
   bool prefix_head_snapshots = false;  // the head cut (2026-09-28); absent legacy field = off
+  bool prefix_partial_hits = false;    // the attach inside an entry (2026-11-13); absent legacy field = off
   int prefix_pin_max_pct = 50;        // the pin cap (2026-10-28); absent legacy field = 50
   double bulk_pace_gbps = 0.0;
   int bulk_inflight = 0;

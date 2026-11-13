@@ -342,6 +342,8 @@ class EagerEngineAdapter : public sched::SchedulerEngine {
       info.prefill_lookahead = info.prefill_lookahead || model_->dflash2_enabled();
     if constexpr (requires { model_->prefill_bounded(); })
       info.body_snapshots = !model_->prefill_bounded();
+    if constexpr (requires { model_->attaches_within_snapshot(); })
+      info.attach_within = model_->attaches_within_snapshot() && info.block_tokens > 0;
     return info;
   }
   int32_t prefill_cached(int req, const std::vector<int64_t>& prompt,
@@ -382,10 +384,7 @@ class EagerEngineAdapter : public sched::SchedulerEngine {
       typename Model::Outputs out;
       try {
         if (plan->attach_slot >= 0) {
-          if (arena_.position(plan->attach_slot) != plan->attach_position)
-            throw std::logic_error(
-                "generation engine: the attach slot's position differs from the plan");
-          arena_.attach(req, plan->attach_slot);
+          arena_.attach(req, plan->attach_slot, plan->attach_position);
           try {
             const std::vector<int64_t> suffix(prompt.begin() + plan->attach_position, prompt.end());
             out = cached_model_prefill(model_, req, suffix, *plan->boundaries, snap_ptr,

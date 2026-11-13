@@ -376,6 +376,7 @@ struct ClusterConfig {
     double prefix_cache_gib = 1.5;
     int prefix_min_tokens = 1024;       // no prefix snapshot below this position (0: every cut)
     bool prefix_head_snapshots = true;  // a cold prompt also keeps its first structural cut (the system prompt's end)
+    bool prefix_partial_hits = true;    // a prompt opens on the tokens it shares with a deeper entry
     // prompt_cache_key pins protect their entries while the pinned entries
     // hold at most this share of the arena's slots and the NVMe slab's
     // pages; past it a pin protects nothing (100: always).

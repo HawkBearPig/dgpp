@@ -2947,6 +2947,8 @@ void GenerationService::route_metrics_prometheus(HttpResponseWriter& w) {
   out.gauge("dgpp_prefix_cache_pinned", "Entries a prompt_cache_key pins against eviction.", static_cast<int64_t>(m.prefix_pinned));
   out.gauge("dgpp_prefix_cache_snapshot_bytes", "Bytes per arena snapshot.", pe.snapshot_bytes);
   out.counter("dgpp_prefix_cache_hits_total", "Admissions that attached to an entry.", m.prefix_hits);
+  out.counter("dgpp_prefix_cache_partial_hits_total", "Of the hits, admissions that attached inside an entry.",
+              m.prefix_partial_hits);
   out.counter("dgpp_prefix_cache_misses_total", "Admissions that found no entry.", m.prefix_misses);
   out.counter("dgpp_prefix_cache_queries_total", "Prefix-cache lookups (hits plus misses).",
               m.prefix_hits + m.prefix_misses);
@@ -3207,6 +3209,8 @@ void GenerationService::route_metrics(HttpResponseWriter& w) {  Scheduler::Meter
   append_json_int(&out, sched_.admission_policy().prefix_min_tokens);
   out.append(sched_.admission_policy().prefix_head_snapshots ? ",\"head_cuts\":true"
                                                                : ",\"head_cuts\":false");
+  out.append(sched_.admission_policy().prefix_partial_hits ? ",\"partial_hits_on\":true"
+                                                             : ",\"partial_hits_on\":false");
   out.append(",\"entries\":");
   append_json_int(&out, m.prefix_entries);
   out.append(",\"hits\":");
@@ -3215,6 +3219,8 @@ void GenerationService::route_metrics(HttpResponseWriter& w) {  Scheduler::Meter
   append_json_int(&out, m.prefix_misses);
   out.append(",\"tokens_saved\":");
   append_json_int(&out, m.prefix_tokens_saved);
+  out.append(",\"partial_hits\":");
+  append_json_int(&out, m.prefix_partial_hits);
   out.append(",\"snapshots\":");
   append_json_int(&out, m.prefix_snapshots);
   out.append(",\"head_snapshots\":");

@@ -5,6 +5,27 @@ project procedures and design guidance live in `docs/`.
 
 ## Unreleased
 
+- **Prefix cache hits inside an entry**: a prompt that shares its first
+  tokens with a cached entry and differs from it before any stored position
+  opens on the shared tokens and prefills only the rest. A request used to
+  attach only where an entry stood at one of its own cuts, so a prompt with
+  an edit in the middle of a long message reused nothing. The request opens
+  one token short of the point where the prompts part, takes the entry's
+  complete KV blocks by reference and copies the block the position falls in.
+  The change applies to the model families whose snapshot holds nothing but
+  KV rows: GLM-5.3, GLM-4.7, MiMo without its native draft, Flint and Dory.
+  `engine.prefix_partial_hits` (default true) turns it off, and the suffix of
+  such a hit walks prefill chunks a cold prompt would not. On four nodes with
+  GLM-5.3 Mixed346 and a runtime adapter, twelve prompts of 4K to 12K tokens
+  shaped like a production log reuse 69 percent of their tokens where they
+  reused 24 percent, and their summed time to the first token falls from
+  198 s to 85 s. A prompt with one line changed 7K tokens into its 8K waits
+  3.0 s where it waited 20.5 s. Every answer names its own prompt's code
+  word. The configuration digest that ranks compare at startup carries the
+  NVMe cache settings again, which a format string one field short had
+  dropped. [Prefix reuse](docs/prefix-cache.md#hits-inside-an-entry)
+  describes the rule.
+
 - **A runtime adapter's boundary in one collective**: in graph execution a
   rank's projection writes its rank-space values as byte digits directly
   behind the boundary's BF16 partial, the boundary's collective folds both as

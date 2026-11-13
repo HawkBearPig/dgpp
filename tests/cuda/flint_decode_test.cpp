@@ -41,6 +41,7 @@
 #include "models/flint/config.hpp"
 #include "kernels/latent_format.hpp"
 #include "models/flint/forward.hpp"
+#include "attach_within_gate.hpp"
 #include "flint_fixture.hpp"
 
 namespace fs = std::filesystem;
@@ -572,6 +573,13 @@ int run_fixture(const std::string& dir) {
   }
   // 7. The sliding window at the session level.
   run_window_gate(fs::path(dir).parent_path().string());
+  // The prefix cache's hit inside an entry (the shared gate).
+  {
+    FlintModel w(cfg, dir, /*max_tokens=*/64, /*max_cache_tokens=*/2048, FlintResidency::Resident, nullptr, 0, 1,
+                 /*max_requests=*/2);
+    dgpp::test::attach_within_gate(w, [&](int n, uint64_t seed) { return smoke_tokens(cfg, n, seed); },
+                                   cfg.vocab_size, /*mtp=*/false, "flint");
+  }
   std::printf("[ OK ] flint session surface: every fixture gate held\n");
   return 0;
 }

@@ -23,6 +23,7 @@
 #include <cmath>
 #include <cstdio>
 #include <map>
+#include <memory>
 #include <set>
 #include <stdexcept>
 #include <sstream>
@@ -170,8 +171,13 @@ class FakeEngine : public SchedulerEngine {
     info.chunk_tokens = arena_chunk_;
     info.step_tokens_max = step_tokens_max_;
     info.prefill_lookahead = prefill_lookahead_;
+    info.attach_within = attach_within_;
     return info;
   }
+  // The attach inside an entry: the fake then takes an attach position
+  // below the arena slot's own (an engine that does not declare it refuses).
+  void set_attach_within(bool on) { attach_within_ = on; }
+  bool attach_within_ = false;
   // The two-token step's hop (M7): the fake commits whatever its script
   // says per step; an armed hop is taken ("H:req:pos@slot") when the step
   // returns two tokens, at the position the scheduler named, which must be
@@ -197,7 +203,9 @@ class FakeEngine : public SchedulerEngine {
     last_boundaries = *plan->boundaries;
     if (plan->attach_slot >= 0) {
       require(pinned_.count(plan->attach_slot) != 0, "fake: attach from an empty arena slot");
-      require(pinned_positions_[plan->attach_slot] == plan->attach_position,
+      require(pinned_positions_[plan->attach_slot] == plan->attach_position ||
+                  (attach_within_ && plan->attach_position > 0 &&
+                   plan->attach_position < pinned_positions_[plan->attach_slot]),
               "fake: attach position differs from the arena slot's");
       ops_.push_back("X:" + std::to_string(req) + ":" +
                      std::to_string(plan->attach_position) + "@" +
@@ -4571,6 +4579,188 @@ DGPP_TEST(scheduler_prefixCache_headCutThroughChunkedPrefill) {
           "the chunked prefill's head cut serves the next conversation: saved " +
               std::to_string(m.prefix_tokens_saved) + ", head " +
               std::to_string(m.prefix_head_snapshots) + ": " + engine.op_stream());
+}
+
+// ---- the hit inside an entry (2026-11-13) ----------------------------------------
+namespace {
+// The arena slot of the "X:req:position@slot" attach op, -1 without one.
+int attach_slot_of(const std::string& ops, const std::string& head) {
+  const size_t at = ops.rfind(head);
+  return at == std::string::npos ? -1 : std::stoi(ops.substr(at + head.size()));
+}
+// `first` with every token from `from` on replaced: a prompt that shares
+// exactly `from` tokens with it.
+std::vector<int64_t> parting_at(std::vector<int64_t> prompt, size_t from) {
+  for (size_t i = from; i < prompt.size(); ++i) prompt[i] += 100000;
+  return prompt;
+}
+struct WithinWorld {
+  FakeEngine engine;
+  dgpp::sched::AdmissionPolicy policy;
+  std::unique_ptr<Scheduler> sched;
+  explicit WithinWorld(bool key = true, bool engine_can = true, int64_t align = 1, int64_t blocks = 400)
+      : engine(/*slots=*/1, blocks, /*block_tokens=*/4) {
+    engine.set_prefix_arena(/*slots=*/16, align);
+    engine.set_attach_within(engine_can);
+    policy.prefix_partial_hits = key;
+    sched = std::make_unique<Scheduler>(&engine, std::vector<int64_t>{kEos}, 0, policy);
+  }
+  void run(const std::string& id, std::vector<int64_t> prompt, std::vector<int64_t> boundaries) {
+    engine.arm(0, {10}, 1);
+    sched->submit(make_cached_request(id, std::move(prompt), std::move(boundaries), 1));
+    sched->run_to_completion();
+  }
+};
+}  // namespace
+
+DGPP_TEST(scheduler_prefixCache_aPromptOpensOnTheTokensItSharesInsideAnEntry) {
+  // The entry stands at the first prompt's deepest cut, 40. The second
+  // prompt shares 23 tokens with it and has no cut below them: it opens at
+  // 22 (the token at the attach position is shared too), inside the entry.
+  WithinWorld w;
+  const auto first = counted_prompt(41);
+  w.run("a", first, {40});
+  w.run("b", parting_at(first, 23), {40});
+  const Scheduler::Meters m = w.sched->meters();
+  const std::string ops = w.engine.op_stream();
+  const int slot = attach_slot_of(ops, "X:0:22@");
+  require(slot >= 0 && w.engine.prefix_position(slot) > 22, "the second prompt opens at 22 inside an entry: " + ops);
+  require(m.prefix_hits == 1 && m.prefix_partial_hits == 1 && m.prefix_misses == 1 && m.prefix_tokens_saved == 22,
+          "one hit, inside an entry, 22 tokens saved: hits " + std::to_string(m.prefix_hits) + " partial " +
+              std::to_string(m.prefix_partial_hits) + " misses " + std::to_string(m.prefix_misses) + " saved " +
+              std::to_string(m.prefix_tokens_saved));
+  require(w.sched->find("b")->status == Scheduler::Result::Status::kDone, "the second request completes");
+}
+
+DGPP_TEST(scheduler_prefixCache_theHitInsideAnEntryNeedsTheKeyAndTheEngine) {
+  // The same two prompts with the key off, and on an engine that opens a
+  // slot at an entry's own position only: the second prefills cold.
+  for (const bool key : {false, true}) {
+    WithinWorld w(key, /*engine_can=*/!key);
+    const auto first = counted_prompt(41);
+    w.run("a", first, {40});
+    w.run("b", parting_at(first, 23), {40});
+    const Scheduler::Meters m = w.sched->meters();
+    require(m.prefix_hits == 0 && m.prefix_partial_hits == 0 && m.prefix_misses == 2 &&
+                w.engine.op_stream().find("X:") == std::string::npos,
+            std::string(key ? "an engine without the attach" : "the key off") + ": both prompts prefill cold: " +
+                w.engine.op_stream());
+  }
+}
+
+DGPP_TEST(scheduler_prefixCache_theDeeperOfTheCutAndTheSharedTokensWins) {
+  // Entries at the head cut 12 and the deepest cut 40 of the first prompt.
+  // A prompt that shares 13 tokens opens at the cut's entry, whole (the
+  // shared tokens reach no deeper); one that shares 30 opens at 29 inside
+  // the deeper entry, past the cut.
+  WithinWorld w;
+  w.policy.prefix_head_snapshots = true;
+  w.sched = std::make_unique<Scheduler>(&w.engine, std::vector<int64_t>{kEos}, 0, w.policy);
+  const auto first = counted_prompt(41);
+  w.run("a", first, {12, 40});
+  w.run("b", parting_at(first, 13), {12, 40});
+  std::string ops = w.engine.op_stream();
+  int slot = attach_slot_of(ops, "X:0:12@");
+  require(slot >= 0 && w.engine.prefix_position(slot) == 12 && w.sched->meters().prefix_partial_hits == 0,
+          "13 shared tokens: the whole entry at the cut 12: " + ops);
+  w.run("c", parting_at(first, 30), {12, 40});
+  ops = w.engine.op_stream();
+  slot = attach_slot_of(ops, "X:0:29@");
+  require(slot >= 0 && w.engine.prefix_position(slot) > 29 && w.sched->meters().prefix_partial_hits == 1,
+          "30 shared tokens: 29 inside a deeper entry, past the cut at 12: " + ops);
+}
+
+DGPP_TEST(scheduler_prefixCache_aPromptThatIsAPrefixOfAnEntryPrefillsItsLastToken) {
+  // The whole prompt is the head of a cached one and none of its cuts holds
+  // an entry: it opens one token short of its end.
+  WithinWorld w;
+  const auto first = counted_prompt(41);
+  w.run("a", first, {40});
+  w.run("b", std::vector<int64_t>(first.begin(), first.begin() + 30), {});
+  const std::string ops = w.engine.op_stream();
+  require(attach_slot_of(ops, "X:0:29@") >= 0 && w.sched->meters().prefix_tokens_saved == 29,
+          "a 30-token head of the cached prompt opens at 29: " + ops);
+}
+
+DGPP_TEST(scheduler_prefixCache_theHitInsideAnEntryNeedsAWholeBlockAndKeepsTheAlignment) {
+  // Fewer shared tokens than a block bring nothing by reference: a miss.
+  {
+    WithinWorld w;
+    const auto first = counted_prompt(41);
+    w.run("a", first, {40});
+    w.run("b", parting_at(first, 4), {40});  // opens at 3 at best, under the 4-token block
+    require(w.sched->meters().prefix_hits == 0, "four shared tokens stay a miss: " + w.engine.op_stream());
+    w.run("c", parting_at(first, 5), {40});  // 4: one whole block
+    require(attach_slot_of(w.engine.op_stream(), "X:0:4@") >= 0, "five shared tokens open at 4: " + w.engine.op_stream());
+  }
+  // An aligned family opens at the aligned image below the shared tokens.
+  {
+    WithinWorld w(/*key=*/true, /*engine_can=*/true, /*align=*/4);
+    const auto first = counted_prompt(41);
+    w.run("a", first, {40});
+    w.run("b", parting_at(first, 23), {40});
+    require(attach_slot_of(w.engine.op_stream(), "X:0:20@") >= 0, "23 shared tokens at align 4 open at 20: " + w.engine.op_stream());
+  }
+}
+
+DGPP_TEST(scheduler_prefixCache_amongEqualsTheShallowestEntryIsOpened) {
+  // The deeper prompt first, so its entries are the older records; then a
+  // shorter one sharing 15 tokens with it. A third prompt shares the same
+  // 15 with all of them: it opens inside the shallowest entry, which pins
+  // the fewest blocks while the request lives.
+  WithinWorld w;
+  const auto deep = counted_prompt(41);
+  auto shallow = parting_at(deep, 15);
+  shallow.resize(21);
+  w.run("a", deep, {40});
+  w.run("b", shallow, {20});
+  auto third = parting_at(deep, 15);
+  for (size_t i = 15; i < third.size(); ++i) third[i] += 100000;  // parts from `shallow` at 15 as well
+  w.run("c", third, {40});
+  const std::string ops = w.engine.op_stream();
+  const int slot = attach_slot_of(ops, "X:0:14@");
+  require(slot >= 0 && w.engine.prefix_position(slot) == 20,
+          "the third prompt opens at 14 inside the entry at 20, the shallowest that holds it: slot " +
+              std::to_string(slot) + " at " + std::to_string(slot >= 0 ? w.engine.prefix_position(slot) : -1) + ": " + ops);
+}
+
+DGPP_TEST(scheduler_prefixCache_roomIsMadeAroundTheEntryARequestOpensInside) {
+  // Two cached prompts fill the pool: each holds its cut's entry at 40 (ten
+  // blocks) and its close entry at 41 (eleven). A third prompt shares 23
+  // tokens with the first. Room for it comes from the least recently used
+  // entry that is not the one it opens inside, and the answer in hand
+  // stands through that eviction.
+  const auto world = [](int64_t blocks, int steps) {
+    auto w = std::make_unique<WithinWorld>(/*key=*/true, /*engine_can=*/true, /*align=*/1, blocks);
+    const auto first = counted_prompt(41);
+    w->run("a", first, {40});
+    w->run("x", counted_prompt(41, 5000), {40});
+    w->engine.arm(0, {10, kEos}, steps);
+    w->sched->submit(make_cached_request("c", parting_at(first, 23), {40}, steps));
+    w->sched->run_to_completion();
+    return w;
+  };
+  {
+    const auto w = world(/*blocks=*/46, /*steps=*/1);
+    const Scheduler::Meters m = w->sched->meters();
+    const std::string ops = w->engine.op_stream();
+    const int slot = attach_slot_of(ops, "X:0:22@");
+    require(slot >= 0 && w->engine.prefix_position(slot) == 40 && m.prefix_partial_hits == 1 &&
+                m.prefix_evictions >= 1,
+            "the third prompt opens at 22 inside the first's entry at 40 after an eviction made room: evictions " +
+                std::to_string(m.prefix_evictions) + ", slot " + std::to_string(slot) + ": " + ops);
+  }
+  // A reservation the pool covers only with every entry gone: the entry the
+  // request would have opened inside goes last, and the request prefills cold.
+  {
+    const auto w = world(/*blocks=*/46, /*steps=*/135);
+    const Scheduler::Meters m = w->sched->meters();
+    require(m.prefix_partial_hits == 0 && m.prefix_hits == 0 && m.prefix_misses == 3 &&
+                w->engine.op_stream().find("X:") == std::string::npos &&
+                w->sched->find("c")->status == Scheduler::Result::Status::kDone,
+            "with its entry evicted for room the third prompt prefills cold: evictions " +
+                std::to_string(m.prefix_evictions) + ": " + w->engine.op_stream());
+  }
 }
 
 int main() {

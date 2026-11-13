@@ -175,6 +175,27 @@ class PrefixArena {
     end_timer(t, &attach_ms_, &attaches_);
   }
 
+  // Opens closed session `req` at `position`: the slot's own position, or
+  // one inside it on a family that opens on a snapshot's first tokens.
+  void attach(int req, int slot, int64_t position) {
+    check(slot);
+    if (!filled_[static_cast<size_t>(slot)])
+      throw std::logic_error("PrefixArena: attach from empty slot " + std::to_string(slot));
+    const auto& meta = metas_[static_cast<size_t>(slot)];
+    if (position == meta.position) {
+      attach(req, slot);
+      return;
+    }
+    if constexpr (requires { model_->session_attach_within(req, meta, position); }) {
+      Timer& t = begin_timer();
+      model_->session_attach_within(req, meta, position);
+      end_timer(t, &attach_ms_, &attaches_);
+    } else {
+      throw std::logic_error("PrefixArena: slot " + std::to_string(slot) + " sits at " +
+                             std::to_string(meta.position) + ", the attach expects " + std::to_string(position));
+    }
+  }
+
   // Drops the slot's block references; the slot is empty afterwards.
   void release(int slot) {
     check(slot);

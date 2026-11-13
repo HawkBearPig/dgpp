@@ -61,6 +61,7 @@ class PrefixCache {
   };
   struct Stats {
     int64_t hits = 0;
+    int64_t partial_hits = 0;   // of them, attached inside an entry (below its position)
     int64_t misses = 0;
     int64_t tokens_saved = 0;   // sum of attach positions
     int64_t snapshots = 0;      // entries taken at a prefill cut
@@ -131,6 +132,23 @@ class PrefixCache {
     int64_t common = 0;  // ids shared with the entry, from the start
   };
   Nearest nearest(const std::vector<int64_t>& prompt, const Images& images = {}) const;
+  // The deepest position at which the prompt can open inside a live entry,
+  // short of the entry's own: the aligned image of one less than the tokens
+  // the two share (the draft block's row before a position embeds the token
+  // at it, so that token is shared too), below the entry's position. Among
+  // equals the shallowest entry (it pins the fewest blocks while attached),
+  // then the oldest record. A pass over the entries' ids; a decision, so a
+  // function of the index and the prompt alone.
+  struct Shared {
+    int entry = -1;
+    int64_t position = 0;
+  };
+  Shared shared(const std::vector<int64_t>& prompt, const Images& images = {}) const;
+  // Counts the entries inserted. With stats().evictions it dates an answer
+  // of shared(): evictions alone leave it standing while its entry lives
+  // (the deepest of a set is the deepest of what remains of it), an insert
+  // may better it and may reuse a dead record's index.
+  uint64_t inserts() const { return inserts_; }
   // The ghosts: the last kGhosts evicted entries by (hash,
   // position, last use, eviction ordinal), so a miss can say "an entry at
   // this prompt's cut was evicted" — the case the nearest entry cannot
@@ -170,7 +188,8 @@ class PrefixCache {
   const Entry& entry(int index) const { return entries_.at(static_cast<size_t>(index)); }
   int size() const { return static_cast<int>(entries_.size()); }  // records, live or dead
   // `key` (prompt_cache_key) pins the entry when it carries none yet.
-  void attach(int index, uint64_t now, const std::string& key = "");
+  // `position` (> 0) is an attach inside the entry; otherwise the entry's own.
+  void attach(int index, uint64_t now, const std::string& key = "", int64_t position = 0);
   // Protect a planned attach until admission takes its own reference. No
   // hit, LRU or digest change; pair with detach even if admission throws.
   void retain(int index);
@@ -197,6 +216,7 @@ class PrefixCache {
   size_t ghost_next_ = 0;
   std::unordered_multimap<uint64_t, int> by_hash_;  // hash -> entry index
   std::vector<int> free_;  // sorted ascending
+  uint64_t inserts_ = 0;
   Stats stats_;
   uint64_t digest_ = kSeed;
 };

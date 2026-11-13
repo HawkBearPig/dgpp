@@ -214,12 +214,16 @@ same prompt can answer differently at temperature 0 when its chunks differ,
 with or without the prefix cache. The admission controller changes those
 shapes: the first prompt after a boot walks its ramp from
 `prefill_initial_tokens`, and readers in flight together share the budget
-and get smaller chunks each. A cache hit reproduces the walk that made the
-entry, which is why a restored entry answers like the in-memory one.
+and get smaller chunks each. A cache hit at one of the prompt's cuts
+reproduces the walk that made the entry, which is why a restored entry
+answers like the in-memory one. A
+[hit inside an entry](prefix-cache.md#hits-inside-an-entry) starts its
+suffix at the attach position, so its chunks differ from the cold walk's.
 
 A transcript comparison across boots, restarts or concurrent clients is
 therefore not evidence about the change under test unless the chunk shapes
 are held fixed. Pin them by setting `engine.first_token_target_ms` and
 `engine.decode_gap_target_ms` to 0 in the deployment, so every tick offers
-the idle budget, and run one client at a time. Otherwise compare at the
+the idle budget, set `engine.prefix_partial_hits` to false, and run one
+client at a time. Otherwise compare at the
 kernel level, where the row-count and split invariance gates apply.

@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "common/dtypes.hpp"
+#include "attach_within_gate.hpp"
 #include "common/test.hpp"
 #include "dory_fixture.hpp"
 #include "dory_host_reference.hpp"
@@ -290,6 +291,24 @@ DGPP_TEST(dory_forward_loop_override) {
   require(differ > 0, "the loop count changes the result");
   DoryModel::clear_recurrent_loops();
   require(DoryModel::recurrent_loops_override() == 0, "the override clears");
+}
+
+DGPP_TEST(dory_attach_inside_a_snapshot_is_the_attach_at_a_cut) {
+  // The prefix cache's hit inside an entry (the shared gate), under both
+  // recurrent K/V policies.
+  const Fixture fx = write_fixture("dory_attach_within_fixture");
+  const auto tokens = [&](int n, uint64_t seed) {
+    std::vector<int64_t> ids(static_cast<size_t>(n));
+    for (int64_t& id : ids) {
+      seed = seed * 6364136223846793005ull + 1442695040888963407ull;
+      id = static_cast<int64_t>((seed >> 33) % static_cast<uint64_t>(fx.cfg.vocab_size));
+    }
+    return ids;
+  };
+  for (const DoryKvPolicy policy : {DoryKvPolicy::PerLoop, DoryKvPolicy::LastLoop}) {
+    DoryModel w(fx.cfg, fx.dir, 64, 2048, DoryResidency::Resident, 2, 1, false, policy);
+    dgpp::test::attach_within_gate(w, tokens, fx.cfg.vocab_size, /*mtp=*/false, "dory");
+  }
 }
 
 DGPP_TEST(dory_forward_decode_matches_prefill) {

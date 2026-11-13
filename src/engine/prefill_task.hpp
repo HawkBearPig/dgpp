@@ -67,11 +67,9 @@ struct PrefillTask {
       task->head_snap.next = snap;
       snap = &task->head_snap;
     }
-    if (input.attach_slot >= 0) {
-      if (arena.position(input.attach_slot) != input.attach_position)
-        throw std::logic_error("prefill: attached prefix differs from the plan");
-      arena.attach(req, input.attach_slot);
-    }
+    // At the slot's position, or inside it on a family that opens on a
+    // snapshot's first tokens (the arena refuses any other difference).
+    if (input.attach_slot >= 0) arena.attach(req, input.attach_slot, input.attach_position);
     auto cursor = std::make_shared<typename Model::PrefillCursor>([&] {
       if constexpr (requires { model.session_prefill_begin(req, task->prompt, reserve_tokens,
           chunk_tokens, task->boundaries, snap, input.attach_position, &task->images); }) {
