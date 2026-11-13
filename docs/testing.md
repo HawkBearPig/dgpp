@@ -302,7 +302,11 @@ intact on both Qwen families). On a booted world,
 `scripts/serve_nvme_cache_check.py` drives the whole flow and
 `scripts/serve_nvme_cache_fuzz.py` drives random workloads with pins,
 opt-outs, concurrent clients, mid-flight cancels, clean restarts and rank
-crashes, checking every repeated answer against its first.
+crashes, checking every repeated answer against its first. On a world that
+attaches inside cached entries the repeated answers are reported without
+failing the run, because such a hit walks other prefill chunks than the
+first answer did. Set `engine.prefix_partial_hits` to false in the template
+for the strict comparison.
 
 The Qwen fixture's duplicate-open cases check slab size and bytes before
 releasing ownership, then check stale-content clearing with persistence both

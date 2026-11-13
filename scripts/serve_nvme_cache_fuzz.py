@@ -224,7 +224,13 @@ def main():
         f.result()
     pool.shutdown()
     steps.sort(key=lambda s: s["n"])
+    # A request its client dropped retires at the server's next pass or
+    # prefill chunk: give the service a moment before judging it stuck.
+    settle_by = time.time() + 60
     m = chk.metrics(args.host, args.port)
+    while (m["scheduler"].get("active", 0) or m["scheduler"].get("queued", 0)) and time.time() < settle_by:
+        time.sleep(1)
+        m = chk.metrics(args.host, args.port)
     nv = m.get("nvme_cache", {})  # the driver also serves as a plain workload on a world without the tier
     tier_ok = nv.get("spill_failed", 0) == 0 and nv.get("restore_failed", 0) == 0 and nv.get("failures", 0) == 0 \
         and nv.get("pages_used", 0) <= nv.get("pages_total", 0)
