@@ -257,6 +257,8 @@ class GlmDsaModel : public SessionModel<GlmDsaModel> {
   void enqueue_dense(const GlmDsaDenseMlpResident& d, const uint16_t* x, int T, uint16_t* out);
   uint16_t* stage(uint16_t* fallback, int T, int width, bool capture);
   void fold(uint16_t* buf, int T, int width, bool capture);
+  uint16_t* adapter_rider(int layer, bool attention, uint16_t* buf, int T, int width, bool capture);
+  void fold_adapted(int layer, bool attention, uint16_t* buf, int T, int width, bool capture, uint16_t* rider);
 
   // The vocab-sharded embedding (the loader's setting at world > 1):
   // each rank gathers the rows it holds and one fold sums them — bitwise

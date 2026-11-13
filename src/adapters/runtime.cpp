@@ -40,6 +40,8 @@ Runtime::Runtime(const Manifest& manifest, int rank, int world, int max_rows, in
     : id_(manifest.id),
       max_rows_(max_rows),
       hidden_(hidden),
+      rank_index_(rank),
+      world_(world),
       sum_(std::move(sum)),
       stream_sum_(std::move(stream_sum)) {
   if (!enabled)
@@ -74,19 +76,29 @@ Runtime::Runtime(const Manifest& manifest, int rank, int world, int max_rows, in
                 (p.target.component == "attn.o_proj" ? 0 : 1)) = std::move(f);
   }
   try {
-    DGPP_CUDA_OK(cudaHostAlloc(&host_z_, static_cast<size_t>(max_rows) * max_rank * sizeof(float),
-                               cudaHostAllocMapped));
-    DGPP_CUDA_OK(cudaHostGetDevicePointer(&device_z_, host_z_, 0));
+    const size_t z_bytes = static_cast<size_t>(max_rows) * max_rank * sizeof(float);
+    if (sum_) {
+      // The host-side fold reads and rewrites the rank-space rows: mapped host memory.
+      DGPP_CUDA_OK(cudaHostAlloc(&host_z_, z_bytes, cudaHostAllocMapped));
+      DGPP_CUDA_OK(cudaHostGetDevicePointer(&device_z_, host_z_, 0));
+    } else {
+      // Only kernels touch them (the stream transport, or one node): device
+      // memory. Mapped host memory here made every load of z a round trip to
+      // system memory, and the Bz kernel's 50 a thread took 20 us a boundary.
+      DGPP_CUDA_OK(cudaMalloc(&device_z_, z_bytes));
+    }
     DGPP_CUDA_OK(cudaHostAlloc(&host_delta_, hidden * sizeof(float), cudaHostAllocMapped));
     DGPP_CUDA_OK(cudaHostGetDevicePointer(&device_delta_, host_delta_, 0));
   } catch (...) {
-    cudaFreeHost(host_z_);
+    if (host_z_) cudaFreeHost(host_z_);
+    else cudaFree(device_z_);
     cudaFreeHost(host_delta_);
     throw;
   }
 }
 Runtime::~Runtime() {
-  cudaFreeHost(host_z_);
+  if (host_z_) cudaFreeHost(host_z_);
+  else cudaFree(device_z_);
   cudaFreeHost(host_delta_);
 }
 const Runtime::DeviceFactor* Runtime::factor(int layer, bool attention) const {
@@ -96,13 +108,27 @@ bool Runtime::has(int layer, bool attention) const {
   return factor(layer, attention) != nullptr;
 }
 void Runtime::project(int layer, bool attention, const uint16_t* x, int stride, int row_begin,
-                      int rows, cudaStream_t stream) {
+                      int rows, cudaStream_t stream, uint16_t* rider, int fold_rows) {
   const auto* f = factor(layer, attention);
   if (!f) return;
   if (row_begin < 0 || rows <= 0 || row_begin > max_rows_ - rows || stride < f->inputs)
     throw std::invalid_argument("runtime adapter row/input bounds");
-  low_rank_project(x, stride, f->a, device_z_ + static_cast<size_t>(row_begin) * f->rank, rows,
-                   f->inputs, f->rank, stream);
+  float* z = device_z_ + static_cast<size_t>(row_begin) * f->rank;
+  if (rider == nullptr) {
+    low_rank_project(x, stride, f->a, z, rows, f->inputs, f->rank, stream);
+    return;
+  }
+  if (rider_elems(layer, attention, fold_rows) == 0 || row_begin + rows > fold_rows)
+    throw std::invalid_argument("runtime adapter rider without a factor or a transport");
+  const int site = layer * 2 + (attention ? 0 : 1);
+  if (site != rider_site_) {
+    rider_site_ = site;
+    rider_rows_ = 0;
+  }
+  rider_rows_ += rows;
+  low_rank_project_digits(x, stride, f->a, z, rows, f->inputs, f->rank, rider,
+                          static_cast<size_t>(row_begin) * f->rank,
+                          static_cast<size_t>(fold_rows) * f->rank, rank_index_, world_, stream);
 }
 void Runtime::add(int layer, bool attention, uint16_t* output, int rows, cudaStream_t stream,
                   bool capture) {
@@ -117,6 +143,23 @@ void Runtime::add(int layer, bool attention, uint16_t* output, int rows, cudaStr
     sum_(host_z_, static_cast<size_t>(rows) * f->rank);
   }
   low_rank_add(device_z_, f->b, output, rows, hidden_, f->rank, stream);
+}
+size_t Runtime::rider_elems(int layer, bool attention, int rows) const {
+  const auto* f = factor(layer, attention);
+  if (!f || !stream_sum_ || world_ < 2 || rows < 1 || rows > max_rows_) return 0;
+  return static_cast<size_t>(rows) * f->rank * world_ * 4;
+}
+void Runtime::add_from_rider(int layer, bool attention, const uint16_t* digits, uint16_t* output, int rows,
+                             cudaStream_t stream) {
+  const auto* f = factor(layer, attention);
+  if (!f || !digits || rider_elems(layer, attention, rows) == 0)
+    throw std::invalid_argument("runtime adapter rider without a factor or a transport");
+  // The digits are this boundary's only if every one of its rows was projected into them.
+  const bool whole = rider_site_ == layer * 2 + (attention ? 0 : 1) && rider_rows_ == rows;
+  rider_site_ = -1;
+  rider_rows_ = 0;
+  if (!whole) throw std::logic_error("runtime adapter rider rows were not all projected");
+  low_rank_add_digits(digits, world_, device_z_, f->b, output, rows, hidden_, f->rank, stream);
 }
 void Runtime::shared_capture(int layer, std::vector<float>& output, int rows, cudaStream_t stream) {
   if (output.size() != static_cast<size_t>(hidden_))

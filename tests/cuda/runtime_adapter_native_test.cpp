@@ -14,6 +14,7 @@
 #include "engine/eager_engine.hpp"
 #include "engine/graph_engine.hpp"
 #include "glm_dsa_fixture.hpp"
+#include "kernels/low_rank.hpp"
 #include "models/glm_dsa/model.hpp"
 
 namespace {
@@ -26,6 +27,83 @@ template <class T>
 void exact(const std::vector<T>& a, const std::vector<T>& b, const char* message) {
   require(a.size() == b.size() && std::memcmp(a.data(), b.data(), a.size() * sizeof(T)) == 0,
           message);
+}
+
+// The graph boundary's two fused kernels against the kernels they replace,
+// bit for bit, at shapes the model fixture does not reach: the projection
+// that writes its own digits against project + pack_digits (in two row
+// ranges, so the second starts mid rider), and the kernel behind the
+// collective against sum_digits + add. The shapes cover every block layout
+// (two, four and eight rows of threads a column), rows that loop a thread,
+// a partial last block, and a rank too wide for shared memory.
+void kernel_check(int world) {
+  if (world == 1) return;
+  struct Shape { int rows, rank, outputs, inputs; };
+  const Shape shapes[] = {{1, 50, 6144, 1536}, {2, 50, 6144, 4096}, {3, 50, 6144, 1536}, {5, 50, 6144, 1536},
+                          {8, 50, 6144, 1536}, {20, 50, 6144, 257}, {2, 7, 100, 33},      {4, 96, 6144, 512},
+                          {2, 200, 1000, 64},  {2, 400, 512, 64}};
+  uint32_t seed = 0x9e3779b9u;
+  const auto rnd = [&] { return seed = seed * 1664525u + 1013904223u; };
+  const auto unit = [&] { return static_cast<float>(rnd() >> 8) / 8388608.0f - 1.0f; };
+  for (const Shape& sh : shapes) {
+    const size_t count = static_cast<size_t>(sh.rows) * sh.rank, digit_elems = count * world * 4;
+    std::vector<uint16_t> x(static_cast<size_t>(sh.rows) * sh.inputs), base(static_cast<size_t>(sh.rows) * sh.outputs);
+    std::vector<float> b(static_cast<size_t>(sh.outputs) * sh.rank);
+    for (auto& v : b) v = unit();
+    for (auto& v : base) v = float_to_bf16_bits(4.0f * unit());
+    uint16_t *dx, *dout, *ddigits;
+    float *da, *db, *dz;
+    DGPP_CUDA_OK(cudaMalloc(&dx, x.size() * 2));
+    DGPP_CUDA_OK(cudaMalloc(&dout, base.size() * 2));
+    DGPP_CUDA_OK(cudaMalloc(&ddigits, digit_elems * 2));
+    DGPP_CUDA_OK(cudaMalloc(&da, static_cast<size_t>(sh.rank) * sh.inputs * 4));
+    DGPP_CUDA_OK(cudaMalloc(&db, b.size() * 4));
+    DGPP_CUDA_OK(cudaMalloc(&dz, count * 4));
+    DGPP_CUDA_OK(cudaMemcpy(db, b.data(), b.size() * 4, cudaMemcpyHostToDevice));
+    std::vector<float> folded(digit_elems, 0.0f);
+    for (int r = 0; r < world; ++r) {
+      std::vector<float> a(static_cast<size_t>(sh.rank) * sh.inputs);
+      for (auto& v : a) v = unit();
+      for (auto& v : x) v = float_to_bf16_bits(unit());
+      DGPP_CUDA_OK(cudaMemcpy(da, a.data(), a.size() * 4, cudaMemcpyHostToDevice));
+      DGPP_CUDA_OK(cudaMemcpy(dx, x.data(), x.size() * 2, cudaMemcpyHostToDevice));
+      std::vector<uint16_t> packed(digit_elems), written(digit_elems);
+      low_rank_project(dx, sh.inputs, da, dz, sh.rows, sh.inputs, sh.rank, nullptr);
+      low_rank_pack_digits(dz, ddigits, count, r, world, nullptr);
+      DGPP_CUDA_OK(cudaMemcpy(packed.data(), ddigits, digit_elems * 2, cudaMemcpyDeviceToHost));
+      DGPP_CUDA_OK(cudaMemset(ddigits, 0xff, digit_elems * 2));
+      const int head = sh.rows / 2;  // the rows in two launches, as a boundary's spans project them
+      if (head)
+        low_rank_project_digits(dx, sh.inputs, da, dz, head, sh.inputs, sh.rank, ddigits, 0, count, r, world, nullptr);
+      low_rank_project_digits(dx + static_cast<size_t>(head) * sh.inputs, sh.inputs, da,
+                              dz + static_cast<size_t>(head) * sh.rank, sh.rows - head, sh.inputs, sh.rank, ddigits,
+                              static_cast<size_t>(head) * sh.rank, count, r, world, nullptr);
+      DGPP_CUDA_OK(cudaMemcpy(written.data(), ddigits, digit_elems * 2, cudaMemcpyDeviceToHost));
+      exact(written, packed, "the projection's own digits differ from pack_digits");
+      for (size_t i = 0; i < digit_elems; ++i) folded[i] += bf16_bits_to_float(packed[i]);
+    }
+    std::vector<uint16_t> digits(digit_elems);  // what the collective leaves: the ranks' digits summed in bf16
+    for (size_t i = 0; i < digit_elems; ++i) digits[i] = float_to_bf16_bits(folded[i]);
+    DGPP_CUDA_OK(cudaMemcpy(ddigits, digits.data(), digit_elems * 2, cudaMemcpyHostToDevice));
+    std::vector<uint16_t> want(base.size()), got(base.size());
+    std::vector<float> z_want(count), z_got(count);
+    DGPP_CUDA_OK(cudaMemcpy(dout, base.data(), base.size() * 2, cudaMemcpyHostToDevice));
+    low_rank_sum_digits(ddigits, dz, count, world, nullptr);
+    low_rank_add(dz, db, dout, sh.rows, sh.outputs, sh.rank, nullptr);
+    DGPP_CUDA_OK(cudaMemcpy(want.data(), dout, want.size() * 2, cudaMemcpyDeviceToHost));
+    DGPP_CUDA_OK(cudaMemcpy(z_want.data(), dz, count * 4, cudaMemcpyDeviceToHost));
+    DGPP_CUDA_OK(cudaMemcpy(dout, base.data(), base.size() * 2, cudaMemcpyHostToDevice));
+    DGPP_CUDA_OK(cudaMemset(dz, 0, count * 4));
+    low_rank_add_digits(ddigits, world, dz, db, dout, sh.rows, sh.outputs, sh.rank, nullptr);
+    DGPP_CUDA_OK(cudaMemcpy(got.data(), dout, got.size() * 2, cudaMemcpyDeviceToHost));
+    DGPP_CUDA_OK(cudaMemcpy(z_got.data(), dz, count * 4, cudaMemcpyDeviceToHost));
+    exact(got, want, "the fused boundary kernel differs from sum_digits + add");
+    exact(z_got, z_want, "the fused boundary kernel leaves other rank-space rows than sum_digits");
+    require(std::memcmp(want.data(), base.data(), want.size() * 2) != 0, "the adapter kernels added nothing");
+    for (void* q : {static_cast<void*>(dx), static_cast<void*>(dout), static_cast<void*>(ddigits),
+                    static_cast<void*>(da), static_cast<void*>(db), static_cast<void*>(dz)})
+      DGPP_CUDA_OK(cudaFree(q));
+  }
 }
 
 template <class Work>
@@ -304,10 +382,11 @@ int main(int argc, char** argv) {
     set_bf16_residency(Bf16Residency::Bf12);
     GlmDsaLayerStream::set_embed_vocab_sharded(true);
     draft_head_configure(DraftHeadSettings{2});
+    kernel_check(world);
     transport_check(world);
     model_check(cfg, argv[1], world);
     std::printf(
-        "native adapter %s world %d: FP32 fold, C8 MTP graphs, FP8 KV, BF12, vocab embeddings and "
+        "native adapter %s world %d: boundary kernels, FP32 fold, C8 MTP graphs, FP8 KV, BF12, vocab embeddings and "
         "prefix reuse passed\n",
         argv[2], world);
     return 0;

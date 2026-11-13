@@ -966,6 +966,9 @@ __global__ __launch_bounds__(Threads) void bus_allreduce_graph_kernel(
     for (int p = 0; p < v.send_peers; ++p) bits |= 1ULL << p;
     ready.store(bits, cuda::memory_order_release);
   }
+  // The source is staged and the engine can post: a dependent released here
+  // (kernels/pdl.cuh) loads beside the wait for the peers, not the staging.
+  if (v.release_dependents) dgpp_pdl_release();
 
   // Phase 2 — wait for every peer's doorbell (identical to eager).
   const int lat_slots_per_view = v.recv_views > 0 ? v.recv[0].lat_slots : 0;
@@ -1470,6 +1473,11 @@ __global__ __launch_bounds__(Threads) void bus_allreduce_write_kernel(
     cuda::atomic_ref<uint32_t, cuda::thread_scope_system> ready(rec.ready);
     ready.store(gen, cuda::memory_order_release);
   }
+  // My chunks are staged and the engine can post: from here the grid only
+  // waits on the peers, and a released dependent's loads (kernels/pdl.cuh)
+  // share the memory with polls that have nothing to find yet. Released
+  // before the staging, the dependent's loads delayed it (4 us a fold).
+  if (v.release_dependents) dgpp_pdl_release();
 
   // Phase 2 — my chunks: every peer's copy polled in flight, proven by
   // its trailer, folded in rank order, stored. The gentle cadence keeps the

@@ -3214,12 +3214,19 @@ struct CollectiveBus::Impl {
   }
 };
 
+// The buses alive in this process (allreduce_record's release rule).
+static std::atomic<int> g_live_buses{0};
+
 CollectiveBus::CollectiveBus(BusOptions options)
     : impl_(std::make_unique<Impl>()), options_(std::move(options)) {
   impl_->opt = options_;
+  g_live_buses.fetch_add(1, std::memory_order_relaxed);
 }
 
-CollectiveBus::~CollectiveBus() { stop(); }
+CollectiveBus::~CollectiveBus() {
+  stop();
+  g_live_buses.fetch_sub(1, std::memory_order_relaxed);
+}
 
 bool CollectiveBus::start(std::string* error) {
   Impl& impl = *impl_;
@@ -4588,7 +4595,8 @@ bool CollectiveBus::graph_record_begin(std::string* error, int variant) {
 
 bool CollectiveBus::allreduce_record(cudaStream_t capture_stream,
                                      const void* device_src, void* device_dst,
-                                     size_t bf16_elems, std::string* error) {
+                                     size_t bf16_elems, std::string* error,
+                                     bool release_dependents) {
   if (impl_->world1) {
     Impl& w = *impl_;
     std::lock_guard<std::mutex> lock(w.w1_mu);
@@ -4643,6 +4651,8 @@ bool CollectiveBus::allreduce_record(cudaStream_t capture_stream,
   v.send_peers = static_cast<int>(impl.peer_ranks.size());
   v.stage_ring = Impl::kStageRing;
   v.stage_row_bytes = static_cast<uint32_t>(impl.stage_pitch());
+  v.release_dependents =
+      release_dependents && g_live_buses.load(std::memory_order_relaxed) == 1 ? 1 : 0;
 
   const cudaError_t launch =
       impl.write_transport()

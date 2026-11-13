@@ -427,6 +427,25 @@ struct GraphRecordReducer final : BoundaryReducer {
                                "rejected: " + err);
   }
 
+  // The rider sits in the stable buffer behind the staged partial, inside
+  // the same latency slot, and the recorded node folds both.
+  uint16_t* rider(const uint16_t* partial, int rows, int hidden, size_t elems) override {
+    if (partial != stable_ || hidden <= 0 || rows <= 0 || elems == 0) return nullptr;
+    const size_t body = static_cast<size_t>(rows) * static_cast<size_t>(hidden);
+    if (body > max_elems_ || elems > max_elems_ - body) return nullptr;
+    return stable_ + body;
+  }
+  void reduce_with_rider(uint16_t* partial, int rows, int hidden, size_t rider_elems) override {
+    if (rider(partial, rows, hidden, rider_elems) == nullptr || hidden % 2 != 0)
+      throw std::invalid_argument("graph record reducer: the rider does not fit behind the staged partial");
+    std::string err;
+    const size_t elems = static_cast<size_t>(rows) * static_cast<size_t>(hidden) + rider_elems;
+    // The kernel recorded behind a rider's collective reads its own weights
+    // before its wait: the node releases it to run beside the round trip.
+    if (!bus_.allreduce_record(stream_, partial, partial, elems, &err, /*release_dependents=*/true))
+      throw std::runtime_error("graph record reducer: allreduce_record rejected: " + err);
+  }
+
  private:
   net::CollectiveBus& bus_;
   cudaStream_t stream_ = nullptr;

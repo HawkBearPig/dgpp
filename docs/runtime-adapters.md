@@ -89,8 +89,10 @@ fail validation.
 
 Checkpoint weight formats leave the original packed and quantized tensors
 intact. Adapter execution does not produce a dequantized or merged checkpoint.
-It adds factor storage, scratch buffers and computation, including collectives
-across ranks. Graph bookkeeping grows only for an enabled adapter, and the
+It adds factor storage, scratch buffers and computation. Eager execution adds
+one collective at each adapted boundary. Graph execution carries the adapter's
+values in the boundary's own collective. Graph bookkeeping grows only for an
+enabled adapter, and the
 startup memory plan includes its factors, scratch and additional graph records.
 Ordinary-serving benchmark results do not measure adapter overhead.
 With `runtime_adapters=false`, serving allocates no adapter buffers and runs no
@@ -138,9 +140,14 @@ the BF16 projection input, gathers FP32 partials losslessly, sums in rank order
 and adds B times that sum once to the already-folded BF16 branch output,
 rounding to BF16. Shared-expert corrections enter the combined MLP branch;
 research capture retains the shared projection's separate FP32 output plus
-correction. Graph execution packs FP32 partials into disjoint byte-digit slices
-for the existing collective, then reconstructs and sums them on the GPU in
-rank order. The MTP draft remains a proposer; the adapted main model verifies
+correction. Graph execution writes each rank's FP32 partials as byte digits
+into disjoint slices directly behind the boundary's BF16 partial, and the
+boundary's collective folds both as one message. One kernel behind the
+collective reconstructs the partials, sums them in rank order and adds the
+correction. That kernel reads its columns of B while the collective is in
+flight (`engine.decode_pdl`). A boundary whose rows and digits exceed one
+latency slot folds the digits in a second collective, with the same values.
+The MTP draft remains a proposer; the adapted main model verifies
 its proposals. Prefix snapshots hold state produced by that same installed
 adapter. Zero factors skip the addition, preserving identity exactly.
 This execution contract does not promise bitwise equivalence to merged

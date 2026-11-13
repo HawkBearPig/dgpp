@@ -13,18 +13,88 @@ namespace {
 
 constexpr int kBlock = 512;
 
-// Two-rounding RMSNorm of one row (the Glm5NextTextRMSNorm choreography):
-// fp32 mean of squares, u = bf16(x * rstd), y = bf16(w * u). The
-// intermediate bf16 round of u is semantics, not noise — the reference
-// multiplies the bf16 tensor. Block-wide: every thread of the block takes
-// part; `sx` is a [dim] staging area for the second pass.
-// The reduction and the second pass over a row whose fp32 values are
-// staged in `sx` and whose per-thread sum of squares is `ssq` (accumulated
-// in the first pass's i = tid, tid + nthreads, ... order). Shared by the
-// plain norm and the residual-fused one below, so both produce the same
-// bits from the same staged row.
-__device__ void rmsnorm_row_finish(const uint16_t* __restrict__ w, uint16_t* __restrict__ yr, int dim,
-                                   float eps, const float* sx, double ssq) {
+// Loads a thread issues together. What these kernels read is cold more
+// often than not (the residual stream was last touched a sublayer ago, the
+// norm weight a step ago), and issued one an iteration each load waited
+// out a memory round trip before the next was asked for: a 6144-wide row,
+// twelve elements a thread, took 12-14 us on the GB10. A thread now asks
+// for a pass's elements together, and for its norm weights before the
+// first pass, so they arrive under it. The arithmetic and its order are
+// unchanged: the same bits.
+constexpr int kNormBatch = 16;
+
+// A thread's norm weights for the first kNormBatch elements of the second
+// pass (i = tid, tid + nthreads, ...).
+__device__ __forceinline__ void norm_weights_first(const uint16_t* __restrict__ w, int dim,
+                                                   uint16_t (&w0)[kNormBatch]) {
+  const int tid = threadIdx.x, nthreads = blockDim.x;
+#pragma unroll
+  for (int k = 0; k < kNormBatch; ++k) {
+    const int i = tid + k * nthreads;
+    w0[k] = i < dim ? w[i] : 0;
+  }
+}
+
+// The first pass over a row: its fp32 values staged in `sx` ([dim], for
+// the second pass) and the thread's sum of squares, accumulated in the
+// i = tid, tid + nthreads, ... order.
+__device__ __forceinline__ double norm_stage_row(const uint16_t* __restrict__ xr, int dim, float* sx) {
+  const int tid = threadIdx.x, nthreads = blockDim.x;
+  double ssq = 0.0;
+  for (int i0 = tid; i0 < dim; i0 += nthreads * kNormBatch) {
+    uint16_t xv[kNormBatch];
+#pragma unroll
+    for (int k = 0; k < kNormBatch; ++k) {
+      const int i = i0 + k * nthreads;
+      xv[k] = i < dim ? xr[i] : 0;
+    }
+#pragma unroll
+    for (int k = 0; k < kNormBatch; ++k) {
+      const int i = i0 + k * nthreads;
+      if (i < dim) {
+        const float v = bf16_bits_to_float(xv[k]);
+        sx[i] = v;
+        ssq += static_cast<double>(v) * v;
+      }
+    }
+  }
+  return ssq;
+}
+
+// The first pass with the residual add fused in (2026-10-13): x[i] =
+// bf16(x[i] + y[i]) exactly as glm_residual_add_kernel writes it, the sum
+// staged and squared from that rounded value. Bitwise the add kernel and
+// the pass above, one launch and one read of the row fewer.
+__device__ __forceinline__ double norm_stage_row_add(uint16_t* __restrict__ xr, const uint16_t* __restrict__ add,
+                                                     int dim, float* sx) {
+  const int tid = threadIdx.x, nthreads = blockDim.x;
+  double ssq = 0.0;
+  for (int i0 = tid; i0 < dim; i0 += nthreads * kNormBatch) {
+    uint16_t xv[kNormBatch], av[kNormBatch];
+#pragma unroll
+    for (int k = 0; k < kNormBatch; ++k) {
+      const int i = i0 + k * nthreads;
+      xv[k] = i < dim ? xr[i] : 0;
+      av[k] = i < dim ? add[i] : 0;
+    }
+#pragma unroll
+    for (int k = 0; k < kNormBatch; ++k) {
+      const int i = i0 + k * nthreads;
+      if (i < dim) {
+        const uint16_t xb = float_to_bf16_bits(bf16_bits_to_float(xv[k]) + bf16_bits_to_float(av[k]));
+        xr[i] = xb;
+        const float v = bf16_bits_to_float(xb);
+        sx[i] = v;
+        ssq += static_cast<double>(v) * v;
+      }
+    }
+  }
+  return ssq;
+}
+
+// The block's reduction of the threads' sums of squares to the row's
+// reciprocal RMS. Block-wide: every thread of the block takes part.
+__device__ __forceinline__ float norm_rstd(double ssq, int dim, float eps) {
   const int tid = threadIdx.x;
   const int nthreads = blockDim.x;
   __syncthreads();
@@ -36,12 +106,39 @@ __device__ void rmsnorm_row_finish(const uint16_t* __restrict__ w, uint16_t* __r
       part[tid] += part[tid + stride];
     __syncthreads();
   }
-  const float rstd = rsqrtf(static_cast<float>(part[0] / dim) + eps);
+  return rsqrtf(static_cast<float>(part[0] / dim) + eps);
+}
 
-  for (int i = tid; i < dim; i += nthreads) {
-    const uint16_t u = float_to_bf16_bits(sx[i] * rstd);
-    yr[i] = float_to_bf16_bits(bf16_bits_to_float(w[i]) *
-                               bf16_bits_to_float(u));
+// Two-rounding RMSNorm of one row (the Glm5NextTextRMSNorm choreography):
+// fp32 mean of squares, u = bf16(x * rstd), y = bf16(w * u). The
+// intermediate bf16 round of u is semantics, not noise — the reference
+// multiplies the bf16 tensor. This is the reduction and the second pass
+// over a row staged by one of the first passes above; `w0` holds the
+// thread's first weights (norm_weights_first). Shared by the plain norm
+// and the residual-fused one, so both produce the same bits from the same
+// staged row.
+__device__ void rmsnorm_row_finish(const uint16_t* __restrict__ w, uint16_t* __restrict__ yr, int dim,
+                                   float eps, const float* sx, double ssq, const uint16_t (&w0)[kNormBatch]) {
+  const int tid = threadIdx.x;
+  const int nthreads = blockDim.x;
+  const float rstd = norm_rstd(ssq, dim, eps);
+  bool first = true;
+  for (int i0 = tid; i0 < dim; i0 += nthreads * kNormBatch) {
+    uint16_t wv[kNormBatch];
+#pragma unroll
+    for (int k = 0; k < kNormBatch; ++k) {
+      const int i = i0 + k * nthreads;
+      wv[k] = first ? w0[k] : (i < dim ? w[i] : 0);
+    }
+    first = false;
+#pragma unroll
+    for (int k = 0; k < kNormBatch; ++k) {
+      const int i = i0 + k * nthreads;
+      if (i < dim) {
+        const uint16_t u = float_to_bf16_bits(sx[i] * rstd);
+        yr[i] = float_to_bf16_bits(bf16_bits_to_float(wv[k]) * bf16_bits_to_float(u));
+      }
+    }
   }
 }
 
@@ -49,39 +146,13 @@ __device__ void rmsnorm_row_two_rounding(const uint16_t* __restrict__ xr,
                                          const uint16_t* __restrict__ w,
                                          uint16_t* __restrict__ yr, int dim,
                                          float eps, float* sx) {
-  const int tid = threadIdx.x;
-  const int nthreads = blockDim.x;
-  double ssq = 0.0;
-  for (int i = tid; i < dim; i += nthreads) {
-    const float v = bf16_bits_to_float(xr[i]);
-    sx[i] = v;
-    ssq += static_cast<double>(v) * v;
-  }
-  rmsnorm_row_finish(w, yr, dim, eps, sx, ssq);
+  uint16_t w0[kNormBatch];
+  norm_weights_first(w, dim, w0);
+  const double ssq = norm_stage_row(xr, dim, sx);
+  rmsnorm_row_finish(w, yr, dim, eps, sx, ssq, w0);
 }
 
-// The residual add fused into the norm's first pass (2026-10-13): x[i] =
-// bf16(x[i] + y[i]) exactly as glm_residual_add_kernel writes it, the sum
-// staged and squared from that rounded value, then the norm above —
-// bitwise the two kernels, one launch and one read of the row fewer.
-__device__ void residual_add_rmsnorm_row(uint16_t* __restrict__ xr, const uint16_t* __restrict__ add,
-                                         const uint16_t* __restrict__ w, uint16_t* __restrict__ yr,
-                                         int dim, float eps, float* sx) {
-  const int tid = threadIdx.x;
-  const int nthreads = blockDim.x;
-  double ssq = 0.0;
-  for (int i = tid; i < dim; i += nthreads) {
-    const uint16_t xb = float_to_bf16_bits(bf16_bits_to_float(xr[i]) + bf16_bits_to_float(add[i]));
-    xr[i] = xb;
-    const float v = bf16_bits_to_float(xb);
-    sx[i] = v;
-    ssq += static_cast<double>(v) * v;
-  }
-  rmsnorm_row_finish(w, yr, dim, eps, sx, ssq);
-}
-
-
-__global__ void glm_rmsnorm_kernel(const uint16_t* __restrict__ x,
+__global__ __launch_bounds__(kBlock) void glm_rmsnorm_kernel(const uint16_t* __restrict__ x,
                                    const uint16_t* __restrict__ w,
                                    uint16_t* __restrict__ y, int dim,
                                    float eps) {
@@ -92,82 +163,106 @@ __global__ void glm_rmsnorm_kernel(const uint16_t* __restrict__ x,
                            y + static_cast<size_t>(row) * dim, dim, eps, smem);
 }
 
-__global__ void glm_residual_add_rmsnorm_kernel(uint16_t* __restrict__ x, const uint16_t* __restrict__ add,
+__global__ __launch_bounds__(kBlock) void glm_residual_add_rmsnorm_kernel(uint16_t* __restrict__ x, const uint16_t* __restrict__ add,
                                                 const uint16_t* __restrict__ w, uint16_t* __restrict__ y,
                                                 int dim, float eps) {
   dgpp_pdl_wait();
   const int row = blockIdx.x;
   extern __shared__ float smem[];
-  residual_add_rmsnorm_row(x + static_cast<size_t>(row) * dim, add + static_cast<size_t>(row) * dim, w,
-                           y + static_cast<size_t>(row) * dim, dim, eps, smem);
+  uint16_t w0[kNormBatch];
+  norm_weights_first(w, dim, w0);
+  const double ssq =
+      norm_stage_row_add(x + static_cast<size_t>(row) * dim, add + static_cast<size_t>(row) * dim, dim, smem);
+  rmsnorm_row_finish(w, y + static_cast<size_t>(row) * dim, dim, eps, smem, ssq, w0);
 }
 
 // The norm with the Mixed346 activation quantizer fused into its second
 // pass: the block's warps take the row's 128-value groups in turn (warp w
-// groups w, w + 16, ...; lane j element j of each of the group's four H32
-// blocks), write y as the kernel above does, then rotate the four bf16
+// groups w, w + warps, ...; lane j element j of each of the group's four
+// H32 blocks), write y as the kernels above do, then rotate the four bf16
 // values across the lanes, round, and emit the group's scale and codes
-// exactly as hadamard32_quant_int8_kernel does from y. The first pass and
-// the reduction are the kernel above's.
-__global__ void glm_rmsnorm_quant_int8_kernel(const uint16_t* __restrict__ x, const uint16_t* __restrict__ w,
+// exactly as hadamard32_quant_int8_kernel does from y. kNormBatch / 4
+// groups' weights are asked for together: the thread's first before the
+// first pass (norm_quant_weights_first), the rest a batch ahead of use.
+__device__ __forceinline__ void norm_quant_weights_first(const uint16_t* __restrict__ w, int dim,
+                                                         uint16_t (&w0)[kNormBatch]) {
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, warps = blockDim.x >> 5;
+  const int groups = dim / 128;
+#pragma unroll
+  for (int m = 0; m < kNormBatch / 4; ++m) {
+    const int g = warp + m * warps;
+#pragma unroll
+    for (int b = 0; b < 4; ++b) w0[m * 4 + b] = g < groups ? w[g * 128 + b * kHadamard32Block + lane] : 0;
+  }
+}
+
+__device__ void rmsnorm_row_finish_quant_int8(const uint16_t* __restrict__ w, uint16_t* __restrict__ yr,
+                                              int8_t* __restrict__ cr, float* __restrict__ scales_row, int dim,
+                                              float eps, const float* sx, double ssq,
+                                              const uint16_t (&w0)[kNormBatch]) {
+  const float rstd = norm_rstd(ssq, dim, eps);
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, warps = blockDim.x >> 5;
+  const int groups = dim / 128;
+  bool first = true;
+  for (int g0 = warp; g0 < groups; g0 += warps * (kNormBatch / 4)) {
+    uint16_t wv[kNormBatch];
+#pragma unroll
+    for (int m = 0; m < kNormBatch / 4; ++m) {
+      const int g = g0 + m * warps;
+#pragma unroll
+      for (int b = 0; b < 4; ++b)
+        wv[m * 4 + b] = first ? w0[m * 4 + b] : (g < groups ? w[g * 128 + b * kHadamard32Block + lane] : 0);
+    }
+    first = false;
+#pragma unroll
+    for (int m = 0; m < kNormBatch / 4; ++m) {
+      const int g = g0 + m * warps;
+      if (g < groups) {  // uniform across the warp
+        const int c = g * 128;
+        float v[4];
+        float amax = 0.f;
+#pragma unroll
+        for (int b = 0; b < 4; ++b) {
+          const int i = c + b * kHadamard32Block + lane;
+          const uint16_t u = float_to_bf16_bits(sx[i] * rstd);
+          const uint16_t yv = float_to_bf16_bits(bf16_bits_to_float(wv[m * 4 + b]) * bf16_bits_to_float(u));
+          yr[i] = yv;
+          v[b] = bf16_bits_to_float(hadamard32_warp_bf16(yv));
+          amax = fmaxf(amax, fabsf(v[b]));
+        }
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, off));
+        const float s = fmaxf(__fdiv_rn(amax, 127.f), 1e-30f);
+#pragma unroll
+        for (int b = 0; b < 4; ++b) {
+          float q = rintf(__fdiv_rn(v[b], s));
+          q = fminf(fmaxf(q, -128.f), 127.f);
+          cr[c + b * kHadamard32Block + lane] = static_cast<int8_t>(static_cast<int>(q));
+        }
+        if (lane == 0) scales_row[g] = s;
+      }
+    }
+  }
+}
+
+__global__ __launch_bounds__(kBlock) void glm_rmsnorm_quant_int8_kernel(const uint16_t* __restrict__ x, const uint16_t* __restrict__ w,
                                               uint16_t* __restrict__ y, int8_t* __restrict__ codes,
                                               size_t code_stride, float* __restrict__ scales,
                                               size_t scale_stride, int dim, float eps) {
   dgpp_pdl_wait();
   const int row = blockIdx.x;
   extern __shared__ float smem[];
-  const uint16_t* xr = x + static_cast<size_t>(row) * dim;
-  uint16_t* yr = y + static_cast<size_t>(row) * dim;
-  const int tid = threadIdx.x;
-  const int nthreads = blockDim.x;
-  double ssq = 0.0;
-  for (int i = tid; i < dim; i += nthreads) {
-    const float v = bf16_bits_to_float(xr[i]);
-    smem[i] = v;
-    ssq += static_cast<double>(v) * v;
-  }
-  __syncthreads();
-  __shared__ double part[kBlock];
-  part[tid] = ssq;
-  __syncthreads();
-  for (int stride = nthreads / 2; stride > 0; stride >>= 1) {
-    if (tid < stride && tid + stride < blockDim.x) part[tid] += part[tid + stride];
-    __syncthreads();
-  }
-  const float rstd = rsqrtf(static_cast<float>(part[0] / dim) + eps);
-  const int warp = tid >> 5, lane = tid & 31, warps = nthreads >> 5;
-  const int groups = dim / 128;
-  int8_t* cr = codes + static_cast<size_t>(row) * code_stride;
-  for (int g = warp; g < groups; g += warps) {
-    const int c = g * 128;
-    float v[4];
-    float amax = 0.f;
-#pragma unroll
-    for (int b = 0; b < 4; ++b) {
-      const int i = c + b * kHadamard32Block + lane;
-      const uint16_t u = float_to_bf16_bits(smem[i] * rstd);
-      const uint16_t yv = float_to_bf16_bits(bf16_bits_to_float(w[i]) * bf16_bits_to_float(u));
-      yr[i] = yv;
-      v[b] = bf16_bits_to_float(hadamard32_warp_bf16(yv));
-      amax = fmaxf(amax, fabsf(v[b]));
-    }
-#pragma unroll
-    for (int off = 16; off > 0; off >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, off));
-    const float s = fmaxf(__fdiv_rn(amax, 127.f), 1e-30f);
-#pragma unroll
-    for (int b = 0; b < 4; ++b) {
-      float q = rintf(__fdiv_rn(v[b], s));
-      q = fminf(fmaxf(q, -128.f), 127.f);
-      cr[c + b * kHadamard32Block + lane] = static_cast<int8_t>(static_cast<int>(q));
-    }
-    if (lane == 0) scales[static_cast<size_t>(row) * scale_stride + g] = s;
-  }
+  uint16_t w0[kNormBatch];
+  norm_quant_weights_first(w, dim, w0);
+  const double ssq = norm_stage_row(x + static_cast<size_t>(row) * dim, dim, smem);
+  rmsnorm_row_finish_quant_int8(w, y + static_cast<size_t>(row) * dim, codes + static_cast<size_t>(row) * code_stride,
+                                scales + static_cast<size_t>(row) * scale_stride, dim, eps, smem, ssq, w0);
 }
 
 // The quant norm with the residual add fused into its first pass (as
 // glm_residual_add_rmsnorm_kernel): bitwise the add kernel followed by the
 // kernel above.
-__global__ void glm_residual_add_rmsnorm_quant_int8_kernel(uint16_t* __restrict__ x, const uint16_t* __restrict__ add,
+__global__ __launch_bounds__(kBlock) void glm_residual_add_rmsnorm_quant_int8_kernel(uint16_t* __restrict__ x, const uint16_t* __restrict__ add,
                                                            const uint16_t* __restrict__ w, uint16_t* __restrict__ y,
                                                            int8_t* __restrict__ codes, size_t code_stride,
                                                            float* __restrict__ scales, size_t scale_stride, int dim,
@@ -175,62 +270,19 @@ __global__ void glm_residual_add_rmsnorm_quant_int8_kernel(uint16_t* __restrict_
   dgpp_pdl_wait();
   const int row = blockIdx.x;
   extern __shared__ float smem[];
-  uint16_t* xr = x + static_cast<size_t>(row) * dim;
-  const uint16_t* ar = add + static_cast<size_t>(row) * dim;
-  uint16_t* yr = y + static_cast<size_t>(row) * dim;
-  const int tid = threadIdx.x;
-  const int nthreads = blockDim.x;
-  double ssq = 0.0;
-  for (int i = tid; i < dim; i += nthreads) {
-    const uint16_t xb = float_to_bf16_bits(bf16_bits_to_float(xr[i]) + bf16_bits_to_float(ar[i]));
-    xr[i] = xb;
-    const float v = bf16_bits_to_float(xb);
-    smem[i] = v;
-    ssq += static_cast<double>(v) * v;
-  }
-  __syncthreads();
-  __shared__ double part[kBlock];
-  part[tid] = ssq;
-  __syncthreads();
-  for (int stride = nthreads / 2; stride > 0; stride >>= 1) {
-    if (tid < stride && tid + stride < blockDim.x) part[tid] += part[tid + stride];
-    __syncthreads();
-  }
-  const float rstd = rsqrtf(static_cast<float>(part[0] / dim) + eps);
-  const int warp = tid >> 5, lane = tid & 31, warps = nthreads >> 5;
-  const int groups = dim / 128;
-  int8_t* cr = codes + static_cast<size_t>(row) * code_stride;
-  for (int g = warp; g < groups; g += warps) {
-    const int c = g * 128;
-    float v[4];
-    float amax = 0.f;
-#pragma unroll
-    for (int b = 0; b < 4; ++b) {
-      const int i = c + b * kHadamard32Block + lane;
-      const uint16_t u = float_to_bf16_bits(smem[i] * rstd);
-      const uint16_t yv = float_to_bf16_bits(bf16_bits_to_float(w[i]) * bf16_bits_to_float(u));
-      yr[i] = yv;
-      v[b] = bf16_bits_to_float(hadamard32_warp_bf16(yv));
-      amax = fmaxf(amax, fabsf(v[b]));
-    }
-#pragma unroll
-    for (int off = 16; off > 0; off >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, off));
-    const float s = fmaxf(__fdiv_rn(amax, 127.f), 1e-30f);
-#pragma unroll
-    for (int b = 0; b < 4; ++b) {
-      float q = rintf(__fdiv_rn(v[b], s));
-      q = fminf(fmaxf(q, -128.f), 127.f);
-      cr[c + b * kHadamard32Block + lane] = static_cast<int8_t>(static_cast<int>(q));
-    }
-    if (lane == 0) scales[static_cast<size_t>(row) * scale_stride + g] = s;
-  }
+  uint16_t w0[kNormBatch];
+  norm_quant_weights_first(w, dim, w0);
+  const double ssq =
+      norm_stage_row_add(x + static_cast<size_t>(row) * dim, add + static_cast<size_t>(row) * dim, dim, smem);
+  rmsnorm_row_finish_quant_int8(w, y + static_cast<size_t>(row) * dim, codes + static_cast<size_t>(row) * code_stride,
+                                scales + static_cast<size_t>(row) * scale_stride, dim, eps, smem, ssq, w0);
 }
 
 // The MTP draft block's input row: [enorm(embed[token]) | hnorm(hidden)].
 // blockIdx.y selects the half — the embedding half normalizes the token's
 // embedding row, the hidden half the cached main-stack hidden at the row's
 // position (positions[t], or first_pos + t when positions is null).
-__global__ void glm_mtp_input_kernel(const uint16_t* __restrict__ embed,
+__global__ __launch_bounds__(kBlock) void glm_mtp_input_kernel(const uint16_t* __restrict__ embed,
                                      const int64_t* __restrict__ tokens,
                                      const uint16_t* __restrict__ hidden_cache,
                                      int64_t request_cache_stride,
