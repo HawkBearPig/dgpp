@@ -103,7 +103,9 @@ or pooled state in their snapshots, or a draft block with state of its own,
 keep the cut rule above.
 
 A hit inside an entry prefills its suffix from the attach position, so the
-suffix walks chunks the cold prefill would not have walked. See
+suffix walks chunks the cold prefill would not have walked. A greedy answer
+can then be worded differently from an earlier answer to the same prompt
+where the generation passes a near tie. See
 [Greedy transcripts and chunk shape](numerics.md#greedy-transcripts-and-chunk-shape).
 Set the key to false to keep every hit on the cold walk's cuts.
 `/v1/metrics` reports `partial_hits_on` and the `partial_hits` count under

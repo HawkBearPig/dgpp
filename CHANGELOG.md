@@ -21,10 +21,15 @@ project procedures and design guidance live in `docs/`.
   reused 24 percent, and their summed time to the first token falls from
   198 s to 85 s. A prompt with one line changed 7K tokens into its 8K waits
   3.0 s where it waited 20.5 s. Every answer names its own prompt's code
-  word. The configuration digest that ranks compare at startup carries the
-  NVMe cache settings again, which a format string one field short had
-  dropped. [Prefix reuse](docs/prefix-cache.md#hits-inside-an-entry)
-  describes the rule.
+  word. On one node with Dory 1.0 4B NVFP4 the same prompts reuse 69 percent
+  where they reused 54. A repeated prompt can be worded differently from its
+  first answer when one of the two opened inside an entry, 6 of 47 repeats in
+  the cold-tier fuzz, and `serve_nvme_cache_fuzz.py` reports those without
+  failing on such a world. The configuration digest that ranks compare at
+  startup carries the NVMe cache settings again, which a format string one
+  field short had dropped.
+  [Prefix reuse](docs/prefix-cache.md#hits-inside-an-entry) describes the
+  rule.
 
 - **A runtime adapter's boundary in one collective**: in graph execution a
   rank's projection writes its rank-space values as byte digits directly
