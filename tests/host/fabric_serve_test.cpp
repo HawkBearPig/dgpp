@@ -561,12 +561,13 @@ void test_journal_codec() {
     entry_policy.prefix_min_tokens = 1024;
     entry_policy.prefix_head_snapshots = true;
     entry_policy.prefix_pin_max_pct = 25;
+    entry_policy.prefix_partial_hits = true;
     const auto entry_warm =
         dgpp::serve::decode_journal_line(dgpp::serve::encode_journal_warm(entry_policy));
     require(entry_warm.admission == entry_policy && fixed_warm.admission.prefix_min_tokens == 0 &&
-                !fixed_warm.admission.prefix_head_snapshots,
-            "the prefix entry floor and the head cut round-trip; old records carry neither");
-    for (const std::string bad : {R"("pmin":-1)", R"("phead":2)", R"("ppin":101)"}) {
+                !fixed_warm.admission.prefix_head_snapshots && !fixed_warm.admission.prefix_partial_hits,
+            "the prefix entry floor, the head cut and the hit inside an entry round-trip; old records carry none");
+    for (const std::string bad : {R"("pmin":-1)", R"("phead":2)", R"("ppin":101)", R"("ppart":2)"}) {
       bool rejected = false;
       try {
         (void)dgpp::serve::decode_journal_line(R"({"op":"warm","adm":0,"win":256,)" + bad + "}");
@@ -633,6 +634,7 @@ void test_journal_codec() {
     ws.prefill_early_admission = true;
     ws.prefix_min_tokens = 1024;
     ws.prefix_head_snapshots = true;
+    ws.prefix_partial_hits = true;
     ws.bulk_pace_gbps = 28.333333333333332;
     ws.bulk_inflight = 4;
     ws.rendezvous_timeout_ms = 120000;
@@ -702,11 +704,14 @@ void test_journal_codec() {
       auto plain = ws;
       plain.prefix_min_tokens = 0;
       plain.prefix_head_snapshots = false;
+      plain.prefix_partial_hits = false;
       const std::string line = dgpp::serve::encode_journal_settings(plain);
-      require(line.find("\"pmin\"") == std::string::npos && line.find("\"phead\"") == std::string::npos,
+      require(line.find("\"pmin\"") == std::string::npos && line.find("\"phead\"") == std::string::npos &&
+                  line.find("\"ppart\"") == std::string::npos,
               "codec: the entry policy's keys are absent when it is off");
       const auto decoded = dgpp::serve::decode_journal_line(line);
-      require(decoded.world_settings.prefix_min_tokens == 0 && !decoded.world_settings.prefix_head_snapshots,
+      require(decoded.world_settings.prefix_min_tokens == 0 && !decoded.world_settings.prefix_head_snapshots &&
+                  !decoded.world_settings.prefix_partial_hits,
               "codec: absent entry policy decodes to off");
     }
     for (const std::optional<bool> early : {std::optional<bool>{}, std::optional<bool>{false},

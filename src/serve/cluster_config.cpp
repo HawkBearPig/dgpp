@@ -505,6 +505,7 @@ ClusterConfig parse_cluster_config(const std::string& json, const std::string& w
         else if (p.key == "prefix_pin_max_pct")
           e.prefix_pin_max_pct = static_cast<int>(integer(x, ek, what, 0, 100));
         else if (p.key == "prefix_head_snapshots") e.prefix_head_snapshots = boolean(x, ek, what);
+        else if (p.key == "prefix_partial_hits") e.prefix_partial_hits = boolean(x, ek, what);
         else if (p.key == "admission") {
           e.admission = text(x, ek, what);
           if (e.admission != "full" && e.admission != "grow")

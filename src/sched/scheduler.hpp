@@ -257,6 +257,9 @@ class SchedulerEngine {
     int step_tokens_max = 1;   // tokens one step may commit (2: the MTP step)
     bool prefill_lookahead = false;  // MTP prefill snapshots also depend on prompt[position]
     bool body_snapshots = true;      // extra snapshots must preserve the prefill's computation
+    // A request may open on the first tokens of a deeper entry: the engine
+    // takes an attach position inside the attach slot's own.
+    bool attach_within = false;
   };
   virtual PrefixInfo prefix_info() const { return {}; }
   // The hop (M7 under a multi-token step): the request's next step may
@@ -294,8 +297,10 @@ class SchedulerEngine {
   // The prefill with the cache: `boundaries` (absolute positions, ascending)
   // are the request's structural cut positions — the cold chunking cuts at
   // every chunk multiple and at the aligned image of each; attach_slot >= 0
-  // opens the slot from that arena entry (at attach_position tokens, one
-  // of the prompt's cuts) and prefills prompt[attach_position..] only;
+  // opens the slot from that arena entry (at attach_position tokens: the
+  // entry's own position at one of the prompt's cuts, or a position inside
+  // the entry on an engine whose prefix_info() declares attach_within) and
+  // prefills prompt[attach_position..] only;
   // snap_slot >= 0 asks for a snapshot into that arena slot when a chunk
   // ends at snap_position (a cut, > attach_position), reported in
   // snap_taken. body_snap_slot names an optional earlier document cut in
@@ -659,6 +664,13 @@ struct AdmissionPolicy {
   // hold at most this share of the arena's slots and of the NVMe slab's
   // pages; past it a pin protects nothing. 100: always.
   int prefix_pin_max_pct = 50;
+  // A prompt that parts from every entry before the entry's position opens
+  // on the tokens it shares with the nearest one, on an engine that declares
+  // attach_within: a client that edits the middle of a long prompt (a clock
+  // in its system prompt, retrieved notes ahead of the history) shares a
+  // prefix that ends inside a message, where no cut of the cold walk
+  // stands. The suffix then walks chunks the cold prefill would not have.
+  bool prefix_partial_hits = false;
   // Resolved admission policy. Serving resolves automatic admission from the
   // engine's execution capabilities; old journal records retain false.
   // Engines without a shared walk can pay for additional decode passes.
@@ -671,7 +683,7 @@ struct AdmissionPolicy {
            prefill_budget_automatic == o.prefill_budget_automatic &&
            prefill_early_admission == o.prefill_early_admission &&
            prefix_min_tokens == o.prefix_min_tokens && prefix_head_snapshots == o.prefix_head_snapshots &&
-           prefix_pin_max_pct == o.prefix_pin_max_pct;
+           prefix_pin_max_pct == o.prefix_pin_max_pct && prefix_partial_hits == o.prefix_partial_hits;
   }
   bool operator!=(const AdmissionPolicy& o) const { return !(*this == o); }
   static const char* name(Mode m) {
@@ -746,6 +758,7 @@ class Scheduler {
     int prefix_slots = 0;
     int prefix_entries = 0;
     int64_t prefix_hits = 0;
+    int64_t prefix_partial_hits = 0;  // of the hits, attaches inside an entry
     int64_t prefix_misses = 0;
     int64_t prefix_tokens_saved = 0;
     int64_t prefix_snapshots = 0;
@@ -936,6 +949,13 @@ class Scheduler {
     std::vector<uint64_t> cut_hashes;
     int attach_entry = -1;
     int64_t attach_position = 0;
+    // The deepest position the prompt shares inside a live entry, kept
+    // while it stands (plan_prefix asks at every tick the request waits and
+    // after every eviction made for it; the answer is a pass over the
+    // entries' ids): until an entry is inserted, or its own entry evicted.
+    mutable uint64_t shared_inserts = ~uint64_t{0};
+    mutable int64_t shared_evictions = -1;
+    mutable PrefixCache::Shared shared;
     int rolling_slot = -1;
     int64_t rolling_position = -1;
     int64_t hop_armed = -1;    // the aligned position armed for the next step
@@ -964,8 +984,8 @@ class Scheduler {
     int decode_passes = 0;
   };
   // The admission plan the cache proposes for a queued request: the entry
-  // to attach (or -1) and the position, and the cut a new entry would be
-  // taken at (0: none).
+  // to attach (or -1) and the position (the entry's own, or one inside it),
+  // and the cut a new entry would be taken at (0: none).
   struct PrefixPlan {
     int attach_entry = -1;
     int64_t attach_position = 0;
@@ -1016,6 +1036,7 @@ class Scheduler {
   // A miss explained at INFO: the cuts probed, the entries held, and where
   // the prompt parts from the entry it shares the most with.
   void log_prefix_miss(const Request& r) const;
+  void log_prefix_within(const Request& r, const PrefixPlan& plan) const;
   // The NVMe cold tier (issue #26). A memory entry worth keeping cold
   // spills as soon as it is inserted (up to the op bound; the tick's top
   // starts what the bound deferred), so it is busy — never evicted — from

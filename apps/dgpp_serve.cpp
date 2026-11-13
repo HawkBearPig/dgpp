@@ -1890,6 +1890,9 @@ int main(int argc, char** argv) {
       "    short prompt attaches to what exists but never takes a snapshot slot\n"
       "  [--prefix-head-snapshots | --no-prefix-head-snapshots (default on)]: a cold prompt\n"
       "    also keeps the cut at its first structural boundary (a long system prompt's end)\n"
+      "  [--prefix-partial-hits | --no-prefix-partial-hits (default on)]: a prompt that parts\n"
+      "    from every cached entry before the entry's position opens on the tokens it shares\n"
+      "    with the nearest one (families whose cache state is positional only)\n"
       "  bus (the prefill's bulk all-reduce): [--bulk-pace-gbps X]: sender\n"
       "    pacing per (peer, lane) queue pair (default: derived from the\n"
       "    port rate, port / ((world-1) x lanes) x 0.85; 0 = unpaced)\n"
@@ -1989,6 +1992,7 @@ int main(int argc, char** argv) {
   // and a cold prompt keeps the cut at its first structural boundary.
   int prefix_min_tokens = 1024;
   bool prefix_head_snapshots = true;
+  bool prefix_partial_hits = true;
   int prefix_pin_max_pct = 50;
   // The bulk collective's sender pacing (prefill all-reduces): negative
   // derives the per-QP rate from the port at bus start.
@@ -2204,6 +2208,7 @@ int main(int argc, char** argv) {
     prefill_early_admission_override = e.prefill_early_admission;
     prefix_min_tokens = e.prefix_min_tokens;
     prefix_head_snapshots = e.prefix_head_snapshots;
+    prefix_partial_hits = e.prefix_partial_hits;
     prefix_pin_max_pct = e.prefix_pin_max_pct;
     bulk_pace_gbps = e.bulk_pace_gbps;
     bulk_inflight = e.bulk_inflight;
@@ -2397,6 +2402,8 @@ int main(int argc, char** argv) {
     else if (a == "--prefix-min-tokens") prefix_min_tokens = std::stoi(next());
     else if (a == "--prefix-head-snapshots") prefix_head_snapshots = true;
     else if (a == "--no-prefix-head-snapshots") prefix_head_snapshots = false;
+    else if (a == "--prefix-partial-hits") prefix_partial_hits = true;
+    else if (a == "--no-prefix-partial-hits") prefix_partial_hits = false;
     else if (a == "--bulk-pace-gbps") bulk_pace_gbps = std::stod(next());
     else if (a == "--bulk-inflight") bulk_inflight = std::stoi(next());
     else if (a == "--world") world = std::stoi(next());
@@ -2592,7 +2599,7 @@ int main(int argc, char** argv) {
                "msad={} msss={} mdr={} mdt={} mvf={} dbr={} "
                "batchmin={} cand={} "
                "pcgib={} adm={} win={} pfbudget={} pfidle={} gapms={} ttftms={} pfhr={} pfgrow={} "
-               "pfrec={} pfstart={} pfifloor={} pfearly={} pmin={} phead={} pace={} inflight={} "
+               "pfrec={} pfstart={} pfifloor={} pfearly={} pmin={} phead={} ppin={} ppart={} pace={} inflight={} "
                "reasoning_in_content={} "
                "rs={} dflash={} dfw={} lk={} lkn={} lks={} lka={} lkt={} nvme={}",
                model_id.empty() ? ckpt : model_id, world, fabric_port, journal_port,
@@ -2615,7 +2622,8 @@ int main(int argc, char** argv) {
                prefill_early_admission_override.has_value()
                    ? (*prefill_early_admission_override ? 1 : 0)
                    : -1,
-               prefix_min_tokens, prefix_head_snapshots ? 1 : 0, prefix_pin_max_pct, bulk_pace_gbps,
+               prefix_min_tokens, prefix_head_snapshots ? 1 : 0, prefix_pin_max_pct,
+               prefix_partial_hits ? 1 : 0, bulk_pace_gbps,
                bulk_inflight, reasoning_in_content ? 1 : 0,
                rope_scaling
                    ? std::format("yarn:{}:{}:{}:{}:{}:{}", rope_scaling->factor,
@@ -2770,6 +2778,7 @@ int main(int argc, char** argv) {
         ws.prefill_early_admission = prefill_early_admission_override;
         ws.prefix_min_tokens = prefix_min_tokens;
         ws.prefix_head_snapshots = prefix_head_snapshots;
+        ws.prefix_partial_hits = prefix_partial_hits;
         ws.prefix_pin_max_pct = prefix_pin_max_pct;
         ws.bulk_pace_gbps = bulk_pace_gbps;
         ws.bulk_inflight = bulk_inflight;
@@ -2895,6 +2904,7 @@ int main(int argc, char** argv) {
         prefill_early_admission_override = ws.prefill_early_admission;
         prefix_min_tokens = ws.prefix_min_tokens;
         prefix_head_snapshots = ws.prefix_head_snapshots;
+        prefix_partial_hits = ws.prefix_partial_hits;
         prefix_pin_max_pct = ws.prefix_pin_max_pct;
         bulk_pace_gbps = ws.bulk_pace_gbps;
         bulk_inflight = ws.bulk_inflight;
@@ -3929,6 +3939,7 @@ int main(int argc, char** argv) {
     knobs.admission.prefill_latency = prefill_latency;
     knobs.admission.prefix_min_tokens = prefix_min_tokens;
     knobs.admission.prefix_head_snapshots = prefix_head_snapshots;
+    knobs.admission.prefix_partial_hits = prefix_partial_hits;
     knobs.admission.prefix_pin_max_pct = prefix_pin_max_pct;
     knobs.default_max_tokens = default_max_tokens;
     knobs.file_inputs = file_inputs;

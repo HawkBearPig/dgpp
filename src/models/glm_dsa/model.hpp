@@ -177,6 +177,9 @@ class GlmDsaModel : public SessionModel<GlmDsaModel> {
   Outputs run_rows(const RowRun& run);
   void reset_slot_state(int req);
   GlmSpecSegments spec_segments(int req, int snapshot_row0 = 0) const;
+  // The snapshot is the pool's blocks and the two counters: a request may
+  // open on the first tokens of a deeper one.
+  bool attaches_within_snapshot() const { return true; }
   size_t snapshot_state_bytes() const { return kSnapshotStamp; }
   size_t draft_state_bytes() const { return 0; }
   void write_state_snapshot(int req, uint8_t* dst, int spec_row);

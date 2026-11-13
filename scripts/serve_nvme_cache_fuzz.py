@@ -27,8 +27,11 @@ clean restart, then brings the world down and up — the slab's adoption must
 then agree on every rank or start fresh everywhere, and every answer
 restored afterwards must still equal its first.
 
-With more than one client the transcript check is advisory (reported, not
-a finding) unless `--strict-transcripts`: readers in flight together share
+With more than one client, or on a world that attaches inside cached entries
+(`engine.prefix_partial_hits` on a family that supports it), the transcript
+check is advisory (reported, not a finding) unless `--strict-transcripts`:
+a hit inside an entry starts its suffix where the prompts part, and
+readers in flight together share
 the prefill budget, so a prompt's chunks shrink to 512, 256 or 128 tokens
 and its cold walk's arithmetic differs from the solo walk's (the DSA
 sites are not split-invariant) — the same answer variance as the first
@@ -118,10 +121,16 @@ def main():
     ap.add_argument("--strict-transcripts", action="store_true",
                     help="count transcript mismatches as findings even with several clients")
     args = ap.parse_args()
-    strict = args.clients <= 1 or args.strict_transcripts
     advisory = []
     rng = random.Random(args.seed)
     model = served_model(args.host, args.port)
+    # A hit inside an entry starts its suffix where the prompts part, so a
+    # repeat can walk other chunks than the first answer's walk did.
+    partial_hits = bool(chk.metrics(args.host, args.port).get("prefix_cache", {}).get("partial_hits_on"))
+    strict = (args.clients <= 1 and not partial_hits) or args.strict_transcripts
+    if partial_hits and not args.strict_transcripts:
+        print("NOTE: the world attaches inside cached entries (engine.prefix_partial_hits); transcript "
+              "mismatches are advisory, as under several clients", flush=True)
     adm = chk.metrics(args.host, args.port)["service"]["admission"]
     if "nvme_cache" not in chk.metrics(args.host, args.port):
         print("NOTE: the world has no NVMe cache; running as a plain workload (service checks only)", flush=True)
@@ -215,7 +224,13 @@ def main():
         f.result()
     pool.shutdown()
     steps.sort(key=lambda s: s["n"])
+    # A request its client dropped retires at the server's next pass or
+    # prefill chunk: give the service a moment before judging it stuck.
+    settle_by = time.time() + 60
     m = chk.metrics(args.host, args.port)
+    while (m["scheduler"].get("active", 0) or m["scheduler"].get("queued", 0)) and time.time() < settle_by:
+        time.sleep(1)
+        m = chk.metrics(args.host, args.port)
     nv = m.get("nvme_cache", {})  # the driver also serves as a plain workload on a world without the tier
     tier_ok = nv.get("spill_failed", 0) == 0 and nv.get("restore_failed", 0) == 0 and nv.get("failures", 0) == 0 \
         and nv.get("pages_used", 0) <= nv.get("pages_total", 0)
@@ -231,7 +246,7 @@ def main():
                          "engine_failed": m["service"].get("engine_failed")})
     print(f"\n{args.requests} requests, {repeats} repeats checked, {cancelled} cancelled, {restarts} restarts "
           f"({crashes} crashes), {len(findings)} finding(s)" +
-          (f", {len(advisory)} transcript mismatch(es) advisory under {args.clients} clients" if advisory else ""))
+          (f", {len(advisory)} transcript mismatch(es) advisory" if advisory else ""))
     print("nvme_cache:", {k: nv.get(k) for k in ("entries", "spills", "spilled", "restores", "restored", "spill_failed",
                                                  "restore_failed", "evictions", "pinned", "adopted", "pages_used",
                                                  "pages_total")})

@@ -433,6 +433,7 @@ std::string encode_journal_warm(const dgpp::sched::AdmissionPolicy& policy,
   if (policy.prefill_early_admission) out += ",\"pfearly\":1";
   if (policy.prefix_min_tokens > 0) out += ",\"pmin\":" + std::to_string(policy.prefix_min_tokens);
   if (policy.prefix_head_snapshots) out += ",\"phead\":1";
+  if (policy.prefix_partial_hits) out += ",\"ppart\":1";
   if (policy.prefix_pin_max_pct != 50) out += ",\"ppin\":" + std::to_string(policy.prefix_pin_max_pct);
   if (!config_digest.empty()) {
     out += ",\"cfg\":";
@@ -472,6 +473,7 @@ std::string encode_journal_settings(const WorldSettings& s) {
   else if (*s.prefill_early_admission) out += ",\"pfearly\":1";
   if (s.prefix_min_tokens > 0) out += ",\"pmin\":" + std::to_string(s.prefix_min_tokens);
   if (s.prefix_head_snapshots) out += ",\"phead\":1";
+  if (s.prefix_partial_hits) out += ",\"ppart\":1";
   if (s.prefix_pin_max_pct != 50) out += ",\"ppin\":" + std::to_string(s.prefix_pin_max_pct);
   out += std::format(",\"win\":{},\"pace\":{:.17g},\"inflight\":{},\"rdv\":{},\"stats\":{:.17g},\"ric\":{},\"kvdt\":",
       s.admission_window, s.bulk_pace_gbps, s.bulk_inflight, s.rendezvous_timeout_ms,
@@ -770,6 +772,7 @@ JournalRecord decode_journal_line(std::string_view line) {
       s.prefix_min_tokens = static_cast<int>(pmin->as_int());
     }
     if (v.find("phead")) s.prefix_head_snapshots = flag("phead");
+    if (v.find("ppart")) s.prefix_partial_hits = flag("ppart");
     if (const auto* ppin = v.find("ppin")) {
       if (!ppin->is_number() || ppin->as_int() < 0 || ppin->as_int() > 100)
         throw std::runtime_error("journal: settings record with a bad prefix pin cap");
@@ -1040,6 +1043,11 @@ JournalRecord decode_journal_line(std::string_view line) {
         if (!phead->is_number() || (phead->as_int() != 0 && phead->as_int() != 1))
           throw std::runtime_error("journal: warm record with a bad head-cut flag");
         rec.admission.prefix_head_snapshots = phead->as_int() == 1;
+      }
+      if (const auto* ppart = v.find("ppart")) {
+        if (!ppart->is_number() || (ppart->as_int() != 0 && ppart->as_int() != 1))
+          throw std::runtime_error("journal: warm record with a bad partial-hit flag");
+        rec.admission.prefix_partial_hits = ppart->as_int() == 1;
       }
       if (const auto* ppin = v.find("ppin")) {
         if (!ppin->is_number() || ppin->as_int() < 0 || ppin->as_int() > 100)

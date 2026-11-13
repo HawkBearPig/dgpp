@@ -45,6 +45,7 @@
 #include "models/mimo/config.hpp"
 #include "kernels/latent_format.hpp"
 #include "models/mimo/forward.hpp"
+#include "attach_within_gate.hpp"
 #include "mimo_fixture.hpp"
 
 namespace fs = std::filesystem;
@@ -659,6 +660,14 @@ int run_fixture(const std::string& dir) {
     require(agree >= 8, "fp8 pool: fewer than eight greedy picks agree with the bf16 pool");
     require(worst < 0.1, "fp8 pool: relative l2 over the fp8 cache's budget on the agreeing rows");
     std::printf("[ OK ] the fp8 K/V pool decodes within the format's budget of the bf16 pool\n");
+  }
+  // The prefix cache's hit inside an entry (the shared gate).
+  for (const bool mtp : {false, true}) {
+    MimoModel w(cfg, dir, /*max_tokens=*/64, /*max_cache_tokens=*/4096, MimoResidency::Resident, nullptr, 0, 1,
+            /*max_requests=*/3, mtp);
+    const auto tokens = [&](int n, uint64_t seed) { return smoke_tokens(cfg, n, seed); };
+    dgpp::test::attach_within_gate(w, tokens, cfg.vocab_size, mtp, "mimo");
+    dgpp::test::attach_within_decode_gate(w, tokens, cfg.vocab_size, mtp, "mimo");
   }
   std::printf("[ OK ] mimo_decode_test\n");
   return 0;

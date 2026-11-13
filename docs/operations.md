@@ -945,7 +945,12 @@ prefill at the prompt's first structural boundary past its start (a long
 system prompt's end), where the next conversation under that prompt or the
 turn after a client-side compaction attaches. Both are world settings pushed
 to every peer; `/v1/metrics` shows them under `prefix_cache` as `min_tokens`
-and `head_cuts`, with `head_snapshots` counting the head entries taken. See
+and `head_cuts`, with `head_snapshots` counting the head entries taken.
+`engine.prefix_partial_hits` (`--prefix-partial-hits`,
+`--no-prefix-partial-hits`, default on) lets a prompt that differs from every
+entry before a stored position open on the tokens it shares with the nearest
+one, on model families whose cached state is the KV rows alone. `/v1/metrics`
+counts those admissions as `partial_hits`. See
 [the sizing guide](prefix-cache.md).
 
 Unfinished prefills share the selected budget in deterministic arrival order,

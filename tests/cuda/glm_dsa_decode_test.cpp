@@ -38,6 +38,7 @@
 #include "engine/speculative.hpp"
 #include "models/glm_dsa/config.hpp"
 #include "models/glm_dsa/model.hpp"
+#include "attach_within_gate.hpp"
 
 namespace fs = std::filesystem;
 using dgpp::GlmDsaModel;
@@ -610,6 +611,14 @@ int run_fixture(const std::string& dir) {
       d.session_close(1);
     }
     std::printf("[ OK ] the eager speculator reproduces the greedy transcript through the draft block\n");
+  }
+  // 8. The prefix cache's hit inside an entry, without and with the draft block.
+  for (const bool mtp : {false, true}) {
+    GlmDsaModel w(cfg, dir, /*max_tokens=*/64, /*max_cache_tokens=*/4096, GlmDsaResidency::Resident, nullptr, 0, 1,
+                  /*max_requests=*/3, mtp);
+    const auto tokens = [&](int n, uint64_t seed) { return smoke_tokens(cfg, n, seed); };
+    dgpp::test::attach_within_gate(w, tokens, cfg.vocab_size, mtp, "glm_dsa");
+    dgpp::test::attach_within_decode_gate(w, tokens, cfg.vocab_size, mtp, "glm_dsa");
   }
   std::printf("[ OK ] glm_dsa_decode_test\n");
   return 0;

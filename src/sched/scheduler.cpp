@@ -282,6 +282,26 @@ Scheduler::PrefixPlan Scheduler::plan_prefix(const Request& r) const {
     plan.attach_entry = e;
     plan.attach_position = cache_.entry(e).position;
   }
+  // An entry at none of the prompt's cuts still holds the cache rows of
+  // every token the two share (2026-11-13: 37 of a deployment's 83 requests
+  // prefilled cold beside an entry that shared 1.7K to 12.4K of their first
+  // tokens, 37 % of all the prompt tokens it computed; the prompts parted
+  // from the entries inside a message). Deeper than the cut's entry, and at
+  // least one block: below that nothing comes by reference.
+  if (policy_.prefix_partial_hits && prefix_info_.attach_within) {
+    const uint64_t inserts = cache_.inserts();
+    const int64_t evictions = cache_.stats().evictions;
+    if (r.shared_inserts != inserts ||
+        (r.shared_evictions != evictions && r.shared.entry >= 0 && !cache_.entry(r.shared.entry).live))
+      r.shared = cache_.shared(r.spec.prompt, r.cache_images);
+    r.shared_inserts = inserts;
+    r.shared_evictions = evictions;
+    if (r.shared.entry >= 0 && r.shared.position > plan.attach_position &&
+        r.shared.position >= std::max<int64_t>(1, prefix_info_.block_tokens)) {
+      plan.attach_entry = r.shared.entry;
+      plan.attach_position = r.shared.position;
+    }
+  }
   // No entry below the policy's floor: a short prompt attaches to what
   // exists but never takes a slot (the single-Spark replay of 2026-09-28:
   // three 45-token probes per turn pushed a 66K conversation out of a
@@ -698,9 +718,10 @@ void Scheduler::admit(int arrival) {
     }
   } else {
     // The prefix cache's plan (M7): attach to the deepest matching entry at
-    // one of the prompt's cuts, and save the deepest cut plus an earlier
-    // document cut for long prompts. The deepest cut gets an arena slot
-    // first; a full arena may skip the extra snapshot.
+    // one of the prompt's cuts, or deeper inside an entry the prompt shares
+    // more with, and save the deepest cut plus an earlier document cut for
+    // long prompts. The deepest cut gets an arena slot first; a full arena
+    // may skip the extra snapshot.
     const PrefixPlan plan = plan_prefix(r);
     const std::vector<int64_t> cuts = cut_boundaries(r);
     SchedulerEngine::PrefixPrefill pp;
@@ -713,10 +734,11 @@ void Scheduler::admit(int arrival) {
       // the arena full, was this very entry (the curve sweep's find of
       // 2026-09-05: "PrefixArena: slot 25 is empty" — the victim's slot came
       // back as the snapshot slot, and the prefill attached to nothing).
-      cache_.attach(plan.attach_entry, ticks_);
+      cache_.attach(plan.attach_entry, ticks_, "", plan.attach_position);
       if (const int d = cache_.entry(plan.attach_entry).disk; d >= 0) disk_.touch(d, ticks_);
       pp.attach_slot = cache_.entry(plan.attach_entry).slot;
       pp.attach_position = plan.attach_position;
+      log_prefix_within(r, plan);
     }
     if (plan.snap_position > 0) {
       snap_slot = acquire_arena_slot(r.spec.id);
@@ -789,13 +811,14 @@ void Scheduler::begin_prefill(int arrival, int64_t budget) {
     if (cache_on(r)) {
       const PrefixPlan plan = plan_prefix(r);
       if (plan.attach_entry >= 0) {
-        cache_.attach(plan.attach_entry, ticks_);
+        cache_.attach(plan.attach_entry, ticks_, "", plan.attach_position);
         if (const int d = cache_.entry(plan.attach_entry).disk; d >= 0) disk_.touch(d, ticks_);
         r.attach_entry = plan.attach_entry;
         r.attach_position = plan.attach_position;
         pp.attach_slot = cache_.entry(plan.attach_entry).slot;
         pp.attach_position = plan.attach_position;
         emit_prefix(r.spec.id, "attach", plan.attach_position, pp.attach_slot);
+        log_prefix_within(r, plan);
       } else {
         ++cache_.stats().misses;
         log_prefix_miss(r);
@@ -2001,6 +2024,7 @@ Scheduler::Meters Scheduler::meters() const {
   m.prefix_slots = cache_.slots();
   m.prefix_entries = cache_.live_entries();
   m.prefix_hits = cache_.stats().hits;
+  m.prefix_partial_hits = cache_.stats().partial_hits;
   m.prefix_misses = cache_.stats().misses;
   m.prefix_tokens_saved = cache_.stats().tokens_saved;
   m.prefix_snapshots = cache_.stats().snapshots;
@@ -2125,6 +2149,18 @@ int Scheduler::acquire_arena_slot(const std::string& id) {
 void Scheduler::free_arena_slot(int slot) {
   engine_->prefix_release(slot);
   cache_.give_back_slot(slot);
+}
+
+// An attach inside an entry, at INFO beside the miss it replaces: where the
+// request opened and how deep the entry it opened on stands.
+void Scheduler::log_prefix_within(const Request& r, const PrefixPlan& plan) const {
+  if (plan.attach_entry < 0) return;
+  const PrefixCache::Entry& e = cache_.entry(plan.attach_entry);
+  if (plan.attach_position >= e.position) return;
+  DGPP_LOG_INFO(
+      "sched: request '{}' prefix cache hit inside an entry — opened at {} of the prompt's {} "
+      "tokens on the entry at position {}",
+      r.spec.id, plan.attach_position, r.spec.prompt.size(), e.position);
 }
 
 // A miss, explained at INFO: the live log of an agent session
