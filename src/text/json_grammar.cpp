@@ -1888,6 +1888,19 @@ bool JsonMachine::extended_constraints_live() const {
   return false;
 }
 
+#if defined(DGPP_JSON_FREE_STRING_MASK)
+bool JsonMachine::unconstrained_value_string() const {
+  // Container enums retain the spelling of nested strings. Keys and escape
+  // states stay on the trie path, as does any constrained cursor in an anyOf.
+  if (!alive_ || !schema_ || schema_->container_enums || cursors_.empty() ||
+      lexer_.state() != JsonLexer::State::kInString || lexer_.in_escape())
+    return false;
+  for (const Cursor& c : cursors_)
+    if (c.dead || c.string_node >= 0 || c.target_node >= 0 || c.bound_node >= 0) return false;
+  return true;
+}
+#endif
+
 bool JsonMachine::bounds_live_here(bool value_start) const {
   for (const Cursor& c : cursors_) {
     if (!value_start) {
@@ -1984,7 +1997,11 @@ void JsonMachine::mask_brute_force(const GrammarVocab& vocab, TokenMask* out) co
 void JsonMachine::mask(const GrammarVocab& vocab, TokenMask* out) const {
   // Content constraints cannot use the structural representatives. Traverse
   // the vocabulary trie instead, evaluating each shared byte prefix once.
-  if (extended_constraints_live()) {
+  if (extended_constraints_live()
+#if defined(DGPP_JSON_FREE_STRING_MASK)
+      && !unconstrained_value_string()
+#endif
+  ) {
     out->vocab = vocab.vocab_size();
     out->words.assign(static_cast<size_t>(tables_->words()), 0u);
     out->allowed = 0;
@@ -1997,7 +2014,16 @@ void JsonMachine::mask(const GrammarVocab& vocab, TokenMask* out) const {
         if (next.feed(byte)) self(self, child, next);
       }
     };
+#if defined(DGPP_JSON_FREE_STRING_MASK)
+    // Trie descendants only feed bytes; they never use the table-mask cache.
+    // A preceding free string can populate it. Do not copy those answer vectors
+    // at every trie edge, and retain the caller's cache for its next mask.
+    JsonMachine root = *this;
+    root.cache_ = Cache{};
+    visit(visit, 0, root);
+#else
     visit(visit, 0, *this);
+#endif
     out->allowed = popcount(out->words);
     return;
   }
