@@ -259,7 +259,7 @@ struct ServeGraphEngine {
   // The scheduled verify depth (engine/verify_schedule.hpp), before the
   // warm capture; throws for a family without a confidence head.
   virtual void configure_verify_schedule(bool on, float row_ms, float lambda, int min_depth, float base_ms,
-                                         bool adapt, int max_options) = 0;
+                                         bool adapt, int max_options, int max_live) = 0;
   // The sampled requests' draft rule (engine.mtp_draft), before the warm capture.
   virtual void set_proposal_drafts(bool on) = 0;
   // engine.mtp_draft_temperature: the drawn drafts' temperature as a fraction of the request's.
@@ -286,8 +286,8 @@ struct ServeGraphEngineOf final : ServeGraphEngine {
   dgpp::sched::SchedulerEngine* engine() override { return &eng; }
   void warm_captures(const std::vector<int64_t>& p) override { eng.warm_captures(p); }
   void configure_verify_schedule(bool on, float row_ms, float lambda, int min_depth, float base_ms,
-                                 bool adapt, int max_options) override {
-    eng.configure_verify_schedule(on, row_ms, lambda, min_depth, base_ms, adapt, max_options);
+                                 bool adapt, int max_options, int max_live) override {
+    eng.configure_verify_schedule(on, row_ms, lambda, min_depth, base_ms, adapt, max_options, max_live);
   }
   void set_proposal_drafts(bool on) override { eng.set_proposal_drafts(on); }
   void set_proposal_temperature_scale(float scale) override { eng.set_proposal_temperature_scale(scale); }
@@ -1860,6 +1860,8 @@ int main(int argc, char** argv) {
       "      [--mtp-schedule-row-ms X (8)] [--mtp-schedule-base-ms X (28)]\n"
       "      [--mtp-schedule-lambda X (0 = 1/(base+row) tok/ms)]\n"
       "      [--mtp-schedule-min-depth N (1)]\n"
+      "      [--mtp-schedule-max-live N (0 = no limit): past N live requests a\n"
+      "        step verifies and drafts the minimum depth only]\n"
       "      [--mtp-schedule-sampled-scale X (0.93; 0 = sampled requests verify\n"
       "        the whole block): a sampled request's acceptance as a fraction of\n"
       "        the confidence head's, with argmax drafts (--mtp-draft greedy)]\n"
@@ -2017,6 +2019,7 @@ int main(int argc, char** argv) {
   double mtp_schedule_lambda = 0.0;  // 0: the reservation rate 1 / (base + row)
   int mtp_schedule_min_depth = 1;
   int mtp_schedule_options = 0;  // engine.mtp_schedule_options: at most this many scheduled depths (0: the budget's count)
+  int mtp_schedule_max_live = 0;  // engine.mtp_schedule_max_live: past this many live requests a step verifies and drafts the minimum depth only (0: no limit)
   bool mtp_schedule_adapt = true;  // lambda follows the modeled throughput (floored at the configured lambda)
   double mtp_schedule_sampled_scale = 0.93;  // engine.mtp_schedule_sampled_scale
   std::string mtp_draft = "auto";  // engine.mtp_draft: auto | sampled | greedy
@@ -2167,6 +2170,7 @@ int main(int argc, char** argv) {
     mtp_schedule_lambda = e.mtp_schedule_lambda;
     mtp_schedule_min_depth = e.mtp_schedule_min_depth;
     mtp_schedule_options = e.mtp_schedule_options;
+    mtp_schedule_max_live = e.mtp_schedule_max_live;
     mtp_schedule_adapt = e.mtp_schedule_adapt;
     mtp_schedule_sampled_scale = e.mtp_schedule_sampled_scale;
     mtp_draft = e.mtp_draft;
@@ -2349,6 +2353,7 @@ int main(int argc, char** argv) {
     else if (a == "--mtp-schedule-lambda") mtp_schedule_lambda = std::stod(next());
     else if (a == "--mtp-schedule-min-depth") mtp_schedule_min_depth = std::stoi(next());
     else if (a == "--mtp-schedule-options") mtp_schedule_options = std::stoi(next());
+    else if (a == "--mtp-schedule-max-live") mtp_schedule_max_live = std::stoi(next());
     else if (a == "--mtp-schedule-adapt") mtp_schedule_adapt = true;
     else if (a == "--mtp-schedule-fixed-lambda") mtp_schedule_adapt = false;
     else if (a == "--mtp-schedule-sampled-scale") mtp_schedule_sampled_scale = std::stod(next());
@@ -2595,7 +2600,7 @@ int main(int argc, char** argv) {
                "pfw={} dcw={} ctr={} pdl={} dlp={} dkv={} "
                "emsh={} maxtok={} queue={} "
                "eos={} graph={} compact={} mtp={} mtpd={} mss={} msrow={} msbase={} mslam={} "
-               "msmin={} msopt={} "
+               "msmin={} msopt={} msml={} "
                "msad={} msss={} mdr={} mdt={} mvf={} dbr={} "
                "batchmin={} cand={} "
                "pcgib={} adm={} win={} pfbudget={} pfidle={} gapms={} ttftms={} pfhr={} pfgrow={} "
@@ -2612,7 +2617,7 @@ int main(int argc, char** argv) {
                queue_limit, no_eos ? 0 : 1, decode_graph ? 1 : 0, compact_batches ? 1 : 0,
                mtp ? 1 : 0, mtp_depth, mtp_schedule ? 1 : 0, mtp_schedule_row_ms,
                mtp_schedule_base_ms, mtp_schedule_lambda, mtp_schedule_min_depth,
-               mtp_schedule_options, mtp_schedule_adapt ? 1 : 0, mtp_schedule_sampled_scale,
+               mtp_schedule_options, mtp_schedule_max_live, mtp_schedule_adapt ? 1 : 0, mtp_schedule_sampled_scale,
                mtp_draft, mtp_draft_temperature, mtp_verify, dflash_batch_rows,
                effective_batch_min_live, sampling_candidates, prefix_cache_gib, admission_mode,
                admission_window, prefill_budget_tokens, prefill_idle_budget_tokens,
@@ -2753,6 +2758,7 @@ int main(int argc, char** argv) {
         ws.mtp_schedule_lambda = mtp_schedule_lambda;
         ws.mtp_schedule_min_depth = mtp_schedule_min_depth;
         ws.mtp_schedule_options = mtp_schedule_options;
+        ws.mtp_schedule_max_live = mtp_schedule_max_live;
         ws.mtp_schedule_adapt = mtp_schedule_adapt;
         ws.mtp_schedule_sampled_scale = mtp_schedule_sampled_scale;
         ws.mtp_draft = mtp_draft;
@@ -2879,6 +2885,7 @@ int main(int argc, char** argv) {
         mtp_schedule_lambda = ws.mtp_schedule_lambda;
         mtp_schedule_min_depth = ws.mtp_schedule_min_depth;
         mtp_schedule_options = ws.mtp_schedule_options;
+        mtp_schedule_max_live = ws.mtp_schedule_max_live;
         mtp_schedule_adapt = ws.mtp_schedule_adapt;
         mtp_schedule_sampled_scale = ws.mtp_schedule_sampled_scale;
         mtp_draft = ws.mtp_draft;
@@ -3288,9 +3295,11 @@ int main(int argc, char** argv) {
   // min_depth past it).
   if (mtp_schedule && (!(mtp_schedule_row_ms > 0.0) || mtp_schedule_base_ms < 0.0 || mtp_schedule_lambda < 0.0 ||
                        mtp_schedule_min_depth < 1 || (dflash_model.empty() && mtp_schedule_min_depth > mtp_depth) ||
-                       mtp_schedule_options < 0 || mtp_schedule_options > 6)) {
-    DGPP_LOG_ERROR("--mtp-schedule: row_ms > 0, base_ms >= 0, lambda >= 0, min_depth in [1, the draft width] and options in [0, 6] (got {}, {}, {}, {}, {})",
-                   mtp_schedule_row_ms, mtp_schedule_base_ms, mtp_schedule_lambda, mtp_schedule_min_depth, mtp_schedule_options);
+                       mtp_schedule_options < 0 || mtp_schedule_options > 6 ||
+                       mtp_schedule_max_live < 0 || mtp_schedule_max_live > 64)) {
+    DGPP_LOG_ERROR("--mtp-schedule: row_ms > 0, base_ms >= 0, lambda >= 0, min_depth in [1, the draft width], options in [0, 6] and max_live in [0, 64] (got {}, {}, {}, {}, {}, {})",
+                   mtp_schedule_row_ms, mtp_schedule_base_ms, mtp_schedule_lambda, mtp_schedule_min_depth, mtp_schedule_options,
+                   mtp_schedule_max_live);
     return 2;
   }
   if (!(mtp_schedule_sampled_scale >= 0.0 && mtp_schedule_sampled_scale <= 1.0)) {
@@ -4186,7 +4195,7 @@ int main(int argc, char** argv) {
             graph_engine->configure_verify_schedule(true, static_cast<float>(mtp_schedule_row_ms), lambda,
                                                     mtp_schedule_min_depth,
                                                     static_cast<float>(mtp_schedule_base_ms), mtp_schedule_adapt,
-                                                    mtp_schedule_options);
+                                                    mtp_schedule_options, mtp_schedule_max_live);
           }
           // Record every graph variant now, on every rank at this same
           // point, so no capture pauses a live stream later. The warm-up

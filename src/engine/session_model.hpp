@@ -2020,7 +2020,10 @@ template <class D>
 void SessionModel<D>::session_graph_capture_next_tokens(int req,
                                                         const std::vector<const PickVerdict*>& draft_verdicts) {
   check_req(req, "session_graph_capture_next_tokens");
-  if (draft_verdicts.size() == 1) {
+  // One draft into a two-row feed is the fixed depth-1 form. One draft into a
+  // wider feed (the scheduled verify depth's narrow variant) writes the
+  // feed's prefix below.
+  if (draft_verdicts.size() == 1 && (graph_feed_rows_ > 0 ? graph_feed_rows_ : decode_rows_) == 2) {
     session_graph_capture_next_tokens(req, draft_verdicts[0]);
     return;
   }
@@ -2029,9 +2032,12 @@ void SessionModel<D>::session_graph_capture_next_tokens(int req,
   if (draft_verdicts.empty() || draft_verdicts.size() > static_cast<size_t>(kSpecMaxDrafts))
     throw std::invalid_argument("session_graph_capture_next_tokens: draft count");
   // The feed carries every draft of the block whatever the verify's rows.
+  // A replay that drafts fewer (the narrow variant) writes [next, draft_1 ..
+  // draft_m]; the rows past them keep an older step's tokens, which the
+  // engine does not verify (its count of the drafts available).
   const int feed_rows = graph_feed_rows_ > 0 ? graph_feed_rows_ : decode_rows_;
-  if (feed_rows != 1 + static_cast<int>(draft_verdicts.size()))
-    throw std::logic_error("session_graph_capture_next_tokens: the token feed is [next, draft_1 .. draft_n] (T = 1 + n)");
+  if (feed_rows < 1 + static_cast<int>(draft_verdicts.size()))
+    throw std::logic_error("session_graph_capture_next_tokens: the token feed is [next, draft_1 .. draft_n] (T >= 1 + n)");
   GlmSpecDrafts d;
   for (size_t i = 0; i < draft_verdicts.size(); ++i) {
     if (draft_verdicts[i] == nullptr) throw std::invalid_argument("session_graph_capture_next_tokens: null verdict");
@@ -2188,9 +2194,9 @@ void SessionModel<D>::session_graph_capture_next_tokens_batch(const std::vector<
   // The feeds carry every draft of the block whatever the verify's rows
   // (the reduced-depth batch verified a prefix off the compacted copy).
   const int feed_rows = graph_feed_rows_ > 0 ? graph_feed_rows_ : graph_rows_per_request_;
-  if (feed_rows != 1 + static_cast<int>(draft_verdicts.size()))
+  if (feed_rows < 1 + static_cast<int>(draft_verdicts.size()))  // fewer drafts: the narrow variant writes a prefix
     throw std::logic_error(
-        "session_graph_capture_next_tokens_batch: the token feed is [next, draft_1 .. draft_n] per request (T = 1 + n)");
+        "session_graph_capture_next_tokens_batch: the token feed is [next, draft_1 .. draft_n] per request (T >= 1 + n)");
   GlmSpecDrafts d;
   for (size_t i = 0; i < draft_verdicts.size(); ++i) {
     if (draft_verdicts[i] == nullptr)

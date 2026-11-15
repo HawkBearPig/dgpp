@@ -618,7 +618,7 @@ struct SchedOutcome {
 
 void rank_work_sched(int r, const GlmDsaTextConfig& cfg, const std::string& dir, const std::vector<int64_t>& A,
                      const std::vector<int64_t>& B, const std::vector<int64_t>& C, CollectiveBus* bus,
-                     ConstructBarrier* barrier, SchedOutcome* out) {
+                     ConstructBarrier* barrier, SchedOutcome* out, int max_live = 0) {
   bool arrived = false;
   const auto arrive_once = [&] {
     if (arrived) return;
@@ -653,7 +653,8 @@ void rank_work_sched(int r, const GlmDsaTextConfig& cfg, const std::string& dir,
                                           /*batch_min_live=*/2, prefix_scratch, gather_scratch,
                                           dgpp::kSamplingCandidates, nullptr, 0, /*mtp_depth=*/depth);
       require(eng.supports_sampling(), "the world has the device sampler (the draft probabilities' source)");
-      eng.configure_verify_schedule(true, /*row_ms=*/12.0f, dgpp::verify_reservation_lambda(50.0f, 12.0f), 1);
+      eng.configure_verify_schedule(true, /*row_ms=*/12.0f, dgpp::verify_reservation_lambda(50.0f, 12.0f), 1,
+                                    /*base_ms=*/0.f, /*adapt=*/false, /*max_options=*/0, max_live);
       out->options = eng.verify_depth_options();
       int step = 0;
       eng.set_verify_depth_hook([&](int, int, const float*, int) { return 1 + (step++ % 2); });
@@ -735,7 +736,7 @@ DGPP_TEST(glm_dsa_engines_loopback_world_2_scheduled_verify_depth_from_draft_pro
   std::vector<std::thread> workers;
   for (int r = 0; r < kWorld; ++r)
     workers.emplace_back(rank_work_sched, r, std::cref(cfg), std::cref(dir), std::cref(A), std::cref(B), std::cref(C),
-                         buses[static_cast<size_t>(r)].get(), &barrier, &outs[static_cast<size_t>(r)]);
+                         buses[static_cast<size_t>(r)].get(), &barrier, &outs[static_cast<size_t>(r)], /*max_live=*/0);
   for (auto& t : workers) t.join();
   for (int r = 0; r < kWorld; ++r) require(outs[static_cast<size_t>(r)].error.empty(), outs[static_cast<size_t>(r)].error);
   for (int r = 1; r < kWorld; ++r)
@@ -763,6 +764,57 @@ DGPP_TEST(glm_dsa_engines_loopback_world_2_scheduled_verify_depth_from_draft_pro
   require(total == static_cast<uint64_t>(o.steps_a + o.steps_b_alone) && btotal == static_cast<uint64_t>(o.steps_batch),
           "the histograms count every replay");
   require(o.steps_b_alone > 0, "B stepped alone after the batch over the batch's published draft probabilities");
+}
+
+// engine.mtp_schedule_max_live 1: a step with more than one live request
+// takes the narrow option (one draft verified AND drafted, the fixed
+// depth-1 replay), whatever the policy or the hook asks; the step after it
+// has one draft to verify, so a forced whole block verifies one; and a
+// request alone is scheduled as before. Every transcript is the plain eager
+// engine's.
+DGPP_TEST(glm_dsa_engines_loopback_world_2_scheduled_verify_depth_narrows_past_one_live_request) {
+  const GlmDsaTextConfig cfg = glmdsafx::tiny_config();
+  const std::string dir = "glm_dsa_engine_fixture";
+  glmdsafx::write_fixture(cfg, dir);
+  const std::vector<int64_t> A = smoke_tokens(cfg, 23, 0x9E3779B97F4A7C15ull);
+  const std::vector<int64_t> B = smoke_tokens(cfg, 17, 0xD1B54A32D192ED03ull);
+  const std::vector<int64_t> C = smoke_tokens(cfg, 11, 0x2545F4914F6CDD1Dull);
+  std::vector<std::unique_ptr<CollectiveBus>> buses = start_world(kWorld, kPort + 12);
+  require(!buses.empty(), "the loopback bus world failed to start");
+  std::vector<SchedOutcome> outs(kWorld);
+  ConstructBarrier barrier(kWorld);
+  std::vector<std::thread> workers;
+  for (int r = 0; r < kWorld; ++r)
+    workers.emplace_back(rank_work_sched, r, std::cref(cfg), std::cref(dir), std::cref(A), std::cref(B), std::cref(C),
+                         buses[static_cast<size_t>(r)].get(), &barrier, &outs[static_cast<size_t>(r)], /*max_live=*/1);
+  for (auto& t : workers) t.join();
+  for (int r = 0; r < kWorld; ++r) require(outs[static_cast<size_t>(r)].error.empty(), outs[static_cast<size_t>(r)].error);
+  for (int r = 1; r < kWorld; ++r)
+    require(outs[static_cast<size_t>(r)].sa == outs[0].sa && outs[static_cast<size_t>(r)].sb == outs[0].sb &&
+                outs[static_cast<size_t>(r)].sc == outs[0].sc && outs[static_cast<size_t>(r)].hist == outs[0].hist,
+            "the ranks' narrowed transcripts or depths differ");
+  const Ref ref = world1_reference(cfg, dir, A, B, C);
+  const SchedOutcome& o = outs[0];
+  std::string hist, bhist;
+  for (size_t i = 0; i < o.hist.size(); ++i)
+    hist += (i ? " " : "") + std::to_string(o.options[i]) + ":" + std::to_string(o.hist[i]);
+  for (size_t i = 0; i < o.batch_hist.size(); ++i)
+    bhist += (i ? " " : "") + std::to_string(o.options[i]) + ":" + std::to_string(o.batch_hist[i]);
+  DGPP_LOG_INFO("world 2 scheduled depth, one live request at most: options {} | A {} ({} steps) | B {} | C {} | scalar [{}] | batched [{}]",
+                ids_text(o.options), ids_text(o.sa), o.steps_a, ids_text(o.sb), ids_text(o.sc), hist, bhist);
+  require(o.options == std::vector<int>{1, 1, 2}, "the narrow option stands before the policy's two");
+  require(o.sa == o.ea, "the scheduled scalar transcript of A differs from the plain eager engine's");
+  engine_ties::require_agrees_or_tie(o.sb, o.eb, ref.bm, kTieMargin, kAgreePositions, "the narrowed transcript of B");
+  engine_ties::require_agrees_or_tie(o.sc, o.ec, ref.cm, kTieMargin, kAgreePositions, "the narrowed batched transcript of C");
+  require(o.batch_hist.size() == 3 && o.batch_hist[0] == static_cast<uint64_t>(o.steps_batch) && o.batch_hist[1] == 0 &&
+              o.batch_hist[2] == 0,
+          "every two-request step took the narrow option");
+  require(o.hist.size() == 3 && o.hist[0] == 0 && o.hist[1] > 0 && o.hist[2] > 0,
+          "a request alone replays the policy's options and never the narrow one");
+  uint64_t total = 0;
+  for (const uint64_t h : o.hist) total += h;
+  require(total == static_cast<uint64_t>(o.steps_a + o.steps_b_alone), "the histogram counts every scalar replay");
+  require(o.steps_b_alone > 0, "B stepped alone after the narrow batch");
 }
 
 DGPP_TEST(glm_dsa_engines_loopback_world_2_mtp_depth2_graph_matches_plain_decode) {

@@ -1080,7 +1080,9 @@ cost with the draft, default 28), `mtp_schedule_lambda`
 default, is the reservation rate `1 / (base + row)` — a verify row is
 taken only when it beats a plain step's rate), `mtp_schedule_min_depth`
 (`--mtp-schedule-min-depth`, the fewest drafts a step verifies, default
-1). The scheduled path gives up the pipelined replay's launch-ahead (the
+1), `mtp_schedule_max_live` (`--mtp-schedule-max-live`, default 0: past
+that many live requests a step verifies and drafts the minimum depth
+only, the pass a fixed depth of the minimum runs). The scheduled path gives up the pipelined replay's launch-ahead (the
 graph to launch is not known until the previous replay's confidence is
 published at its tail), so a stream that stays at the full block pays the
 graph launch (~0.5 ms a step) for nothing; the win is on the streams the

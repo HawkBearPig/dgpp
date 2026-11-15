@@ -362,6 +362,7 @@ void test_settings_handshake() {
   sent.mtp_schedule_row_ms = 3.7;
   sent.mtp_schedule_base_ms = 24.3;
   sent.mtp_schedule_sampled_scale = 0.9;
+  sent.mtp_schedule_max_live = 1;
   sent.prefill_dense = "streaming";
   sent.prefill_fold_overlap = false;
   sent.decode_pdl = false;
@@ -401,6 +402,7 @@ void test_settings_handshake() {
     require(got.fp8_head == "mma", "rank 0 overrides the peer default head mode");
     require(got.draft_head == "screen" && got.draft_head_blocks == 48, "the draft head's read travels with the settings");
     require(got.mtp_draft == "greedy", "the sampled requests' draft rule travels with the settings");
+    require(got.mtp_schedule_max_live == 1, "the schedule's live-request limit must cross the wire");
     require(got.mtp_schedule && got.mtp_schedule_sampled_scale == 0.9,
             "the sampled requests' schedule scale travels with the settings");
     require(got.prefill_dense == "streaming", "the prefill dense form travels with the settings");

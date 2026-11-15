@@ -586,6 +586,8 @@ std::string encode_journal_settings(const WorldSettings& s) {
   // a missing key to 0; a peer without the key would differ in the digest
   // and refuse the world, as every setting does).
   if (s.mtp_schedule_options > 0) out += std::format(",\"msopt\":{}", s.mtp_schedule_options);
+  // The live-request limit (2026-11-15): absent when 0, like the cap above.
+  if (s.mtp_schedule_max_live > 0) out += std::format(",\"msml\":{}", s.mtp_schedule_max_live);
   out += ",\"mdr\":";
   append_json_string(&out, s.mtp_draft);
   out += std::format(",\"mdt\":{:.17g}", s.mtp_draft_temperature);
@@ -951,6 +953,8 @@ JournalRecord decode_journal_line(std::string_view line) {
       s.mtp_schedule_min_depth = static_cast<int>(field(v, "msmin", "settings").as_int());
       if (const dgpp::minijson::Value* msopt = v.find("msopt")) s.mtp_schedule_options = static_cast<int>(msopt->as_int());
       else s.mtp_schedule_options = 0;
+      if (const dgpp::minijson::Value* msml = v.find("msml")) s.mtp_schedule_max_live = static_cast<int>(msml->as_int());
+      else s.mtp_schedule_max_live = 0;
       // Records before the adaptive lambda (2026-09-14, later) carry no msad: fixed.
       if (const dgpp::minijson::Value* msad = v.find("msad")) s.mtp_schedule_adapt = msad->as_int() != 0;
       else s.mtp_schedule_adapt = false;

@@ -5,6 +5,22 @@ project procedures and design guidance live in `docs/`.
 
 ## Unreleased
 
+- **The scheduled verify depth can stop at one live request**:
+  `engine.mtp_schedule_max_live` (`--mtp-schedule-max-live`, default 0: no
+  limit). Past that many live requests a step takes a new narrow replay
+  that verifies and drafts only `engine.mtp_schedule_min_depth` tokens, the
+  pass a fixed depth of that minimum runs. A reduced depth otherwise still
+  drafts the whole block, and a chained draft is a forward of the draft
+  layer and its head (2.0-2.2 ms a pass on GLM-5.3 at one request); with
+  several requests sharing a pass the deeper verify measured -6 % to +2 %
+  at two requests and -3 % to +1 % at eight against one draft. The step
+  after a narrow one verifies what that replay drafted. Chained drafters
+  only. Four nodes, GLM-5.3 Mixed346 with a runtime adapter, two drafts
+  scheduled with the limit at 1 against one draft: one request 29.2-32.0 ->
+  30.1-36.8 tok/s by class and 28.3, 27.9, 27.0 -> 30.4, 29.5, 28.1 on
+  8-21K prompts; two requests 40.8-47.2 -> 41.1-47.1; eight 59.8-66.7 ->
+  60.4-67.5; transcripts identical with the prefill controller pinned.
+
 - **The decode selection writes its token ids in order**: the kernel that
   chooses a query's attended tokens (`select_decode_kernel`, GLM-5.3,
   GLM-5.3-Flash and DeepSeek-V4) gathered the chosen keys in the order their
