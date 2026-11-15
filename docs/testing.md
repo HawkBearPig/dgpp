@@ -667,7 +667,9 @@ build. The suites cover:
   exact-tie and 512th-boundary constructions, the fused decode select (MTP
   multi-row, grid-size invariance, 100k-pool long-context stripes, graph
   capture/replay with changed position), split-KV absorbed attention against
-  the host oracle at TP1/TP4 with empty-row and head-group coverage,
+  the host oracle at TP1/TP4 with empty-row and head-group coverage (the
+  listed kernel's rows bitwise the same at every row count from one to
+  eight, where an odd count pairs a row's splits in a block),
   latent/gather block-table round trip, the quantized latent cache (the
   fp8/fp4 append bitwise against the host codec at 512/256/32 wide; the
   split, listed-flash and dense-flash attention kernels over an fp8/fp4

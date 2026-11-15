@@ -5,6 +5,33 @@ project procedures and design guidance live in `docs/`.
 
 ## Unreleased
 
+- **The decode's attention over the selected tokens asks for its rows ahead
+  and runs three rows in one round of blocks**: the listed form of
+  `attn_flash_kernel` runs a block of two slabs (sixteen row-heads each) per
+  split of a row's selection. At an odd count of slabs the last block of
+  every split was half empty: three rows of sixteen local heads at 32 splits
+  were 64 blocks where 48 SMs hold one each, so the launch ran as two rounds
+  (alone: 46 us at two rows, 66 at three, 69 at four, 71 at six), and the
+  scheduled verify depth makes three rows the common pass at one request. An
+  odd count of slabs now pairs each slab's two consecutive splits in a block
+  (48 blocks at three rows). A slab also asks for a tile's rows four tiles
+  before it fetches them (`prefetch.global.L2`): a selected row is wherever
+  the selection put it, and the block, alone on its SM, had nothing to run
+  while it waited on DRAM. A slab's arithmetic is its own rows and its own
+  split's tokens either way: every partial is bit for bit the same. Alone,
+  2,048 selected tokens a row from DRAM: two rows 46.5 -> 42.8 us a launch,
+  three 66.2 -> 40.8, four 68.2 -> 59.6.
+  Four nodes, GLM-5.3 Mixed346 with a runtime adapter on production's recipe
+  (two drafts scheduled, the limit at one live request), one request: 80.5 ->
+  79.1 ms a pass at 7.7K tokens of context, 85.3 -> 84.1 at 24K (83.9 with
+  this change alone), 96.2 -> 95.8 at 65K; decode on 8-21K prompts 30.5 ->
+  30.7, 29.7 -> 30.1 and 28.2 -> 28.5 tok/s; short prompts, two and eight
+  requests, and cold prefill level. Every transcript is identical, and every
+  token's logprobs are equal on raw completions of four long prompts. (The
+  legs but the one named carried the adapter's tiled prefill add as well,
+  which does not run in decode.) GLM-5.3-Flash NVFP4-FP8 and
+  DeepSeek-V4.1-Flash-1017: level, transcripts identical.
+
 - **A runtime adapter's correction on a prefill tile's rows runs from shared
   memory**: `low_rank_add` took the kernel written for a row at a time, in
   which every thread read its column's `rank` values of B and its row's

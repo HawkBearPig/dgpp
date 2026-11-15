@@ -1538,6 +1538,101 @@ DGPP_TEST(dsa_listed_attention_matches_split_kernel_and_reference) {
   }
 }
 
+// A row's partials do not depend on the rows beside it, at every row count
+// from one to eight (2026-11-15). At sixteen local heads a row is one slab
+// of a block: an even count runs two rows a block, an odd count pairs each
+// row's splits in a block instead (the kernel's layout note), and a slab is
+// the same arithmetic either way. Every row of every count is held bit for
+// bit to that row in the eight-row launch — m, l and c of every split — at
+// the decode's 32 splits (64 tokens a split: every tile asked for ahead) and
+// at 2 (1,024 tokens: two address rounds), counts from 3 to 2,048 so splits
+// are empty, short and whole; the 512 + 64 fp8 cache rows (one block an SM)
+// and a 512-wide bf16 cache (two).
+DGPP_TEST(dsa_listed_attention_rows_do_not_depend_on_the_rows_beside_them) {
+  struct Form { LatentFormat fmt; int rope; };
+  for (const Form form : {Form{LatentFormat::kFp8, 64}, Form{LatentFormat::kBf16, 0}}) {
+    constexpr int kv = 512, lh = 16, bt_tokens = 128, n_blocks = 40, max_rows = 8, max_selected = 2048;
+    const int sd = kv + form.rope;
+    const int64_t total = int64_t(n_blocks) * bt_tokens;
+    const size_t row_bytes = latent_row_bytes(form.fmt, kv) + size_t(form.rope) * 2;
+    std::vector<uint8_t> cache(size_t(total) * row_bytes);
+    std::vector<float> scales(static_cast<size_t>(total));
+    for (int64_t t = 0; t < total; ++t) {
+      uint8_t* row = cache.data() + size_t(t) * row_bytes;
+      if (form.fmt == LatentFormat::kFp8) {
+        for (int e = 0; e < kv; ++e) {
+          uint8_t c = uint8_t(hash32(7001 + uint64_t(t) * 977 + uint64_t(e)) & 0xFF);
+          if ((c & 0x7Fu) == 0x7Fu) c ^= 0x01u;  // no NaN encodings
+          row[e] = c;
+        }
+      } else {
+        for (int e = 0; e < kv; ++e) {
+          const uint16_t v = float_to_bf16_bits(random_f32(7002, t * kv + e));
+          std::memcpy(row + e * 2, &v, 2);
+        }
+      }
+      for (int e = 0; e < form.rope; ++e) {
+        const uint16_t v = float_to_bf16_bits(random_f32(7003, t * 64 + e) * 0.5f);
+        std::memcpy(row + latent_row_bytes(form.fmt, kv) + e * 2, &v, 2);
+      }
+      scales[size_t(t)] = 0.002f + std::fabs(random_f32(7004, t)) * 0.004f;
+    }
+    auto q = random_bf16_bits(7005, int64_t(max_rows) * lh * sd, -2, 1);
+    const int row_counts[max_rows] = {2048, 2048, 700, 3, 2048, 65, 1300, 2048};
+    std::vector<int32_t> tokens(size_t(max_rows) * max_selected, -1), counts(row_counts, row_counts + max_rows),
+        req_ids(max_rows, 0), bt(n_blocks);
+    for (int b = 0; b < n_blocks; ++b) bt[size_t(b)] = (b * 7 + 3) % n_blocks;  // a permuted table
+    for (int r = 0; r < max_rows; ++r)
+      for (int i = 0; i < row_counts[r]; ++i)
+        tokens[size_t(r) * max_selected + i] = int32_t((int64_t(r) * 131 + int64_t(i) * 2503) % total);
+    DevBuf dcache(cache.size()), dscale(scales.size() * 4), dq(q.size() * 2), dtopk(tokens.size() * 4),
+        dcnt(counts.size() * 4), dri(req_ids.size() * 4), dbt(bt.size() * 4);
+    dcache.upload(cache.data(), cache.size());
+    dscale.upload(scales.data(), scales.size() * 4);
+    dq.upload(q.data(), q.size() * 2);
+    dtopk.upload(tokens.data(), tokens.size() * 4);
+    dcnt.upload(counts.data(), counts.size() * 4);
+    dri.upload(req_ids.data(), req_ids.size() * 4);
+    dbt.upload(bt.data(), bt.size() * 4);
+    for (const int n_split : {32, 2}) {
+      const size_t parts = size_t(max_rows) * n_split * lh;
+      DevBuf dm(parts * 4), dl(parts * 4), dc(parts * kv * 4);
+      std::vector<float> m8, l8, c8;
+      for (int rows = max_rows; rows >= 1; --rows) {
+        // Poisoned first: a partial a launch does not write would show.
+        DGPP_CUDA_OK(cudaMemset(dm.p, 0xEE, parts * 4));
+        DGPP_CUDA_OK(cudaMemset(dl.p, 0xEE, parts * 4));
+        DGPP_CUDA_OK(cudaMemset(dc.p, 0xEE, parts * kv * 4));
+        if (!dsa_attn_listed(dq.p, dcache.p, static_cast<const int32_t*>(dri.p), static_cast<const int32_t*>(dtopk.p),
+                             max_selected, static_cast<const int32_t*>(dcnt.p), rows, n_split, lh, kv, bt_tokens,
+                             static_cast<const int32_t*>(dbt.p), n_blocks, 0.05f, static_cast<float*>(dm.p),
+                             static_cast<float*>(dl.p), static_cast<float*>(dc.p), 0, form.fmt,
+                             static_cast<const float*>(dscale.p), form.rope))
+          throw std::runtime_error("rows beside: the listed kernel refused the geometry");
+        DGPP_CUDA_OK(cudaDeviceSynchronize());
+        const size_t n = size_t(rows) * n_split * lh;
+        std::vector<float> m(n), l(n), c(n * kv);
+        dm.download(m.data(), n * 4);
+        dl.download(l.data(), n * 4);
+        dc.download(c.data(), n * kv * 4);
+        const std::string tag = std::string("rows beside (") + latent_format_name(form.fmt) + ", " +
+                                std::to_string(n_split) + " splits, " + std::to_string(rows) + " rows)";
+        if (rows == max_rows) {
+          m8 = m, l8 = l, c8 = c;
+          double mass = 0;
+          for (float v : l) mass += double(v);
+          if (!(mass > 0)) throw std::runtime_error(tag + ": the launch attended to nothing");
+          continue;
+        }
+        require_bitwise(tag + " m", m.data(), m8.data(), n * 4);
+        require_bitwise(tag + " l", l.data(), l8.data(), n * 4);
+        require_bitwise(tag + " c", c.data(), c8.data(), n * kv * 4);
+      }
+    }
+    std::printf("[ OK ] listed attention %s: every row of 1..7 rows bitwise its row of 8, at 32 and 2 splits\n",
+                latent_format_name(form.fmt));
+  }
+}
 
 // The listed kernel's split groups (2026-10-23, kAttnSplitGroup): eight
 // consecutive splits of a row merge in a thread-block cluster and publish

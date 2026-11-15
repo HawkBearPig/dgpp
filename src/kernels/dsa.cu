@@ -2549,7 +2549,7 @@ __global__ __launch_bounds__(dense::kThreads, (attn_flash_min_blocks<KV, SD, kLi
     int block_tokens, const int32_t* __restrict__ block_tables,
     int blocks_per_request, int blocks_total, float scale, float* __restrict__ m_ws,
     float* __restrict__ l_ws, float* __restrict__ c_ws, int32_t* __restrict__ tickets,
-    float* __restrict__ mg_ws, float* __restrict__ lg_ws, float* __restrict__ cg_ws) {
+    float* __restrict__ mg_ws, float* __restrict__ lg_ws, float* __restrict__ cg_ws, int pair_splits) {
   dgpp_pdl_wait();
   constexpr int NTOK = kListed ? 16 : dense::kTile;  // tokens per tile (per slab when listed)
   using G = dense::Geo<KV, SD, NTOK>;
@@ -2566,12 +2566,25 @@ __global__ __launch_bounds__(dense::kThreads, (attn_flash_min_blocks<KV, SD, kLi
   const int slab = warp / 4, quarter = warp % 4;
   const int r = lane / 4, cc = (lane % 4) * 2;
   const int total_m = rows * local_heads;
-  const int m0 = blockIdx.x * M;
-  const int s = blockIdx.y;
+  // The block's layout. A block is two slabs of sixteen M-rows, and a slab
+  // walks one split of its rows' selection. Rows paired (the grid's x a
+  // pair of slabs, its y a split): the slabs are consecutive sixteens of
+  // M-rows on the same split. Splits paired (listed form, pair_splits, the
+  // grid's x one slab's M-rows, its y a pair of splits): the slabs are the
+  // same sixteen M-rows on two consecutive splits — an odd count of slabs
+  // then leaves no half-empty blocks (2026-11-15: three rows of sixteen
+  // heads at 32 splits were 64 blocks where 48 SMs hold one each, so the
+  // launch ran as two rounds of blocks; paired by split they are 48). A
+  // slab's arithmetic is its own rows and its own split's tokens either
+  // way, so a row's partials are bit for bit the same in both layouts.
+  const bool pair = kListed && kGroup == 1 && pair_splits != 0;
+  const int m0 = pair ? blockIdx.x * 16 : blockIdx.x * M;
+  const int slab_m0 = pair ? m0 : m0 + slab * 16;  // this slab's first M-row
+  const int s = pair ? blockIdx.y * 2 + slab : blockIdx.y;  // this slab's split
   uint16_t* sL = kListed ? sLall + slab * NTOK * SQ : sLall;
 
   // The lane's two M-rows (slab rows r and r+8): validity and positions.
-  const int m_lo = m0 + slab * 16 + r;
+  const int m_lo = slab_m0 + r;
   const int m_hi = m_lo + 8;
   const bool v_lo = m_lo < total_m, v_hi = m_hi < total_m;
   const int64_t p_lo = (!kListed && v_lo) ? pos[m_lo / local_heads] : -1;
@@ -2586,7 +2599,7 @@ __global__ __launch_bounds__(dense::kThreads, (attn_flash_min_blocks<KV, SD, kLi
   int t_begin = 0, t_end = 0;
   const int32_t* list = nullptr;
   if constexpr (kListed) {
-    const int slab_m = m0 + slab * 16;
+    const int slab_m = slab_m0;
     const int qrow = min(slab_m, total_m - 1) / local_heads;
     const int cnt = slab_m < total_m ? counts[qrow] : 0;
     const int chunk = (cnt + n_split - 1) / n_split;
@@ -2654,7 +2667,11 @@ __global__ __launch_bounds__(dense::kThreads, (attn_flash_min_blocks<KV, SD, kLi
   constexpr int kTilesPerRound = kAddrRound / NTOK;
   constexpr int GTHREADS = kListed ? 128 : dense::kThreads;  // the gather's threads (per slab when listed)
   constexpr int TPT = NTOK * (SD / 8) / GTHREADS;              // uint4 per thread per tile
-  constexpr int HALF = (TPT + 3) / 4;  // uint4 per pass: four passes, the registers of two blocks per SM
+  // uint4 per pass: four passes, the registers of two blocks per SM. (TRIED
+  // 2026-11-15 for the one-block geometry: the whole tile in one pass. No
+  // gain beside the requests ahead below, 43.8 against 42.8 us a launch at
+  // two rows and 2,048 selected tokens.)
+  constexpr int HALF = (TPT + 3) / 4;
   static_assert(NTOK * (SD / 8) % GTHREADS == 0, "the gather's uint4s divide its threads");
   __shared__ int32_t s_phys[2][kListed ? kAddrRound : 1];
   const int gtid = threadIdx.x % GTHREADS;
@@ -2721,6 +2738,33 @@ __global__ __launch_bounds__(dense::kThreads, (attn_flash_min_blocks<KV, SD, kLi
       }
     }
   };
+  // The listed walk asks for a tile's rows kAhead tiles before it fetches
+  // them (2026-11-15): a selected row is wherever the selection put it, so
+  // each tile's fetch found its rows in DRAM and the block, alone on its SM,
+  // had nothing to run meanwhile. One request a 128-byte line of the row
+  // (and the line of its last byte, for a cache that is not line-aligned)
+  // and one for its scale; the requests do not wait.
+  constexpr int kAhead = 4;
+  const auto prefetch_tile = [&](int tile) {
+    if constexpr (kListed) {
+      constexpr int kLines = static_cast<int>((kRowBytes + 127) / 128);
+      constexpr int kAsks = kLines + 2;  // the row's lines, its last byte's, its scale's
+      for (int i = gtid; i < NTOK * kAsks; i += GTHREADS) {
+        const int tt = i / kAsks, part = i % kAsks;
+        if (t_begin + tile * NTOK + tt >= t_end) continue;
+        const int32_t phys = s_phys[slab][(tile % kTilesPerRound) * NTOK + tt];
+        if (phys < 0) continue;
+        const uint8_t* row = latent + int64_t(phys) * int64_t(kRowBytes);
+        if (part < kLines) {
+          asm volatile("prefetch.global.L2 [%0];" ::"l"(row + part * 128));
+        } else if (part == kLines) {
+          asm volatile("prefetch.global.L2 [%0];" ::"l"(row + kRowBytes - 1));
+        } else if (latent_scale != nullptr) {
+          asm volatile("prefetch.global.L2 [%0];" ::"l"(latent_scale + phys));
+        }
+      }
+    }
+  };
   resolve_round(t_begin);
 
   for (int tile = 0; tile < n_tiles; ++tile) {
@@ -2729,6 +2773,14 @@ __global__ __launch_bounds__(dense::kThreads, (attn_flash_min_blocks<KV, SD, kLi
     (void)t0;  // the dense mask reads it
     if (tile > 0 && tile % kTilesPerRound == 0) resolve_round(t0);  // the round's addresses, ahead of its first fetch
     __syncthreads();  // the previous tile's readers are done; the round's addresses landed
+    if constexpr (kListed) {
+      // A round's first tile asks for the tiles behind it; every other tile
+      // for the one kAhead on, while it is in the round whose addresses are
+      // resolved (the next round's first tiles are asked for when it is).
+      const int in_round = tile % kTilesPerRound;
+      const int last = min(tile + kAhead, tile - in_round + kTilesPerRound - 1);
+      for (int pt = in_round == 0 ? tile + 1 : tile + kAhead; pt <= last; ++pt) prefetch_tile(pt);
+    }
     fetch_tile(tile);
     __syncthreads();
 
@@ -4252,13 +4304,13 @@ void launch_attn_flash_variant(dim3 grid, const void* q_tilde,
                                const int32_t* block_tables, int blocks_per_request,
                                int blocks_total, float scale, float* m_ws, float* l_ws, float* c_ws,
                                int32_t* tickets, float* mg_ws, float* lg_ws, float* cg_ws,
-                               cudaStream_t stream) {
+                               cudaStream_t stream, int pair_splits) {
   constexpr size_t kSmem = dense::Geo<KV, SD, kListed ? 16 : dense::kTile>::smem_bytes;
   attn_flash_kernel<KV, SD, kListed, F, kGroup><<<grid, dense::kThreads, kSmem, stream>>>(
       static_cast<const uint16_t*>(q_tilde),
       static_cast<const uint8_t*>(latent_cache), latent_scale, req_ids, pos, topk,
       topk_stride, counts, rows, n_split, local_heads, block_tokens, block_tables,
-      blocks_per_request, blocks_total, scale, m_ws, l_ws, c_ws, tickets, mg_ws, lg_ws, cg_ws);
+      blocks_per_request, blocks_total, scale, m_ws, l_ws, c_ws, tickets, mg_ws, lg_ws, cg_ws, pair_splits);
 }
 
 template <int KV, int SD, bool kListed, int kGroup>
@@ -4271,37 +4323,37 @@ void launch_attn_flash_format(LatentFormat format, dim3 grid, const void* q_tild
                               const int32_t* block_tables, int blocks_per_request,
                               int blocks_total, float scale, float* m_ws, float* l_ws, float* c_ws,
                               int32_t* tickets, float* mg_ws, float* lg_ws, float* cg_ws,
-                              cudaStream_t stream) {
+                              cudaStream_t stream, int pair_splits) {
   switch (format) {
     case LatentFormat::kBf16:
       launch_attn_flash_variant<KV, SD, kListed, LatentFormat::kBf16, kGroup>(
           grid, q_tilde, latent_cache, latent_scale, req_ids, pos, topk, topk_stride,
           counts, rows, n_split, local_heads, block_tokens, block_tables,
-          blocks_per_request, blocks_total, scale, m_ws, l_ws, c_ws, tickets, mg_ws, lg_ws, cg_ws, stream);
+          blocks_per_request, blocks_total, scale, m_ws, l_ws, c_ws, tickets, mg_ws, lg_ws, cg_ws, stream, pair_splits);
       break;
     case LatentFormat::kFp8:
       launch_attn_flash_variant<KV, SD, kListed, LatentFormat::kFp8, kGroup>(
           grid, q_tilde, latent_cache, latent_scale, req_ids, pos, topk, topk_stride,
           counts, rows, n_split, local_heads, block_tokens, block_tables,
-          blocks_per_request, blocks_total, scale, m_ws, l_ws, c_ws, tickets, mg_ws, lg_ws, cg_ws, stream);
+          blocks_per_request, blocks_total, scale, m_ws, l_ws, c_ws, tickets, mg_ws, lg_ws, cg_ws, stream, pair_splits);
       break;
     case LatentFormat::kFp4:
       launch_attn_flash_variant<KV, SD, kListed, LatentFormat::kFp4, kGroup>(
           grid, q_tilde, latent_cache, latent_scale, req_ids, pos, topk, topk_stride,
           counts, rows, n_split, local_heads, block_tokens, block_tables,
-          blocks_per_request, blocks_total, scale, m_ws, l_ws, c_ws, tickets, mg_ws, lg_ws, cg_ws, stream);
+          blocks_per_request, blocks_total, scale, m_ws, l_ws, c_ws, tickets, mg_ws, lg_ws, cg_ws, stream, pair_splits);
       break;
     case LatentFormat::kFp8Block:
       launch_attn_flash_variant<KV, SD, kListed, LatentFormat::kFp8Block, kGroup>(
           grid, q_tilde, latent_cache, latent_scale, req_ids, pos, topk, topk_stride,
           counts, rows, n_split, local_heads, block_tokens, block_tables,
-          blocks_per_request, blocks_total, scale, m_ws, l_ws, c_ws, tickets, mg_ws, lg_ws, cg_ws, stream);
+          blocks_per_request, blocks_total, scale, m_ws, l_ws, c_ws, tickets, mg_ws, lg_ws, cg_ws, stream, pair_splits);
       break;
     case LatentFormat::kFp4Block:
       launch_attn_flash_variant<KV, SD, kListed, LatentFormat::kFp4Block, kGroup>(
           grid, q_tilde, latent_cache, latent_scale, req_ids, pos, topk, topk_stride,
           counts, rows, n_split, local_heads, block_tokens, block_tables,
-          blocks_per_request, blocks_total, scale, m_ws, l_ws, c_ws, tickets, mg_ws, lg_ws, cg_ws, stream);
+          blocks_per_request, blocks_total, scale, m_ws, l_ws, c_ws, tickets, mg_ws, lg_ws, cg_ws, stream, pair_splits);
       break;
   }
 }
@@ -4335,24 +4387,29 @@ bool launch_attn_flash(const void* q_tilde, const void* latent_cache,
     throw std::invalid_argument("dsa attention: a quantized cache needs its scales");
   dsa_prepare_kernel_smem();
   const int total_m = rows * local_heads;
+  // The splits pair (see the kernel's layout note) when the slabs are an odd
+  // count: the same blocks otherwise, so those launches stay as they were.
+  const int slabs = total_m / 16;
+  const int pair_splits = kListed && group == 1 && n_split % 2 == 0 && slabs % 2 == 1 ? 1 : 0;
   dim3 grid{unsigned((total_m + dense::kM - 1) / dense::kM), unsigned(n_split)};
+  if (pair_splits) grid = dim3{unsigned(slabs), unsigned(n_split / 2)};
   const auto dispatch = [&](auto group_tag) {
     constexpr int kG = decltype(group_tag)::value;
     if (rope == 64) {
       launch_attn_flash_format<512, 576, kListed, kG>(
           format, grid, q_tilde, latent_cache, latent_scale, req_ids, pos, topk,
           topk_stride, counts, rows, n_split, local_heads, block_tokens, block_tables,
-          blocks_per_request, blocks_total, scale, m_ws, l_ws, c_ws, tickets, mg_ws, lg_ws, cg_ws, stream);
+          blocks_per_request, blocks_total, scale, m_ws, l_ws, c_ws, tickets, mg_ws, lg_ws, cg_ws, stream, pair_splits);
     } else if (kv_lora == 512) {
       launch_attn_flash_format<512, 512, kListed, kG>(
           format, grid, q_tilde, latent_cache, latent_scale, req_ids, pos, topk,
           topk_stride, counts, rows, n_split, local_heads, block_tokens, block_tables,
-          blocks_per_request, blocks_total, scale, m_ws, l_ws, c_ws, tickets, mg_ws, lg_ws, cg_ws, stream);
+          blocks_per_request, blocks_total, scale, m_ws, l_ws, c_ws, tickets, mg_ws, lg_ws, cg_ws, stream, pair_splits);
     } else {
       launch_attn_flash_format<256, 256, kListed, kG>(
           format, grid, q_tilde, latent_cache, latent_scale, req_ids, pos, topk,
           topk_stride, counts, rows, n_split, local_heads, block_tokens, block_tables,
-          blocks_per_request, blocks_total, scale, m_ws, l_ws, c_ws, tickets, mg_ws, lg_ws, cg_ws, stream);
+          blocks_per_request, blocks_total, scale, m_ws, l_ws, c_ws, tickets, mg_ws, lg_ws, cg_ws, stream, pair_splits);
     }
   };
   if constexpr (kListed) {
