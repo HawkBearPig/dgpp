@@ -87,6 +87,56 @@ __global__ void finish(const float* z, const float* b, uint16_t* output, float* 
   } else
     delta[column] = sum;
 }
+// finish<true> for a prefill tile's rows. There every thread read its
+// column's `rank` values of B and its row's `rank` values of z from global
+// memory: rows x outputs x rank x 2 loads a boundary, 630 million at 1,024
+// rows of rank 50, and 1.6 ms a launch, 8 % of a cold prefill's kernel time
+// with an adapter. Here a block is kTileColumns columns by a tile of rows:
+// its slice of B and its rows of z go to shared memory once, and thread
+// (c, k) runs the chains of rows k, k + R, ... of column c from there, each
+// in finish's order, so every value is bit for bit the same.
+constexpr int kTileThreads = 256;
+constexpr int kTileColumns = 128;
+__global__ void finish_tile(const float* z, const float* b, uint16_t* output, int rows, int outputs,
+                            int rank, int tile_rows) {
+  dgpp_pdl_wait();
+  extern __shared__ float smem[];
+  constexpr int C = kTileColumns, R = kTileThreads / C;
+  float* bs = smem;             // [C][rank]: the block's columns of B
+  float* zs = smem + C * rank;  // [tile_rows][rank]: the tile's rank-space rows
+  const int col0 = blockIdx.x * C, row0 = blockIdx.y * tile_rows;
+  const int nb = min(C, outputs - col0) * rank, nz = min(tile_rows, rows - row0) * rank;
+  const float* bsrc = b + static_cast<size_t>(col0) * rank;
+  const float* zsrc = z + static_cast<size_t>(row0) * rank;
+  for (int i0 = threadIdx.x; i0 < max(nb, nz); i0 += kTileThreads * kLoadBatch) {
+    float bv[kLoadBatch], zv[kLoadBatch];
+#pragma unroll
+    for (int k = 0; k < kLoadBatch; ++k) {
+      const int i = i0 + k * kTileThreads;
+      bv[k] = i < nb ? bsrc[i] : 0.f;
+      zv[k] = i < nz ? zsrc[i] : 0.f;
+    }
+#pragma unroll
+    for (int k = 0; k < kLoadBatch; ++k) {
+      const int i = i0 + k * kTileThreads;
+      if (i < nb) bs[i] = bv[k];
+      if (i < nz) zs[i] = zv[k];
+    }
+  }
+  __syncthreads();
+  const int c = threadIdx.x % C, column = col0 + c;
+  if (column >= outputs) return;
+  const float* bc = bs + c * rank;
+  const int tile = nz / rank;
+  for (int row = threadIdx.x / C; row < tile; row += R) {
+    const float* zr = zs + row * rank;
+    float sum = 0;
+#pragma unroll 8
+    for (int i = 0; i < rank; ++i) sum = __fadd_rn(sum, __fmul_rn(bc[i], zr[i]));
+    auto* out = reinterpret_cast<__nv_bfloat16*>(output) + static_cast<size_t>(row0 + row) * outputs + column;
+    *out = __float2bfloat16_rn(__fadd_rn(__bfloat162float(*out), sum));
+  }
+}
 // The rider's finish: sum_digits and finish<true> in one kernel behind the
 // collective that carries the digits. A block is C columns by R rows of
 // threads (C = blockDim / R). Its slice of B goes to shared memory in the
@@ -238,10 +288,29 @@ void low_rank_add_digits(const uint16_t* digits, int world, float* z, const floa
     finish_rider<8><<<blocks, kRiderThreads, smem, stream>>>(d, world, z, b, output, rows, outputs, rank);
   DGPP_CUDA_OK(cudaGetLastError());
 }
+namespace {
+// Rows from which low_rank_add takes the tiled kernel (a prefill tile; a
+// decode step's few rows keep one block a row), and a tile's rows: the most
+// of 64, 32, 16 that fit the default shared memory beside the block's slice
+// of B. 0: the rank is too wide for a tile.
+constexpr int kTileMinRows = 16;
+int tile_rows_for(int rank) {
+  for (int r : {64, 32, 16})
+    if (static_cast<size_t>(kTileColumns + r) * rank * sizeof(float) <= kRiderSmemBytes) return r;
+  return 0;
+}
+}  // namespace
 void low_rank_add(const float* z, const float* b, uint16_t* output, int rows, int outputs, int rank,
                   cudaStream_t stream) {
-  finish<true><<<dim3((outputs + 127) / 128, rows), 128, 0, stream>>>(z, b, output, nullptr, rows,
-                                                                      outputs, rank);
+  const int tile = rows >= kTileMinRows ? tile_rows_for(rank) : 0;
+  if (tile != 0) {
+    const size_t smem = static_cast<size_t>(kTileColumns + tile) * rank * sizeof(float);
+    finish_tile<<<dim3((outputs + kTileColumns - 1) / kTileColumns, (rows + tile - 1) / tile), kTileThreads, smem,
+                  stream>>>(z, b, output, rows, outputs, rank, tile);
+  } else {
+    finish<true><<<dim3((outputs + 127) / 128, rows), 128, 0, stream>>>(z, b, output, nullptr, rows,
+                                                                        outputs, rank);
+  }
   DGPP_CUDA_OK(cudaGetLastError());
 }
 void low_rank_delta_last(const float* z, const float* b, float* delta, int rows, int outputs,

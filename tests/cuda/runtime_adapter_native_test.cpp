@@ -41,7 +41,11 @@ void kernel_check(int world) {
   struct Shape { int rows, rank, outputs, inputs; };
   const Shape shapes[] = {{1, 50, 6144, 1536}, {2, 50, 6144, 4096}, {3, 50, 6144, 1536}, {5, 50, 6144, 1536},
                           {8, 50, 6144, 1536}, {20, 50, 6144, 257}, {2, 7, 100, 33},      {4, 96, 6144, 512},
-                          {2, 200, 1000, 64},  {2, 400, 512, 64}};
+                          {2, 200, 1000, 64},  {2, 400, 512, 64},
+                          // A prefill tile's rows: low_rank_add's tiled kernel (tiles of 64 and 16 rows, a last
+                          // partial tile, a last partial block of columns) and a rank too wide for a tile.
+                          {64, 50, 6144, 33},  {150, 50, 6100, 33},  {1030, 50, 6144, 16}, {40, 80, 6144, 16},
+                          {33, 96, 1000, 16}};
   uint32_t seed = 0x9e3779b9u;
   const auto rnd = [&] { return seed = seed * 1664525u + 1013904223u; };
   const auto unit = [&] { return static_cast<float>(rnd() >> 8) / 8388608.0f - 1.0f; };
@@ -92,6 +96,20 @@ void kernel_check(int world) {
     low_rank_add(dz, db, dout, sh.rows, sh.outputs, sh.rank, nullptr);
     DGPP_CUDA_OK(cudaMemcpy(want.data(), dout, want.size() * 2, cudaMemcpyDeviceToHost));
     DGPP_CUDA_OK(cudaMemcpy(z_want.data(), dz, count * 4, cudaMemcpyDeviceToHost));
+    {
+      // The add against its definition: a column's chain over the rank in order, added to the output in fp32
+      // and rounded to bf16 (whichever kernel the row count takes).
+      std::vector<uint16_t> host(base.size());
+      for (int row = 0; row < sh.rows; ++row)
+        for (int c = 0; c < sh.outputs; ++c) {
+          float sum = 0;
+          for (int i = 0; i < sh.rank; ++i)
+            sum = sum + b[static_cast<size_t>(c) * sh.rank + i] * z_want[static_cast<size_t>(row) * sh.rank + i];
+          const size_t at = static_cast<size_t>(row) * sh.outputs + c;
+          host[at] = float_to_bf16_bits(bf16_bits_to_float(base[at]) + sum);
+        }
+      exact(want, host, "low_rank_add differs from the chain it defines");
+    }
     DGPP_CUDA_OK(cudaMemcpy(dout, base.data(), base.size() * 2, cudaMemcpyHostToDevice));
     DGPP_CUDA_OK(cudaMemset(dz, 0, count * 4));
     low_rank_add_digits(ddigits, world, dz, db, dout, sh.rows, sh.outputs, sh.rank, nullptr);
