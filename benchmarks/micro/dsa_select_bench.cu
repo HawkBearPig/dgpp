@@ -5,7 +5,13 @@
 // on every step (2026-09-06: ~650 us x 12 calls = 7.9 ms of a 54 ms step).
 //
 // Usage: dsa_select_bench [--rows N] [--iters N] [--warmup N] [--ctx a,b,c]
+//                         [--kpool N] [--heads N]
 // Prints microseconds per launch per context (mean / min).
+// --kpool: tokens a pool. The default 4 is GLM-5.3-Flash's geometry (512
+// pools selected); 1 is the full model's (2,048 tokens selected, a pool a
+// token), where the selection's cost by context is four times the entries
+// and whose id sort went unmeasured until 2026-11-14 because this bench
+// only ran the default. --heads: 32, or 64 for the tensor-core scoring.
 #include <cuda_runtime.h>
 
 #include <cstdint>
@@ -47,11 +53,13 @@ struct DevBuf {
 }  // namespace
 
 int main(int argc, char** argv) {
-  int rows = 2, iters = 200, warmup = 20, grid = 0;
+  int rows = 2, iters = 200, warmup = 20, grid = 0, kpool_arg = 4, heads_arg = 32;
   std::vector<int64_t> ctxs = {512, 1024, 2048, 4096, 8192, 16384, 32768, 131072, 393216};
   for (int i = 1; i < argc; ++i) {
     if (std::strcmp(argv[i], "--rows") == 0 && i + 1 < argc) rows = std::atoi(argv[++i]);
     else if (std::strcmp(argv[i], "--grid") == 0 && i + 1 < argc) grid = std::atoi(argv[++i]);
+    else if (std::strcmp(argv[i], "--kpool") == 0 && i + 1 < argc) kpool_arg = std::atoi(argv[++i]);
+    else if (std::strcmp(argv[i], "--heads") == 0 && i + 1 < argc) heads_arg = std::atoi(argv[++i]);
     else if (std::strcmp(argv[i], "--iters") == 0 && i + 1 < argc) iters = std::atoi(argv[++i]);
     else if (std::strcmp(argv[i], "--warmup") == 0 && i + 1 < argc) warmup = std::atoi(argv[++i]);
     else if (std::strcmp(argv[i], "--ctx") == 0 && i + 1 < argc) {
@@ -66,13 +74,15 @@ int main(int argc, char** argv) {
       }
     }
   }
-  const dgpp::DsaConfig cfg{};
+  dgpp::DsaConfig cfg{};
+  cfg.index_kpool = kpool_arg;
+  cfg.index_n_heads = heads_arg;
   const dgpp::DsaGeometry g = dgpp::DsaGeometry::from_config(cfg);
   const int heads = cfg.index_n_heads, dim = cfg.index_head_dim;
   const int kpool = cfg.index_kpool;
   const int ppb = g.pools_per_block;
-  std::printf("dsa_select_bench: rows=%d select_k=%d pools_per_block=%d iters=%d grid=%d\n",
-              rows, g.select_k, ppb, iters, grid);
+  std::printf("dsa_select_bench: rows=%d kpool=%d heads=%d select_k=%d pools_per_block=%d iters=%d grid=%d\n",
+              rows, kpool, heads, g.select_k, ppb, iters, grid);
   std::printf("%10s %10s %12s %12s\n", "ctx tok", "pools", "mean us", "min us");
   for (const int64_t ctx : ctxs) {
     const int64_t visible = (ctx + 1) / kpool;
