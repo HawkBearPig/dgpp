@@ -401,7 +401,9 @@ __global__ void compress_decode_update_kernel(const float* kv, const float* scor
 // ---- the selections -----------------------------------------------------------------------
 // One entry's logit, warp-cooperative (lane = head): the fp8 dot in fp32
 // with contraction-proof arithmetic, relu, the folded weight, the entry's
-// scale, the warp sum — dsa_select_decode's DecodeKeyFn arithmetic. q8:
+// scale, the warp sum (the chain dsa_select_decode scored with until it
+// moved to the tensor cores, 2026-11-15: the two agree to the fp32 sums'
+// rounding). q8:
 // smem [16 chunks][32 heads] uint2 (8 e4m3 each); krow: smem [32] u32
 // (the entry's 128 codes, lane l loads word l).
 __device__ __forceinline__ float entry_logit(const uint2* q8, const uint32_t* krow, const float* w,

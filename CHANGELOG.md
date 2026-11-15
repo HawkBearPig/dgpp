@@ -5,6 +5,43 @@ project procedures and design guidance live in `docs/`.
 
 ## Unreleased
 
+- **The decode selection scores with the prefill select's arithmetic**: the
+  kernel that chooses a query's attended tokens (`select_decode_kernel`)
+  scores every token of the context for every query row. For the 32-head
+  indexers (GLM-5.3, GLM-5.3-Flash, DeepSeek-V4) that was a scalar chain,
+  128 separate multiply-adds a head a lane: 146 us of a 191 us launch at 32K
+  tokens and two rows, 22 launches a pass on GLM-5.3, the part of a decode
+  pass that grows with the context. The 32-head form is now the prefill
+  select's fused scoring, instruction for instruction
+  (`mma.m16n8k32` on the e4m3 codes, each head's dot times `w * scale`, the
+  same head-sum fold), over the blocked cache. A decode step scores an entry
+  to the same bits as a prefill tile does
+  (`dsa_select_decode_keys_are_the_prefill_select_keys`); until now the two
+  were different roundings of the same sums. Against the chain a score
+  agrees to the fp32 sums' rounding, not bit for bit (both within 1.3e-7 of
+  a row's score range of the exact logit), so two entries that tie that
+  closely at the selection's boundary can trade places. The selection's two
+  passes over a row's keys ask for eight keys a thread together. Alone, us a
+  launch at two rows: 61 -> 23 at 8K tokens, 191 -> 48 at 32K, 357 -> 80 at
+  65K, 705 -> 155 at 131K; at eight rows 715 -> 91 at 32K. The decode-select
+  tests hold every score to its exact (fp64) logit and the selection bitwise
+  to the top of the kernel's own keys, which are bitwise the same at another
+  grid and with other rows beside the row. The 64-head form
+  (DeepSeek-V4-Flash) is unchanged.
+  Four nodes, GLM-5.3 Mixed346 with a runtime adapter on production's recipe
+  (two drafts scheduled, the limit at one live request), one request, against
+  the same tree without this change: 79.1 -> 78.5 ms a pass at 7.7K tokens of
+  context, 84.1 -> 79.6 at 24K, 95.8 -> 83.3 at 65K (28.9 -> 33.3 tok/s);
+  decode on 8-21K prompts 30.7 -> 31.4, 30.1 -> 30.7 and 28.5 -> 29.9 tok/s;
+  short prompts, two and eight requests level. Against master every chat
+  transcript is identical (eight context probes to 65K, three long prompts of
+  640 tokens, the short classes). Raw completions of four long prompts, 300
+  tokens each with every token's logprobs: three equal master's at every
+  token, bit for bit; one (7.9K tokens) moves two of its first 28 tokens, by
+  up to 0.14 nat, and takes the other of two candidates 0.15 nat apart at the
+  28th. GLM-5.3-Flash NVFP4-FP8 and DeepSeek-V4.1-Flash-1017: level,
+  transcripts identical.
+
 - **The decode's attention over the selected tokens asks for its rows ahead
   and runs three rows in one round of blocks**: the listed form of
   `attn_flash_kernel` runs a block of two slabs (sixteen row-heads each) per
