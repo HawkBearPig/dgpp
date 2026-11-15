@@ -5,6 +5,22 @@ project procedures and design guidance live in `docs/`.
 
 ## Unreleased
 
+- **A runtime adapter's correction on a prefill tile's rows runs from shared
+  memory**: `low_rank_add` took the kernel written for a row at a time, in
+  which every thread read its column's `rank` values of B and its row's
+  `rank` values of z from global memory: 630 million loads and 1.6 ms a
+  launch at a 1,024-row tile of rank 50, 8.3 % of a cold prefill's kernel
+  time on GLM-5.3 Mixed346 with its adapter. From 16 rows up it is a tiled
+  kernel: a block is 128 columns by a tile of rows, its slice of B and its
+  rows of z go to shared memory once, and a thread runs its column's chains
+  from there in the same order, so every value is bit for bit the same.
+  Four nodes, GLM-5.3 Mixed346 with its runtime adapter, cold prefill: 19.3 ->
+  17.9 s at 7.7K tokens and 61.1 -> 56.9 s at 24K; 177.4 -> 164.8 s at 65K and
+  19.6 -> 18.2, 26.4 -> 24.7, 53.4 -> 49.7 s on 8K, 10.5K and 21K prompts
+  (those with the listed attention's change beside it, which measured no
+  prefill change alone). Decode level; every transcript identical, and every
+  token's logprobs equal on raw completions of four long prompts.
+
 - **The scheduled verify depth can stop at one live request**:
   `engine.mtp_schedule_max_live` (`--mtp-schedule-max-live`, default 0: no
   limit). Past that many live requests a step takes a new narrow replay
