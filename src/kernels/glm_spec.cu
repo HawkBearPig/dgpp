@@ -662,11 +662,12 @@ void glm_spec_next_tokens_batched(const int64_t* next, const GlmSpecDrafts& draf
       throw std::invalid_argument(
           "glm_spec_next_tokens_batched: null draft verdicts");
   if (requests < 1 || requests > kPickMaxRequests ||
-      rows_per_request != 1 + drafts.count ||
+      rows_per_request < 1 + drafts.count ||
       requests * rows_per_request > kPickMaxRows)
     throw std::invalid_argument(
         "glm_spec_next_tokens_batched: the feed is [next, draft_1 .. "
-        "draft_n] per request (rows_per_request = 1 + drafts)");
+        "draft_n] per request (rows_per_request >= 1 + drafts; the rows "
+        "past a narrower write are zeroed)");
   spec_next_tokens_batched_kernel<<<requests, 32, 0, stream>>>(next, drafts, rows_per_request,
                                                                tokens, request_map);
   DGPP_CUDA_OK(cudaGetLastError());

@@ -329,6 +329,7 @@ struct ClusterConfig {
     double mtp_schedule_lambda = 0.0;
     int mtp_schedule_min_depth = 1;
     int mtp_schedule_options = 0;  // at most this many scheduled depths (0: as many as the graph-variant budget holds)
+    int mtp_schedule_max_live = 0;  // past this many live requests a step verifies and drafts the minimum depth only (0: no limit)
     bool mtp_schedule_adapt = true;  // lambda follows the modeled throughput, floored at mtp_schedule_lambda
     // A sampled request's acceptance per position as a fraction of the
     // confidence head's, when its drafts are the draft's argmax
