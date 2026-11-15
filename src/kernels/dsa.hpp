@@ -249,11 +249,15 @@ void dsa_prepare_kernel_smem();
 
 
 // Fused decode select: streams pools [0, visible(pos[r])) per row straight
-// from the blocked index cache, computes pool logits inline (warp per pool,
-// lane per head), and keeps a running top-select_k composite-key selection.
-// Fixed grid, grid-stride over pools; the last block finishes the
-// selection, extracts ids ascending, expands pools to tokens, and appends
-// each row's incomplete tail. The workspace (dsa_select_workspace_bytes,
+// from the blocked index cache, scores them on the tensor cores (32 heads:
+// the prefill select's arithmetic, mmas on the e4m3 codes and its head-sum
+// order, so the keys are dsa_prefill_score_keys' bit for bit; 64 heads:
+// 16-entry tiles widened exactly to f16 — fp32 sums either way, the scores
+// the exact logits within those sums' rounding, the same on every rank and
+// at every grid and row count), and selects the select_k highest by a radix
+// select over the keys. Fixed grid, a stripe of one row's pools a block;
+// the last blocks finish the selection, extract ids ascending, expand pools
+// to tokens, and append each row's incomplete tail. The workspace (dsa_select_workspace_bytes,
 // sized for the caller's largest row count and pool count: the rows' keys,
 // their first-digit histograms and their selection bitmaps) and counter_ws
 // must be zeroed once at allocation; both self-reset after each call.

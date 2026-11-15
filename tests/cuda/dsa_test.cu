@@ -5,11 +5,14 @@
 //     decode, repeat runs) are bitwise;
 //   * device-vs-host oracle comparisons are tolerance-based where libm or
 //     FMA contraction can differ (compress, attention);
-//   * the top-k selection is exact by construction: the host oracle mirrors
-//     the kernel's contraction-proof logit arithmetic (separate mul/add in
-//     the documented order plus the warp butterfly reduction), so pool
-//     positions and expanded token rows are compared bitwise over the fuzz
-//     corpus — the M3 exit criterion.
+//   * the top-k selection is exact by construction where the host can
+//     mirror the scores (the prefill select's chain over its captured dots:
+//     separate mul/add in the documented order plus the warp butterfly), so
+//     pool positions and expanded token rows are compared bitwise over the
+//     fuzz corpus — the M3 exit criterion. The decode select scores on the
+//     tensor cores, whose accumulation order is the hardware's: its scores
+//     are held to the exact logits within the fp32 sums' rounding, and its
+//     selection bitwise to the top of its own keys (DecodeSelScenario).
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -932,139 +935,6 @@ DGPP_TEST(dsa_select_prefill_bitwise_fuzz) {
 }
 
 // ---------------------------------------------------------------------------
-// Fused decode select: same bitwise oracle, logits computed inline from the
-// fp8 cache; also repeat-run determinism.
-// ---------------------------------------------------------------------------
-DGPP_TEST(dsa_select_decode_fused_bitwise) {
-  const DsaConfig cfg{};
-  const DsaGeometry g = DsaGeometry::from_config(cfg);
-  const int select_k = g.select_k, kpool = cfg.index_kpool;
-  const int max_selected = g.max_selected;
-  const int heads = cfg.index_n_heads, dim = cfg.index_head_dim;
-  const int n_pools = 6000;  // > select_k: real sparse selection
-  const int64_t pos = 4 * n_pools + 2;  // visible = n_pools, tail 2
-
-  // q_fp8 with sane magnitudes and matching scales; random fp8 cache.
-  std::vector<uint16_t> qb = random_bf16_bits(61, heads * dim, -2, 1);
-  std::vector<uint8_t> q8(size_t(heads) * dim);
-  std::vector<float> q_scale(size_t(heads), 0.0f);
-  dsa_ref::fwht128_quant_fp8<float>(qb.data(), heads, dim, q8.data(),
-                                    q_scale.data());
-  std::vector<float> w_raw(heads, 0.0f);
-  for (auto& v : w_raw) v = random_f32(62, &v - w_raw.data()) * 0.01f;
-  std::vector<float> w(heads, 0.0f);
-  const float logit_scale =
-      float(std::pow(128.0, -0.5) * std::pow(32.0, -0.5));
-  for (int h = 0; h < heads; ++h)
-    w[h] = (w_raw[h] * q_scale[h]) * logit_scale;
-
-  std::vector<uint8_t> k8(size_t(n_pools) * dim);
-  std::vector<float> ks(n_pools, 0.0f);
-  // Random fp8 bytes, remapping the two NaN encodings (0x7F/0xFF) to max
-  // finite: real cache rows are always finite (the saturating encoder never
-  // mints NaN), and the select spec assumes finite logits.
-  for (auto& v : k8) {
-    v = uint8_t(hash32(63 + (&v - k8.data())) & 0xFF);
-    if ((v & 0x7Fu) == 0x7Fu) v ^= 0x01u;
-  }
-  for (auto& v : ks) v = std::fabs(random_f32(64, &v - ks.data())) * 0.05f;
-
-  DevBuf dq8(q8.size()), dks_cache(ks.size() * 4), dw(w.size() * 4),
-      dki(k8.size()), dpos(8), dri(4), dbt(4), dtopk(size_t(max_selected) * 4),
-      dcnt(4), dws(dsa_select_workspace_bytes(1, n_pools)), dctr(8);
-  dq8.upload(q8.data(), q8.size());
-  dw.upload(w.data(), w.size() * 4);
-  dki.upload(k8.data(), k8.size());
-  dks_cache.upload(ks.data(), ks.size() * 4);
-  std::vector<int64_t> posv = {pos};
-  std::vector<int32_t> req0 = {0}, bt0 = {0};
-  dpos.upload(posv.data(), 8);
-  dri.upload(req0.data(), 4);
-  dbt.upload(bt0.data(), 4);
-  int32_t zero32 = 0;
-  dctr.upload(&zero32, 4);
-
-  dsa_select_decode(dq8.p, static_cast<const float*>(dw.p),
-                    static_cast<const int32_t*>(dri.p),
-                    static_cast<const int64_t*>(dpos.p), 1,
-                    static_cast<const int32_t*>(dbt.p), 1, dki.p,
-                    static_cast<const float*>(dks_cache.p), n_pools, heads,
-                    dim, select_k, kpool, max_selected,
-                    static_cast<int32_t*>(dtopk.p),
-                    static_cast<int32_t*>(dcnt.p), dws.p, n_pools,
-                    static_cast<int32_t*>(dctr.p), 48, 0);
-
-  // Host mirror: identical inline dot arithmetic.
-  std::vector<float> logits(n_pools, 0.0f);
-  for (int j = 0; j < n_pools; ++j) {
-    float contrib[32];
-    for (int h = 0; h < 32; ++h) {
-      float partial = 0.0f;
-      for (int d = 0; d < 128; ++d)
-        partial = partial +
-                  fp8_e4m3_bits_to_float(q8[size_t(h) * 128 + d]) *
-                      fp8_e4m3_bits_to_float(k8[size_t(j) * 128 + d]);
-      contrib[h] = (w[h] * ks[j]) * partial;
-    }
-    logits[size_t(j)] = butterfly_sum_32(contrib);
-  }
-  std::vector<int32_t> pool_ids(select_k, 0);
-  const int n_sel =
-      dsa_ref::select_pools(logits.data(), n_pools, select_k, pool_ids.data());
-  std::vector<int32_t> want(size_t(max_selected), -1);
-  dsa_ref::expand_append_tail(pool_ids.data(), n_sel, pos, kpool, max_selected,
-                              want.data());
-
-  std::vector<int32_t> got(size_t(max_selected), -12345);
-  int32_t got_cnt = -1;
-  dtopk.download(got.data(), got.size() * 4);
-  dcnt.download(&got_cnt, 4);
-  if (got_cnt != int(n_sel * kpool + (pos + 1) % kpool))
-    throw std::runtime_error("decode select count");
-  if (std::memcmp(got.data(), want.data(), max_selected * 4) != 0) {
-    // Diagnostics: which pools are selected by one side but not the other,
-    // and their host-mirror logits (a boundary flip shows ulp-close logits;
-    // a kernel bug shows a clearly-better pool missing).
-    std::vector<int32_t> gset, wset;
-    for (int i = 0; i < max_selected; ++i) {
-      if (got[size_t(i)] >= 0) gset.push_back(got[size_t(i)] / kpool);
-      if (want[size_t(i)] >= 0) wset.push_back(want[size_t(i)] / kpool);
-    }
-    std::sort(gset.begin(), gset.end());
-    std::sort(wset.begin(), wset.end());
-    std::string detail;
-    for (int p : gset)
-      if (!std::binary_search(wset.begin(), wset.end(), p))
-        detail += " device-only pool " + std::to_string(p) + " logit " +
-                  std::to_string(logits[size_t(p)]) + ";";
-    for (int p : wset)
-      if (!std::binary_search(gset.begin(), gset.end(), p))
-        detail += " host-only pool " + std::to_string(p) + " logit " +
-                  std::to_string(logits[size_t(p)]) + ";";
-    std::vector<float> sorted = logits;
-    std::sort(sorted.begin(), sorted.end(), std::greater<float>());
-    detail += " 512th logit=" + std::to_string(sorted[511]) + " 513th=" +
-              std::to_string(sorted[512]);
-    throw std::runtime_error("decode select tokens mismatch: " + detail);
-  }
-
-  // Determinism: a second run must be identical.
-  std::vector<int32_t> got2(size_t(max_selected), -12345);
-  dsa_select_decode(dq8.p, static_cast<const float*>(dw.p),
-                    static_cast<const int32_t*>(dri.p),
-                    static_cast<const int64_t*>(dpos.p), 1,
-                    static_cast<const int32_t*>(dbt.p), 1, dki.p,
-                    static_cast<const float*>(dks_cache.p), n_pools, heads,
-                    dim, select_k, kpool, max_selected,
-                    static_cast<int32_t*>(dtopk.p),
-                    static_cast<int32_t*>(dcnt.p), dws.p, n_pools,
-                    static_cast<int32_t*>(dctr.p), 48, 0);
-  dtopk.download(got2.data(), got2.size() * 4);
-  require_bitwise("decode select repeat", got2.data(), got.data(),
-                  got.size() * 4);
-}
-
-// ---------------------------------------------------------------------------
 // Absorbed attention chain vs the host oracle (tolerance: online-softmax
 // rescaling vs one-shot).
 // ---------------------------------------------------------------------------
@@ -1730,8 +1600,16 @@ DGPP_TEST(dsa_dense_attention_matches_split_kernel_and_reference) {
 
 // ---------------------------------------------------------------------------
 // Decode-select scenarios shared by the MTP-row, grid-invariance,
-// long-context, and graph-replay tests. The host expectation mirrors the
-// kernel's contraction-proof arithmetic exactly (see the bitwise test above).
+// long-context, and graph-replay tests. The kernel scores on the tensor
+// cores (2026-11-15), whose accumulation order is the hardware's, so the
+// host cannot mirror a score bit for bit. The expectation is therefore the
+// selection's two definitions, each exact in its own terms:
+//   * a pool's score, read back from the key the kernel left in the
+//     workspace, is its exact (fp64) logit within the fp32 sums' rounding
+//     (1e-5 of the row's range), and the key carries the pool's own id;
+//   * the selection is the select_k smallest of the kernel's OWN keys (they
+//     are distinct: the id is their low bits), expanded as the reference
+//     expands a selection — bit for bit.
 // ---------------------------------------------------------------------------
 
 struct DecodeSelScenario {
@@ -1744,6 +1622,9 @@ struct DecodeSelScenario {
   std::vector<int32_t> req_ids;
   const DsaGeometry g;
   int heads = 32, dim = 128;
+  std::vector<uint64_t> keys;  // [rows][n_pools]: the last run's keys (expect() reads them)
+  bool relu = false;           // each head's dot clamped at zero (the full model's indexer)
+  static constexpr int kKeyIdBits = 21;  // the key's pool id (topk_select.cuh's kIdxBits)
 
   static DsaGeometry geometry(int tokens_a_pool) {
     DsaConfig c{};
@@ -1807,39 +1688,73 @@ struct DecodeSelScenario {
                       dim, g.select_k, kpool, max_selected,
                       static_cast<int32_t*>(dtopk.p),
                       static_cast<int32_t*>(dcnt.p), dws.p, n_pools,
-                      static_cast<int32_t*>(dctr.p), grid_blocks, stream);
+                      static_cast<int32_t*>(dctr.p), grid_blocks, stream, relu);
     topk.assign(size_t(max_selected) * rows, -12345);
     counts.assign(rows, -1);
     cudaDeviceSynchronize();
     dtopk.download(topk.data(), topk.size() * 4);
     dcnt.download(counts.data(), counts.size() * 4);
+    keys.assign(size_t(rows) * size_t(n_pools), 0);  // row r's keys at r * ws_max_pools
+    dws.download(keys.data(), keys.size() * 8);
   }
 
-  // Host mirror of the kernel's logits + the pinned selection + expansion.
+  // A key's score: the key is ~sortable(score) above the pool id.
+  static float key_score(uint64_t key) {
+    const uint32_t sortable = ~uint32_t(key >> kKeyIdBits);
+    const uint32_t bits = sortable & 0x80000000u ? sortable ^ 0x80000000u : ~sortable;
+    float f;
+    std::memcpy(&f, &bits, 4);
+    return f;
+  }
+
+  // The expectation (see the header above): checks the last run's keys
+  // against the exact logits, then selects and expands from those keys.
   void expect(std::vector<int32_t>& topk, std::vector<int32_t>& counts) const {
     const int max_selected = g.max_selected;
     topk.assign(size_t(max_selected) * rows, -1);
     counts.assign(rows, 0);
-    std::vector<float> logits(size_t(n_pools), 0.0f);
+    std::vector<double> logits(size_t(n_pools), 0.0);
     std::vector<int32_t> pool_ids(g.select_k, 0);
     for (int r = 0; r < rows; ++r) {
       const int64_t visible = (pos[size_t(r)] + 1) / kpool;
-      for (int64_t j = 0; j < visible; ++j) {
-        float contrib[32];
-        for (int h = 0; h < 32; ++h) {
-          float partial = 0.0f;
-          for (int d = 0; d < 128; ++d)
-            partial =
-                partial +
-                fp8_e4m3_bits_to_float(
-                    q8[size_t(r) * heads * dim + size_t(h) * 128 + d]) *
-                    fp8_e4m3_bits_to_float(k8[size_t(j) * dim + d]);
-          contrib[h] = (w[size_t(r) * heads + h] * ks[size_t(j)]) * partial;
+      int n_sel = 0;
+      if (visible <= g.select_k) {
+        for (int64_t j = 0; j < visible; ++j) pool_ids[size_t(n_sel++)] = int32_t(j);
+      } else {
+        if (keys.size() != size_t(rows) * size_t(n_pools))
+          throw std::runtime_error("decode select scenario: expect() needs the keys of a run");
+        const uint64_t* krow = keys.data() + size_t(r) * size_t(n_pools);
+        double lo = 0.0, hi = 0.0;
+        for (int64_t j = 0; j < visible; ++j) {
+          double total = 0.0;
+          for (int h = 0; h < heads; ++h) {
+            double partial = 0.0;
+            for (int d = 0; d < dim; ++d)
+              partial += double(fp8_e4m3_bits_to_float(q8[(size_t(r) * heads + size_t(h)) * dim + d])) *
+                         double(fp8_e4m3_bits_to_float(k8[size_t(j) * dim + d]));
+            total += double(w[size_t(r) * heads + h]) * (relu ? std::max(partial, 0.0) : partial);
+          }
+          logits[size_t(j)] = total * double(ks[size_t(j)]);
+          lo = j == 0 ? logits[0] : std::min(lo, logits[size_t(j)]);
+          hi = j == 0 ? logits[0] : std::max(hi, logits[size_t(j)]);
         }
-        logits[size_t(j)] = butterfly_sum_32(contrib);
+        const double tol = 1e-5 * (hi - lo);
+        for (int64_t j = 0; j < visible; ++j) {
+          if (int64_t(krow[j] & ((1ull << kKeyIdBits) - 1)) != j)
+            throw std::runtime_error("decode select scenario: row " + std::to_string(r) + " pool " +
+                                     std::to_string(j) + " carries another pool's id in its key");
+          const double dev = double(key_score(krow[j]));
+          if (!(std::fabs(dev - logits[size_t(j)]) <= tol))
+            throw std::runtime_error("decode select scenario: row " + std::to_string(r) + " pool " +
+                                     std::to_string(j) + " scored " + std::to_string(dev) + " against the exact " +
+                                     std::to_string(logits[size_t(j)]) + " (tolerance " + std::to_string(tol) + ")");
+        }
+        std::vector<uint64_t> order(krow, krow + visible);
+        std::nth_element(order.begin(), order.begin() + (g.select_k - 1), order.end());
+        for (int i = 0; i < g.select_k; ++i) pool_ids[size_t(i)] = int32_t(order[size_t(i)] & ((1ull << kKeyIdBits) - 1));
+        std::sort(pool_ids.begin(), pool_ids.end());
+        n_sel = g.select_k;
       }
-      const int n_sel = dsa_ref::select_pools(logits.data(), visible,
-                                              g.select_k, pool_ids.data());
       counts[size_t(r)] =
           dsa_ref::expand_append_tail(pool_ids.data(), n_sel, pos[size_t(r)],
                                       kpool, max_selected,
@@ -1847,6 +1762,29 @@ struct DecodeSelScenario {
     }
   }
 };
+
+// The fused decode select over the fp8 cache, and repeat-run determinism.
+DGPP_TEST(dsa_select_decode_fused_bitwise) {
+  // 6000 visible pools (> select_k: a real sparse selection), a tail of two
+  // tokens: the scores against the exact logits and the selection bitwise
+  // from the kernel's own keys (DecodeSelScenario::expect, below), and a
+  // second run bit for bit the first, keys included.
+  DecodeSelScenario sc;
+  const int n_pools = 6000;
+  sc.init(61, {int64_t(sc.kpool) * n_pools + 2});
+  std::vector<int32_t> got, counts, want, want_counts;
+  sc.run(48, got, counts);
+  sc.expect(want, want_counts);
+  if (counts[0] != want_counts[0] || counts[0] != sc.g.select_k * sc.kpool + 3 % sc.kpool)
+    throw std::runtime_error("decode select count");
+  if (std::memcmp(got.data(), want.data(), got.size() * 4) != 0)
+    throw std::runtime_error("decode select tokens are not the top of the kernel's own keys");
+  const std::vector<uint64_t> keys = sc.keys;
+  std::vector<int32_t> got2, counts2;
+  sc.run(48, got2, counts2);
+  require_bitwise("decode select repeat", got2.data(), got.data(), got.size() * 4);
+  require_bitwise("decode select repeat keys", sc.keys.data(), keys.data(), size_t(n_pools) * 8);
+}
 
 // MTP-shaped multi-row decode: 4 rows at consecutive positions (differing
 // visible counts), plus short-context rows where most blocks get empty
@@ -1937,9 +1875,9 @@ DGPP_TEST(dsa_select_decode_row_groups) {
 }
 
 // The 64-head indexer at the DeepSeek-V4-Flash release shape (2026-10-01):
-// 64 heads x 128, relu, select_k 512, one entry per pool (kpool 1) — the
-// kernel's kHG = 2 instantiation, which scores 16-entry tiles on the tensor
-// cores (e4m3 codes widened exactly to f16, mma f16 -> f32) and needs the
+// 64 heads x 128, relu, select_k 512, one entry per pool (kpool 1): eight
+// head tiles a 16-entry tile on the tensor cores (e4m3 codes widened
+// exactly to f16, mma f16 -> f32), and the shape that needs the
 // per-symbol dynamic shared-memory opt-in (a missing one is `invalid
 // argument` at the launch, which the tiny fixture's select_k 16 never
 // reached). Rows 1, 4 and 6, contexts below, at and far above select_k,
@@ -2053,16 +1991,98 @@ DGPP_TEST(dsa_select_decode_64_heads_release_shape) {
   }
 }
 
-// The selection must not depend on the grid: 7 blocks vs 48 blocks produce
-// identical rows (uneven stripes at grid=7 exercise the stripe bounds).
+// Neither the selection nor a single key may depend on the grid: 7 blocks
+// vs 48 blocks produce identical rows and identical keys (uneven stripes at
+// grid=7 exercise the stripe bounds, and put every entry in another tile,
+// at another place in its tile: a score is its entry's alone).
 DGPP_TEST(dsa_select_decode_grid_invariance) {
-  DecodeSelScenario sc;
-  sc.init(84, {40003});
-  std::vector<int32_t> a, ca, b, cb;
-  sc.run(48, a, ca);
-  sc.run(7, b, cb);
-  if (ca != cb || a != b)
-    throw std::runtime_error("decode select depends on grid size");
+  for (const int kpool : {4, 1}) {
+    DecodeSelScenario sc(kpool);
+    sc.init(84, {int64_t(kpool) * 10000 + kpool - 1});
+    std::vector<int32_t> a, ca, b, cb;
+    sc.run(48, a, ca);
+    const std::vector<uint64_t> keys = sc.keys;
+    sc.run(7, b, cb);
+    if (ca != cb || a != b)
+      throw std::runtime_error("decode select depends on grid size");
+    require_bitwise("decode select keys at another grid", sc.keys.data(), keys.data(), size_t(10000) * 8);
+  }
+}
+
+// A decode step scores an entry to the bits a prefill tile does: the 32-head
+// form is the prefill select's fused scoring (dsa_prefill_score_keys) over
+// the blocked cache, so the two leave the same keys for the same queries,
+// weights, cache rows and scales — with and without the relu, at both pool
+// geometries, a short row and one whose last tile is partial.
+DGPP_TEST(dsa_select_decode_keys_are_the_prefill_select_keys) {
+  for (const bool relu : {false, true})
+    for (const int kpool : {4, 1}) {
+      DecodeSelScenario sc(kpool);
+      sc.relu = relu;
+      sc.init(87, {int64_t(kpool) * 9000 + kpool - 1, int64_t(kpool) * 30007, int64_t(kpool) * 2049});
+      std::vector<int32_t> topk, counts;
+      sc.run(0, topk, counts);
+      DevBuf dq(sc.q8.size()), dk(sc.k8.size()), dw(sc.w.size() * 4), dks(sc.ks.size() * 4), dpos(sc.pos.size() * 8),
+          dkeys(size_t(sc.rows) * size_t(sc.n_pools) * 8);
+      dq.upload(sc.q8.data(), sc.q8.size());
+      dk.upload(sc.k8.data(), sc.k8.size());
+      dw.upload(sc.w.data(), sc.w.size() * 4);
+      dks.upload(sc.ks.data(), sc.ks.size() * 4);
+      dpos.upload(sc.pos.data(), sc.pos.size() * 8);
+      DGPP_CUDA_OK(cudaMemset(dkeys.p, 0, size_t(sc.rows) * size_t(sc.n_pools) * 8));
+      dsa_prefill_score_keys(static_cast<const uint8_t*>(dq.p), static_cast<const uint8_t*>(dk.p),
+                             static_cast<const float*>(dw.p), static_cast<const float*>(dks.p),
+                             static_cast<const int64_t*>(dpos.p), sc.rows, sc.n_pools, sc.n_pools, sc.g.select_k, kpool,
+                             static_cast<uint64_t*>(dkeys.p), 0, relu);
+      DGPP_CUDA_OK(cudaDeviceSynchronize());
+      std::vector<uint64_t> prefill(size_t(sc.rows) * size_t(sc.n_pools));
+      dkeys.download(prefill.data(), prefill.size() * 8);
+      for (int r = 0; r < sc.rows; ++r) {
+        const int64_t visible = (sc.pos[size_t(r)] + 1) / kpool;
+        if (visible <= sc.g.select_k) throw std::runtime_error("decode keys vs prefill keys: a row with nothing to score");
+        require_bitwise("decode keys vs the prefill select's, row " + std::to_string(r) + (relu ? " (relu)" : "") +
+                            " kpool " + std::to_string(kpool),
+                        &sc.keys[size_t(r) * size_t(sc.n_pools)], &prefill[size_t(r) * size_t(sc.n_pools)],
+                        size_t(visible) * 8);
+      }
+    }
+}
+
+// Nor on the rows beside it: a row's keys and its selection in a launch of
+// one row, of three and of eight (each row count is another grid: the
+// stripes are the default blocks over the rows).
+DGPP_TEST(dsa_select_decode_row_does_not_depend_on_the_rows_beside_it) {
+  for (const int kpool : {4, 1}) {
+    const std::vector<int64_t> all = {int64_t(kpool) * 9000 + kpool - 1, int64_t(kpool) * 5000, int64_t(kpool) * 12000 + 1,
+                                      int64_t(kpool) * 2500, int64_t(kpool) * 9000, 77, int64_t(kpool) * 30000,
+                                      int64_t(kpool) * 2049};
+    DecodeSelScenario s8(kpool);
+    s8.init(86, all);
+    std::vector<int32_t> t8, c8;
+    s8.run(0, t8, c8);
+    for (const int rows : {1, 3}) {
+      DecodeSelScenario sn(kpool);
+      sn.init(86, std::vector<int64_t>(all.begin(), all.begin() + rows));
+      // The same queries, weights and cache as the eight-row launch's first rows.
+      sn.q8.assign(s8.q8.begin(), s8.q8.begin() + size_t(rows) * sn.heads * sn.dim);
+      sn.w.assign(s8.w.begin(), s8.w.begin() + size_t(rows) * sn.heads);
+      sn.k8 = s8.k8;
+      sn.ks = s8.ks;
+      sn.n_pools = s8.n_pools;
+      std::vector<int32_t> tn, cn;
+      sn.run(0, tn, cn);
+      for (int r = 0; r < rows; ++r) {
+        const std::string tag = "decode select row " + std::to_string(r) + " of " + std::to_string(rows) + " rows";
+        if (cn[size_t(r)] != c8[size_t(r)]) throw std::runtime_error(tag + ": count");
+        require_bitwise(tag, &tn[size_t(r) * sn.g.max_selected], &t8[size_t(r) * s8.g.max_selected],
+                        size_t(sn.g.max_selected) * 4);
+        const int64_t visible = (all[size_t(r)] + 1) / kpool;
+        if (visible > sn.g.select_k)
+          require_bitwise(tag + " keys", &sn.keys[size_t(r) * size_t(sn.n_pools)],
+                          &s8.keys[size_t(r) * size_t(s8.n_pools)], size_t(visible) * 8);
+      }
+    }
+  }
 }
 
 // Long-context decode: 100k visible pools — stripes exceed the 2048-pool
@@ -2699,6 +2719,11 @@ DGPP_TEST(dsa_select_decode_graph_replay) {
   sb.w = sc.w;
   sb.k8 = sc.k8;
   sb.ks = sc.ks;
+  // The replay's keys (row 0 of the workspace) are the expectation's: sb's
+  // pools are the first of sc's, where the replay wrote them.
+  std::vector<uint64_t> replay_keys(static_cast<size_t>(sc.n_pools));
+  dws.download(replay_keys.data(), replay_keys.size() * 8);
+  sb.keys.assign(replay_keys.begin(), replay_keys.begin() + sb.n_pools);
   std::vector<int32_t> want_b, want_cnt_b;
   sb.expect(want_b, want_cnt_b);
   if (cnt_b != want_cnt_b[0] ||
@@ -5051,12 +5076,13 @@ DGPP_TEST(dsa_layer_full_tp2_head_slice_matches_tp1) {
 }
 
 // The select networks at the full model's width: select_k 2048 over
-// per-token entries (kpool 1) with the relu'd logits, bitwise against the
-// host spec — the prefill select (a 4096-key tile) over materialized dots
-// and the fused decode select over an fp8 cache, then the expansion's
-// eight rounds (2048 ids sorted ascending, no tail).
+// per-token entries (kpool 1) with the relu'd logits — the prefill select
+// (a 4096-key tile) over materialized dots, bitwise against the host spec,
+// and the fused decode select over an fp8 cache, bitwise from its own keys
+// (their scores against the exact logits); then the expansion's eight
+// rounds (2048 ids sorted ascending, no tail).
 DGPP_TEST(dsa_select_kpool1_select2048_bitwise) {
-  const int select_k = 2048, kpool = 1, max_selected = 2048, heads = 32, dim = 128;
+  const int select_k = 2048, kpool = 1, max_selected = 2048, heads = 32;
   // Prefill: positions around the dense/sparse boundary and beyond.
   std::vector<int64_t> cases = {0, 1, 7, 2046, 2047, 2048, 2049, 2100, 4095, 4096, 6000, 9001};
   for (int i = 0; i < 12; ++i) cases.push_back(int64_t(2048 + hash32(7600 + i) % 7000));
@@ -5103,73 +5129,19 @@ DGPP_TEST(dsa_select_kpool1_select2048_bitwise) {
                                " (count " + std::to_string(got_cnt) + " want " +
                                std::to_string(n_tok) + ")");
   }
-  // Decode over an fp8 cache: 6000 visible entries, the same mirror.
+  // Decode over an fp8 cache: 6000 visible entries, relu — the scores
+  // against the exact logits, the selection bitwise from the kernel's keys.
   {
-    const int n_pools = 6000;
-    const int64_t pos = n_pools - 1;
-    std::vector<uint16_t> qb = random_bf16_bits(7640, heads * dim, -2, 1);
-    std::vector<uint8_t> q8(size_t(heads) * dim);
-    std::vector<float> q_scale(heads);
-    dsa_ref::fwht128_quant_fp8<float>(qb.data(), heads, dim, q8.data(), q_scale.data());
-    std::vector<float> w(heads);
-    const float logit_scale = float(std::pow(128.0, -0.5) * std::pow(32.0, -0.5));
-    for (int h = 0; h < heads; ++h)
-      w[size_t(h)] = (random_f32(7641, h) * 0.01f * q_scale[size_t(h)]) * logit_scale;
-    std::vector<uint8_t> k8(size_t(n_pools) * dim);
-    std::vector<float> ks(n_pools);
-    for (size_t i = 0; i < k8.size(); ++i) {
-      k8[i] = uint8_t(hash32(7642 + i) & 0xFF);
-      if ((k8[i] & 0x7Fu) == 0x7Fu) k8[i] ^= 0x01u;
-    }
-    for (int j = 0; j < n_pools; ++j) ks[size_t(j)] = std::fabs(random_f32(7643, j)) * 0.05f;
-    DevBuf dq8(q8.size()), dks(ks.size() * 4), dw(w.size() * 4), dki(k8.size()), dpos(8), dri(4),
-        dbt(4), dtopk(size_t(max_selected) * 4), dcnt(4),
-        dws(dsa_select_workspace_bytes(1, n_pools)), dctr(8);
-    dq8.upload(q8.data(), q8.size());
-    dw.upload(w.data(), w.size() * 4);
-    dki.upload(k8.data(), k8.size());
-    dks.upload(ks.data(), ks.size() * 4);
-    const std::vector<int64_t> posv = {pos};
-    const std::vector<int32_t> req0 = {0}, bt0 = {0};
-    dpos.upload(posv.data(), 8);
-    dri.upload(req0.data(), 4);
-    dbt.upload(bt0.data(), 4);
-    const int32_t zero2[2] = {0, 0};
-    dctr.upload(zero2, 8);
-    dsa_select_decode(dq8.p, static_cast<const float*>(dw.p), static_cast<const int32_t*>(dri.p),
-                      static_cast<const int64_t*>(dpos.p), 1, static_cast<const int32_t*>(dbt.p), 1,
-                      dki.p, static_cast<const float*>(dks.p), n_pools, heads, dim, select_k, kpool,
-                      max_selected, static_cast<int32_t*>(dtopk.p), static_cast<int32_t*>(dcnt.p),
-                      dws.p, n_pools, static_cast<int32_t*>(dctr.p), 48, 0, /*relu=*/true);
-    std::vector<float> logits(n_pools);
-    for (int j = 0; j < n_pools; ++j) {
-      float contrib[32];
-      for (int h = 0; h < 32; ++h) {
-        float partial = 0.0f;
-        for (int d = 0; d < 128; ++d)
-          partial = partial + fp8_e4m3_bits_to_float(q8[size_t(h) * 128 + d]) *
-                                  fp8_e4m3_bits_to_float(k8[size_t(j) * 128 + d]);
-        contrib[h] = (w[size_t(h)] * ks[size_t(j)]) * std::max(partial, 0.0f);
-      }
-      logits[size_t(j)] = butterfly_sum_32(contrib);
-    }
-    std::vector<int32_t> ids(select_k);
-    const int n_sel = dsa_ref::select_pools(logits.data(), n_pools, select_k, ids.data());
-    std::vector<int32_t> want(size_t(max_selected), -1);
-    dsa_ref::expand_append_tail(ids.data(), n_sel, pos, kpool, max_selected, want.data());
-    std::vector<int32_t> got(size_t(max_selected), -12345);
-    int32_t got_cnt = -1;
-    dtopk.download(got.data(), got.size() * 4);
-    dcnt.download(&got_cnt, 4);
-    if (got_cnt != select_k) throw std::runtime_error("select2048 decode count");
-    if (std::memcmp(got.data(), want.data(), got.size() * 4) != 0) {
-      std::string detail;
-      for (int i = 0; i < max_selected; ++i)
-        if (got[size_t(i)] != want[size_t(i)] && detail.size() < 400)
-          detail += " [" + std::to_string(i) + "] " + std::to_string(got[size_t(i)]) + " vs " +
-                    std::to_string(want[size_t(i)]);
-      throw std::runtime_error("select2048 decode mismatch:" + detail);
-    }
+    DecodeSelScenario sc(kpool);
+    if (sc.g.select_k != select_k) throw std::runtime_error("select2048 decode: the scenario's geometry");
+    sc.relu = true;
+    sc.init(7640, {int64_t(kpool) * 6000 - 1});
+    std::vector<int32_t> got, counts, want, want_counts;
+    sc.run(48, got, counts);
+    sc.expect(want, want_counts);
+    if (counts[0] != select_k * kpool) throw std::runtime_error("select2048 decode count");
+    if (counts[0] != want_counts[0] || std::memcmp(got.data(), want.data(), got.size() * 4) != 0)
+      throw std::runtime_error("select2048 decode: not the top of the kernel's own keys");
   }
 }
 

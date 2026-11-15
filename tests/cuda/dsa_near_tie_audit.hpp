@@ -10,7 +10,11 @@
 //      device's selection must match it bitwise — this certifies the whole
 //      select pipeline (logit arithmetic, composite key, merge, expansion)
 //      is spec-exact for the inputs it actually consumed. A wrong scale,
-//      fold order, or misindexed dot buffer fails here, loudly.
+//      fold order, or misindexed dot buffer fails here, loudly. (A decode
+//      row's dots are the tensor cores', which the host cannot reproduce
+//      bit for bit and the fused kernel does not leave behind: there the
+//      selection may differ from the oracle's only in entries whose oracle
+//      logits sit on the cut within the fp32 sums' rounding.)
 //   2. Certify the divergence is a boundary near tie: recompute logits from
 //      the REFERENCE's inputs too, then require each swapped pool pair to
 //      straddle the rank-select_k cut within a small multiple of the
@@ -21,11 +25,14 @@
 // (gathered in LOGICAL pool order through the block table) and both sides'
 // quantized q rows. The arithmetic mirrors are the kernel-pinned ones from
 // dsa_test.cu (contraction-proof separate mul/add in the documented order
-// plus the warp butterfly), so parity is bitwise, not statistical.
+// plus the warp butterfly), so parity is bitwise, not statistical, wherever
+// the device's dots are captured (the prefill rows).
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <functional>
+#include <iterator>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -93,9 +100,10 @@ inline float pool_logit_mirror(const uint8_t* q8_row, const float* w_row,
 //                        tensor-core dots bit-exact instead of recomputing
 //                        them (the host cannot reproduce a tensor-core
 //                        reduction order). Null for decode rows, whose
-//                        fused select computes dots inline with pinned
-//                        contraction-proof arithmetic the mirror reproduces
-//                        exactly.
+//                        fused select scores on the tensor cores too
+//                        (2026-11-15) and keeps no dots: the mirror's
+//                        chain is then the scores within their rounding,
+//                        and Part 1 holds the selection to that.
 inline void audit_flipped_row(int select_k, const int32_t* dev_topk,
                               const int32_t* ref_topk, const uint8_t* dev_q8,
                               const float* dev_w, const uint8_t* dev_k,
@@ -129,7 +137,8 @@ inline void audit_flipped_row(int select_k, const int32_t* dev_topk,
   pools_of(ref_topk, ref_pools);
 
   // The device logit for pool j, using the device's ACTUAL dot values when
-  // they were captured (prefill) or the pinned inline arithmetic (decode).
+  // they were captured (prefill) or the chain over its inputs (decode: the
+  // device's score within the fp32 sums' rounding).
   const auto dev_logit = [&](int64_t j) -> float {
     float contrib[32];
     for (int h = 0; h < heads; ++h) {
@@ -159,8 +168,26 @@ inline void audit_flipped_row(int select_k, const int32_t* dev_topk,
     std::vector<int32_t> spec(size_t(select_k), 0);
     const int n = dsa_ref::select_pools(logits.data(), n_pools, select_k,
                                         spec.data());
-    if (n != int(dev_pools.size()) ||
-        !std::equal(dev_pools.begin(), dev_pools.end(), spec.begin())) {
+    // A decode row (no captured dots): entries only one side selected must
+    // sit on the cut — within 1e-5 of the row's logit range of the
+    // select_k-th logit, the bound the kernel's own tests hold a score to.
+    bool on_the_cut = false;
+    if (dev_dots == nullptr && n == int(dev_pools.size()) && n == select_k && n_pools > select_k) {
+      std::vector<float> sorted = logits;
+      std::nth_element(sorted.begin(), sorted.begin() + (select_k - 1), sorted.end(), std::greater<float>());
+      const double cut = sorted[size_t(select_k - 1)];
+      const auto range = std::minmax_element(logits.begin(), logits.end());
+      const double tol = 1e-5 * (double(*range.second) - double(*range.first));
+      std::vector<int32_t> only;
+      std::set_symmetric_difference(dev_pools.begin(), dev_pools.end(), spec.begin(), spec.begin() + n,
+                                    std::back_inserter(only));
+      on_the_cut = true;
+      for (int32_t p : only)
+        if (!(std::fabs(double(logits[size_t(p)]) - cut) <= tol)) on_the_cut = false;
+    }
+    if (!on_the_cut &&
+        (n != int(dev_pools.size()) ||
+         !std::equal(dev_pools.begin(), dev_pools.end(), spec.begin()))) {
       std::string ds, ss;
       for (int32_t p : dev_pools) ds += " " + std::to_string(p);
       for (int i = 0; i < n; ++i) ss += " " + std::to_string(spec[size_t(i)]);

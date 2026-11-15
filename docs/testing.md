@@ -645,7 +645,8 @@ build. The suites cover:
   fixed depth 5 split past the widest family), `dsv4_tokenizer_test` and
   `dsv4_prompt_test` against the snapshot's own tokenizer and
   `encoding_dsv4.py`; `dsa_test`'s 64-head release-shape decode select
-  certified against fp64 logits, `mma_gemv_test`'s dense bf16-weight tile
+  certified against fp64 logits (the 32-head indexers' scenarios hold every
+  score to them as well), `mma_gemv_test`'s dense bf16-weight tile
   kernel (oracle budget, row-invariant across chunkings, the gated ring
   form bitwise the plain rows), `glm_moe_test`'s
   early shared-slot order bitwise the default one and the phased prefill
@@ -665,8 +666,11 @@ build. The suites cover:
   bitwise via hard-max gates (including multi-token decode == single-token),
   a 1,100-case bitwise pooled top-k fuzz around pool boundaries plus
   exact-tie and 512th-boundary constructions, the fused decode select (MTP
-  multi-row, grid-size invariance, 100k-pool long-context stripes, graph
-  capture/replay with changed position), split-KV absorbed attention against
+  multi-row, 100k-pool long-context stripes, graph capture/replay with
+  changed position: each score within the fp32 sums' rounding of its exact
+  logit and the selection bitwise the top of the kernel's own keys; the keys
+  bitwise the prefill select's, and the same at another grid and with other
+  rows beside them), split-KV absorbed attention against
   the host oracle at TP1/TP4 with empty-row and head-group coverage (the
   listed kernel's rows bitwise the same at every row count from one to
   eight, where an odd count pairs a row's splits in a block),
