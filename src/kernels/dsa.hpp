@@ -254,7 +254,8 @@ void dsa_prepare_kernel_smem();
 // Fixed grid, grid-stride over pools; the last block finishes the
 // selection, extracts ids ascending, expands pools to tokens, and appends
 // each row's incomplete tail. The workspace (dsa_select_workspace_bytes,
-// sized for the caller's largest row count and pool count) and counter_ws
+// sized for the caller's largest row count and pool count: the rows' keys,
+// their first-digit histograms and their selection bitmaps) and counter_ws
 // must be zeroed once at allocation; both self-reset after each call.
 //   q_fp8: [rows, heads, dim] fp8; w_folded: [rows, heads] fp32;
 //   block_tables: int32 [max_requests, blocks_per_request]; req_ids: [rows];

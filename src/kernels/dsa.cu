@@ -1104,9 +1104,13 @@ struct PrefillKeyFn {
 // digit; the last block to finish (a ticket on counter_ws) finds the
 // select_k-th smallest key by radix refinement over that histogram — one
 // pass over the row's keys per further digit, stopping when the boundary
-// digit's bin holds at most kSelectStopCandidates keys — gathers the keys
-// below the boundary straight into best[] (the expansion sorts ids, so
-// their order is free), sorts only the boundary bin's keys, and expands.
+// digit's bin holds at most kSelectStopCandidates keys — marks the keys
+// below the boundary in the row's bitmap (the workspace's third region: a
+// bit a pool), ranks only the boundary bin's keys and adds the chosen
+// ones' bits, then writes the pool ids out of the bitmap by a prefix
+// count, in order by construction (2026-11-14; until then the keys went
+// to a shared-memory array in arrival order and the expansion rank-sorted
+// their ids), and expands.
 // The selection is a set under a total order (the key), so it is the
 // streaming top-k's set bit for bit. What it replaces: a 2048-key bitonic
 // sort per block per tile regardless of the stripe, and a serial merge of
@@ -1257,12 +1261,12 @@ __global__ void select_decode_kernel(
     int blocks_per_request, const uint8_t* index_k, const float* index_scale,
     int pools_per_block, int heads, int select_k, int kpool, int max_selected,
     int32_t* topk_out, int32_t* out_counts, uint64_t* keys_ws,
-    int64_t keys_stride, int32_t* hist_ws, int32_t* counter_ws) {
+    int64_t keys_stride, int32_t* hist_ws, uint32_t* bitmap_ws,
+    int64_t bitmap_stride, int32_t* counter_ws) {
   dgpp_pdl_wait();
   extern __shared__ uint64_t smem_u64[];
   // Layout: [q8: rows x [16 chunks][32 heads] x 8 bytes][k rows: warps x 4 x
   //         32 u32][w: rows*heads f32][hist: kSelectHistBins i32]
-  //         [best_hi/best_lo: select_k each]
   //         [cand_hi/cand_lo: kSelectStopCandidates each]
   //         [scratch: select_k + 1 i32].
   constexpr int kPoolsPerIter = 4;
@@ -1276,12 +1280,11 @@ __global__ void select_decode_kernel(
       reinterpret_cast<uint8_t*>(krow_s) +
       (kMma ? kMmaSelKeyBytes : size_t(256 / 32) * kPoolsPerIter * 32 * sizeof(uint32_t)));
   int32_t* hist = reinterpret_cast<int32_t*>(w + int64_t(rows) * heads);
-  uint32_t* best_hi = reinterpret_cast<uint32_t*>(hist + kSelectHistBins);
-  uint32_t* best_lo = best_hi + select_k;
-  uint32_t* cand_hi = best_lo + select_k;
+  uint32_t* cand_hi = reinterpret_cast<uint32_t*>(hist + kSelectHistBins);
   uint32_t* cand_lo = cand_hi + kSelectStopCandidates;
   int32_t* scratch = reinterpret_cast<int32_t*>(cand_lo + kSelectStopCandidates);
-  __shared__ int s_bin, s_below, s_n_def, s_n_cand;
+  __shared__ int s_bin, s_below, s_n_take, s_n_cand, s_n_sel;
+  __shared__ int s_warp_sel[8];  // the block's warps (256 threads)
 
   const unsigned long long t_entry = select_now();
   // q to smem chunk-major per row ([16 chunks][32 heads] of 8 bytes): the
@@ -1488,18 +1491,21 @@ __global__ void select_decode_kernel(
     g_select_phase[2] = select_now();
   }
 
-  // Phase 2 (this block's row): its select_k smallest keys.
+  // Phase 2 (this block's row): its select_k smallest keys, as ascending
+  // pool ids in scratch[0, n_sel). The ids come out in order by
+  // construction (2026-11-14): until then the keys were gathered in the
+  // order their threads arrived and the ids rank-sorted, n^2 / 256 compares
+  // a thread, which at the full model's 2,048 selected tokens was 108 us of
+  // every launch at any context (the sort was sized for 512 pools), and ran
+  // on a context short enough to select every pool as well.
   for (int r = my_row; r <= my_row; ++r) {
     const int64_t visible = (pos[r] + 1) / kpool;
     const unsigned long long t_row = select_now();
+    int n_sel = 0;
     if (visible <= select_k) {
-      // Every visible pool is selected: keys carry only the pool id in
-      // their low kIdxBits — the expansion reads nothing else.
-      for (int i = threadIdx.x; i < select_k; i += blockDim.x) {
-        const bool real = i < visible;
-        best_hi[i] = real ? 0u : 0xFFFFFFFFu;
-        best_lo[i] = real ? uint32_t(i) : 0xFFFFFFFFu;
-      }
+      // Every visible pool is selected: the ids in order, nothing to read.
+      for (int i = threadIdx.x; i < int(visible); i += blockDim.x) scratch[i] = i;
+      n_sel = int(visible);
       __syncthreads();
     } else {
       const uint64_t* krow = keys_ws + int64_t(r) * keys_stride;
@@ -1540,49 +1546,52 @@ __global__ void select_decode_kernel(
         }
         __syncthreads();
       }
-      // Gather: keys below the boundary bin straight into best[] (their
-      // order is free — the expansion sorts ids); the bin's keys into the
-      // candidate array, sorted so the `remaining` smallest complete best.
-      // best[] starts EMPTY: an entry the fill leaves
-      // unwritten is dropped by the expansion instead of carrying shared
-      // memory's leftovers into the token list (a 62,600 in a 2,119-token
-      // context faulted the listed attention on the fabric); a short fill
-      // is recorded (dsa_select_anomalies).
+      // Gather: the row's selection as a bitmap of its pools, in the
+      // workspace. A warp reads 32 consecutive keys an iteration (krow's
+      // index is the pool id), so the keys below the boundary bin are one
+      // ballot — one word, written by its warp alone; the bin's keys go to
+      // the candidate array, whose `remaining` smallest add their bits.
+      // Every word below the row's visible pools is written here before it
+      // is read, so the bitmap carries nothing from an earlier launch (a
+      // 62,600 in a 2,119-token context faulted the listed attention on
+      // the fabric when a fill left shared memory's leftovers in the list);
+      // a fill that disagrees with the histogram is recorded
+      // (dsa_select_anomalies).
+      uint32_t* sel = bitmap_ws + int64_t(r) * bitmap_stride;
       if (threadIdx.x == 0) {
-        s_n_def = 0;
+        s_n_take = 0;
         s_n_cand = 0;
-      }
-      for (int i = threadIdx.x; i < select_k; i += blockDim.x) {
-        best_hi[i] = 0xFFFFFFFFu;
-        best_lo[i] = 0xFFFFFFFFu;
       }
       for (int i = threadIdx.x; i < kSelectStopCandidates; i += blockDim.x) {
         cand_hi[i] = 0xFFFFFFFFu;
         cand_lo[i] = 0xFFFFFFFFu;
       }
       __syncthreads();
-      for (int64_t p = threadIdx.x; p < visible; p += blockDim.x) {
-        const uint64_t key = krow[p];
-        const uint64_t top = key >> shift;
-        if (top < prefix) {
-          const int s = atomicAdd(&s_n_def, 1);
-          if (s < select_k) {
-            best_hi[s] = uint32_t(key >> 32);
-            best_lo[s] = uint32_t(key);
+      {
+        const int gwarp = threadIdx.x >> 5, glane = threadIdx.x & 31;
+        for (int64_t base = int64_t(gwarp) * 32; base < visible; base += blockDim.x) {
+          const int64_t p = base + glane;
+          bool below = false;
+          if (p < visible) {
+            const uint64_t key = krow[p];
+            const uint64_t top = key >> shift;
+            below = top < prefix;
+            if (top == prefix) {
+              const int s = atomicAdd(&s_n_cand, 1);
+              if (s < kSelectStopCandidates) {
+                cand_hi[s] = uint32_t(key >> 32);
+                cand_lo[s] = uint32_t(key);
+              }
+            }
           }
-        } else if (top == prefix) {
-          const int s = atomicAdd(&s_n_cand, 1);
-          if (s < kSelectStopCandidates) {
-            cand_hi[s] = uint32_t(key >> 32);
-            cand_lo[s] = uint32_t(key);
-          }
+          const uint32_t word = __ballot_sync(0xffffffffu, below);
+          if (glane == 0) sel[base >> 5] = word;
         }
       }
       __syncthreads();
       // The bin's `remaining` smallest keys by rank (unique keys: the
-      // rank is a permutation, so the keys ranked below `remaining` land
-      // at best[lower + rank]) — cnt^2 / blockDim compares per thread, no
-      // sorting network.
+      // rank is a permutation) — cnt^2 / blockDim compares per thread, no
+      // sorting network. Each one's pool joins the bitmap.
       {
         const int n = cnt < kSelectStopCandidates ? cnt : kSelectStopCandidates;
         const int i = threadIdx.x;
@@ -1591,21 +1600,53 @@ __global__ void select_decode_kernel(
         int rank = 0;
 #pragma unroll 8
         for (int j = 0; j < n; ++j) rank += key_less(cand_hi[j], cand_lo[j], vh, vl);
-        if (i < n && rank < remaining) {
-          best_hi[lower + rank] = vh;
-          best_lo[lower + rank] = vl;
+        const int64_t pool = int64_t(vl & uint32_t(kIdxMask));
+        if (i < n && rank < remaining && (vh != 0xFFFFFFFFu || vl != 0xFFFFFFFFu) && pool < visible) {
+          atomicOr(&sel[pool >> 5], 1u << int(pool & 31));
+          atomicAdd(&s_n_take, 1);
         }
       }
       __syncthreads();
-      if (threadIdx.x == 0 &&
-          (s_n_def != lower || s_n_cand < remaining || cnt != s_n_cand))
-        select_anomaly_record(visible, lower, s_n_def, remaining, cnt, s_n_cand);
+      // The ids in order: each thread counts a contiguous run of words,
+      // the block's exclusive scan places it, and it writes its pools.
+      {
+        const int gwarp = threadIdx.x >> 5, glane = threadIdx.x & 31;
+        const int words = int((visible + 31) >> 5);
+        const int chunk = (words + int(blockDim.x) - 1) / int(blockDim.x);
+        const int w0 = min(words, int(threadIdx.x) * chunk), w1 = min(words, w0 + chunk);
+        int mine = 0;
+        for (int wd = w0; wd < w1; ++wd) mine += __popc(sel[wd]);
+        int incl = mine;
+#pragma unroll
+        for (int off = 1; off < 32; off <<= 1) {
+          const int up = __shfl_up_sync(0xffffffffu, incl, off);
+          if (glane >= off) incl += up;
+        }
+        if (glane == 31) s_warp_sel[gwarp] = incl;
+        __syncthreads();
+        int at = incl - mine;
+        for (int wp = 0; wp < gwarp; ++wp) at += s_warp_sel[wp];
+        if (threadIdx.x == blockDim.x - 1) s_n_sel = at + mine;
+        for (int wd = w0; wd < w1; ++wd) {
+          uint32_t m = sel[wd];
+          while (m != 0u) {
+            const int b = __ffs(m) - 1;
+            m &= m - 1u;
+            if (at < select_k) scratch[at] = wd * 32 + b;
+            ++at;
+          }
+        }
+        __syncthreads();
+        n_sel = s_n_sel < select_k ? s_n_sel : select_k;
+        const int n_def = s_n_sel - s_n_take;
+        if (threadIdx.x == 0 &&
+            (n_def != lower || s_n_cand < remaining || cnt != s_n_cand))
+          select_anomaly_record(visible, lower, n_def, remaining, cnt, s_n_cand);
+      }
     }
     const unsigned long long t_mid = select_now();
-    int* smem_count = reinterpret_cast<int*>(scratch + select_k);
-    const int out_cnt = expand_from_best(
-        best_hi, best_lo, select_k, pos[r], kpool, max_selected,
-        topk_out + int64_t(r) * max_selected, scratch, smem_count);
+    const int out_cnt = expand_sorted_ids(scratch, n_sel, pos[r], kpool, max_selected,
+                                          topk_out + int64_t(r) * max_selected);
     if (threadIdx.x == 0) out_counts[r] = out_cnt;
     __syncthreads();
     t_sel += t_mid - t_row;
@@ -3846,6 +3887,11 @@ size_t select_keys_bytes(int rows, int64_t pools) {
 size_t select_hist_bytes(int rows) {
   return select_align256(size_t(rows) * kSelectHistBins * 4);
 }
+// A row's selection bitmap: one bit a pool, in 32-bit words.
+int64_t select_bitmap_words(int64_t pools) { return (pools + 31) / 32; }
+size_t select_bitmap_bytes(int rows, int64_t pools) {
+  return select_align256(size_t(rows) * size_t(select_bitmap_words(pools)) * 4);
+}
 }  // namespace
 
 size_t dsa_select_workspace_bytes(int max_rows, int64_t max_pools) {
@@ -3860,7 +3906,8 @@ size_t dsa_select_workspace_bytes(int max_rows, int64_t max_pools) {
   // partial best[] fill, stale shared-memory pool ids expanded into token
   // ids, and the listed attention reading an unmapped page.)
   (void)max_rows;
-  return select_keys_bytes(kSelectLayoutRows, max_pools) + select_hist_bytes(kSelectLayoutRows);
+  return select_keys_bytes(kSelectLayoutRows, max_pools) + select_hist_bytes(kSelectLayoutRows) +
+         select_bitmap_bytes(kSelectLayoutRows, max_pools);
 }
 
 void dsa_select_decode(const void* q_fp8, const float* w_folded,
@@ -3884,6 +3931,10 @@ void dsa_select_decode(const void* q_fp8, const float* w_folded,
   // The histograms at the workspace's fixed offset (dsa_select_workspace_bytes).
   int32_t* hist_ws = reinterpret_cast<int32_t*>(
       static_cast<char*>(select_ws) + select_keys_bytes(kSelectLayoutRows, ws_max_pools));
+  // The rows' selection bitmaps behind the histograms, at the same fixed layout.
+  uint32_t* bitmap_ws = reinterpret_cast<uint32_t*>(
+      reinterpret_cast<char*>(hist_ws) + select_hist_bytes(kSelectLayoutRows));
+  const int64_t bitmap_stride = select_bitmap_words(ws_max_pools);
   // Row groups of at most kSelectMaxRows (2026-09-13, the decode batch's
   // cap lifted to 16): the kernel holds every row's fp8 q and weights in
   // shared memory (~4.2 KB per row; sixteen would exceed the block's
@@ -3900,8 +3951,7 @@ void dsa_select_decode(const void* q_fp8, const float* w_folded,
     const size_t score_smem = heads == 64 ? select_mma_q_bytes(heads) + kMmaSelKeyBytes
                                           : size_t(grows) * heads * 128 + size_t(256 / 32) * 4 * 32 * 4;
     const size_t smem = score_smem + size_t(grows) * heads * 4 + size_t(kSelectHistBins) * 4 +
-                        size_t(select_k) * 8 + size_t(kSelectStopCandidates) * 8 +
-                        (select_k + 1) * 4;
+                        size_t(kSelectStopCandidates) * 8 + (select_k + 1) * 4;
     if (smem > size_t(g_select_smem_cap)) DGPP_CUDA_OK(cudaErrorInvalidValue);
     // The tensor-core form's shared memory leaves one block per SM, and its
     // grid is (stripes, rows): a row's stripes are the grid's x.
@@ -3920,7 +3970,7 @@ void dsa_select_decode(const void* q_fp8, const float* w_folded,
           static_cast<const uint8_t*>(index_k), index_scale, pools_per_block,
           heads, select_k, kpool, max_selected, topk_out + int64_t(g) * max_selected,
           out_counts + g, keys_ws + int64_t(g) * ws_max_pools, ws_max_pools, ghist,
-          counter_ws);
+          bitmap_ws + int64_t(g) * bitmap_stride, bitmap_stride, counter_ws);
     };
     if (heads == 64) {
       if (relu) launch(std::true_type{}, std::integral_constant<int, 2>{});

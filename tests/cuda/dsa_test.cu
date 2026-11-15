@@ -1640,20 +1640,28 @@ DGPP_TEST(dsa_dense_attention_matches_split_kernel_and_reference) {
 // ---------------------------------------------------------------------------
 
 struct DecodeSelScenario {
+  int kpool = 4;  // tokens a pool: 4 (GLM-5.3-Flash), 1 (the full model: 2,048 pools selected)
   int rows = 0;
   int64_t n_pools = 0;  // complete pools resident in the cache
   std::vector<uint8_t> q8, k8;
   std::vector<float> w, ks;
   std::vector<int64_t> pos;
   std::vector<int32_t> req_ids;
-  const DsaGeometry g = DsaGeometry::from_config(DsaConfig{});
+  const DsaGeometry g;
   int heads = 32, dim = 128;
+
+  static DsaGeometry geometry(int tokens_a_pool) {
+    DsaConfig c{};
+    c.index_kpool = tokens_a_pool;
+    return DsaGeometry::from_config(c);
+  }
+  explicit DecodeSelScenario(int tokens_a_pool = 4) : kpool(tokens_a_pool), g(geometry(tokens_a_pool)) {}
 
   void init(uint64_t seed, const std::vector<int64_t>& positions) {
     pos = positions;
     rows = int(pos.size());
     n_pools = 8;
-    for (int64_t p : pos) n_pools = std::max(n_pools, (p + 1) / 4 + 8);
+    for (int64_t p : pos) n_pools = std::max(n_pools, (p + 1) / kpool + 8);
 
     std::vector<uint16_t> qb =
         random_bf16_bits(seed, int64_t(rows) * heads * dim, -2, 1);
@@ -1701,7 +1709,7 @@ struct DecodeSelScenario {
                       static_cast<const int64_t*>(dpos.p), rows,
                       static_cast<const int32_t*>(dbt.p), 1, dki.p,
                       static_cast<const float*>(dks_c.p), int(n_pools), heads,
-                      dim, g.select_k, 4, max_selected,
+                      dim, g.select_k, kpool, max_selected,
                       static_cast<int32_t*>(dtopk.p),
                       static_cast<int32_t*>(dcnt.p), dws.p, n_pools,
                       static_cast<int32_t*>(dctr.p), grid_blocks, stream);
@@ -1720,7 +1728,7 @@ struct DecodeSelScenario {
     std::vector<float> logits(size_t(n_pools), 0.0f);
     std::vector<int32_t> pool_ids(g.select_k, 0);
     for (int r = 0; r < rows; ++r) {
-      const int64_t visible = (pos[size_t(r)] + 1) / 4;
+      const int64_t visible = (pos[size_t(r)] + 1) / kpool;
       for (int64_t j = 0; j < visible; ++j) {
         float contrib[32];
         for (int h = 0; h < 32; ++h) {
@@ -1739,7 +1747,7 @@ struct DecodeSelScenario {
                                               g.select_k, pool_ids.data());
       counts[size_t(r)] =
           dsa_ref::expand_append_tail(pool_ids.data(), n_sel, pos[size_t(r)],
-                                      4, max_selected,
+                                      kpool, max_selected,
                                       &topk[size_t(r) * max_selected]);
     }
   }
@@ -1782,6 +1790,33 @@ DGPP_TEST(dsa_select_decode_mtp_rows_and_short_context) {
   z.expect(want3, want_counts3);
   if (counts3[0] != 1 || got3[0] != 0 || got3[1] != -1)
     throw std::runtime_error("pos=0 decode select");
+}
+
+// The full model's geometry (2026-11-14): a pool is a token and 2,048 are
+// selected, so the selection's ids leave the ordered gather eight a thread
+// (until then they were rank-sorted, a sort sized for 512 pools). Rows
+// below select_k, at it (every pool selected), one past it and far past
+// it, each bitwise the host mirror.
+DGPP_TEST(dsa_select_decode_per_token_geometry) {
+  DecodeSelScenario sc(1);
+  sc.init(91, {33, 2046, 2047, 2048, 2100, 9000, 40000});
+  if (sc.g.select_k != 2048) throw std::runtime_error("per-token geometry: select_k");
+  std::vector<int32_t> got, counts, want, want_counts;
+  long long anomalies[6] = {};
+  dsa_select_anomalies(anomalies, true, 0);  // an earlier test's record is not this one's
+  sc.run(96, got, counts);
+  sc.expect(want, want_counts);
+  for (int r = 0; r < sc.rows; ++r) {
+    if (counts[size_t(r)] != want_counts[size_t(r)])
+      throw std::runtime_error("per-token geometry count r=" + std::to_string(r));
+    const int32_t* a = &got[size_t(r) * sc.g.max_selected];
+    if (std::memcmp(a, &want[size_t(r) * sc.g.max_selected], sc.g.max_selected * 4) != 0)
+      throw std::runtime_error("per-token geometry tokens r=" + std::to_string(r));
+    for (int i = 1; i < counts[size_t(r)]; ++i)
+      if (a[i] <= a[i - 1]) throw std::runtime_error("per-token geometry order r=" + std::to_string(r));
+  }
+  if (dsa_select_anomalies(anomalies, true, 0) != 0)
+    throw std::runtime_error("per-token geometry: a selection anomaly");
 }
 
 // Rows past the fused kernel's eight run as the launcher's row groups

@@ -5,6 +5,25 @@ project procedures and design guidance live in `docs/`.
 
 ## Unreleased
 
+- **The decode selection writes its token ids in order**: the kernel that
+  chooses a query's attended tokens (`select_decode_kernel`, GLM-5.3,
+  GLM-5.3-Flash and DeepSeek-V4) gathered the chosen keys in the order their
+  threads arrived and then rank-sorted the ids, n^2 / 256 compares a thread.
+  The sort was sized for GLM-5.3-Flash's 512 selected pools; at the full
+  model's 2,048 selected tokens it was 108 us of every launch at any context
+  over 2K, and it also ran on a context short enough to select every token.
+  The gather now marks the selection in a per-row bitmap (a warp's 32
+  consecutive keys are one ballot, one word) and writes the ids out by a
+  prefix count, in order by construction: the same ids, bitwise the same
+  list. Four nodes, GLM-5.3 Mixed346 with a runtime adapter, one request:
+  65.5 -> 63.6 ms a pass at 1.5K tokens of context, 68.5 -> 66.3 at 7.7K,
+  71.7 -> 69.4 at 24K; decode on 8-21K prompts 27.5 -> 28.5, 27.1 -> 28.1 and
+  24.9 -> 25.8 tok/s; short prompts, GLM-5.3-Flash and DeepSeek-V4.1 level;
+  every transcript identical. Alone, at two rows: 182 -> 78 us a launch at
+  10.5K tokens, 257 -> 148 at 24K, 127 -> 11 at 2,048. `dsa_select_bench`
+  takes `--kpool` and `--heads`: it only ran Flash's geometry, which is how
+  the sort went unmeasured.
+
 - **Prefix cache hits inside an entry**: a prompt that shares its first
   tokens with a cached entry and differs from it before any stored position
   opens on the shared tokens and prefills only the rest. A request used to

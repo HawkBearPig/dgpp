@@ -194,6 +194,31 @@ __device__ __forceinline__ void rank_sort_ids(int32_t* scratch, int n) {
   __syncthreads();
 }
 
+// The ascending pool ids scratch[0, n_sel) as token positions: each pool's
+// kpool tokens, then the query's incomplete tail. Writes out_row[0,
+// max_selected) (-1 padded); returns the token count. A selection that
+// already holds its ids in order (the decode select's ordered gather) calls
+// this directly; expand_from_best sorts first.
+__device__ inline int expand_sorted_ids(const int32_t* scratch, int n_sel, int64_t pos, int kpool,
+                                        int max_selected, int32_t* out_row) {
+  const int nthreads = blockDim.x;
+  const int64_t seq_len = pos + 1;
+  const int64_t tail_start = (seq_len / kpool) * kpool;
+  const int tail_cnt = int(seq_len - tail_start);
+  const int hist = n_sel * kpool;
+  for (int col = threadIdx.x; col < max_selected; col += nthreads) {
+    int32_t tok;
+    if (col < hist)
+      tok = scratch[col / kpool] * kpool + (col % kpool);
+    else if (col - hist < tail_cnt)
+      tok = int32_t(tail_start + (col - hist));
+    else
+      tok = -1;
+    out_row[col] = tok;
+  }
+  return hist + tail_cnt;
+}
+
 __device__ inline int expand_from_best(const uint32_t* best_hi,
                                        const uint32_t* best_lo, int select_k,
                                        int64_t pos, int kpool,
@@ -244,21 +269,7 @@ __device__ inline int expand_from_best(const uint32_t* best_hi,
   else if (n_sel <= 2 * nthreads) rank_sort_ids<2>(scratch, n_sel);
   else if (n_sel <= 4 * nthreads) rank_sort_ids<4>(scratch, n_sel);
   else rank_sort_ids<8>(scratch, n_sel);
-  const int64_t seq_len = pos + 1;
-  const int64_t tail_start = (seq_len / kpool) * kpool;
-  const int tail_cnt = int(seq_len - tail_start);
-  const int hist = n_sel * kpool;
-  for (int col = threadIdx.x; col < max_selected; col += nthreads) {
-    int32_t tok;
-    if (col < hist)
-      tok = scratch[col / kpool] * kpool + (col % kpool);
-    else if (col - hist < tail_cnt)
-      tok = int32_t(tail_start + (col - hist));
-    else
-      tok = -1;
-    out_row[col] = tok;
-  }
-  return hist + tail_cnt;
+  return expand_sorted_ids(scratch, n_sel, pos, kpool, max_selected, out_row);
 }
 
 }  // namespace dgpp
