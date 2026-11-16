@@ -230,6 +230,11 @@ class DsaLayer {
   // tensor-core path is the default where the context is below index_topk).
   void set_dense_prefill(bool on) { dense_prefill_ = on; }
   bool dense_prefill() const { return dense_prefill_; }
+  // Tests: the prefill tiles' listed attention straight from the cache
+  // (the staged copy of a tile's distinct rows is the default over a
+  // quantized cache; the two are bit for bit the same output).
+  void set_staged_prefill(bool on) { staged_prefill_ = on; }
+  bool staged_prefill() const { return staged_prefill_ && stage_ws_ != nullptr; }
   const int32_t* debug_topk() const { return topk_; }        // [rows, max_selected]
   const int32_t* debug_counts() const { return counts_; }    // [rows]
   const void* debug_q_fp8() const { return q_fp8_; }         // [rows*heads, 128] fp8
@@ -261,9 +266,10 @@ class DsaLayer {
     size_t off_counts = 0, off_pos = 0, off_req_ids = 0, off_attn_out = 0;
     size_t off_q_tilde = 0, off_c = 0, off_m = 0, off_l = 0, off_cws = 0;
     size_t off_dot = 0, off_gather_k = 0, off_gather_scale = 0;
-    size_t off_select_ws = 0, off_counter = 0, off_k_rot = 0;
+    size_t off_select_ws = 0, off_counter = 0, off_k_rot = 0, off_stage = 0;
     int64_t max_pools = 0;   // gather buffer capacity, in pools
     int tile_cap = 0;        // query rows that fit at max_pools
+    int stage_slots = 0;     // rows the prefill tile's staged copy holds (0: no staged form)
   };
   static ScratchLayout scratch_layout(const DsaConfig& cfg, int max_tokens,
                                       int64_t max_cache_tokens,
@@ -311,9 +317,11 @@ class DsaLayer {
   // is outside the dense kernel's (kv_lora not 512/256).
   // `decode`: the projections keep their warp kernels (a batched decode
   // row is bitwise the row alone; the tensor-core forms are not).
+  // `one_req` >= 0: every row is this request's (a prefill chunk), so a
+  // listed tile may attend from the staged copy of its distinct rows.
   void attend_dense(DsaStatePool& state, int layer, const int32_t* req_ids,
                     int64_t row0, int rows, bool listed, cudaStream_t stream,
-                    int n_split = kDensePrefillSplit, bool decode = false);
+                    int n_split = kDensePrefillSplit, bool decode = false, int one_req = -1);
   void attend_tile(DsaStatePool& state, int layer, const int32_t* req_ids,
                    int64_t row0, int rows, int n_split, cudaStream_t stream);
 
@@ -342,6 +350,14 @@ class DsaLayer {
   static constexpr int kDensePrefillRows = 128;
   static constexpr int kDensePrefillSplit = 4;
   bool dense_prefill_ = true;
+  // The staged copy of a listed prefill tile's distinct cache rows
+  // (dsa_attn_listed_staged). The tile's rows share most of their tokens,
+  // so the copy is dsa_attn_stage_slots rows, not the pairs' bound; a tile
+  // past it attends from the cache, the same bits.
+  bool staged_prefill_ = true;
+  bool stage_zeroed_ = false;   // the workspace's bitmap, zeroed before its first launch
+  void* stage_ws_ = nullptr;    // dsa_attn_stage_bytes(max_cache_tokens, stage_slots_, score_width); null: no staged form
+  int stage_slots_ = 0;
   int tile_cap_ = 0;          // prefill dot-tile rows at maximum context
   int64_t max_pools_ = 0;     // gather/dot capacity, in padded pools
   int64_t gather_zeroed_ = 0; // gather high-water mark already zeroed

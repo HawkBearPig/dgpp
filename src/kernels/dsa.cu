@@ -2575,7 +2575,20 @@ constexpr int attn_flash_min_blocks() {
 // twelve co-resident ones schedule in coarse waves (+35 us a layer at ten
 // to twenty rows). 1 = a partial per split (the prefill tile and the
 // scalar form's layout).
-template <int KV, int SD, bool kListed, LatentFormat F, int kGroup = 1>
+//
+// kStaged (2026-11-16, the prefill tile's listed form): the rows of a tile
+// are consecutive positions of one request and select nearly the same
+// tokens — 128 rows of the full GLM-5.3 read 257,000 (row, token) pairs
+// over 6,900 distinct tokens — and each pair was a cache row gathered and
+// dequantized again. dsa_attn_listed_staged dequantizes each distinct row
+// once into a contiguous bf16 copy (the staging kernels below) and this
+// kernel gathers from the copy: a list entry resolves through
+// stage_slot_of to its row there, and the fetch is the bf16 format's. The
+// copy holds the bits the format's load8 produces, so the launch is bit
+// for bit the unstaged one. A tile whose distinct rows exceed the copy
+// (stage_state says so) reads the cache as before.
+constexpr int kStageDistinct = 0, kStageOk = 1;  // stage_state's words
+template <int KV, int SD, bool kListed, LatentFormat F, int kGroup = 1, bool kStaged = false>
 __global__ __launch_bounds__(dense::kThreads, (attn_flash_min_blocks<KV, SD, kListed>())) void attn_flash_kernel(
     const uint16_t* __restrict__ q_tilde, const uint8_t* __restrict__ latent,
     const float* __restrict__ latent_scale,
@@ -2585,9 +2598,15 @@ __global__ __launch_bounds__(dense::kThreads, (attn_flash_min_blocks<KV, SD, kLi
     int block_tokens, const int32_t* __restrict__ block_tables,
     int blocks_per_request, int blocks_total, float scale, float* __restrict__ m_ws,
     float* __restrict__ l_ws, float* __restrict__ c_ws, int32_t* __restrict__ tickets,
-    float* __restrict__ mg_ws, float* __restrict__ lg_ws, float* __restrict__ cg_ws, int pair_splits) {
+    float* __restrict__ mg_ws, float* __restrict__ lg_ws, float* __restrict__ cg_ws, int pair_splits,
+    const uint8_t* __restrict__ stage_rows, const int32_t* __restrict__ stage_slot_of,
+    const int32_t* __restrict__ stage_state, int stage_tokens) {
   dgpp_pdl_wait();
+  static_assert(!kStaged || (kListed && kGroup == 1), "the staged form is the listed kernel's, a partial per split");
   constexpr int NTOK = kListed ? 16 : dense::kTile;  // tokens per tile (per slab when listed)
+  constexpr size_t kStageRowBytes = latent_cache_row_bytes(LatentFormat::kBf16, KV, SD - KV);
+  // Uniform across the grid: the staging kernels ran before this one.
+  const bool staged = kStaged && stage_state[kStageOk] != 0;
   using G = dense::Geo<KV, SD, NTOK>;
   constexpr int SQ = G::SQ, CW = G::CW, NT = G::NT, KW = G::KW, KS = G::KS, XF = G::XF;
   constexpr int M = dense::kM;
@@ -2723,6 +2742,15 @@ __global__ __launch_bounds__(dense::kThreads, (attn_flash_min_blocks<KV, SD, kLi
           // read an unmapped page on the fabric once in ~10 eager rows of
           // the fallback path; the record names the values.
           const int64_t tok = list[t];
+          if (staged) {
+            // The token's row in the staged copy (every listed token under
+            // stage_tokens was given one; a row whose block is outside the
+            // pool was staged as zeros and recorded there).
+            if (tok >= 0 && tok < stage_tokens)
+              phys = stage_slot_of[tok];
+            else
+              attn_anomaly_record(tok, -1, qrow_first, s, t, t_end - t_begin);
+          } else {
           const int64_t bidx = tok >= 0 ? tok / block_tokens : -1;
           // The block must lie in the pool: blocks_total physical blocks
           // (the table's row width bounds the index into the row; a
@@ -2734,14 +2762,17 @@ __global__ __launch_bounds__(dense::kThreads, (attn_flash_min_blocks<KV, SD, kLi
             phys = static_cast<int32_t>(int64_t(blk) * block_tokens + (tok % block_tokens));
           else
             attn_anomaly_record(tok, blk, qrow_first, s, t, t_end - t_begin);
+          }
         }
         s_phys[slab][i] = phys;
       }
     }
   };
   // The tile's rows into the shared tile (zero-filled past the slab's live
-  // tokens), HALF uint4 per thread per pass.
-  const auto fetch_tile = [&](int tile) {
+  // tokens), HALF uint4 per thread per pass. `from_stage`: the rows are the
+  // staged copy's (a compile-time tag, so each source has its own loop).
+  const auto fetch_tile = [&](int tile, auto from_stage) {
+    constexpr bool kFromStage = decltype(from_stage)::value;
     const int t0 = t_begin + tile * NTOK;
     const int n = max(0, min(NTOK, t_end - t0));
 #pragma unroll
@@ -2761,7 +2792,12 @@ __global__ __launch_bounds__(dense::kThreads, (attn_flash_min_blocks<KV, SD, kLi
             const int32_t blk = bt[tok / block_tokens];
             phys = int64_t(blk) * block_tokens + (tok % block_tokens);
           }
-          if (phys >= 0) v = LatentTile<F>::load8(latent, latent_scale, phys, kRowBytes, KV, c8 * 8);
+          if (phys >= 0) {
+            if constexpr (kFromStage)
+              v = LatentTile<LatentFormat::kBf16>::load8(stage_rows, nullptr, phys, kStageRowBytes, KV, c8 * 8);
+            else
+              v = LatentTile<F>::load8(latent, latent_scale, phys, kRowBytes, KV, c8 * 8);
+          }
         }
         val[k] = v;
       }
@@ -2781,25 +2817,40 @@ __global__ __launch_bounds__(dense::kThreads, (attn_flash_min_blocks<KV, SD, kLi
   // (and the line of its last byte, for a cache that is not line-aligned)
   // and one for its scale; the requests do not wait.
   constexpr int kAhead = 4;
-  const auto prefetch_tile = [&](int tile) {
+  const auto prefetch_tile = [&](int tile, auto from_stage) {
     if constexpr (kListed) {
-      constexpr int kLines = static_cast<int>((kRowBytes + 127) / 128);
-      constexpr int kAsks = kLines + 2;  // the row's lines, its last byte's, its scale's
+      constexpr bool kFromStage = decltype(from_stage)::value;
+      // The staged copy's rows are whole lines with no scale beside them.
+      constexpr size_t kSrcRowBytes = kFromStage ? kStageRowBytes : kRowBytes;
+      constexpr int kLines = static_cast<int>((kSrcRowBytes + 127) / 128);
+      constexpr int kAsks = kFromStage ? kLines : kLines + 2;  // the row's lines, its last byte's, its scale's
       for (int i = gtid; i < NTOK * kAsks; i += GTHREADS) {
         const int tt = i / kAsks, part = i % kAsks;
         if (t_begin + tile * NTOK + tt >= t_end) continue;
         const int32_t phys = s_phys[slab][(tile % kTilesPerRound) * NTOK + tt];
         if (phys < 0) continue;
-        const uint8_t* row = latent + int64_t(phys) * int64_t(kRowBytes);
+        const uint8_t* row = (kFromStage ? stage_rows : latent) + int64_t(phys) * int64_t(kSrcRowBytes);
         if (part < kLines) {
           asm volatile("prefetch.global.L2 [%0];" ::"l"(row + part * 128));
         } else if (part == kLines) {
-          asm volatile("prefetch.global.L2 [%0];" ::"l"(row + kRowBytes - 1));
+          asm volatile("prefetch.global.L2 [%0];" ::"l"(row + kSrcRowBytes - 1));
         } else if (latent_scale != nullptr) {
           asm volatile("prefetch.global.L2 [%0];" ::"l"(latent_scale + phys));
         }
       }
     }
+  };
+  // A tile's requests ahead and its fetch, from the staged copy or the cache.
+  const auto gather_tile = [&](int tile, auto from_stage) {
+    if constexpr (kListed) {
+      // A round's first tile asks for the tiles behind it; every other tile
+      // for the one kAhead on, while it is in the round whose addresses are
+      // resolved (the next round's first tiles are asked for when it is).
+      const int in_round = tile % kTilesPerRound;
+      const int last = min(tile + kAhead, tile - in_round + kTilesPerRound - 1);
+      for (int pt = in_round == 0 ? tile + 1 : tile + kAhead; pt <= last; ++pt) prefetch_tile(pt, from_stage);
+    }
+    fetch_tile(tile, from_stage);
   };
   resolve_round(t_begin);
 
@@ -2809,15 +2860,14 @@ __global__ __launch_bounds__(dense::kThreads, (attn_flash_min_blocks<KV, SD, kLi
     (void)t0;  // the dense mask reads it
     if (tile > 0 && tile % kTilesPerRound == 0) resolve_round(t0);  // the round's addresses, ahead of its first fetch
     __syncthreads();  // the previous tile's readers are done; the round's addresses landed
-    if constexpr (kListed) {
-      // A round's first tile asks for the tiles behind it; every other tile
-      // for the one kAhead on, while it is in the round whose addresses are
-      // resolved (the next round's first tiles are asked for when it is).
-      const int in_round = tile % kTilesPerRound;
-      const int last = min(tile + kAhead, tile - in_round + kTilesPerRound - 1);
-      for (int pt = in_round == 0 ? tile + 1 : tile + kAhead; pt <= last; ++pt) prefetch_tile(pt);
+    if constexpr (kStaged) {
+      if (staged)
+        gather_tile(tile, std::true_type{});
+      else
+        gather_tile(tile, std::false_type{});
+    } else {
+      gather_tile(tile, std::false_type{});
     }
-    fetch_tile(tile);
     __syncthreads();
 
     // S partial over this warp's k-quarter: 16 rows x NTOK tokens.
@@ -3072,6 +3122,149 @@ __global__ __launch_bounds__(dense::kThreads, (attn_flash_min_blocks<KV, SD, kLi
       const float* row = c_ws + ((int64_t(qr) * n_split + s0 + b) * local_heads + h) * KV;
       asm volatile("discard.global.L2 [%0], 128;" ::"l"(row + line * 32) : "memory");
     }
+  }
+}
+
+// ---- the staged copy of a launch's distinct rows (dsa_attn_listed_staged) ----
+// Three launches ahead of the attention's, in stream order:
+//   mark:  every listed token's bit in a bitmap of the request's tokens;
+//   scan:  the bitmap's set bits numbered in token order — the token's slot
+//          (slot_of[token], slot_token[slot]) — and the bitmap left zero for
+//          the next launch; the count and whether it fits the copy to
+//          stage_state;
+//   rows:  each slot's cache row through the format's load8 into the copy,
+//          bf16 [slot][SD].
+// The first tile's count of distinct tokens is not known to the host (the
+// lists are device data and a prefill chunk is enqueued without a
+// readback), so the copy has a fixed capacity and the attention kernel
+// reads stage_state: a launch whose distinct tokens exceed it is the
+// unstaged one, same bits.
+__device__ unsigned long long g_attn_stage_stats[4] = {0, 0, 0, 0};  // launches, not staged, distinct summed, the most
+// A row's tokens, one block a row. A bit is tested before it is set: the
+// rows of a tile share most of their tokens, so nearly every test finds
+// the bit and the atomics are the distinct tokens', not the pairs'. (A
+// test that misses a bit another block set a moment ago sets it again.)
+__global__ void attn_stage_mark_kernel(const int32_t* __restrict__ topk, int topk_stride,
+                                       const int32_t* __restrict__ counts, uint32_t* bitmap, int stage_tokens) {
+  dgpp_pdl_wait();
+  constexpr int kPer = 4;  // list entries a thread asks for together
+  const int cnt = max(counts[blockIdx.x], 0);
+  const int32_t* list = topk + int64_t(blockIdx.x) * topk_stride;
+  for (int i0 = threadIdx.x; i0 < cnt; i0 += kPer * int(blockDim.x)) {
+    int32_t tok[kPer];
+    uint32_t word[kPer];
+#pragma unroll
+    for (int u = 0; u < kPer; ++u) {
+      const int i = i0 + u * int(blockDim.x);
+      tok[u] = i < cnt ? list[i] : -1;
+    }
+#pragma unroll
+    for (int u = 0; u < kPer; ++u)
+      word[u] = (tok[u] >= 0 && tok[u] < stage_tokens) ? __ldcg(bitmap + (tok[u] >> 5)) : 0xFFFFFFFFu;
+#pragma unroll
+    for (int u = 0; u < kPer; ++u)
+      if (((word[u] >> (tok[u] & 31)) & 1u) == 0u) atomicOr(bitmap + (tok[u] >> 5), 1u << (tok[u] & 31));
+  }
+}
+
+constexpr int kStageScanThreads = 1024;
+__global__ void attn_stage_scan_kernel(uint32_t* bitmap, int words, int32_t* slot_of, int32_t* slot_token,
+                                       int32_t* stage_state, int slots) {
+  dgpp_pdl_wait();
+  __shared__ int s_warp[kStageScanThreads / 32];
+  // A contiguous run of words a thread: its count, the block's exclusive
+  // scan, then its tokens' slots in order.
+  const int per = (words + int(blockDim.x) - 1) / int(blockDim.x);
+  const int w0 = min(words, int(threadIdx.x) * per), w1 = min(words, w0 + per);
+  int mine = 0;
+  for (int w = w0; w < w1; ++w) mine += __popc(bitmap[w]);
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  int incl = mine;
+#pragma unroll
+  for (int off = 1; off < 32; off <<= 1) {
+    const int up = __shfl_up_sync(0xffffffffu, incl, off);
+    if (lane >= off) incl += up;
+  }
+  if (lane == 31) s_warp[warp] = incl;
+  __syncthreads();
+  int at = incl - mine;
+  for (int wp = 0; wp < warp; ++wp) at += s_warp[wp];
+  if (threadIdx.x == blockDim.x - 1) {
+    const int total = at + mine;
+    stage_state[kStageDistinct] = total;
+    stage_state[kStageOk] = total <= slots ? 1 : 0;
+    atomicAdd(&g_attn_stage_stats[0], 1ull);
+    if (total > slots) atomicAdd(&g_attn_stage_stats[1], 1ull);
+    atomicAdd(&g_attn_stage_stats[2], static_cast<unsigned long long>(total));
+    atomicMax(&g_attn_stage_stats[3], static_cast<unsigned long long>(total));
+  }
+  for (int w = w0; w < w1; ++w) {
+    uint32_t m = bitmap[w];
+    bitmap[w] = 0u;  // zero at rest: the next launch marks into it
+    while (m != 0u) {
+      const int b = __ffs(m) - 1;
+      m &= m - 1u;
+      if (at < slots) {
+        slot_token[at] = w * 32 + b;
+        slot_of[w * 32 + b] = at;
+      }
+      ++at;
+    }
+  }
+}
+
+constexpr int kStageRowThreads = 256;
+constexpr int kStageRowsPerRound = 32;  // rows a block decodes a round
+template <int KV, int SD, LatentFormat F>
+__global__ __launch_bounds__(kStageRowThreads) void attn_stage_rows_kernel(
+    const uint8_t* __restrict__ latent, const float* __restrict__ latent_scale, const int32_t* __restrict__ bt,
+    int block_tokens, int blocks_per_request, int blocks_total, const int32_t* __restrict__ slot_token,
+    const int32_t* __restrict__ stage_state, uint8_t* __restrict__ stage_rows) {
+  dgpp_pdl_wait();
+  constexpr int kU4 = SD / 8;                                             // uint4 a row
+  constexpr int kPer = kStageRowsPerRound * kU4 / kStageRowThreads;       // uint4 a thread a round
+  static_assert(kStageRowsPerRound * kU4 % kStageRowThreads == 0, "a round's uint4s divide the block's threads");
+  constexpr size_t kRowBytes = latent_cache_row_bytes(F, KV, SD - KV);
+  constexpr size_t kStageRowBytes = latent_cache_row_bytes(LatentFormat::kBf16, KV, SD - KV);
+  __shared__ int32_t s_phys[kStageRowsPerRound];
+  if (stage_state[kStageOk] == 0) return;  // more distinct rows than the copy holds: the attention reads the cache
+  const int n = stage_state[kStageDistinct];
+  for (int s0 = int(blockIdx.x) * kStageRowsPerRound; s0 < n; s0 += int(gridDim.x) * kStageRowsPerRound) {
+    if (threadIdx.x < kStageRowsPerRound) {
+      const int slot = s0 + int(threadIdx.x);
+      int32_t phys = -1;
+      if (slot < n) {
+        // The listed gather's guard: a block outside the pool stages a zero
+        // row and records the anomaly, as the unstaged gather zero-fills.
+        const int64_t tok = slot_token[slot];
+        const int64_t bidx = tok / block_tokens;
+        const int32_t blk = bidx < blocks_per_request ? bt[bidx] : -1;
+        if (blk >= 0 && blk < blocks_total)
+          phys = static_cast<int32_t>(int64_t(blk) * block_tokens + (tok % block_tokens));
+        else
+          attn_anomaly_record(tok, blk, -1, -1, slot, n);
+      }
+      s_phys[threadIdx.x] = phys;
+    }
+    __syncthreads();
+    uint4 val[kPer];
+#pragma unroll
+    for (int k = 0; k < kPer; ++k) {
+      const int idx = int(threadIdx.x) + k * kStageRowThreads;
+      const int row = idx / kU4, c8 = idx % kU4;
+      const int32_t phys = s_phys[row];
+      uint4 v = make_uint4(0, 0, 0, 0);
+      if (phys >= 0) v = LatentTile<F>::load8(latent, latent_scale, phys, kRowBytes, KV, c8 * 8);
+      val[k] = v;
+    }
+#pragma unroll
+    for (int k = 0; k < kPer; ++k) {
+      const int idx = int(threadIdx.x) + k * kStageRowThreads;
+      const int row = idx / kU4, c8 = idx % kU4;
+      if (s0 + row < n)
+        *reinterpret_cast<uint4*>(stage_rows + int64_t(s0 + row) * int64_t(kStageRowBytes) + c8 * 16) = val[k];
+    }
+    __syncthreads();  // the round's addresses are rewritten next round
   }
 }
 
@@ -3568,6 +3761,18 @@ void dsa_prepare_kernel_smem() {
       DGPP_CUDA_OK(cudaFuncSetAttribute(
           attn_flash_kernel<512, 576, true, F>, cudaFuncAttributeMaxDynamicSharedMemorySize,
           int(dense::Geo<512, 576>::smem_bytes)));
+      // The staged forms (a quantized cache's): their own kernel symbols.
+      if constexpr (F != LatentFormat::kBf16) {
+        DGPP_CUDA_OK(cudaFuncSetAttribute(
+            attn_flash_kernel<512, 512, true, F, 1, true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+            int(dense::Geo<512, 512>::smem_bytes)));
+        DGPP_CUDA_OK(cudaFuncSetAttribute(
+            attn_flash_kernel<256, 256, true, F, 1, true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+            int(dense::Geo<256, 256>::smem_bytes)));
+        DGPP_CUDA_OK(cudaFuncSetAttribute(
+            attn_flash_kernel<512, 576, true, F, 1, true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+            int(dense::Geo<512, 576>::smem_bytes)));
+      }
     };
     opt_in(std::integral_constant<LatentFormat, LatentFormat::kBf16>{});
     opt_in(std::integral_constant<LatentFormat, LatentFormat::kFp8>{});
@@ -4325,7 +4530,15 @@ void dsa_attn_partial(const void* q_tilde, const void* latent_cache,
 }
 
 namespace {
-template <int KV, int SD, bool kListed, LatentFormat F, int kGroup>
+// The staged copy a listed launch gathers from (dsa_attn_listed_staged), or none.
+struct AttnStage {
+  const uint8_t* rows = nullptr;     // bf16 [slots][kv_lora + rope]
+  const int32_t* slot_of = nullptr;  // [tokens]: a listed token's row in the copy
+  const int32_t* state = nullptr;    // [kStageDistinct], [kStageOk]
+  int tokens = 0;                    // the tokens slot_of covers
+};
+
+template <int KV, int SD, bool kListed, LatentFormat F, int kGroup, bool kStaged>
 void launch_attn_flash_variant(dim3 grid, const void* q_tilde,
                                const void* latent_cache, const float* latent_scale,
                                const int32_t* req_ids, const int64_t* pos,
@@ -4335,16 +4548,17 @@ void launch_attn_flash_variant(dim3 grid, const void* q_tilde,
                                const int32_t* block_tables, int blocks_per_request,
                                int blocks_total, float scale, float* m_ws, float* l_ws, float* c_ws,
                                int32_t* tickets, float* mg_ws, float* lg_ws, float* cg_ws,
-                               cudaStream_t stream, int pair_splits) {
+                               cudaStream_t stream, int pair_splits, const AttnStage& stage) {
   constexpr size_t kSmem = dense::Geo<KV, SD, kListed ? 16 : dense::kTile>::smem_bytes;
-  attn_flash_kernel<KV, SD, kListed, F, kGroup><<<grid, dense::kThreads, kSmem, stream>>>(
+  attn_flash_kernel<KV, SD, kListed, F, kGroup, kStaged><<<grid, dense::kThreads, kSmem, stream>>>(
       static_cast<const uint16_t*>(q_tilde),
       static_cast<const uint8_t*>(latent_cache), latent_scale, req_ids, pos, topk,
       topk_stride, counts, rows, n_split, local_heads, block_tokens, block_tables,
-      blocks_per_request, blocks_total, scale, m_ws, l_ws, c_ws, tickets, mg_ws, lg_ws, cg_ws, pair_splits);
+      blocks_per_request, blocks_total, scale, m_ws, l_ws, c_ws, tickets, mg_ws, lg_ws, cg_ws, pair_splits,
+      stage.rows, stage.slot_of, stage.state, stage.tokens);
 }
 
-template <int KV, int SD, bool kListed, int kGroup>
+template <int KV, int SD, bool kListed, int kGroup, bool kStaged>
 void launch_attn_flash_format(LatentFormat format, dim3 grid, const void* q_tilde,
                               const void* latent_cache, const float* latent_scale,
                               const int32_t* req_ids, const int64_t* pos,
@@ -4354,37 +4568,46 @@ void launch_attn_flash_format(LatentFormat format, dim3 grid, const void* q_tild
                               const int32_t* block_tables, int blocks_per_request,
                               int blocks_total, float scale, float* m_ws, float* l_ws, float* c_ws,
                               int32_t* tickets, float* mg_ws, float* lg_ws, float* cg_ws,
-                              cudaStream_t stream, int pair_splits) {
+                              cudaStream_t stream, int pair_splits, const AttnStage& stage) {
   switch (format) {
     case LatentFormat::kBf16:
-      launch_attn_flash_variant<KV, SD, kListed, LatentFormat::kBf16, kGroup>(
-          grid, q_tilde, latent_cache, latent_scale, req_ids, pos, topk, topk_stride,
-          counts, rows, n_split, local_heads, block_tokens, block_tables,
-          blocks_per_request, blocks_total, scale, m_ws, l_ws, c_ws, tickets, mg_ws, lg_ws, cg_ws, stream, pair_splits);
+      // A bf16 cache is its own decoded copy: no staged instantiation.
+      if constexpr (kStaged)
+        DGPP_CUDA_OK(cudaErrorInvalidValue);
+      else
+        launch_attn_flash_variant<KV, SD, kListed, LatentFormat::kBf16, kGroup, false>(
+            grid, q_tilde, latent_cache, latent_scale, req_ids, pos, topk, topk_stride,
+            counts, rows, n_split, local_heads, block_tokens, block_tables,
+            blocks_per_request, blocks_total, scale, m_ws, l_ws, c_ws, tickets, mg_ws, lg_ws, cg_ws, stream, pair_splits,
+            stage);
       break;
     case LatentFormat::kFp8:
-      launch_attn_flash_variant<KV, SD, kListed, LatentFormat::kFp8, kGroup>(
+      launch_attn_flash_variant<KV, SD, kListed, LatentFormat::kFp8, kGroup, kStaged>(
           grid, q_tilde, latent_cache, latent_scale, req_ids, pos, topk, topk_stride,
           counts, rows, n_split, local_heads, block_tokens, block_tables,
-          blocks_per_request, blocks_total, scale, m_ws, l_ws, c_ws, tickets, mg_ws, lg_ws, cg_ws, stream, pair_splits);
+          blocks_per_request, blocks_total, scale, m_ws, l_ws, c_ws, tickets, mg_ws, lg_ws, cg_ws, stream, pair_splits,
+          stage);
       break;
     case LatentFormat::kFp4:
-      launch_attn_flash_variant<KV, SD, kListed, LatentFormat::kFp4, kGroup>(
+      launch_attn_flash_variant<KV, SD, kListed, LatentFormat::kFp4, kGroup, kStaged>(
           grid, q_tilde, latent_cache, latent_scale, req_ids, pos, topk, topk_stride,
           counts, rows, n_split, local_heads, block_tokens, block_tables,
-          blocks_per_request, blocks_total, scale, m_ws, l_ws, c_ws, tickets, mg_ws, lg_ws, cg_ws, stream, pair_splits);
+          blocks_per_request, blocks_total, scale, m_ws, l_ws, c_ws, tickets, mg_ws, lg_ws, cg_ws, stream, pair_splits,
+          stage);
       break;
     case LatentFormat::kFp8Block:
-      launch_attn_flash_variant<KV, SD, kListed, LatentFormat::kFp8Block, kGroup>(
+      launch_attn_flash_variant<KV, SD, kListed, LatentFormat::kFp8Block, kGroup, kStaged>(
           grid, q_tilde, latent_cache, latent_scale, req_ids, pos, topk, topk_stride,
           counts, rows, n_split, local_heads, block_tokens, block_tables,
-          blocks_per_request, blocks_total, scale, m_ws, l_ws, c_ws, tickets, mg_ws, lg_ws, cg_ws, stream, pair_splits);
+          blocks_per_request, blocks_total, scale, m_ws, l_ws, c_ws, tickets, mg_ws, lg_ws, cg_ws, stream, pair_splits,
+          stage);
       break;
     case LatentFormat::kFp4Block:
-      launch_attn_flash_variant<KV, SD, kListed, LatentFormat::kFp4Block, kGroup>(
+      launch_attn_flash_variant<KV, SD, kListed, LatentFormat::kFp4Block, kGroup, kStaged>(
           grid, q_tilde, latent_cache, latent_scale, req_ids, pos, topk, topk_stride,
           counts, rows, n_split, local_heads, block_tokens, block_tables,
-          blocks_per_request, blocks_total, scale, m_ws, l_ws, c_ws, tickets, mg_ws, lg_ws, cg_ws, stream, pair_splits);
+          blocks_per_request, blocks_total, scale, m_ws, l_ws, c_ws, tickets, mg_ws, lg_ws, cg_ws, stream, pair_splits,
+          stage);
       break;
   }
 }
@@ -4399,9 +4622,11 @@ bool launch_attn_flash(const void* q_tilde, const void* latent_cache,
                        float* l_ws, float* c_ws, cudaStream_t stream,
                        LatentFormat format, const float* latent_scale, int rope,
                        int blocks_total, int group, int32_t* tickets, float* mg_ws, float* lg_ws,
-                       float* cg_ws) {
+                       float* cg_ws, const AttnStage* stage = nullptr) {
   if (rows <= 0) return true;
   if (blocks_total < 0) blocks_total = blocks_per_request;
+  if (stage != nullptr && (!kListed || group != 1 || format == LatentFormat::kBf16))
+    throw std::invalid_argument("dsa attention: the staged form is the listed kernel's, a partial per split, over a quantized cache");
   // The split groups (listed form only): 1, or kAttnSplitGroup dividing
   // n_split with the tickets and the group partials' buffers.
   if (group != 1 && (!kListed || group != kAttnSplitGroup || n_split % kAttnSplitGroup != 0 || tickets == nullptr ||
@@ -4424,32 +4649,37 @@ bool launch_attn_flash(const void* q_tilde, const void* latent_cache,
   const int pair_splits = kListed && group == 1 && n_split % 2 == 0 && slabs % 2 == 1 ? 1 : 0;
   dim3 grid{unsigned((total_m + dense::kM - 1) / dense::kM), unsigned(n_split)};
   if (pair_splits) grid = dim3{unsigned(slabs), unsigned(n_split / 2)};
-  const auto dispatch = [&](auto group_tag) {
+  const AttnStage none;
+  const AttnStage& st = stage != nullptr ? *stage : none;
+  const auto dispatch = [&](auto group_tag, auto staged_tag) {
     constexpr int kG = decltype(group_tag)::value;
+    constexpr bool kSt = decltype(staged_tag)::value;
     if (rope == 64) {
-      launch_attn_flash_format<512, 576, kListed, kG>(
+      launch_attn_flash_format<512, 576, kListed, kG, kSt>(
           format, grid, q_tilde, latent_cache, latent_scale, req_ids, pos, topk,
           topk_stride, counts, rows, n_split, local_heads, block_tokens, block_tables,
-          blocks_per_request, blocks_total, scale, m_ws, l_ws, c_ws, tickets, mg_ws, lg_ws, cg_ws, stream, pair_splits);
+          blocks_per_request, blocks_total, scale, m_ws, l_ws, c_ws, tickets, mg_ws, lg_ws, cg_ws, stream, pair_splits, st);
     } else if (kv_lora == 512) {
-      launch_attn_flash_format<512, 512, kListed, kG>(
+      launch_attn_flash_format<512, 512, kListed, kG, kSt>(
           format, grid, q_tilde, latent_cache, latent_scale, req_ids, pos, topk,
           topk_stride, counts, rows, n_split, local_heads, block_tokens, block_tables,
-          blocks_per_request, blocks_total, scale, m_ws, l_ws, c_ws, tickets, mg_ws, lg_ws, cg_ws, stream, pair_splits);
+          blocks_per_request, blocks_total, scale, m_ws, l_ws, c_ws, tickets, mg_ws, lg_ws, cg_ws, stream, pair_splits, st);
     } else {
-      launch_attn_flash_format<256, 256, kListed, kG>(
+      launch_attn_flash_format<256, 256, kListed, kG, kSt>(
           format, grid, q_tilde, latent_cache, latent_scale, req_ids, pos, topk,
           topk_stride, counts, rows, n_split, local_heads, block_tokens, block_tables,
-          blocks_per_request, blocks_total, scale, m_ws, l_ws, c_ws, tickets, mg_ws, lg_ws, cg_ws, stream, pair_splits);
+          blocks_per_request, blocks_total, scale, m_ws, l_ws, c_ws, tickets, mg_ws, lg_ws, cg_ws, stream, pair_splits, st);
     }
   };
   if constexpr (kListed) {
-    if (group == kAttnSplitGroup)
-      dispatch(std::integral_constant<int, kAttnSplitGroup>{});
+    if (stage != nullptr)
+      dispatch(std::integral_constant<int, 1>{}, std::true_type{});
+    else if (group == kAttnSplitGroup)
+      dispatch(std::integral_constant<int, kAttnSplitGroup>{}, std::false_type{});
     else
-      dispatch(std::integral_constant<int, 1>{});
+      dispatch(std::integral_constant<int, 1>{}, std::false_type{});
   } else {
-    dispatch(std::integral_constant<int, 1>{});
+    dispatch(std::integral_constant<int, 1>{}, std::false_type{});
   }
   DGPP_CUDA_OK(cudaGetLastError());
   return true;
@@ -4483,6 +4713,121 @@ bool dsa_attn_listed(const void* q_tilde, const void* latent_cache,
                                  kv_lora, block_tokens, block_tables,
                                  blocks_per_request, scale, m_ws, l_ws, c_ws, stream,
                                  format, latent_scale, rope, blocks_total, group, tickets, mg_ws, lg_ws, cg_ws);
+}
+
+namespace {
+// The staged copy's workspace: [bitmap: a bit a token][slot_of: i32 a
+// token][slot_token: i32 a slot][state: 4 i32][rows: slots x score_width
+// bf16], each region 256-byte aligned.
+struct StageLayout {
+  size_t off_slot_of = 0, off_slot_token = 0, off_state = 0, off_rows = 0, total = 0;
+  int words = 0;
+};
+StageLayout stage_layout(int64_t tokens, int slots, int score_width) {
+  if (tokens <= 0 || tokens > (int64_t{1} << 30) || slots <= 0 || score_width <= 0)
+    throw std::invalid_argument("dsa staged attention: tokens in (0, 2^30], slots and score width positive");
+  const auto align = [](size_t b) { return (b + 255) / 256 * 256; };
+  StageLayout L;
+  L.words = static_cast<int>((tokens + 31) / 32);
+  L.off_slot_of = align(size_t(L.words) * 4);
+  L.off_slot_token = L.off_slot_of + align(size_t(tokens) * 4);
+  L.off_state = L.off_slot_token + align(size_t(slots) * 4);
+  L.off_rows = L.off_state + 256;
+  L.total = L.off_rows + align(size_t(slots) * size_t(score_width) * 2);
+  return L;
+}
+template <int KV, int SD>
+void launch_stage_rows(LatentFormat format, unsigned grid, const void* latent_cache, const float* latent_scale,
+                       const int32_t* bt, int block_tokens, int blocks_per_request, int blocks_total,
+                       const int32_t* slot_token, const int32_t* state, uint8_t* rows, cudaStream_t stream) {
+  const auto go = [&](auto tag) {
+    constexpr LatentFormat F = decltype(tag)::value;
+    attn_stage_rows_kernel<KV, SD, F><<<grid, kStageRowThreads, 0, stream>>>(
+        static_cast<const uint8_t*>(latent_cache), latent_scale, bt, block_tokens, blocks_per_request, blocks_total,
+        slot_token, state, rows);
+  };
+  switch (format) {
+    case LatentFormat::kBf16: DGPP_CUDA_OK(cudaErrorInvalidValue); break;
+    case LatentFormat::kFp8: go(std::integral_constant<LatentFormat, LatentFormat::kFp8>{}); break;
+    case LatentFormat::kFp4: go(std::integral_constant<LatentFormat, LatentFormat::kFp4>{}); break;
+    case LatentFormat::kFp8Block: go(std::integral_constant<LatentFormat, LatentFormat::kFp8Block>{}); break;
+    case LatentFormat::kFp4Block: go(std::integral_constant<LatentFormat, LatentFormat::kFp4Block>{}); break;
+  }
+  DGPP_CUDA_OK(cudaGetLastError());
+}
+}  // namespace
+
+size_t dsa_attn_stage_bytes(int64_t tokens, int slots, int score_width) {
+  return stage_layout(tokens, slots, score_width).total;
+}
+
+bool dsa_attn_listed_staged(const void* q_tilde, const void* latent_cache, int32_t req,
+                            const int32_t* req_ids, const int32_t* topk, int topk_stride,
+                            const int32_t* counts, int rows, int n_split, int local_heads,
+                            int kv_lora, int block_tokens, const int32_t* block_tables,
+                            int blocks_per_request, float scale, float* m_ws, float* l_ws,
+                            float* c_ws, cudaStream_t stream, LatentFormat format,
+                            const float* latent_scale, int rope, int blocks_total, void* stage_ws,
+                            int64_t stage_tokens, int stage_slots) {
+  if (rows <= 0) return true;
+  // The listed kernel's geometries over a quantized cache (a bf16 cache is
+  // its own decoded copy); anything else is the caller's unstaged launch.
+  if (stage_ws == nullptr || format == LatentFormat::kBf16) return false;
+  if (rope == 0 && kv_lora != 512 && kv_lora != 256) return false;
+  if (rope != 0 && !(kv_lora == 512 && rope == 64)) return false;
+  if (local_heads < 16 || local_heads % 16 != 0) return false;
+  if (req < 0 || block_tokens <= 0 || blocks_per_request <= 0 || topk_stride <= 0)
+    DGPP_CUDA_OK(cudaErrorInvalidValue);
+  if (reinterpret_cast<uintptr_t>(stage_ws) % 256 != 0) DGPP_CUDA_OK(cudaErrorInvalidValue);
+  if (latent_format_has_row_scale(format) && latent_scale == nullptr)
+    throw std::invalid_argument("dsa attention: a quantized cache needs its scales");
+  if (blocks_total < 0) blocks_total = blocks_per_request;
+  const StageLayout L = stage_layout(stage_tokens, stage_slots, kv_lora + rope);
+  auto* base = static_cast<uint8_t*>(stage_ws);
+  auto* bitmap = reinterpret_cast<uint32_t*>(base);
+  auto* slot_of = reinterpret_cast<int32_t*>(base + L.off_slot_of);
+  auto* slot_token = reinterpret_cast<int32_t*>(base + L.off_slot_token);
+  auto* state = reinterpret_cast<int32_t*>(base + L.off_state);
+  uint8_t* stage_rows = base + L.off_rows;
+  // A token past the request's table row has no cache row: it is not
+  // staged, and the attention's resolve zero-fills and records it as the
+  // unstaged gather does.
+  const int tokens = static_cast<int>(std::min<int64_t>(stage_tokens, int64_t(blocks_per_request) * block_tokens));
+  const int words = (tokens + 31) / 32;
+  attn_stage_mark_kernel<<<unsigned(rows), 256, 0, stream>>>(topk, topk_stride, counts, bitmap, tokens);
+  DGPP_CUDA_OK(cudaGetLastError());
+  attn_stage_scan_kernel<<<1, kStageScanThreads, 0, stream>>>(bitmap, words, slot_of, slot_token, state, stage_slots);
+  DGPP_CUDA_OK(cudaGetLastError());
+  const int32_t* bt = block_tables + int64_t(req) * blocks_per_request;
+  // The rows' grid: two blocks an SM's worth, each walking its rounds of
+  // the distinct rows (their count is the device's to know).
+  const unsigned row_grid =
+      unsigned(std::min<int64_t>(96, (int64_t(stage_slots) + kStageRowsPerRound - 1) / kStageRowsPerRound));
+  if (rope == 64)
+    launch_stage_rows<512, 576>(format, row_grid, latent_cache, latent_scale, bt, block_tokens, blocks_per_request,
+                                blocks_total, slot_token, state, stage_rows, stream);
+  else if (kv_lora == 512)
+    launch_stage_rows<512, 512>(format, row_grid, latent_cache, latent_scale, bt, block_tokens, blocks_per_request,
+                                blocks_total, slot_token, state, stage_rows, stream);
+  else
+    launch_stage_rows<256, 256>(format, row_grid, latent_cache, latent_scale, bt, block_tokens, blocks_per_request,
+                                blocks_total, slot_token, state, stage_rows, stream);
+  const AttnStage stage{stage_rows, slot_of, state, tokens};
+  return launch_attn_flash<true>(q_tilde, latent_cache, req_ids, nullptr, topk, topk_stride, counts, rows, n_split,
+                                 local_heads, kv_lora, block_tokens, block_tables, blocks_per_request, scale, m_ws,
+                                 l_ws, c_ws, stream, format, latent_scale, rope, blocks_total, 1, nullptr, nullptr,
+                                 nullptr, nullptr, &stage);
+}
+
+void dsa_attn_stage_stats(unsigned long long out[4], bool clear, cudaStream_t stream) {
+  DGPP_CUDA_OK(cudaMemcpyFromSymbolAsync(out, g_attn_stage_stats, sizeof(unsigned long long) * 4, 0,
+                                         cudaMemcpyDeviceToHost, stream));
+  DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+  if (clear) {
+    static const unsigned long long zero[4] = {0, 0, 0, 0};
+    DGPP_CUDA_OK(cudaMemcpyToSymbolAsync(g_attn_stage_stats, zero, sizeof(zero), 0, cudaMemcpyHostToDevice, stream));
+    DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+  }
 }
 
 void dsa_attn_combine(const float* m_ws, const float* l_ws, const float* c_ws,

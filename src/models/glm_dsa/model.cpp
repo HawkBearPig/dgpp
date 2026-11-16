@@ -19,6 +19,7 @@
 #include "kernels/scale_gemm.hpp"
 #include "loaders/packq_quant.hpp"
 #include "models/glm_dsa/modification_targets.hpp"
+#include "models/staged_prefill_record.hpp"
 
 namespace dgpp {
 namespace {
@@ -420,6 +421,7 @@ void GlmDsaModel::set_runtime_adapter(std::unique_ptr<adapters::Runtime> adapter
 }
 
 GlmDsaModel::~GlmDsaModel() {
+  log_staged_prefill_tiles("glm_dsa", stream_);
   if (runtime_adapter_) {
     cudaStreamSynchronize(stream_);
     runtime_adapter_.reset();

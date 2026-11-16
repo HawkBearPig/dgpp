@@ -2882,6 +2882,10 @@ if(DGPP_BUILD_BENCHMARKS)
     SOURCES benchmarks/micro/dsa_select_bench.cu
     LIBRARIES dgpp_models_dsa CUDA::cudart)
 
+  dgpp_add_benchmark(dsa_attn_tile_bench
+    SOURCES benchmarks/micro/dsa_attn_tile_bench.cu
+    LIBRARIES dgpp_models_dsa CUDA::cudart)
+
   dgpp_add_benchmark(qsa_prefill_bench
     SOURCES benchmarks/micro/qsa_prefill_bench.cu
     LIBRARIES dgpp_kernels CUDA::cudart)

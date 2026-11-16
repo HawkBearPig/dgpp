@@ -120,6 +120,10 @@ class Csa2Layer {
   // default; engine.prefill_window flash) or the scalar partial kernel
   // (scalar, the decode window's kernel: the decode audit's form).
   void set_prefill_window_flash(bool on) { prefill_window_flash_ = on; }
+  // Tests: a prefill tile's two sources straight from their caches (the
+  // staged copy of the tile's distinct rows is the default, kernels/dsa.hpp
+  // dsa_attn_listed_staged; the two are bit for bit the same output).
+  void set_staged_prefill(bool on) { staged_prefill_ = on; }
   // The decode window (engine.decode_window, 2026-10-19): flash = the
   // flash listed kernel unsplit (one block per row and head group); scalar
   // = the scalar partial kernel split kWinDecodeSplit ways (the form until
@@ -224,6 +228,9 @@ class Csa2Layer {
     size_t m_grp_main, l_grp_main, c_grp_main, m_grp_win, l_grp_win, c_grp_win, tickets;
     size_t tickets_per_source = 0;  // ints per source (the window's follow the main's)
     size_t gather_k, gather_scale, logits, select_ws, counter, violations;
+    size_t stage = 0;          // the prefill tiles' staged copy (0 slots: none)
+    int stage_slots = 0;
+    int64_t stage_tokens = 0;  // the entries / window-scratch rows its lists can name
     size_t exl3_ws = 0, exl3_ws_bytes = 0;
     int tile_cap = 0;
     int64_t max_entries = 0;
@@ -265,7 +272,8 @@ class Csa2Layer {
   void attend_rows(Csa2StatePool& pool, const int32_t* req_ids_win, const uint8_t* win_cache, int win_block_tokens,
                    const int32_t* win_table, const int32_t* req_ids_main, const int64_t* pos, int row0, int rows,
                    int n_split_main, cudaStream_t stream, const int32_t* list, int list_stride,
-                   const int32_t* counts, bool split_window = false, int sel_base = 0, bool flash_window = false);
+                   const int32_t* counts, bool split_window = false, int sel_base = 0, bool flash_window = false,
+                   int one_req = -1);
   void project_out(int tokens, void* out, cudaStream_t stream);
   void validate_pool(const Csa2StatePool& pool) const;
 
@@ -284,6 +292,15 @@ class Csa2Layer {
   bool prefill_tile_ = false;
   bool prefill_dense_tile_ = true;  // the configured form (set_prefill_dense_tile)
   bool prefill_window_flash_ = true;  // set_prefill_window_flash
+  // A prefill tile's rows are consecutive positions of one request: their
+  // windows overlap by all but one key and their selections mostly agree,
+  // so each source's distinct rows are staged once a tile, decoded, and the
+  // listed kernel reads the copy (a tile with more distinct rows than the
+  // copy's dsa_attn_stage_slots reads the cache: the same bits).
+  bool staged_prefill_ = true;
+  void* stage_ws_ = nullptr;
+  int stage_slots_ = 0;
+  int64_t stage_tokens_ = 0;
   bool decode_window_flash_ = true;   // set_decode_window_flash
   cudaStream_t side_stream_ = nullptr;  // set_decode_side
   cudaEvent_t side_fork_ = nullptr;

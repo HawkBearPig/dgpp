@@ -673,7 +673,11 @@ build. The suites cover:
   rows beside them), split-KV absorbed attention against
   the host oracle at TP1/TP4 with empty-row and head-group coverage (the
   listed kernel's rows bitwise the same at every row count from one to
-  eight, where an odd count pairs a row's splits in a block),
+  eight, where an odd count pairs a row's splits in a block; a prefill
+  tile's listed attention from the staged copy of its distinct cache rows
+  bitwise the launch from the cache in every quantized format, with the copy
+  large enough and too small, and a layer's prefill output bitwise with and
+  without it),
   latent/gather block-table round trip, the quantized latent cache (the
   fp8/fp4 append bitwise against the host codec at 512/256/32 wide; the
   split, listed-flash and dense-flash attention kernels over an fp8/fp4
