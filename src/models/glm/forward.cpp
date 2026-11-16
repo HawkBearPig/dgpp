@@ -1,4 +1,5 @@
 #include "models/glm/forward.hpp"
+#include "models/staged_prefill_record.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -664,6 +665,7 @@ GlmDiagnosticModel::MemoryPlan GlmDiagnosticModel::plan_memory(
 }
 
 GlmDiagnosticModel::~GlmDiagnosticModel() {
+  log_staged_prefill_tiles("glm", stream_);
   vision_.reset();
   cudaFree(gemm_ws_);
   cudaFree(dsa_scratch_);

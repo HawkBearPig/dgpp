@@ -1,4 +1,5 @@
 #include "models/dsv41/model.hpp"
+#include "models/staged_prefill_record.hpp"
 
 #include "kernels/dsv41_dspark.hpp"
 #include "kernels/exl3_gemv.hpp"
@@ -363,6 +364,7 @@ HeadMatrix Dsv41Model::draft_head_matrix() const {
 
 Dsv41Model::~Dsv41Model() {
   cudaStreamSynchronize(stream_);
+  log_staged_prefill_tiles("dsv41", stream_);
   for (cudaEvent_t e : ov_ev_)
     if (e) cudaEventDestroy(e);
   csa2_.reset();

@@ -5,6 +5,54 @@ project procedures and design guidance live in `docs/`.
 
 ## Unreleased
 
+- **A prefill tile attends from one decoded copy of its distinct cache rows**:
+  past a prompt's first 2,048 tokens a query row attends to the tokens its
+  selection listed, and a prefill tile is 128 consecutive rows of one
+  request, whose lists mostly agree. On the full GLM-5.3 a tile's 257,000
+  (row, token) pairs name 11,500 distinct tokens on average and 38,000 at
+  most (prompts of 8K to 65K tokens). The listed kernel gathered and
+  dequantized a cache row once a pair, and it is a fifth of a cold prefill
+  (20.7 % at 24K tokens). `dsa_attn_listed_staged` puts three small launches
+  ahead of the attention's: every listed token's bit in a bitmap of the
+  request's tokens, the set bits numbered in token order, and each numbered
+  token's cache row through the format's own decode into a contiguous bf16
+  copy. The attention kernel (a staged instantiation of `attn_flash_kernel`)
+  resolves a list entry to its row in the copy and fetches bf16. The copy
+  holds the bits the decode produces, so the partials are bit for bit the
+  launch from the cache (`dsa_listed_attention_from_the_staged_copy_is_the_listed_attention`,
+  every quantized format). The host does not know a tile's distinct count (a
+  chunk is enqueued without a readback), so the copy is a fixed 40 MB of
+  rows and the kernel itself reads the cache, as before, for a tile that
+  lists more: one launch in a thousand here. The size is measured, not
+  derived: 19, 24, 32 and 40 MB held 77, 88, 98 and 99.9 % of the launches
+  and each step was level or better. The rule is the shared layers': the GLM
+  layers at the listed kernel's geometries over a quantized cache, and
+  DeepSeek-V4.1's two sources (the window's fp8_block rows, the compressed
+  fp4_block entries). A bf16 cache (DeepSeek-V4) is its own decoded copy and
+  keeps the launch from the cache. A model logs at shutdown how many
+  launches read the copy and how many the cache.
+  The kernel alone (`dsa_attn_tile_bench`, 512 + 64 over an fp8 cache, 128
+  rows of 2,048 tokens, every launch's cache cold), us a tile with the three
+  staging launches included: 841 -> 656 at 6,400 distinct rows, 843 -> 697 at
+  11,400, 841 -> 733 at 16,000, 844 -> 764 at 21,600; level at 30,000 and 3 %
+  behind at 38,000 over uniformly random lists, an edge the model's own lists
+  did not show on the fabric. The decode's launches are unchanged (the same
+  times at one to eight rows).
+  Four nodes, GLM-5.3 Mixed346 with a runtime adapter on production's recipe,
+  one request, against master before and after in the same window (the legs
+  carried the selection's shared index tiles as well, which do not run in
+  prefill): cold prefill 17.9 / 17.9 -> 17.3 s at 7.7K tokens, 56.7 / 56.5 ->
+  54.8 at 24K, 165.5 / 164.6 -> 161.4 at 65K, and 18.5 / 18.2 -> 17.6 and 24.7
+  / 24.6 -> 23.7 s on two repository prompts: 2.0 to 3.6 % off the nearer
+  baseline. 66,684 launches read the copy and 68 the cache. Short prompts and
+  two and eight requests level. Raw completions with the prefill controller
+  pinned, six prompts of 7.7K to 65K tokens, 300 tokens each with every
+  token's logprobs: equal to master's at every token, bit for bit.
+  DeepSeek-V4.1-Flash-1017 staged every launch (2,200 distinct rows on
+  average) and measured level, 8.74 -> 8.67 s at 24K tokens: its listed
+  attention is a small part of its prefill. GLM-5.3-Flash NVFP4-FP8 keeps a
+  bf16 cache: level, as it should be.
+
 - **The decode selection scores with the prefill select's arithmetic**: the
   kernel that chooses a query's attended tokens (`select_decode_kernel`)
   scores every token of the context for every query row. For the 32-head

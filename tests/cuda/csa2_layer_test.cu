@@ -30,6 +30,7 @@
 #include "common/test.hpp"
 #include "kda_test_helpers.hpp"
 #include "kernels/csa2.hpp"
+#include "kernels/dsa.hpp"
 #include "kernels/gemm.hpp"
 #include "kernels/latent_format.hpp"
 #include "models/dsv41/csa2_layer.hpp"
@@ -457,6 +458,7 @@ struct Scenario {
   int64_t max_cache = 512;
   std::string tag;
   int flips = 0;  // certified near-tie selection flips
+  std::vector<std::vector<uint16_t>> record;  // every prefill's device rows, a layer a call, in order
   std::vector<std::vector<float>> hidden;  // per request, per position: [hidden] rows (all positions ever generated)
 
   explicit Scenario(int tp, const std::string& tag_, int64_t cache_tokens = 512,
@@ -598,6 +600,7 @@ struct Scenario {
       layer->enqueue_prefill(dh.p, pool, req, p0, T, dout.p, 0);
       DGPP_CUDA_OK(cudaDeviceSynchronize());
       const auto got = download<uint16_t>(dout.p, size_t(T) * cfg.hidden);
+      record.push_back(got);
       const auto want = ref->layer_rows(int(l), hf, p0, T, req);
       std::vector<std::vector<int32_t>> dsel;
       if (layers[l].w.ratio > 0) {
@@ -717,6 +720,46 @@ DGPP_TEST(csa2_prefill_reuses_score_workspace_at_shorter_contexts) {
       s.decode({{0, 81, 3}});
       require(s.layer->index_violations() == 0, s.tag + ": index-key exactness violations");
       std::printf("[INFO] %s: %d selection flips, every one certified as a near tie\n", s.tag.c_str(), s.flips);
+    }
+  }
+}
+
+// A prefill tile's two sources attend from the staged copy of the tile's
+// distinct rows (2026-11-16, kernels/dsa.hpp dsa_attn_listed_staged): the
+// window scratch's fp8_block rows and the compressed source's fp4_block
+// entries, one source after the other through the same workspace. Every
+// layer's rows of every chunk are bit for bit the rows without the staged
+// form, over the chunks of two requests (the second request's lists name
+// its own table's blocks), and the staged launches were taken where the
+// listed tensor-core kernel runs (sixteen local heads: TP 1).
+DGPP_TEST(csa2_prefill_staged_tiles_are_the_unstaged_output) {
+  for (const int tp : {1, 4}) {
+    std::vector<std::vector<uint16_t>> want;
+    for (const bool staged : {false, true}) {
+      Scenario s(tp, std::string("staged-tp") + std::to_string(tp) + (staged ? "" : "-off"));
+      s.layer->set_staged_prefill(staged);
+      unsigned long long st[4];
+      dgpp::dsa_attn_stage_stats(st, /*clear=*/true, 0);
+      s.prefill(0, 0, 32);
+      s.prefill(0, 32, 32);
+      s.prefill(1, 0, 32);
+      s.prefill(0, 64, 32);
+      s.prefill(1, 32, 8);
+      dgpp::dsa_attn_stage_stats(st, /*clear=*/false, 0);
+      const bool flash = s.cfg.local_heads() >= 16;
+      if (!staged) {
+        require(st[0] == 0, s.tag + ": staged launches with the staged form off");
+        want = s.record;
+        continue;
+      }
+      require(st[1] == 0, s.tag + ": a tile's distinct rows exceeded the copy");
+      require(flash ? st[0] >= 5 * 6 : st[0] == 0,
+              s.tag + ": " + std::to_string(st[0]) + " staged launches (the listed kernel " + (flash ? "runs" : "does not run") +
+                  " at this head count)");
+      require(s.record.size() == want.size(), s.tag + ": the walks differ in their calls");
+      for (size_t i = 0; i < want.size(); ++i)
+        require(s.record[i] == want[i], s.tag + ": prefill call " + std::to_string(i) +
+                                            " differs between the staged and the unstaged form");
     }
   }
 }

@@ -133,6 +133,13 @@ Csa2Layer::Layout Csa2Layer::layout(const Csa2Config& cfg, int max_tokens, int64
   L.select_ws = alloc(dsa_select_workspace_bytes(max_decode_rows, L.max_entries));
   L.counter = alloc(16);
   L.violations = alloc(16);
+  // The prefill tiles' staged copy (the listed tensor-core kernel's head
+  // tiling): its lists name main entries or rows of the window scratch.
+  if (lh >= 16 && lh % 16 == 0) {
+    L.stage_tokens = std::max<int64_t>(L.max_entries, int64_t(cfg.window) - 1 + max_tokens);
+    L.stage_slots = dsa_attn_stage_slots(kCsa2Latent, L.stage_tokens);
+    L.stage = alloc(dsa_attn_stage_bytes(L.stage_tokens, L.stage_slots, kCsa2Latent));
+  }
   if (cfg.exl3) {
     // The EXL3 launchers' workspace: the widest of the layer's sites (the
     // rotated rows at 64 x k fp16 and the split partials the narrow shapes
@@ -224,6 +231,9 @@ Csa2Layer::Csa2Layer(IGemm& gemm, const Csa2Config& cfg, int max_tokens, int64_t
   select_ws_ = at(L.select_ws);
   counter_ws_ = reinterpret_cast<int32_t*>(at(L.counter));
   violations_ = reinterpret_cast<unsigned*>(at(L.violations));
+  stage_slots_ = L.stage_slots;
+  stage_tokens_ = L.stage_tokens;
+  stage_ws_ = L.stage_slots > 0 ? at(L.stage) : nullptr;
   if (cfg.exl3) {
     exl3_ws_ = at(L.exl3_ws);
     exl3_ws_bytes_ = L.exl3_ws_bytes;
@@ -239,6 +249,8 @@ Csa2Layer::Csa2Layer(IGemm& gemm, const Csa2Config& cfg, int max_tokens, int64_t
   DGPP_CUDA_OK(cudaMemset(counter_ws_, 0, 16));
   DGPP_CUDA_OK(cudaMemset(tickets_main_, 0, 2 * L.tickets_per_source * 4));  // the group tickets start at zero
   DGPP_CUDA_OK(cudaMemset(violations_, 0, 16));
+  if (stage_ws_ != nullptr)  // the staged copy's bitmap is zero at rest
+    DGPP_CUDA_OK(cudaMemset(stage_ws_, 0, static_cast<size_t>((stage_tokens_ + 31) / 32) * 4));
   if (cfg.exl3) DGPP_CUDA_OK(cudaMemset(exl3_ws_, 0, exl3_ws_bytes_));  // the GEMV's arrival counters start at zero
   DGPP_CUDA_OK(cudaMemset(wscratch_, 0, (size_t(cfg.window) - 1 + size_t(max_tokens)) * latent_row_bytes(Csa2StatePool::kRingFormat, kCsa2Latent)));
 }
@@ -471,8 +483,11 @@ void Csa2Layer::attend_rows(Csa2StatePool& pool, const int32_t* req_ids_win, con
                             int win_block_tokens, const int32_t* win_table, const int32_t* req_ids_main,
                             const int64_t* pos, int row0, int rows, int n_split_main, cudaStream_t stream,
                             const int32_t* list, int list_stride, const int32_t* counts, bool split_window,
-                            int sel_base, bool flash_window) {
+                            int sel_base, bool flash_window, int one_req) {
   const int lh = cfg_.local_heads();
+  // A prefill tile (one request's rows): each source from the staged copy
+  // of the tile's distinct rows, one source after the other on the stream.
+  const bool staged = one_req >= 0 && !split_window && staged_prefill_ && stage_ws_ != nullptr;
   if (rows > ws_win_rows_ || rows * n_split_main > ws_slots_) throw std::logic_error("csa2 layer: attention tile too wide");
   const uint16_t* q = q_ + size_t(row0) * lh * kCsa2Latent;
   // The window source. At decode (one or a few rows) an unsplit window is a
@@ -530,11 +545,19 @@ void Csa2Layer::attend_rows(Csa2StatePool& pool, const int32_t* req_ids_win, con
   const int win_blocks_total = split_window ? pool.shape().max_requests : 1;
   int n_win_pub = n_split_win;
   const float *m_win_pub = m_win_, *l_win_pub = l_win_, *c_win_pub = c_win_;
-  if (flash_try &&
-      dsa_attn_listed(q, win_cache, req_ids_win, list + size_t(row0) * list_stride, list_stride, counts + row0, rows,
-                      n_split_win, lh, kCsa2Latent, win_block_tokens, win_table, 1, attn_scale_, m_win_, l_win_, c_win_,
-                      wstream, Csa2StatePool::kRingFormat, nullptr, 0, win_blocks_total, group, tickets_win_, m_grp_win_,
-                      l_grp_win_, c_grp_win_)) {
+  // (The prefill scratch is request 0's one block, whatever the request.)
+  const bool win_staged =
+      flash_try && staged && group == 1 &&
+      dsa_attn_listed_staged(q, win_cache, 0, req_ids_win, list + size_t(row0) * list_stride, list_stride, counts + row0,
+                             rows, n_split_win, lh, kCsa2Latent, win_block_tokens, win_table, 1, attn_scale_, m_win_,
+                             l_win_, c_win_, wstream, Csa2StatePool::kRingFormat, nullptr, 0, win_blocks_total, stage_ws_,
+                             stage_tokens_, stage_slots_);
+  if (win_staged ||
+      (flash_try &&
+       dsa_attn_listed(q, win_cache, req_ids_win, list + size_t(row0) * list_stride, list_stride, counts + row0, rows,
+                       n_split_win, lh, kCsa2Latent, win_block_tokens, win_table, 1, attn_scale_, m_win_, l_win_, c_win_,
+                       wstream, Csa2StatePool::kRingFormat, nullptr, 0, win_blocks_total, group, tickets_win_, m_grp_win_,
+                       l_grp_win_, c_grp_win_))) {
     n_win_pub = n_split_win / group;
     if (group > 1) {
       m_win_pub = m_grp_win_;
@@ -554,11 +577,18 @@ void Csa2Layer::attend_rows(Csa2StatePool& pool, const int32_t* req_ids_win, con
     const int32_t* topk = topk_ + size_t(sel_base + row0) * cfg_.index_topk;
     const int32_t* counts = counts_ + sel_base + row0;
     const int n_main = n_split_main;
-    if (lh >= 16 && lh % 16 == 0 &&
-        dsa_attn_listed(q, pool.main(ord), req_ids_main, topk, cfg_.index_topk, counts, rows, n_main, lh, kCsa2Latent,
-                        epb, pool.block_tables(), int(pool.total_blocks()), attn_scale_, m_main_, l_main_, c_main_,
-                        stream, Csa2StatePool::kMainFormat, nullptr, 0, -1, group, tickets_main_, m_grp_main_,
-                        l_grp_main_, c_grp_main_)) {
+    const bool main_staged =
+        staged && group == 1 &&
+        dsa_attn_listed_staged(q, pool.main(ord), one_req, req_ids_main, topk, cfg_.index_topk, counts, rows, n_main, lh,
+                               kCsa2Latent, epb, pool.block_tables(), int(pool.total_blocks()), attn_scale_, m_main_,
+                               l_main_, c_main_, stream, Csa2StatePool::kMainFormat, nullptr, 0, -1, stage_ws_,
+                               stage_tokens_, stage_slots_);
+    if (main_staged ||
+        (lh >= 16 && lh % 16 == 0 &&
+         dsa_attn_listed(q, pool.main(ord), req_ids_main, topk, cfg_.index_topk, counts, rows, n_main, lh, kCsa2Latent,
+                         epb, pool.block_tables(), int(pool.total_blocks()), attn_scale_, m_main_, l_main_, c_main_,
+                         stream, Csa2StatePool::kMainFormat, nullptr, 0, -1, group, tickets_main_, m_grp_main_,
+                         l_grp_main_, c_grp_main_))) {
       n_main_pub = n_main / group;
       if (group > 1) {
         m_main_pub = m_grp_main_;
@@ -947,7 +977,7 @@ void Csa2Layer::enqueue_prefill(const void* hidden_in, Csa2StatePool& pool, int 
   for (int row0 = 0; row0 < tokens; row0 += kPrefillAttnRows) {
     const int rows = std::min(kPrefillAttnRows, tokens - row0);
     attend_rows(pool, req_zero_, wscratch_, win_rows, one_block_, req_ids_, pos_ + row0, row0, rows, kPrefillSplit,
-                stream, wlist_, cfg_.window, wcounts_, false, row_base, prefill_window_flash_);
+                stream, wlist_, cfg_.window, wcounts_, false, row_base, prefill_window_flash_, /*one_req=*/req);
   }
   csa2_window_ring_writeback(wscratch_, cfg_.window, pos0, tokens, cfg_.ring_slots, rb, ring, stream);
   project_out(tokens, out, stream);

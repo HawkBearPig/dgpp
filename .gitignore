@@ -44,6 +44,7 @@ benchmarks/micro/*
 !benchmarks/micro/host_penalties_bench.cpp
 !benchmarks/micro/minimax_moe_bench.cpp
 !benchmarks/micro/mxfp8_gemm_bench.cu
+!benchmarks/micro/dsa_attn_tile_bench.cu
 
 # --- Debug residue ---------------------------------------------------------------
 

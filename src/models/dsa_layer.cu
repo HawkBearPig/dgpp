@@ -155,6 +155,19 @@ DsaLayer::ScratchLayout DsaLayer::scratch_layout(
       dsa_select_workspace_bytes(max_decode_rows, max_pools),
       dsa_select_prefill_workspace_bytes(tile_cap, max_pools, g.select_k)));
   L.off_counter = alloc(8);  // int32 [2]: the select ticket and rows-done
+  // The staged copy of a listed prefill tile's distinct rows: a quantized
+  // cache at the listed kernel's geometries (a bf16 cache is its own
+  // decoded copy). Never more rows than a tile can list or a request hold.
+  {
+    const bool tail = cfg.qk_rope_head_dim != 0;
+    const bool geometry = tail ? (cfg.kv_lora_rank == 512 && cfg.qk_rope_head_dim == 64)
+                               : (cfg.kv_lora_rank == 512 || cfg.kv_lora_rank == 256);
+    if (cfg.latent_format != LatentFormat::kBf16 && geometry && g.local_heads >= 16 && g.local_heads % 16 == 0) {
+      L.stage_slots = dsa_attn_stage_slots(
+          g.score_width, std::min<int64_t>(int64_t(DsaLayer::kDensePrefillRows) * g.max_selected, max_cache_tokens));
+      L.off_stage = alloc(dsa_attn_stage_bytes(max_cache_tokens, L.stage_slots, g.score_width));
+    }
+  }
   L.total = align256(off);
   L.max_pools = max_pools;
   L.tile_cap = tile_cap;
@@ -242,6 +255,8 @@ DsaLayer::DsaLayer(IGemm& gemm, const DsaLayerWeights& w, const DsaConfig& cfg,
   select_ws_ = at(L.off_select_ws);
   select_ws_pools_ = L.max_pools;
   counter_ws_ = reinterpret_cast<int32_t*>(at(L.off_counter));
+  stage_slots_ = L.stage_slots;
+  stage_ws_ = L.stage_slots > 0 ? at(L.off_stage) : nullptr;
 }
 
 size_t DsaLayer::scratch_bytes(const DsaConfig& cfg, int max_tokens,
@@ -592,7 +607,13 @@ void dsa_debug_sync(cudaStream_t stream, const char* what) {
 void DsaLayer::attend_dense(DsaStatePool& state, int layer,
                             const int32_t* req_ids, int64_t row0, int rows,
                             bool listed, cudaStream_t stream, int n_split,
-                            bool decode) {
+                            bool decode, int one_req) {
+  const bool staged = listed && !decode && one_req >= 0 && staged_prefill();
+  if (staged && !stage_zeroed_) {
+    // The staged copy's bitmap is zero at rest (each launch leaves it so).
+    DGPP_CUDA_OK(cudaMemsetAsync(stage_ws_, 0, size_t((max_cache_tokens_ + 31) / 32) * 4, stream));
+    stage_zeroed_ = true;
+  }
   for (int64_t a0 = row0; a0 < row0 + rows; a0 += kDensePrefillRows) {
     const int arows =
         int(std::min<int64_t>(kDensePrefillRows, row0 + rows - a0));
@@ -600,7 +621,18 @@ void DsaLayer::attend_dense(DsaStatePool& state, int layer,
                  geo_.local_heads, cfg_.qk_nope_head_dim, cfg_.v_head_dim,
                  cfg_.kv_lora_rank, stream, geo_.rope_dim, /*tensor_cores=*/!decode);
     dsa_debug_sync(stream, "absorb_q");
+    // A prefill tile over a quantized cache: from the staged copy of the
+    // tile's distinct rows (bit for bit the launch below).
+    const bool launched_staged =
+        staged && dsa_attn_listed_staged(q_tilde_, state.latent(layer), one_req, req_ids + a0,
+                                         topk_ + (sel_base_ + a0) * geo_.max_selected, geo_.max_selected,
+                                         counts_ + sel_base_ + a0, arows, n_split, geo_.local_heads,
+                                         cfg_.kv_lora_rank, cfg_.block_tokens, state.block_tables(),
+                                         int(state.total_blocks()), attn_scale_, m_ws_, l_ws_, c_ws_, stream,
+                                         cfg_.latent_format, state.latent_scale(layer), geo_.rope_dim, -1,
+                                         stage_ws_, max_cache_tokens_, stage_slots_);
     const bool launched =
+        launched_staged ? true :
         listed ? dsa_attn_listed(q_tilde_, state.latent(layer), req_ids + a0,
                                  topk_ + (sel_base_ + a0) * geo_.max_selected, geo_.max_selected,
                                  counts_ + sel_base_ + a0, arows, n_split,
@@ -821,7 +853,7 @@ void DsaLayer::enqueue_prefill(const void* hidden_in, DsaStatePool& state,
   // the geometry is outside the kernel's).
   if (tokens > dense_rows)
     attend_dense(state, layer, req_ids_dev_, dense_rows, tokens - dense_rows,
-                 /*listed=*/true, stream);
+                 /*listed=*/true, stream, kDensePrefillSplit, /*decode=*/false, /*one_req=*/req);
 
   // Output projection.
   project_out(out, tokens, stream);

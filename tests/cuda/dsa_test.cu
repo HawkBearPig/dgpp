@@ -3713,6 +3713,63 @@ DGPP_TEST(dsa_layer_prefill_dot_budget_preserves_selection_and_output) {
   }
 }
 
+// A prefill chunk's listed tiles attend from the staged copy of each
+// tile's distinct cache rows (2026-11-16) at the geometries the listed
+// tensor-core kernel takes over a quantized cache: sixteen heads at kv_lora
+// 256 (Flash's form) and at 512 + the 64-wide rope tail (the full model's).
+// The layer's output with the staged form is bit for bit its output
+// without, over two chunks (the second starts inside the context, its
+// tiles listing the first chunk's rows), and the staged launches were
+// taken (the staging's own record).
+DGPP_TEST(dsa_layer_prefill_staged_tiles_are_the_unstaged_output) {
+  cudaStream_t s = dgpp::kda_test::test_stream();
+  const int T = 276, first = 160, cache = 1024;
+  DsaConfig flash = small_cfg();
+  flash.num_heads = 16;
+  flash.kv_lora_rank = 256;
+  flash.latent_format = LatentFormat::kFp8;
+  DsaConfig full = full_cfg();
+  full.num_heads = 16;
+  full.kv_lora_rank = 512;
+  full.latent_format = LatentFormat::kFp8;
+  for (const DsaConfig& cfg : {flash, full}) {
+    TestWeights tw(cfg, 4300);
+    const auto hidden = random_bf16_bits(4301, int64_t(T) * cfg.hidden, -2, 1);
+    std::vector<uint16_t> expected;
+    for (const bool staged : {false, true}) {
+      const size_t budget = 8ull << 20;
+      LayerEnv env(cfg, T, cache, 1, 320, s, budget);
+      DsaStatePool pool;
+      pool.init(env.arena, cfg, 1, 320);
+      const size_t sb = DsaLayer::scratch_bytes(cfg, T, cache, 8, 32, budget);
+      DsaLayer layer(env.gemm, tw.layer_views, cfg, T, cache,
+                     env.arena.alloc_persistent(MemClass::DeviceHot, sb, 256), sb, env.ws.p, env.ws.bytes, 8, 32,
+                     budget);
+      if (!layer.staged_prefill())
+        throw std::runtime_error("staged prefill tiles: the layer has no staged form at this geometry");
+      layer.set_staged_prefill(staged);
+      DevBuf din(hidden.size() * 2), dout(hidden.size() * 2);
+      din.upload(hidden.data(), hidden.size() * 2);
+      unsigned long long st[4];
+      dsa_attn_stage_stats(st, /*clear=*/true, s);
+      layer.enqueue_prefill(din.p, pool, 0, 0, 0, first, dout.p, s);
+      layer.enqueue_prefill(static_cast<const uint16_t*>(din.p) + size_t(first) * cfg.hidden, pool, 0, 0, first, T - first,
+                            static_cast<uint16_t*>(dout.p) + size_t(first) * cfg.hidden, s);
+      DGPP_CUDA_OK(cudaStreamSynchronize(s));
+      dsa_attn_stage_stats(st, /*clear=*/false, s);
+      if (staged ? (st[0] < 2 || st[1] != 0) : st[0] != 0)
+        throw std::runtime_error("staged prefill tiles: " + std::to_string(st[0]) + " staged launch(es), " +
+                                 std::to_string(st[1]) + " past the copy, with the staged form " + (staged ? "on" : "off"));
+      std::vector<uint16_t> output(hidden.size());
+      dout.download(output.data(), output.size() * 2);
+      if (!staged)
+        expected = std::move(output);
+      else
+        require_bitwise("staged prefill tiles: the layer's output", output.data(), expected.data(), output.size() * 2);
+    }
+  }
+}
+
 DGPP_TEST(dsa_layer_fused_prefill_preserves_gemm_selection) {
   cudaStream_t s = dgpp::kda_test::test_stream();
   DsaConfig cfg = full_cfg();
@@ -4570,6 +4627,184 @@ DGPP_TEST(dsa_attention_quantized_cache_matches_dequantized_oracle) {
   attention_quantized_case(LatentFormat::kFp8Block, 6003);
   attention_quantized_case(LatentFormat::kFp4Block, 6004);
   attention_quantized_case(LatentFormat::kBf16, 6003);  // the path the others must equal
+}
+
+// The listed attention from the staged copy of a launch's distinct rows
+// (2026-11-16, dsa_attn_listed_staged) is the listed attention, bit for
+// bit: m, l and c of every split. The rows are one request's (request 1 of
+// two, through its own permuted table) and their lists drift a few tokens
+// a row as a prefill tile's do, with counts from none to 2,048, at the
+// prefill's 4 splits and at 32; every quantized format at a geometry the
+// listed kernel takes. The copy is large enough (every distinct row
+// staged, counted against the host's count) and too small (the kernel
+// reads the cache: the launch must not depend on what the staging left);
+// two launches in a row over different rows (the bitmap is zero at rest);
+// and lists with a token past the table, a negative one and one whose
+// block is unmapped, which both forms zero-fill and record.
+DGPP_TEST(dsa_listed_attention_from_the_staged_copy_is_the_listed_attention) {
+  struct Form { LatentFormat fmt; int kv; int rope; };
+  for (const Form form : {Form{LatentFormat::kFp8, 512, 64}, Form{LatentFormat::kFp8, 512, 0}, Form{LatentFormat::kFp4, 256, 0},
+                          Form{LatentFormat::kFp8Block, 512, 64}, Form{LatentFormat::kFp4Block, 512, 0}}) {
+    constexpr int lh = 16, bt_tokens = 128, n_blocks = 40, max_rows = 21, max_selected = 2048, req = 1;
+    const int kv = form.kv, sd = kv + form.rope;
+    const int64_t total = int64_t(n_blocks) * bt_tokens;
+    const size_t payload = latent_row_bytes(form.fmt, kv), row_bytes = payload + size_t(form.rope) * 2;
+    const std::vector<uint16_t> latent = latent_rows_with_outliers(7101, total, kv);
+    std::vector<uint8_t> cache(size_t(total) * row_bytes);
+    std::vector<float> scales(static_cast<size_t>(total));
+    for (int64_t t = 0; t < total; ++t) {
+      uint8_t* row = cache.data() + size_t(t) * row_bytes;
+      dgpp::latent_quantize_row_host(form.fmt, &latent[size_t(t) * kv], kv, row, &scales[size_t(t)]);
+      for (int e = 0; e < form.rope; ++e) {
+        const uint16_t v = float_to_bf16_bits(random_f32(7103, t * 64 + e) * 0.5f);
+        std::memcpy(row + payload + e * 2, &v, 2);
+      }
+    }
+    auto q = random_bf16_bits(7105, int64_t(max_rows) * lh * sd, -2, 1);
+    // Two requests' tables; the rows are request 1's. One of its blocks is unmapped.
+    std::vector<int32_t> bt(size_t(2) * n_blocks);
+    for (int b = 0; b < n_blocks; ++b) {
+      bt[size_t(b)] = b;
+      bt[size_t(n_blocks) + size_t(b)] = (b * 7 + 3) % n_blocks;
+    }
+    constexpr int kUnmapped = 11;
+    bt[size_t(n_blocks) + kUnmapped] = -1;
+    // The drifting lists, ascending: row 0's 2,048 tokens, each next row trading 23 of the row before's.
+    const int row_counts[max_rows] = {2048, 2048, 700, 3, 2048, 0, 1300, 2048, 2048, 65, 2048,
+                                      2048, 2048, 1,  2048, 2048, 2048, 513, 2048, 2048, 2048};
+    std::vector<int32_t> tokens(size_t(max_rows) * max_selected, -1), counts(row_counts, row_counts + max_rows),
+        req_ids(max_rows, req);
+    {
+      std::vector<char> in(static_cast<size_t>(total), 0);
+      std::vector<int32_t> cur;
+      uint64_t n = 0;
+      // (No row lists the unmapped block's tokens but the one placed below.)
+      for (int e = 0; e < bt_tokens; ++e) in[size_t(kUnmapped) * bt_tokens + e] = 1;
+      while (int(cur.size()) < max_selected) {
+        const int32_t t = int32_t(hash32(7107 + n++) % uint32_t(total));
+        if (!in[size_t(t)]) in[size_t(t)] = 1, cur.push_back(t);
+      }
+      for (int r = 0; r < max_rows; ++r) {
+        for (int d = 0; r > 0 && d < 23; ++d) {
+          const size_t out = hash32(7109 + uint64_t(r) * 1000 + d) % cur.size();
+          int32_t t;
+          do t = int32_t(hash32(7107 + n++) % uint32_t(total)); while (in[size_t(t)]);
+          in[size_t(cur[out])] = 0, in[size_t(t)] = 1, cur[out] = t;
+        }
+        std::vector<int32_t> pick(cur.begin(), cur.begin() + row_counts[r]);
+        std::sort(pick.begin(), pick.end());
+        std::copy(pick.begin(), pick.end(), tokens.begin() + size_t(r) * max_selected);
+      }
+      // The guarded entries: past the table, negative, and in the unmapped block.
+      tokens[size_t(1) * max_selected + 5] = int32_t(total + 77);
+      tokens[size_t(4) * max_selected + 900] = -9;
+      tokens[size_t(7) * max_selected + 31] = kUnmapped * bt_tokens + 17;
+    }
+    DevBuf dcache(cache.size()), dscale(scales.size() * 4), dq(q.size() * 2), dtopk(tokens.size() * 4),
+        dcnt(counts.size() * 4), dri(req_ids.size() * 4), dbt(bt.size() * 4);
+    dcache.upload(cache.data(), cache.size());
+    dscale.upload(scales.data(), scales.size() * 4);
+    dq.upload(q.data(), q.size() * 2);
+    dtopk.upload(tokens.data(), tokens.size() * 4);
+    dcnt.upload(counts.data(), counts.size() * 4);
+    dri.upload(req_ids.data(), req_ids.size() * 4);
+    dbt.upload(bt.data(), bt.size() * 4);
+    // The distinct tokens of rows [r0, r0 + rows) the staging numbers: those under the table's bound.
+    const auto distinct = [&](int r0, int rows) {
+      std::vector<char> seen(static_cast<size_t>(total), 0);
+      unsigned long long n = 0;
+      for (int r = r0; r < r0 + rows; ++r)
+        for (int i = 0; i < row_counts[r]; ++i) {
+          const int32_t t = tokens[size_t(r) * max_selected + i];
+          if (t >= 0 && t < total && !seen[size_t(t)]) seen[size_t(t)] = 1, ++n;
+        }
+      return n;
+    };
+    long long first[6];
+    dsa_attn_anomalies(first, /*clear=*/true, 0);
+    for (const int n_split : {4, 32}) {
+      const size_t parts = size_t(max_rows) * n_split * lh;
+      DevBuf dm(parts * 4), dl(parts * 4), dc(parts * kv * 4);
+      struct Launch { int r0, rows, slots; };
+      // Whole and too small a copy, then two launches in a row on one workspace over other rows.
+      for (const std::vector<Launch>& seq :
+           {std::vector<Launch>{{0, max_rows, 8192}}, std::vector<Launch>{{0, max_rows, 512}},
+            std::vector<Launch>{{0, 13, 4096}, {9, 12, 4096}, {2, 8, 4096}}}) {
+        const size_t ws_bytes = dsa_attn_stage_bytes(total, seq[0].slots, sd);
+        DevBuf dstage(ws_bytes);
+        // The bitmap zero at allocation, the rest poisoned: a launch reads only what it staged.
+        DGPP_CUDA_OK(cudaMemset(dstage.p, 0xA5, ws_bytes));
+        DGPP_CUDA_OK(cudaMemset(dstage.p, 0, size_t((total + 31) / 32) * 4));
+        for (const Launch& ln : seq) {
+          std::vector<float> want[3], got[3];
+          const size_t n = size_t(ln.rows) * n_split * lh;
+          const std::string tag = std::string("staged listed attention (") + latent_format_name(form.fmt) + " " +
+                                  std::to_string(kv) + "+" + std::to_string(form.rope) + ", " + std::to_string(n_split) +
+                                  " splits, rows " + std::to_string(ln.r0) + "+" + std::to_string(ln.rows) + ", copy of " +
+                                  std::to_string(ln.slots) + ")";
+          for (int staged = 0; staged < 2; ++staged) {
+            DGPP_CUDA_OK(cudaMemset(dm.p, 0xEE, parts * 4));
+            DGPP_CUDA_OK(cudaMemset(dl.p, 0xEE, parts * 4));
+            DGPP_CUDA_OK(cudaMemset(dc.p, 0xEE, parts * kv * 4));
+            const void* qrows = static_cast<const uint16_t*>(dq.p) + size_t(ln.r0) * lh * sd;
+            const int32_t* lists = static_cast<const int32_t*>(dtopk.p) + size_t(ln.r0) * max_selected;
+            const int32_t* cnts = static_cast<const int32_t*>(dcnt.p) + ln.r0;
+            unsigned long long st[4];
+            if (staged) dsa_attn_stage_stats(st, /*clear=*/true, 0);
+            const bool ok =
+                staged ? dsa_attn_listed_staged(qrows, dcache.p, req, static_cast<const int32_t*>(dri.p), lists,
+                                                max_selected, cnts, ln.rows, n_split, lh, kv, bt_tokens,
+                                                static_cast<const int32_t*>(dbt.p), n_blocks, 0.05f,
+                                                static_cast<float*>(dm.p), static_cast<float*>(dl.p),
+                                                static_cast<float*>(dc.p), 0, form.fmt,
+                                                static_cast<const float*>(dscale.p), form.rope, -1, dstage.p, total,
+                                                ln.slots)
+                       : dsa_attn_listed(qrows, dcache.p, static_cast<const int32_t*>(dri.p), lists, max_selected, cnts,
+                                         ln.rows, n_split, lh, kv, bt_tokens, static_cast<const int32_t*>(dbt.p),
+                                         n_blocks, 0.05f, static_cast<float*>(dm.p), static_cast<float*>(dl.p),
+                                         static_cast<float*>(dc.p), 0, form.fmt, static_cast<const float*>(dscale.p),
+                                         form.rope);
+            if (!ok) throw std::runtime_error(tag + ": the kernel refused the geometry");
+            DGPP_CUDA_OK(cudaDeviceSynchronize());
+            std::vector<float>* out = staged ? got : want;
+            out[0].resize(n), out[1].resize(n), out[2].resize(n * kv);
+            dm.download(out[0].data(), n * 4);
+            dl.download(out[1].data(), n * 4);
+            dc.download(out[2].data(), n * kv * 4);
+            // Both forms met the guarded entries of their rows.
+            const bool guarded = (ln.r0 <= 1 && 1 < ln.r0 + ln.rows) || (ln.r0 <= 4 && 4 < ln.r0 + ln.rows) ||
+                                 (ln.r0 <= 7 && 7 < ln.r0 + ln.rows);
+            const unsigned long long anomalies = dsa_attn_anomalies(first, /*clear=*/true, 0);
+            if ((anomalies != 0) != guarded)
+              throw std::runtime_error(tag + (staged ? " staged" : " from the cache") + ": " + std::to_string(anomalies) +
+                                       " guarded gathers recorded");
+            if (staged) {
+              dsa_attn_stage_stats(st, /*clear=*/false, 0);
+              const unsigned long long want_distinct = distinct(ln.r0, ln.rows);
+              const unsigned long long want_unstaged = want_distinct > static_cast<unsigned long long>(ln.slots) ? 1 : 0;
+              if (st[0] != 1 || st[1] != want_unstaged || st[2] != want_distinct || st[3] != want_distinct)
+                throw std::runtime_error(tag + ": the staging counted " + std::to_string(st[2]) + " distinct rows in " +
+                                         std::to_string(st[0]) + " launch(es), " + std::to_string(st[1]) +
+                                         " not staged; the lists hold " + std::to_string(want_distinct));
+            } else {
+              double mass = 0;
+              for (float v : out[1]) mass += double(v);
+              if (!(mass > 0)) throw std::runtime_error(tag + ": the launch attended to nothing");
+            }
+          }
+          require_bitwise(tag + " m", got[0].data(), want[0].data(), n * 4);
+          require_bitwise(tag + " l", got[1].data(), want[1].data(), n * 4);
+          require_bitwise(tag + " c", got[2].data(), want[2].data(), n * kv * 4);
+        }
+      }
+    }
+    std::printf("[ OK ] staged listed attention %s %d+%d: bitwise the listed attention, staged and past the copy\n",
+                latent_format_name(form.fmt), kv, form.rope);
+  }
+  // A bf16 cache is its own decoded copy: the staged form declines it.
+  if (dsa_attn_listed_staged(nullptr, nullptr, 0, nullptr, nullptr, 1, nullptr, 1, 4, 16, 512, 128, nullptr, 1, 1.f, nullptr,
+                             nullptr, nullptr, 0, LatentFormat::kBf16, nullptr, 0, -1, reinterpret_cast<void*>(256), 128, 8))
+    throw std::runtime_error("staged listed attention: a bf16 cache was not declined");
 }
 
 // Exercise every finite nonnegative e4m3 block-scale code and every e2m1
