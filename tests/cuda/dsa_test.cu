@@ -1669,16 +1669,22 @@ struct DecodeSelScenario {
     const int max_selected = g.max_selected;
     DevBuf dq8(q8.size()), dw(w.size() * 4), dki(k8.size()),
         dks_c(ks.size() * 4), dpos(pos.size() * 8), dri(req_ids.size() * 4),
-        dbt(4), dtopk(size_t(max_selected) * rows * 4), dcnt(rows * 4),
+        dtopk(size_t(max_selected) * rows * 4), dcnt(rows * 4),
         dws(dsa_select_workspace_bytes(rows, n_pools)), dctr(8);
+    // A table row a request id, every one the same block: rows given
+    // different ids are different requests over the same index.
+    int32_t max_req = 0;
+    for (const int32_t id : req_ids) max_req = std::max(max_req, id);
+    const std::vector<int32_t> table(size_t(max_req) + 1, 0);
+    DevBuf dbt(table.size() * 4);
     dq8.upload(q8.data(), q8.size());
     dw.upload(w.data(), w.size() * 4);
     dki.upload(k8.data(), k8.size());
     dks_c.upload(ks.data(), ks.size() * 4);
     dpos.upload(pos.data(), pos.size() * 8);
     dri.upload(req_ids.data(), req_ids.size() * 4);
-    int32_t bt0 = 0, ctr0 = 0;
-    dbt.upload(&bt0, 4);
+    int32_t ctr0 = 0;
+    dbt.upload(table.data(), table.size() * 4);
     dctr.upload(&ctr0, 4);
     dsa_select_decode(dq8.p, static_cast<const float*>(dw.p),
                       static_cast<const int32_t*>(dri.p),
@@ -1941,6 +1947,30 @@ DGPP_TEST(dsa_select_decode_64_heads_release_shape) {
         if (again != got) throw std::runtime_error("64-head select: two launches differ");
       }
     }
+    // The rows as requests of their own (a table row each, the same two
+    // blocks): no rows share a staged tile, and the picks are the same.
+    if (rows > 1) {
+      std::vector<int32_t> own(static_cast<size_t>(rows)), tables(size_t(rows) * 2);
+      for (int r = 0; r < rows; ++r) {
+        own[size_t(r)] = r;
+        tables[size_t(r) * 2] = table[0];
+        tables[size_t(r) * 2 + 1] = table[1];
+      }
+      DevBuf dri2(own.size() * 4), dbt2(tables.size() * 4);
+      dri2.upload(own.data(), own.size() * 4);
+      dbt2.upload(tables.data(), tables.size() * 4);
+      dsa_select_decode(dq8.p, static_cast<const float*>(dw.p), static_cast<const int32_t*>(dri2.p),
+                        static_cast<const int64_t*>(dpos.p), rows, static_cast<const int32_t*>(dbt2.p), 2, dki.p,
+                        static_cast<const float*>(dks.p), pools_per_block, heads, dim, select_k, 1, select_k,
+                        static_cast<int32_t*>(dtopk.p), static_cast<int32_t*>(dcnt.p), dws.p, n_pools,
+                        static_cast<int32_t*>(dctr.p), 0, 0, /*relu=*/true);
+      cudaDeviceSynchronize();
+      std::vector<int32_t> alone(got.size(), 0), alone_counts(counts.size(), 0);
+      dtopk.download(alone.data(), alone.size() * 4);
+      dcnt.download(alone_counts.data(), alone_counts.size() * 4);
+      if (alone != got || alone_counts != counts)
+        throw std::runtime_error("64-head select: the rows as requests of their own pick differently");
+    }
 
     std::vector<double> logits(static_cast<size_t>(n_pools));
     for (int r = 0; r < rows; ++r) {
@@ -2080,6 +2110,56 @@ DGPP_TEST(dsa_select_decode_row_does_not_depend_on_the_rows_beside_it) {
         if (visible > sn.g.select_k)
           require_bitwise(tag + " keys", &sn.keys[size_t(r) * size_t(sn.n_pools)],
                           &s8.keys[size_t(r) * size_t(s8.n_pools)], size_t(visible) * 8);
+      }
+    }
+  }
+}
+
+// Consecutive rows of one request share their blocks' staged tiles
+// (2026-11-16): each tile of the index is read once and every row of the
+// group scores against it. A row's keys and selection must not depend on
+// that: the same eight rows as one request (two groups of four), as runs
+// of three, one, two and two, as a request a row (no sharing: the launch
+// before the change) and as a five and a three (a group of four, then the
+// fifth row alone) — bit for bit the same lists, counts and keys. The
+// rows are a decode step's (three positions a token apart), a context
+// short enough to select every pool inside a group, a padding row inside
+// a group, and contexts of different lengths in one group (the group's
+// stripes span the longest, and a shorter row publishes only its own).
+DGPP_TEST(dsa_select_decode_rows_of_a_request_share_their_tiles) {
+  for (const int kpool : {4, 1}) {
+    const int64_t k = kpool;
+    const std::vector<int64_t> all = {k * 9000 + k - 1, k * 9000 + k, k * 9000 + k + 1, 77,
+                                      k * 30000,        k * 2049,     -1,               k * 12000 + 1};
+    const std::vector<std::vector<int32_t>> groupings = {
+        {0, 0, 0, 0, 0, 0, 0, 0}, {0, 0, 0, 1, 2, 2, 3, 3}, {0, 1, 2, 3, 4, 5, 6, 7}, {5, 5, 5, 5, 5, 2, 2, 2}};
+    for (const bool relu : {false, true}) {
+      std::vector<int32_t> t0, c0;
+      std::vector<uint64_t> k0;
+      for (size_t gi = 0; gi < groupings.size(); ++gi) {
+        DecodeSelScenario s(kpool);
+        s.init(87, all);
+        s.relu = relu;
+        s.req_ids = groupings[gi];
+        std::vector<int32_t> t, c;
+        s.run(0, t, c);
+        if (gi == 0) {
+          t0 = t, c0 = c, k0 = s.keys;
+          int scored = 0;
+          for (const int64_t p : all) scored += (p + 1) / kpool > s.g.select_k;
+          if (scored < 6) throw std::runtime_error("shared tiles: the scenario scores too few rows");
+          continue;
+        }
+        const std::string tag = "decode select, kpool " + std::to_string(kpool) + (relu ? ", relu" : "") + ", grouping " +
+                                std::to_string(gi);
+        require_bitwise(tag + " counts", c.data(), c0.data(), c.size() * 4);
+        require_bitwise(tag + " lists", t.data(), t0.data(), t.size() * 4);
+        for (size_t r = 0; r < all.size(); ++r) {
+          const int64_t visible = (all[r] + 1) / kpool;
+          if (visible > s.g.select_k)
+            require_bitwise(tag + " keys of row " + std::to_string(r), &s.keys[r * size_t(s.n_pools)],
+                            &k0[r * size_t(s.n_pools)], size_t(visible) * 8);
+        }
       }
     }
   }

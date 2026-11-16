@@ -255,7 +255,10 @@ void dsa_prepare_kernel_smem();
 // 16-entry tiles widened exactly to f16 — fp32 sums either way, the scores
 // the exact logits within those sums' rounding, the same on every rank and
 // at every grid and row count), and selects the select_k highest by a radix
-// select over the keys. Fixed grid, a stripe of one row's pools a block;
+// select over the keys. Fixed grid, a stripe of pools a block: consecutive
+// rows of one request share their blocks, each staging a tile of the index
+// once and scoring every one of those rows against it (a row's keys are
+// the same whatever rows share its launch);
 // the last blocks finish the selection, extract ids ascending, expand pools
 // to tokens, and append each row's incomplete tail. The workspace (dsa_select_workspace_bytes,
 // sized for the caller's largest row count and pool count: the rows' keys,
