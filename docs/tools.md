@@ -44,7 +44,7 @@ modules to see their arguments. Their offline regression tests run with
 | `micro_ibv_smoke verify --peer IP:PORT --dev DEV` | ordered NIC DMA payload/doorbell → GPU hash validation |
 | `kda_bench` | KDA decode state-traffic and layer timing profile (M2) |
 | `dsa_bench [--tp N]` | the DSA layer's decode kernels at a chosen context and TP width |
-| `dsa_select_bench --ctx a,b,c [--rows R --grid G]` | the decode index selection alone, with its phase breakdown (the 2026-09-06 select rewrite's microbench) |
+| `dsa_select_bench --ctx a,b,c [--rows R --grid G --layers N --split 1]` | the decode index selection alone, with its phase breakdown (the 2026-09-06 select rewrite's microbench); `--layers` walks that many index caches so each launch reads its index from DRAM, `--split 1` makes every row its own request |
 | `dsa_attn_tile_bench [--ctx N --drift D --layers N --slots S]` | a prefill tile's listed attention alone, from the cache and from the staged copy of the tile's distinct rows, with the two forms' partials compared bit for bit |
 | `moe_slot_bench --rows R --inter I` | the MoE decode slot's expert GEMV at a chosen row count (the down kernel's row batching) |
 | `gpt_doll --selftest` | synthetic eager/graph parity testbed |

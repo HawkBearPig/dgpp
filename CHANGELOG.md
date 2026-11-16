@@ -5,6 +5,37 @@ project procedures and design guidance live in `docs/`.
 
 ## Unreleased
 
+- **The rows of a request score against one staging of each index tile**: the
+  decode selection (`select_decode_kernel`) gave each block one row's stripe
+  of the context, so the rows of a request — a decode step's token and its
+  drafts, a token apart in the same context — each staged the whole index
+  from memory: three rows at 65K tokens were three passes over the same 8 MB
+  a launch, 22 launches a pass on the full GLM-5.3. Consecutive rows of one
+  request now share their blocks. A group of up to four such rows (two at 64
+  heads: a row's q and histogram are the block's shared memory) splits the
+  request's context between the rows' blocks, and a block stages a tile once
+  and scores every row of the group against it. A row's score is the same
+  instructions on the same operands, so the keys and the selection are bit
+  for bit what they were whatever rows share a launch
+  (`dsa_select_decode_rows_of_a_request_share_their_tiles`: eight rows as one
+  request, as runs of three, one, two and two, and as a request a row, with
+  a short context and a padding row inside a group). Rows of different
+  requests score as before.
+  The kernel alone (`dsa_select_bench --layers 24`: every launch's index
+  cold), us a launch at the full model's geometry: three rows 50.8 -> 48.3 at
+  24K tokens and 112.1 -> 101.3 at 65K; eight rows 78.9 -> 61.5 and 189.3 ->
+  137.6; level at 8K. At 64 heads, four rows: 121 -> 117 and 296 -> 268.
+  Four nodes, GLM-5.3 Mixed346 with a runtime adapter on production's recipe
+  (two drafts scheduled: three rows the common pass), one request, against
+  master before and after in the same window (the legs carried the staged
+  prefill attention as well, which does not run in decode): a pass at 65K
+  tokens of context 83.1 / 82.0 -> 81.1 ms (three readings, 81.1 to 81.2;
+  33.4 / 33.8 -> 34.2 tok/s); level at 24K (79.4 / 79.1 -> 79.1), at 7.7K, on
+  short prompts and at two and eight requests. Raw completions with the
+  prefill controller pinned, six prompts of 7.7K to 65K tokens, 300 tokens
+  each with every token's logprobs: equal to master's at every token, bit for
+  bit. GLM-5.3-Flash NVFP4-FP8 and DeepSeek-V4.1-Flash-1017: level,
+  transcripts identical.
 - **A prefill tile attends from one decoded copy of its distinct cache rows**:
   past a prompt's first 2,048 tokens a query row attends to the tokens its
   selection listed, and a prefill tile is 128 consecutive rows of one

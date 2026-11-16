@@ -1198,6 +1198,29 @@ constexpr int kE4Groups = 2;    // the block's 256 threads
 constexpr size_t kE4QBytes = size_t(32) * kE4Stride;
 constexpr size_t kE4GroupBytes = size_t(kE4Tile) * kE4Stride + kE4Tile * sizeof(float);
 constexpr size_t kE4KeyBytes = kE4Groups * kE4GroupBytes;
+// Rows of one request that score against the same staged tile (2026-11-16).
+// A block used to score ONE row's stripe, so the rows of a request — a
+// decode step's token and its drafts, a token apart in the same context —
+// each read the whole index: three rows at 65K tokens of context were 25 MB
+// of index a launch from DRAM for 8 MB of distinct bytes, and on the fabric
+// (22 launches a pass, every layer's index evicted by the weights between
+// its launches) a launch took 178 us against 96 us with the index resident.
+// A block now stages a tile once and scores each of up to this many
+// consecutive rows of the same request against it; the rows' share of the
+// grid's blocks splits the request's context between them, so the scoring
+// work a block does is what it was. The bound is shared memory: a row's q
+// and a row's histogram a row, beside the tiles, within the block's 100 KB.
+constexpr int kE4Share = 4;
+constexpr int kWideShare = 2;  // the 64-head form: a row's q as f16 is 16 KB
+constexpr int select_share_rows(bool wide) { return wide ? kWideShare : kE4Share; }
+// The rows' histograms in phase 1 and, when they are flushed, one row's
+// phase 2 (its histogram, the boundary bin's candidates, the ids) share
+// the same bytes.
+constexpr size_t select_tail_bytes(bool wide, int select_k) {
+  const size_t p1 = size_t(select_share_rows(wide)) * kSelectHistBins * 4;
+  const size_t p2 = size_t(kSelectHistBins) * 4 + size_t(kSelectStopCandidates) * 8 + size_t(select_k + 1) * 4;
+  return p1 > p2 ? p1 : p2;
+}
 
 template <bool kRelu, bool kWide = false>
 __global__ void select_decode_kernel(
@@ -1210,15 +1233,18 @@ __global__ void select_decode_kernel(
     int64_t bitmap_stride, int32_t* counter_ws) {
   dgpp_pdl_wait();
   extern __shared__ uint64_t smem_u64[];
-  // Layout: [q: ONE row — kWide: as f16, heads x 128; else its codes,
-  //         32 x kE4Stride][key tiles — kWide: warps x (16 entries x 128 f16
-  //         + 16 scales); else two groups x (kE4Tile pools x kE4Stride +
-  //         kE4Tile scales)][w: rows*heads f32][hist: kSelectHistBins i32]
-  //         [cand_hi/cand_lo: kSelectStopCandidates each]
+  // Layout: [q: the block's rows (at most kShare) — kWide: as f16, heads x
+  //         128 a row; else their codes, 32 x kE4Stride a row][key tiles —
+  //         kWide: warps x (16 entries x 128 f16 + 16 scales); else two
+  //         groups x (kE4Tile pools x kE4Stride + kE4Tile scales)]
+  //         [w: rows*heads f32][phase 1: hist, kSelectHistBins i32 a row of
+  //         the block's; phase 2, over the same bytes: hist: kSelectHistBins
+  //         i32][cand_hi/cand_lo: kSelectStopCandidates each]
   //         [scratch: select_k + 1 i32].
+  constexpr int kShare = select_share_rows(kWide);
   uint32_t* q16 = reinterpret_cast<uint32_t*>(smem_u64);
   uint32_t* krow_s = reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(q16) +
-                                                 (kWide ? select_mma_q_bytes(heads) : kE4QBytes));
+                                                 size_t(kShare) * (kWide ? select_mma_q_bytes(heads) : kE4QBytes));
   float* w = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(krow_s) + (kWide ? kMmaSelKeyBytes : kE4KeyBytes));
   int32_t* hist = reinterpret_cast<int32_t*>(w + int64_t(rows) * heads);
   uint32_t* cand_hi = reinterpret_cast<uint32_t*>(hist + kSelectHistBins);
@@ -1237,49 +1263,66 @@ __global__ void select_decode_kernel(
   // pool and need no keys (the last block writes them directly).
   const int warp = threadIdx.x >> 5;
   const int nwarp = int(blockDim.x) >> 5;
-  // The grid is (stripes, rows): a block scores ONE row's stripe, so the
-  // rows of a launch score side by side (a four-row verify batch was four
-  // passes of every block: 35 us of a 48 us launch at 512 entries).
+  // The grid is (stripes, rows). A row's blocks used to score that row's
+  // own stripes; the rows of a launch still score side by side (a four-row
+  // verify batch was once four passes of every block: 35 us of a 48 us
+  // launch at 512 entries), but consecutive rows of ONE request now share
+  // their blocks: a group of n such rows (n <= kShare, a longer run is cut
+  // into groups) splits the request's context into n x gridDim.x stripes,
+  // and the block (x, the group's k-th row) scores stripe k * gridDim.x + x
+  // for every row of the group from one staging of each tile. A score is
+  // its row's and its entry's alone, so the keys do not depend on the
+  // grouping (dsa_select_decode_row_does_not_depend_on_the_rows_beside_it).
   const int total_blocks = int(gridDim.x) * int(gridDim.y);
   {
     const int r = int(blockIdx.y);
-    const int64_t visible = (pos[r] + 1) / kpool;
+    const int32_t req = req_ids[r];
+    int first = r, last = r;
+    while (first > 0 && req_ids[first - 1] == req) --first;
+    while (last + 1 < rows && req_ids[last + 1] == req) ++last;
+    const int g0 = first + (r - first) / kShare * kShare;  // the group's first row
+    const int gn = min(kShare, last + 1 - g0);              // its rows
+    // A row's visible pools; a short context (visible <= select_k pools)
+    // selects EVERY pool and needs no keys (phase 2 writes the ids
+    // directly): it scores nothing, here zero.
+    int64_t vis[kShare];
+    int64_t vmax = 0;
+#pragma unroll
+    for (int j = 0; j < kShare; ++j) {
+      vis[j] = j < gn ? (pos[g0 + j] + 1) / kpool : 0;
+      if (vis[j] <= select_k) vis[j] = 0;
+      vmax = max(vmax, vis[j]);
+    }
     // The stripe is at least a block's tiles: a short context then runs in
     // its first blocks alone (the others have nothing to stage: 48 blocks
     // each converting the row's q for eleven entries was the 512-entry
     // launch's scoring).
-    const int64_t stripe = max((visible + gridDim.x - 1) / gridDim.x,
+    const int64_t stripes = int64_t(gn) * gridDim.x;
+    const int64_t stripe = max((vmax + stripes - 1) / stripes,
                                int64_t(kWide ? kMmaSelWarps * kMmaSelTile : kE4Groups * kE4Tile));
-    const int64_t lo = min(visible, int64_t(blockIdx.x) * stripe);
-    const int64_t hi = min(visible, lo + stripe);
-    if (visible > select_k && lo < hi) {  // uniform across the block
-    for (int i = threadIdx.x; i < kSelectHistBins; i += blockDim.x) hist[i] = 0;
+    const int64_t lo = min(vmax, (int64_t(r - g0) * gridDim.x + blockIdx.x) * stripe);
+    const int64_t hi = min(vmax, lo + stripe);
+    if (lo < hi) {  // uniform across the block
+    for (int i = threadIdx.x; i < gn * kSelectHistBins; i += blockDim.x) hist[i] = 0;
     __syncthreads();
-    uint64_t* krow = keys_ws + int64_t(r) * keys_stride;
     const int lane = threadIdx.x & 31;
+    const int32_t* bt = block_tables + int64_t(req) * blocks_per_request;
     if constexpr (!kWide) {
       // prefill_fused_score_keys_kernel's arithmetic over the blocked cache:
       // the same staging layout, fragments, mma and head-sum order, so the
       // keys are that kernel's bit for bit.
       constexpr int S = kE4Stride;
-      uint8_t* a = reinterpret_cast<uint8_t*>(q16);  // [32][S]: the row's q codes
+      uint8_t* a = reinterpret_cast<uint8_t*>(q16);  // [gn][32][S]: the rows' q codes
       const int grp = warp >> 2, gwarp = warp & 3, gtid = threadIdx.x & (kE4Tile - 1);
       uint8_t* b = reinterpret_cast<uint8_t*>(krow_s) + size_t(grp) * kE4GroupBytes;  // [kE4Tile][S]
       float* bks = reinterpret_cast<float*>(b + size_t(kE4Tile) * S);                  // [kE4Tile]
-      {
+      for (int j = 0; j < gn; ++j) {
         const int row = threadIdx.x / 8, col = (threadIdx.x % 8) * 16;  // 32 heads x 8 uint4: one a thread
-        *reinterpret_cast<uint4*>(a + row * S + col) =
-            *reinterpret_cast<const uint4*>(q_fp8 + (int64_t(r) * 32 + row) * 128 + col);
+        *reinterpret_cast<uint4*>(a + (j * 32 + row) * S + col) =
+            *reinterpret_cast<const uint4*>(q_fp8 + (int64_t(g0 + j) * 32 + row) * 128 + col);
       }
-      const int32_t* bt = block_tables + int64_t(req_ids[r]) * blocks_per_request;
-      const float* wr = w + int64_t(r) * heads;
-      float weight[2][2];
-#pragma unroll
-      for (int i = 0; i < 2; ++i)
-#pragma unroll
-        for (int h = 0; h < 2; ++h) weight[i][h] = wr[i * 16 + h * 8 + lane / 4];
       for (int64_t p0 = lo; p0 < hi; p0 += kE4Groups * kE4Tile) {
-        const int64_t g0 = p0 + int64_t(grp) * kE4Tile;  // this group's first pool
+        const int64_t t0 = p0 + int64_t(grp) * kE4Tile;  // this four-warp group's first pool
         // The tile's codes: kE4Tile pools x 8 uint4, eight a thread with
         // their loads in flight together, and a pool's scale a thread; a
         // pool past the stripe is zero and publishes nothing.
@@ -1288,14 +1331,14 @@ __global__ void select_decode_kernel(
 #pragma unroll
           for (int u = 0; u < 8; ++u) {
             const int i = gtid + u * kE4Tile, row = i / 8, col = (i % 8) * 16;
-            const int64_t pool = g0 + row;
+            const int64_t pool = t0 + row;
             raw[u] = make_uint4(0u, 0u, 0u, 0u);
             if (pool < hi) {
               const int64_t slot = int64_t(bt[pool / pools_per_block]) * pools_per_block + (pool % pools_per_block);
               raw[u] = *reinterpret_cast<const uint4*>(index_k + slot * 128 + col);
             }
           }
-          const int64_t mine = g0 + gtid;
+          const int64_t mine = t0 + gtid;
           const float ks = mine < hi ? index_scale[int64_t(bt[mine / pools_per_block]) * pools_per_block +
                                                    (mine % pools_per_block)]
                                      : 0.f;
@@ -1307,85 +1350,100 @@ __global__ void select_decode_kernel(
           bks[gtid] = ks;
         }
         __syncthreads();
-        float acc[2][4][4];
+        // The tile's fragments, once for every row of the group.
+        uint32_t bf[4][4][2];
 #pragma unroll
-        for (int i = 0; i < 2; ++i)
+        for (int ki = 0; ki < 4; ++ki) {
 #pragma unroll
-          for (int j = 0; j < 4; ++j) acc[i][j][0] = acc[i][j][1] = acc[i][j][2] = acc[i][j][3] = 0.f;
-#pragma unroll
-        for (int kk = 0; kk < 128; kk += 32) {
-          uint32_t af[2][4], bf[4][2];
-#pragma unroll
-          for (int i = 0; i < 2; ++i) {
-            const unsigned addr = static_cast<unsigned>(
-                __cvta_generic_to_shared(a + (i * 16 + lane % 16) * S + kk + (lane / 16) * 16));
-            asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
-                         : "=r"(af[i][0]), "=r"(af[i][1]), "=r"(af[i][2]), "=r"(af[i][3])
-                         : "r"(addr));
-          }
-#pragma unroll
-          for (int j = 0; j < 2; ++j) {
-            const int row = gwarp * 32 + j * 16 + (lane / 16) * 8 + lane % 8;
-            const int col = kk + ((lane / 8) % 2) * 16;
+          for (int jj = 0; jj < 2; ++jj) {
+            const int row = gwarp * 32 + jj * 16 + (lane / 16) * 8 + lane % 8;
+            const int col = ki * 32 + ((lane / 8) % 2) * 16;
             const unsigned addr = static_cast<unsigned>(__cvta_generic_to_shared(b + row * S + col));
             uint32_t v[4];
             asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
                          : "=r"(v[0]), "=r"(v[1]), "=r"(v[2]), "=r"(v[3])
                          : "r"(addr));
-            bf[j * 2][0] = v[0];
-            bf[j * 2][1] = v[1];
-            bf[j * 2 + 1][0] = v[2];
-            bf[j * 2 + 1][1] = v[3];
+            bf[ki][jj * 2][0] = v[0];
+            bf[ki][jj * 2][1] = v[1];
+            bf[ki][jj * 2 + 1][0] = v[2];
+            bf[ki][jj * 2 + 1][1] = v[3];
           }
+        }
+        for (int j = 0; j < gn; ++j) {
+          const int64_t hi_j = min(hi, vis[j]);  // the row's own visible pools
+          if (t0 >= hi_j) continue;              // uniform across the warp
+          const float* wr = w + int64_t(g0 + j) * heads;
+          float weight[2][2];
 #pragma unroll
           for (int i = 0; i < 2; ++i)
 #pragma unroll
-            for (int j = 0; j < 4; ++j)
-              asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
-                           "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
-                           : "+f"(acc[i][j][0]), "+f"(acc[i][j][1]), "+f"(acc[i][j][2]), "+f"(acc[i][j][3])
-                           : "r"(af[i][0]), "r"(af[i][1]), "r"(af[i][2]), "r"(af[i][3]), "r"(bf[j][0]),
-                             "r"(bf[j][1]));
-        }
-        // The fragments hold heads h, h+8, h+16, h+24 in each lane: offsets
-        // 16 and 8 fold in registers, then 4, 2, 1 between four-lane groups.
+            for (int h = 0; h < 2; ++h) weight[i][h] = wr[i * 16 + h * 8 + lane / 4];
+          float acc[2][4][4];
 #pragma unroll
-        for (int j = 0; j < 4; ++j)
+          for (int i = 0; i < 2; ++i)
 #pragma unroll
-          for (int v = 0; v < 2; ++v) {
-            const int e = gwarp * 32 + j * 8 + (lane % 4) * 2 + v;  // the pool's place in the tile
-            const int64_t pool = g0 + e;
-            const float ks = bks[e];
-            float c[2][2];
+            for (int jj = 0; jj < 4; ++jj) acc[i][jj][0] = acc[i][jj][1] = acc[i][jj][2] = acc[i][jj][3] = 0.f;
+#pragma unroll
+          for (int ki = 0; ki < 4; ++ki) {
+            uint32_t af[2][4];
+#pragma unroll
+            for (int i = 0; i < 2; ++i) {
+              const unsigned addr = static_cast<unsigned>(__cvta_generic_to_shared(
+                  a + (j * 32 + i * 16 + lane % 16) * S + ki * 32 + (lane / 16) * 16));
+              asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+                           : "=r"(af[i][0]), "=r"(af[i][1]), "=r"(af[i][2]), "=r"(af[i][3])
+                           : "r"(addr));
+            }
 #pragma unroll
             for (int i = 0; i < 2; ++i)
 #pragma unroll
-              for (int h = 0; h < 2; ++h) {
-                float d = acc[i][j][h * 2 + v];
-                if (kRelu) d = fmaxf(d, 0.0f);
-                c[i][h] = __fmul_rn(__fmul_rn(weight[i][h], ks), d);
-              }
-            float sum = __fadd_rn(__fadd_rn(c[0][0], c[1][0]), __fadd_rn(c[0][1], c[1][1]));
-#pragma unroll
-            for (int off = 16; off >= 4; off >>= 1) sum = __fadd_rn(sum, __shfl_xor_sync(0xffffffffu, sum, off));
-            if (lane < 4 && pool < hi) {
-              // ~sortable reverses the ascending float order: the smallest
-              // composite key is the HIGHEST logit (ties -> the lower pool).
-              const uint64_t key = (uint64_t(~sortable_f32_dev(sum)) << kIdxBits) | uint64_t(pool);
-              krow[pool] = key;
-              atomicAdd(&hist[select_digit(key, kSelectTopShift, kSelectRadixBits)], 1);
-            }
+              for (int jj = 0; jj < 4; ++jj)
+                asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
+                             "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                             : "+f"(acc[i][jj][0]), "+f"(acc[i][jj][1]), "+f"(acc[i][jj][2]), "+f"(acc[i][jj][3])
+                             : "r"(af[i][0]), "r"(af[i][1]), "r"(af[i][2]), "r"(af[i][3]), "r"(bf[ki][jj][0]),
+                               "r"(bf[ki][jj][1]));
           }
+          // The fragments hold heads h, h+8, h+16, h+24 in each lane: offsets
+          // 16 and 8 fold in registers, then 4, 2, 1 between four-lane groups.
+          uint64_t* krow = keys_ws + int64_t(g0 + j) * keys_stride;
+          int32_t* hrow = hist + j * kSelectHistBins;
+#pragma unroll
+          for (int jj = 0; jj < 4; ++jj)
+#pragma unroll
+            for (int v = 0; v < 2; ++v) {
+              const int e = gwarp * 32 + jj * 8 + (lane % 4) * 2 + v;  // the pool's place in the tile
+              const int64_t pool = t0 + e;
+              const float ks = bks[e];
+              float c[2][2];
+#pragma unroll
+              for (int i = 0; i < 2; ++i)
+#pragma unroll
+                for (int h = 0; h < 2; ++h) {
+                  float d = acc[i][jj][h * 2 + v];
+                  if (kRelu) d = fmaxf(d, 0.0f);
+                  c[i][h] = __fmul_rn(__fmul_rn(weight[i][h], ks), d);
+                }
+              float sum = __fadd_rn(__fadd_rn(c[0][0], c[1][0]), __fadd_rn(c[0][1], c[1][1]));
+#pragma unroll
+              for (int off = 16; off >= 4; off >>= 1) sum = __fadd_rn(sum, __shfl_xor_sync(0xffffffffu, sum, off));
+              if (lane < 4 && pool < hi_j) {
+                // ~sortable reverses the ascending float order: the smallest
+                // composite key is the HIGHEST logit (ties -> the lower pool).
+                const uint64_t key = (uint64_t(~sortable_f32_dev(sum)) << kIdxBits) | uint64_t(pool);
+                krow[pool] = key;
+                atomicAdd(&hrow[select_digit(key, kSelectTopShift, kSelectRadixBits)], 1);
+              }
+            }
+        }
         __syncthreads();  // the tiles are overwritten next iteration
       }
     } else {
-      // The row's q as f16 [heads][128] (two codes per conversion).
-      for (int c = threadIdx.x; c < heads * 64; c += blockDim.x)
+      // The rows' q as f16 [gn][heads][128] (two codes per conversion).
+      for (int c = threadIdx.x; c < gn * heads * 64; c += blockDim.x)
         q16[c] = e4m3x2_to_f16x2(
-            *reinterpret_cast<const uint16_t*>(q_fp8 + int64_t(r) * heads * 128 + int64_t(c) * 2));
+            *reinterpret_cast<const uint16_t*>(q_fp8 + int64_t(g0) * heads * 128 + int64_t(c) * 2));
       __syncthreads();
-      const int32_t* bt = block_tables + int64_t(req_ids[r]) * blocks_per_request;
-      const float* wr = w + int64_t(r) * heads;
       uint32_t* kt = reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(krow_s) +
                                                  size_t(warp) * (kMmaSelTileBytes + kMmaSelTile * sizeof(float)));
       float* kscale = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(kt) + kMmaSelTileBytes);
@@ -1422,47 +1480,55 @@ __global__ void select_decode_kernel(
           }
         }
         __syncwarp();
-        float s_lo = 0.f, s_hi = 0.f;  // entries p + mr and p + mr + 8: the weighted head sum so far
-        // (TRIED 2026-11-15: the head tiles' chains four side by side, sharing
-        // the key fragments. The same time at 32 and 64 heads: the tile's
-        // staging above is the larger half of a 32-head tile, not the mmas.)
+        for (int j = 0; j < gn; ++j) {
+          const int64_t whi_j = min(whi, vis[j]);  // the row's own visible pools
+          if (p >= whi_j) continue;                // uniform across the warp
+          const float* wr = w + int64_t(g0 + j) * heads;
+          const uint32_t* qj = q16 + int64_t(j) * heads * 64;
+          float s_lo = 0.f, s_hi = 0.f;  // entries p + mr and p + mr + 8: the weighted head sum so far
+          // (TRIED 2026-11-15: the head tiles' chains four side by side, sharing
+          // the key fragments. The same time at 32 and 64 heads: the tile's
+          // staging above is the larger half of a 32-head tile, not the mmas.)
 #pragma unroll 1
-        for (int ht = 0; ht < heads / 8; ++ht) {
-          float c[4] = {0.f, 0.f, 0.f, 0.f};
-          const uint32_t* qh = q16 + (ht * 8 + mr) * 64;  // head ht * 8 + mr: 64 uint32 of f16 pairs
+          for (int ht = 0; ht < heads / 8; ++ht) {
+            float c[4] = {0.f, 0.f, 0.f, 0.f};
+            const uint32_t* qh = qj + (ht * 8 + mr) * 64;  // head ht * 8 + mr: 64 uint32 of f16 pairs
 #pragma unroll
-          for (int ks = 0; ks < 8; ++ks) {
-            const int k0 = ks * 8 + mt;  // the pair (2t, 2t + 1) of this 16-k step
-            mma_f16_16816(c, kt[mr * 64 + k0], kt[(mr + 8) * 64 + k0], kt[mr * 64 + k0 + 4],
-                          kt[(mr + 8) * 64 + k0 + 4], qh[k0], qh[k0 + 4]);
+            for (int ks = 0; ks < 8; ++ks) {
+              const int k0 = ks * 8 + mt;  // the pair (2t, 2t + 1) of this 16-k step
+              mma_f16_16816(c, kt[mr * 64 + k0], kt[(mr + 8) * 64 + k0], kt[mr * 64 + k0 + 4],
+                            kt[(mr + 8) * 64 + k0 + 4], qh[k0], qh[k0 + 4]);
+            }
+            if (kRelu) {
+              c[0] = fmaxf(c[0], 0.f);
+              c[1] = fmaxf(c[1], 0.f);
+              c[2] = fmaxf(c[2], 0.f);
+              c[3] = fmaxf(c[3], 0.f);
+            }
+            const float w0 = wr[ht * 8 + 2 * mt], w1 = wr[ht * 8 + 2 * mt + 1];
+            s_lo = __fadd_rn(s_lo, __fmul_rn(w0, c[0]));
+            s_lo = __fadd_rn(s_lo, __fmul_rn(w1, c[1]));
+            s_hi = __fadd_rn(s_hi, __fmul_rn(w0, c[2]));
+            s_hi = __fadd_rn(s_hi, __fmul_rn(w1, c[3]));
           }
-          if (kRelu) {
-            c[0] = fmaxf(c[0], 0.f);
-            c[1] = fmaxf(c[1], 0.f);
-            c[2] = fmaxf(c[2], 0.f);
-            c[3] = fmaxf(c[3], 0.f);
-          }
-          const float w0 = wr[ht * 8 + 2 * mt], w1 = wr[ht * 8 + 2 * mt + 1];
-          s_lo = __fadd_rn(s_lo, __fmul_rn(w0, c[0]));
-          s_lo = __fadd_rn(s_lo, __fmul_rn(w1, c[1]));
-          s_hi = __fadd_rn(s_hi, __fmul_rn(w0, c[2]));
-          s_hi = __fadd_rn(s_hi, __fmul_rn(w1, c[3]));
-        }
-        // The quad's four lanes hold the entry's eight column pairs: pairwise.
-        s_lo = __fadd_rn(s_lo, __shfl_xor_sync(0xffffffffu, s_lo, 1));
-        s_lo = __fadd_rn(s_lo, __shfl_xor_sync(0xffffffffu, s_lo, 2));
-        s_hi = __fadd_rn(s_hi, __shfl_xor_sync(0xffffffffu, s_hi, 1));
-        s_hi = __fadd_rn(s_hi, __shfl_xor_sync(0xffffffffu, s_hi, 2));
-        if (mt == 0) {
+          // The quad's four lanes hold the entry's eight column pairs: pairwise.
+          s_lo = __fadd_rn(s_lo, __shfl_xor_sync(0xffffffffu, s_lo, 1));
+          s_lo = __fadd_rn(s_lo, __shfl_xor_sync(0xffffffffu, s_lo, 2));
+          s_hi = __fadd_rn(s_hi, __shfl_xor_sync(0xffffffffu, s_hi, 1));
+          s_hi = __fadd_rn(s_hi, __shfl_xor_sync(0xffffffffu, s_hi, 2));
+          if (mt == 0) {
+            uint64_t* krow = keys_ws + int64_t(g0 + j) * keys_stride;
+            int32_t* hrow = hist + j * kSelectHistBins;
 #pragma unroll
-          for (int half = 0; half < 2; ++half) {
-            const int e = mr + half * 8;
-            const int64_t pool = p + e;
-            if (pool < whi) {
-              const float total = __fmul_rn(half == 0 ? s_lo : s_hi, kscale[e]);
-              const uint64_t key = (uint64_t(~sortable_f32_dev(total)) << kIdxBits) | uint64_t(pool);
-              krow[pool] = key;
-              atomicAdd(&hist[select_digit(key, kSelectTopShift, kSelectRadixBits)], 1);
+            for (int half = 0; half < 2; ++half) {
+              const int e = mr + half * 8;
+              const int64_t pool = p + e;
+              if (pool < whi_j) {
+                const float total = __fmul_rn(half == 0 ? s_lo : s_hi, kscale[e]);
+                const uint64_t key = (uint64_t(~sortable_f32_dev(total)) << kIdxBits) | uint64_t(pool);
+                krow[pool] = key;
+                atomicAdd(&hrow[select_digit(key, kSelectTopShift, kSelectRadixBits)], 1);
+              }
             }
           }
         }
@@ -1470,9 +1536,8 @@ __global__ void select_decode_kernel(
       }
     }
     __syncthreads();
-    int32_t* ghist = hist_ws + int64_t(r) * kSelectHistBins;
-    for (int i = threadIdx.x; i < kSelectHistBins; i += blockDim.x)
-      if (hist[i] != 0) atomicAdd(&ghist[i], hist[i]);
+    for (int i = threadIdx.x; i < gn * kSelectHistBins; i += blockDim.x)
+      if (hist[i] != 0) atomicAdd(&hist_ws[int64_t(g0) * kSelectHistBins + i], hist[i]);
     __syncthreads();
     }
   }
@@ -4228,20 +4293,22 @@ void dsa_select_decode(const void* q_fp8, const float* w_folded,
       reinterpret_cast<char*>(hist_ws) + select_hist_bytes(kSelectLayoutRows));
   const int64_t bitmap_stride = select_bitmap_words(ws_max_pools);
   // Row groups of at most kSelectMaxRows (2026-09-13, the decode batch's
-  // cap lifted to 16). A block scores a stripe of ONE row's own context —
-  // the rows share nothing — so a group is the same work at any grouping;
-  // the groups run in stream order through the same counters (each launch's
-  // last block resets them). Up to eight rows, every single-stream shape,
-  // is one launch.
+  // cap lifted to 16). A row's keys are its own whatever rows share its
+  // launch (the rows of one request share the index's bytes, not their
+  // scores), so a group is the same result at any grouping; the groups run
+  // in stream order through the same counters (each launch's last block
+  // resets them). Up to eight rows, every single-stream shape, is one
+  // launch.
   const int max_rows = kSelectMaxRows;
   for (int g = 0; g < rows; g += max_rows) {
     const int grows = std::min(max_rows, rows - g);
-    // One row's q and the block's key tiles, whatever the rows of the
-    // launch; every row's weights.
+    // The q of the rows a block scores together and its key tiles, whatever
+    // the rows of the launch; every row's weights; the histograms' and
+    // phase 2's bytes.
     const bool wide = heads == 64;
-    const size_t smem = (wide ? select_mma_q_bytes(heads) + kMmaSelKeyBytes : kE4QBytes + kE4KeyBytes) +
-                        size_t(grows) * heads * 4 + size_t(kSelectHistBins) * 4 +
-                        size_t(kSelectStopCandidates) * 8 + (select_k + 1) * 4;
+    const size_t smem = size_t(select_share_rows(wide)) * (wide ? select_mma_q_bytes(heads) : kE4QBytes) +
+                        (wide ? kMmaSelKeyBytes : kE4KeyBytes) + size_t(grows) * heads * 4 +
+                        select_tail_bytes(wide, select_k);
     if (smem > size_t(g_select_smem_cap)) DGPP_CUDA_OK(cudaErrorInvalidValue);
     // The grid is (stripes, rows): a row's stripes are the grid's x.
     const int want_blocks = std::max(grid_blocks > 0 ? grid_blocks : kSelectDefaultGrid, grows);

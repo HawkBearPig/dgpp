@@ -669,8 +669,9 @@ build. The suites cover:
   multi-row, 100k-pool long-context stripes, graph capture/replay with
   changed position: each score within the fp32 sums' rounding of its exact
   logit and the selection bitwise the top of the kernel's own keys; the keys
-  bitwise the prefill select's, and the same at another grid and with other
-  rows beside them), split-KV absorbed attention against
+  bitwise the prefill select's, and the same at another grid, with other
+  rows beside them and whichever of those rows share its request and so its
+  staged index tiles), split-KV absorbed attention against
   the host oracle at TP1/TP4 with empty-row and head-group coverage (the
   listed kernel's rows bitwise the same at every row count from one to
   eight, where an odd count pairs a row's splits in a block; a prefill
