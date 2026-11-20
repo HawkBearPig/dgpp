@@ -58,6 +58,79 @@ __global__ void project(const uint16_t* x, int stride, const float* a, float* z,
         __float2bfloat16_rn(static_cast<float>(byte));
   }
 }
+// project for a prefill tile's rows. There a block was one value: its 128
+// threads read the row of x and the row of A from global memory, so a
+// boundary of 1,024 rows at rank 50 was 51,200 blocks, each row of x read 50
+// times and all of A read once a row, 0.4 to 0.5 ms a launch whatever the
+// input width. Here a block is kProjectRows rows of x, staged in shared
+// memory once, against every factor: its kProjectLanes lanes of 128 threads
+// take the factors in turn, a thread loads its strided terms of A once a
+// factor and runs them down the block's rows. A value is project's own
+// arithmetic — thread t's chain over inputs t, t + 128, ... in order, then
+// the same tree over the 128 partials — so it is bit for bit the same.
+constexpr int kProjectStripes = 128;  // project's block: the chains' stride and the tree's leaves
+constexpr int kProjectLanes = 4;
+constexpr int kProjectRows = 4;
+constexpr size_t project_tile_smem(int inputs) {
+  return static_cast<size_t>(kProjectRows) * inputs * sizeof(uint16_t) +
+         static_cast<size_t>(kProjectLanes) * kProjectRows * kProjectStripes * sizeof(float);
+}
+__global__ void project_tile(const uint16_t* x, int stride, const float* a, float* z, int rows, int inputs,
+                             int rank) {
+  dgpp_pdl_wait();
+  extern __shared__ __align__(16) uint8_t project_smem[];
+  auto* xs = reinterpret_cast<__nv_bfloat16*>(project_smem);  // [kProjectRows][inputs]
+  float* ps = reinterpret_cast<float*>(project_smem + static_cast<size_t>(kProjectRows) * inputs * sizeof(uint16_t));
+  const int row0 = blockIdx.x * kProjectRows;
+  const int nr = min(kProjectRows, rows - row0);
+  for (int i = threadIdx.x; i < nr * inputs; i += blockDim.x) {
+    const int r = i / inputs, c = i - r * inputs;
+    xs[i] = reinterpret_cast<const __nv_bfloat16*>(x)[static_cast<size_t>(row0 + r) * stride + c];
+  }
+  __syncthreads();
+  const int t = threadIdx.x % kProjectStripes, lane = threadIdx.x / kProjectStripes;
+  float* mine = ps + static_cast<size_t>(lane) * kProjectRows * kProjectStripes;  // [kProjectRows][kProjectStripes]
+  const int rounds = (rank + kProjectLanes - 1) / kProjectLanes;
+  for (int round = 0; round < rounds; ++round) {
+    const int factor = round * kProjectLanes + lane;  // past the rank: the lane idles through the round's barriers
+    float sum[kProjectRows];
+#pragma unroll
+    for (int r = 0; r < kProjectRows; ++r) sum[r] = 0;
+    if (factor < rank) {
+      const float* ar = a + static_cast<size_t>(factor) * inputs;
+      for (int c = t; c < inputs; c += kProjectStripes * kLoadBatch) {
+        float av[kLoadBatch];
+#pragma unroll
+        for (int i = 0; i < kLoadBatch; ++i) {
+          const int ci = c + i * kProjectStripes;
+          av[i] = ci < inputs ? ar[ci] : 0.f;
+        }
+#pragma unroll
+        for (int i = 0; i < kLoadBatch; ++i) {
+          const int ci = c + i * kProjectStripes;
+          if (ci >= inputs) break;
+#pragma unroll
+          for (int r = 0; r < kProjectRows; ++r)
+            if (r < nr) sum[r] = __fadd_rn(sum[r], __fmul_rn(__bfloat162float(xs[r * inputs + ci]), av[i]));
+        }
+      }
+    }
+#pragma unroll
+    for (int r = 0; r < kProjectRows; ++r) mine[r * kProjectStripes + t] = sum[r];
+    __syncthreads();
+    for (int offset = kProjectStripes / 2; offset; offset /= 2) {
+      if (t < offset) {
+#pragma unroll
+        for (int r = 0; r < kProjectRows; ++r)
+          mine[r * kProjectStripes + t] =
+              __fadd_rn(mine[r * kProjectStripes + t], mine[r * kProjectStripes + t + offset]);
+      }
+      __syncthreads();
+    }
+    if (t == 0 && factor < rank)
+      for (int r = 0; r < nr; ++r) z[static_cast<size_t>(row0 + r) * rank + factor] = mine[r * kProjectStripes];
+  }
+}
 template <bool Add>
 __global__ void finish(const float* z, const float* b, uint16_t* output, float* delta, int rows,
                        int outputs, int rank) {
@@ -244,7 +317,16 @@ __global__ void sum_digits(const __nv_bfloat16* digits, float* values, size_t co
 }  // namespace
 void low_rank_project(const uint16_t* x, int stride, const float* a, float* z, int rows, int inputs,
                       int rank, cudaStream_t stream) {
-  project<<<dim3(rank, rows), 128, 0, stream>>>(x, stride, a, z, inputs, rank, nullptr, 0, 0, 0, 0);
+  // A prefill tile's rows take the tiled kernel while a block's rows of x fit
+  // the default shared memory; a decode step's few rows keep a block a value.
+  constexpr int kTiledFromRows = 16;
+  constexpr size_t kDefaultSmemBytes = 48 * 1024;
+  if (rows >= kTiledFromRows && project_tile_smem(inputs) <= kDefaultSmemBytes) {
+    project_tile<<<(rows + kProjectRows - 1) / kProjectRows, kProjectStripes * kProjectLanes,
+                   project_tile_smem(inputs), stream>>>(x, stride, a, z, rows, inputs, rank);
+  } else {
+    project<<<dim3(rank, rows), 128, 0, stream>>>(x, stride, a, z, inputs, rank, nullptr, 0, 0, 0, 0);
+  }
   DGPP_CUDA_OK(cudaGetLastError());
 }
 void low_rank_project_digits(const uint16_t* x, int stride, const float* a, float* z, int rows,

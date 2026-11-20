@@ -45,7 +45,13 @@ void kernel_check(int world) {
                           // A prefill tile's rows: low_rank_add's tiled kernel (tiles of 64 and 16 rows, a last
                           // partial tile, a last partial block of columns) and a rank too wide for a tile.
                           {64, 50, 6144, 33},  {150, 50, 6100, 33},  {1030, 50, 6144, 16}, {40, 80, 6144, 16},
-                          {33, 96, 1000, 16}};
+                          {33, 96, 1000, 16},
+                          // The same rows through low_rank_project's tiled kernel, which the digit-writing
+                          // projection (a block a value) is held to below: the two production widths, a last
+                          // block of two rows, inputs that leave the chains unequal or some of them empty, a
+                          // rank below the block's lanes, and inputs too wide for a tile.
+                          {1024, 50, 64, 4096}, {130, 50, 64, 512},   {17, 3, 64, 500},     {16, 5, 64, 100},
+                          {18, 50, 64, 5000}};
   uint32_t seed = 0x9e3779b9u;
   const auto rnd = [&] { return seed = seed * 1664525u + 1013904223u; };
   const auto unit = [&] { return static_cast<float>(rnd() >> 8) / 8388608.0f - 1.0f; };
@@ -247,6 +253,44 @@ void transport_check(int world) {
       net::kBusMaxGraphGens);
 }
 
+// The eager fold at the sizes of its two machines: latency collectives up to
+// two slots (one slot, and two with a tail), the bulk machine past them (a
+// prefill boundary's rows) at less than one stripe, where not every rank owns
+// one, and at several stripes with a tail. The FP32 rank-order sum, bit for
+// bit, at each.
+void transport_sizes_check(int world) {
+  if (world == 1) return;
+  constexpr size_t kMax = 70001;
+  world_run(world, 29984, [&](int r, net::CollectiveBus& bus, auto sync) {
+    cudaStream_t stream;
+    DGPP_CUDA_OK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    float* values = nullptr;
+    DGPP_CUDA_OK(cudaMalloc(&values, kMax * sizeof(float)));
+    auto fold = adapters::bus_sum_stream(bus, r, world, kMax, 60000);
+    const auto value = [](int rank, size_t i) {
+      return std::ldexp(static_cast<float>(static_cast<int>((i * 29 + rank * 5) % 131) - 65) / 41.0f,
+                        static_cast<int>(i % 37) - 18);
+    };
+    const size_t slot = bus_latency_slot_elems(bus) / (static_cast<size_t>(world) * 4);  // values a latency slot
+    sync();
+    for (const size_t count : {slot / 2, 2 * slot - 3, 2 * slot + 1, size_t{4099}, kMax}) {
+      std::vector<float> input(count), expected(count), actual(count);
+      for (size_t i = 0; i < count; ++i) {
+        input[i] = value(r, i);
+        expected[i] = value(0, i);
+        for (int p = 1; p < world; ++p) expected[i] += value(p, i);
+      }
+      DGPP_CUDA_OK(cudaMemcpyAsync(values, input.data(), count * sizeof(float), cudaMemcpyHostToDevice, stream));
+      fold(values, count, stream, false);
+      DGPP_CUDA_OK(cudaMemcpyAsync(actual.data(), values, count * sizeof(float), cudaMemcpyDeviceToHost, stream));
+      DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+      exact(actual, expected, "the eager adapter fold loses FP32 values at one of its sizes");
+    }
+    cudaFree(values);
+    cudaStreamDestroy(stream);
+  });
+}
+
 adapters::Manifest factors(const GlmDsaTextConfig& cfg, int world, bool zero) {
   adapters::Manifest manifest;
   manifest.world = world;
@@ -402,6 +446,7 @@ int main(int argc, char** argv) {
     draft_head_configure(DraftHeadSettings{2});
     kernel_check(world);
     transport_check(world);
+    transport_sizes_check(world);
     model_check(cfg, argv[1], world);
     std::printf(
         "native adapter %s world %d: boundary kernels, FP32 fold, C8 MTP graphs, FP8 KV, BF12, vocab embeddings and "
