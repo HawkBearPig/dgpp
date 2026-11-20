@@ -5,6 +5,53 @@ project procedures and design guidance live in `docs/`.
 
 ## Unreleased
 
+- **A prefill boundary's adapter rows fold in one bulk collective and
+  project a block of rows at a time**: two costs of a runtime adapter on a
+  long prompt, both bit for bit what they replace.
+  The fold. A runtime adapter's correction needs the ranks' FP32 rank-space
+  rows summed before B is applied, and they travel as byte digits through the
+  bf16 all-reduce (`adapters/bus_sum.hpp`). The eager walk sent them as
+  latency collectives, one slot at a time, each a host-driven collective of
+  its own. A decode step's rows are a fraction of a slot. A prefill
+  boundary's are not: 1,024 rows at rank 50 are 819,200 digits, six
+  294,912-byte slots, and the six collectives took 1.9 ms a boundary, as long
+  as the boundary's own 12.6 MB partial takes through the bulk machine. On
+  the full GLM-5.3 with a rank-50 adapter that was 8.3 % of a cold prefill's
+  kernel time. Past two latency slots the digits now take the bulk machine in
+  one collective, the rule a boundary's partial follows. Every element is one
+  rank's digit plus zeros, so the sum is the same bits on either machine, and
+  up to two slots (a decode step, a short prompt, a mixed walk's rows)
+  nothing changes. A bulk collective of fewer stripes than ranks folds
+  correctly, which the comment that kept these rows off it had doubted.
+  The projection. `low_rank_project` ran a block a value: 128 threads read
+  the row of x and the row of A from global memory, so a boundary of 1,024
+  rows at rank 50 was 51,200 blocks, each row of x read 50 times and all of A
+  read once a row. For 16 rows and more, while a block's rows of x fit the
+  default shared memory, a block is now four rows of x staged once against
+  every factor (`project_tile`): four lanes of 128 threads take the factors
+  in turn and run each factor's terms down the block's rows. A value is the
+  same chain over the same inputs in the same order and the same tree over
+  the 128 partials. A decode step's few rows keep a block a value.
+  `runtime_adapter_native_test`: `transport_sizes_check` runs the eager fold
+  at five sizes on worlds of two and four (half a latency slot, two slots
+  less a value, two slots plus a value where not every rank owns a stripe,
+  4,099 values and 70,001), each the FP32 rank-order sum bit for bit, and
+  `kernel_check` holds the tiled projection to the digit-writing one at the
+  two production widths, a last block of two rows, inputs that leave the
+  chains unequal or empty, a rank below the block's lanes and inputs too wide
+  for a tile.
+  Four nodes, GLM-5.3 Mixed346 with the rank-50 adapter on production's
+  recipe, one request, against master before and after in the same window,
+  cold prefill in seconds, master / the fold / the fold and the projection:
+  17.18, 17.32, 17.28 / 16.14 / 15.93 at 7.7K tokens; 54.60, 54.77, 54.71 /
+  51.23 / 50.25 at 24K; 160.88 / 150.86 / 150.89 at 65K; 17.51, 17.53, 17.55
+  / 16.29 / 16.10 and 23.69, 23.77, 23.65 / 22.05 / 21.81 on two repository
+  prompts. Together 6.2 to 8.1 % off the nearest baseline, of which the
+  projection is 1.1 to 1.9 % up to 24K and nothing at 65K. Decode level (78.5
+  to 79.0 ms a pass at 7.7K and 24K, 81.1 to 81.5 at 65K). Chat transcripts
+  identical on every prompt. Raw completions with the prefill controller
+  pinned, four prompts of 7.7K to 24K tokens, 300 tokens each with every
+  token's logprobs: equal to master's at every token, bit for bit.
 - **A request's head rows and mask rows follow the request, not the last
   batch** (issue #182): two defects of concurrent requests on engines with
   compacted batches, both from state a batch left behind for the request that
