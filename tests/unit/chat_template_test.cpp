@@ -149,3 +149,41 @@ DGPP_TEST(chat_template_integer_arithmetic_overflow_refuses) {
   rejects("\n{{ a - b }}", numbers(kMax, -1), "integer subtraction overflow");
   rejects("\n{{ a - b }}", numbers(0, kMin), "integer subtraction overflow");
 }
+
+// transformers' {% generation %} block marks the span an assistant turn
+// generates. A render takes its body as written. The expected strings and
+// refusals are the reference environment's (a call block): the body reads
+// the enclosing scope, its own assignments end with it, a namespace
+// attribute stays set, and a break may not leave it.
+DGPP_TEST(chat_template_generation_block_renders_its_body_in_its_own_scope) {
+  equal(render("{% set x = 1 %}{% generation %}{% set x = 2 %}{{ x }}{% endgeneration %}{{ x }}"), "21");
+  equal(render("{% generation %}{% set y = 5 %}{% endgeneration %}{{ y is defined }}"), "False");
+  equal(render("{% set ns = namespace(v=1) %}{% generation %}{% set ns.v = 2 %}{% endgeneration %}{{ ns.v }}"), "2");
+  const Value::Members turns = {
+      {"ms", Value::list_value({Value::string_value("a"), Value::string_value("b")})}};
+  equal(render("{% for m in ms %}[{% generation %}{{ m }}{{ loop.index0 }}{% endgeneration %}]{% endfor %}", turns),
+        "[a0][b1]");
+  equal(render("a\n  {%- generation %}\n  b\n  {%- endgeneration %}\nc"), "a  bc");
+  equal(render("{% generation %}a{% generation %}b{% endgeneration %}c{% endgeneration %}"), "abc");
+  // A break that ends a loop of the block's own is the loop's.
+  equal(render("{% generation %}{% for m in ms %}{% if m == 'b' %}{% break %}{% endif %}{{ m }}{% endfor %}"
+               "{% endgeneration %}!",
+               turns),
+        "a!");
+  rejects("\n{% for m in ms %}{% generation %}{% if m %}{% break %}{% endif %}{% endgeneration %}{% endfor %}", turns,
+          "generation: 'break' outside loop");
+  rejects("\n{% generation now %}x{% endgeneration %}", {}, "generation: the tag takes no arguments");
+  rejects("\n{% generation %}x", {}, "missing 'endgeneration'");
+  rejects("\nx{% endgeneration %}", {}, "unsupported statement 'endgeneration'");
+}
+
+// The knob gate asks which globals a template can read. A name the block
+// sets is the block's alone, so a read of it after the block is the global.
+DGPP_TEST(chat_template_generation_block_scopes_the_global_reads) {
+  const auto inside = ChatTemplate::compile("{% generation %}{{ inner }}{% endgeneration %}");
+  if (!inside.reads("inner")) throw std::runtime_error("a read inside the block is a read of the global");
+  const auto after = ChatTemplate::compile("{% generation %}{% set flag = 1 %}{{ flag }}{% endgeneration %}{{ flag }}");
+  if (!after.reads("flag")) throw std::runtime_error("the block's own name must not hide the global after it");
+  const auto local = ChatTemplate::compile("{% generation %}{% set flag = 1 %}{{ flag }}{% endgeneration %}");
+  if (local.reads("flag")) throw std::runtime_error("a name the block set and read is not the global");
+}

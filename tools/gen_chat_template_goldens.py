@@ -8,6 +8,9 @@ verified 2026-08-31):
   * trim_blocks=True, lstrip_blocks=True
   * extensions=[jinja2.ext.loopcontrols]  (the template uses {% break %};
     plain jinja2 rejects it)
+  * the {% generation %} block of transformers' AssistantTracker, which a
+    render passes through (the Qwen3.8 template wraps the assistant turn
+    in it)
   * the tojson OVERRIDE: json.dumps(ensure_ascii=..., indent=None,
     separators=None, sort_keys=False) — jinja's built-in tojson both
     escapes HTML (<, >, &, ') and rejects the ensure_ascii kwarg, so the
@@ -73,11 +76,27 @@ THINK_CLOSE = "</" + "think>"
 
 def env():
     import jinja2
+    import jinja2.ext
     from jinja2.sandbox import ImmutableSandboxedEnvironment
+
+    class Generation(jinja2.ext.Extension):
+        # transformers' AssistantTracker: {% generation %} marks the span an
+        # assistant turn generates. It parses as a call block and a render
+        # returns the body unchanged.
+        tags = {"generation"}
+
+        def parse(self, parser):
+            lineno = next(parser.stream).lineno
+            body = parser.parse_statements(["name:endgeneration"], drop_needle=True)
+            call = self.call_method("_generation_support")
+            return jinja2.nodes.CallBlock(call, [], [], body).set_lineno(lineno)
+
+        def _generation_support(self, caller):
+            return caller()
 
     e = ImmutableSandboxedEnvironment(
         trim_blocks=True, lstrip_blocks=True,
-        extensions=["jinja2.ext.loopcontrols"],
+        extensions=["jinja2.ext.loopcontrols", Generation],
     )
     # transformers' tojson override, character for character.
     def tojson(x, ensure_ascii=False, indent=None, separators=None,

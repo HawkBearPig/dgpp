@@ -5,6 +5,25 @@ project procedures and design guidance live in `docs/`.
 
 ## Unreleased
 
+- **The chat template interpreter reads transformers' `{% generation %}`
+  block**: the `Qwen/Qwen3.8-Flash-Next-FP8` repository's template now wraps
+  the assistant turn in `{% generation %}` ... `{% endgeneration %}`,
+  transformers' marker for the span an assistant turn generates (the source
+  of its assistant-token mask). The interpreter refused the template at load
+  with `unsupported statement 'generation'`, so a checkpoint downloaded since
+  that change did not get past the template. The block now parses and renders
+  as the reference does. A render takes the body as written. The reference
+  parses the block as a call block, so the body reads the enclosing scope,
+  its own assignments end with it, a namespace attribute stays set, and a
+  break may not leave it. The new template renders what the previous one
+  did: regenerating `tests/data/qwen_chat_template_goldens.jsonl` against it
+  changes the header's template hash and none of the 20 cases, renders and
+  token ids alike. The reference environment of
+  `tools/gen_chat_template_goldens.py` carries the same block and matches
+  transformers' own environment on every case.
+  `chat_template_generation_block_renders_its_body_in_its_own_scope` and
+  `chat_template_generation_block_scopes_the_global_reads` hold the
+  interpreter to the reference's strings and refusals.
 - **A prefill boundary's adapter rows fold in one bulk collective and
   project a block of rows at a time**: two costs of a runtime adapter on a
   long prompt, both bit for bit what they replace.

@@ -10,7 +10,9 @@
 // Supported statement forms: text and {{ output }} (with the full
 // whitespace-trim marker set), set (name or namespace-attribute target),
 // if/elif/else, for (single or (k, v) tuple targets, with loop meta and
-// {% break %}), and macro definitions. Macros resolve at RENDER time
+// {% break %}), macro definitions, and transformers' {% generation %}
+// block, which renders its body as written in a scope of its own (the
+// span an assistant turn generates). Macros resolve at RENDER time
 // (tool_to_json lives inside {% if tools %} — a falsy `tools` leaves it
 // undefined, exactly like Jinja), close over the root frame only, and
 // return their rendered body as a string.

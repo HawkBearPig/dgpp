@@ -69,7 +69,7 @@ struct MacroDef {
 using Frame = std::unordered_map<std::string, Value>;
 
 struct Stmt {
-  enum class Tag { Text, Output, Set, If, For, Macro, Break };
+  enum class Tag { Text, Output, Set, If, For, Macro, Break, Generation };
   Tag tag;
   size_t line = 1;
   std::string text;               // Text
@@ -79,7 +79,7 @@ struct Stmt {
   std::vector<std::string> names;  // For loop variables (1 or 2)
   ExprPtr filter;                 // For: the trailing `if <cond>` inline filter
   std::shared_ptr<MacroDef> macro;      // Macro definition
-  std::vector<StmtPtr> body;            // If-then / For / Macro body
+  std::vector<StmtPtr> body;            // If-then / For / Macro / Generation body
   std::vector<std::pair<ExprPtr, std::vector<StmtPtr>>> elifs;
   std::vector<StmtPtr> else_body;
 };
@@ -888,6 +888,23 @@ class StmtParser {
         s->line = t.line;
         out.push_back(std::move(s));
         ++pos_;
+      } else if (kw == "generation") {
+        // {% generation %} ... {% endgeneration %}: transformers' marker
+        // for the span an assistant turn generates (its assistant-token
+        // mask). A render takes the body as written. The reference parses
+        // it as a call block, so the body reads the enclosing scope, its
+        // own assignments end with it, and a break may not leave it.
+        if (rest.find_first_not_of(" \t") != std::string::npos)
+          fail(t.line, "generation: the tag takes no arguments");
+        auto s = std::make_unique<Stmt>();
+        s->tag = Stmt::Tag::Generation;
+        s->line = t.line;
+        ++pos_;
+        static const char* kGenerationTerm[] = {"endgeneration"};
+        std::string ended;
+        s->body = parse_statements(kGenerationTerm, 1, &ended);
+        if (breaks_out(s->body)) fail(t.line, "generation: 'break' outside loop");
+        out.push_back(std::move(s));
       } else {
         fail(t.line, "unsupported statement '" + kw + "'");
       }
@@ -897,6 +914,20 @@ class StmtParser {
  private:
   static ExprPtr parse_expr_str(std::string_view src, size_t line) {
     return ExprParser(src, line).parse();
+  }
+
+  // Whether a break in these statements would leave them: one outside any
+  // loop of theirs. A nested generation block was checked when it closed.
+  static bool breaks_out(const std::vector<StmtPtr>& stmts) {
+    for (const StmtPtr& s : stmts) {
+      if (s->tag == Stmt::Tag::Break) return true;
+      if (s->tag == Stmt::Tag::Set && breaks_out(s->body)) return true;
+      if (s->tag != Stmt::Tag::If) continue;
+      if (breaks_out(s->body) || breaks_out(s->else_body)) return true;
+      for (const auto& [cond, branch] : s->elifs)
+        if (breaks_out(branch)) return true;
+    }
+    return false;
   }
 
   StmtPtr parse_set(std::string rest, size_t line) {
@@ -2079,6 +2110,15 @@ struct Renderer {
           break;
         case Stmt::Tag::Break:
           return Flow::Break;
+        case Stmt::Tag::Generation: {
+          // The body in a frame of its own: it reads every enclosing name,
+          // and what it sets ends with the block (a namespace attribute is
+          // shared storage and stays set).
+          ctx_.stack.emplace_back();
+          exec(s->body, out);
+          ctx_.stack.pop_back();
+          break;
+        }
       }
     }
     return Flow::Next;
@@ -2161,6 +2201,10 @@ void collect_global_reads(const std::vector<StmtPtr>& body,
           for (const std::string& p : s->macro->params) inner.push_back(p);
           collect_global_reads(s->macro->body, std::move(inner), out);
         }
+        break;
+      case Stmt::Tag::Generation:
+        // The block's own bindings end with it (`bound` is this call's copy).
+        collect_global_reads(s->body, bound, out);
         break;
     }
   }
