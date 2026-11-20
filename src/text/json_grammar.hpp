@@ -434,6 +434,7 @@ class JsonMachine {
   // tokens need the digit arithmetic beyond the tables' lexical answer.
   bool bounds_live_here(bool value_start) const;
   bool extended_constraints_live() const;
+  bool unconstrained_value_string() const;
   // Whether a numeric token (JsonTables::numeric_ids) survives every
   // cursor's bounds — the prefix arithmetic where the cursors are plain,
   // a simulation where an enum target shares the position.
