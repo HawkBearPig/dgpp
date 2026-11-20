@@ -697,7 +697,9 @@ system, so every byte moved anyway. A plane must be a contiguous run at
 least a burst long.) For a call whose rows all belong to plain-greedy
 slots (no temperature, logprobs, penalties, bias or grammar — the engine
 writes a per-slot flag beside the sampling specs; the decode graph is fixed
-at capture, so the kernel reads the flag on the device), that pass gives
+at capture, so the kernel reads the flag on the device, and a row's slot is
+its entry of the walk's per-row request table, the one attention and state
+read, whatever the shape of the call), that pass gives
 every head row `A ± B`: `A` the centered six-bit dot, `B = 1.5 · Σ_g |s_g|
 Σ_{k∈g} |x_k|` (the scales are signed; `B` is inflated by 1e-3 for the
 fp32 rounding of both chains). Rows whose `A + B` falls under the best
@@ -721,8 +723,10 @@ Kernels: `kernels/packq_head.{hpp,cu}` (three launches per four-row chunk:
 prepare, bounds, candidates), the plane tile in `packq_gemm.cu`, the
 permute at load in the loader (the head is repacked every boot; no
 resident-image change). Gates: `packq_head_test` (full form bitwise the
-row layout, argmax + logit bitwise, the tile bitwise, the slice's scatter),
-the transcript gate. `DGPP_QWEN_HEAD_PLANES=off` keeps the row layout.
+row layout, argmax + logit bitwise, the tile bitwise, the slice's scatter,
+the slot each row reads in every launch shape), the transcript gate, and
+`qwen_engine_test`'s `argmax_head` case (every transcript of a mixed greedy
+and sampled workload equal with the flags on and off). `DGPP_QWEN_HEAD_PLANES=off` keeps the row layout.
 
 ### 6.7 The draft vocabulary slice (opt-in; `engine.draft_vocab`)
 

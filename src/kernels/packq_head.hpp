@@ -25,14 +25,18 @@ namespace dgpp {
 // bytes, cols a multiple of 128) into the plane layout, in place.
 void packq_planes_permute_int8(uint8_t* payload, int64_t rows, int64_t cols);
 
-// Which rows of a launch want only the argmax: row r belongs to slot
-// request_map[r / rows_per_request] (req0 when request_map is null), and
-// greedy[slot] != 0 says its logits may be the argmax-only form. A null
-// `greedy` means every row takes the full read.
+// Which rows of a launch want only the argmax: greedy[slot] != 0 says a
+// slot's logits may be the argmax-only form, and row r of the launch
+// belongs to slot row_slots[r]. The table is the walk's own per-row
+// request ids, the one its attention and state read, so a row's slot never
+// depends on the shape of the call: a scalar step, a batch over a slot
+// prefix or over a compacted map, a one-row-per-request chain. A negative
+// entry is a batch's padding row and takes the full read. A null
+// `row_slots` gives every row slot `req0`. A null `greedy` means every row
+// takes the full read.
 struct PackqHeadMode {
   const uint8_t* greedy = nullptr;
-  const int32_t* request_map = nullptr;
-  int rows_per_request = 1;
+  const int32_t* row_slots = nullptr;  // device [m]
   int req0 = 0;
 };
 

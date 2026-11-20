@@ -735,15 +735,16 @@ void QwenModel::lm_head_logits(const uint16_t* hidden, int rows, cudaStream_t st
       // The plane layout (kernels/packq_head.hpp): a decode call whose
       // rows all belong to greedy slots reads the argmax form; a prefill's
       // last row, an eager oracle (no flags) and sampled slots read the
-      // full form, bitwise the row layout's chain. The draft's call takes
-      // the vocabulary slice when one is configured (engine.draft_vocab):
-      // its rows scattered to their ids, every other id -inf.
+      // full form, bitwise the row layout's chain. A row's slot is the
+      // walk's own request id for that row, whatever the call's shape. The
+      // draft's call takes the vocabulary slice when one is configured
+      // (engine.draft_vocab): its rows scattered to their ids, every other
+      // id -inf.
       PackqHeadMode mode;
       if (!selected && rows <= max_decode_rows_) {
+        if (head_row_req_ == nullptr) throw std::logic_error("Qwen head: a decode-shaped call without its row table");
         mode.greedy = head_dump_site_ == 1 ? head_greedy_draft_ : head_greedy_verify_;
-        mode.request_map = graph_batch_map_source_ ? d_batch_map_ : nullptr;
-        mode.rows_per_request = graph_rows_per_request_ > 0 ? graph_rows_per_request_ : rows;
-        mode.req0 = head_req_;
+        mode.row_slots = head_row_req_;
       }
       PackqHeadScratch scratch{head_ab_, head_lo_, head_cand_, head_cand_count_};
       const bool slice = head_dump_site_ == 1 && globals_.draft_head_packed.packed != nullptr;
@@ -1507,7 +1508,7 @@ QwenModel::Outputs QwenModel::run_rows(const RowRun& run) {
   const bool last_row_only = !run.decode && !run.all_rows && run.num_spans == 0 && T > 1 &&
                              (globals_.lm_head_fp8.payload != nullptr || globals_.lm_head_packed.packed != nullptr) &&
                              !mma_envelope && !head_all_rows;
-  head_req_ = req;
+  head_row_req_ = d_req;
   const bool packed_logits = packed_prefill_logits(run);
   if (packed_logits) {
     // FP8 and packed heads preserve the full product's dispatch. BF16
@@ -1517,7 +1518,6 @@ QwenModel::Outputs QwenModel::run_rows(const RowRun& run) {
       if (mixed && input == 0) {
         // Project the decoder prefix together, preserving decode dispatch.
         configure_gemm_rows(count, true);
-        head_req_ = 0;
         lm_head_logits(h_, count, stream_, false);
         configure_gemm_rows(T, false);
       } else {
@@ -1995,7 +1995,7 @@ void QwenModel::mtp_run_rows(int req, const int64_t* tokens, int64_t first_pos, 
   uint16_t* head_in = mtp_r_ + static_cast<size_t>(T - head_rows) * W;
   mtp_mixer_->mix(head_in, h_, head_rows, stream_);
   head_dump_site_ = 1;
-  head_req_ = req;
+  head_row_req_ = d_req + (T - head_rows);
   head_screen_site_ = decode_row && head_rows <= max_decode_rows_;
   lm_head_logits(h_, head_rows, stream_);
   head_screen_site_ = false;

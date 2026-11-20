@@ -5,6 +5,67 @@ project procedures and design guidance live in `docs/`.
 
 ## Unreleased
 
+- **A request's head rows and mask rows follow the request, not the last
+  batch** (issue #182): two defects of concurrent requests on engines with
+  compacted batches, both from state a batch left behind for the request that
+  went on alone.
+  The server exit. The AutoRound hybrid's int8 plane head
+  (`kernels/packq_head`) reads only the argmax candidates for the rows of a
+  plain greedy slot and leaves every other logit `-inf`. Which slot a row
+  belonged to was derived from the last batch family's capture state
+  (`request_map[row / rows_per_request]`), and that state outlived the batch:
+  a slot's scalar graph captured after the families, every eager one-row
+  verify, a slot-prefix batch and the one-row-per-request chain of a batched
+  draft read the flag of whichever slot the last batched replay had put
+  first, or of slot 0. A closed slot is plain greedy. So when two sampled
+  requests decoded together and the one the batch listed first retired, the
+  survivor's rows came back in the argmax form: its draws came from the
+  argmax candidates alone, and a grammar-constrained request whose mask
+  excluded those candidates had no logit left. The sampled fallback's fold
+  threw `glm_sample: non-finite slice log-sum-exp` and the server exited. The
+  head now takes each row's slot from the walk's own per-row request table
+  (`PackqHeadMode::row_slots`), the one attention and the recurrent state
+  read and every decode-shaped walk already stages, so a row's flag no longer
+  depends on the shape of the call or on what was captured before it.
+  The leaked mask. A batch stages its token masks by position
+  (`stage_masks_compact`), and a request's position is not its slot when the
+  requests joined on different ticks (the round robin steps the later
+  arrival first). A request without a grammar never restaged its own rows, so
+  after a constrained neighbour retired it decoded alone under that
+  neighbour's last mask: a free answer beside a finished `json_object`
+  request trailed off into tabs and ended. An unconstrained slot now writes
+  zero headers into its own rows on every replay, a slot's host masks are
+  reset with its grammar, and the fallback's eagerly re-run rows take a mask
+  only from a slot that has a grammar.
+  Gates: `packq_head_test` (`packq_head_row_table_names_each_rows_slot`: the
+  slot each row reads for a lone slot's one and two rows, one row a request,
+  slots that are not a prefix, padding rows and a chunk boundary inside a
+  request), `qwen_engine_test`
+  (`qwen_engines_argmax_head_never_changes_a_transcript`: one seeded workload
+  of plain greedy and sampled requests on two engines over the hybrid
+  fixture, one with the head flags and one reading every row in full, every
+  transcript equal, at one and three drafts, over compacted and slot-prefix
+  batches and under the scheduled verify depth) and `glm_tp_test`
+  (`glm_tp_serving_graph_free_request_keeps_its_vocabulary_beside_a_constrained_one`:
+  free, JSON, schema and tool-constrained requests arriving together or
+  staggered, against the eager engine). Before the change the Qwen gate
+  reports 4 of 29 requests changed and a sampled slot's eager row holding 2
+  of 512 logits, and the GLM gate a free request repeating the one token its
+  neighbour's mask allowed. Seeded runs of both: 200 engine pairs (16,630
+  requests) and 5,280 transcripts against the eager engine, no difference.
+  One Spark, the hybrid at one draft (the report's settings) and at the
+  template's three, the report's pairs of strict `json_schema` requests at
+  temperature 1: master exits on pair 4 with the report's error after the
+  survivor's fallbacks (3 and 12 of about 21 steps), the change runs 330
+  pairs (strict and `json_object`) with every output valid, no fallback in
+  28,155 sampled steps and no engine failure. A free prose request beside a
+  `json_object` request: cut after 4 to 27 tokens in 14 of 14 runs before,
+  its full 200 tokens in 16 of 16 after. A fuzz of 1,403 mixed requests in
+  550 waves (greedy and sampled, free, `json_object`, strict schemas and
+  tools, one to four at a time): the server up throughout and every
+  constrained answer valid. Greedy requests still read the argmax form: four
+  prompts at three drafts decode at 40.1, 65.1, 53.1 and 63.6 tok/s before
+  and after (53 to 54 ms a pass) with identical transcripts.
 - **The rows of a request score against one staging of each index tile**: the
   decode selection (`select_decode_kernel`) gave each block one row's stripe
   of the context, so the rows of a request — a decode step's token and its

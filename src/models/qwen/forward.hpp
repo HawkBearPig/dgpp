@@ -418,7 +418,7 @@ class QwenModel : public SessionModel<QwenModel> {
   bool head_screen_site_ = false;
   const uint8_t* head_greedy_verify_ = nullptr;
   const uint8_t* head_greedy_draft_ = nullptr;
-  int head_req_ = 0;                 // the request of a single-request head call
+  const int32_t* head_row_req_ = nullptr;  // device: the request of each row of the head call (the walk's table)
   float* head_ab_ = nullptr;         // [4][V] the argmax pass's upper bounds
   int32_t* head_lo_ = nullptr;       // [4] the best lower bounds (ordered ints)
   int32_t* head_cand_ = nullptr;     // [V] the candidate rows, compacted

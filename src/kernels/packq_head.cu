@@ -213,8 +213,7 @@ __device__ __forceinline__ void warp_dots_planes(const uint8_t* __restrict__ w, 
 __device__ __forceinline__ bool rows_all_greedy(const PackqHeadMode& mode, int row0, int rows) {
   if (mode.greedy == nullptr) return false;
   for (int r = 0; r < rows; ++r) {
-    const int row = row0 + r;
-    const int slot = mode.request_map != nullptr ? mode.request_map[row / mode.rows_per_request] : mode.req0;
+    const int slot = mode.row_slots != nullptr ? mode.row_slots[row0 + r] : mode.req0;
     if (slot < 0 || mode.greedy[slot] == 0) return false;
   }
   return true;
@@ -537,8 +536,8 @@ void launch_packq_head_f32(const uint16_t* act, size_t act_stride, const GlmPack
     throw std::invalid_argument("packq_head: matrix geometry does not match n, k");
   if (!packq_gemv::shape_ok(w.packed, w.bits, k, w.scale_fmt))
     throw std::invalid_argument("packq_head: K outside the packed core's contract or a misaligned payload");
-  if (mode.greedy != nullptr && mode.rows_per_request < 1)
-    throw std::invalid_argument("packq_head: rows per request");
+  if (mode.greedy != nullptr && mode.row_slots == nullptr && mode.req0 < 0)
+    throw std::invalid_argument("packq_head: a launch without a row table needs its slot");
   for (int row0 = 0; row0 < m;) {
     int rows = std::min(packq_gemv::kMaxRows, m - row0);
     while (!gemv::smem_fits(rows, k)) --rows;

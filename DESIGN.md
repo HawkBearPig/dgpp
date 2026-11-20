@@ -2362,6 +2362,12 @@ mask reflects the corresponding tentative prefix; it is used only if
 the preceding draft was accepted. Draft generation itself remains
 unconstrained. The prefill pick is the first constrained position.
 
+A batch stages its mask rows by batch position and a lone request by
+slot, and a request's position need not be its slot. Every replay
+therefore stages the rows it reads for each of its requests. A request
+without a grammar writes zero headers into its rows, so a mask never
+outlives the request that staged it.
+
 The graph saves verifier logits after penalties and masking, before the
 draft head reuses the buffer. Exact-gather fallback reads that snapshot
 and checks its covered mass against the device result. Tests compare
