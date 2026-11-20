@@ -23,6 +23,7 @@
 #include <fstream>
 #include <memory>
 #include <mutex>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -2012,6 +2013,224 @@ DGPP_TEST(qwen_engines_loopback_world_2_lookup_skips_sampled_slots) {
       require(on[r].fused == 0, "lookup must never reprice sampled MTP proposals");
       require(on[r].la == on[0].la && on[r].lb == on[0].lb && on[r].lc == on[0].lc,
               "sampled lookup ranks disagree");
+    }
+  }
+}
+
+// The argmax-only head (kernels/packq_head.hpp) may shorten the read of a
+// plain greedy slot's rows and of nothing else, so switching it off must
+// leave every transcript as it was. The same seeded workload runs on two
+// engines over the hybrid fixture, one with the per-slot flags and one
+// whose model reads every row in full. Plain greedy and sampled requests
+// open, step together and retire in every order: a sampled request keeps
+// decoding alone in a slot past a closed one, shares a batch with a greedy
+// request, sits past a hole and takes over a reused slot, at one and three
+// drafts, over compacted and slot-prefix batches and under the scheduled
+// verify depth. The workload's shape never depends on a generated token,
+// so both engines run the same operations.
+struct ArgmaxHeadRun {
+  std::vector<std::vector<int32_t>> transcripts;
+  uint64_t fallbacks = 0;
+  uint64_t sampled_steps = 0;   // steps of sampled requests: the fallbacks' base
+  int sampled_alone_steps = 0;  // scalar steps of a sampled request in a slot past the first
+  int mixed_batch_steps = 0;    // batched steps holding a greedy and a sampled request
+  size_t sampled_row_masked = 0;  // -inf logits in a sampled slot's eager row
+  size_t greedy_row_masked = 0;   // and in a plain greedy slot's
+};
+
+static ArgmaxHeadRun argmax_head_run(const QwenTextConfig& cfg, const std::string& dir, int depth, bool compact,
+                                     bool scheduled, bool flags, uint64_t seed, int rounds) {
+  constexpr int kRequests = 4;
+  constexpr int kStepLimit = 20;
+  auto buses = start_world(1, 30031);
+  require(buses.size() == 1, "argmax head: world-of-one bus");
+  QwenModel model(cfg, dir, 128, 4096, QwenResidency::Resident, nullptr, 0, 1, kRequests, /*mtp=*/true,
+                  /*decode_rows=*/kRequests * (1 + depth));
+  uint16_t *scratch = nullptr, *prefix_scratch = nullptr, *gather_scratch = nullptr;
+  DGPP_CUDA_OK(cudaHostAlloc(reinterpret_cast<void**>(&scratch), sizeof(uint16_t) * dgpp::kPickScratchElems(1),
+                             cudaHostAllocDefault));
+  DGPP_CUDA_OK(cudaHostAlloc(reinterpret_cast<void**>(&prefix_scratch),
+                             sizeof(uint16_t) * dgpp::fabric_sampling_prefix_scratch_elems(1), cudaHostAllocDefault));
+  DGPP_CUDA_OK(cudaHostAlloc(reinterpret_cast<void**>(&gather_scratch),
+                             sizeof(uint16_t) * dgpp::sampling_gather_scratch_elems(cfg.vocab_size),
+                             cudaHostAllocDefault));
+  ArgmaxHeadRun run;
+  std::string error;
+  try {
+    GraphEngineAdapter<QwenModel> graph(&model, buses[0].get(), 0, 1, scratch, cfg.vocab_size, wait_timeout_ms(),
+                                        /*batch_min_live=*/2, prefix_scratch, gather_scratch,
+                                        /*sampling_candidates=*/16, nullptr, /*prefix_slots=*/0, depth, compact);
+    if (scheduled) graph.configure_verify_schedule(true, 1.f, .5f);
+    if (!flags) model.set_head_greedy_flags(nullptr, nullptr);
+    std::mt19937_64 rng(seed);
+    std::array<int, kRequests> owner;  // slot -> its transcript, -1 closed
+    owner.fill(-1);
+    std::array<bool, kRequests> sampled{};
+    std::array<int, kRequests> steps{};
+    int opened = 0;
+    const auto open = [&](int slot, bool sample) {
+      dgpp::sample::Params p = dgpp::sample::greedy_params();
+      if (sample) {
+        // A cold request's draws resolve on the device, a hot one's fall
+        // back to the host's gather on this fixture's flat rows.
+        static constexpr float kTemperatures[] = {0.02f, 0.1f, 1.0f};
+        p.temperature = kTemperatures[rng() % 3];
+        p.top_p = rng() % 2 ? 0.9f : 1.f;
+        p.top_k = rng() % 3 == 0 ? 7 : 0;
+        if (rng() % 2) p.presence_penalty = 0.2f;
+      }
+      graph.configure_sampling(slot, p, 9000 + static_cast<uint64_t>(opened));
+      const auto prompt = smoke_tokens(cfg, 9 + static_cast<int>(rng() % 9), 0x51ED + 977ull * static_cast<uint64_t>(opened));
+      owner[static_cast<size_t>(slot)] = opened++;
+      sampled[static_cast<size_t>(slot)] = sample;
+      steps[static_cast<size_t>(slot)] = 0;
+      run.transcripts.push_back({graph.prefill(slot, prompt)});
+      graph.reserve(slot, static_cast<int64_t>(prompt.size()) + (kStepLimit + 2) * (1 + depth) + 8);
+    };
+    const auto close = [&](int slot) {
+      graph.close(slot);
+      owner[static_cast<size_t>(slot)] = -1;
+    };
+    const auto step = [&] {
+      std::vector<int> live;
+      bool any_sampled = false, any_greedy = false;
+      for (int slot = 0; slot < kRequests; ++slot) {
+        if (owner[static_cast<size_t>(slot)] < 0) continue;
+        live.push_back(slot);
+        (sampled[static_cast<size_t>(slot)] ? any_sampled : any_greedy) = true;
+        run.sampled_steps += sampled[static_cast<size_t>(slot)];
+      }
+      if (live.empty()) return;
+      const auto tokens = graph.step_batch(live);
+      require(tokens.size() == live.size(), "argmax head: one token block a live slot");
+      for (size_t j = 0; j < live.size(); ++j) {
+        auto& transcript = run.transcripts[static_cast<size_t>(owner[static_cast<size_t>(live[j])])];
+        transcript.insert(transcript.end(), tokens[j].begin(), tokens[j].end());
+        ++steps[static_cast<size_t>(live[j])];
+      }
+      if (live.size() == 1 && live[0] > 0 && any_sampled) ++run.sampled_alone_steps;
+      if (live.size() > 1 && any_sampled && any_greedy) ++run.mixed_batch_steps;
+    };
+    // A slot's next row run eagerly, as the sampled fallback re-runs one:
+    // how many of its logits the head left out.
+    const auto eager_row_masked = [&](int slot) {
+      graph.drain();
+      const auto& transcript = run.transcripts[static_cast<size_t>(owner[static_cast<size_t>(slot)])];
+      const auto out = model.session_verify(slot, std::vector<int64_t>{transcript.back()});
+      return static_cast<size_t>(std::count(out.logits.begin(), out.logits.end(), -INFINITY));
+    };
+
+    // Two sampled requests decode together, the lower slot retires and the
+    // other goes on alone: its rows stay full reads, the eager one included.
+    open(0, true);
+    open(1, true);
+    for (int i = 0; i < 3; ++i) step();
+    close(0);
+    for (int i = 0; i < 6; ++i) step();
+    run.sampled_row_masked = eager_row_masked(1);
+    close(1);
+    // A plain greedy request in the same place reads the argmax form.
+    open(1, false);
+    for (int i = 0; i < 3; ++i) step();
+    run.greedy_row_masked = eager_row_masked(1);
+    close(1);
+
+    for (int round = 0; round < rounds; ++round) {
+      bool any = false;
+      for (int slot = 0; slot < kRequests; ++slot) {
+        const bool closed = owner[static_cast<size_t>(slot)] < 0;
+        const uint64_t draw = rng();
+        if (closed && draw % 3 == 0) open(slot, (draw >> 8) % 2 == 0);
+        any = any || owner[static_cast<size_t>(slot)] >= 0;
+      }
+      if (!any) {
+        const uint64_t draw = rng();
+        open(static_cast<int>(draw % kRequests), (draw >> 8) % 2 == 0);
+      }
+      const int burst = 1 + static_cast<int>(rng() % 3);
+      for (int i = 0; i < burst; ++i) step();
+      for (int slot = 0; slot < kRequests; ++slot) {
+        const uint64_t draw = rng();
+        if (owner[static_cast<size_t>(slot)] < 0) continue;
+        if (draw % 4 == 0 || steps[static_cast<size_t>(slot)] + 3 > kStepLimit) close(slot);
+      }
+    }
+    for (int slot = 0; slot < kRequests; ++slot)
+      if (owner[static_cast<size_t>(slot)] >= 0) close(slot);
+    run.fallbacks = graph.fallbacks();
+    graph.drain();
+  } catch (const std::exception& e) {
+    error = e.what();
+  }
+  cudaFreeHost(scratch);
+  cudaFreeHost(prefix_scratch);
+  cudaFreeHost(gather_scratch);
+  require(error.empty(), std::string("argmax head (flags ") + (flags ? "on" : "off") + "): " + error);
+  require(model.kv_blocks_in_use() == 0, "argmax head: the workload leaked cache blocks");
+  return run;
+}
+
+DGPP_TEST(qwen_engines_argmax_head_never_changes_a_transcript) {
+  struct RestoreDense {
+    bool fp8 = dgpp::QwenLayerStream::dense_weights_fp8();
+    ~RestoreDense() { dgpp::QwenLayerStream::set_dense_weights_fp8(fp8); }
+  } restore;
+  // The hybrid's fixture carries the packed int8 head the argmax form reads
+  // (its dense stack ships as fp8, which the loader's fp8 mode alone reads).
+  dgpp::QwenLayerStream::set_dense_weights_fp8(true);
+  const QwenTextConfig cfg = qwenfx::tiny_gptq_config();
+  const std::string dir = "qwen_engine_argmax_head_fixture";
+  qwenfx::write_fixture_for(cfg, dir);
+  const auto knob = [](const char* name, int fallback) {
+    const char* v = std::getenv(name);
+    return v != nullptr && v[0] != '\0' ? std::atoi(v) : fallback;
+  };
+  const int rounds = knob("DGPP_TEST_ARGMAX_HEAD_ROUNDS", 32);
+  const int seeds = knob("DGPP_TEST_ARGMAX_HEAD_SEEDS", 1);
+  const uint64_t seed0 = static_cast<uint64_t>(knob("DGPP_TEST_ARGMAX_HEAD_SEED", 182));
+  struct Shape {
+    int depth;
+    bool compact, scheduled;
+    const char* name;
+  };
+  const Shape shapes[] = {{1, true, false, "one draft, compacted batches"},
+                          {1, false, false, "one draft, slot-prefix batches"},
+                          {3, true, false, "three drafts, compacted batches"},
+                          {3, false, false, "three drafts, slot-prefix batches"},
+                          {3, false, true, "three drafts, scheduled verify depth"}};
+  for (const Shape& shape : shapes) {
+    for (int s = 0; s < seeds; ++s) {
+      const uint64_t seed = seed0 + static_cast<uint64_t>(s);
+      const std::string what = std::string("argmax head, ") + shape.name + ", seed " + std::to_string(seed) + ": ";
+      const ArgmaxHeadRun on = argmax_head_run(cfg, dir, shape.depth, shape.compact, shape.scheduled, true, seed, rounds);
+      const ArgmaxHeadRun off = argmax_head_run(cfg, dir, shape.depth, shape.compact, shape.scheduled, false, seed, rounds);
+      require(on.transcripts.size() == off.transcripts.size(), what + "the workloads differ");
+      size_t changed = 0, first = on.transcripts.size(), first_token = 0;
+      for (size_t i = 0; i < on.transcripts.size(); ++i) {
+        const size_t agree = agreeing_prefix(on.transcripts[i], off.transcripts[i]);
+        if (agree == on.transcripts[i].size() && agree == off.transcripts[i].size()) continue;
+        if (changed++ == 0) first = i, first_token = agree;
+      }
+      require(changed == 0, what + std::to_string(changed) + " of " + std::to_string(on.transcripts.size()) +
+                                " requests change with the argmax-only head on, the first (request " +
+                                std::to_string(first) + ") at token " + std::to_string(first_token) +
+                                "; a sampled slot's eager row lost " + std::to_string(on.sampled_row_masked) +
+                                " logits");
+      require(on.sampled_row_masked == 0,
+              what + "a sampled slot's eager row lost " + std::to_string(on.sampled_row_masked) + " logits");
+      require(off.sampled_row_masked == 0 && off.greedy_row_masked == 0, what + "a full read left logits out");
+      require(on.greedy_row_masked > 0, what + "the fixture never reads the argmax form");
+      require(on.fallbacks == off.fallbacks, what + "the sampled fallbacks differ");
+      require(on.fallbacks > 0 && on.fallbacks < on.sampled_steps,
+              what + "sampled steps must be decided both on the device and by the host's fallback (" +
+                  std::to_string(on.fallbacks) + " fallbacks in " + std::to_string(on.sampled_steps) + " steps)");
+      require(on.sampled_alone_steps > 0 && on.mixed_batch_steps > 0,
+              what + "the workload must hold a lone sampled slot past the first and a mixed batch");
+      DGPP_LOG_INFO("{}{} requests, {} fallbacks in {} sampled steps, {} lone sampled steps, {} mixed batch steps, "
+                    "a greedy eager row keeps {} of {} logits",
+                    what, on.transcripts.size(), on.fallbacks, on.sampled_steps, on.sampled_alone_steps,
+                    on.mixed_batch_steps,
+                    static_cast<size_t>(cfg.vocab_size) - on.greedy_row_masked, cfg.vocab_size);
     }
   }
 }

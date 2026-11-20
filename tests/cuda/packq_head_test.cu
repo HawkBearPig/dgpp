@@ -2,7 +2,7 @@
 // bitwise the row layout's packed GEMV; the argmax form gives every row the
 // full form's argmax and its logit bit for bit (every written logit is the
 // full form's), with -inf elsewhere; both across the launcher's row chunks
-// and the request map.
+// and the row table that names each row's slot.
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -76,8 +76,12 @@ int ref_argmax(const std::vector<float>& logits, size_t off, int n) {
   return best;
 }
 
-void run_case(int n, int k, int m, bool greedy, const std::vector<uint8_t>& flags, int rows_per_request,
-              const std::vector<int32_t>& map, const char* label) {
+// `row_slots`: the launch's per-row slots (empty: every row is slot 0).
+// `expect_argmax`: the launch must leave -inf somewhere (the argmax form ran).
+void run_case(int n, int k, int m, bool greedy, const std::vector<uint8_t>& flags,
+              const std::vector<int32_t>& row_slots, const char* label, bool expect_argmax = false) {
+  if (!row_slots.empty() && static_cast<int>(row_slots.size()) != m)
+    throw std::runtime_error(std::string(label) + ": one slot per row");
   cudaStream_t st = test_stream();
   const Head h = make_head(7 + n + m, n, k);
   const std::vector<uint16_t> x = make_act(11 + m, m, k);
@@ -104,14 +108,13 @@ void run_case(int n, int k, int m, bool greedy, const std::vector<uint8_t>& flag
   pm.packed = d_planes.as<uint32_t>();
   pm.layout = dgpp::kPackedLayoutPlanes8;
   DevBuf d_ab(static_cast<size_t>(4) * n * 4), d_lo(4 * 4), d_flags(std::max<size_t>(1, flags.size())),
-      d_map(std::max<size_t>(1, map.size()) * 4), d_cand(static_cast<size_t>(n) * 4), d_cc(4);
+      d_slots(std::max<size_t>(1, row_slots.size()) * 4), d_cand(static_cast<size_t>(n) * 4), d_cc(4);
   if (!flags.empty()) d_flags.upload(flags.data(), flags.size());
-  if (!map.empty()) d_map.upload(map.data(), map.size() * 4);
+  if (!row_slots.empty()) d_slots.upload(row_slots.data(), row_slots.size() * 4);
   dgpp::PackqHeadMode mode;
   if (greedy) {
     mode.greedy = d_flags.as<uint8_t>();
-    mode.request_map = map.empty() ? nullptr : d_map.as<int32_t>();
-    mode.rows_per_request = rows_per_request;
+    mode.row_slots = row_slots.empty() ? nullptr : d_slots.as<int32_t>();
     mode.req0 = 0;
   }
   dgpp::PackqHeadScratch scratch{d_ab.as<float>(), d_lo.as<int32_t>(), d_cand.as<int32_t>(), d_cc.as<int32_t>()};
@@ -125,11 +128,21 @@ void run_case(int n, int k, int m, bool greedy, const std::vector<uint8_t>& flag
   for (int a = 0; a < m; ++a) {
     const size_t off = static_cast<size_t>(a) * n;
     // Every written logit is the full form's, bit for bit.
+    size_t row_written = 0;
     for (int i = 0; i < n; ++i) {
       if (std::isinf(out[off + i]) && out[off + i] < 0) continue;
-      ++written;
+      ++row_written;
       if (std::memcmp(&out[off + i], &ref[off + i], 4) != 0) ++differ;
     }
+    written += row_written;
+    // A row whose own slot is sampled, or a padding row, is a full read
+    // whatever its neighbours' slots are.
+    const int slot = row_slots.empty() ? 0 : row_slots[static_cast<size_t>(a)];
+    const bool sampled = greedy && (slot < 0 || flags[static_cast<size_t>(slot)] == 0);
+    if (sampled && row_written != static_cast<size_t>(n))
+      throw std::runtime_error(std::string(label) + ": row " + std::to_string(a) + " of slot " +
+                               std::to_string(slot) + " is not a full read (" + std::to_string(row_written) +
+                               " of " + std::to_string(n) + " logits)");
     // The argmax and its logit.
     const int ra = ref_argmax(ref, off, n), oa = ref_argmax(out, off, n);
     if (ra != oa || std::memcmp(&out[off + oa], &ref[off + ra], 4) != 0)
@@ -144,23 +157,46 @@ void run_case(int n, int k, int m, bool greedy, const std::vector<uint8_t>& flag
   std::printf("[ OK ] %s: m=%d n=%d written %zu of %zu logits (%.2f%%), argmax + logit bitwise\n", label, m, n,
               written, total, 100.0 * written / total);
   if (!greedy && written != total) throw std::runtime_error(std::string(label) + ": the full form left -inf");
+  if (expect_argmax && written == total)
+    throw std::runtime_error(std::string(label) + ": no row took the argmax form");
 }
 
 }  // namespace
 
 DGPP_TEST(packq_head_full_form_is_bitwise_the_row_layout) {
-  for (int m : {1, 3, 4, 6}) run_case(4096, 2560, m, false, {}, 1, {}, "full");
+  for (int m : {1, 3, 4, 6}) run_case(4096, 2560, m, false, {}, {}, "full");
 }
 
 DGPP_TEST(packq_head_argmax_form_keeps_the_argmax_and_its_logit) {
   // One greedy slot: every chunk argmax-only.
-  for (int m : {1, 2, 4, 6}) run_case(8192, 2560, m, true, {1}, m, {}, "argmax");
-  // A sampled slot among greedy ones through the request map: rows of the
+  for (int m : {1, 2, 4, 6}) run_case(8192, 2560, m, true, {1}, {}, "argmax", true);
+  // A sampled slot among greedy ones through the row table: rows of the
   // sampled slot's chunk take the full form, the others the argmax form.
-  run_case(4096, 2560, 8, true, {1, 0}, 4, {0, 1}, "argmax+sampled");
-  run_case(4096, 2560, 8, true, {1, 1}, 4, {0, 1}, "two greedy slots");
+  run_case(4096, 2560, 8, true, {1, 0}, {0, 0, 0, 0, 1, 1, 1, 1}, "argmax+sampled", true);
+  run_case(4096, 2560, 8, true, {1, 1}, {0, 0, 0, 0, 1, 1, 1, 1}, "two greedy slots", true);
   // A narrower K of the compiled set (the test geometries).
-  run_case(2048, 1024, 4, true, {1}, 4, {}, "argmax k=1024");
+  run_case(2048, 1024, 4, true, {1}, {}, "argmax k=1024", true);
+}
+
+// A row's slot is its entry of the row table, whatever the launch's shape:
+// a sampled slot never reads the argmax form because a neighbouring or an
+// earlier slot is greedy.
+DGPP_TEST(packq_head_row_table_names_each_rows_slot) {
+  // A sampled slot's own launch beside a greedy slot 0: the one-row eager
+  // verify and the two-row scalar step of slot 1.
+  run_case(4096, 2560, 1, true, {1, 0}, {1}, "sampled slot 1, one row");
+  run_case(4096, 2560, 2, true, {1, 0}, {1, 1}, "sampled slot 1, two rows");
+  // The same launches of a greedy slot 1 beside a sampled slot 0.
+  run_case(4096, 2560, 1, true, {0, 1}, {1}, "greedy slot 1, one row", true);
+  run_case(4096, 2560, 2, true, {0, 1}, {1, 1}, "greedy slot 1, two rows", true);
+  // One row per request (the chained drafts of a batch).
+  run_case(4096, 2560, 4, true, {1, 0, 1, 1}, {0, 1, 2, 3}, "one row a request, one sampled");
+  run_case(4096, 2560, 4, true, {1, 1, 1, 1}, {0, 1, 2, 3}, "one row a request, all greedy", true);
+  // A batch over slots that are not a prefix, and its padding rows.
+  run_case(4096, 2560, 6, true, {1, 1, 0, 1}, {1, 1, 1, 1, 3, 3}, "slots 1 and 3", true);
+  run_case(4096, 2560, 4, true, {1, 1}, {0, 0, -1, -1}, "padding rows");
+  // Three rows a request: the chunk boundary falls inside a request.
+  run_case(4096, 2560, 6, true, {1, 0}, {0, 0, 0, 1, 1, 1}, "three rows a request");
 }
 
 DGPP_TEST(packq_head_planes_tile_gemm_is_bitwise_the_row_layout_tile) {
@@ -251,7 +287,6 @@ DGPP_TEST(packq_head_slice_scatters_the_argmax_to_the_ids) {
     dgpp::PackqHeadMode mode;
     if (greedy) {
       mode.greedy = d_flags.as<uint8_t>();
-      mode.rows_per_request = m;
     }
     dgpp::PackqHeadScratch scratch{d_ab.as<float>(), d_lo.as<int32_t>(), d_cand.as<int32_t>(), d_cc.as<int32_t>()};
     DGPP_CUDA_OK(cudaMemset(d_out.p, 0, d_out.bytes));

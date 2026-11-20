@@ -3512,9 +3512,11 @@ class GraphEngineAdapter final : public sched::SchedulerEngine {
     bool gathered = true;  // row t is the gathered snapshot row
     typename Model::Outputs eager;  // else the eagerly re-run row t
     for (;;) {
+      // The mask staged for row t, which only a slot with a grammar has.
       const text::TokenMask& m =
           masks_[static_cast<size_t>(req) * rows_per_request_ + t];
-      const text::TokenMask* mask = m.constrained() ? &m : nullptr;
+      const text::TokenMask* mask =
+          grammar_[static_cast<size_t>(req)] != nullptr && m.constrained() ? &m : nullptr;
       if (t + 1 < T && o.block != 0) {
         // Block verification rejected the block at row t0 = tau and its
         // residual lay in the unseen tail: the host draws (p_tau P - Q)+
@@ -3701,10 +3703,11 @@ class GraphEngineAdapter final : public sched::SchedulerEngine {
     std::unique_ptr<text::GrammarState>& grammar = grammar_[static_cast<size_t>(req)];
     uint32_t* h = h_masks_ + static_cast<size_t>(req) * rows_per_request_ * mask_stride_;
     if (!grammar) {
-      // The headers are zero (configure/close) — unless a reduced-depth
-      // batch staged its compact layout over these rows meanwhile.
-      if (schedule_)
-        for (int t = 0; t < rows_per_request_; ++t) h[static_cast<size_t>(t) * mask_stride_] = 0u;
+      // An unconstrained slot says so in its own rows every replay. A
+      // batch stages its masks by position (stage_masks_compact), so the
+      // rows of this slot may hold the mask of whichever request last sat
+      // at that position, and that request may have retired since.
+      for (int t = 0; t < rows_per_request_; ++t) h[static_cast<size_t>(t) * mask_stride_] = 0u;
       return;
     }
     stage_mask_rows(req, rows_per_request_, h);
@@ -3782,9 +3785,13 @@ class GraphEngineAdapter final : public sched::SchedulerEngine {
         model_->device_logits() + static_cast<size_t>(first_row) * count,
         sizeof(float) * static_cast<size_t>(rows) * count, model_->stream());
   }
-  // Zero headers for the slot's rows: unconstrained until staged again.
+  // Zero headers for the slot's rows: unconstrained until staged again. The
+  // host's copies go with them: the fallback's eagerly re-run rows read
+  // those, and a previous occupant's mask must not outlive its grammar.
   void clear_masks(int req) {
     if (!sampling_ || d_masks_ == nullptr) return;
+    for (int t = 0; t < rows_per_request_; ++t)
+      masks_[static_cast<size_t>(req) * rows_per_request_ + t].allowed = 0;
     uint32_t* h = h_masks_ + static_cast<size_t>(req) * rows_per_request_ * mask_stride_;
     for (int t = 0; t < rows_per_request_; ++t) h[static_cast<size_t>(t) * mask_stride_] = 0u;
     for (int t = 0; t < rows_per_request_; ++t) {

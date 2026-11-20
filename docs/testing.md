@@ -258,6 +258,27 @@ the synchronous path. `DGPP_TEST_FILTER=sampled_` in `dsv4_engine_test`
 exercises both verification rules through every native confidence-scheduled
 depth, including two sampled slots and slot reuse.
 
+The argmax-only head regression runs with `DGPP_TEST_FILTER=argmax_head` in
+`qwen_engine_test`. One seeded workload of plain greedy and sampled requests
+runs on two engines over the hybrid fixture. One engine keeps the per-slot
+head flags and the other reads every head row in full, and every transcript
+must match. The workload holds a sampled request decoding alone in a slot
+past a closed one, batches that mix greedy and sampled requests, holes and
+reused slots. It runs at one and three drafts, over compacted and slot-prefix
+batches and under the scheduled verify depth, with sampled steps decided on
+the device and by the host fallback. `DGPP_TEST_ARGMAX_HEAD_SEEDS` and
+`DGPP_TEST_ARGMAX_HEAD_ROUNDS` lengthen the run. `packq_head_test` pins the
+slot each row reads for every launch shape.
+
+The mask staging regression runs with `DGPP_TEST_FILTER=free_request_keeps`
+in `glm_tp_test`. Requests without a grammar decode beside JSON, schema and
+tool-constrained ones and go on alone after them, with the constrained
+request arriving after, before or together with the free one, over
+slot-prefix and compacted batches. Every transcript must equal the eager
+engine's and every constrained one must stay inside its grammar.
+`DGPP_TEST_FREE_BESIDE_ROUNDS` and `DGPP_TEST_FREE_BESIDE_SEED` add seeded
+random pairs.
+
 The long-document prefix-cache regression is covered by `scheduler_test`
 (changed tails, lookahead identity, small arenas and cleanup), `qwen_decode_test`
 and `glm_tp_test` (two snapshots, resumed target/draft logits and budget changes).
