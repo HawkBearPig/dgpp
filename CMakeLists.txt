@@ -1062,6 +1062,7 @@ add_executable(unit_tests
   tests/unit/dsv41_binding_test.cpp
   tests/unit/dsv4_config_test.cpp
   tests/unit/dsv4_binding_test.cpp
+  tests/unit/dsv4_prompt_test.cpp
   tests/unit/mimo_config_test.cpp
   tests/unit/mimo_binding_test.cpp
   tests/unit/dory_config_test.cpp
