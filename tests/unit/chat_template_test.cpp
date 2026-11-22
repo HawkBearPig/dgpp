@@ -187,3 +187,120 @@ DGPP_TEST(chat_template_generation_block_scopes_the_global_reads) {
   const auto local = ChatTemplate::compile("{% generation %}{% set flag = 1 %}{{ flag }}{% endgeneration %}");
   if (local.reads("flag")) throw std::runtime_error("a name the block set and read is not the global");
 }
+
+namespace {
+// The globals of the scope cases below: `label` is the name a render
+// supplies and a template assigns.
+Value::Members scope_globals() {
+  return {{"label", Value::string_value("global")},
+          {"xs", Value::list_value({Value::string_value("p")})},
+          {"ms", Value::list_value({Value::string_value("a"), Value::string_value("b")})}};
+}
+std::string scoped(const std::string& source) { return render(source, scope_globals()); }
+}  // namespace
+
+// The reference decides from the syntax tree which scope owns a name: one
+// that assigns it owns it for its whole extent, and the scopes nested in it
+// read that copy. The expected strings are the reference environment's.
+DGPP_TEST(chat_template_scope_owns_the_names_it_assigns_from_its_first_statement) {
+  // The owner's copy is undefined until the assignment runs, also for a
+  // nested scope that reads it earlier and with a global of that name
+  // supplied: nested generation blocks, one block at the top level, loops.
+  equal(scoped("{% generation %}{% generation %}[{{ label }}]{% endgeneration %}{% set label = 'local' %}"
+               "{% endgeneration %}"),
+        "[]");
+  equal(scoped("{% generation %}[{{ label }}]{% endgeneration %}{% set label = 'local' %}"), "[]");
+  equal(scoped("{% for a in xs %}{% for b in xs %}[{{ label }}]{% endfor %}{% set label = 'local' %}{% endfor %}"), "[]");
+  equal(scoped("{% for b in xs %}[{{ label }}]{% endfor %}{% set label = 'local' %}"), "[]");
+  equal(scoped("{% for b in xs %}[{{ label is defined }}]{% endfor %}{% set label = 'local' %}[{{ label is defined }}]"),
+        "[False][True]");
+  // Each iteration of the owner starts over.
+  equal(scoped("{% for m in ms %}{% for b in xs %}[{{ label }}]{% endfor %}{% set label = m %}{% endfor %}"), "[][]");
+  // Once assigned, the nested scope reads the value, and it ends with its scope.
+  equal(scoped("{% generation %}{% set label = 'local' %}{% generation %}[{{ label }}]{% endgeneration %}"
+               "{% endgeneration %}[{{ label }}]"),
+        "[local][global]");
+  // The copy starts as the global instead when the scope reads the name
+  // before it assigns it (an earlier statement, or the assignment's own
+  // value), when the assignment is under an if, and when an enclosing scope
+  // mentions the name anywhere, further down included.
+  equal(scoped("{% generation %}{{ label }}{% generation %}[{{ label }}]{% endgeneration %}{% set label = 'local' %}"
+               "{% endgeneration %}"),
+        "global[global]");
+  equal(scoped("{% generation %}{% generation %}[{{ label }}]{% endgeneration %}{% set label = label ~ '!' %}{{ label }}"
+               "{% endgeneration %}"),
+        "[global]global!");
+  equal(scoped("{% generation %}{% generation %}[{{ label }}]{% endgeneration %}{% if true %}{% set label = 'local' %}"
+               "{% endif %}{% endgeneration %}"),
+        "[global]");
+  equal(scoped("{% for a in xs %}{% for b in xs %}[{{ label }}]{% endfor %}{% set label = 'local' %}{% endfor %}"
+               "{{ label }}"),
+        "[global]global");
+}
+
+// The body of a block set and a macro body are scopes like a loop's.
+DGPP_TEST(chat_template_block_set_and_macro_bodies_are_scopes) {
+  equal(scoped("{% set a %}{% set b = 1 %}{{ b }}{% endset %}{{ a }}{{ b is defined }}"), "1False");
+  equal(scoped("{% set cap %}[{{ label }}]{% endset %}{% set label = 'local' %}{{ cap }}"), "[]");
+  equal(scoped("{% set cap %}{% for b in xs %}[{{ label }}]{% endfor %}{% set label = 'local' %}{{ label }}{% endset %}"
+               "{{ cap }}{{ label }}"),
+        "[global]localglobal");
+  // A macro reads the top level's copy, and owns what its body assigns.
+  equal(scoped("{% macro m() %}[{{ label }}]{% endmacro %}{{ m() }}{% set label = 'local' %}{{ m() }}"), "[][local]");
+  equal(scoped("{% macro m() %}{% for b in xs %}[{{ label }}]{% endfor %}{% set label = 'local' %}{{ label }}"
+               "{% endmacro %}{{ m() }}"),
+        "[]local");
+  equal(scoped("{% macro m() %}{% for b in xs %}[{{ label }}]{% endfor %}{% set label = 'local' %}{{ label }}"
+               "{% endmacro %}{{ m() }}{{ label }}"),
+        "[global]localglobal");
+  // A parameter's default is evaluated in the macro's scope: it reads the
+  // top level and the parameters before it, never the caller's names, and
+  // a parameter after it is still undefined.
+  equal(scoped("{% macro m(p=label) %}[{{ p }}]{% endmacro %}{% for label in ms %}{{ m() }}{% endfor %}"),
+        "[global][global]");
+  equal(scoped("{% macro m(a='1', b=a) %}[{{ a }}{{ b }}]{% endmacro %}{{ m() }}{{ m('2') }}"), "[11][22]");
+  equal(scoped("{% macro m(a=label, label='x') %}[{{ a }}|{{ label }}]{% endmacro %}{{ m() }}"), "[|x]");
+  equal(scoped("{% macro m(a=label) %}{% set label = 'local' %}[{{ a }}|{{ label }}]{% endmacro %}{{ m() }}"),
+        "[global|local]");
+  // A macro's name is assigned where it is defined.
+  equal(scoped("{% for b in xs %}{{ m is defined }}{% endfor %}{% macro m() %}x{% endmacro %}{{ m() }}"), "Falsex");
+  // A break in a block set ends the enclosing loop before the name is assigned.
+  equal(scoped("{% for m in ms %}{% set cap %}{{ m }}{% break %}{% endset %}[{{ cap }}]{% endfor %}!{{ cap is defined }}"),
+        "!False");
+  equal(scoped("{% for m in ms %}[{{ m }}]{% set cap %}{% if m == 'a' %}{% break %}{% endif %}{% endset %}{% endfor %}!"),
+        "[a]!");
+  bool refused = false;
+  try {
+    (void)render("{% set cap %}{% break %}{% endset %}");
+  } catch (const std::runtime_error& error) {
+    refused = std::string(error.what()).find("'break' outside of a loop") != std::string::npos;
+  }
+  if (!refused) throw std::runtime_error("a break in a top-level block set leaves no loop");
+}
+
+// The knob gate follows the same ownership: inside the scope that owns a
+// name, no read of it is a read of the global.
+DGPP_TEST(chat_template_scope_ownership_decides_the_global_reads) {
+  const auto reads = [](const std::string& source) { return ChatTemplate::compile(source).reads("label"); };
+  if (reads("{% generation %}{% generation %}[{{ label }}]{% endgeneration %}{% set label = 'local' %}"
+            "{% endgeneration %}"))
+    throw std::runtime_error("the outer block owns the name the inner block reads");
+  if (reads("{% for b in xs %}[{{ label }}]{% endfor %}{% set label = 'local' %}"))
+    throw std::runtime_error("the top level owns the name the loop reads");
+  if (reads("{% set cap %}[{{ label }}]{% endset %}{% set label = 'local' %}{{ cap }}"))
+    throw std::runtime_error("the top level owns the name the block set reads");
+  if (reads("{% macro m() %}[{{ label }}]{% endmacro %}{{ m() }}{% set label = 'local' %}"))
+    throw std::runtime_error("the top level owns the name the macro reads");
+  if (!reads("{% generation %}{% generation %}[{{ label }}]{% endgeneration %}{% if true %}{% set label = 'local' %}"
+             "{% endif %}{% endgeneration %}"))
+    throw std::runtime_error("an assignment under an if leaves the global readable");
+  if (!reads("{% for a in xs %}{% for b in xs %}[{{ label }}]{% endfor %}{% set label = 'local' %}{% endfor %}"
+             "{{ label }}"))
+    throw std::runtime_error("a read at the top level is a read of the global");
+  if (!reads("{% generation %}{{ label }}{% set label = 'local' %}{% endgeneration %}"))
+    throw std::runtime_error("a read before the scope's own assignment is a read of the global");
+  if (!reads("{% macro m(p=label) %}[{{ p }}]{% endmacro %}{{ m() }}"))
+    throw std::runtime_error("a default that reads the global is a read of it");
+  if (reads("{% macro m(a=label, label='x') %}[{{ a }}]{% endmacro %}{{ m() }}"))
+    throw std::runtime_error("a default that reads a later parameter does not read the global");
+}

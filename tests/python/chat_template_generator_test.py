@@ -65,6 +65,68 @@ class ChatTemplateGeneratorTest(unittest.TestCase):
         )
         self.assertEqual(self.env.from_string(source).render(), "[3]")
 
+    def test_generation_block_and_name_scopes(self):
+        # The strings tests/unit/chat_template_test.cpp holds the interpreter
+        # to: transformers' {% generation %} block passes its body through in
+        # a scope of its own, and a scope owns the names it assigns from its
+        # first statement.
+        values = {"label": "global", "xs": ["p"], "ms": ["a", "b"]}
+        cases = [
+            ("{% set x = 1 %}{% generation %}{% set x = 2 %}{{ x }}{% endgeneration %}{{ x }}", "21"),
+            ("{% generation %}{% set y = 5 %}{% endgeneration %}{{ y is defined }}", "False"),
+            ("{% set ns = namespace(v=1) %}{% generation %}{% set ns.v = 2 %}{% endgeneration %}{{ ns.v }}", "2"),
+            ("{% for m in ms %}[{% generation %}{{ m }}{{ loop.index0 }}{% endgeneration %}]{% endfor %}", "[a0][b1]"),
+            ("a\n  {%- generation %}\n  b\n  {%- endgeneration %}\nc", "a  bc"),
+            ("{% generation %}a{% generation %}b{% endgeneration %}c{% endgeneration %}", "abc"),
+            ("{% generation %}{% generation %}[{{ label }}]{% endgeneration %}{% set label = 'local' %}"
+             "{% endgeneration %}", "[]"),
+            ("{% generation %}[{{ label }}]{% endgeneration %}{% set label = 'local' %}", "[]"),
+            ("{% for a in xs %}{% for b in xs %}[{{ label }}]{% endfor %}{% set label = 'local' %}{% endfor %}", "[]"),
+            ("{% for b in xs %}[{{ label }}]{% endfor %}{% set label = 'local' %}", "[]"),
+            ("{% for b in xs %}[{{ label is defined }}]{% endfor %}{% set label = 'local' %}"
+             "[{{ label is defined }}]", "[False][True]"),
+            ("{% for m in ms %}{% for b in xs %}[{{ label }}]{% endfor %}{% set label = m %}{% endfor %}", "[][]"),
+            ("{% generation %}{% set label = 'local' %}{% generation %}[{{ label }}]{% endgeneration %}"
+             "{% endgeneration %}[{{ label }}]", "[local][global]"),
+            ("{% generation %}{{ label }}{% generation %}[{{ label }}]{% endgeneration %}{% set label = 'local' %}"
+             "{% endgeneration %}", "global[global]"),
+            ("{% generation %}{% generation %}[{{ label }}]{% endgeneration %}{% set label = label ~ '!' %}"
+             "{{ label }}{% endgeneration %}", "[global]global!"),
+            ("{% generation %}{% generation %}[{{ label }}]{% endgeneration %}{% if true %}"
+             "{% set label = 'local' %}{% endif %}{% endgeneration %}", "[global]"),
+            ("{% for a in xs %}{% for b in xs %}[{{ label }}]{% endfor %}{% set label = 'local' %}{% endfor %}"
+             "{{ label }}", "[global]global"),
+            ("{% set a %}{% set b = 1 %}{{ b }}{% endset %}{{ a }}{{ b is defined }}", "1False"),
+            ("{% set cap %}[{{ label }}]{% endset %}{% set label = 'local' %}{{ cap }}", "[]"),
+            ("{% set cap %}{% for b in xs %}[{{ label }}]{% endfor %}{% set label = 'local' %}{{ label }}"
+             "{% endset %}{{ cap }}{{ label }}", "[global]localglobal"),
+            ("{% macro m() %}[{{ label }}]{% endmacro %}{{ m() }}{% set label = 'local' %}{{ m() }}", "[][local]"),
+            ("{% macro m() %}{% for b in xs %}[{{ label }}]{% endfor %}{% set label = 'local' %}{{ label }}"
+             "{% endmacro %}{{ m() }}", "[]local"),
+            ("{% macro m() %}{% for b in xs %}[{{ label }}]{% endfor %}{% set label = 'local' %}{{ label }}"
+             "{% endmacro %}{{ m() }}{{ label }}", "[global]localglobal"),
+            ("{% macro m(p=label) %}[{{ p }}]{% endmacro %}{% for label in ms %}{{ m() }}{% endfor %}",
+             "[global][global]"),
+            ("{% macro m(a='1', b=a) %}[{{ a }}{{ b }}]{% endmacro %}{{ m() }}{{ m('2') }}", "[11][22]"),
+            ("{% macro m(a=label, label='x') %}[{{ a }}|{{ label }}]{% endmacro %}{{ m() }}", "[|x]"),
+            ("{% macro m(a=label) %}{% set label = 'local' %}[{{ a }}|{{ label }}]{% endmacro %}{{ m() }}",
+             "[global|local]"),
+            ("{% for b in xs %}{{ m is defined }}{% endfor %}{% macro m() %}x{% endmacro %}{{ m() }}", "Falsex"),
+            ("{% for m in ms %}{% set cap %}{{ m }}{% break %}{% endset %}[{{ cap }}]{% endfor %}"
+             "!{{ cap is defined }}", "!False"),
+            ("{% for m in ms %}[{{ m }}]{% set cap %}{% if m == 'a' %}{% break %}{% endif %}{% endset %}"
+             "{% endfor %}!", "[a]!"),
+        ]
+        for source, expected in cases:
+            with self.subTest(source=source):
+                self.assertEqual(self.env.from_string(source).render(**values), expected)
+        for source in ("{% for m in ms %}{% generation %}{% break %}{% endgeneration %}{% endfor %}",
+                       "{% set cap %}{% break %}{% endset %}"):
+            # The reference compiles the break outside any loop of its own
+            # function, which Python refuses.
+            with self.subTest(source=source), self.assertRaises(SyntaxError):
+                self.env.from_string(source)
+
     def test_tojson_keeps_unicode_and_explicit_ascii_option(self):
         value = {"text": "城市 <>&'", "enabled": True}
         self.assertEqual(

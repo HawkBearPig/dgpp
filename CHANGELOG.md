@@ -5,6 +5,34 @@ project procedures and design guidance live in `docs/`.
 
 ## Unreleased
 
+- **A chat template's names belong to the scope that assigns them, as in
+  the reference**: jinja2 decides from the syntax tree which scope owns a
+  name. A scope that assigns a name owns it for its whole extent, and when
+  the assignment is the scope's first mention of the name and is not under
+  an `if`, the name is undefined there until the assignment runs. The
+  interpreter looked a name up in the frames assigned so far and then in the
+  globals, so a nested scope that read the name before the assignment saw
+  the render's global where the reference sees nothing. With `label`
+  supplied,
+  `{% for b in xs %}[{{ label }}]{% endfor %}{% set label = 'local' %}`
+  rendered `[global]` and the reference renders `[]`. The same held for a
+  generation block, the body of a block set and a macro in place of the
+  loop. The interpreter now resolves ownership once at compile, for the top
+  level, a for body, a macro body, the body of a block set and a generation
+  block, and each scope starts with the names it owns that way undefined.
+  The body of a block set is a scope of its own, so what it assigns ends
+  with it, and a `break` inside one ends the enclosing loop. A macro
+  parameter's default is evaluated in the macro's scope, where it reads the
+  parameters before it and the top level, not the caller's names. `reads()`
+  follows the same ownership. A render differs only for a template that
+  re-binds a name the render supplies after a nested scope has read it, a
+  shape none of the supported templates has. The cases of
+  `chat_template_scope_owns_the_names_it_assigns_from_its_first_statement`,
+  `chat_template_block_set_and_macro_bodies_are_scopes` and
+  `chat_template_scope_ownership_decides_the_global_reads` are the
+  reference's strings, and `chat_template_generator_test` holds the
+  generator's environment, its generation block included, to the same
+  strings.
 - **The chat template interpreter reads transformers' `{% generation %}`
   block**: the `Qwen/Qwen3.8-Flash-Next-FP8` repository's template now wraps
   the assistant turn in `{% generation %}` ... `{% endgeneration %}`,
