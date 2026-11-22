@@ -22,6 +22,21 @@ import prepare_data
 import site_env
 
 
+def shipped_scripts():
+    """Names of the files scripts/ ships. In a checkout that is what Git
+    tracks, because a working tree may also hold local files. Elsewhere it is
+    every file in the directory."""
+    try:
+        listed = subprocess.run(["git", "-C", str(ROOT), "ls-files", "-z", "--", "scripts"],
+                                capture_output=True, text=True, timeout=30)
+    except OSError:
+        listed = None
+    if listed is not None and listed.returncode == 0 and listed.stdout:
+        names = (name.partition("/")[2] for name in listed.stdout.split("\0") if name)
+        return sorted(name for name in names if "/" not in name)
+    return sorted(path.name for path in (ROOT / "scripts").iterdir() if path.is_file())
+
+
 class PortabilityTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -262,9 +277,8 @@ class PortabilityTest(unittest.TestCase):
 
     def test_scripts_index_and_setup_document_links(self):
         index = (ROOT / "scripts/README.md").read_text()
-        for path in (ROOT / "scripts").iterdir():
-            if path.is_file():
-                self.assertIn(f"[{path.name}]({path.name})", index)
+        for name in shipped_scripts():
+            self.assertIn(f"[{name}]({name})", index)
         for name in ("README.md", "CONTRIBUTING.md", "deploy/README.md", "scripts/README.md", "docs/getting-started.md", "docs/dependencies.md", "docs/networking.md", "docs/testing.md", "docs/operations.md"):
             source = ROOT / name
             for target in re.findall(r"\[[^\]]+\]\(([^)]+)\)", source.read_text()):
