@@ -5,6 +5,31 @@ project procedures and design guidance live in `docs/`.
 
 ## Unreleased
 
+- **A scheduled step verifies only the drafts its request holds, with a
+  single scheduled depth too** (issue #193): with
+  `engine.mtp_schedule_options` 1 the policy's only option is the full
+  block, and under `engine.mtp_schedule_max_live` a step past the limit
+  drafts `engine.mtp_schedule_min_depth` tokens only. The first step a
+  request took back under the limit capped its depth at the drafts it held
+  and then rounded up to the next option, which was the full block, so it
+  verified rows its last replay had not drafted. A greedy request decided
+  the same tokens (such a row holds a token that stands only when it is the
+  model's own pick) and paid a verify row for nothing. A sampled request
+  could test a draft against a proposal the draft was not drawn from: after
+  a row-batched narrow step when the older proposal's token was id 0, and
+  after scalar narrow steps on the older draft itself. The option set now
+  carries a refill option beside a single policy option, the minimum depth
+  verified and the whole block drafted. The step after a narrow one takes
+  it and the full depth follows. For every set the chosen option is bounded
+  by the drafts the request holds, and the engine refuses a choice past
+  them. A set with two or more options, the default, chooses exactly as it
+  did. `verify_schedule_test` builds every option set of a 2 to 7 draft
+  block and checks every choice, `glm_dsa_engine_test` holds the issue's
+  sequence to one refill step
+  (`scheduled_verify_depth_single_option_refills_after_the_narrow_batch`)
+  and runs seeded random arrivals of greedy and sampled requests against
+  its own count of the drafts each slot holds
+  (`scheduled_verify_depth_random_walks_verify_only_the_drafts_held`).
 - **A chat template's names belong to the scope that assigns them, as in
   the reference**: jinja2 decides from the syntax tree which scope owns a
   name. A scope that assigns a name owns it for its whole extent, and when

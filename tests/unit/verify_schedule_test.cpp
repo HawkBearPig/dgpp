@@ -7,7 +7,10 @@
 // at the first draft that falls below -- S_i is monotone, so kept drafts are a
 // prefix. Larger lambda (time more valuable) => shallower; a larger fixed base
 // lowers the reservation lambda => deeper (amortization).
+#include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -133,6 +136,205 @@ DGPP_TEST(verify_schedule_adaptive_lambda_converges_to_the_modeled_throughput) {
   double a = 0.045, b = 0.045;
   for (int i = 0; i < 100; ++i) { a = dgpp::verify_lambda_update(a, 7, 12, 28.f, 8.f, 1.0 / 64.0); b = dgpp::verify_lambda_update(b, 7, 12, 28.f, 8.f, 1.0 / 64.0); }
   require(a == b, "the same inputs give the same doubles");
+}
+
+// ---- The option set and the option a step replays ----
+// engine.mtp_schedule_options and engine.mtp_schedule_max_live decide the
+// set; a step's option follows the policy's depth and the drafts its slot
+// holds. These pin that a step never verifies a draft its slot's last replay
+// did not write, on every set the engine can build.
+
+namespace {
+using dgpp::VerifyDepthOptions;
+
+int option_of(const VerifyDepthOptions& s, int k, int available) {
+  return dgpp::verify_depth_option(s.depths, s.first_block, s.first_policy, k, available);
+}
+int drafts_of(const VerifyDepthOptions& s, int option, int depth) {
+  return dgpp::verify_depth_option_drafts(s.depths, s.first_block, option, depth);
+}
+// The policy's own choice: its lowest option covering k, the full block when
+// none does.
+int policy_choice(const VerifyDepthOptions& s, int k) {
+  for (int i = s.first_policy; i < static_cast<int>(s.depths.size()); ++i)
+    if (s.depths[static_cast<size_t>(i)] >= k) return i;
+  return static_cast<int>(s.depths.size()) - 1;
+}
+std::string set_text(int depth, int min_depth, int options, bool narrow) {
+  return "depth " + std::to_string(depth) + " min " + std::to_string(min_depth) + " options " +
+         std::to_string(options) + (narrow ? " with the live limit" : "");
+}
+void require_at(bool c, const std::string& where, const char* w) {
+  if (!c) throw std::runtime_error(where + ": " + w);
+}
+// Every set the engine builds: a block of 2 to 7 drafts, a minimum under it,
+// one option up to every depth of the span, with and without the live limit.
+template <class F>
+void for_every_set(F&& f) {
+  for (int depth = 2; depth <= 7; ++depth)
+    for (int min_depth = 1; min_depth < depth; ++min_depth)
+      for (int options = 1; options <= depth - min_depth + 1; ++options)
+        for (const bool narrow : {false, true})
+          f(depth, min_depth, options, narrow, dgpp::verify_depth_option_set(depth, min_depth, options, narrow));
+}
+uint64_t next_random(uint64_t* s) {
+  *s ^= *s << 13;
+  *s ^= *s >> 7;
+  *s ^= *s << 17;
+  return *s;
+}
+}  // namespace
+
+DGPP_TEST(verify_schedule_options_spread_evenly_and_keep_the_full_block) {
+  const auto depths = [](int depth, int min_depth, int options, bool narrow) {
+    return dgpp::verify_depth_option_set(depth, min_depth, options, narrow).depths;
+  };
+  require(depths(4, 1, 3, false) == std::vector<int>{1, 3, 4}, "three options on a 4-draft block are 1, 3 and 4");
+  require(depths(2, 1, 2, false) == std::vector<int>{1, 2}, "two options on a 2-draft block are both depths");
+  require(depths(2, 1, 1, false) == std::vector<int>{2}, "one option is the full block");
+  require(depths(7, 1, 4, false) == std::vector<int>{1, 3, 5, 7}, "four options on a 7-draft block");
+  require(depths(5, 3, 2, false) == std::vector<int>{3, 5}, "the spread starts at the minimum depth");
+  // The live limit puts the narrow option first. The policy's options follow
+  // it, and a set whose policy has a minimum-depth option needs no other.
+  const VerifyDepthOptions two = dgpp::verify_depth_option_set(2, 1, 2, true);
+  require(two.depths == std::vector<int>{1, 1, 2} && two.first_block == 1 && two.first_policy == 1 && two.narrow() &&
+              !two.refill(),
+          "the narrow option stands before the policy's two");
+  const VerifyDepthOptions four = dgpp::verify_depth_option_set(4, 1, 3, true);
+  require(four.depths == std::vector<int>{1, 1, 3, 4} && four.first_policy == 1 && !four.refill(),
+          "the narrow option stands before the policy's three");
+  // A single option under the limit: the refill option between the two.
+  const VerifyDepthOptions one = dgpp::verify_depth_option_set(2, 1, 1, true);
+  require(one.depths == std::vector<int>{1, 1, 2} && one.first_block == 1 && one.first_policy == 2 && one.refill(),
+          "a single option under the limit carries the refill option");
+  const VerifyDepthOptions deep = dgpp::verify_depth_option_set(4, 2, 1, true);
+  require(deep.depths == std::vector<int>{2, 2, 4} && deep.first_policy == 2 && deep.refill(),
+          "the refill option verifies the minimum depth");
+  const VerifyDepthOptions plain = dgpp::verify_depth_option_set(2, 1, 1, false);
+  require(plain.first_block == 0 && plain.first_policy == 0 && !plain.narrow() && !plain.refill(),
+          "no limit: the policy's options alone");
+}
+
+DGPP_TEST(verify_schedule_single_option_refills_the_block_after_a_narrow_step) {
+  // Two drafts, a minimum of one, a single option and a live limit: two
+  // requests share narrow steps that draft one token each. When one retires
+  // the other holds one draft. Its first step alone verifies that one and
+  // drafts the block, and the full depth follows.
+  const int depth = 2;
+  const VerifyDepthOptions s = dgpp::verify_depth_option_set(depth, 1, 1, true);
+  for (int k = 0; k <= depth + 1; ++k)
+    require(option_of(s, k, depth) == 2, "a slot holding the block verifies it whatever the policy asks");
+  const int after_narrow = drafts_of(s, 0, depth);
+  require(after_narrow == 1, "the narrow option drafts the minimum depth");
+  for (int k = 0; k <= depth + 1; ++k) {
+    const int first_alone = option_of(s, k, after_narrow);
+    require(first_alone == 1 && s.depths[1] == 1, "the first step alone verifies the one draft it holds");
+    require(drafts_of(s, first_alone, depth) == depth, "and drafts the whole block");
+  }
+  require(option_of(s, depth, drafts_of(s, 1, depth)) == 2, "the step after it verifies the full depth");
+}
+
+DGPP_TEST(verify_schedule_option_stays_within_the_drafts_a_slot_holds) {
+  int sets = 0, choices = 0;
+  for_every_set([&](int depth, int min_depth, int options, bool narrow, const VerifyDepthOptions& s) {
+    const std::string where = set_text(depth, min_depth, options, narrow);
+    const int count = static_cast<int>(s.depths.size());
+    ++sets;
+    // The set's shape.
+    require_at(s.depths.back() == depth, where, "the last option is the full block");
+    require_at(s.first_block == (narrow ? 1 : 0) && s.first_policy >= s.first_block && s.first_policy < count, where,
+               "the narrow option, then the block-drafting ones");
+    require_at(s.refill() == (narrow && options == 1), where,
+               "the refill option stands exactly beside a single option under the limit");
+    require_at(s.first_policy - s.first_block <= 1, where, "at most one refill option");
+    if (narrow)
+      require_at(s.depths[0] == min_depth && s.depths[static_cast<size_t>(s.first_block)] == min_depth, where,
+                 "a block-drafting option at the narrow option's depth");
+    for (int i = s.first_policy; i < count; ++i) {
+      require_at(s.depths[static_cast<size_t>(i)] >= min_depth && s.depths[static_cast<size_t>(i)] <= depth, where,
+                 "a policy option outside [min_depth, depth]");
+      if (i > s.first_policy)
+        require_at(s.depths[static_cast<size_t>(i)] > s.depths[static_cast<size_t>(i - 1)], where,
+                   "the policy's options ascend");
+    }
+    require_at(count - s.first_policy <= options, where, "more policy options than asked for");
+    if (options > 1)
+      require_at(s.depths[static_cast<size_t>(s.first_policy)] == min_depth, where,
+                 "two or more options start at the minimum depth");
+    // Every choice. A slot holds the block, or what a narrow step drafted
+    // (the minimum depth). The depths between are checked under the limit
+    // too: the rule holds for any count the minimum-depth options cover.
+    for (int available = narrow ? min_depth : depth; available <= depth; ++available)
+      for (int k = -1; k <= depth + 2; ++k) {
+        ++choices;
+        const int option = option_of(s, k, available);
+        require_at(option >= s.first_block && option < count, where, "a policy depth took the narrow option");
+        require_at(s.depths[static_cast<size_t>(option)] <= available, where,
+                   "a step verifies more drafts than its slot holds");
+        const int policy = policy_choice(s, k);
+        if (s.depths[static_cast<size_t>(policy)] <= available) {
+          require_at(option == policy, where, "the policy's own option fits the drafts available and was not taken");
+        } else {
+          require_at(option < policy, where, "an option the drafts available do not cover");
+          require_at(s.depths[static_cast<size_t>(option + 1)] > available, where,
+                     "a deeper block-drafting option fits the drafts available");
+        }
+        require_at(drafts_of(s, option, depth) == depth, where, "a step under the limit drafts the whole block");
+        // A set whose policy has an option at the minimum depth, and any set
+        // without the limit, rounds up exactly as it did before the drafts
+        // available bounded the chosen option. Only the states a slot
+        // reaches are compared.
+        if (!s.refill() && (available == depth || available == min_depth)) {
+          const int clamped = std::min(std::max(k, min_depth), depth);
+          require_at(option == policy_choice(s, std::min(clamped, available)), where,
+                     "a set with a minimum-depth policy option chooses differently");
+        }
+      }
+  });
+  require(sets == 2 * (2 + 5 + 9 + 14 + 20 + 27), "every option set was built");
+  require(choices > 2000, "every choice was checked");
+}
+
+DGPP_TEST(verify_schedule_option_walk_returns_to_the_policy_after_a_narrow_step) {
+  // Random runs of steps over every set: a step past the live limit takes
+  // the narrow option, any other the option the rule gives for a random
+  // policy depth. No step verifies past what the step before it drafted, a
+  // slot is back on the policy's own options one step after it leaves the
+  // limit, and the refill option is taken only by that one step.
+  const char* env = std::getenv("DGPP_TEST_SCHEDULE_WALK_RUNS");
+  const int runs = env != nullptr ? std::max(1, std::atoi(env)) : 64;
+  uint64_t rng = 0x9E3779B97F4A7C15ull;
+  uint64_t steps = 0, narrow_steps = 0, refill_steps = 0;
+  for_every_set([&](int depth, int min_depth, int options, bool narrow, const VerifyDepthOptions& s) {
+    const std::string where = set_text(depth, min_depth, options, narrow);
+    for (int run = 0; run < runs; ++run) {
+      int available = depth;  // a request opens holding the block
+      bool last_narrow = false;
+      for (int step = 0; step < 48; ++step) {
+        const bool gated = narrow && next_random(&rng) % 3 == 0;
+        const int k = static_cast<int>(next_random(&rng) % static_cast<uint64_t>(depth + 2));
+        const int option = gated ? 0 : option_of(s, std::min(k, available), available);
+        ++steps;
+        require_at(s.depths[static_cast<size_t>(option)] <= available, where,
+                   "a step verifies more drafts than the step before it drafted");
+        if (gated) {
+          ++narrow_steps;
+        } else {
+          require_at(option >= s.first_block, where, "a step under the limit took the narrow option");
+          const bool refill = s.refill() && option == s.first_block;
+          if (refill) ++refill_steps;
+          require_at(refill == (s.refill() && last_narrow), where,
+                     "the refill option belongs to the step after a narrow one, and to no other");
+          if (!last_narrow)
+            require_at(option == policy_choice(s, k), where, "a slot holding the block takes the policy's own option");
+        }
+        available = drafts_of(s, option, depth);
+        require_at(available == (gated ? min_depth : depth), where, "the drafts a step leaves");
+        last_narrow = gated;
+      }
+    }
+  });
+  require(steps > 0 && narrow_steps > 0 && refill_steps > 0, "the walk reached the narrow and the refill options");
 }
 
 DGPP_TEST(verify_schedule_degenerate_block) {
