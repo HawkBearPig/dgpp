@@ -614,11 +614,12 @@ struct SchedOutcome {
   std::vector<int> options;
   std::vector<uint64_t> hist, batch_hist;
   int steps_a = 0, steps_batch = 0, steps_b_alone = 0;
+  int first_alone_option = -1;  // the option B's first step alone replayed
 };
 
 void rank_work_sched(int r, const GlmDsaTextConfig& cfg, const std::string& dir, const std::vector<int64_t>& A,
                      const std::vector<int64_t>& B, const std::vector<int64_t>& C, CollectiveBus* bus,
-                     ConstructBarrier* barrier, SchedOutcome* out, int max_live = 0) {
+                     ConstructBarrier* barrier, SchedOutcome* out, int max_live = 0, int max_options = 0) {
   bool arrived = false;
   const auto arrive_once = [&] {
     if (arrived) return;
@@ -654,7 +655,7 @@ void rank_work_sched(int r, const GlmDsaTextConfig& cfg, const std::string& dir,
                                           dgpp::kSamplingCandidates, nullptr, 0, /*mtp_depth=*/depth);
       require(eng.supports_sampling(), "the world has the device sampler (the draft probabilities' source)");
       eng.configure_verify_schedule(true, /*row_ms=*/12.0f, dgpp::verify_reservation_lambda(50.0f, 12.0f), 1,
-                                    /*base_ms=*/0.f, /*adapt=*/false, /*max_options=*/0, max_live);
+                                    /*base_ms=*/0.f, /*adapt=*/false, max_options, max_live);
       out->options = eng.verify_depth_options();
       int step = 0;
       eng.set_verify_depth_hook([&](int, int, const float*, int) { return 1 + (step++ % 2); });
@@ -700,7 +701,13 @@ void rank_work_sched(int r, const GlmDsaTextConfig& cfg, const std::string& dir,
         return k;
       });
       while (out->sb.size() < static_cast<size_t>(kSteps) + 1) {
+        const std::vector<uint64_t> before = eng.verify_depth_histogram();
         const std::vector<int32_t> t = eng.step(1);
+        if (out->steps_b_alone == 0) {
+          const std::vector<uint64_t> after = eng.verify_depth_histogram();
+          for (size_t i = 0; i < after.size(); ++i)
+            if (after[i] != before[i]) out->first_alone_option = static_cast<int>(i);
+        }
         require(!t.empty() && t.size() <= 3, "sched post-batch step shape");
         out->sb.insert(out->sb.end(), t.begin(), t.end());
         ++out->steps_b_alone;
@@ -736,7 +743,7 @@ DGPP_TEST(glm_dsa_engines_loopback_world_2_scheduled_verify_depth_from_draft_pro
   std::vector<std::thread> workers;
   for (int r = 0; r < kWorld; ++r)
     workers.emplace_back(rank_work_sched, r, std::cref(cfg), std::cref(dir), std::cref(A), std::cref(B), std::cref(C),
-                         buses[static_cast<size_t>(r)].get(), &barrier, &outs[static_cast<size_t>(r)], /*max_live=*/0);
+                         buses[static_cast<size_t>(r)].get(), &barrier, &outs[static_cast<size_t>(r)], /*max_live=*/0, /*max_options=*/0);
   for (auto& t : workers) t.join();
   for (int r = 0; r < kWorld; ++r) require(outs[static_cast<size_t>(r)].error.empty(), outs[static_cast<size_t>(r)].error);
   for (int r = 1; r < kWorld; ++r)
@@ -786,7 +793,7 @@ DGPP_TEST(glm_dsa_engines_loopback_world_2_scheduled_verify_depth_narrows_past_o
   std::vector<std::thread> workers;
   for (int r = 0; r < kWorld; ++r)
     workers.emplace_back(rank_work_sched, r, std::cref(cfg), std::cref(dir), std::cref(A), std::cref(B), std::cref(C),
-                         buses[static_cast<size_t>(r)].get(), &barrier, &outs[static_cast<size_t>(r)], /*max_live=*/1);
+                         buses[static_cast<size_t>(r)].get(), &barrier, &outs[static_cast<size_t>(r)], /*max_live=*/1, /*max_options=*/0);
   for (auto& t : workers) t.join();
   for (int r = 0; r < kWorld; ++r) require(outs[static_cast<size_t>(r)].error.empty(), outs[static_cast<size_t>(r)].error);
   for (int r = 1; r < kWorld; ++r)
@@ -815,6 +822,442 @@ DGPP_TEST(glm_dsa_engines_loopback_world_2_scheduled_verify_depth_narrows_past_o
   for (const uint64_t h : o.hist) total += h;
   require(total == static_cast<uint64_t>(o.steps_a + o.steps_b_alone), "the histogram counts every scalar replay");
   require(o.steps_b_alone > 0, "B stepped alone after the narrow batch");
+  require(o.first_alone_option == 1,
+          "B's first step alone, forced to the whole block, verifies the one draft the narrow batch left it");
+}
+
+// One scheduled depth under the live limit (engine.mtp_schedule_options 1
+// with engine.mtp_schedule_max_live 1): the policy's only option is the full
+// block, and a narrow batch leaves each request one draft. The first step a
+// request takes alone replays the refill option, which verifies that draft
+// and drafts the block, and every step after it verifies the full depth.
+DGPP_TEST(glm_dsa_engines_loopback_world_2_scheduled_verify_depth_single_option_refills_after_the_narrow_batch) {
+  const GlmDsaTextConfig cfg = glmdsafx::tiny_config();
+  const std::string dir = "glm_dsa_engine_fixture";
+  glmdsafx::write_fixture(cfg, dir);
+  const std::vector<int64_t> A = smoke_tokens(cfg, 23, 0x9E3779B97F4A7C15ull);
+  const std::vector<int64_t> B = smoke_tokens(cfg, 17, 0xD1B54A32D192ED03ull);
+  const std::vector<int64_t> C = smoke_tokens(cfg, 11, 0x2545F4914F6CDD1Dull);
+  std::vector<std::unique_ptr<CollectiveBus>> buses = start_world(kWorld, 30020);
+  require(!buses.empty(), "the loopback bus world failed to start");
+  std::vector<SchedOutcome> outs(kWorld);
+  ConstructBarrier barrier(kWorld);
+  std::vector<std::thread> workers;
+  for (int r = 0; r < kWorld; ++r)
+    workers.emplace_back(rank_work_sched, r, std::cref(cfg), std::cref(dir), std::cref(A), std::cref(B), std::cref(C),
+                         buses[static_cast<size_t>(r)].get(), &barrier, &outs[static_cast<size_t>(r)], /*max_live=*/1,
+                         /*max_options=*/1);
+  for (auto& t : workers) t.join();
+  for (int r = 0; r < kWorld; ++r) require(outs[static_cast<size_t>(r)].error.empty(), outs[static_cast<size_t>(r)].error);
+  for (int r = 1; r < kWorld; ++r)
+    require(outs[static_cast<size_t>(r)].sa == outs[0].sa && outs[static_cast<size_t>(r)].sb == outs[0].sb &&
+                outs[static_cast<size_t>(r)].sc == outs[0].sc && outs[static_cast<size_t>(r)].hist == outs[0].hist &&
+                outs[static_cast<size_t>(r)].first_alone_option == outs[0].first_alone_option,
+            "the ranks' single-option transcripts or depths differ");
+  const Ref ref = world1_reference(cfg, dir, A, B, C);
+  const SchedOutcome& o = outs[0];
+  std::string hist, bhist;
+  for (size_t i = 0; i < o.hist.size(); ++i)
+    hist += (i ? " " : "") + std::to_string(o.options[i]) + ":" + std::to_string(o.hist[i]);
+  for (size_t i = 0; i < o.batch_hist.size(); ++i)
+    bhist += (i ? " " : "") + std::to_string(o.options[i]) + ":" + std::to_string(o.batch_hist[i]);
+  DGPP_LOG_INFO("world 2 scheduled depth, one option and one live request at most: options {} | A {} ({} steps) | B {} "
+                "({} alone, the first at option {}) | C {} | scalar [{}] | batched [{}]",
+                ids_text(o.options), ids_text(o.sa), o.steps_a, ids_text(o.sb), o.steps_b_alone, o.first_alone_option,
+                ids_text(o.sc), hist, bhist);
+  require(o.options == std::vector<int>{1, 1, 2}, "the narrow option, the refill option, the full block");
+  require(o.sa == o.ea, "the single-option scalar transcript of A differs from the plain eager engine's");
+  engine_ties::require_agrees_or_tie(o.sb, o.eb, ref.bm, kTieMargin, kAgreePositions, "the single-option transcript of B");
+  engine_ties::require_agrees_or_tie(o.sc, o.ec, ref.cm, kTieMargin, kAgreePositions,
+                                     "the single-option batched transcript of C");
+  require(o.batch_hist.size() == 3 && o.batch_hist[0] == static_cast<uint64_t>(o.steps_batch) && o.batch_hist[1] == 0 &&
+              o.batch_hist[2] == 0,
+          "every two-request step took the narrow option");
+  require(o.steps_b_alone > 1, "B stepped alone after the narrow batch, more than once");
+  require(o.first_alone_option == 1, "B's first step alone verifies the one draft the narrow batch left it");
+  require(o.hist.size() == 3 && o.hist[0] == 0 && o.hist[1] == 1 &&
+              o.hist[2] == static_cast<uint64_t>(o.steps_a + o.steps_b_alone - 1),
+          "one refill step, and the full block on every other step a request takes alone");
+}
+
+// ---- The scheduled verify depth under random arrivals ----
+// Requests open, decode together and retire in a seeded random order on an
+// engine with a live limit, greedy ones and sampled ones. The walk keeps its
+// own count of the drafts every slot holds, from the option each replay took
+// (read off the depth histograms), and holds every step to it: a step past
+// the limit takes the narrow option and no other does, no step verifies a
+// draft its slot's last replay did not write, and a slot is back on the
+// policy's options one step after it leaves the limit. The same walk runs
+// twice on the one engine, where the slots start from different leftovers,
+// and every transcript repeats. A greedy request that only scalar replays
+// carried is the eager engine's transcript exactly.
+struct WalkConfig {
+  const char* name;
+  uint16_t port;
+  int max_options;     // engine.mtp_schedule_options
+  int max_live;        // engine.mtp_schedule_max_live
+  int batch_min_live;  // the row batch's crossover
+  int max_open;        // the walk's live requests at most
+};
+
+struct WalkRequest {
+  std::vector<int64_t> prompt;
+  int tokens = 0;  // decided tokens after the prefill's
+  bool sampled = false;
+  uint64_t seed = 0;
+};
+
+struct WalkOutcome {
+  std::string error;
+  std::vector<int> options;
+  std::vector<std::vector<int32_t>> eager;    // per request: the eager engine's transcript (greedy requests)
+  std::vector<std::vector<int32_t>> pass[2];  // per request: the graph engine's, the walk run twice
+  std::vector<char> sampled, batched;         // per request: sampled; a row-batched replay carried it
+  uint64_t steps = 0, narrow = 0, refill = 0, fallbacks = 0;
+};
+
+constexpr int kWalkRequests = 5;
+constexpr int kWalkDepth = 2;
+constexpr int kWalkMinDepth = 1;
+
+uint64_t walk_random(uint64_t* s) {
+  *s ^= *s << 13;
+  *s ^= *s >> 7;
+  *s ^= *s << 17;
+  return *s;
+}
+
+uint64_t walk_seed(int walk) { return 0xA5B35705F1E4D3C7ull + 0x9E3779B97F4A7C15ull * static_cast<uint64_t>(walk + 1); }
+
+std::vector<WalkRequest> walk_plan(const GlmDsaTextConfig& cfg, uint64_t seed) {
+  std::vector<WalkRequest> plan(kWalkRequests);
+  uint64_t s = seed;
+  for (WalkRequest& q : plan) {
+    const int n = 8 + static_cast<int>(walk_random(&s) % 14);
+    q.prompt = smoke_tokens(cfg, n, walk_random(&s) | 1);
+    q.tokens = 8 + static_cast<int>(walk_random(&s) % 18);
+    q.sampled = walk_random(&s) % 3 == 0;
+    q.seed = walk_random(&s);
+  }
+  return plan;
+}
+
+void run_walk(GraphEngineAdapter<GlmDsaModel>& eng, const WalkConfig& wc, int families,
+              const std::vector<WalkRequest>& plan, uint64_t seed, std::vector<int>* forced,
+              std::vector<std::vector<int32_t>>* transcripts, std::vector<char>* batched, WalkOutcome* out) {
+  const int depth = kWalkDepth, min_depth = kWalkMinDepth;
+  const std::vector<int> options = eng.verify_depth_options();
+  const int count = static_cast<int>(options.size());
+  const int first_block = wc.max_live > 0 ? 1 : 0;
+  const bool has_refill = wc.max_live > 0 && wc.max_options == 1;
+  const int first_policy = first_block + (has_refill ? 1 : 0);
+  // The option the engine owes a step whose policy depth is k and whose
+  // slots hold `held` drafts: the policy's lowest option covering k, or the
+  // block-drafting option at the minimum depth when the slots hold less.
+  const auto owed = [&](int k, int held) {
+    k = std::clamp(std::min(k, held), min_depth, depth);
+    int option = count - 1;
+    for (int i = first_policy; i < count; ++i)
+      if (options[static_cast<size_t>(i)] >= k) {
+        option = i;
+        break;
+      }
+    if (options[static_cast<size_t>(option)] > held) option = first_block;
+    return option;
+  };
+  std::vector<int> slot_request(kSlots, -1), held(kSlots, depth);
+  std::vector<char> fresh(kSlots, 1);
+  uint64_t rng = seed;
+  size_t next = 0;
+  int tick = 0;
+  const auto where = [&] {
+    return std::string(wc.name) + ", walk seed " + std::to_string(seed) + ", tick " + std::to_string(tick);
+  };
+  const auto histograms = [&] {
+    std::vector<std::vector<uint64_t>> h;
+    h.push_back(eng.verify_depth_histogram());
+    for (int f = 0; f < families; ++f) h.push_back(eng.verify_depth_histogram_batch(f));
+    return h;
+  };
+  for (;; ++tick) {
+    require(tick < 4000, where() + ": the walk does not end");
+    int live = 0, sampled_slot = -1;
+    for (int s = 0; s < kSlots; ++s)
+      if (slot_request[static_cast<size_t>(s)] >= 0) {
+        ++live;
+        if (plan[static_cast<size_t>(slot_request[static_cast<size_t>(s)])].sampled) sampled_slot = s;
+      }
+    if (next == plan.size() && live == 0) break;
+    // An arrival: always into an idle engine, else one tick in three. A
+    // sampled request waits for the one before it, so a fallback in a step
+    // is the one sampled slot's.
+    if (next < plan.size() && live < wc.max_open && !(plan[next].sampled && sampled_slot >= 0) &&
+        (live == 0 || walk_random(&rng) % 3 == 0)) {
+      int slot = 0;
+      while (slot_request[static_cast<size_t>(slot)] >= 0) ++slot;
+      const WalkRequest& q = plan[next];
+      eng.drain();
+      if (q.sampled) {
+        // Half the sampled requests keep a top-k the device's candidates
+        // hold, so the device decides their steps. The others draw from the
+        // whole vocabulary, which on this fixture mostly ends in the host's
+        // fallback and its re-draft.
+        dgpp::sample::Params params;
+        params.temperature = 1.0f;
+        if (q.seed & 1) params.top_k = 20;
+        eng.configure_sampling(slot, params, q.seed);
+        sampled_slot = slot;
+      }
+      (*transcripts)[next].push_back(eng.prefill(slot, q.prompt));
+      eng.reserve(slot, static_cast<int64_t>(q.prompt.size()) + q.tokens + depth + 2);
+      slot_request[static_cast<size_t>(slot)] = static_cast<int>(next++);
+      held[static_cast<size_t>(slot)] = depth;  // the eager first drafts are the block
+      fresh[static_cast<size_t>(slot)] = 1;
+    }
+    std::vector<int> reqs;
+    for (int s = 0; s < kSlots; ++s)
+      if (slot_request[static_cast<size_t>(s)] >= 0) reqs.push_back(s);
+    if (reqs.empty()) continue;
+    const bool gated = wc.max_live > 0 && static_cast<int>(reqs.size()) > wc.max_live;
+    for (const int s : reqs)
+      (*forced)[static_cast<size_t>(s)] = static_cast<int>(walk_random(&rng) % static_cast<uint64_t>(depth + 2));
+    const std::vector<std::vector<uint64_t>> before = histograms();
+    const uint64_t fallbacks_before = eng.fallbacks();
+    const std::vector<std::vector<int32_t>> got = eng.step_batch(reqs);
+    const std::vector<std::vector<uint64_t>> after = histograms();
+    require(got.size() == reqs.size(), where() + ": the step's shape");
+    ++out->steps;
+    // The step's replays, by the options the histograms counted.
+    std::vector<int> scalar(static_cast<size_t>(count), 0);
+    int batch_option = -1, batch_replays = 0, scalar_replays = 0;
+    for (int i = 0; i < count; ++i) {
+      scalar[static_cast<size_t>(i)] = static_cast<int>(after[0][static_cast<size_t>(i)] - before[0][static_cast<size_t>(i)]);
+      scalar_replays += scalar[static_cast<size_t>(i)];
+      for (int f = 0; f < families; ++f) {
+        const int d = static_cast<int>(after[static_cast<size_t>(1 + f)][static_cast<size_t>(i)] -
+                                       before[static_cast<size_t>(1 + f)][static_cast<size_t>(i)]);
+        if (d > 0) batch_option = i;
+        batch_replays += d;
+      }
+    }
+    const bool rode_batch = batch_replays > 0;
+    require(rode_batch ? batch_replays == 1 && scalar_replays == 0 : scalar_replays == static_cast<int>(reqs.size()),
+            where() + ": one row-batched replay, or one scalar replay a request");
+    // What the engine owed each slot, and what it replayed.
+    std::vector<int> option_of(kSlots, -1);
+    std::vector<int> held_sorted, depth_sorted;
+    if (rode_batch) {
+      int low = depth, k = 0;
+      bool whole = false;
+      for (const int s : reqs) {
+        low = std::min(low, held[static_cast<size_t>(s)]);
+        whole = whole || fresh[static_cast<size_t>(s)] ||
+                plan[static_cast<size_t>(slot_request[static_cast<size_t>(s)])].sampled;
+        k = std::max(k, (*forced)[static_cast<size_t>(s)]);
+      }
+      require(options[static_cast<size_t>(batch_option)] <= low,
+              where() + ": the batch verified " + std::to_string(options[static_cast<size_t>(batch_option)]) +
+                  " drafts where a slot held " + std::to_string(low));
+      const int want = gated ? 0 : owed(whole ? low : k, low);
+      require(batch_option == want, where() + ": the batch replayed option " + std::to_string(batch_option) +
+                                        ", owed " + std::to_string(want));
+      for (const int s : reqs) option_of[static_cast<size_t>(s)] = batch_option;
+    } else {
+      std::vector<int> want(static_cast<size_t>(count), 0);
+      for (const int s : reqs) {
+        const bool whole = fresh[static_cast<size_t>(s)] ||
+                           plan[static_cast<size_t>(slot_request[static_cast<size_t>(s)])].sampled;
+        const int h = held[static_cast<size_t>(s)];
+        option_of[static_cast<size_t>(s)] = gated ? 0 : owed(whole ? h : (*forced)[static_cast<size_t>(s)], h);
+        ++want[static_cast<size_t>(option_of[static_cast<size_t>(s)])];
+        held_sorted.push_back(h);
+      }
+      // Whatever the walk expects: the depths the scalar replays verified
+      // fit the drafts the slots held, slot for slot in some order.
+      for (int i = 0; i < count; ++i)
+        for (int n = 0; n < scalar[static_cast<size_t>(i)]; ++n) depth_sorted.push_back(options[static_cast<size_t>(i)]);
+      std::sort(held_sorted.begin(), held_sorted.end());
+      std::sort(depth_sorted.begin(), depth_sorted.end());
+      for (size_t i = 0; i < depth_sorted.size(); ++i)
+        require(depth_sorted[i] <= held_sorted[i],
+                where() + ": a scalar replay verified " + std::to_string(depth_sorted[i]) + " drafts where its slot held " +
+                    std::to_string(held_sorted[i]));
+      std::string seen, owes;
+      for (int i = 0; i < count; ++i) {
+        seen += (i ? " " : "") + std::to_string(scalar[static_cast<size_t>(i)]);
+        owes += (i ? " " : "") + std::to_string(want[static_cast<size_t>(i)]);
+      }
+      require(scalar == want, where() + ": the scalar replays per option were [" + seen + "], owed [" + owes + "]");
+    }
+    for (const int s : reqs)
+      require((option_of[static_cast<size_t>(s)] < first_block) == gated,
+              where() + ": the narrow option belongs to the steps past the live limit, and to every one of them");
+    if (gated) ++out->narrow;
+    bool refilled = false;
+    for (const int s : reqs) refilled = refilled || (has_refill && option_of[static_cast<size_t>(s)] == first_block);
+    if (refilled) ++out->refill;
+    // The drafts each slot holds now, and a host re-draft's block.
+    const uint64_t fell = eng.fallbacks() - fallbacks_before;
+    require(fell == 0 || sampled_slot >= 0, where() + ": a fallback without a sampled request");
+    out->fallbacks += fell;
+    for (size_t i = 0; i < reqs.size(); ++i) {
+      const int s = reqs[i];
+      const int option = option_of[static_cast<size_t>(s)];
+      require(!got[i].empty() && static_cast<int>(got[i].size()) <= 1 + options[static_cast<size_t>(option)],
+              where() + ": a step commits its token and at most the drafts it verified");
+      held[static_cast<size_t>(s)] = option < first_block ? options[static_cast<size_t>(option)] : depth;
+      fresh[static_cast<size_t>(s)] = 0;
+    }
+    if (fell > 0) {
+      held[static_cast<size_t>(sampled_slot)] = depth;
+      fresh[static_cast<size_t>(sampled_slot)] = 1;
+    }
+    for (size_t i = 0; i < reqs.size(); ++i) {
+      const int s = reqs[i];
+      const size_t q = static_cast<size_t>(slot_request[static_cast<size_t>(s)]);
+      std::vector<int32_t>& t = (*transcripts)[q];
+      t.insert(t.end(), got[i].begin(), got[i].end());
+      if (rode_batch) (*batched)[q] = 1;
+      if (static_cast<int>(t.size()) >= 1 + plan[q].tokens) {
+        t.resize(static_cast<size_t>(1 + plan[q].tokens));
+        eng.close(s);
+        slot_request[static_cast<size_t>(s)] = -1;
+      }
+    }
+  }
+  eng.drain();
+}
+
+void rank_work_walk(int r, const GlmDsaTextConfig& cfg, const std::string& dir, const WalkConfig& wc, int walks,
+                    CollectiveBus* bus, ConstructBarrier* barrier, WalkOutcome* out) {
+  bool arrived = false;
+  const auto arrive_once = [&] {
+    if (arrived) return;
+    arrived = true;
+    barrier->arrive_and_wait();
+  };
+  uint16_t* scratch = nullptr;
+  uint16_t* prefix_scratch = nullptr;
+  uint16_t* gather_scratch = nullptr;
+  try {
+    BusBoundaryReducer reducer(*bus, wait_timeout_ms());
+    GlmDsaModel eager(cfg, dir, kMaxTokens, kCache, GlmDsaResidency::Resident, &reducer, r, kWorld, kSlots);
+    GlmDsaModel mtp(cfg, dir, kMaxTokens, kCache, GlmDsaResidency::Resident, &reducer, r, kWorld, kSlots,
+                    /*mtp=*/true, /*decode_rows=*/kSlots * 3, dgpp::LatentFormat::kBf16, /*serving_logits=*/true);
+    DGPP_CUDA_OK(cudaHostAlloc(reinterpret_cast<void**>(&scratch),
+                               sizeof(uint16_t) * dgpp::kPickScratchElems(kWorld), cudaHostAllocDefault));
+    DGPP_CUDA_OK(cudaHostAlloc(reinterpret_cast<void**>(&prefix_scratch),
+                               sizeof(uint16_t) * std::max<size_t>(dgpp::fabric_sampling_prefix_scratch_elems(kWorld), 2),
+                               cudaHostAllocDefault));
+    DGPP_CUDA_OK(cudaHostAlloc(reinterpret_cast<void**>(&gather_scratch),
+                               sizeof(uint16_t) * std::max<size_t>(dgpp::sampling_gather_scratch_elems(cfg.vocab_size), 2),
+                               cudaHostAllocDefault));
+    arrive_once();
+    EagerEngineAdapter<GlmDsaModel> eager_engine(
+        &eager, kSlots, dgpp::make_fabric_pick(bus, r, kWorld, scratch, cfg.vocab_size, wait_timeout_ms()));
+    std::vector<std::vector<WalkRequest>> plans;
+    for (int w = 0; w < walks; ++w) {
+      plans.push_back(walk_plan(cfg, walk_seed(w)));
+      for (const WalkRequest& q : plans.back()) {
+        out->sampled.push_back(q.sampled ? 1 : 0);
+        out->eager.push_back(q.sampled ? std::vector<int32_t>{} : solo(eager_engine, 0, q.prompt, q.tokens));
+      }
+    }
+    {
+      GraphEngineAdapter<GlmDsaModel> eng(&mtp, bus, r, kWorld, scratch, cfg.vocab_size, wait_timeout_ms(),
+                                          wc.batch_min_live, prefix_scratch, gather_scratch,
+                                          dgpp::kSamplingCandidates, nullptr, 0, /*mtp_depth=*/kWalkDepth);
+      require(eng.supports_sampling(), "the world has the device sampler (the draft probabilities' source)");
+      eng.configure_verify_schedule(true, /*row_ms=*/12.0f, dgpp::verify_reservation_lambda(50.0f, 12.0f),
+                                    kWalkMinDepth, /*base_ms=*/0.f, /*adapt=*/false, wc.max_options, wc.max_live);
+      out->options = eng.verify_depth_options();
+      int families = 0;
+      for (;; ++families) {
+        try {
+          (void)eng.verify_depth_histogram_batch(families);
+        } catch (const std::out_of_range&) {
+          break;
+        }
+      }
+      std::vector<int> forced(kSlots, 0);
+      eng.set_verify_depth_hook([&](int req, int, const float*, int) { return forced[static_cast<size_t>(req)]; });
+      for (int pass = 0; pass < 2; ++pass)
+        for (int w = 0; w < walks; ++w) {
+          std::vector<std::vector<int32_t>> transcripts(kWalkRequests);
+          std::vector<char> batched(kWalkRequests, 0);
+          run_walk(eng, wc, families, plans[static_cast<size_t>(w)], walk_seed(w), &forced, &transcripts, &batched, out);
+          for (int q = 0; q < kWalkRequests; ++q) {
+            out->pass[pass].push_back(transcripts[static_cast<size_t>(q)]);
+            if (pass == 0) out->batched.push_back(batched[static_cast<size_t>(q)]);
+          }
+        }
+      eng.drain();
+    }
+    cudaFreeHost(scratch);
+    cudaFreeHost(prefix_scratch);
+    cudaFreeHost(gather_scratch);
+  } catch (const std::exception& e) {
+    if (scratch) cudaFreeHost(scratch);
+    if (prefix_scratch) cudaFreeHost(prefix_scratch);
+    if (gather_scratch) cudaFreeHost(gather_scratch);
+    out->error = "rank " + std::to_string(r) + ": " + e.what();
+    arrive_once();
+  }
+}
+
+DGPP_TEST(glm_dsa_engines_loopback_world_2_scheduled_verify_depth_random_walks_verify_only_the_drafts_held) {
+  const GlmDsaTextConfig cfg = glmdsafx::tiny_config();
+  const std::string dir = "glm_dsa_engine_fixture";
+  glmdsafx::write_fixture(cfg, dir);
+  const char* env = std::getenv("DGPP_TEST_SCHEDULE_WALKS");
+  const int walks = env != nullptr ? std::max(1, std::atoi(env)) : 3;
+  const WalkConfig configs[] = {
+      {"one option, scalar narrow steps", 30021, /*max_options=*/1, /*max_live=*/1, /*batch_min_live=*/3, /*max_open=*/2},
+      {"one option, batched narrow steps", 30022, 1, 1, 2, 3},
+      {"one option, a limit of two", 30023, 1, 2, 2, 3},
+      {"every depth, batched narrow steps", 30024, 0, 1, 2, 3},
+  };
+  for (const WalkConfig& wc : configs) {
+    std::vector<std::unique_ptr<CollectiveBus>> buses = start_world(kWorld, wc.port);
+    require(!buses.empty(), "the loopback bus world failed to start");
+    std::vector<WalkOutcome> outs(kWorld);
+    ConstructBarrier barrier(kWorld);
+    std::vector<std::thread> workers;
+    for (int r = 0; r < kWorld; ++r)
+      workers.emplace_back(rank_work_walk, r, std::cref(cfg), std::cref(dir), std::cref(wc), walks,
+                           buses[static_cast<size_t>(r)].get(), &barrier, &outs[static_cast<size_t>(r)]);
+    for (auto& t : workers) t.join();
+    for (int r = 0; r < kWorld; ++r)
+      require(outs[static_cast<size_t>(r)].error.empty(), std::string(wc.name) + ": " + outs[static_cast<size_t>(r)].error);
+    for (int r = 1; r < kWorld; ++r)
+      require(outs[static_cast<size_t>(r)].pass[0] == outs[0].pass[0] && outs[static_cast<size_t>(r)].pass[1] == outs[0].pass[1] &&
+                  outs[static_cast<size_t>(r)].eager == outs[0].eager && outs[static_cast<size_t>(r)].steps == outs[0].steps &&
+                  outs[static_cast<size_t>(r)].narrow == outs[0].narrow && outs[static_cast<size_t>(r)].refill == outs[0].refill,
+              std::string(wc.name) + ": the ranks' walks differ");
+    const WalkOutcome& o = outs[0];
+    require(o.options == std::vector<int>{1, 1, 2}, std::string(wc.name) + ": the narrow option and two behind it");
+    int greedy = 0, exact = 0, sampled = 0;
+    for (size_t q = 0; q < o.pass[0].size(); ++q) {
+      const std::string which = std::string(wc.name) + ", request " + std::to_string(q);
+      require(o.pass[0][q] == o.pass[1][q], which + ": the walk run again decides differently");
+      if (o.sampled[q]) {
+        ++sampled;
+        continue;
+      }
+      ++greedy;
+      if (o.batched[q]) continue;  // the batched rows' lowering differs: the eager transcript is a tolerance there
+      ++exact;
+      require(o.pass[0][q] == o.eager[q], which + ": the scalar transcript differs from the plain eager engine's");
+    }
+    DGPP_LOG_INFO("world 2 scheduled depth walk ({}): {} walks twice, {} steps, {} past the limit, {} refill steps, "
+                  "{} fallbacks | {} greedy requests ({} the eager transcript exactly), {} sampled",
+                  wc.name, walks, o.steps, o.narrow, o.refill, o.fallbacks, greedy, exact, sampled);
+    require(o.narrow > 0, std::string(wc.name) + ": no step went past the live limit");
+    require((o.refill > 0) == (wc.max_options == 1),
+            std::string(wc.name) + ": the refill option belongs to a single option under the limit");
+    if (wc.batch_min_live > wc.max_open)
+      require(exact == greedy, std::string(wc.name) + ": every greedy request stepped on scalar replays");
+  }
 }
 
 DGPP_TEST(glm_dsa_engines_loopback_world_2_mtp_depth2_graph_matches_plain_decode) {

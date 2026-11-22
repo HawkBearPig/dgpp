@@ -136,4 +136,79 @@ inline int scheduled_verify_depth_batch(const float* const* conf_logit, int slot
   return k;
 }
 
+// The depth options a scheduled step chooses among, in the order the engine
+// indexes them: [narrow] [refill] policy options.
+//
+// The policy's options are `options` depths spread evenly over [min_depth,
+// depth], ascending, the last always the full block (one option is the full
+// block alone). A policy depth rounds UP to the next of them, and each of
+// them drafts the whole block.
+//
+// The narrow option (engine.mtp_schedule_max_live) verifies and drafts the
+// minimum depth only, and every step past the live limit takes it. A slot
+// leaves such a step holding min_depth drafts, so its next step may verify no
+// more than those, and has to draft the whole block again before a deeper
+// option can follow. The policy's own minimum-depth option does that when the
+// policy has one. When it has none (a single option: the full block) the set
+// carries the REFILL option: the minimum depth verified, the whole block
+// drafted, taken only by a step whose slot holds fewer drafts than the
+// policy's lowest option covers.
+struct VerifyDepthOptions {
+  std::vector<int> depths;  // the drafts each option verifies
+  int first_block = 0;      // the first option that drafts the whole block (1 behind the narrow option)
+  int first_policy = 0;     // the first option a policy depth rounds to (past the refill option)
+  bool narrow() const { return first_block > 0; }
+  bool refill() const { return first_policy > first_block; }
+};
+
+inline VerifyDepthOptions verify_depth_option_set(int depth, int min_depth, int options, bool narrow) {
+  std::vector<int> policy;
+  for (int i = 0; i < options; ++i) {
+    const int d = options == 1
+                      ? depth
+                      : min_depth + static_cast<int>(std::lround(static_cast<double>(i) * (depth - min_depth) /
+                                                                 static_cast<double>(options - 1)));
+    if (policy.empty() || policy.back() != d) policy.push_back(d);
+  }
+  if (policy.empty() || policy.back() != depth) policy.push_back(depth);
+  VerifyDepthOptions set;
+  set.depths.reserve(policy.size() + 2);
+  if (narrow) {
+    set.depths.push_back(min_depth);
+    set.first_block = 1;
+    if (policy.front() > min_depth) set.depths.push_back(min_depth);  // the refill option
+  }
+  set.first_policy = static_cast<int>(set.depths.size());
+  set.depths.insert(set.depths.end(), policy.begin(), policy.end());
+  return set;
+}
+
+// The drafts option `option` of a `depth`-draft block leaves in the slot's
+// feed for the next step: its own depth for the narrow option, the block for
+// every other.
+inline int verify_depth_option_drafts(const std::vector<int>& depths, int first_block, int option, int depth) {
+  return option < first_block ? depths[static_cast<size_t>(option)] : depth;
+}
+
+// The option a step replays when the policy asks for `k` drafts and the slot
+// holds `available` (what its last replay drafted): the policy's lowest
+// option covering k, the full block when none does, and never an option
+// deeper than the drafts available, in whose place the deepest block-drafting
+// option within them stands. A draft row past the available ones is an older
+// step's token and proposal, which no verify may test. The caller checks the
+// result against `available`: it exceeds them only when no block-drafting
+// option fits, which a set built by verify_depth_option_set never leaves.
+inline int verify_depth_option(const std::vector<int>& depths, int first_block, int first_policy, int k,
+                               int available) {
+  const int count = static_cast<int>(depths.size());
+  int option = count - 1;
+  for (int i = first_policy; i < count; ++i)
+    if (depths[static_cast<size_t>(i)] >= k) {
+      option = i;
+      break;
+    }
+  while (option > first_block && depths[static_cast<size_t>(option)] > available) --option;
+  return option;
+}
+
 }  // namespace dgpp

@@ -599,8 +599,10 @@ class GraphEngineAdapter final : public sched::SchedulerEngine {
     }
     if (schedule_) {
       // The narrow option (index 0 when on) verifies and drafts the minimum depth: "1n".
+      // The refill option behind it verifies that depth and drafts the block: "1r".
       const auto label = [&](size_t i) {
-        return std::format("{}{}", depth_options_[i], sched_narrow_ && i == 0 ? "n" : "");
+        return std::format("{}{}", depth_options_[i],
+                           sched_narrow_ && i == 0 ? "n" : sched_refill_ && i == 1 ? "r" : "");
       };
       std::string hist;
       for (size_t i = 0; i < depth_options_.size(); ++i)
@@ -899,6 +901,7 @@ class GraphEngineAdapter final : public sched::SchedulerEngine {
         throw std::logic_error(
             "graph engine: configure_verify_schedule after a capture");
     sched_narrow_ = false;
+    sched_refill_ = false;
     sched_max_live_ = 0;
     record_drafts_ = 0;
     if (!on) {
@@ -989,17 +992,6 @@ class GraphEngineAdapter final : public sched::SchedulerEngine {
             "graph engine: the confidence covers " +
             std::to_string(conf_rows_) + " positions, the verify depth is " +
             std::to_string(depth_));
-      depth_options_.clear();
-      for (int i = 0; i < options; ++i) {
-        const int d = options == 1
-                          ? depth_
-                          : min_depth + static_cast<int>(std::lround(
-                                            static_cast<double>(i) * (depth_ - min_depth) /
-                                            static_cast<double>(options - 1)));
-        if (depth_options_.empty() || depth_options_.back() != d)
-          depth_options_.push_back(d);
-      }
-      if (depth_options_.back() != depth_) depth_options_.push_back(depth_);
       // engine.mtp_schedule_max_live (2026-11-15): past that many live
       // requests a step takes the NARROW option, index 0 — the minimum
       // depth verified and the minimum depth drafted, the graph a fixed
@@ -1010,8 +1002,17 @@ class GraphEngineAdapter final : public sched::SchedulerEngine {
       // verifies one draft. With several requests sharing a pass the
       // deeper verify measured level to -6 % (two live) against one draft,
       // so those steps keep the fixed minimum's cost exactly.
+      // A slot leaves a narrow step holding min_depth drafts, and its next
+      // step verifies within them and drafts the block again: the policy's
+      // minimum-depth option, or the REFILL option the set carries when the
+      // policy has none (one option, the full block). The refill option
+      // stands only beside that single option, so the set stays within the
+      // two options and the narrow one that `fit` was checked to hold
+      // (verify_schedule.hpp).
+      VerifyDepthOptions set = verify_depth_option_set(depth_, min_depth, options, max_live > 0);
+      depth_options_ = std::move(set.depths);
+      sched_refill_ = set.refill();
       if (max_live > 0) {
-        depth_options_.insert(depth_options_.begin(), min_depth);
         sched_narrow_ = true;
         sched_max_live_ = max_live;
       }
@@ -1053,15 +1054,19 @@ class GraphEngineAdapter final : public sched::SchedulerEngine {
       }
       sched_full_forced_ = 0;
       std::string opts;
-      for (size_t i = sched_narrow_ ? 1 : 0; i < depth_options_.size(); ++i)
+      for (size_t i = static_cast<size_t>(first_policy_option()); i < depth_options_.size(); ++i)
         opts += (opts.empty() ? "" : ",") + std::to_string(depth_options_[i]);
       DGPP_LOG_INFO(
           "rank {}: scheduled verify depth on — options [{}] of the {}-draft "
           "block{} (threshold: prefix survival > {:.3f} = {:.4f} tok/ms x {:.2f} "
           "ms/row{}), {}; the confidence is {}",
           rank_, opts, depth_,
-          sched_narrow_ ? std::format(", and past {} live request(s) a step verifies and drafts {} only", sched_max_live_,
-                                      sched_min_depth_)
+          sched_narrow_ ? std::format(", and past {} live request(s) a step verifies and drafts {} only{}", sched_max_live_,
+                                      sched_min_depth_,
+                                      sched_refill_ ? std::format(", after which a request's next step verifies {} and "
+                                                                  "drafts the block again",
+                                                                  sched_min_depth_)
+                                                    : std::string())
                         : std::string(),
           sched_lambda_ * sched_row_ms_, sched_lambda_,
           sched_row_ms_,
@@ -1085,7 +1090,8 @@ class GraphEngineAdapter final : public sched::SchedulerEngine {
   std::vector<uint64_t> verify_depth_histogram() const { return sched_hist_; }
   // Tests: replaces the policy's depth (req, the policy's depth, the slot's
   // confidence logits, their count) -> the depth to verify (clamped to
-  // [min_depth, depth], then rounded up to an option).
+  // [min_depth, depth] and to the drafts the slot holds, then rounded up to
+  // an option within them).
   void set_verify_depth_hook(
       std::function<int(int, int, const float*, int)> hook) {
     depth_hook_ = std::move(hook);
@@ -2691,18 +2697,29 @@ class GraphEngineAdapter final : public sched::SchedulerEngine {
     }
     return h_conf_ + static_cast<size_t>(req) * conf_rows_;
   }
-  // The option index whose depth covers k drafts (rounding up).
-  int depth_option_for(int k) const {
-    k = std::clamp(k, sched_min_depth_, depth_);
-    for (size_t di = static_cast<size_t>(first_sched_option()); di < depth_options_.size(); ++di)
-      if (depth_options_[di] >= k) return static_cast<int>(di);
-    return full_depth_option();
+  // The option index a step replays: the policy's lowest option covering k
+  // drafts (rounding up), and never an option deeper than the `avail`
+  // drafts the slot holds (verify_schedule.hpp). A row past them carries an
+  // older step's token and proposal: a greedy verify would spend the row for
+  // nothing, a sampled one would test a draft that no draw of this step
+  // stands behind.
+  int depth_option_for(int k, int avail) const {
+    const int di = verify_depth_option(depth_options_, first_sched_option(), first_policy_option(),
+                                       std::clamp(k, sched_min_depth_, depth_), avail);
+    if (depth_options_[static_cast<size_t>(di)] > avail)
+      throw std::logic_error("graph engine: no scheduled verify depth fits the " + std::to_string(avail) +
+                             " drafts a slot holds");
+    return di;
   }
-  // The narrow option (engine.mtp_schedule_max_live): index 0 when on, the
-  // policy's options after it. Its replay drafts what it verifies; every
-  // other option drafts the whole block.
+  // The narrow option (engine.mtp_schedule_max_live): index 0 when on. Its
+  // replay drafts what it verifies; every other option drafts the whole
+  // block. The refill option follows it when the policy has no option at the
+  // minimum depth, and the policy's options come last.
   int first_sched_option() const { return sched_narrow_ ? 1 : 0; }
-  int draft_width(int di) const { return sched_narrow_ && di == 0 ? depth_options_[0] : depth_; }
+  int first_policy_option() const { return first_sched_option() + (sched_refill_ ? 1 : 0); }
+  int draft_width(int di) const {
+    return verify_depth_option_drafts(depth_options_, first_sched_option(), di, depth_);
+  }
   bool live_gated() const { return sched_narrow_ && step_live_ > sched_max_live_; }
   // The drafts the slot's last replay left for this step: the block, or
   // the narrow option's width (what lies past it in the feed and in the
@@ -2737,12 +2754,12 @@ class GraphEngineAdapter final : public sched::SchedulerEngine {
     const int avail = drafts_available(req);
     if (conf == nullptr) {
       ++sched_full_forced_;
-      return depth_option_for(avail);
+      return depth_option_for(avail, avail);
     }
     int k = scheduled_verify_depth(conf, avail, sched_row_ms_, lambda_now(),
                                    sampled_slot(req) ? static_cast<double>(sched_sampled_scale_) : 1.0);
     if (depth_hook_) k = depth_hook_(req, k, conf, depth_);
-    return depth_option_for(std::min(k, avail));
+    return depth_option_for(std::min(k, avail), avail);
   }
 
   // The batch's one depth (verify_schedule.hpp, the mean-survival rule over
@@ -2768,7 +2785,7 @@ class GraphEngineAdapter final : public sched::SchedulerEngine {
     }
     if (whole) {
       ++sched_full_forced_;
-      return depth_option_for(avail);
+      return depth_option_for(avail, avail);
     }
     int k = scheduled_verify_depth_batch(confs.data(), static_cast<int>(confs.size()), avail,
                                          sched_row_ms_, lambda_now(), scales.data());
@@ -2778,7 +2795,7 @@ class GraphEngineAdapter final : public sched::SchedulerEngine {
         forced = std::max(forced, depth_hook_(reqs[i], k, confs[i], depth_));
       k = forced;
     }
-    return depth_option_for(std::min(k, avail));
+    return depth_option_for(std::min(k, avail), avail);
   }
 
   // The MTP replay of batch family `family` verifying `rows` rows per
@@ -4086,6 +4103,10 @@ class GraphEngineAdapter final : public sched::SchedulerEngine {
   // one (the minimum depth verified and drafted), taken by every step with
   // more live requests than the limit.
   bool sched_narrow_ = false;
+  // The REFILL option, index 1 behind the narrow one when the policy has no
+  // option at the minimum depth: that depth verified, the block drafted, for
+  // the step that follows a narrow one.
+  bool sched_refill_ = false;
   int sched_max_live_ = 0;
   int step_live_ = 0;                // the live requests of the step being issued (decoders and prefill readers)
   uint64_t sched_live_forced_ = 0;   // depth choices the limit sent to the narrow option
