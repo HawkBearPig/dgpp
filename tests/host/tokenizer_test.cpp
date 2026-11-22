@@ -325,51 +325,6 @@ DGPP_TEST(glm_tokenizer_differential_goldens) {
                 checked, lines.size() - 1, tok.revision_hash());
 }
 
-DGPP_TEST(glm_tokenizer_boundary_contracts) {
-  // Negative pins on the loader's strictness: these must THROW, not
-  // guess. (Runs without the model cache: the checks are on the reject
-  // paths, exercised through a bad file path / mangled shape.)
-  bool threw = false;
-  try {
-    (void)dgpp::text::Tokenizer::load("/nonexistent/tokenizer.json");
-  } catch (const std::exception&) {
-    threw = true;
-  }
-  require(threw, "load of a missing file must throw");
-
-  // A minimal malformed tokenizer.json (wrong pattern) must refuse with
-  // the pinned-pattern message.
-  // In the working directory (the build tree under ctest): a fixed /tmp
-  // subdirectory came and went with other tools.
-  const std::string tmp = "glm_tokenizer_test_bad_tokenizer.json";
-  {
-    std::ofstream f(tmp);
-    f << R"({"version":"1.0","truncation":null,"padding":null,
-"added_tokens":[],
-"normalizer":null,
-"pre_tokenizer":{"type":"Sequence","pretokenizers":[
- {"type":"Split","pattern":{"Regex":"wrong-pattern"},"behavior":"Isolated","invert":false},
- {"type":"ByteLevel","add_prefix_space":false,"trim_offsets":true,"use_regex":false}]},
-"post_processor":{"type":"ByteLevel","add_prefix_space":true,"trim_offsets":false,"use_regex":true},
-"decoder":{"type":"ByteLevel","add_prefix_space":true,"trim_offsets":true,"use_regex":true},
-"model":{"type":"BPE","dropout":null,"unk_token":null,"continuing_subword_prefix":null,
-"end_of_word_suffix":null,"fuse_unk":false,"byte_fallback":false,"ignore_merges":true,
-"vocab":{},"merges":[]}})";
-  }
-  threw = false;
-  std::string msg;
-  try {
-    (void)dgpp::text::Tokenizer::load(tmp);
-  } catch (const std::exception& e) {
-    threw = true;
-    msg = e.what();
-  }
-  require(threw && msg.find("pinned regex") != std::string::npos,
-               "a non-pinned Split pattern must refuse loudly (got: " + msg +
-                   ")");
-  std::remove(tmp.c_str());
-}
-
 }  // namespace
 
 int main(int argc, char** argv) {

@@ -30,6 +30,20 @@ DGPP_TEST(tokenizer_dory_and_flint_keep_distinct_split_rules) {
     }
   }
 }
+DGPP_TEST(tokenizer_load_refuses_missing_file_and_non_pinned_split_pattern) {
+  const auto require_refusal = [](const std::filesystem::path& file, const std::string& reason) {
+    try {
+      (void)dgpp::text::Tokenizer::load(file.string());
+    } catch (const std::runtime_error& e) {
+      if (std::string(e.what()).find(reason) != std::string::npos) return;
+      throw;
+    }
+    throw std::runtime_error("expected tokenizer loader to refuse " + file.string());
+  };
+  require_refusal(data / "missing-tokenizer.json", "cannot open");
+  require_refusal(data / "tokenizer_wrong_split_pattern.json", "pinned regex");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
