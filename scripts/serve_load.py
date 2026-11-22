@@ -19,6 +19,7 @@ import argparse
 import hashlib
 import http.client
 import json
+import math
 import os
 import sys
 import threading
@@ -295,6 +296,8 @@ def main(*, phase_runner=None, settle=None):
     ap.add_argument("--temperature", type=float, default=0.0,
                     help="0 (default) is greedy; a positive value samples, for the pace at the card's defaults")
     args = ap.parse_args()
+    if not math.isfinite(args.temperature):
+        ap.error("--temperature must be finite")
     cs = [int(x) for x in args.concurrency.split(",")]
     if (args.repeat < 1 or args.max_tokens < 1 or args.warm < 0 or not 0 <= args.isolation <= 16
             or any(c < 1 or c > 16 for c in cs)):
@@ -304,8 +307,6 @@ def main(*, phase_runner=None, settle=None):
     def save():
         if args.json_out:
             requests = [r for phase in reports for r in phase["requests"]]
-            if isolation is not None:
-                requests += [isolation["alone"]] + isolation["batched"]
             modes = {r.get("thinking", "server_default" if args.think else False) for r in requests}
             effective = next(iter(modes)) if len(modes) == 1 else "mixed" if modes else "server_default" if args.think else False
             report = {"schema_version": 1, "model": model, "max_tokens": args.max_tokens,
@@ -348,8 +349,6 @@ def main(*, phase_runner=None, settle=None):
         for out in outs:
             if out.get("error"):
                 raise RuntimeError(out["error"])
-        if settle is not None:
-            settle(args.host, args.port, outs)
         same = alone["text"] == outs[0]["text"] and alone["tokens"] == outs[0]["tokens"]
         a, b = alone["text"], outs[0]["text"]
         k = 0
@@ -361,6 +360,13 @@ def main(*, phase_runner=None, settle=None):
         # Keep diagnostic requests separate from measured throughput phases.
         # Persist before the failure exits, and retain this section on later saves.
         save()
+        if settle is not None:
+            try:
+                settle(args.host, args.port, outs)
+            except Exception as error:
+                isolation["counter_reconciliation_error"] = str(error)
+                save()
+                raise
         print(f"== isolation: prompt 0 alone ({alone['tokens']} tokens) vs beside {args.isolation - 1} others "
               f"({outs[0]['tokens']} tokens): {'IDENTICAL' if same else 'DIFFERENT'}")
         if not same:

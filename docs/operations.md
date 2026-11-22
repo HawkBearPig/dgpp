@@ -58,13 +58,19 @@ prompt alongside C-1 companions. A text or completion-token-count mismatch
 still exits unsuccessfully. The JSON report is saved before that exit,
 with an `isolation` object containing the complete solo and batched response
 records, separate text and token-count match flags, and the first differing
-character index (null when the texts match). These requests are separate
-from the measured `phases`, which remain empty if comparison fails.
+Unicode code-point index (null when the texts match). The timed client also
+saves the comparison before its final scheduler-counter check. If that
+check fails, the client records `isolation.counter_reconciliation_error`
+and exits unsuccessfully even when the transcripts match. Isolation requests
+are separate from measured `phases`, which remain empty on either failure.
 
 Response records include the effective JSON `request` body, including any
 retry without the thinking toggle. Isolation requests use temperature zero
-even when `--temperature` selects sampled throughput phases. Successful
-comparisons remain in the report as later phases are saved. This preserves
+even when `--temperature` selects sampled throughput phases, and both
+clients reject non-finite temperatures. The top-level thinking fields
+describe measured phase requests, or the requested mode if none ran.
+Read the isolation response records for any isolation-only fallback.
+Successful comparisons remain in the report as later phases are saved. This preserves
 evidence for investigating a mismatch without establishing its numerical
 cause or changing the exact comparison requirement.
 
