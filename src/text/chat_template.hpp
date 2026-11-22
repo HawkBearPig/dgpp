@@ -17,6 +17,16 @@
 // undefined, exactly like Jinja), close over the root frame only, and
 // return their rendered body as a string.
 //
+// Names resolve as jinja2 resolves them, from the syntax tree: the top
+// level, a for body, a macro body, the body of a block set and a generation
+// block are each a scope, and a scope that assigns a name owns it for its
+// whole extent. When the assignment is the scope's first mention of the
+// name and is not under an `if`, the name is undefined in that scope until
+// the assignment runs: also for a nested scope that reads it earlier, and
+// also when the render supplies a global of the same name. A macro
+// parameter's default is evaluated in the macro's scope, where it reads the
+// parameters before it and the top level.
+//
 // Supported expressions: string/int/true/false/none literals, names,
 // attribute access (digit names index lists, like Jinja's foo.0),
 // subscripts (negative indexes included), method calls (items/split/

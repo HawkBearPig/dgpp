@@ -14,6 +14,7 @@
 #include <cstring>
 #include <limits>
 #include <stdexcept>
+#include <unordered_set>
 
 namespace dgpp::text {
 
@@ -64,6 +65,7 @@ struct MacroDef {
   std::vector<std::string> params;
   std::vector<ExprPtr> defaults;  // aligned with params; null = required
   std::vector<StmtPtr> body;  // owned here so the in-scope Value shares it
+  std::vector<std::string> hoisted;  // the body's scope (resolve_scopes)
 };
 
 using Frame = std::unordered_map<std::string, Value>;
@@ -80,6 +82,9 @@ struct Stmt {
   ExprPtr filter;                 // For: the trailing `if <cond>` inline filter
   std::shared_ptr<MacroDef> macro;      // Macro definition
   std::vector<StmtPtr> body;            // If-then / For / Macro / Generation body
+  // For / block Set / Generation: the names the body's scope owns from its
+  // first statement, undefined until it assigns them (resolve_scopes).
+  std::vector<std::string> hoisted;
   std::vector<std::pair<ExprPtr, std::vector<StmtPtr>>> elifs;
   std::vector<StmtPtr> else_body;
 };
@@ -1434,7 +1439,7 @@ enum class Flow { Next, Break };
 
 struct Ctx {
   Frame* root = nullptr;    // the render's global frame (macro closure)
-  std::vector<Frame> stack; // loop frames and macro parameter frames
+  std::vector<Frame> stack; // a frame for each scope inside the top level (push_scope)
   size_t line = 1;          // current statement, for error messages
 
   const Value* find(std::string_view name) const {
@@ -1478,6 +1483,16 @@ struct Renderer {
     append(out, text);
   }
 
+  // Enters a scope: a frame of its own in which the names the scope owns
+  // from its first statement are present and undefined (resolve_scopes). A
+  // read of one stops here, where a lookup that only knew the assignments
+  // made so far would go on to an enclosing value or the global.
+  Frame& push_scope(const std::vector<std::string>& hoisted) {
+    Frame& frame = ctx_.stack.emplace_back();
+    for (const std::string& name : hoisted) frame[name] = Value();
+    return frame;
+  }
+
   // A macro call renders its body into a fresh buffer with a stack of
   // just the parameter frame: macros close over the root frame only
   // (this template's macros reference nothing else across scopes).
@@ -1489,17 +1504,25 @@ struct Renderer {
                      std::to_string(def.params.size()) +
                      " argument(s), got " + std::to_string(args.size()));
     Frame params;
+    for (const std::string& name : def.hoisted) params[name] = Value();
     for (size_t k = 0; k < args.size(); ++k) params[def.params[k]] = args[k];
-    // Absent trailing arguments take their defaults (evaluated now, in
-    // the caller's context); a parameter without one is required.
+    // A parameter without a default is required. An absent one with a
+    // default is the macro's own name from the start, undefined until its
+    // default is evaluated below.
     for (size_t k = args.size(); k < def.params.size(); ++k) {
       if (!def.defaults[k])
         fail(ctx_.line, "macro '" + def.name + "': missing argument '" + def.params[k] + "'");
-      params[def.params[k]] = eval(*def.defaults[k]);
+      params[def.params[k]] = Value();
     }
     std::vector<Frame> saved = std::move(ctx_.stack);
     ctx_.stack.clear();
     ctx_.stack.push_back(std::move(params));
+    // Defaults in order, in the macro's own scope: one reads the parameters
+    // before it and the top level, never a name of the caller's.
+    for (size_t k = args.size(); k < def.params.size(); ++k) {
+      Value value = eval(*def.defaults[k]);
+      ctx_.stack.front()[def.params[k]] = std::move(value);
+    }
     std::string buf;
     if (exec(def.body, &buf) == Flow::Break)
       fail(ctx_.line, "'break' outside of a loop");
@@ -1992,8 +2015,13 @@ struct Renderer {
           break;
         case Stmt::Tag::Set:
           if (!s->expr) {  // the block form: the body's render is the value
+            // The body is a scope of its own, and a break in it ends the
+            // enclosing loop before the name is assigned.
             std::string captured;
-            exec(s->body, &captured);
+            push_scope(s->hoisted);
+            const Flow f = exec(s->body, &captured);
+            ctx_.stack.pop_back();
+            if (f == Flow::Break) return f;
             ctx_.set(s->target, Value::string_value(std::move(captured)));
           } else if (s->target_attr.empty()) {
             ctx_.set(s->target, eval(*s->expr));
@@ -2071,8 +2099,7 @@ struct Renderer {
           const bool tuple = s->names.size() == 2;
           for (size_t idx = 0; idx < items.size(); ++idx) {
             step();
-            ctx_.stack.emplace_back();
-            Frame& frame = *ctx_.stack.rbegin();
+            Frame& frame = push_scope(s->hoisted);
             if (tuple) {
               const Value& item = *items[idx];
               if (item.kind() != Value::Kind::List || item.as_list().size() != 2)
@@ -2114,7 +2141,7 @@ struct Renderer {
           // The body in a frame of its own: it reads every enclosing name,
           // and what it sets ends with the block (a namespace attribute is
           // shared storage and stays set).
-          ctx_.stack.emplace_back();
+          push_scope(s->hoisted);
           exec(s->body, out);
           ctx_.stack.pop_back();
           break;
@@ -2127,6 +2154,164 @@ struct Renderer {
   Ctx ctx_;
 };
 
+// Calls `f` with every name an expression reads. Every other tag's `name` is
+// a member, filter or test name, never a variable; only its operands can
+// read one.
+template <typename F>
+void each_name(const Expr& e, F&& f) {
+  if (e.tag == Expr::Tag::Name) {
+    f(e.name);
+    return;
+  }
+  for (const ExprPtr& k : e.kids)
+    if (k) each_name(*k, f);
+  for (const auto& [key, v] : e.kwargs)
+    if (v) each_name(*v, f);
+}
+
+// ---------------------------------------------------------------------------
+// Which scope owns a name — resolved once at compile, from the syntax tree,
+// as jinja2 does (idtracking.py). The top level, a for body, a macro body,
+// the body of a block set and a generation block are each a scope. A scope
+// that assigns a name keeps its own copy of it for its whole extent, and
+// every scope nested in it reads that copy. How the copy starts follows the
+// scope's own statements in order:
+//   - a parameter (a loop variable, `loop`, a macro parameter) is bound;
+//   - a name an enclosing scope mentions starts as that scope's value;
+//   - a name the scope reads before it assigns it, or assigns only under an
+//     `if`, starts as the global;
+//   - any other name the scope assigns starts UNDEFINED and stays so until
+//     the assignment runs.
+// The last kind is what a lookup of "the frames assigned so far, then the
+// globals" gets wrong: a nested scope that reads the name before the
+// assignment would see the global, where the reference sees nothing.
+// `hoisted` lists those names for each scope, and the renderer puts them in
+// the scope's frame when it enters (push_scope; the top level's go in the
+// root frame).
+//
+// A scope's own statements stop at a nested scope. Of a loop the parent
+// reads the iterable, of a block set and a macro definition it assigns the
+// name, and it sees nothing of their bodies or of a generation block. So
+// one statement further down the parent decides how a nested scope reads a
+// name: the parent is scanned whole before the scopes inside it.
+// ---------------------------------------------------------------------------
+
+struct Scope {
+  const Scope* enclosing;
+  std::unordered_set<std::string> names;  // the names this scope keeps a copy of
+  std::vector<std::string> hoisted;       // of those, the ones that start undefined
+
+  explicit Scope(const Scope* enclosing_scope = nullptr) : enclosing(enclosing_scope) {}
+
+  bool knows(const std::string& name) const {
+    for (const Scope* s = this; s; s = s->enclosing)
+      if (s->names.count(name)) return true;
+    return false;
+  }
+  void bind(const std::string& name) { names.insert(name); }
+  void read(const std::string& name) {
+    if (!knows(name)) names.insert(name);
+  }
+  void read(const Expr& e) {
+    each_name(e, [this](const std::string& name) { read(name); });
+  }
+  // `conditional`: under an `if` of this scope, where the assignment may
+  // not run, so the copy cannot start undefined.
+  void assign(const std::string& name, bool conditional) {
+    if (names.count(name)) return;
+    const bool outer = enclosing && enclosing->knows(name);
+    names.insert(name);
+    if (!outer && !conditional) hoisted.push_back(name);
+  }
+};
+
+void scan_scope(const std::vector<StmtPtr>& stmts, Scope& scope, bool conditional) {
+  for (const StmtPtr& s : stmts) {
+    switch (s->tag) {
+      case Stmt::Tag::Text:
+      case Stmt::Tag::Break:
+      case Stmt::Tag::Generation:
+        break;
+      case Stmt::Tag::Output:
+        scope.read(*s->expr);
+        break;
+      case Stmt::Tag::Set:
+        if (s->expr) scope.read(*s->expr);  // the value, before the target
+        if (s->target_attr.empty()) scope.assign(s->target, conditional);
+        else scope.read(s->target);  // {% set ns.attr = value %} reads ns
+        break;
+      case Stmt::Tag::If:
+        scope.read(*s->expr);
+        scan_scope(s->body, scope, true);
+        for (const auto& [cond, branch] : s->elifs) {
+          scope.read(*cond);
+          scan_scope(branch, scope, true);
+        }
+        scan_scope(s->else_body, scope, true);
+        break;
+      case Stmt::Tag::For:
+        scope.read(*s->expr);  // the iterable; the filter and the body are the loop's
+        break;
+      case Stmt::Tag::Macro:
+        scope.assign(s->macro->name, conditional);
+        break;
+    }
+  }
+}
+
+void resolve_nested(std::vector<StmtPtr>& stmts, const Scope& scope);
+
+// Resolves a scope from its statements, `scope` holding its parameters:
+// its own statements first, then the scopes nested in them.
+void resolve_scopes(std::vector<StmtPtr>& stmts, Scope& scope,
+                    std::vector<std::string>& hoisted) {
+  scan_scope(stmts, scope, false);
+  hoisted = scope.hoisted;
+  resolve_nested(stmts, scope);
+}
+
+void resolve_nested(std::vector<StmtPtr>& stmts, const Scope& scope) {
+  for (StmtPtr& s : stmts) {
+    switch (s->tag) {
+      case Stmt::Tag::Text:
+      case Stmt::Tag::Output:
+      case Stmt::Tag::Break:
+        break;
+      case Stmt::Tag::If:
+        resolve_nested(s->body, scope);
+        for (auto& [cond, branch] : s->elifs) resolve_nested(branch, scope);
+        resolve_nested(s->else_body, scope);
+        break;
+      case Stmt::Tag::Set:
+        if (!s->expr) {  // the block form
+          Scope body(&scope);
+          resolve_scopes(s->body, body, s->hoisted);
+        }
+        break;
+      case Stmt::Tag::Generation: {
+        Scope body(&scope);
+        resolve_scopes(s->body, body, s->hoisted);
+        break;
+      }
+      case Stmt::Tag::For: {
+        Scope body(&scope);
+        body.bind("loop");
+        for (const std::string& name : s->names) body.bind(name);
+        resolve_scopes(s->body, body, s->hoisted);
+        break;
+      }
+      case Stmt::Tag::Macro: {
+        Scope body(&scope);
+        for (const std::string& param : s->macro->params) body.bind(param);
+        for (const ExprPtr& d : s->macro->defaults)
+          if (d) body.read(*d);
+        resolve_scopes(s->macro->body, body, s->macro->hoisted);
+        break;
+      }
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Which globals the program reads — ChatTemplate::reads, resolved once at
 // compile. The service's knob gate must ask "can this render depend on the
@@ -2138,25 +2323,28 @@ struct Renderer {
 // ---------------------------------------------------------------------------
 
 // `bound` names what the current scope already rebinds (a {% set %} target,
-// a {% for %} target, a macro parameter), which is what separates a read of
-// the global from a read of a local with the same spelling.
+// a {% for %} target, a macro parameter, a name a scope owns from its first
+// statement), which is what separates a read of the global from a read of a
+// local with the same spelling.
 void collect_name_reads(const Expr& e, const std::vector<std::string>& bound,
                         std::vector<std::string>& out) {
-  if (e.tag == Expr::Tag::Name) {
-    if (std::find(bound.begin(), bound.end(), e.name) == bound.end())
-      out.push_back(e.name);
-    return;
-  }
-  // Every other tag's `name` is a member, filter or test name, never a
-  // global; only its operands can read one.
-  for (const ExprPtr& k : e.kids)
-    if (k) collect_name_reads(*k, bound, out);
-  for (const auto& [key, v] : e.kwargs)
-    if (v) collect_name_reads(*v, bound, out);
+  each_name(e, [&](const std::string& name) {
+    if (std::find(bound.begin(), bound.end(), name) == bound.end()) out.push_back(name);
+  });
 }
 
+// `bound` and the names a scope owns from its first statement.
+std::vector<std::string> with_hoisted(std::vector<std::string> bound,
+                                      const std::vector<std::string>& hoisted) {
+  bound.insert(bound.end(), hoisted.begin(), hoisted.end());
+  return bound;
+}
+
+// `top`: the names the top level owns from its first statement, which hide
+// the global of the same name from the whole program.
 void collect_global_reads(const std::vector<StmtPtr>& body,
                           std::vector<std::string> bound,
+                          const std::vector<std::string>& top,
                           std::vector<std::string>& out) {
   for (const StmtPtr& s : body) {
     if (!s) continue;
@@ -2169,42 +2357,44 @@ void collect_global_reads(const std::vector<StmtPtr>& body,
         break;
       case Stmt::Tag::Set:
         if (s->expr) collect_name_reads(*s->expr, bound, out);
-        else collect_global_reads(s->body, bound, out);  // the block form
+        else collect_global_reads(s->body, with_hoisted(bound, s->hoisted), top, out);  // the block form
         // From here down the scope, this name is the template's own.
         // (A {% set ns.attr = value %} target binds no name.)
         if (s->target_attr.empty()) bound.push_back(s->target);
         break;
       case Stmt::Tag::If:
         collect_name_reads(*s->expr, bound, out);
-        collect_global_reads(s->body, bound, out);
+        collect_global_reads(s->body, bound, top, out);
         for (const auto& [cond, branch] : s->elifs) {
           collect_name_reads(*cond, bound, out);
-          collect_global_reads(branch, bound, out);
+          collect_global_reads(branch, bound, top, out);
         }
-        collect_global_reads(s->else_body, bound, out);
+        collect_global_reads(s->else_body, bound, top, out);
         break;
       case Stmt::Tag::For: {
         collect_name_reads(*s->expr, bound, out);  // the iterable is the parent's
         std::vector<std::string> inner = bound;
         for (const std::string& n : s->names) inner.push_back(n);
         if (s->filter) collect_name_reads(*s->filter, inner, out);  // the loop's own
-        collect_global_reads(s->body, std::move(inner), out);
+        collect_global_reads(s->body, with_hoisted(std::move(inner), s->hoisted), top, out);
         break;
       }
       case Stmt::Tag::Macro:
         if (s->macro) {
-          for (const ExprPtr& d : s->macro->defaults)
-            if (d) collect_name_reads(*d, bound, out);
-          // A macro body closes over the root frame only (call_macro), so
-          // its scope is its parameters — not the definition site's.
-          std::vector<std::string> inner;
+          // A macro closes over the root frame only (call_macro), so its
+          // scope is its parameters and what it owns itself — not the
+          // definition site's. What the top level owns is never the global.
+          // A parameter's default is evaluated in that scope too.
+          std::vector<std::string> inner = with_hoisted(top, s->macro->hoisted);
           for (const std::string& p : s->macro->params) inner.push_back(p);
-          collect_global_reads(s->macro->body, std::move(inner), out);
+          for (const ExprPtr& d : s->macro->defaults)
+            if (d) collect_name_reads(*d, inner, out);
+          collect_global_reads(s->macro->body, std::move(inner), top, out);
         }
         break;
       case Stmt::Tag::Generation:
         // The block's own bindings end with it (`bound` is this call's copy).
-        collect_global_reads(s->body, bound, out);
+        collect_global_reads(s->body, with_hoisted(bound, s->hoisted), top, out);
         break;
     }
   }
@@ -2220,6 +2410,8 @@ struct ChatTemplate::Impl {
   std::string source;
   uint64_t hash = 0;
   std::vector<StmtPtr> root;
+  // The names the top level owns from its first statement (resolve_scopes).
+  std::vector<std::string> hoisted;
   // Sorted, unique: every global the program can read (reads()'s table).
   std::vector<std::string> globals_read;
 };
@@ -2243,7 +2435,9 @@ ChatTemplate ChatTemplate::compile(std::string source) {
   impl->source = std::move(source);
   impl->hash = fnv1a64(impl->source.data(), impl->source.size());
   impl->root = std::move(root);
-  collect_global_reads(impl->root, {}, impl->globals_read);
+  Scope top;
+  resolve_scopes(impl->root, top, impl->hoisted);
+  collect_global_reads(impl->root, impl->hoisted, impl->hoisted, impl->globals_read);
   std::sort(impl->globals_read.begin(), impl->globals_read.end());
   impl->globals_read.erase(std::unique(impl->globals_read.begin(),
                                        impl->globals_read.end()),
@@ -2276,6 +2470,9 @@ std::string ChatTemplate::render(const Value& globals) const {
     throw std::runtime_error("chat-template: render globals must be a map");
   Frame root;
   for (const auto& [k, v] : *members) root[k] = v;
+  // A name the top level owns from its first statement hides the global of
+  // the same name for the whole render.
+  for (const std::string& name : impl_->hoisted) root[name] = Value();
   Renderer r;
   r.ctx_.root = &root;
   std::string out;
