@@ -257,7 +257,7 @@ __global__ void block_attn_split_kernel(
     const uint16_t* __restrict__ q, int64_t q_stride, const uint16_t* __restrict__ k_cache,
     const uint16_t* __restrict__ v_cache, const int32_t* __restrict__ block_table, int block_tokens,
     int blocks_per_request, int block_rows, int64_t window, const int64_t* __restrict__ pos,
-    float scale, float* __restrict__ partials, int heads, int kv_heads, int dim) {
+    float scale, float* __restrict__ partials, int heads, int kv_heads, int dim, bool block_window) {
   dgpp_pdl_wait();
   const int row = blockIdx.x;
   const int kvh = blockIdx.y;
@@ -274,7 +274,9 @@ __global__ void block_attn_split_kernel(
   int last_valid = block_rows - 1;
   while (last_valid > 0 && pos[row - row % block_rows + last_valid] < 0) --last_valid;
   const int64_t blk_hi = p0 + last_valid;
-  const int64_t lo = p - window + 1;
+  // The window ends at the query, or (block_window) at the block's last
+  // row: the block's rows then see one span, the block included in it.
+  const int64_t lo = (block_window ? p0 + block_rows : p + 1) - window;
   const int64_t ctx_lo = lo > 0 ? lo : 0;
   // This split's share of the context keys (empty for a short context).
   const int64_t ctx_n = ctx_end >= ctx_lo ? ctx_end - ctx_lo + 1 : 0;
@@ -430,8 +432,9 @@ __device__ __forceinline__ Cand* block_fold_lists(Cand* X, Cand* Y, int count) {
 template <int K>
 __global__ void __launch_bounds__(kTopkThreads)
     topk_chunk_kernel(const float* __restrict__ logits, int64_t vocab, int chunks, Cand* __restrict__ partial,
-                      int32_t* __restrict__ ids, float* __restrict__ scores) {
+                      int32_t* __restrict__ ids, float* __restrict__ scores, const int32_t* __restrict__ gate) {
   dgpp_pdl_wait();
+  if (gate != nullptr && *gate != 0) return;  // the lists keep the last step's
   constexpr int S = kTopkThreads;
   __shared__ Cand sl[K * S];
   __shared__ Cand ml[K * S];
@@ -471,8 +474,9 @@ __global__ void __launch_bounds__(kTopkThreads)
 template <int K>
 __global__ void __launch_bounds__(kTopkThreads)
     topk_merge_kernel(const Cand* __restrict__ partial, int chunks, int32_t* __restrict__ ids,
-                      float* __restrict__ scores) {
+                      float* __restrict__ scores, const int32_t* __restrict__ gate) {
   dgpp_pdl_wait();
+  if (gate != nullptr && *gate != 0) return;
   constexpr int S = kTopkThreads;
   __shared__ Cand sl[K * S];
   __shared__ Cand ml[K * S];
@@ -902,7 +906,7 @@ void dflash2_block_attn_split(const uint16_t* q, int64_t q_row_stride, const uin
                               int blocks_per_request, int block_rows, int64_t window,
                               const int64_t* pos, int rows, int heads, int kv_heads, int dim,
                               float scale, float* partials, uint16_t* out, cudaStream_t stream,
-                              bool fp32_p) {
+                              bool fp32_p, bool block_window) {
   if (rows <= 0) return;
   if (dim != 128 || heads % kv_heads || heads / kv_heads > 16)
     throw std::invalid_argument(
@@ -915,11 +919,11 @@ void dflash2_block_attn_split(const uint16_t* q, int64_t q_row_stride, const uin
   if (fp32_p)
     block_attn_split_kernel<true><<<grid, 32 * hpq, 0, stream>>>(
         q, q_row_stride, k_cache, v_cache, block_table, block_tokens, blocks_per_request,
-        block_rows, window, pos, scale, partials, heads, kv_heads, dim);
+        block_rows, window, pos, scale, partials, heads, kv_heads, dim, block_window);
   else
     block_attn_split_kernel<false><<<grid, 32 * hpq, 0, stream>>>(
         q, q_row_stride, k_cache, v_cache, block_table, block_tokens, blocks_per_request,
-        block_rows, window, pos, scale, partials, heads, kv_heads, dim);
+        block_rows, window, pos, scale, partials, heads, kv_heads, dim, block_window);
   DGPP_CUDA_OK(cudaGetLastError());
   const dim3 cgrid(rows, heads);
   block_attn_combine_kernel<<<cgrid, 32, 0, stream>>>(partials, heads, dim, out);
@@ -932,7 +936,7 @@ size_t dflash2_topk_ws_bytes(int64_t vocab, int rows, int k) {
 }
 
 void dflash2_topk_f32(const float* logits, int32_t* ids, float* scores, int64_t vocab, int rows,
-                      int k, cudaStream_t stream, void* ws, size_t ws_bytes) {
+                      int k, cudaStream_t stream, void* ws, size_t ws_bytes, const int32_t* gate) {
   if (rows <= 0) return;
   if (k != 16) throw std::invalid_argument("dflash2_topk: only k = 16 is implemented");
   // Each row in chunks of kTopkChunkSpan over as many blocks (32 at most),
@@ -942,11 +946,11 @@ void dflash2_topk_f32(const float* logits, int32_t* ids, float* scores, int64_t 
     throw std::invalid_argument("dflash2_topk: the partials workspace is too small (dflash2_topk_ws_bytes)");
   const dim3 grid(static_cast<unsigned>(chunks), static_cast<unsigned>(rows));
   topk_chunk_kernel<16><<<grid, kTopkThreads, 0, stream>>>(logits, vocab, chunks, static_cast<Cand*>(ws), ids,
-                                                           scores);
+                                                           scores, gate);
   DGPP_CUDA_OK(cudaGetLastError());
   if (chunks > 1) {
     topk_merge_kernel<16><<<static_cast<unsigned>(rows), kTopkThreads, 0, stream>>>(
-        static_cast<const Cand*>(ws), chunks, ids, scores);
+        static_cast<const Cand*>(ws), chunks, ids, scores, gate);
     DGPP_CUDA_OK(cudaGetLastError());
   }
 }

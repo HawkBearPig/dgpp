@@ -100,16 +100,32 @@ void launch_mma_gemv_bf16_bf16(const uint16_t* act, size_t act_stride, const uin
 void launch_mma_gemv_bf16_f32(const uint16_t* act, size_t act_stride, const uint16_t* w,
                               float* out, int m, int n, int k, size_t out_stride,
                               cudaStream_t stream, void* ws = nullptr, size_t ws_bytes = 0);
+// The same launch for m <= 16 rows behind a gate: when *gate is nonzero at
+// execution every block returns at once and `out` keeps what it held. A
+// recorded pass uses it for a step whose result an earlier step of the same
+// pass has made unreadable (the Inkling 2 draft's recurrent head once its
+// later proposals cannot be verified). Unsplit: with a zero gate the rows are
+// bitwise launch_mma_gemv_bf16_f32's without a workspace.
+void launch_mma_gemv_bf16_f32_gated(const uint16_t* act, size_t act_stride, const uint16_t* w, float* out, int m,
+                                    int n, int k, size_t out_stride, const int32_t* gate, cudaStream_t stream);
 // The shape the kernel takes (k a multiple of 16, aligned pointers, m in range).
 bool mma_gemv_shape_ok(const void* w, const void* act, size_t act_stride, int m, int k);
 // The bf16 form over a weight's 12-bit companion (bf12_gemv.hpp; 2026-10-20,
-// the DeepSeek-V4.1 lm head): the decode forms (m <= kMmaGemvMaxRows) stage
-// the packed super-blocks and decode their fragments, so each row's chain
-// is the bf16 launch's bit for bit at three quarters of the bytes. The
-// companion's k is whole super-blocks (1024) and its rows all live; a shape
-// the bf16 form would split keeps the bf16 launch. Returns false when the
-// form does not apply (the caller runs the bf16 launch): nothing was
-// launched.
+// the DeepSeek-V4.1 lm head): the decode forms (m <= kMmaGemvMaxRows) read
+// the packed super-blocks into registers and decode their fragments, so each
+// row's chain is the bf16 launch's bit for bit at three quarters of the
+// bytes. The launches take a companion whose k is whole super-blocks (1024)
+// and then at most a tail of whole 256-column steps (2304, 2560). A partial
+// last step and a shape the bf16 form would split keep the bf16 launch.
+// Returns false when the form does not apply (the caller runs the bf16
+// launch): nothing was launched.
+//
+// The form pays on a matrix whose stream dominates the launch, a vocabulary
+// head: measured on Inkling 2's (201,024 x 2304) it is 2.9 ms against 4.0
+// at up to 16 rows, while its mid-size projections run about a sixth slower
+// than their bf16 launches. mma_gemv_bf12_accepts is the rule the GEMM
+// interface applies to every companion on its own: whole super-blocks only.
+// A caller that wants the form for a tailed matrix launches it itself.
 bool mma_gemv_bf12_accepts(const Bf12Matrix& w, int m);
 bool launch_mma_gemv_bf12_f32(const uint16_t* act, size_t act_stride, const Bf12Matrix& w, float* out, int m, int n,
                               int k, size_t out_stride, cudaStream_t stream, void* ws = nullptr, size_t ws_bytes = 0);

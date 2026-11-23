@@ -316,8 +316,8 @@ sockets), `qwen_decode_test`'s tier block (spill and restore bitwise on the
 fixture, attach parity, a corrupted page detected, the slab across a
 restart and across a crash with content-bound adoption, the lock, damaged
 files, the op timeout and injected I/O failures), `nvme_tier_families_test`
-(spill, restore, attach and step bitwise on the MiMo, Flint and Qwen3.5
-tiny checkpoints) and `dflash2_integration_test`'s `prefix_tier` cases (a
+(spill, restore, attach and step bitwise on the MiMo, Flint, Inkling 2 and
+Qwen3.5 tiny checkpoints) and `dflash2_integration_test`'s `prefix_tier` cases (a
 drafter world's entry spilled and restored with its draft K/V context
 intact on both Qwen families). On a booted world,
 `scripts/serve_nvme_cache_check.py` drives the whole flow and
@@ -679,6 +679,72 @@ build. The suites cover:
   `tools/dsv4_torch_reference.py`); the fp4 GEMV
   core at every compiled K (the MXFP4 set 2048 / 4096 included) and the
   MoE layer's NVFP4 shared expert.
+- the Inkling 2 chain. `unit_tests` parses the release's own config and
+  binds every tensor of both checkpoint files. `inkling2_kernels_test` holds
+  the row kernels to host statements: the two activation quantizers bit for
+  bit, the convolution ring across split, single-row and decode launches,
+  and a ring restored from a prefix snapshot. `inkling2_quantizers_reference`
+  repeats the quantizer comparison against the NumPy reference.
+  `inkling2_forward_test` compares the engine with
+  `tools/inkling2_reference_dump.py` visit by visit, each reference visit
+  starting from the engine's own state, under both settings of
+  `engine.activations`. Under the native setting the reference also takes the
+  engine's expert input, because the activation quantizers turn a difference
+  of one unit in the last place into whole quantization steps.
+  `inkling2_tp_test` runs loopback worlds of 2 and 4 on ports 30042 to 30054:
+  every rank's states are bitwise identical, and rank 0 is held to a reference
+  that follows that world's partial sums and activation slices.
+  `inkling2_decode_test` covers the session surface: prefill equal to the
+  forward bitwise, per-step snapshots, verify rows equal to scalar steps
+  bitwise through the eight rows of one request, rollback, interleaved slots,
+  prefix snapshots
+  resumed bitwise at a prefill cut and mid-decode, and the window's exact
+  reach through the cache and the rings. The fixture's random layers amplify
+  rounding differences, so its decode rows are judged against the re-forward
+  at the first visit, on a fixture whose first layer is local and on one
+  whose first layer attends over the whole context. With
+  `--checkpoint-dir` the same test judges a greedy decode against the
+  re-forward on the release, and `--verify-diag T` compares one verify of T
+  rows with T scalar steps on the release, visit by visit and logit by logit,
+  in a slot another request has used. `inkling2_engine_test` holds the graph engine's
+  scalar and row-batched replays to the eager engine's transcripts bitwise on
+  a loopback world of 2 (ports 30060 and 30061). `inkling2_draft_test` covers
+  the draft model: the target's rows bitwise the plain model's at every
+  accepted length, the memory plan, stacked blocks equal to the slots' own,
+  the recurrent head stopping at its floor, and the eager engine committing
+  the plain engine's tokens with it. Its `--dump` mode writes the tapped
+  states, the stored context keys and values, the block's rows and the
+  proposals of six contexts at worlds 1, 2 and 4 (ports 30072 and 30074), and
+  `tools/inkling2_reference_dump.py check-draft` recomputes each stage from
+  the engine's own input to it. With `--checkpoint-dir` the same pair runs on
+  the release, and `--ids FILE --steps N` decodes it with and without the
+  draft, reports the accepted lengths and fails if the two transcripts
+  differ. Adding `--graph DEPTH` runs that comparison the way a serving world
+  decodes: recorded passes, the device-side pick, a warm capture and the
+  resumable prefill with `--warm`, `--slots` request slots, and `--before
+  FILE` for a request through the slot first. A draft must never change the
+  committed tokens, so run it on the release after any change to a decode
+  kernel or to the rows a pass may hold. `dflash2_integration_test` runs the
+  shared drafter's cases on this family too: prefix snapshots and the NVMe
+  tier carry the draft's planes, two-rank graph replays of two, four and
+  eight slots record the proposals the eager draft makes, and one request at
+  a time through recorded passes of every depth commits the tokens of the
+  same world without the draft. `inkling2_vision_test`
+  compares the vision tower stage by stage with
+  `tools/inkling2_vision_reference.py` on a synthetic tower, and
+  `inkling2_image_prefill_test` holds an image prefill to the text prefill's
+  guarantees: hot equal to cold, slots equal to each other, and an
+  interleaved cursor walk equal to its solo walk. `inkling2_kernels_test`
+  also covers the kernel copy on spans that are not whole 16-byte units,
+  which three logits rows of this vocabulary are. `inkling2_tokenizer_test`
+  and `inkling2_chat_template_test` compare the tokenizer and the template
+  renders with the reference libraries on the snapshot, round-trip every
+  assistant turn through the typed-block parser, and walk each mode of the
+  constrained-decoding grammar over the real vocabulary. `unit_tests` repeats
+  the parser and grammar cases over a synthetic vocabulary at every token
+  split, and `serve_test` holds the prefix cache's cuts for a template
+  without a generation prompt
+  (`serve_prefixCache_cutsAtTurnEndsWhenTheModelOpensItsTurn`).
 - the KDA operator suite: conv/recurrent kernel parity against host
   fp32/fp64 references, chunked-vs-unchunked bitwise equivalence, decode
   graph replay, snapshot round-trip, head-slice TP readiness, and

@@ -79,6 +79,12 @@ bool corpus_is_qwen(const std::string& golden_path) {
 bool corpus_is_flint(const std::string& golden_path) {
   return corpus_model(golden_path).find("flint") != std::string::npos;
 }
+// The Inkling 2 corpus: typed blocks instead of role turns, every marker a
+// special id, a call's body one JSON object. Its parser and grammar have
+// their own gates below.
+bool corpus_is_inkling(const std::string& golden_path) {
+  return corpus_model(golden_path).find("Inkling") != std::string::npos;
+}
 std::string read_text_file(const std::string& path) {
   std::ifstream f(path);
   if (!f) throw std::runtime_error("cannot open " + path);
@@ -98,8 +104,11 @@ EosVocab eos_and_vocab(const std::string& config_path) {
   const dgpp::minijson::Value* tc = parsed.root.find("text_config");
   const dgpp::minijson::Value& c = tc && tc->is_object() ? *tc : parsed.root;
   EosVocab out;
-  out.vocab = c.at("vocab_size").as_int();
-  const dgpp::minijson::Value& e = c.at("eos_token_id");
+  // Inkling 2 pads its tables past the rows the head reads and states its
+  // EOS at the root.
+  const dgpp::minijson::Value* unpadded = c.find("unpadded_vocab_size");
+  out.vocab = unpadded ? unpadded->as_int() : c.at("vocab_size").as_int();
+  const dgpp::minijson::Value& e = c.find("eos_token_id") ? c.at("eos_token_id") : parsed.root.at("eos_token_id");
   if (e.is_array()) {
     for (const auto& v : e.items()) out.eos.push_back(v.as_int());
   } else {
@@ -149,6 +158,7 @@ DGPP_TEST(qwen_reasoning_effort_renders_each_level) {
 
 DGPP_TEST(structured_output_with_tools_over_the_real_tokenizer) {
   const std::string golden = golden_path(g_argc, g_argv);
+  if (corpus_is_inkling(golden)) dgpp::test::skip("the Inkling corpus has its own grammar gate");
   std::string err;
   const std::string snap = dgpp::hf::model_dir(corpus_model(golden), &err);
   if (snap.empty()) {
@@ -204,6 +214,16 @@ DGPP_TEST(reasoning_effort_edge_nativeControlsForEveryCheckpoint) {
   const auto tok = dgpp::text::Tokenizer::load((std::filesystem::path(snap) / "tokenizer.json").string());
   const auto tpl = dgpp::text::ChatTemplate::load((std::filesystem::path(snap) / "chat_template.jinja").string());
   const dgpp::serve::TextFrontend frontend(&tok, &tpl);
+  if (frontend.markers().tool_format() == dgpp::text::ToolFormat::kInkling) {
+    // The template maps every name itself, "none" included (an effort level
+    // of 0), and reads no thinking switch.
+    for (const char* level : {"none", "minimal", "low", "medium", "high", "xhigh", "max"}) {
+      const auto settings = frontend.reasoning_settings(level);
+      require(settings.effort && *settings.effort == level, std::string("Inkling takes the effort name ") + level);
+      require(!settings.enable_thinking.has_value(), "Inkling has no thinking switch");
+    }
+    return;
+  }
   const bool qwen = frontend.markers().tool_format() == dgpp::text::ToolFormat::kQwenXml;
   const std::vector<std::string> levels{"minimal","low","medium","high","xhigh","max"};
   const std::vector<std::string> native = qwen ? std::vector<std::string>{"low","low","medium","xhigh","xhigh","xhigh"} :
@@ -326,6 +346,7 @@ DGPP_TEST(generation_prompt_tails_across_the_cached_checkpoints) {
 }
 
 DGPP_TEST(custom_tools_and_references_over_the_real_tokenizer) {
+  if (corpus_is_inkling(golden_path(g_argc, g_argv))) dgpp::test::skip("the Inkling corpus has its own grammar gate");
   std::string err;
   const auto snap = dgpp::hf::model_dir(corpus_model(golden_path(g_argc, g_argv)), &err);
   if (snap.empty()) { DGPP_LOG_WARN("custom tools checkpoint unavailable ({})", err); std::exit(2); }
@@ -548,6 +569,26 @@ bool json_equal(const dgpp::minijson::Value& a, const dgpp::minijson::Value& b) 
   return false;
 }
 
+// The same with an object's members in any order (Inkling's template sorts a
+// call's top-level argument keys).
+bool json_equal_unordered(const dgpp::minijson::Value& a, const dgpp::minijson::Value& b) {
+  using K = dgpp::minijson::Value::Kind;
+  if (a.kind() != b.kind()) return false;
+  if (a.kind() == K::Array) {
+    if (a.items().size() != b.items().size()) return false;
+    for (size_t i = 0; i < a.items().size(); ++i)
+      if (!json_equal_unordered(a.items()[i], b.items()[i])) return false;
+    return true;
+  }
+  if (a.kind() != K::Object) return json_equal(a, b);
+  if (a.members().size() != b.members().size()) return false;
+  for (const auto& m : a.members()) {
+    const dgpp::minijson::Value* other = b.find(m.key);
+    if (other == nullptr || !json_equal_unordered(m.value, *other)) return false;
+  }
+  return true;
+}
+
 // M6 6f: the template's rendering of an assistant tool-call message IS
 // the model's output format, so render → encode → parse must round-trip
 // over every golden case that carries one: the parser (the real
@@ -558,6 +599,7 @@ DGPP_TEST(glm_tool_call_render_encode_parse_roundTrip) {
   if (corpus_is_qwen(kGoldenPath)) {
     dgpp::test::skip("requires a GLM-format corpus; the Qwen corpus has its own gate");
   }
+  if (corpus_is_inkling(kGoldenPath)) dgpp::test::skip("requires a GLM-format corpus; the Inkling corpus has its own gate");
   const std::string model_id = corpus_model(kGoldenPath);
   std::string err;
   const std::string snap = dgpp::hf::model_dir(model_id, &err);
@@ -1139,6 +1181,7 @@ DGPP_TEST(glm_tool_grammar_accepts_the_golden_turns_over_the_real_tokenizer) {
   if (corpus_is_qwen(kGoldenPath)) {
     dgpp::test::skip("requires a GLM-format corpus; the Qwen corpus has its own gate");
   }
+  if (corpus_is_inkling(kGoldenPath)) dgpp::test::skip("requires a GLM-format corpus; the Inkling corpus has its own gate");
   const std::string model_id = corpus_model(kGoldenPath);
   std::string err;
   const std::string snap = dgpp::hf::model_dir(model_id, &err);
@@ -1356,6 +1399,7 @@ DGPP_TEST(glm_json_grammar_accepts_tokenized_documents_over_the_real_tokenizer) 
   if (corpus_is_qwen(kGoldenPath)) {
     dgpp::test::skip("requires a GLM-format corpus; the Qwen corpus has its own gate");
   }
+  if (corpus_is_inkling(kGoldenPath)) dgpp::test::skip("requires a GLM-format corpus; the Inkling corpus has its own gate");
   const std::string model_id = corpus_model(kGoldenPath);
   std::string err;
   const std::string snap = dgpp::hf::model_dir(model_id, &err);
@@ -1602,6 +1646,337 @@ DGPP_TEST(chat_template_generic_hf_render_extra_keys) {
   require(t3.render(dgpp::text::Value::map_value(std::move(g3))) == "A",
           "a parenthesized ternary iterable still parses");
 }
+
+// ---------------------------------------------------------------------------
+// Inkling 2: typed blocks
+// ---------------------------------------------------------------------------
+
+namespace {
+
+struct InklingParse {
+  std::string reasoning, content;
+  std::vector<dgpp::text::ToolCallParser::Call> calls;
+  int reasoning_blocks = 0;
+};
+
+InklingParse inkling_parse(const dgpp::text::Tokenizer& tok, const dgpp::text::ChatMarkers& markers,
+                           const std::vector<int64_t>& ids) {
+  dgpp::text::ToolCallParser parser(
+      markers, [&](const std::vector<int64_t>& v) { return tok.decode(v, true); }, dgpp::text::ToolSchemas(),
+      dgpp::text::ToolCallParser::Options{});
+  std::vector<dgpp::text::ToolCallParser::Event> events;
+  for (const int64_t id : ids) parser.feed(id, &events);
+  parser.finish(&events);
+  InklingParse out;
+  for (const auto& ev : events) {
+    using Kind = dgpp::text::ToolCallParser::Event::Kind;
+    if (ev.kind == Kind::kReasoning) out.reasoning += ev.text;
+    if (ev.kind == Kind::kReasoningClosed) ++out.reasoning_blocks;
+    if (ev.kind == Kind::kContent) out.content += ev.text;
+    if (ev.kind == Kind::kToolCall) out.calls.push_back(ev.call);
+  }
+  return out;
+}
+
+// Feeds the ids through a grammar. Returns the index of the first refused
+// id, or ids.size() when every id was allowed. The mask and the pointwise
+// rule must agree at every position.
+size_t inkling_accepts(const dgpp::text::GrammarVocab& vocab, const dgpp::text::GrammarSpec& spec,
+                       const std::vector<int64_t>& ids) {
+  dgpp::text::GrammarState state(&vocab, spec, false);
+  for (size_t i = 0; i < ids.size(); ++i) {
+    dgpp::text::TokenMask mask;
+    state.mask(&mask);
+    require(mask.allows(ids[i]) == state.allows(ids[i]),
+            "the Inkling grammar's mask and its pointwise rule agree (position " + std::to_string(i) + ", state " +
+                state.state_name() + ")");
+    if (!mask.allows(ids[i])) return i;
+    state.advance(ids[i]);
+    require(state.active() || i + 1 == ids.size(), "an allowed id keeps the Inkling grammar alive");
+  }
+  return ids.size();
+}
+
+}  // namespace
+
+// Every assistant turn of the corpus: what the template renders for it is
+// what the model writes, so its ids through the parser give back the
+// turn's reasoning, text and calls, and the auto grammar admits them.
+DGPP_TEST(inkling_turns_render_encode_parse_roundTrip) {
+  const std::string kGoldenPath = golden_path(g_argc, g_argv);
+  if (!corpus_is_inkling(kGoldenPath)) dgpp::test::skip("requires the Inkling corpus");
+  std::string err;
+  const std::string snap = dgpp::hf::model_dir(corpus_model(kGoldenPath), &err);
+  if (snap.empty()) {
+    DGPP_LOG_WARN("inkling round trip: checkpoint unavailable ({})", err);
+    std::exit(2);
+  }
+  const dgpp::text::ChatTemplate tpl =
+      dgpp::text::ChatTemplate::load((std::filesystem::path(snap) / "chat_template.jinja").string());
+  const dgpp::text::Tokenizer tok = dgpp::text::Tokenizer::load((std::filesystem::path(snap) / "tokenizer.json").string());
+  const dgpp::text::ChatMarkers markers = dgpp::text::ChatMarkers::from_tokenizer(tok);
+  require(markers.tool_format() == dgpp::text::ToolFormat::kInkling && markers.reasoning_available(),
+          "the tokenizer carries Inkling's block markers");
+  require(markers.role_markers.size() == 4, "the four message headers are the prefix cache's boundaries");
+  const EosVocab cfg = eos_and_vocab((std::filesystem::path(snap) / "config.json").string());
+  const dgpp::text::GrammarVocab vocab = dgpp::text::GrammarVocab::from_tokenizer(tok, cfg.eos, cfg.vocab);
+  require(vocab.usable() && vocab.call_turn_eos() == cfg.eos[0], "the grammar vocabulary ends a turn at the EOS id");
+
+  std::istringstream f(read_text_file(kGoldenPath));
+  std::string line;
+  std::getline(f, line);  // the header
+  int turns = 0, calls = 0, with_reasoning = 0;
+  while (std::getline(f, line)) {
+    if (line.empty()) continue;
+    const dgpp::minijson::ParseResult parsed = dgpp::minijson::parse(line);
+    const std::string name(parsed.root.at("name").as_string());
+    const dgpp::minijson::Value& kwargs = parsed.root.at("kwargs");
+    const dgpp::minijson::Value& messages = kwargs.at("messages");
+    const dgpp::minijson::Value* tools = kwargs.find("tools");
+    for (size_t k = 0; k < messages.items().size(); ++k) {
+      const dgpp::minijson::Value& msg = messages.items()[k];
+      if (msg.at("role").as_string() != "assistant") continue;
+      const auto render_through = [&](size_t count) {
+        std::vector<dgpp::text::Value> ms;
+        for (size_t j = 0; j < count; ++j) ms.push_back(dgpp::text::Value::from_minijson(messages.items()[j]));
+        dgpp::text::Value::Members g;
+        g.emplace_back("messages", dgpp::text::Value::list_value(std::move(ms)));
+        if (tools) g.emplace_back("tools", dgpp::text::Value::from_minijson(*tools));
+        return tpl.render(dgpp::text::Value::map_value(std::move(g)));
+      };
+      const std::string before = render_through(k);
+      const std::string through = render_through(k + 1);
+      require(through.compare(0, before.size(), before) == 0, name + ": the render grows by the assistant turn");
+      const std::string turn = through.substr(before.size());
+      const std::vector<int64_t> ids = tok.encode(turn);
+      require(!ids.empty() && ids.back() == cfg.eos[0], name + ": the turn ends at the end-of-sampling id");
+
+      const InklingParse got = inkling_parse(tok, markers, std::vector<int64_t>(ids.begin(), ids.end() - 1));
+      const dgpp::minijson::Value* reasoning = msg.find("reasoning_content");
+      const dgpp::minijson::Value* content = msg.find("content");
+      const dgpp::minijson::Value* tcs = msg.find("tool_calls");
+      const std::string want_reasoning = reasoning && reasoning->is_string() ? std::string(reasoning->as_string()) : "";
+      const std::string want_content = content && content->is_string() ? std::string(content->as_string()) : "";
+      require(got.reasoning == want_reasoning, name + ": reasoning '" + got.reasoning + "' != '" + want_reasoning + "'");
+      require(got.reasoning_blocks == (want_reasoning.empty() ? 0 : 1), name + ": one close per thinking block");
+      require(got.content == want_content, name + ": content '" + got.content + "' != '" + want_content + "'");
+      const size_t want_calls = tcs ? tcs->items().size() : 0;
+      require(got.calls.size() == want_calls,
+              name + ": " + std::to_string(got.calls.size()) + " calls parsed, " + std::to_string(want_calls) + " expected");
+      for (size_t c = 0; c < want_calls; ++c) {
+        const dgpp::minijson::Value& def = tcs->items()[c].at("function");
+        require(got.calls[c].name == def.at("name").as_string(), name + ": call " + std::to_string(c) + " name");
+        const dgpp::minijson::ParseResult args = dgpp::minijson::parse(got.calls[c].arguments);
+        require(json_equal_unordered(args.root, def.at("arguments")),
+                name + ": call " + std::to_string(c) + " arguments " + got.calls[c].arguments + " differ from the case's");
+        ++calls;
+      }
+      with_reasoning += !want_reasoning.empty();
+
+      // The auto grammar over the turn's own tools admits every id. A turn
+      // whose calls name a tool outside the request's list is the model's
+      // error, so the tools here are the ones the calls name.
+      dgpp::text::GrammarSpec spec;
+      spec.mode = dgpp::text::GrammarSpec::Mode::kAuto;
+      if (tcs)
+        for (const auto& tc : tcs->items()) {
+          const std::string tool(tc.at("function").at("name").as_string());
+          bool seen = false;
+          for (const auto& t : spec.tools) seen = seen || t.name == tool;
+          if (seen) continue;
+          dgpp::text::GrammarTool gt;
+          gt.name = tool;
+          spec.tools.push_back(gt);
+        }
+      if (spec.tools.empty()) spec.mode = dgpp::text::GrammarSpec::Mode::kForbidCalls;
+      // A history turn may carry a speaker name in its headers. The grammar
+      // holds a header's name to the callable tools, so such a turn is not
+      // one a constrained reply writes.
+      const dgpp::minijson::Value* speaker = msg.find("name");
+      const bool named_speaker = speaker && speaker->is_string() && !speaker->as_string().empty();
+      if (!named_speaker)
+        require(inkling_accepts(vocab, spec, ids) == ids.size(), name + ": the grammar refuses the template's own turn");
+      ++turns;
+    }
+  }
+  require(turns >= 10 && calls >= 6 && with_reasoning >= 3,
+          "expected at least 10 assistant turns, 6 calls and 3 reasoning turns in the corpus, got " +
+              std::to_string(turns) + " / " + std::to_string(calls) + " / " + std::to_string(with_reasoning));
+  DGPP_LOG_INFO("inkling: {} assistant turns ({} calls, {} with reasoning) round-trip render -> encode -> parse and pass "
+                "the grammar",
+                turns, calls, with_reasoning);
+}
+
+// The parser on replies the template never writes: headerless blocks, a
+// block the model did not close, a malformed call, a cut generation.
+DGPP_TEST(inkling_parser_reads_irregular_replies) {
+  const std::string kGoldenPath = golden_path(g_argc, g_argv);
+  if (!corpus_is_inkling(kGoldenPath)) dgpp::test::skip("requires the Inkling corpus");
+  std::string err;
+  const std::string snap = dgpp::hf::model_dir(corpus_model(kGoldenPath), &err);
+  if (snap.empty()) std::exit(2);
+  const dgpp::text::Tokenizer tok = dgpp::text::Tokenizer::load((std::filesystem::path(snap) / "tokenizer.json").string());
+  const dgpp::text::ChatMarkers mk = dgpp::text::ChatMarkers::from_tokenizer(tok);
+  const std::string M = mk.message_model.text, TH = mk.content_thinking.text, TX = mk.content_text.text,
+                    TJ = mk.content_tool_json.text, E = mk.end_message.text;
+  const auto parse = [&](const std::string& text) { return inkling_parse(tok, mk, tok.encode(text)); };
+  {
+    const InklingParse p = parse(TH + "plan" + E + TX + "answer" + E);
+    require(p.reasoning == "plan" && p.content == "answer" && p.calls.empty(), "headerless blocks");
+  }
+  {
+    // A block left open when the next one starts, and a reply cut inside text.
+    const InklingParse p = parse(M + TH + "plan" + M + TX + "cut off he");
+    require(p.reasoning == "plan" && p.reasoning_blocks == 1 && p.content == "cut off he", "unclosed blocks");
+  }
+  {
+    // Two thinking blocks around text: both are reasoning.
+    const InklingParse p = parse(M + TH + "a" + E + M + TX + "b" + E + M + TH + "c" + E + M + TX + "d" + E);
+    require(p.reasoning == "ac" && p.reasoning_blocks == 2 && p.content == "bd", "interleaved blocks");
+  }
+  {
+    // The call's own name wins over the header's, the arguments keep their
+    // spelling, a call without args takes none.
+    const InklingParse p = parse(M + "get_weather" + TJ + R"({"name":"get_weather","args":{"days":3,"city":"Paris","t":1.50}})" +
+                                 E + M + TJ + R"({ "args" : {} , "name" : "ping" })" + E + M + "x" + TJ + R"({"name":"noargs"})" + E);
+    require(p.calls.size() == 3 && p.content.empty(), "three calls and no text");
+    require(p.calls[0].name == "get_weather" && p.calls[1].name == "ping" && p.calls[2].name == "noargs", "call names");
+    require(json_equal(dgpp::minijson::parse(p.calls[0].arguments).root,
+                       dgpp::minijson::parse(R"({"days":3,"city":"Paris","t":1.5})").root),
+            "call arguments");
+    require(p.calls[1].arguments == "{}" && p.calls[2].arguments == "{}", "empty arguments");
+  }
+  {
+    // A body that is not a call is shown as the text the model wrote: bad
+    // JSON, a non-object, a call cut by the token limit.
+    const InklingParse bad = parse(M + "f" + TJ + R"({"name":"f","args":{"x":)" + E + M + TX + "sorry" + E);
+    require(bad.calls.empty() && bad.content == std::string(R"({"name":"f","args":{"x":)") + "sorry", "a malformed call is text");
+    const InklingParse arr = parse(TJ + R"(["f"])" + E);
+    require(arr.calls.empty() && arr.content == R"(["f"])", "a non-object body is text");
+    const InklingParse cut = parse(M + "f" + TJ + R"({"name":"f","ar)");
+    require(cut.calls.empty() && cut.content == R"({"name":"f","ar)", "a cut call is text");
+  }
+}
+
+// The modes of the grammar over the real vocabulary.
+DGPP_TEST(inkling_grammar_enforces_each_mode_over_the_real_tokenizer) {
+  const std::string kGoldenPath = golden_path(g_argc, g_argv);
+  if (!corpus_is_inkling(kGoldenPath)) dgpp::test::skip("requires the Inkling corpus");
+  std::string err;
+  const std::string snap = dgpp::hf::model_dir(corpus_model(kGoldenPath), &err);
+  if (snap.empty()) std::exit(2);
+  const dgpp::text::Tokenizer tok = dgpp::text::Tokenizer::load((std::filesystem::path(snap) / "tokenizer.json").string());
+  const EosVocab cfg = eos_and_vocab((std::filesystem::path(snap) / "config.json").string());
+  const dgpp::text::GrammarVocab vocab = dgpp::text::GrammarVocab::from_tokenizer(tok, cfg.eos, cfg.vocab);
+  const dgpp::text::ChatMarkers& mk = vocab.markers();
+  const std::string M = mk.message_model.text, TH = mk.content_thinking.text, TX = mk.content_text.text,
+                    TJ = mk.content_tool_json.text, E = mk.end_message.text;
+  const auto ids_of = [&](const std::string& text) {
+    std::vector<int64_t> ids = tok.encode(text);
+    ids.push_back(cfg.eos[0]);
+    return ids;
+  };
+  const auto weather = dgpp::minijson::parse(
+      R"({"name":"get_weather","strict":true,"parameters":{"type":"object","properties":{"city":{"type":"string"},)"
+      R"("days":{"type":"integer","minimum":0,"maximum":14},"units":{"type":"string","enum":["metric","imperial"]}},)"
+      R"("required":["city"],"additionalProperties":false}})");
+  const auto clock = dgpp::minijson::parse(R"({"name":"get_time","parameters":{"type":"object","properties":{}}})");
+  using Mode = dgpp::text::GrammarSpec::Mode;
+  const auto spec_of = [&](Mode mode, bool parallel = true) {
+    dgpp::text::GrammarSpec spec;
+    spec.mode = mode;
+    spec.parallel = parallel;
+    spec.tools.push_back(dgpp::text::grammar_tool_from_function(weather.root, nullptr, nullptr, true));
+    spec.tools.push_back(dgpp::text::grammar_tool_from_function(clock.root, nullptr, nullptr, true));
+    return spec;
+  };
+  const auto call = [&](const std::string& name, const std::string& args, bool header = true) {
+    return M + (header ? name : "") + TJ + R"({"name":")" + name + R"(","args":)" + args + "}" + E;
+  };
+  const std::string think = M + TH + "Let me check the weather." + E;
+  const std::string answer = M + TX + "It is sunny." + E;
+  const std::string paris = call("get_weather", R"({"city":"Paris","days":3})");
+  const auto accepted = [&](const dgpp::text::GrammarSpec& spec, const std::string& text) {
+    const std::vector<int64_t> ids = ids_of(text);
+    return inkling_accepts(vocab, spec, ids) == ids.size();
+  };
+
+  // auto: text, reasoning and well-formed calls, in any order.
+  const auto autos = spec_of(Mode::kAuto);
+  require(accepted(autos, think + answer), "auto: a plain answer");
+  require(accepted(autos, think + paris), "auto: a call");
+  require(accepted(autos, answer + paris + call("get_time", "{}")), "auto: text and two calls");
+  require(!accepted(autos, call("get_weather", R"({"city":"Paris"})", false)), "auto: a call block follows a named header");
+  require(accepted(autos, call("get_weather", R"({ "units" : "metric" , "city" : "Oslo" })")), "auto: JSON whitespace and key order");
+  require(!accepted(autos, call("get_weather", R"({"days":3})")), "auto: a required argument is missing");
+  require(!accepted(autos, call("get_weather", R"({"city":"Paris","days":"three"})")), "auto: an argument of the wrong type");
+  require(!accepted(autos, call("get_weather", R"({"city":"Paris","days":15})")), "auto: an integer past its maximum");
+  require(!accepted(autos, call("get_weather", R"({"city":"Paris","units":"kelvin"})")), "auto: a value outside the enum");
+  require(!accepted(autos, call("get_weather", R"({"city":"Paris","extra":1})")), "auto: an undeclared key");
+  require(!accepted(autos, call("launch", "{}")), "auto: a tool that was not declared");
+  require(!accepted(autos, M + "get_time" + TJ + R"({"name":"get_weather","args":{"city":"x"}})" + E),
+          "auto: the body names another tool than its header");
+  require(!accepted(autos, M + TH + "x" + E + M + "get_weather" + TX + "y" + E), "auto: a named header opens a call only");
+  // One call when parallel is off, with text allowed after it.
+  const auto single = spec_of(Mode::kAuto, false);
+  require(accepted(single, paris + answer), "auto, one call: text after the call");
+  require(!accepted(single, paris + call("get_time", "{}")), "auto, one call: a second call");
+  // none: no call block at all.
+  const auto none = spec_of(Mode::kForbidCalls);
+  require(accepted(none, think + answer) && !accepted(none, think + paris), "none: text only");
+  // required: the turn cannot end before a call.
+  const auto required = spec_of(Mode::kRequired);
+  require(!accepted(required, think + answer), "required: a turn without a call");
+  require(!accepted(required, answer + paris), "required: text before the call");
+  require(accepted(required, think + paris), "required: reasoning then the call");
+  require(!accepted(required, think + think + paris), "required: a second thinking block before the call");
+  require(!accepted(required, paris + answer), "required: text after the call");
+  require(accepted(required, paris + call("get_time", "{}")), "required: several calls");
+  require(!accepted(spec_of(Mode::kRequired, false), paris + call("get_time", "{}")), "required, one call: a second call");
+  // named: exactly that tool, once, then the end.
+  auto named = spec_of(Mode::kNamed);
+  named.named = "get_time";
+  require(accepted(named, think + call("get_time", "{}")), "named: the named call");
+  require(!accepted(named, paris), "named: another tool");
+  require(!accepted(named, call("get_time", "{}") + answer), "named: text after the call");
+  require(!accepted(named, answer), "named: no call");
+  // json: one text block holding the JSON answer, reasoning allowed first.
+  dgpp::text::GrammarSpec json;
+  json.mode = Mode::kJson;
+  json.json_schema =
+      R"({"type":"object","properties":{"score":{"type":"integer","minimum":0,"maximum":10}},"required":["score"],"additionalProperties":false})";
+  require(accepted(json, think + M + TX + R"({"score": 7})" + E), "json: reasoning then the answer");
+  require(accepted(json, TX + R"({"score":0})" + E), "json: the answer alone");
+  require(!accepted(json, M + TX + "  " + R"({"score":0})" + E), "json: whitespace before the value");
+  require(!accepted(json, think + think + M + TX + R"({"score":0})" + E), "json: a second thinking block before the answer");
+  require(!accepted(autos, M + "get_time" + TJ + " {\"name\":\"get_time\",\"args\":{}}" + E), "auto: whitespace before a call's body");
+  require(!accepted(json, M + TX + R"({"score": 11})" + E), "json: a value outside the schema");
+  require(!accepted(json, M + TX + "seven" + E), "json: text that is not JSON");
+  require(!accepted(json, think), "json: no answer");
+  require(!accepted(json, M + TX + R"({"score": 7})" + E + answer), "json: text after the answer");
+  dgpp::text::GrammarSpec object;
+  object.mode = Mode::kJson;
+  require(accepted(object, M + TX + R"({"anything": [1, "two", null]})" + E), "json_object: any object");
+  require(!accepted(object, M + TX + "[1]" + E), "json_object: not an object");
+  // json or tools: the answer, or a turn of calls, not both.
+  auto either = spec_of(Mode::kJsonOrTools);
+  either.json_schema = json.json_schema;
+  require(accepted(either, think + M + TX + R"({"score": 3})" + E), "json or tools: the answer");
+  require(accepted(either, think + paris), "json or tools: a call");
+  require(!accepted(either, paris + M + TX + R"({"score": 3})" + E), "json or tools: an answer after a call");
+  require(!accepted(either, think), "json or tools: neither");
+  // Copies share nothing they advance: a speculative copy leaves the original where it was.
+  {
+    dgpp::text::GrammarState a(&vocab, autos, false);
+    const std::vector<int64_t> ids = ids_of(think + paris);
+    for (size_t i = 0; i < 3; ++i) a.advance(ids[i]);
+    dgpp::text::GrammarState b = a;
+    for (size_t i = 3; i < ids.size(); ++i) b.advance(ids[i]);
+    require(std::string(a.state_name()) == "inkling thinking" && std::string(b.state_name()) == "done",
+            "a copy advances on its own cursor");
+  }
+}
+
 
 int main(int argc, char** argv) {
   g_argc = argc;

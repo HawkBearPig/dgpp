@@ -94,6 +94,7 @@ DGPP_TEST(glm_tokenizer_differential_goldens) {
   if (model_id.empty()) model_id = "unsloth/GLM-5.3-Flash-FP8";
   const bool mimo = model_id.find("MiMo") != std::string::npos;
   const bool flint = model_id.find("flint") != std::string::npos;
+  const bool inkling = model_id.find("Inkling") != std::string::npos;
   const bool qwen = model_id.find("Qwen") != std::string::npos || mimo;  // the NFC tokenizers
   const bool dsv41 = model_id.find("DeepSeek-V4") != std::string::npos;
   std::string err;
@@ -118,6 +119,13 @@ DGPP_TEST(glm_tokenizer_differential_goldens) {
             "deepseek anchor prompt does not encode to the recorded ids");
     require(tok.encode(" Paris") == std::vector<int64_t>{11111}, "deepseek anchor ' Paris' != id 11111");
     require(tok.decode(std::vector<int64_t>{11111, 16}, false) == " Paris.", "deepseek anchor does not decode to ' Paris.'");
+  } else if (inkling) {
+    // The Inkling 2 corpus's anchors (HF tokenizers 0.23.3 on the snapshot):
+    // the case-class pattern under Isolated.
+    require(tok.encode("The capital of France is") == std::vector<int64_t>{371, 151451, 149879, 151194, 149884},
+            "inkling anchor prompt does not encode to the recorded ids");
+    require(tok.encode(" Paris") == std::vector<int64_t>{152717}, "inkling anchor ' Paris' != id 152717");
+    require(tok.decode(std::vector<int64_t>{152717, 13}, false) == " Paris.", "inkling anchor does not decode to ' Paris.'");
   } else if (flint) {
     // The Flint corpus's anchors (HF tokenizers 0.23.3 on the snapshot,
     // 2026-10-22): the three-stage pre-tokenizer's plain words.

@@ -203,6 +203,7 @@ add_library(dgpp_kernels STATIC
   src/kernels/pick.cu
   src/kernels/sample_pick.cu
   src/kernels/glm_spec.cu
+  src/kernels/device_copy.cu
   src/kernels/qwen_norm.cu
   src/kernels/qwen_gr.cu
   src/kernels/qwen_moe.cu
@@ -228,7 +229,12 @@ add_library(dgpp_kernels STATIC
   src/kernels/add_rmsnorm.cu
   src/kernels/dory_norm.cu
   src/kernels/dory_attn.cu
-  src/kernels/dory_head.cu)
+  src/kernels/dory_head.cu
+  src/kernels/inkling2.cu
+  src/kernels/inkling2_attn.cu
+  src/kernels/inkling2_attn_prefill.cu
+  src/kernels/inkling2_draft.cu
+  src/kernels/inkling2_vision.cu)
 target_link_libraries(dgpp_kernels PUBLIC CUDA::cudart CUDA::cublas CUDA::cublasLt CUDA::cuda_driver dgpp_core dgpp_rope_scaling)
 dgpp_set_common(dgpp_kernels)
 # The device sampler mirrors the host oracle bit for bit: no contraction of
@@ -277,6 +283,7 @@ add_library(dgpp_text STATIC
   src/text/tool_parser.cpp
   src/text/tool_grammar.cpp
   src/text/minimax_tool_grammar.cpp
+  src/text/inkling_tool_grammar.cpp
   src/text/string_constraint.cpp
   src/text/json_grammar.cpp)
 target_link_libraries(dgpp_text PUBLIC dgpp_loaders dgpp_pcre2)
@@ -377,6 +384,15 @@ target_include_directories(dgpp_models_flint PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/
 target_link_libraries(dgpp_models_flint PUBLIC dgpp_loaders dgpp_common)
 dgpp_set_common(dgpp_models_flint)
 
+# Inkling 2 (docs/inkling2_mini_plan.md): the host-side config and binding
+# tables of the looped model.
+add_library(dgpp_models_inkling2 STATIC
+  src/models/inkling2/config.cpp
+  src/models/inkling2/binding.cpp)
+target_include_directories(dgpp_models_inkling2 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(dgpp_models_inkling2 PUBLIC dgpp_loaders dgpp_common)
+dgpp_set_common(dgpp_models_inkling2)
+
 add_library(dgpp_models_minimax STATIC
   src/models/minimax/dspark_config.cpp
   src/models/minimax/config.cpp
@@ -443,6 +459,28 @@ target_include_directories(dgpp_models_flint_layers PUBLIC ${CMAKE_CURRENT_SOURC
 target_link_libraries(dgpp_models_flint_layers
   PUBLIC dgpp_models_flint dgpp_models_flint_loader dgpp_models_mimo_kv dgpp_models_qwen_moe dgpp_models_moe dgpp_models_glm dgpp_kernels CUDA::cudart)
 dgpp_set_common(dgpp_models_flint_layers)
+
+# The Inkling 2 loader (docs/inkling2_mini_plan.md section 2): the shared
+# resident stream over the family's bindings and TP geometry.
+add_library(dgpp_models_inkling2_loader STATIC
+  src/models/inkling2/loader.cpp)
+target_include_directories(dgpp_models_inkling2_loader PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(dgpp_models_inkling2_loader PUBLIC dgpp_models_inkling2 dgpp_models_glm dgpp_loaders CUDA::cudart dgpp_device_ranges)
+dgpp_set_common(dgpp_models_inkling2_loader)
+
+# The Inkling 2 layers and model: the relative-bias attention kernels, the
+# shared grouped expert kernels under the family's activation recipe, the
+# MiMo paged pool with one plane per visit.
+add_library(dgpp_models_inkling2_layers STATIC
+  src/models/inkling2/layers.cpp
+  src/models/inkling2/draft.cpp
+  src/models/inkling2/vision.cpp
+  src/models/inkling2/image_prefill.cpp
+  src/models/inkling2/forward.cpp)
+target_include_directories(dgpp_models_inkling2_layers PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(dgpp_models_inkling2_layers
+  PUBLIC dgpp_models_inkling2 dgpp_models_inkling2_loader dgpp_models_dflash2 dgpp_models_mimo_kv dgpp_models_moe dgpp_models_glm dgpp_kernels CUDA::cudart)
+dgpp_set_common(dgpp_models_inkling2_layers)
 
 # The full GLM-5.3 model on the session core (docs/glm53_plan.md G5).
 add_library(dgpp_models_glm_dsa_layers STATIC
@@ -960,6 +998,7 @@ if(DGPP_ENABLE_IBV)
                                              dgpp_models_dsv41_layers dgpp_models_dsv4_layers dgpp_models_mimo_layers
                                              dgpp_models_dory_layers
                                              dgpp_models_flint_layers dgpp_models_minimax_layers
+                                             dgpp_models_inkling2_layers
                                              dgpp_loaders dgpp_bus
                                              dgpp_serve CUDA::cudart
                                              Threads::Threads)
@@ -1037,6 +1076,7 @@ add_executable(unit_tests
   tests/unit/sampler_test.cpp
   tests/unit/tool_parser_test.cpp
   tests/unit/minimax_tool_test.cpp
+  tests/unit/inkling_tool_test.cpp
   tests/unit/tool_grammar_test.cpp
   tests/unit/json_grammar_test.cpp
   tests/unit/net_test.cpp
@@ -1070,6 +1110,8 @@ add_executable(unit_tests
   tests/unit/dory_reference_test.cpp
   tests/unit/flint_config_test.cpp
   tests/unit/flint_binding_test.cpp
+  tests/unit/inkling2_config_test.cpp
+  tests/unit/inkling2_binding_test.cpp
   tests/unit/minimax_dspark_config_test.cpp
   tests/unit/minimax_config_test.cpp
   tests/unit/minimax_binding_test.cpp
@@ -1083,7 +1125,7 @@ target_link_libraries(unit_tests PRIVATE CUDA::cudart dgpp_loaders dgpp_adapters
                                         dgpp_models_glm dgpp_models_qwen dgpp_models_qwen_loader
                                         dgpp_models_glm4
                                         dgpp_models_glm_dsa dgpp_models_dsv41 dgpp_models_dsv4 dgpp_models_mimo
-                                        dgpp_models_dory dgpp_models_minimax
+                                        dgpp_models_dory dgpp_models_minimax dgpp_models_inkling2
                                         dgpp_models_glm_dsa dgpp_models_dsv41 dgpp_models_dsv4 dgpp_models_mimo dgpp_models_flint
                                         dgpp_rope_scaling
                                         dgpp_net dgpp_serve Threads::Threads)
@@ -1185,6 +1227,9 @@ set_tests_properties(mimo_tokenizer_test PROPERTIES SKIP_RETURN_CODE 2)
 add_test(NAME flint_tokenizer_test
   COMMAND tokenizer_test ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/flint_tokenizer_goldens.jsonl)
 set_tests_properties(flint_tokenizer_test PROPERTIES SKIP_RETURN_CODE 2)
+add_test(NAME inkling2_tokenizer_test
+  COMMAND tokenizer_test ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/inkling2_tokenizer_goldens.jsonl)
+set_tests_properties(inkling2_tokenizer_test PROPERTIES SKIP_RETURN_CODE 2)
 
 # M6 Stage 3b: the chat-template differential gate (host). Skips with rc 2
 # when the model cache is absent, same as above.
@@ -1220,6 +1265,9 @@ set_tests_properties(mimo_chat_template_test PROPERTIES SKIP_RETURN_CODE 2)
 add_test(NAME flint_chat_template_test
   COMMAND chat_template_test ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/flint_chat_template_goldens.jsonl)
 set_tests_properties(flint_chat_template_test PROPERTIES SKIP_RETURN_CODE 2)
+add_test(NAME inkling2_chat_template_test
+  COMMAND chat_template_test ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/inkling2_chat_template_goldens.jsonl)
+set_tests_properties(inkling2_chat_template_test PROPERTIES SKIP_RETURN_CODE 2)
 
 # M6 Stage 4: the serving capstone — HTTP/SSE over epoll + the OpenAI
 # generation service (host-only; the engine adapters live in the apps,
@@ -1232,6 +1280,7 @@ add_library(dgpp_serve STATIC
   src/serve/vision_frontend.cpp
   src/serve/glm_vision_frontend.cpp
   src/serve/qwen_vision_frontend.cpp
+  src/serve/inkling_vision_frontend.cpp
   src/serve/file_inputs.cpp
   src/serve/cluster_config.cpp
   src/serve/nvme_cache_check.cpp
@@ -1804,7 +1853,7 @@ set_tests_properties(qwen_dflash2_test PROPERTIES RUN_SERIAL TRUE LABELS "gpu")
 
 add_executable(dflash2_integration_test tests/cuda/dflash2_integration_test.cpp)
 target_include_directories(dflash2_integration_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
-target_link_libraries(dflash2_integration_test PRIVATE dgpp_models_minimax_layers dgpp_models_qwen_layers dgpp_bus dgpp_sched dgpp_text CUDA::cudart Threads::Threads)
+target_link_libraries(dflash2_integration_test PRIVATE dgpp_models_minimax_layers dgpp_models_qwen_layers dgpp_models_inkling2_layers dgpp_bus dgpp_sched dgpp_text CUDA::cudart Threads::Threads)
 dgpp_set_common(dflash2_integration_test)
 add_test(NAME dflash2_integration_test COMMAND dflash2_integration_test)
 set_tests_properties(dflash2_integration_test PROPERTIES RUN_SERIAL TRUE LABELS "gpu")
@@ -1966,6 +2015,186 @@ add_test(NAME flint_forward_test
   COMMAND flint_forward_test --checkpoint-dir ${FLINT_FORWARD_FIXTURE}
           --dump-file ${CMAKE_CURRENT_BINARY_DIR}/flint_teacher_ref.fdump)
 set_tests_properties(flint_forward_test PROPERTIES DEPENDS flint_forward_generate_teacher)
+
+# The Inkling 2 row kernels against host statements, and the two activation
+# quantizers against the numpy reference's (docs/inkling2_mini_plan.md G2).
+add_executable(inkling2_kernels_test tests/cuda/inkling2_kernels_test.cu)
+target_include_directories(inkling2_kernels_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
+target_link_libraries(inkling2_kernels_test PRIVATE dgpp_kernels CUDA::cudart Threads::Threads)
+dgpp_set_common(inkling2_kernels_test)
+add_test(NAME inkling2_kernels_test
+  COMMAND inkling2_kernels_test --dump-quant ${CMAKE_CURRENT_BINARY_DIR}/inkling2_quant.bin)
+add_test(NAME inkling2_quantizers_reference
+  COMMAND ${DSV41_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/tools/inkling2_reference_dump.py
+          check-quant --dump ${CMAKE_CURRENT_BINARY_DIR}/inkling2_quant.bin)
+set_tests_properties(inkling2_quantizers_reference PROPERTIES DEPENDS inkling2_kernels_test)
+
+# The Inkling 2 forward (docs/inkling2_mini_plan.md G3): fixture -> smoke;
+# the python reference end to end (relaxed) -> teacher-forced (strict), once
+# per expert activation recipe.
+add_executable(inkling2_forward_test tests/cuda/inkling2_forward_test.cpp)
+target_include_directories(inkling2_forward_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
+target_link_libraries(inkling2_forward_test PRIVATE dgpp_models_inkling2_layers dgpp_models_glm_loader CUDA::cudart Threads::Threads)
+dgpp_set_common(inkling2_forward_test)
+set(INKLING2_FORWARD_FIXTURE ${CMAKE_CURRENT_BINARY_DIR}/inkling2_forward_fixture)
+add_test(NAME inkling2_forward_fixture COMMAND inkling2_forward_test --write-fixture ${INKLING2_FORWARD_FIXTURE})
+foreach(INK2_ACT bf16 native)
+  add_test(NAME inkling2_forward_smoke_${INK2_ACT}
+    COMMAND inkling2_forward_test --smoke ${INKLING2_FORWARD_FIXTURE} --activations ${INK2_ACT})
+  set_tests_properties(inkling2_forward_smoke_${INK2_ACT} PROPERTIES DEPENDS inkling2_forward_fixture)
+  add_test(NAME inkling2_forward_generate_${INK2_ACT}
+    COMMAND ${DSV41_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/tools/inkling2_reference_dump.py
+            gen-pure --checkpoint-dir ${INKLING2_FORWARD_FIXTURE} --activations ${INK2_ACT}
+            --out ${CMAKE_CURRENT_BINARY_DIR}/inkling2_pure_ref_${INK2_ACT}.idump)
+  set_tests_properties(inkling2_forward_generate_${INK2_ACT} PROPERTIES DEPENDS inkling2_forward_fixture)
+  add_test(NAME inkling2_forward_test_e2e_${INK2_ACT}
+    COMMAND ${CMAKE_COMMAND} -E env
+            DGPP_INKLING2_DUMP_ENGINE_STATES=${CMAKE_CURRENT_BINARY_DIR}/inkling2_engine_states_${INK2_ACT}.bin
+            $<TARGET_FILE:inkling2_forward_test> --checkpoint-dir ${INKLING2_FORWARD_FIXTURE}
+            --dump-file ${CMAKE_CURRENT_BINARY_DIR}/inkling2_pure_ref_${INK2_ACT}.idump
+            --activations ${INK2_ACT} --relaxed)
+  set_tests_properties(inkling2_forward_test_e2e_${INK2_ACT} PROPERTIES DEPENDS inkling2_forward_generate_${INK2_ACT})
+  add_test(NAME inkling2_forward_generate_teacher_${INK2_ACT}
+    COMMAND ${DSV41_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/tools/inkling2_reference_dump.py
+            gen-pure --checkpoint-dir ${INKLING2_FORWARD_FIXTURE} --activations ${INK2_ACT}
+            --out ${CMAKE_CURRENT_BINARY_DIR}/inkling2_teacher_ref_${INK2_ACT}.idump
+            --teacher ${CMAKE_CURRENT_BINARY_DIR}/inkling2_engine_states_${INK2_ACT}.bin)
+  set_tests_properties(inkling2_forward_generate_teacher_${INK2_ACT} PROPERTIES DEPENDS inkling2_forward_test_e2e_${INK2_ACT})
+  add_test(NAME inkling2_forward_test_${INK2_ACT}
+    COMMAND inkling2_forward_test --checkpoint-dir ${INKLING2_FORWARD_FIXTURE}
+            --dump-file ${CMAKE_CURRENT_BINARY_DIR}/inkling2_teacher_ref_${INK2_ACT}.idump
+            --activations ${INK2_ACT})
+  set_tests_properties(inkling2_forward_test_${INK2_ACT} PROPERTIES DEPENDS inkling2_forward_generate_teacher_${INK2_ACT})
+endforeach()
+
+# The Inkling 2 tensor-parallel forwards (docs/inkling2_mini_plan.md section
+# 2): loopback worlds of 2 and 4 ranks, bitwise across ranks and
+# teacher-forced against the reference at that world, once per activation
+# recipe (ports 30042 to 30055).
+add_executable(inkling2_tp_test tests/cuda/inkling2_tp_test.cpp)
+target_include_directories(inkling2_tp_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
+target_link_libraries(inkling2_tp_test PRIVATE dgpp_models_inkling2_layers dgpp_bus dgpp_loaders CUDA::cudart Threads::Threads)
+dgpp_set_common(inkling2_tp_test)
+set(INKLING2_TP_TESTS "")
+foreach(INK2_ACT bf16 native)
+  foreach(INK2_WORLD 2 4)
+    if(INK2_ACT STREQUAL "native")
+      math(EXPR INK2_PORT "30050 + ${INK2_WORLD}")
+    else()
+      math(EXPR INK2_PORT "30040 + ${INK2_WORLD}")
+    endif()
+    set(INK2_TAG w${INK2_WORLD}_${INK2_ACT})
+    add_test(NAME inkling2_tp_states_${INK2_TAG}
+      COMMAND ${CMAKE_COMMAND} -E env
+              DGPP_INKLING2_DUMP_ENGINE_STATES=${CMAKE_CURRENT_BINARY_DIR}/inkling2_engine_states_${INK2_TAG}.bin
+              $<TARGET_FILE:inkling2_tp_test> --checkpoint-dir ${INKLING2_FORWARD_FIXTURE}
+              --dump-file ${CMAKE_CURRENT_BINARY_DIR}/inkling2_pure_ref_${INK2_ACT}.idump
+              --world ${INK2_WORLD} --port ${INK2_PORT} --activations ${INK2_ACT} --report)
+    set_tests_properties(inkling2_tp_states_${INK2_TAG} PROPERTIES DEPENDS inkling2_forward_generate_${INK2_ACT})
+    add_test(NAME inkling2_tp_generate_teacher_${INK2_TAG}
+      COMMAND ${DSV41_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/tools/inkling2_reference_dump.py
+              gen-pure --checkpoint-dir ${INKLING2_FORWARD_FIXTURE} --activations ${INK2_ACT} --world ${INK2_WORLD}
+              --out ${CMAKE_CURRENT_BINARY_DIR}/inkling2_teacher_ref_${INK2_TAG}.idump
+              --teacher ${CMAKE_CURRENT_BINARY_DIR}/inkling2_engine_states_${INK2_TAG}.bin)
+    set_tests_properties(inkling2_tp_generate_teacher_${INK2_TAG} PROPERTIES DEPENDS inkling2_tp_states_${INK2_TAG})
+    add_test(NAME inkling2_tp_test_${INK2_TAG}
+      COMMAND inkling2_tp_test --checkpoint-dir ${INKLING2_FORWARD_FIXTURE}
+              --dump-file ${CMAKE_CURRENT_BINARY_DIR}/inkling2_teacher_ref_${INK2_TAG}.idump
+              --world ${INK2_WORLD} --port ${INK2_PORT} --activations ${INK2_ACT})
+    set_tests_properties(inkling2_tp_test_${INK2_TAG} PROPERTIES DEPENDS inkling2_tp_generate_teacher_${INK2_TAG})
+    list(APPEND INKLING2_TP_TESTS inkling2_tp_states_${INK2_TAG} inkling2_tp_test_${INK2_TAG})
+  endforeach()
+endforeach()
+set_tests_properties(${INKLING2_TP_TESTS} PROPERTIES LABELS "gpu;rdma" RUN_SERIAL TRUE)
+
+# The Inkling 2 engines (docs/inkling2_mini_plan.md G5): the eager and graph
+# adapters on a loopback world of 2, once per activation recipe.
+add_executable(inkling2_engine_test tests/cuda/inkling2_engine_test.cpp)
+target_include_directories(inkling2_engine_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
+target_link_libraries(inkling2_engine_test PRIVATE dgpp_models_inkling2_layers dgpp_bus dgpp_loaders dgpp_sched dgpp_text CUDA::cudart Threads::Threads)
+dgpp_set_common(inkling2_engine_test)
+add_test(NAME inkling2_engine_test COMMAND inkling2_engine_test)
+set_tests_properties(inkling2_engine_test PROPERTIES LABELS "gpu;rdma" RUN_SERIAL TRUE)
+
+# The Inkling 2 session surface (docs/inkling2_mini_plan.md G4): decode
+# against the re-forward, snapshots, verify rows, slots, the prefix cache.
+add_executable(inkling2_decode_test tests/cuda/inkling2_decode_test.cpp)
+target_include_directories(inkling2_decode_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
+target_link_libraries(inkling2_decode_test PRIVATE dgpp_models_inkling2_layers dgpp_models_glm_loader CUDA::cudart Threads::Threads)
+dgpp_set_common(inkling2_decode_test)
+foreach(INK2_ACT bf16 native)
+  add_test(NAME inkling2_decode_test_${INK2_ACT}
+    COMMAND inkling2_decode_test --fixture ${CMAKE_CURRENT_BINARY_DIR}/inkling2_decode_fixture --activations ${INK2_ACT})
+endforeach()
+set_tests_properties(inkling2_decode_test_native PROPERTIES DEPENDS inkling2_decode_test_bf16)
+
+# The Inkling 2 draft model (docs/inkling2_mini_plan.md section 1.7): the
+# structural checks once per activation recipe, then the draft's context
+# rows, block rows and proposals at worlds 1, 2 and 4 against the numpy
+# reference (loopback ports 30072 and 30074).
+add_executable(inkling2_draft_test tests/cuda/inkling2_draft_test.cpp)
+target_include_directories(inkling2_draft_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
+target_link_libraries(inkling2_draft_test PRIVATE dgpp_models_inkling2_layers dgpp_bus dgpp_loaders dgpp_sched dgpp_text CUDA::cudart Threads::Threads)
+dgpp_set_common(inkling2_draft_test)
+set(INKLING2_DRAFT_FIXTURE ${CMAKE_CURRENT_BINARY_DIR}/inkling2_draft_fixture)
+add_test(NAME inkling2_draft_fixture COMMAND inkling2_draft_test --write-fixture ${INKLING2_DRAFT_FIXTURE})
+set(INKLING2_DRAFT_TESTS "")
+foreach(INK2_ACT bf16 native)
+  add_test(NAME inkling2_draft_test_${INK2_ACT}
+    COMMAND inkling2_draft_test --fixture ${INKLING2_DRAFT_FIXTURE} --activations ${INK2_ACT})
+  set_tests_properties(inkling2_draft_test_${INK2_ACT} PROPERTIES DEPENDS inkling2_draft_fixture)
+  list(APPEND INKLING2_DRAFT_TESTS inkling2_draft_test_${INK2_ACT})
+endforeach()
+foreach(INK2_WORLD 1 2 4)
+  math(EXPR INK2_PORT "30070 + ${INK2_WORLD}")
+  add_test(NAME inkling2_draft_cases_w${INK2_WORLD}
+    COMMAND inkling2_draft_test --fixture ${INKLING2_DRAFT_FIXTURE}
+            --dump ${CMAKE_CURRENT_BINARY_DIR}/inkling2_draft_w${INK2_WORLD}.bin
+            --world ${INK2_WORLD} --port ${INK2_PORT})
+  set_tests_properties(inkling2_draft_cases_w${INK2_WORLD} PROPERTIES DEPENDS inkling2_draft_fixture)
+  add_test(NAME inkling2_draft_reference_w${INK2_WORLD}
+    COMMAND ${DSV41_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/tools/inkling2_reference_dump.py
+            check-draft --checkpoint-dir ${INKLING2_DRAFT_FIXTURE}
+            --dump ${CMAKE_CURRENT_BINARY_DIR}/inkling2_draft_w${INK2_WORLD}.bin)
+  set_tests_properties(inkling2_draft_reference_w${INK2_WORLD} PROPERTIES DEPENDS inkling2_draft_cases_w${INK2_WORLD})
+  list(APPEND INKLING2_DRAFT_TESTS inkling2_draft_cases_w${INK2_WORLD})
+endforeach()
+set_tests_properties(${INKLING2_DRAFT_TESTS} PROPERTIES LABELS "gpu;rdma" RUN_SERIAL TRUE)
+
+# The Inkling 2 vision tower against its numpy reference on the tiny tower
+# tools/inkling2_vision_reference.py writes, and the image prefill on the tiny
+# release with a tower.
+add_executable(inkling2_vision_test tests/cuda/inkling2_vision_test.cpp)
+target_include_directories(inkling2_vision_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
+target_link_libraries(inkling2_vision_test PRIVATE dgpp_models_inkling2_layers CUDA::cudart Threads::Threads)
+dgpp_set_common(inkling2_vision_test)
+set(INKLING2_VISION_FIXTURE ${CMAKE_CURRENT_BINARY_DIR}/inkling2_vision_fixture)
+add_test(NAME inkling2_vision_fixture
+  COMMAND ${DSV41_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/tools/inkling2_vision_reference.py
+          write-fixture --out ${INKLING2_VISION_FIXTURE})
+set_tests_properties(inkling2_vision_fixture PROPERTIES LABELS "host")
+set(INKLING2_VISION_DUMPS "")
+set(INKLING2_VISION_REFERENCES "")
+foreach(INK2_CASE rect padded minimum tiled)
+  set(INK2_DUMP ${CMAKE_CURRENT_BINARY_DIR}/inkling2_vision_${INK2_CASE}.idump)
+  add_test(NAME inkling2_vision_reference_${INK2_CASE}
+    COMMAND ${DSV41_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/tools/inkling2_vision_reference.py
+            gen --checkpoint-dir ${INKLING2_VISION_FIXTURE} --case ${INK2_CASE} --out ${INK2_DUMP})
+  set_tests_properties(inkling2_vision_reference_${INK2_CASE} PROPERTIES
+    DEPENDS inkling2_vision_fixture LABELS "host" ENVIRONMENT "OPENBLAS_NUM_THREADS=1")
+  list(APPEND INKLING2_VISION_DUMPS ${INK2_DUMP})
+  list(APPEND INKLING2_VISION_REFERENCES inkling2_vision_reference_${INK2_CASE})
+endforeach()
+add_test(NAME inkling2_vision_test COMMAND inkling2_vision_test ${INKLING2_VISION_FIXTURE} ${INKLING2_VISION_DUMPS})
+set_tests_properties(inkling2_vision_test PROPERTIES DEPENDS "${INKLING2_VISION_REFERENCES}" LABELS "gpu")
+
+add_executable(inkling2_image_prefill_test tests/cuda/inkling2_image_prefill_test.cpp)
+target_include_directories(inkling2_image_prefill_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
+target_link_libraries(inkling2_image_prefill_test PRIVATE dgpp_models_inkling2_layers dgpp_models_glm_loader CUDA::cudart Threads::Threads)
+dgpp_set_common(inkling2_image_prefill_test)
+add_test(NAME inkling2_image_prefill_test
+  COMMAND inkling2_image_prefill_test --fixture ${CMAKE_CURRENT_BINARY_DIR}/inkling2_image_fixture)
+set_tests_properties(inkling2_image_prefill_test PROPERTIES LABELS "gpu")
 
 # The full GLM-5.3 forward (docs/glm53_plan.md G5): fixture -> smoke; the
 # python reference -> the dump parity.
@@ -2708,7 +2937,7 @@ add_test(NAME glm_forward_fixture
 set_tests_properties(glm_forward_fixture PROPERTIES SKIP_RETURN_CODE 2)
 add_executable(nvme_tier_families_test tests/cuda/nvme_tier_families_test.cpp)
 target_include_directories(nvme_tier_families_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
-target_link_libraries(nvme_tier_families_test PRIVATE dgpp_models_dory_layers dgpp_models_mimo_layers dgpp_models_flint_layers dgpp_models_qwen_layers dgpp_models_qwen_loader dgpp_models_qwen dgpp_models_glm_loader dgpp_kernels CUDA::cudart Threads::Threads)
+target_link_libraries(nvme_tier_families_test PRIVATE dgpp_models_dory_layers dgpp_models_mimo_layers dgpp_models_flint_layers dgpp_models_inkling2_layers dgpp_models_qwen_layers dgpp_models_qwen_loader dgpp_models_qwen dgpp_models_glm_loader dgpp_kernels CUDA::cudart Threads::Threads)
 dgpp_set_common(nvme_tier_families_test)
 add_test(NAME nvme_tier_families_test COMMAND nvme_tier_families_test)
 set_tests_properties(nvme_tier_families_test PROPERTIES RUN_SERIAL TRUE)
@@ -2952,7 +3181,9 @@ endif()
 set_tests_properties(tokenizer_test qwen_tokenizer_test glm4_tokenizer_test dsv41_tokenizer_test
   chat_template_test qwen_chat_template_test glm4_chat_template_test dsv41_prompt_test
   dsv4_tokenizer_test dsv4_prompt_test glm_dsa_tokenizer_test mimo_tokenizer_test flint_tokenizer_test
-  glm_dsa_chat_template_test mimo_chat_template_test flint_chat_template_test dory_grammar_repro
+  inkling2_tokenizer_test
+  glm_dsa_chat_template_test mimo_chat_template_test flint_chat_template_test inkling2_chat_template_test
+  dory_grammar_repro
   PROPERTIES LABELS "host;checkpoint")
 foreach(_test qwen_forward_fixture qwen_forward_generate glm4_forward_fixture
     glm4_forward_generate mimo_forward_fixture mimo_forward_generate mimo_forward_generate_teacher
@@ -3058,6 +3289,11 @@ target_link_libraries(minimax_vision_frontend_test PRIVATE dgpp_serve)
 dgpp_set_common(minimax_vision_frontend_test)
 add_test(NAME minimax_vision_frontend_test COMMAND minimax_vision_frontend_test)
 set_tests_properties(minimax_vision_frontend_test PROPERTIES LABELS "host;checkpoint" SKIP_RETURN_CODE 2)
+add_executable(inkling_vision_frontend_test tests/host/inkling_vision_frontend_test.cpp)
+target_link_libraries(inkling_vision_frontend_test PRIVATE dgpp_serve)
+dgpp_set_common(inkling_vision_frontend_test)
+add_test(NAME inkling_vision_frontend_test COMMAND inkling_vision_frontend_test)
+set_tests_properties(inkling_vision_frontend_test PROPERTIES LABELS "host;checkpoint" SKIP_RETURN_CODE 2)
 add_executable(minimax_video_frontend_test tests/host/minimax_video_frontend_test.cpp)
 target_link_libraries(minimax_video_frontend_test PRIVATE dgpp_serve)
 dgpp_set_common(minimax_video_frontend_test)
@@ -3085,7 +3321,7 @@ target_link_libraries(shared_prefill_test PRIVATE dgpp_models_glm_loader dgpp_mo
   dgpp_models_glm_dsa_layers dgpp_models_mimo_layers dgpp_models_qwen_layers
   dgpp_models_dsv4_layers dgpp_models_dsv41_layers dgpp_text CUDA::cudart Threads::Threads)
 dgpp_set_common(shared_prefill_test)
-target_link_libraries(shared_prefill_test PRIVATE dgpp_models_minimax_layers)
+target_link_libraries(shared_prefill_test PRIVATE dgpp_models_minimax_layers dgpp_models_inkling2_layers)
 if(TARGET dgpp_bus)
   target_link_libraries(shared_prefill_test PRIVATE dgpp_bus dgpp_serve)
   target_compile_definitions(shared_prefill_test PRIVATE DGPP_TEST_HAS_BUS=1)

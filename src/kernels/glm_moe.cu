@@ -1379,13 +1379,20 @@ __device__ __forceinline__ int block_exclusive_scan_int(int v, int* s_warp,
   return excl;
 }
 
-__global__ void moe_segment_count_kernel(const int32_t* __restrict__ ids, int tk,
+// `positions` (nullable, one per token): a token with a negative position is
+// padding. It is in no expert's row list.
+__device__ __forceinline__ bool segment_live(const int64_t* __restrict__ positions, int i, int K) {
+  return positions == nullptr || positions[i / K] >= 0;
+}
+
+__global__ void moe_segment_count_kernel(const int32_t* __restrict__ ids, int tk, int K,
+                                         const int64_t* __restrict__ positions,
                                          MoeSegment* __restrict__ segs) {
   dgpp_pdl_wait();
   __shared__ int s_warp[kSegmentThreads / 32];
   const int e = blockIdx.x;
   int c = 0;
-  for (int i = threadIdx.x; i < tk; i += kSegmentThreads) c += ids[i] == e;
+  for (int i = threadIdx.x; i < tk; i += kSegmentThreads) c += ids[i] == e && segment_live(positions, i, K);
 #pragma unroll
   for (int off = 16; off > 0; off >>= 1) c += __shfl_xor_sync(0xffffffffu, c, off);
   if (threadIdx.x % 32 == 0) s_warp[threadIdx.x / 32] = c;
@@ -1398,9 +1405,12 @@ __global__ void moe_segment_count_kernel(const int32_t* __restrict__ ids, int tk
 }
 
 __global__ void moe_segment_scan_kernel(int tokens, int K, int E,
+                                        const int64_t* __restrict__ positions,
                                         int32_t* __restrict__ rows,
+                                        int32_t* __restrict__ slot_row,
                                         MoeSegment* __restrict__ segs) {
   dgpp_pdl_wait();
+  __shared__ int s_listed;
   const int tk = tokens * K;
   if (threadIdx.x == 0) {
     int acc = 0;
@@ -1409,13 +1419,33 @@ __global__ void moe_segment_scan_kernel(int tokens, int K, int E,
       acc += segs[e].rows;
     }
     segs[E] = MoeSegment{tk, tokens, E};
+    s_listed = acc;
   }
   // The shared expert: every token once more, after the routed rows.
   for (int t = threadIdx.x; t < tokens; t += blockDim.x) rows[tk + t] = t;
+  if (positions == nullptr) return;
+  // The padding tokens' slots take the gathered rows behind the experts'
+  // lists, in token order, which no launch computes. Every routed slot keeps
+  // a gathered row of its own: a caller's per-row tables (the row's slot,
+  // its scale) are then written for exactly one slot each, and a padding
+  // row's values can never land on a live slot's.
+  __syncthreads();
+  const int listed = s_listed;
+  for (int t = threadIdx.x; t < tokens; t += blockDim.x) {
+    if (positions[t] >= 0) continue;
+    int before = 0;  // the padding tokens ahead of this one
+    for (int u = 0; u < t; ++u) before += positions[u] < 0;
+    for (int j = 0; j < K; ++j) {
+      const int row = listed + before * K + j;
+      slot_row[t * K + j] = row;
+      rows[row] = t;
+    }
+  }
 }
 
 __global__ void moe_segment_place_kernel(const int32_t* __restrict__ ids, int tk,
-                                         int K, int32_t* __restrict__ rows,
+                                         int K, const int64_t* __restrict__ positions,
+                                         int32_t* __restrict__ rows,
                                          int32_t* __restrict__ slot_row,
                                          const MoeSegment* __restrict__ segs) {
   dgpp_pdl_wait();
@@ -1426,7 +1456,7 @@ __global__ void moe_segment_place_kernel(const int32_t* __restrict__ ids, int tk
   int running = seg.row0;
   for (int base = 0; base < tk; base += kSegmentThreads) {
     const int i = base + threadIdx.x;
-    const int flag = (i < tk && ids[i] == e) ? 1 : 0;
+    const int flag = (i < tk && ids[i] == e && segment_live(positions, i, K)) ? 1 : 0;
     int total = 0;
     const int excl = block_exclusive_scan_int(flag, s_warp, &total);
     if (flag) {
@@ -1580,7 +1610,7 @@ void launch_moe_tile_list(const MoeSegment* segs, int n_segs, int tile_rows,
 
 void launch_moe_segment(const int32_t* ids, int tokens, int top_k,
                         int n_experts, int32_t* rows, int32_t* slot_row,
-                        MoeSegment* segs, cudaStream_t stream) {
+                        MoeSegment* segs, cudaStream_t stream, const int64_t* positions) {
   if (tokens <= 0) return;
   if (!ids || !rows || !slot_row || !segs)
     throw std::invalid_argument("moe segment: null pointer");
@@ -1588,12 +1618,12 @@ void launch_moe_segment(const int32_t* ids, int tokens, int top_k,
       n_experts > kSegmentMaxExperts)
     throw std::invalid_argument("moe segment: top_k or n_experts out of range");
   const int tk = tokens * top_k;
-  moe_segment_count_kernel<<<n_experts, kSegmentThreads, 0, stream>>>(ids, tk, segs);
+  moe_segment_count_kernel<<<n_experts, kSegmentThreads, 0, stream>>>(ids, tk, top_k, positions, segs);
   DGPP_CUDA_OK(cudaGetLastError());
-  moe_segment_scan_kernel<<<1, 256, 0, stream>>>(tokens, top_k, n_experts, rows, segs);
+  moe_segment_scan_kernel<<<1, 256, 0, stream>>>(tokens, top_k, n_experts, positions, rows, slot_row, segs);
   DGPP_CUDA_OK(cudaGetLastError());
   moe_segment_place_kernel<<<n_experts, kSegmentThreads, 0, stream>>>(
-      ids, tk, top_k, rows, slot_row, segs);
+      ids, tk, top_k, positions, rows, slot_row, segs);
   DGPP_CUDA_OK(cudaGetLastError());
 }
 

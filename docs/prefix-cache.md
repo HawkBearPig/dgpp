@@ -77,6 +77,27 @@ whose prefill cannot take extra cuts (DeepSeek's bounded prefill).
 `/v1/metrics` reports `min_tokens`, `head_cuts` and the `head_snapshots`
 taken under `prefix_cache`.
 
+## Templates without a generation prompt
+
+Most templates end a prompt with the assistant's role marker, and that
+marker is where the prompt's deepest cut stands. Inkling 2's template ends
+a prompt with its last message, and the model opens its turn with its own
+marker. For such a family the service cuts one token before every change
+of speaker, and at the last token of a prompt the model answers.
+
+Those are the positions the cached state already stands at. A prompt's
+prefill stores its state at the prompt's end. A finished answer's snapshot
+stands one token before the next speaker's marker, because the token that
+ends sampling is never fed. A repeated prompt therefore attaches at its
+last token. The next turn attaches at the end of the previous prompt when
+the client drops the reasoning from its history, and at the end of the
+previous answer when the history returns the answer token for token.
+
+A marker that continues the same speaker cuts at itself: the parts of a
+system prompt, or the blocks of one answer. The head cut is therefore
+where it is for every other template. A prompt that ends inside the
+model's own block is continued, not answered, and takes no cut at its end.
+
 ## Hits inside an entry
 
 `engine.prefix_partial_hits` (`--prefix-partial-hits`, default on) lets a

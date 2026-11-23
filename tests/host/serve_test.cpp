@@ -575,9 +575,16 @@ class FakeFrontend : public ModelFrontend {
   }
   // The prefix cache's boundary token (M7): the byte '|' plays the role
   // marker — a prompt "ab|cd|ef" has boundaries at 2 and 5.
+  // A template without a generation prompt (Inkling 2): '|' is the user's
+  // marker and '^' the one the model opens its own turn with. The service
+  // reads both declarations when it is built, so a test sets the switch
+  // before it builds its rig.
+  static inline std::atomic<bool> model_opens_turn{false};
   std::vector<int64_t> boundary_token_ids() const override {
+    if (model_opens_turn) return {static_cast<int64_t>('|'), static_cast<int64_t>('^')};
     return {static_cast<int64_t>('|')};
   }
+  int64_t self_opened_turn_marker() const override { return model_opens_turn ? static_cast<int64_t>('^') : -1; }
 
  private:
   bool with_markers_;
@@ -4267,6 +4274,75 @@ DGPP_TEST(serve_prefixCache_boundariesAttachOptOutAndMetrics) {
               met.find("\"ttft_hit_count\":1") != std::string::npos &&
               met.find("\"ttft_miss_count\":2") != std::string::npos,
           "metrics: " + met);
+}
+
+// A template that writes no generation prompt: the model opens its turn
+// with its own marker ('^' here), so a prompt has no marker at its end. The
+// cuts then stand one token before every change of speaker and at the last
+// token of a prompt the model answers. The fake arena aligns at 4.
+DGPP_TEST(serve_prefixCache_cutsAtTurnEndsWhenTheModelOpensItsTurn) {
+  struct Switch {
+    Switch() { FakeFrontend::model_opens_turn = true; }
+    ~Switch() { FakeFrontend::model_opens_turn = false; }
+  } on;
+  ServiceRig rig(/*queue_limit=*/8, dgpp::sample::greedy_params(),
+                 /*can_sample=*/false, std::nullopt, /*with_markers=*/false,
+                 /*reasoning_in_content=*/false, dgpp::sched::AdmissionPolicy{},
+                 /*prefix_slots=*/8);
+  const auto post = [&](const std::string& content) {
+    const std::string body = chat_body(content, 3);
+    Client c(rig.port());
+    c.send_all("POST /v1/chat/completions HTTP/1.1\r\nHost: t\r\n"
+               "Content-Type: application/json\r\nContent-Length: " +
+               std::to_string(body.size()) + "\r\n\r\n" + body);
+    const std::string resp = c.read_until("usage", 5000) + c.read_available(300);
+    require(resp.find("200 OK") != std::string::npos, "the request answers: " + resp.substr(0, 160));
+    return resp;
+  };
+  const auto ops_since = [&](size_t from) {
+    const std::vector<std::string> ops = rig.engine.prefix_ops();
+    std::string joined;
+    for (size_t i = from; i < ops.size(); ++i) joined += ops[i] + " ";
+    return joined;
+  };
+  const auto has = [](const std::string& joined, const std::string& op) { return joined.find(op) != std::string::npos; };
+
+  // A prompt of nine tokens with no marker past its first: its end, position
+  // 8, is the cut. The first request stores the state there and an
+  // identical one attaches to it.
+  size_t mark = 0;
+  const std::string first = post("|abcdefgh");
+  std::string ops = ops_since(mark);
+  require(has(ops, "N:0:8 ") && !has(ops, "X:"), "a snapshot at the prompt's last token: " + ops);
+  mark = rig.engine.prefix_ops().size();
+  const std::string again = post("|abcdefgh");
+  ops = ops_since(mark);
+  require(has(ops, "X:0:8 "), "the repeated prompt attaches at its last token: " + ops);
+  require(again.find("\"cached_tokens\":8") != std::string::npos, "the usage reports the attach: " + again.substr(0, 600));
+
+  // The next turn: the same nine tokens, the model's answer under its own
+  // marker at 9, the user's marker at 12. Both changes of speaker cut one
+  // token earlier (8 and 11, the latter's aligned image is 8), and the
+  // prompt's end cuts at 16. The turn attaches at 8 and stores 16.
+  mark = rig.engine.prefix_ops().size();
+  post("|abcdefgh^xy|pqrs");
+  ops = ops_since(mark);
+  require(has(ops, "X:0:8 ") && has(ops, "N:0:16 "), "the next turn attaches at the turn's end and stores its own: " + ops);
+
+  // A marker that continues the same speaker cuts at itself: '|' at 4
+  // after '|' at 0. The deepest cut is still the prompt's end, 12.
+  mark = rig.engine.prefix_ops().size();
+  post("|xyz|uvwxyzab");
+  ops = ops_since(mark);
+  require(has(ops, "N:0:12 "), "the end of a prompt with two parts of one speaker: " + ops);
+
+  // A prompt that ends inside the model's own block is continued, not
+  // answered: no cut at its end. The change of speaker at 8 cuts at 7,
+  // whose aligned image is 4.
+  mark = rig.engine.prefix_ops().size();
+  post("|mnopqrs^tuvw");
+  ops = ops_since(mark);
+  require(has(ops, "N:0:4 ") && !has(ops, "N:0:12 "), "a prompt the model continues takes no cut at its end: " + ops);
 }
 
 DGPP_TEST(serve_throughputLog_reports_unfinished_prefill_work) {

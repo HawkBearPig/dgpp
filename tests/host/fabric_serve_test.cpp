@@ -2319,6 +2319,48 @@ DGPP_TEST(journal_images_roundtrip_and_validation) {
   require(threw, "mismatched pixel dimensions rejected");
 }
 
+// A padded canvas (Inkling 2's 40-pixel grid): the content region travels
+// with the pixels, an image without one keeps the six-field entry, and a
+// region outside the canvas or short of the last grid row is refused.
+DGPP_TEST(journal_image_content_region_roundtrips_and_is_validated) {
+  dgpp::serve::GenerationService::PassEvents events;
+  dgpp::sched::SchedulerRequest r;
+  r.id = "padded";
+  r.prompt = {7, 200054, 200054, 8};
+  dgpp::ImageInput im;
+  im.offset = 1;
+  im.tokens = 2;
+  im.width = 80;
+  im.height = 40;
+  im.grid = 40;
+  im.valid_width = 53;
+  im.valid_height = 31;
+  im.rgb.assign(80 * 40 * 3, 9);
+  r.images.push_back(im);
+  events.submits.push_back(r);
+  const auto line = dgpp::serve::encode_journal_tick(events);
+  require(line.find("[1,2,80,40,40,[53,31],") != std::string::npos, "the content region is on the wire: " + line.substr(0, 200));
+  const auto back = dgpp::serve::decode_journal_line(line).submits[0].images[0];
+  require(back.grid == 40 && back.valid_width == 53 && back.valid_height == 31 && back.rgb == im.rgb,
+          "grid, content region and pixels reach the peer");
+  events.submits[0].images[0].valid_width = events.submits[0].images[0].valid_height = 0;
+  const auto plain = dgpp::serve::encode_journal_tick(events);
+  require(plain.find("[1,2,80,40,40,\"") != std::string::npos, "an image without a region keeps its entry");
+  require(dgpp::serve::decode_journal_line(plain).submits[0].images[0].valid_width == 0, "no region on the peer");
+  for (const char* region : {"[81,31]", "[53,41]", "[40,31]", "[53,0]", "[53]"}) {
+    auto bad = line;
+    const auto at = bad.find("[53,31]");
+    bad.replace(at, 7, region);
+    bool threw = false;
+    try {
+      (void)dgpp::serve::decode_journal_line(bad);
+    } catch (const std::exception&) {
+      threw = true;
+    }
+    require(threw, std::string("a bad content region is refused: ") + region);
+  }
+}
+
 DGPP_TEST(journal_image_history_exceeds_old_count_and_token_caps) {
   dgpp::serve::GenerationService::PassEvents events;
   dgpp::sched::SchedulerRequest request;

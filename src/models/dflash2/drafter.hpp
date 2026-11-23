@@ -26,6 +26,7 @@
 
 #include "engine/boundary_reducer.hpp"
 #include "kernels/gemm.hpp"
+#include "kernels/inkling2_draft.hpp"
 #include "kernels/pick.hpp"
 #include "kernels/sample_pick.hpp"
 #include "kernels/rope_scaling.hpp"
@@ -81,6 +82,15 @@ struct DFlash2Host {
   // product (the selector walk reads the top-K off it): the family's
   // served-head dispatch, with or without its draft screen.
   std::function<void(const uint16_t* hidden, float* out, int rows)> head;
+  // Inkling 2: the recurrent head reads a feature of the last committed
+  // position. The family keeps one such row per position where its own
+  // positional state lives (rollback and prefix snapshots then cover it):
+  // store_step_feature takes the rows of a target run at their positions,
+  // load_step_feature writes the row of the position before the block whose
+  // first position is at d_block_pos (zeros when none precedes it).
+  std::function<void(const uint16_t* rows, int count, const int32_t* d_req, const int64_t* d_pos)>
+      store_step_feature = nullptr;
+  std::function<void(int req, const int64_t* d_block_pos, uint16_t* d_out)> load_step_feature = nullptr;
 };
 
 // The capture-time step fields (SessionModel members the family keeps
@@ -121,6 +131,9 @@ class DFlash2Drafter {
   int tap(int layer) const;
   float* acc() const { return df_acc_; }
   float* tap_gemm_out() const { return df_t32_; }
+  // Inkling 2: the family copies each tapped state's rows of a run here,
+  // BF16 [max_tokens, H] per tap in the checkpoint's order.
+  uint16_t* tap_rows(int tap) const;
   // Read-only diagnostic views, valid until the next draft or feature run.
   const uint16_t* block_hidden() const { return df_h_; }
   const float* block_logits() const { return df_logits_; }
@@ -157,6 +170,20 @@ class DFlash2Drafter {
   const int32_t* drafts_host(int req) const;
   const int32_t* candidates_host(int req) const;
   const float* confidence() const { return df_conf_; }
+  // Inkling 2: the acceptance estimate's fit over a proposal's softmax mass
+  // among its step's candidates (kernels/inkling2_draft.hpp). A calibration
+  // run sets the identity (0, 1) before any capture to record the raw logit.
+  void set_confidence_fit(float bias, float slope) { conf_fit_ = Ink2DraftConfidenceFit{bias, slope}; }
+  // Inkling 2: the recurrent head's stop floors, one pinned cell per request
+  // (null for another backbone). A pass reads the cell of its first request
+  // while it drafts, so the engine writes the cells of a pass's requests
+  // before launching it. Zero, the initial value, never stops.
+  float* stop_floor() const { return df_floor_h_; }
+  // The eager drafts' floor: zero in serving, where an eager block is
+  // verified whole. A test sets it to stop an eager draft.
+  void set_eager_stop_floor(float floor) {
+    if (df_floor_h_ != nullptr) df_floor_h_[h_.max_requests] = floor;
+  }
   // The sampled requests' block proposals (the engine's draft rule): the
   // recorded walk draws each draft from the selector's softmax at the
   // request's draft temperature and writes the set it drew from to
@@ -181,6 +208,11 @@ class DFlash2Drafter {
   // and attention at its row offset against its own block table).
   void block_layers(int slots, const int* reqs, bool capture);
   void minimax_block_layers(int slots, const int* reqs, bool capture);
+  void inkling2_block_layers(int slots, const int* reqs, bool capture);
+  void inkling2_store_features(int T, const int32_t* d_req, const int64_t* d_pos);
+  void inkling2_select(int slots, const int* reqs, bool capture);
+  // The stacked blocks' input rows from df_tokens_ into df_resid_.
+  void embed_block(int rows);
   // The mask rows' head rows and top-K per slot (world > 1: this rank's
   // slice lists staged, folded and merged into the global top-K), the
   // hidden projection and the selector walk into df_tok_ (D per slot).
@@ -241,6 +273,17 @@ class DFlash2Drafter {
   int32_t* df_tok_h_ = nullptr;     // pinned readback
   int64_t* df_io64_h_ = nullptr;    // pinned staging: [2][df_batch_ * QR]
   float* df_conf_ = nullptr;        // [max_requests][drafts]
+  Ink2DraftConfidenceFit conf_fit_;  // the Inkling 2 estimate's calibration
+  // Inkling 2: the tapped states of a target run, and the recurrent head.
+  uint16_t* df_taps_ = nullptr;     // [taps][max_tokens, H]
+  uint16_t* df_frnn_ = nullptr;     // [df_batch_, H] each slot's context feature
+  float* df_ctx_ = nullptr;         // [df_batch_ * drafts, 3 * rank] the steps' fixed terms
+  uint16_t* df_state_ = nullptr;    // [df_batch_, rank]
+  uint16_t* df_latent_ = nullptr;   // [df_batch_, rank]
+  float* df_raw_ = nullptr;         // [df_batch_, 3 rank]: a step's projection before its gates
+  int32_t* df_stop_ = nullptr;      // the recurrent head's stop flag of the block in flight
+  float* df_surv_ = nullptr;        // [df_batch_]: each slot's survival through the steps so far
+  float* df_floor_h_ = nullptr;     // pinned [max_requests + 1]: each request's stop floor, then the eager drafts'
   // The armed proposals (arm_proposals): the engine's spec table and
   // proposal rows, df_props_stride_ rows per request.
   const SampleSpec* df_specs_ = nullptr;

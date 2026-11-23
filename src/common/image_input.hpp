@@ -12,7 +12,7 @@ namespace dgpp {
 // same pixels and token spans; no URL or process-local pointer crosses the
 // wire. `grid` is the family's pixels per visual-token side (patch_size *
 // spatial_merge_size): 28 for the GLM5-Next tower, 32 for the Qwen3-VL one,
-// so the same struct describes both towers' canvases.
+// 40 for Inkling 2's, so the same struct describes every tower's canvas.
 struct ImageInput {
   int64_t offset = 0;
   int tokens = 0;
@@ -25,6 +25,14 @@ struct ImageInput {
   // the segment, so later pixels can change its first token's embedding.
   int frames = 1;
   std::vector<int64_t> frame_offsets = {};
+  // Inkling 2 keeps an image at its own size on a canvas padded right and
+  // bottom to the grid. The padding is not image content: the tower reads a
+  // pixel outside [0, valid_width) x [0, valid_height) as its processor's
+  // padding value, whatever the canvas bytes hold. 0 x 0: the whole canvas
+  // is content (every other family).
+  int valid_width = 0, valid_height = 0;
+  int content_width() const { return valid_width > 0 ? valid_width : width; }
+  int content_height() const { return valid_height > 0 ? valid_height : height; }
   bool is_video() const { return frames != 1; }
   int spans() const { return is_video() ? frames / 2 : 1; }
   int span_tokens() const { return tokens / spans(); }
@@ -33,6 +41,7 @@ struct ImageInput {
 inline constexpr int kMaxImageTokens = 1024;
 inline constexpr int kGlmImageGrid = 28;
 inline constexpr int kQwenImageGrid = 32;
+inline constexpr int kInklingImageGrid = 40;
 // The GLM tower's workspace bound; per-family sizes follow from pixels_for().
 inline constexpr size_t kMaxImagePixels = 1024ull * 28 * 28;
 // Bound decoded host data independently of the context's visual-token count.
@@ -42,7 +51,7 @@ inline constexpr size_t kMaxRequestImageBytes = 256ull << 20;
 inline constexpr size_t pixels_for(int grid) {
   return static_cast<size_t>(kMaxImageTokens) * grid * grid;
 }
-inline bool image_grid_supported(int grid) { return grid == 28 || grid == 32; }
+inline bool image_grid_supported(int grid) { return grid == 28 || grid == 32 || grid == 40; }
 
 // The checkpoint's three image delimiters, read from config.json: the
 // trained start/end markers and the pad token repeated once per patch.
@@ -67,6 +76,13 @@ inline void validate_image_pixels(const ImageInput& im, bool allow_video = false
           static_cast<uint64_t>(im.tokens) ||
       im.rgb.size() != static_cast<uint64_t>(im.width) * im.height * 3 * im.frames)
     throw std::invalid_argument("invalid image RGB dimensions or token geometry");
+  // A valid region names both sides, lies inside the canvas and reaches into
+  // the last grid row and column (a canvas is never padded by a whole token).
+  if ((im.valid_width == 0) != (im.valid_height == 0) || im.valid_width < 0 || im.valid_height < 0 ||
+      im.valid_width > im.width || im.valid_height > im.height ||
+      (im.valid_width > 0 && (im.frames != 1 || im.width - im.valid_width >= g ||
+                              im.height - im.valid_height >= g)))
+    throw std::invalid_argument("invalid image content region");
 }
 
 inline void validate_image_inputs(const std::vector<ImageInput>& images, size_t prompt_tokens,

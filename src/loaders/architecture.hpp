@@ -23,6 +23,7 @@ enum class ModelArchitecture : int {
   Dory,         // DoryForCausalLM / dory (Dory1.0-4B, 2026-10-16, docs/dory_plan.md)
   Flint,  // FlintForCausalLM / flint (RecursiveSI/flint, the HawkBearPig mixed export, 2026-10-22)
   MinimaxM3,  // MiniMaxM3SparseForConditionalGeneration / minimax_m3_vl
+  Inkling2Loop,  // Inkling2LoopForConditionalGeneration / inkling2_loop (Inkling 2 Mini, docs/inkling2_mini_plan.md)
 };
 
 constexpr const char* model_architecture_name(ModelArchitecture a) {
@@ -39,6 +40,8 @@ constexpr const char* model_architecture_name(ModelArchitecture a) {
     case ModelArchitecture::Flint: return "flint";
     case ModelArchitecture::MinimaxM3:
       return "minimax_m3";
+    case ModelArchitecture::Inkling2Loop:
+      return "inkling2_loop";
   }
   return "glm5";
 }

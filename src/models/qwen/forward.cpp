@@ -1,6 +1,7 @@
 #include "models/qwen/forward.hpp"
 #include "models/qwen/image_stage_plan.hpp"
 
+#include "kernels/device_copy.hpp"
 #include "kernels/packq_gemm.hpp"
 #include "kernels/packq_gemv.hpp"
 #include "kernels/packq_head.hpp"
@@ -802,7 +803,7 @@ void QwenModel::head_dump_record(const uint16_t* hidden, int rows, cudaStream_t 
   const size_t slot_elems = static_cast<size_t>(max_decode_rows_) * H;
   const int slot = head_dump_next_++ % kHeadDumpSlots;
   // Kernel nodes only: the captured decode graph refuses copy-engine nodes.
-  glm_device_copy(head_dump_ring_ + static_cast<size_t>(slot) * slot_elems, hidden,
+  device_copy(head_dump_ring_ + static_cast<size_t>(slot) * slot_elems, hidden,
                   static_cast<size_t>(rows) * H * 2, stream);
   glm_device_store_u8x2(head_dump_meta_ + static_cast<size_t>(slot) * 2, static_cast<uint8_t>(rows),
                         static_cast<uint8_t>(head_dump_site_), stream);
@@ -2043,12 +2044,12 @@ QwenModel::Outputs QwenModel::mtp_forward(const std::vector<int64_t>& token_ids)
 }
 
 void QwenModel::snapshot_draft_state(int req) {
-  glm_device_copy(mtp_ring_snapshot_ + static_cast<size_t>(req) * ring_elems(), pool_.ring(num_qsa_, req),
+  device_copy(mtp_ring_snapshot_ + static_cast<size_t>(req) * ring_elems(), pool_.ring(num_qsa_, req),
                   ring_elems() * 2, stream_);
 }
 
 void QwenModel::restore_draft_state(int req) {
-  glm_device_copy(pool_.ring(num_qsa_, req), mtp_ring_snapshot_ + static_cast<size_t>(req) * ring_elems(),
+  device_copy(pool_.ring(num_qsa_, req), mtp_ring_snapshot_ + static_cast<size_t>(req) * ring_elems(),
                   ring_elems() * 2, stream_);
 }
 
@@ -2056,12 +2057,12 @@ void QwenModel::restore_draft_state(int req) {
 // back after the last — its own buffer, so the draft snapshot above (the
 // fallback's rollback point) stays the pre-draft ring.
 void QwenModel::snapshot_chain_state(int req) {
-  glm_device_copy(mtp_chain_ring_ + static_cast<size_t>(req) * ring_elems(), pool_.ring(num_qsa_, req),
+  device_copy(mtp_chain_ring_ + static_cast<size_t>(req) * ring_elems(), pool_.ring(num_qsa_, req),
                   ring_elems() * 2, stream_);
 }
 
 void QwenModel::restore_chain_state(int req) {
-  glm_device_copy(pool_.ring(num_qsa_, req), mtp_chain_ring_ + static_cast<size_t>(req) * ring_elems(),
+  device_copy(pool_.ring(num_qsa_, req), mtp_chain_ring_ + static_cast<size_t>(req) * ring_elems(),
                   ring_elems() * 2, stream_);
 }
 

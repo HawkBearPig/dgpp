@@ -10,6 +10,7 @@
 #include "common/test.hpp"
 #include "models/glm/vision_config.hpp"
 #include "models/qwen/vision_config.hpp"
+#include "tiny_png.hpp"
 
 namespace {
 void require(bool value, const char* message) {
@@ -479,4 +480,184 @@ DGPP_TEST(image_preparation_concurrent_formats_and_errors) {
     });
   for (auto& worker : workers) worker.join();
   require(!mismatch, "concurrent PNG/JPEG/WebP preparation preserves pixels and isolates errors");
+}
+
+// --- Inkling 2: the image at its own size on a padded canvas -------------------
+
+namespace {
+std::vector<uint8_t> patterned(int width, int height, int channels) {
+  std::vector<uint8_t> out(static_cast<size_t>(width) * height * channels);
+  // Never 0, so content and padding cannot be confused.
+  for (size_t i = 0; i < out.size(); ++i) out[i] = static_cast<uint8_t>(1 + i % 251);
+  return out;
+}
+dgpp::minijson::Value png_part(const std::vector<uint8_t>& pixels, int width, int height, int channels,
+                               const char* detail = nullptr) {
+  using V = dgpp::minijson::Value;
+  auto url = V::make_owned_string("data:image/png;base64," +
+                                  dgpp::encode_base64(tinypng::encode(pixels, width, height, channels)));
+  if (!detail) return V::make_object({{"url", std::move(url)}});
+  return V::make_object({{"url", std::move(url)}, {"detail", V::make_string(detail)}});
+}
+// The canvas holds `content` [height, width, 3] at its top left and zeros
+// elsewhere.
+bool canvas_holds(const dgpp::ImageInput& im, const std::vector<uint8_t>& content, int width, int height) {
+  for (int y = 0; y < im.height; ++y)
+    for (int x = 0; x < im.width; ++x)
+      for (int c = 0; c < 3; ++c) {
+        const uint8_t got = im.rgb[(static_cast<size_t>(y) * im.width + x) * 3 + c];
+        const bool inside = x < width && y < height;
+        if (got != (inside ? content[(static_cast<size_t>(y) * width + x) * 3 + c] : 0)) return false;
+      }
+  return true;
+}
+}  // namespace
+
+DGPP_TEST(image_inkling_keeps_the_size_and_records_the_content_region) {
+  const auto pp = dgpp::serve::inkling_image_preprocess();
+  const auto rgb = patterned(93, 57, 3);
+  auto im = dgpp::serve::resize_image(rgb.data(), 93, 57, pp);
+  require(im.grid == 40 && im.width == 120 && im.height == 80 && im.tokens == 6, "canvas padded to the 40-pixel grid");
+  require(im.valid_width == 93 && im.valid_height == 57 && im.content_width() == 93 && im.content_height() == 57,
+          "the content region is recorded");
+  require(canvas_holds(im, rgb, 93, 57), "the content is not resampled and the padding is zero");
+  dgpp::validate_image_inputs({im}, 6);
+
+  // An image that fills its canvas names no region.
+  const auto full = patterned(80, 40, 3);
+  im = dgpp::serve::resize_image(full.data(), 80, 40, pp);
+  require(im.width == 80 && im.height == 40 && im.tokens == 2 && im.rgb == full, "an image on the grid is its own canvas");
+  require(im.valid_width == 0 && im.valid_height == 0 && im.content_width() == 80 && im.content_height() == 40,
+          "no content region when the canvas is all content");
+
+  // No floor: one pixel is one token.
+  const uint8_t pixel[] = {255, 0, 42};
+  im = dgpp::serve::resize_image(pixel, 1, 1, pp);
+  require(im.tokens == 1 && im.width == 40 && im.height == 40 && im.valid_width == 1 && im.valid_height == 1,
+          "a 1 x 1 image is one token");
+  require(im.rgb[0] == 255 && im.rgb[1] == 0 && im.rgb[2] == 42 && im.rgb[3] == 0, "the one pixel and its padding");
+
+  // One side on the grid: the region still names both.
+  const auto strip = patterned(120, 30, 3);
+  im = dgpp::serve::resize_image(strip.data(), 120, 30, pp);
+  require(im.width == 120 && im.height == 40 && im.tokens == 3 && im.valid_width == 120 && im.valid_height == 30,
+          "a region with one side on the grid");
+  dgpp::validate_image_inputs({im}, 3);
+
+  // The other families' canvases carry no region.
+  const std::vector<uint8_t> gray(113 * 117 * 3, 123);
+  const auto glm = dgpp::serve::resize_glm_image(gray.data(), 113, 117, 1024);
+  require(glm.valid_width == 0 && glm.valid_height == 0 && glm.width == 140 && glm.height == 140,
+          "the GLM canvas is unchanged");
+  const dgpp::serve::ImagePreprocess qwen{dgpp::kQwenImageGrid, 64, dgpp::kMaxImageTokens, false, 256};
+  const auto q = dgpp::serve::resize_image(gray.data(), 113, 117, qwen);
+  require(q.valid_width == 0 && q.valid_height == 0 && q.grid == 32, "the Qwen canvas is unchanged");
+}
+
+DGPP_TEST(image_inkling_scales_down_only_above_the_token_ceiling) {
+  auto pp = dgpp::serve::inkling_image_preprocess();
+  // 32 x 32 cells is the ceiling: untouched.
+  const std::vector<uint8_t> square(static_cast<size_t>(1280) * 1280 * 3, 91);
+  auto im = dgpp::serve::resize_image(square.data(), 1280, 1280, pp);
+  require(im.tokens == 1024 && im.width == 1280 && im.height == 1280 && im.valid_width == 0, "an image at the ceiling");
+  // One pixel wider would be 33 x 32 cells: the largest size that fits.
+  const std::vector<uint8_t> wider(static_cast<size_t>(1281) * 1280 * 3, 91);
+  im = dgpp::serve::resize_image(wider.data(), 1281, 1280, pp);
+  require(im.tokens == 1024 && im.width == 1280 && im.height == 1280, "an image past the ceiling keeps the ceiling");
+  require(im.valid_width == 1279 && im.valid_height == 1279, "the scaled content is the largest that fits");
+  require(im.rgb[0] == 91 && im.rgb[(static_cast<size_t>(1278) * 1280 + 1278) * 3] == 91, "scaled content");
+  require(im.rgb[(static_cast<size_t>(1278) * 1280 + 1279) * 3] == 0 && im.rgb[static_cast<size_t>(1279) * 1280 * 3] == 0,
+          "padding beside and below the scaled content");
+  dgpp::validate_image_inputs({im}, 1024);
+
+  // A small budget shows the shape: the aspect is kept and the content ends
+  // inside the last cells.
+  pp.max_tokens = 12;
+  const std::vector<uint8_t> photo(300 * 130 * 3, 60);
+  im = dgpp::serve::resize_image(photo.data(), 300, 130, pp);
+  require(im.width == 200 && im.height == 80 && im.tokens == 10, "scaled canvas under a 12-token budget");
+  require(im.valid_width == 184 && im.valid_height == 80, "scaled content keeps the aspect");
+  require(im.rgb[(static_cast<size_t>(79) * 200 + 183) * 3] == 60 && im.rgb[(static_cast<size_t>(79) * 200 + 184) * 3] == 0,
+          "scaled content and its padding");
+  dgpp::validate_image_inputs({im}, 10);
+  pp.max_tokens = dgpp::kMaxImageTokens + 1;
+  rejects([&] { dgpp::serve::resize_image(photo.data(), 300, 130, pp); });
+}
+
+DGPP_TEST(image_inkling_composites_transparency_on_the_checkerboard) {
+  // Left half transparent, top right opaque, bottom right half transparent.
+  std::vector<uint8_t> rgba(16 * 16 * 4);
+  for (int y = 0; y < 16; ++y)
+    for (int x = 0; x < 16; ++x) {
+      uint8_t* p = &rgba[(static_cast<size_t>(y) * 16 + x) * 4];
+      p[0] = 200;
+      p[1] = 100;
+      p[2] = 50;
+      p[3] = x < 8 ? 0 : (y < 8 ? 255 : 128);
+    }
+  std::vector<uint8_t> expected(16 * 16 * 3);
+  dgpp::serve::composite_on_checkerboard(rgba.data(), 16, 16, expected.data());
+  const auto at = [&](const std::vector<uint8_t>& rgb, int stride, int x, int y) {
+    const uint8_t* p = &rgb[(static_cast<size_t>(y) * stride + x) * 3];
+    return std::array<int, 3>{p[0], p[1], p[2]};
+  };
+  require(at(expected, 16, 0, 0) == std::array<int, 3>{204, 204, 204}, "a light square shows through");
+  require(at(expected, 16, 0, 8) == std::array<int, 3>{153, 153, 153}, "a dark square shows through");
+  require(at(expected, 16, 8, 0) == std::array<int, 3>{200, 100, 50}, "opaque pixels are kept");
+  // (value * 128 + 204 * 127 + 127) / 255
+  require(at(expected, 16, 8, 8) == std::array<int, 3>{202, 152, 127}, "half transparency rounds as the processor");
+
+  const auto pp = dgpp::serve::inkling_image_preprocess();
+  const auto im = dgpp::serve::prepare_image(png_part(rgba, 16, 16, 4), "i", pp);
+  require(im.width == 40 && im.height == 40 && im.tokens == 1 && im.valid_width == 16 && im.valid_height == 16,
+          "an RGBA PNG at its own size");
+  require(canvas_holds(im, expected, 16, 16), "a PNG's transparency is composited on the checkerboard");
+  // The other families read the same file as before: the color channels alone.
+  const auto glm = dgpp::serve::prepare_glm_image(png_part(rgba, 16, 16, 4), "i");
+  require(glm.rgb[0] == 200 && glm.rgb[1] == 100 && glm.rgb[2] == 50, "the GLM decode is unchanged");
+}
+
+DGPP_TEST(image_inkling_prepare_keeps_pixels_and_honors_detail_low) {
+  const auto pp = dgpp::serve::inkling_image_preprocess();
+  const auto rgb = patterned(93, 57, 3);
+  auto im = dgpp::serve::prepare_image(png_part(rgb, 93, 57, 3), "i", pp);
+  require(im.grid == 40 && im.width == 120 && im.height == 80 && im.tokens == 6 && im.valid_width == 93 &&
+              im.valid_height == 57,
+          "a PNG at its own size");
+  require(canvas_holds(im, rgb, 93, 57), "decoded pixels reach the canvas unchanged");
+  // 700 x 700 is 18 x 18 cells. detail low caps an image at 256 tokens.
+  const std::vector<uint8_t> big(700 * 700 * 3, 77);
+  im = dgpp::serve::prepare_image(png_part(big, 700, 700, 3), "i", pp);
+  require(im.tokens == 324 && im.width == 720 && im.valid_width == 700 && im.valid_height == 700, "default detail");
+  im = dgpp::serve::prepare_image(png_part(big, 700, 700, 3, "low"), "i", pp);
+  require(im.tokens == 256 && im.width == 640 && im.height == 640 && im.valid_width == 0 && im.rgb[0] == 77,
+          "detail low scales to its budget");
+}
+
+DGPP_TEST(image_content_region_is_validated) {
+  dgpp::ImageInput im;
+  im.grid = dgpp::kInklingImageGrid;
+  im.width = 80;
+  im.height = 40;
+  im.tokens = 2;
+  im.rgb.assign(80 * 40 * 3, 5);
+  dgpp::validate_image_inputs({im}, 2);
+  const auto with = [&](int w, int h) {
+    auto copy = im;
+    copy.valid_width = w;
+    copy.valid_height = h;
+    return copy;
+  };
+  dgpp::validate_image_inputs({with(53, 31)}, 2);
+  dgpp::validate_image_inputs({with(80, 40)}, 2);
+  // One side alone, a region outside the canvas, a whole token of padding.
+  for (const auto& bad : {with(53, 0), with(0, 31), with(81, 31), with(53, 41), with(40, 31), with(-1, -1)})
+    rejects([&] { dgpp::validate_image_inputs({bad}, 2); });
+  // 40 is a grid of its own: a 28-pixel canvas cannot claim it.
+  auto wrong = im;
+  wrong.width = 56;
+  wrong.height = 28;
+  wrong.rgb.assign(56 * 28 * 3, 5);
+  rejects([&] { dgpp::validate_image_inputs({wrong}, 2); });
+  require(dgpp::pixels_for(dgpp::kInklingImageGrid) == 1024ull * 40 * 40, "the Inkling pixel cap");
 }

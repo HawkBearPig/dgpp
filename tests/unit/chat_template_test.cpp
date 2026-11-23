@@ -304,3 +304,91 @@ DGPP_TEST(chat_template_scope_ownership_decides_the_global_reads) {
   if (reads("{% macro m(a=label, label='x') %}[{{ a }}]{% endmacro %}{{ m() }}"))
     throw std::runtime_error("a default that reads a later parameter does not read the global");
 }
+
+// The constructs Inkling 2's template brought in. Every expected string is
+// what transformers' Jinja environment renders for the same source.
+DGPP_TEST(chat_template_float_literals_compare_and_print) {
+  equal(render("{{ 0.5 }}|{{ 1.0 }}|{{ 0.99 }}|{{ 1.5e3 }}|{{ -0.25 }}|{{ 2.50 }}"), "0.5|1.0|0.99|1500.0|-0.25|2.5");
+  equal(render("{{ 0.2 < 0.7 }}|{{ x >= 0.0 }}|{{ x <= 0.99 }}|{{ x == 0.9 }}|{{ 1 < 1.5 }}|{{ 2 == 2.0 }}",
+               {{"x", Value::number(0.9)}}),
+        "True|True|True|True|True|True");
+  equal(render("{{ -0.5 + 1 }}|{{ 1 - -0.5 }}"), "0.5|1.5");
+  // An attribute that is a digit run stays an attribute, and a point
+  // without digits on both sides is not a literal.
+  equal(render("{{ xs.0 }}", {{"xs", Value::list_value({Value::string_value("first")})}}), "first");
+  rejects("\n{{ -x }}", {{"x", Value::number(0.25)}}, "unary '-' is only supported on number literals");
+}
+
+DGPP_TEST(chat_template_float_filter_follows_python) {
+  equal(render("{{ '0.7'|float }}|{{ 3|float }}|{{ 'x'|float }}|{{ '1e2'|float }}|{{ ' 2.5 '|float }}|{{ none|float }}|"
+               "{{ true|float }}"),
+        "0.7|3.0|0.0|100.0|2.5|0.0|1.0");
+}
+
+DGPP_TEST(chat_template_dict_literals) {
+  equal(render("{% set m = {'none': 0.0, \"low\": 0.2, 'max': 0.99,} %}{{ m['low'] }}|{{ m.max }}|{{ 'low' in m }}|"
+               "{{ 'mid' in m }}|{{ m|length }}"),
+        "0.2|0.99|True|False|3");
+  // A repeated key keeps its first position and takes the last value.
+  equal(render("{% set m = {'a': 1, 'b': 2, 'a': 3} %}{{ m|tojson }}|{% for k in m %}{{ k }}{% endfor %}"),
+        R"({"a": 3, "b": 2}|ab)");
+  equal(render("{% set m = {'a': {'b': [1, 2.5, 'c']}, 'e': {}} %}{{ m|tojson }}|{{ m.a.b[1] }}|{{ {}|length }}"),
+        R"({"a": {"b": [1, 2.5, "c"]}, "e": {}}|2.5|0)");
+  // Braces in the text around an expression are text.
+  equal(render("{ {{ '{' }} } {{ {'a': '}'}['a'] }} }"), "{ { } } }");
+  rejects("\n{{ {1: 2} }}", {}, "dict literal: a key is not a string");
+}
+
+DGPP_TEST(chat_template_list_concatenation_builds_a_new_list) {
+  equal(render("{{ ([1, 2] + [3])|tojson }}|{{ ([] + ['a'])|length }}|{% set xs = [1] %}{% set ys = xs + [2, 3] %}"
+               "{{ xs|length }}{{ ys|length }}"),
+        "[1, 2, 3]|1|13");
+}
+
+DGPP_TEST(chat_template_dictsort_orders_by_key) {
+  const auto map = [](std::vector<std::pair<std::string, int64_t>> items) {
+    Value::Members members;
+    for (auto& [key, value] : items) members.emplace_back(key, Value::integer(value));
+    return Value::map_value(std::move(members));
+  };
+  equal(render("{% for k, v in m|dictsort %}{{ k }}={{ v }};{% endfor %}", {{"m", map({{"b", 2}, {"A", 1}, {"c", 3}})}}),
+        "A=1;b=2;c=3;");
+  equal(render("{% for k, v in m|dictsort(true) %}{{ k }}={{ v }};{% endfor %}|"
+               "{% for k, v in m|dictsort(case_sensitive=true, reverse=true) %}{{ k }};{% endfor %}",
+               {{"m", map({{"b", 2}, {"A", 1}, {"c", 3}, {"B", 4}})}}),
+        "A=1;B=4;b=2;c=3;|c;b;B;A;");
+  equal(render("{% for k, v in m|dictsort(reverse=true) %}{{ k }};{% endfor %}|"
+               "{% for k, v in m|dictsort(by='key') %}{{ k }};{% endfor %}",
+               {{"m", map({{"b", 2}, {"A", 1}, {"c", 3}})}}),
+        "c;b;A;|A;b;c;");
+  rejects("\n{{ m|dictsort(by='value') }}", {{"m", map({{"a", 1}})}}, "dictsort: only by='key' is supported");
+  rejects("\n{{ m|dictsort }}", {{"m", map({{"\xC3\xA9", 1}})}}, "dictsort: a key outside ASCII needs case_sensitive=true");
+  equal(render("{% for k, v in m|dictsort(true) %}{{ k }};{% endfor %}", {{"m", map({{"\xC3\xA9", 1}, {"z", 2}})}}),
+        "z;\xC3\xA9;");
+}
+
+DGPP_TEST(chat_template_tojson_takes_json_dumps_arguments) {
+  Value::Members inner;
+  inner.emplace_back("z", Value::integer(1));
+  inner.emplace_back("y", Value::string_value("</s>"));
+  Value::Members outer;
+  outer.emplace_back("b", Value::string_value("\xC3\xA9"));
+  outer.emplace_back("a", Value::list_value({Value::integer(1), Value::number(2.5), Value::null_value(), Value::boolean(true)}));
+  outer.emplace_back("c", Value::map_value(std::move(inner)));
+  const Value v = Value::map_value(std::move(outer));
+  equal(render("{{ v|tojson }}", {{"v", v}}), "{\"b\": \"\xC3\xA9\", \"a\": [1, 2.5, null, true], \"c\": {\"z\": 1, \"y\": \"</s>\"}}");
+  // ensure_ascii writes the six characters of the escape, assembled here from two pieces.
+  equal(render("{{ v|tojson(ensure_ascii=true) }}", {{"v", v}}),
+        std::string("{\"b\": \"\\") + "u00e9\", \"a\": [1, 2.5, null, true], \"c\": {\"z\": 1, \"y\": \"</s>\"}}");
+  equal(render("{{ v|tojson(sort_keys=true) }}", {{"v", v}}),
+        "{\"a\": [1, 2.5, null, true], \"b\": \"\xC3\xA9\", \"c\": {\"y\": \"</s>\", \"z\": 1}}");
+  equal(render("{{ v|tojson(separators=(',', ':')) }}", {{"v", v}}),
+        "{\"b\":\"\xC3\xA9\",\"a\":[1,2.5,null,true],\"c\":{\"z\":1,\"y\":\"</s>\"}}");
+  equal(render("{{ v|tojson(separators=(', ', ': '), sort_keys=true) }}|{{ v|tojson(indent=none) }}", {{"v", v}}),
+        "{\"a\": [1, 2.5, null, true], \"b\": \"\xC3\xA9\", \"c\": {\"y\": \"</s>\", \"z\": 1}}|"
+        "{\"b\": \"\xC3\xA9\", \"a\": [1, 2.5, null, true], \"c\": {\"z\": 1, \"y\": \"</s>\"}}");
+  // An argument that would change the string and is not implemented is refused.
+  rejects("\n{{ v|tojson(indent=2) }}", {{"v", v}}, "tojson: indent is not supported");
+  rejects("\n{{ v|tojson(default=none) }}", {{"v", v}}, "tojson: unsupported argument 'default'");
+  rejects("\n{{ v|tojson(separators=',') }}", {{"v", v}}, "tojson: separators is not a pair of strings");
+}

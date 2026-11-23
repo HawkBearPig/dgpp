@@ -1,6 +1,7 @@
 #include "serve/generation_service.hpp"
 #include "serve/image_inputs.hpp"
 #include "text/dsv41_prompt.hpp"
+#include "text/inkling_tool_grammar.hpp"
 #include "text/minimax_tool_grammar.hpp"
 
 #include <mutex>
@@ -567,6 +568,11 @@ GenerationService::GenerationService(const ServiceConfig& cfg,
   std::sort(boundary_ids_.begin(), boundary_ids_.end());
   boundary_ids_.erase(std::unique(boundary_ids_.begin(), boundary_ids_.end()),
                       boundary_ids_.end());
+  turn_marker_id_ = frontend_->self_opened_turn_marker();
+  if (turn_marker_id_ >= 0 &&
+      !std::binary_search(boundary_ids_.begin(), boundary_ids_.end(), turn_marker_id_))
+    throw std::invalid_argument(
+        "GenerationService: the self-opened turn marker is not one of the frontend's boundary tokens");
   const auto defaults = minijson::parse(cfg_.default_chat_template_kwargs);
   if (!defaults.root.is_object() ||
       cfg_.default_chat_template_kwargs.find_first_not_of(" \t\r\n", defaults.consumed) !=
@@ -593,8 +599,9 @@ GenerationService::GenerationService(const ServiceConfig& cfg,
   default_chat_template_kwargs_ = defaults.root;
   if (sched_.prefix_slots() > 0)
     DGPP_LOG_INFO(
-        "serve: prefix cache on — {} snapshot slots, {} boundary token(s)",
-        sched_.prefix_slots(), boundary_ids_.size());
+        "serve: prefix cache on — {} snapshot slots, {} boundary token(s){}",
+        sched_.prefix_slots(), boundary_ids_.size(),
+        turn_marker_id_ >= 0 ? ", turns cut one token before the next speaker's marker" : "");
   // The sampling surface: the defaults must be a valid spec (an operator
   // error otherwise), and an engine that cannot draw serves GREEDY defaults
   // — loudly — rather than a stochastic mode it would silently ignore.
@@ -1391,9 +1398,21 @@ bool GenerationService::parse_chat(const dgpp::minijson::Value& body,
         // the keyword path, a non-strict one leaves that value free.
         std::vector<std::string> warnings, notes;
         try {
+          // The formats whose arguments are not GLM's typed values keep
+          // every property's schema: MiniMax's recursive XML and Inkling
+          // 2's JSON call body.
+          const bool inkling = markers_.tool_format() == dgpp::text::ToolFormat::kInkling;
           g.tools.push_back(
               dgpp::text::grammar_tool_from_function(def, &warnings, &notes,
-                markers_.tool_format() == dgpp::text::ToolFormat::kMiniMax));
+                markers_.tool_format() == dgpp::text::ToolFormat::kMiniMax || inkling));
+          if (inkling) {
+            GrammarSpec one;
+            one.mode = GrammarSpec::Mode::kAuto;
+            one.tools.push_back(g.tools.back());
+            // Refuse a schema the call grammar cannot compile at the
+            // request boundary, before a worker or a peer rank configures it.
+            dgpp::text::InklingToolGrammar validate(nullptr, one);
+          }
           if (markers_.tool_format() == dgpp::text::ToolFormat::kMiniMax) {
             GrammarSpec one;
             one.tools.push_back(g.tools.back());
@@ -3648,9 +3667,31 @@ std::vector<int64_t> GenerationService::prompt_boundaries(
     const std::vector<int64_t>& prompt) const {
   std::vector<int64_t> out;
   if (boundary_ids_.empty()) return out;
-  for (size_t i = 1; i < prompt.size(); ++i)
-    if (std::binary_search(boundary_ids_.begin(), boundary_ids_.end(), prompt[i]))
-      out.push_back(static_cast<int64_t>(i));
+  const auto marker = [&](int64_t id) {
+    return std::binary_search(boundary_ids_.begin(), boundary_ids_.end(), id);
+  };
+  if (turn_marker_id_ < 0) {
+    for (size_t i = 1; i < prompt.size(); ++i)
+      if (marker(prompt[i])) out.push_back(static_cast<int64_t>(i));
+    return out;
+  }
+  // The model opens its own turn. A prompt that ends "…<end of message>"
+  // is answered from its last token on, and an answer's cached state stops
+  // at its end-of-sampling token, which is never fed. Both are one token
+  // before the marker of the speaker that follows, so that is where a
+  // change of speaker cuts. A marker that continues the same speaker (the
+  // blocks of one turn, a system prompt's parts) cuts at itself.
+  const auto push = [&](int64_t at) {
+    if (at >= 1 && (out.empty() || at > out.back())) out.push_back(at);
+  };
+  int64_t speaker = !prompt.empty() && marker(prompt[0]) ? prompt[0] : -1;
+  for (size_t i = 1; i < prompt.size(); ++i) {
+    if (!marker(prompt[i])) continue;
+    push(static_cast<int64_t>(i) - (prompt[i] != speaker ? 1 : 0));
+    speaker = prompt[i];
+  }
+  // The end of a chat prompt the model answers: its marker comes next.
+  if (speaker >= 0 && speaker != turn_marker_id_) push(static_cast<int64_t>(prompt.size()) - 1);
   return out;
 }
 

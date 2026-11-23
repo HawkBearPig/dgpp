@@ -172,6 +172,7 @@ its node.
 | `cluster_deepseek-v4.1-flash-1017_mxfp4-fp8_w4.example.json` | DeepSeek-V4.1-Flash-1017 (the refined weights, the same architecture) as shipped, the V4.1-Flash shape; the indexer budget is a key (`engine.index_topk`, the checkpoint's 512 as shipped, 2048 priced in the card) |
 | `cluster_mimo-v2.6-flash_mxfp4-fp8_w{4,2}.example.json` | MiMo-V2.6-Flash as shipped (MXFP4 experts, fp8 dense, the BF16 matrices in their 12-bit form), four nodes with a 128K BF16 K/V pool or two nodes with a 256K K/V pool in the fp8 row form (`kv_dtype`), four request slots, MTP depth 1 |
 | `cluster_flint_fp8-nvfp4_w{1,2,4}.example.json` | Flint as shipped (the routed experts in the export's per-projection FP8 / NVFP4 formats, every BF16 matrix the GEMM interface serves in its 12-bit form), one, two or four nodes, a 512K BF16 K/V pool, eight request slots, no draft head (`mtp` off) |
+| `cluster_inkling-2-mini_nvfp4-mxfp8_w{1,2,4}.example.json` | Inkling 2 Mini as shipped (NVFP4 and MXFP8 routed experts under the checkpoint's activation recipe, the BF16 decode matrices in their 12-bit form), one, two or four nodes, the same matrices kept in BF16 for verify passes of several requests (`"bf12+bf16"`), a BF16 K/V pool of 384K, 768K or 1.5M tokens with one plane per layer visit and per draft layer, eight request slots, the bundled draft model with a scheduled verify depth, image inputs |
 
 One template per model, quant and world (2026-09-14): the modes a template
 does not name are knobs — `--no-mtp` for the plain T=1 world, `--mtp-depth N`,

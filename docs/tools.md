@@ -94,6 +94,9 @@ frontend maps minimal to low and high to xhigh; low, medium and xhigh pass
 through. Qwen's checkpoint template adds short/extended thinking instructions
 for low/xhigh, while medium uses its neutral thinking prompt. Other model
 families receive the requested name unchanged and apply their own template.
+Inkling 2's template also reads `none` and `max` and writes the level it maps
+a name to into the prompt. Its `none` is the lowest level and does not switch
+thinking off.
 
 History controls use native template kwargs, as in vLLM. For example, Qwen's
 `chat_template_kwargs.preserve_thinking` is passed unchanged to Qwen's template;
@@ -136,3 +139,15 @@ multiple non-null alternatives, and container `enum`/`const` are refused
 with the offending field named. Nullable single-alternative schemas and
 scalar enums are supported; JSON response schemas keep the normal JSON
 grammar's capabilities.
+
+Inkling 2 replies are typed blocks, each opened by a content marker and
+closed by an end marker that are single special tokens. A thinking block is
+returned as `reasoning_content` and a text block as `content`. A call is a
+header naming the tool followed by a JSON block that holds an object with the
+tool's `name` and its `args`. The grammar admits a call only after a header
+that names a declared tool, and the block's body follows that tool's schema
+with the full JSON Schema machine, nested objects and `$defs` included.
+`tool_choice: required` and a named tool admit no text block, so the call
+cannot be put off with an answer, and they allow one thinking block before
+it. A JSON response is one text block that holds the value with no leading
+whitespace. Malformed or truncated blocks are returned as literal content.

@@ -90,6 +90,8 @@
 #include "models/dsv41/model.hpp"
 #include "models/flint/config.hpp"
 #include "models/flint/forward.hpp"
+#include "models/inkling2/config.hpp"
+#include "models/inkling2/forward.hpp"
 #include "models/glm/fabric_engine.hpp"
 #include "models/glm/forward.hpp"
 #include "models/glm/gen_engine.hpp"
@@ -114,6 +116,7 @@
 #include "serve/generation_service.hpp"
 #include "serve/glm_vision_frontend.hpp"
 #include "serve/http_server.hpp"
+#include "serve/inkling_vision_frontend.hpp"
 #include "serve/minimax_vision_frontend.hpp"
 #include "serve/nvme_cache_check.hpp"
 #include "serve/prefill_policy.hpp"
@@ -1157,6 +1160,91 @@ struct FlintFamily final : ServeFamily {
   }
 };
 
+// Inkling 2 (docs/inkling2_mini_plan.md): the looped model. A token passes
+// every visit of the layer stack, each with its own K/V plane and
+// convolution state. engine.activations picks the experts' input recipe.
+struct Inkling2Family final : ServeFamily {
+  dgpp::Inkling2Config cfg;
+  std::string ckpt;
+  dgpp::LatentFormat kv_format = dgpp::LatentFormat::kBf16;
+  bool native_activations = false;
+  std::unique_ptr<dgpp::Inkling2Model> model;
+  Inkling2Family(const std::string& checkpoint, dgpp::LatentFormat fmt, bool native)
+      : cfg(dgpp::Inkling2Config::from_checkpoint_dir(checkpoint)), ckpt(checkpoint), kv_format(fmt),
+        native_activations(native) {
+    if (kv_format != dgpp::LatentFormat::kBf16)
+      throw std::invalid_argument(std::string("engine.kv_dtype ") + dgpp::latent_format_name(kv_format) +
+                                  " is not implemented for the Inkling 2 K/V cache (bf16)");
+  }
+  const char* name() const override { return "inkling2_loop"; }
+  int64_t vocab_size() const override { return cfg.vocab_size; }
+  const std::vector<int64_t>& eos_token_ids() const override { return cfg.eos_token_ids; }
+  // The checkpoint's positional ceiling (1048576): a larger pool seats more
+  // requests, a single request never passes it.
+  int64_t position_limit() const override { return cfg.max_position_embeddings; }
+  int64_t block_tokens() const override { return dgpp::Inkling2Model::kv_block_tokens_static(); }
+  int prefill_chunk_tokens() const override { return dgpp::Inkling2Model::prefill_chunk_tokens(); }
+  std::string pool_check(int64_t) const override { return ""; }
+  const char* kv_format_name() const override { return dgpp::latent_format_name(kv_format); }
+  int decode_rows_cap() const override { return dgpp::Inkling2Model::decode_rows_cap(); }
+  // The widest fold the decode graph records: a sublayer output [rows, hidden].
+  size_t lat_slot_bytes(int decode_rows) const override {
+    return static_cast<size_t>(decode_rows) * static_cast<size_t>(cfg.hidden_size) * 2;
+  }
+  // engine.mtp runs the bundled draft model: a block of the checkpoint's
+  // width every step, of which engine.mtp_schedule may verify fewer rows.
+  void check_mtp_depth(int depth) const override {
+    if (!cfg.draft.present)
+      throw std::invalid_argument("engine.mtp: this Inkling 2 checkpoint bundles no draft model (mtp_config)");
+    if (depth != cfg.draft.drafts())
+      throw std::invalid_argument("engine.mtp_depth: Inkling 2 requires its draft block's width " +
+                                  std::to_string(cfg.draft.drafts()) +
+                                  "; engine.mtp_schedule can select fewer verification rows");
+  }
+  dgpp::MemoryPlan plan(int forward_rows, int64_t context, int rank, int world_, bool fabric, int slots,
+                        bool mtp, int decode_rows) const override {
+    return dgpp::Inkling2Model::plan_memory(
+        cfg, forward_rows, context, fabric ? rank : 0, fabric ? world_ : 1,
+        fabric ? dgpp::Inkling2Residency::Resident : dgpp::Inkling2Residency::Streaming, slots, mtp,
+        decode_rows, kv_format, /*serving_logits=*/true, native_activations);
+  }
+  size_t snapshot_bytes(int world_, bool mtp) const override {
+    return dgpp::Inkling2Model::session_snapshot_bytes(cfg, world_, mtp);
+  }
+  size_t cache_block_bytes(int world_, bool mtp) const override {
+    return dgpp::Inkling2Model::kv_block_bytes_static(cfg, 0, world_, kv_format, mtp);
+  }
+  void build_model(dgpp::BoundaryReducer* reducer, int rank, int world_, bool fabric, int forward_rows,
+                   int64_t pool_tokens, int slots, bool mtp, int decode_rows) override {
+    dgpp::Inkling2LayerStream::set_resident_image_dir(dgpp::GlmLayerStream::resident_image_dir());
+    model = std::make_unique<dgpp::Inkling2Model>(
+        cfg, ckpt, forward_rows, pool_tokens,
+        fabric ? dgpp::Inkling2Residency::Resident : dgpp::Inkling2Residency::Streaming, reducer,
+        fabric ? rank : 0, fabric ? world_ : 1, slots, mtp, decode_rows, kv_format,
+        /*serving_logits=*/true, native_activations);
+  }
+  void destroy_model() override { model.reset(); }
+  size_t model_snapshot_bytes() const override { return model ? model->session_snapshot_bytes() : 0; }
+  std::unique_ptr<ServeGraphEngine> make_graph_engine(dgpp::net::CollectiveBus* bus, int rank,
+                                                      int world_, uint16_t* pick_scratch,
+                                                      int batch_min_live, uint16_t* prefix_scratch,
+                                                      uint16_t* gather_scratch, int candidates,
+                                                      const dgpp::text::GrammarVocab* grammar,
+                                                      int prefix_slots, int mtp_depth,
+                                                      bool compact_batches, int lookup_tail = 0) override {
+    return std::make_unique<ServeGraphEngineOf<dgpp::Inkling2Model>>(
+        model.get(), bus, rank, world_, pick_scratch, cfg.vocab_size, /*pick_timeout_ms=*/60000,
+        batch_min_live, prefix_scratch, gather_scratch, candidates, grammar, prefix_slots,
+        mtp_depth, compact_batches, lookup_tail);
+  }
+  std::unique_ptr<dgpp::sched::SchedulerEngine> make_eager_engine(
+      int slots, dgpp::DecodePick pick, dgpp::DecodeSample sample, const dgpp::text::GrammarVocab* grammar,
+      int prefix_slots) override {
+    return std::make_unique<dgpp::EagerEngineAdapter<dgpp::Inkling2Model>>(
+        model.get(), slots, std::move(pick), std::move(sample), grammar, prefix_slots);
+  }
+};
+
 struct MinimaxFamily final : ServeFamily {
   dgpp::MinimaxConfig cfg;
   std::string ckpt;
@@ -1370,8 +1458,9 @@ std::unique_ptr<ServeFamily> make_family(const std::string& ckpt, int world,
       dgpp::detect_architecture_file((fs::path(ckpt) / "config.json").string());
   if (activations != "bf16" && activations != "native")
     throw std::invalid_argument("engine.activations must be bf16 or native");
-  if (activations == "native" && arch != dgpp::ModelArchitecture::MinimaxM3)
-    throw std::invalid_argument("engine.activations native is currently supported only for MiniMax");
+  if (activations == "native" && arch != dgpp::ModelArchitecture::MinimaxM3 &&
+      arch != dgpp::ModelArchitecture::Inkling2Loop)
+    throw std::invalid_argument("engine.activations native is supported only for MiniMax and Inkling 2");
   if (arch == dgpp::ModelArchitecture::DeepseekV41)
     return std::make_unique<Dsv41Family>(ckpt, index_topk, candidate_topk_blocks, candidate_block_size);
   // The index budget is the DeepSeek-V4.1 indexer's: no other family has a
@@ -1386,6 +1475,8 @@ std::unique_ptr<ServeFamily> make_family(const std::string& ckpt, int world,
   if (arch == dgpp::ModelArchitecture::Flint) return std::make_unique<FlintFamily>(ckpt, kv_format);
   if (arch == dgpp::ModelArchitecture::MinimaxM3)
     return std::make_unique<MinimaxFamily>(ckpt, kv_format, activations == "native");
+  if (arch == dgpp::ModelArchitecture::Inkling2Loop)
+    return std::make_unique<Inkling2Family>(ckpt, kv_format, activations == "native");
   if (arch == dgpp::ModelArchitecture::Qwen4Exp)
     return std::make_unique<QwenFamily>(ckpt, rope_scaling, fp8_head_mma, kv_format);
   if (arch == dgpp::ModelArchitecture::Qwen3_5)
@@ -1526,6 +1617,8 @@ int serve_openai(dgpp::sched::SchedulerEngine* engine, int64_t vocab_size,
         vision_frontend = std::make_unique<dgpp::serve::QwenVisionFrontend>(&tok, &*tpl, ids);
       else if (family_name == "minimax_m3")
         vision_frontend = std::make_unique<dgpp::serve::MinimaxVisionFrontend>(&tok, &*tpl, ids);
+      else if (family_name == "inkling2_loop")
+        vision_frontend = std::make_unique<dgpp::serve::InklingVisionFrontend>(&tok, &*tpl, ids);
     }
     frontend = vision_frontend ? std::move(vision_frontend)
                                : std::make_unique<dgpp::serve::TextFrontend>(&tok, &*tpl, model_opens_thinking);
@@ -2550,6 +2643,12 @@ int main(int argc, char** argv) {
           dgpp::minimax_dspark_config_file((fs::path(ckpt) / "dspark" / "config.json").string());
       mtp_depth = draft.drafts();
       DGPP_LOG_INFO("serve: --mtp on MiniMax: the DSpark block's {} drafts", mtp_depth);
+    } else if (arch == dgpp::ModelArchitecture::Inkling2Loop) {
+      const dgpp::Inkling2Config inkling = dgpp::Inkling2Config::from_checkpoint_dir(ckpt);
+      if (inkling.draft.present) {
+        mtp_depth = inkling.draft.drafts();
+        DGPP_LOG_INFO("serve: --mtp on Inkling 2: the draft block's {} drafts", mtp_depth);
+      }
     } else if (arch == dgpp::ModelArchitecture::DeepseekV41) {
       mtp_depth = dgpp::Dsv41TextConfig::from_json_file((fs::path(ckpt) / "config.json").string()).dspark_block_size;
       DGPP_LOG_INFO("serve: --mtp without --mtp-depth on DeepSeek-V4.1: the DSpark block's {} drafts", mtp_depth);
@@ -3294,10 +3393,10 @@ int main(int argc, char** argv) {
   // config is read (the graph engine's configure_verify_schedule refuses a
   // min_depth past it).
   if (mtp_schedule && (!(mtp_schedule_row_ms > 0.0) || mtp_schedule_base_ms < 0.0 || mtp_schedule_lambda < 0.0 ||
-                       mtp_schedule_min_depth < 1 || (dflash_model.empty() && mtp_schedule_min_depth > mtp_depth) ||
+                       mtp_schedule_min_depth < 0 || (dflash_model.empty() && mtp_schedule_min_depth > mtp_depth) ||
                        mtp_schedule_options < 0 || mtp_schedule_options > 6 ||
                        mtp_schedule_max_live < 0 || mtp_schedule_max_live > 64)) {
-    DGPP_LOG_ERROR("--mtp-schedule: row_ms > 0, base_ms >= 0, lambda >= 0, min_depth in [1, the draft width], options in [0, 6] and max_live in [0, 64] (got {}, {}, {}, {}, {}, {})",
+    DGPP_LOG_ERROR("--mtp-schedule: row_ms > 0, base_ms >= 0, lambda >= 0, min_depth in [0, the draft width], options in [0, 6] and max_live in [0, 64] (got {}, {}, {}, {}, {}, {})",
                    mtp_schedule_row_ms, mtp_schedule_base_ms, mtp_schedule_lambda, mtp_schedule_min_depth, mtp_schedule_options,
                    mtp_schedule_max_live);
     return 2;

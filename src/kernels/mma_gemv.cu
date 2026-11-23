@@ -303,8 +303,12 @@ __global__ __launch_bounds__(kW * 32, 2) void mma_gemv_kernel(const uint16_t* __
                                                             int blocks0,
                                                             const uint32_t* __restrict__ b12_rows,
                                                             const uint32_t* __restrict__ b12_esc,
-                                                            const uint16_t* __restrict__ b12_raw) {
+                                                            const uint16_t* __restrict__ b12_raw,
+                                                            const int32_t* __restrict__ gate) {
   dgpp_pdl_wait();
+  // A gated launch (launch_mma_gemv_bf16_f32_gated) writes nothing while its
+  // gate is set: a recorded step whose result nothing will read.
+  if (gate != nullptr && *gate != 0) return;
   // The two-segment form (2026-10-20): blocks from blocks0 on compute a
   // second matrix (its own activations, weights, scales, output and n) at
   // the same k, width and split, so each row's chain is the single
@@ -384,9 +388,16 @@ __global__ __launch_bounds__(kW * 32, 2) void mma_gemv_kernel(const uint16_t* __
   // row's slice whole or absent past k.
   // The bf12 form's units: this lane's row's super-block, in registers
   // (b12_u[i]: unit 8 g + 2 t + v of segment i / 8 — A, B, then E — at
-  // i = 8 seg + 2 g + v: the units lane t's fragments decode).
+  // i = 8 seg + 2 g + v: the units lane t's fragments decode). A row whose
+  // k is not whole super-blocks ends in a tail of whole 256-column steps
+  // (bf12_gemv.cuh: a pair unit, a full unit, or both), loaded at the tail's
+  // first window: the pair unit's sign+mantissa vectors at [2 g + v] and its
+  // exponent vectors at [8 + g], the full unit's at [12 + g] and [16 + g].
   uint4 b12_u[kBf12 ? 24 : 1];
-  const size_t b12_row_bytes = static_cast<size_t>(k / kBf12Super) * kBf12SuperBytes;
+  const bf12_gemv::Tail b12_tail = bf12_gemv::tail_of(k);
+  const size_t b12_row_bytes =
+      static_cast<size_t>(b12_tail.nsb) * kBf12SuperBytes + static_cast<size_t>(bf12_gemv::tail_bytes(b12_tail));
+  const int b12_tail_k = b12_tail.nsb * kBf12Super;  // the tail's first column
   const uint8_t* b12_rowp = w8 + (row_live ? static_cast<size_t>(row) * b12_row_bytes : 0);
   auto issue = [&](int win) {
     if constexpr (L::kOn) {
@@ -433,14 +444,36 @@ __global__ __launch_bounds__(kW * 32, 2) void mma_gemv_kernel(const uint16_t* __
     if constexpr (kBf12) {
       // A super-block's first window: the lane's 24 units of its row (a
       // raw row's slot holds nothing it reads; rows past n read nothing).
-      const int win = base / W::kK;
-      if ((win & 3) == 0) {
-        const uint8_t* sbp = b12_rowp + static_cast<size_t>(win >> 2) * kBf12SuperBytes;
+      // The tail's first window: its units (group j = 8 g + 2 t + v of a
+      // step is the packed format's lane j).
+      if ((base % kBf12Super) == 0) {
+        const uint8_t* sbp = b12_rowp + static_cast<size_t>(base / kBf12Super) * kBf12SuperBytes;
         const bool in = row_live && !b12_raw_row;
+        const uint4 zero = make_uint4(0u, 0u, 0u, 0u);
+        if (base < b12_tail_k) {
 #pragma unroll
-        for (int i = 0; i < 24; ++i) {
-          const int u = (i / 8) * 32 + ((i % 8) / 2) * 8 + 2 * t + (i & 1);
-          b12_u[i] = in ? *reinterpret_cast<const uint4*>(sbp + u * 16) : make_uint4(0u, 0u, 0u, 0u);
+          for (int i = 0; i < 24; ++i) {
+            const int u = (i / 8) * 32 + ((i % 8) / 2) * 8 + 2 * t + (i & 1);
+            b12_u[i] = in ? *reinterpret_cast<const uint4*>(sbp + u * 16) : zero;
+          }
+        } else {
+          const uint8_t* up = sbp;
+          if (b12_tail.pair != 0) {
+#pragma unroll
+            for (int i = 0; i < 8; ++i)
+              b12_u[i] = in ? *reinterpret_cast<const uint4*>(up + ((i / 2) * 8 + 2 * t + (i & 1)) * 16) : zero;
+#pragma unroll
+            for (int gg = 0; gg < 4; ++gg)
+              b12_u[8 + gg] = in ? *reinterpret_cast<const uint4*>(up + 512 + (4 * gg + t) * 16) : zero;
+            up += bf12_gemv::kTailPairBytes;
+          }
+          if (b12_tail.full != 0) {
+#pragma unroll
+            for (int gg = 0; gg < 4; ++gg) {
+              b12_u[12 + gg] = in ? *reinterpret_cast<const uint4*>(up + (4 * gg + t) * 16) : zero;
+              b12_u[16 + gg] = in ? *reinterpret_cast<const uint4*>(up + 256 + (2 * gg + (t >> 1)) * 16) : zero;
+            }
+          }
         }
       }
       stage_a<kTiles, kFp8, F::kLaneUnits, kW>(act, act_stride, m, k, base + W::kK, sA[buf ^ 1], act2, limit);
@@ -510,10 +543,32 @@ __global__ __launch_bounds__(kW * 32, 2) void mma_gemv_kernel(const uint16_t* __
           if (b12_raw_row) {
             if (row_live && col < k) e = *reinterpret_cast<const uint4*>(b12_raw_p + col);
           } else {
-            const int step = (base / W::kK) & 3;
-            const uint4 sm = step < 2 ? b12_u[2 * g + v] : b12_u[8 + 2 * g + v];
-            const uint32_t lo = (step & 1) ? sm.z : sm.x, hi = (step & 1) ? sm.w : sm.y;
-            const uint32_t ew = bf12_gemv::word_of(b12_u[16 + 2 * g + v], step);
+            // The 256-column step this window lies in and the lane run's
+            // group within it (a window is a whole step in the one- and
+            // two-tile forms, the ones launched).
+            const int step = (base / 256) & 3;
+            const int gs = (base % 256) / F::kQuadSpan + g;
+            uint32_t lo, hi, ew;
+            if (base < b12_tail_k) {
+              const uint4 sm = step < 2 ? b12_u[2 * gs + v] : b12_u[8 + 2 * gs + v];
+              lo = (step & 1) ? sm.z : sm.x;
+              hi = (step & 1) ? sm.w : sm.y;
+              ew = bf12_gemv::word_of(b12_u[16 + 2 * gs + v], step);
+            } else if (b12_tail.pair != 0 && step < 2) {
+              // The pair unit: a lane's two steps in one vector, its
+              // exponent words in the vector its lane pair shares.
+              const uint4 sm = b12_u[2 * gs + v];
+              lo = step ? sm.z : sm.x;
+              hi = step ? sm.w : sm.y;
+              ew = bf12_gemv::word_of(b12_u[8 + gs], 2 * v + step);
+            } else {
+              // The full unit: a lane pair's step in one vector, four
+              // lanes' exponent words in another.
+              const uint4 sm = b12_u[12 + gs];
+              lo = v ? sm.z : sm.x;
+              hi = v ? sm.w : sm.y;
+              ew = bf12_gemv::word_of(b12_u[16 + gs], 2 * (t & 1) + v);
+            }
             e = bf12_gemv::expand_step(lo, hi, ew, b12_base7, col, b12_esc, b12_eb, b12_ee);
           }
           w[0] = e.x; w[1] = e.y; w[2] = e.z; w[3] = e.w;
@@ -670,7 +725,8 @@ int split_k_for(int n, int k, const void* ws, size_t ws_bytes) {
 template <int kTiles, bool kFp8, int kW, typename OutT, typename ScaleT>
 void launch_decode_form(const uint16_t* a, size_t act_stride, const void* w, const ScaleT* scales, OutT* o,
                         int rows, int n, int k, size_t out_stride, int rs, int cs, cudaStream_t stream,
-                        void* ws, size_t ws_bytes, const uint16_t* act2 = nullptr, float limit = 0.f) {
+                        void* ws, size_t ws_bytes, const uint16_t* act2 = nullptr, float limit = 0.f,
+                        const int32_t* gate = nullptr) {
   using L = WarpLoads<kTiles, kFp8, kW>;
   static bool opted_in = false;
   if (!opted_in) {
@@ -684,14 +740,14 @@ void launch_decode_form(const uint16_t* a, size_t act_stride, const void* w, con
   if (splits > 1) {
     float* part = static_cast<float*>(ws);
     mma_gemv_kernel<kTiles, kFp8, kW, OutT, ScaleT><<<dim3(blocks, splits), kW * 32, L::kSmemBytes, stream>>>(
-        a, act_stride, w, scales, o, rows, n, k, out_stride, rs, cs, part, act2, limit, nullptr, nullptr, nullptr, nullptr, 0, 0, 0, nullptr, nullptr, nullptr);
+        a, act_stride, w, scales, o, rows, n, k, out_stride, rs, cs, part, act2, limit, nullptr, nullptr, nullptr, nullptr, 0, 0, 0, nullptr, nullptr, nullptr, nullptr);
     const int total = rows * n;
     mma_gemv_split_reduce_kernel<OutT><<<(total + 255) / 256, 256, 0, stream>>>(part, splits, rows, n, o,
                                                                                  out_stride);
     return;
   }
   mma_gemv_kernel<kTiles, kFp8, kW, OutT, ScaleT><<<dim3(blocks), kW * 32, L::kSmemBytes, stream>>>(
-      a, act_stride, w, scales, o, rows, n, k, out_stride, rs, cs, nullptr, act2, limit, nullptr, nullptr, nullptr, nullptr, 0, 0, 0, nullptr, nullptr, nullptr);
+      a, act_stride, w, scales, o, rows, n, k, out_stride, rs, cs, nullptr, act2, limit, nullptr, nullptr, nullptr, nullptr, 0, 0, 0, nullptr, nullptr, nullptr, gate);
 }
 // The bf12 form's launch (two warps a block; the unsplit chain — the
 // caller refused the shapes the bf16 form would split).
@@ -710,13 +766,19 @@ void launch_bf12_decode_form(const uint16_t* a, size_t act_stride, const Bf12Mat
   const int blocks = (n + kW * kRowsPerWarp - 1) / (kW * kRowsPerWarp);
   mma_gemv_kernel<kTiles, false, kW, OutT, float, true><<<dim3(blocks), kW * 32, L::kSmemBytes, stream>>>(
       a, act_stride, w.packed, nullptr, o, rows, n, k, out_stride, 0, 0, nullptr, nullptr, 0.f, nullptr, nullptr, nullptr,
-      nullptr, 0, 0, 0, w.rows, w.esc, w.raw);
+      nullptr, 0, 0, 0, w.rows, w.esc, w.raw, nullptr);
   DGPP_CUDA_OK(cudaGetLastError());
+}
+// The shapes the form's launches take: whole super-blocks, then at most a
+// tail of whole 256-column steps (a partial last step keeps the bf16 form).
+bool bf12_form_takes(const Bf12Matrix& w, int m) {
+  return w.packed != nullptr && w.rows != nullptr && w.esc != nullptr && w.raw != nullptr && m >= 1 &&
+         m <= kMmaGemvMaxRows && w.n >= 1 && w.k >= kBf12Super && (w.k % 256) == 0;
 }
 template <typename OutT>
 bool launch_bf12(const uint16_t* act, size_t act_stride, const Bf12Matrix& w, OutT* out, int m, int n, int k,
                  size_t out_stride, cudaStream_t stream, void* ws, size_t ws_bytes) {
-  if (!mma_gemv_bf12_accepts(w, m) || w.n != n || w.k != k || act == nullptr || out == nullptr) return false;
+  if (!bf12_form_takes(w, m) || w.n != n || w.k != k || act == nullptr || out == nullptr) return false;
   if (!mma_gemv_shape_ok(w.packed, act, act_stride, m, k)) return false;
   if (out_stride == 0) out_stride = static_cast<size_t>(n);
   if (out_stride < static_cast<size_t>(n)) return false;
@@ -777,14 +839,14 @@ void launch_decode_form_pair(const uint16_t* a0, const void* w0, const ScaleT* s
   if (splits > 1) {
     float* part = static_cast<float*>(ws);
     mma_gemv_kernel<kTiles, kFp8, kW, OutT, ScaleT><<<dim3(blocks0 + blocks1, splits), kW * 32, L::kSmemBytes, stream>>>(
-        a0, act_stride, w0, s0, o0, rows, n0, k, stride0, rs, cs, part, nullptr, 0.f, a1, w1, s1, o1, n1, stride1, blocks0, nullptr, nullptr, nullptr);
+        a0, act_stride, w0, s0, o0, rows, n0, k, stride0, rs, cs, part, nullptr, 0.f, a1, w1, s1, o1, n1, stride1, blocks0, nullptr, nullptr, nullptr, nullptr);
     const int total = rows * (n0 + n1);
     mma_gemv_split_reduce_pair_kernel<OutT><<<(total + 255) / 256, 256, 0, stream>>>(part, splits, rows, n0, o0, stride0,
                                                                                       n1, o1, stride1);
     return;
   }
   mma_gemv_kernel<kTiles, kFp8, kW, OutT, ScaleT><<<dim3(blocks0 + blocks1), kW * 32, L::kSmemBytes, stream>>>(
-      a0, act_stride, w0, s0, o0, rows, n0, k, stride0, rs, cs, nullptr, nullptr, 0.f, a1, w1, s1, o1, n1, stride1, blocks0, nullptr, nullptr, nullptr);
+      a0, act_stride, w0, s0, o0, rows, n0, k, stride0, rs, cs, nullptr, nullptr, 0.f, a1, w1, s1, o1, n1, stride1, blocks0, nullptr, nullptr, nullptr, nullptr);
 }
 
 // The 33..64-row form (four tiles, eight warps, direct loads) with the
@@ -800,14 +862,14 @@ void launch_wide_split(const uint16_t* a, size_t act_stride, const void* w, cons
   if (splits > 1) {
     float* part = static_cast<float*>(ws);
     mma_gemv_kernel<kTiles, kFp8, kWideWarps, OutT, ScaleT><<<dim3(blocks, splits), kWideThreads, Win<kTiles, kFp8>::kSmemBytes, stream>>>(
-        a, act_stride, w, scales, o, rows, n, k, out_stride, rs, cs, part, act2, limit, nullptr, nullptr, nullptr, nullptr, 0, 0, 0, nullptr, nullptr, nullptr);
+        a, act_stride, w, scales, o, rows, n, k, out_stride, rs, cs, part, act2, limit, nullptr, nullptr, nullptr, nullptr, 0, 0, 0, nullptr, nullptr, nullptr, nullptr);
     const int total = rows * n;
     mma_gemv_split_reduce_kernel<OutT><<<(total + 255) / 256, 256, 0, stream>>>(part, splits, rows, n, o,
                                                                                  out_stride);
     return;
   }
   mma_gemv_kernel<kTiles, kFp8, kWideWarps, OutT, ScaleT><<<dim3(blocks), kWideThreads, Win<kTiles, kFp8>::kSmemBytes, stream>>>(
-      a, act_stride, w, scales, o, rows, n, k, out_stride, rs, cs, nullptr, act2, limit, nullptr, nullptr, nullptr, nullptr, 0, 0, 0, nullptr, nullptr, nullptr);
+      a, act_stride, w, scales, o, rows, n, k, out_stride, rs, cs, nullptr, act2, limit, nullptr, nullptr, nullptr, nullptr, 0, 0, 0, nullptr, nullptr, nullptr, nullptr);
 }
 template <int kTiles, bool kFp8, typename OutT, typename ScaleT>
 void launch_decode(const uint16_t* a, size_t act_stride, const void* w, const ScaleT* scales, OutT* o, int rows,
@@ -904,8 +966,7 @@ void launch_mma_gemv_fp8_bf16(const uint16_t* act, size_t act_stride, const uint
 }
 
 bool mma_gemv_bf12_accepts(const Bf12Matrix& w, int m) {
-  return w.packed != nullptr && w.rows != nullptr && w.esc != nullptr && w.raw != nullptr && m >= 1 &&
-         m <= kMmaGemvMaxRows && w.n >= 1 && w.k >= kBf12Super && (w.k % kBf12Super) == 0;
+  return bf12_form_takes(w, m) && (w.k % kBf12Super) == 0;
 }
 bool launch_mma_gemv_bf12_f32(const uint16_t* act, size_t act_stride, const Bf12Matrix& w, float* out, int m, int n,
                               int k, size_t out_stride, cudaStream_t stream, void* ws, size_t ws_bytes) {
@@ -991,6 +1052,28 @@ void launch_mma_gemv_bf16_f32(const uint16_t* act, size_t act_stride, const uint
                               float* out, int m, int n, int k, size_t out_stride,
                               cudaStream_t stream, void* ws, size_t ws_bytes) {
   launch<false, float, float>(act, act_stride, w, nullptr, out, m, n, k, out_stride, 7, 7, stream, ws, ws_bytes);
+}
+
+void launch_mma_gemv_bf16_f32_gated(const uint16_t* act, size_t act_stride, const uint16_t* w, float* out, int m,
+                                    int n, int k, size_t out_stride, const int32_t* gate, cudaStream_t stream) {
+  if (m < 1 || m > 16) throw std::invalid_argument("mma_gemv gated: m outside [1, 16]");
+  if (n <= 0 || k <= 0 || (k % 64) != 0) throw std::invalid_argument("mma_gemv gated: k a multiple of 64");
+  if (!mma_gemv_shape_ok(w, act, act_stride, m, k)) throw std::invalid_argument("mma_gemv gated: alignment");
+  if (gate == nullptr) throw std::invalid_argument("mma_gemv gated: null gate");
+  if (out_stride == 0) out_stride = static_cast<size_t>(n);
+  if (out_stride < static_cast<size_t>(n)) throw std::invalid_argument("mma_gemv gated: out stride");
+  // The unsplit one-tile form at the decode width: the chain of the plain
+  // launch without a workspace.
+  const int width = decode_width(n);
+  if (width == 8)
+    launch_decode_form<1, false, 8, float, float>(act, act_stride, w, nullptr, out, m, n, k, out_stride, 7, 7, stream, nullptr, 0, nullptr, 0.f, gate);
+  else if (width == 4)
+    launch_decode_form<1, false, 4, float, float>(act, act_stride, w, nullptr, out, m, n, k, out_stride, 7, 7, stream, nullptr, 0, nullptr, 0.f, gate);
+  else if (width == 2)
+    launch_decode_form<1, false, 2, float, float>(act, act_stride, w, nullptr, out, m, n, k, out_stride, 7, 7, stream, nullptr, 0, nullptr, 0.f, gate);
+  else
+    launch_decode_form<1, false, 1, float, float>(act, act_stride, w, nullptr, out, m, n, k, out_stride, 7, 7, stream, nullptr, 0, nullptr, 0.f, gate);
+  DGPP_CUDA_OK(cudaGetLastError());
 }
 
 }  // namespace dgpp

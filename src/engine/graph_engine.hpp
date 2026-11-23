@@ -39,6 +39,7 @@
 #include "engine/step_timing.hpp"
 #include "engine/tp_bus.hpp"
 #include "engine/verify_schedule.hpp"
+#include "kernels/device_copy.hpp"
 #include "kernels/glm_spec.hpp"
 #include "net/bus_kernel.hpp"
 #include "net/collective_bus.hpp"
@@ -739,7 +740,9 @@ class GraphEngineAdapter final : public sched::SchedulerEngine {
   // throughput; the reservation rate verify_reservation_lambda(base, row)
   // before it is measured) — the same constants on every rank, so every
   // rank derives the same depth from the replicated confidence.
-  // `min_depth`: never verify fewer drafts than this (>= 1).
+  // `min_depth`: never verify fewer drafts than this. A block drafter takes
+  // 0: a step whose first draft is not worth its row verifies the pending
+  // token alone and drafts the next block. A chained drafter's minimum is 1.
   // The depth options: every depth in [min_depth, depth] when the bus's
   // graph-variant budget (kBusMaxGraphVariants: two per slot per option
   // plus two per batch family) holds them — and `max_options`
@@ -927,10 +930,11 @@ class GraphEngineAdapter final : public sched::SchedulerEngine {
         throw std::invalid_argument(
             "graph engine: the scheduled verify depth needs row_ms > 0 and "
             "lambda > 0");
-      if (min_depth < 1 || min_depth > depth_)
+      if (min_depth < (block_ ? 0 : 1) || min_depth > depth_)
         throw std::invalid_argument(
-            "graph engine: the scheduled verify depth's min_depth must be in "
-            "[1, depth]");
+            block_ ? "graph engine: the scheduled verify depth's min_depth must be in [0, depth]"
+                   : "graph engine: the scheduled verify depth's min_depth must be in [1, depth] "
+                     "(0 is a block drafter's)");
       // Validate capacity before allocating confidence buffers or changing
       // draft reporting: a rejected schedule leaves ordinary MTP usable.
       const int variants_per_depth = 2 * (slots_ + static_cast<int>(families_.size()));
@@ -1938,6 +1942,7 @@ class GraphEngineAdapter final : public sched::SchedulerEngine {
       ++fam.sched_hist[static_cast<size_t>(di)];
       if (sched_narrow_)
         for (const int req : reqs) drafts_avail_[static_cast<size_t>(req)] = draft_width(di);
+      publish_draft_floor(reqs.data(), static_cast<int>(reqs.size()));
     }
     if (!(schedule_ && spec_enabled()) && block_ && block_rows_budget_ > 0 && !depth_options_.empty()) {
       // The block drafter's rows budget: the family's static depth.
@@ -2726,6 +2731,25 @@ class GraphEngineAdapter final : public sched::SchedulerEngine {
   // published confidence is an older step's).
   int drafts_available(int req) const {
     return sched_narrow_ ? drafts_avail_[static_cast<size_t>(req)] : depth_;
+  }
+
+  // A block drafter that can stop drafting early (Inkling 2's recurrent
+  // head) reads a floor per request: the survival below which no later
+  // proposal of the block this pass drafts can be verified by the next
+  // pass. That pass verifies proposal i while the mean survival through i
+  // is above lambda x row, and lambda moves a little between two passes, so
+  // the floor sits a quarter under the threshold in force. Written before
+  // the pass is launched and read only by that pass: a request's passes
+  // never overlap. A depth hook (tests) may verify any depth, so it gets
+  // every proposal.
+  static constexpr float kDraftFloorMargin = 0.75f;
+  void publish_draft_floor(const int* reqs, int count) {
+    if constexpr (requires { model_->dflash2_stop_floor(); }) {
+      float* floor = model_->dflash2_stop_floor();
+      if (floor == nullptr) return;
+      const float value = depth_hook_ ? 0.0f : kDraftFloorMargin * lambda_now() * sched_row_ms_;
+      for (int i = 0; i < count; ++i) floor[reqs[i]] = value;
+    }
   }
 
   // The lambda in force: the configured constant, or the adaptive EWMA
@@ -3668,6 +3692,7 @@ class GraphEngineAdapter final : public sched::SchedulerEngine {
       if (di < full_depth_option()) ensure_sched_graph(req, di);
       ++sched_hist_[static_cast<size_t>(di)];
       if (sched_narrow_) drafts_avail_[static_cast<size_t>(req)] = draft_width(di);
+      publish_draft_floor(&req, 1);
     }
     // The pinned row metadata (the MTP feed itself is device-resident; a
     // plain T=1 graph uploads the staged token at its start).
@@ -3797,10 +3822,9 @@ class GraphEngineAdapter final : public sched::SchedulerEngine {
   void snapshot_verify_rows(int req, int rows, int first_row) {
     if (d_verify_logits_ == nullptr) return;
     const size_t count = static_cast<size_t>(model_->lm_vocab_count());
-    glm_device_copy(
-        d_verify_logits_ + static_cast<size_t>(req) * rows_per_request_ * count,
-        model_->device_logits() + static_cast<size_t>(first_row) * count,
-        sizeof(float) * static_cast<size_t>(rows) * count, model_->stream());
+    device_copy(d_verify_logits_ + static_cast<size_t>(req) * rows_per_request_ * count,
+                model_->device_logits() + static_cast<size_t>(first_row) * count,
+                sizeof(float) * static_cast<size_t>(rows) * count, model_->stream());
   }
   // Zero headers for the slot's rows: unconstrained until staged again. The
   // host's copies go with them: the fallback's eagerly re-run rows read

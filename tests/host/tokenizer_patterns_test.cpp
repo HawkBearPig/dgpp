@@ -1,4 +1,8 @@
+#include <unistd.h>
+
 #include <filesystem>
+#include <fstream>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -42,6 +46,66 @@ DGPP_TEST(tokenizer_load_refuses_missing_file_and_non_pinned_split_pattern) {
   };
   require_refusal(data / "missing-tokenizer.json", "cannot open");
   require_refusal(data / "tokenizer_wrong_split_pattern.json", "pinned regex");
+}
+
+DGPP_TEST(tokenizer_one_stage_case_pattern_accepts_both_split_forms) {
+  // The one-stage case pattern matches every codepoint, so a text has no
+  // gaps between matches. "Isolated" (Inkling 2) and "Removed" with invert
+  // (MiniMax) therefore cut the same pieces. The other two combinations
+  // would keep the gaps instead of the matches and are refused.
+  std::ifstream in(data / "inkling2_tokenizer_pattern.json");
+  std::stringstream buffer;
+  buffer << in.rdbuf();
+  const std::string isolated = buffer.str();
+  const auto variant = [&](const std::string& behavior, bool invert) {
+    std::string text = isolated;
+    const auto swap = [&](const std::string& from, const std::string& to) {
+      const size_t at = text.find(from);
+      if (at == std::string::npos || text.find(from, at + 1) != std::string::npos)
+        throw std::runtime_error("the fixture states '" + from + "' exactly once");
+      text.replace(at, from.size(), to);
+    };
+    swap("\"behavior\": \"Isolated\"", "\"behavior\": \"" + behavior + "\"");
+    swap("\"invert\": false", std::string("\"invert\": ") + (invert ? "true" : "false"));
+    return text;
+  };
+  const std::filesystem::path dir =
+      std::filesystem::temp_directory_path() / ("dgpp_tokenizer_patterns_" + std::to_string(::getpid()));
+  std::filesystem::create_directories(dir);
+  const auto write = [&](const std::string& name, const std::string& text) {
+    std::ofstream(dir / name) << text;
+    return (dir / name).string();
+  };
+  const auto refused = [](const std::string& file) {
+    try {
+      (void)dgpp::text::Tokenizer::load(file);
+    } catch (const std::runtime_error& e) {
+      return std::string(e.what()).find("Removed with invert=true or Isolated with invert=false") != std::string::npos;
+    }
+    return false;
+  };
+  bool ok = true;
+  std::string why;
+  try {
+    for (const auto& file : {write("isolated.json", variant("Isolated", false)), write("removed.json", variant("Removed", true))}) {
+      for (size_t cache : {size_t{0}, size_t{128}}) {
+        const auto tok = dgpp::text::Tokenizer::load(file, cache);
+        // A contraction stays with its word and a digit run is cut in threes.
+        if (tok.encode("a's") != std::vector<int64_t>{0} || tok.encode("1234") != std::vector<int64_t>{1, 2} ||
+            tok.decode({0, 1, 2}, false) != "a's1234") {
+          ok = false;
+          why = "the split forms disagree in " + file;
+        }
+      }
+    }
+    if (!refused(write("removed_plain.json", variant("Removed", false)))) ok = false, why = "Removed without invert was loaded";
+    if (!refused(write("isolated_inverted.json", variant("Isolated", true)))) ok = false, why = "Isolated with invert was loaded";
+  } catch (...) {
+    std::filesystem::remove_all(dir);
+    throw;
+  }
+  std::filesystem::remove_all(dir);
+  if (!ok) throw std::runtime_error(why);
 }
 
 }  // namespace

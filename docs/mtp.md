@@ -461,3 +461,79 @@ MiniMax M3.1 uses the bundled DSpark block with seven proposals. Set
 verification scheduler can select fewer rows while keeping the complete
 physical draft block. The deployment parser accepts 1–7; the loaded model
 checks its supported width before allocating weights.
+
+## Inkling 2 Mini's bundled draft model
+
+Inkling 2 Mini ships a three-layer block draft model in `mtp.safetensors`.
+`engine.mtp` serves it on the shared block drafter
+(`src/models/inkling2/draft.hpp`, `src/kernels/inkling2_draft.hpp`), and the
+family's templates turn it on. `engine.mtp_depth` is 7, the block's width, or
+omitted.
+
+The draft reads four states of the target for every committed position: the
+block state at the entry of visits 5, 23 and 41, and the final-norm output.
+Each draft layer mixes them with its own softmax weights, and the mix becomes
+that layer's context keys and values in one more plane of the K/V pool. A
+block is the newest token's normed embedding followed by seven copies of a
+learned mask row, and every row attends over the block and the context. Two
+of the three layers see only the last 1,024 positions, counted back from the
+block's last row. Every target pass, prefill chunks and verify rows alike,
+writes the context of its positions, so a rolled-back row needs no undo and a
+prefix snapshot carries the draft's planes with the target's.
+
+A recurrent head then corrects the mask rows' logits one proposal after
+another. Its rank-256 state reads the proposal before it, the mask row's
+final state and one feature of the last committed position, and its output
+biases the whole vocabulary through the target's head. Each step is one pass
+over a 102 MiB matrix (the head folded through the recurrent head's output
+projection at load), a tensor-core GEMV, after one read of the head for the
+uncorrected logits. The shared head screen is not read here: a shortlist
+taken from the uncorrected logits leaves out tokens the correction would
+have chosen, and it cut the accepted tokens per step on code from 4.0 to 2.3.
+
+Four things decide what the draft returns on this model.
+
+**A verify row is not cheap.** Every row routes to its own experts and reads
+their weights, so a row costs 3.9 ms on one node, 2.2 on two and 1.4 on four,
+against plain steps of 28.5, 20 and 15 ms. Verifying all seven proposals
+more than doubles a pass. The templates therefore run `engine.mtp_schedule`
+with the row and pass costs measured on each world, and with
+`engine.mtp_schedule_min_depth` at 0: when the first proposal is not worth
+its row, a step feeds the pending token alone and drafts the next block.
+
+**The recurrent head stops when the schedule would.** The schedule verifies
+proposal i only while the chance that the first i proposals all hold is above
+its threshold, and that chance only falls from one proposal to the next. The
+head keeps the same running product as it drafts. Once it is a quarter below
+the threshold in force, no later proposal can be verified, and the remaining
+steps return at once without reading the folded matrix. On prose the head
+runs two or three of its seven steps. The proposals it does produce are
+unchanged.
+
+**The draft has no confidence output.** The schedule's estimate of a
+proposal's acceptance is the probability the draft gave it among its step's
+sixteen candidates. Read directly, that probability overstates acceptance: a
+proposal the draft gave 94 percent was accepted 73 percent of the time. The
+engine passes its logit through a linear fit (bias -0.64, slope 0.568)
+regressed on 2,443 verified proposals of five chat prompts under greedy
+decoding, which predicts within three points of the measured rate from 0.25
+to 0.98. `inkling2_draft_test --conf-fit 0,1 --conf-out FILE` records the raw
+logit and the committed tokens of every step for a new fit.
+
+**Several requests share a verify pass.** The packed 12-bit launch takes
+eight rows, so a pass of sixteen rows would read every attention matrix
+twice. With `"bf16_weights": "bf12+bf16"` the BF16 bytes stay resident and a
+decode pass of nine rows or more takes the tensor-core form over them, one
+read for all its rows. The templates set it. The vocabulary head is the one
+matrix large enough for the tensor-core form to pay over the 12-bit bytes as
+well: from nine to 32 rows the target's head and the draft's read the packed
+head once, 2.9 ms where the BF16 read is 4.0, with the same arithmetic.
+
+Acceptance depends on the text. On code the first proposal is accepted 70 to
+87 percent of the time and a step commits about four tokens. On prose the
+first proposal is accepted about half the time and a step commits about two.
+A batch verifies one depth for all its requests, chosen from their mean
+estimate. The margin over plain decoding is therefore widest for one request
+and narrowest for prose at eight requests on one node, where a verify row's
+expert reads cost almost what its accepted proposals return. Measured rates
+are in [benchmarks](benchmarks.md).

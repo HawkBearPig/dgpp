@@ -75,6 +75,9 @@ prompt classes, and C is the number of concurrent client requests.
 | DeepSeek-V4.1-Flash-1017 MXFP4/FP8 | 4 | 54-89 | 84-139 | 1.01 / 2.64 / 10.0 |
 | DeepSeek-V4.1-Flash-1017 EXL3 3.5 bpw | 4 | 70-134 | 165-248 | 1.19 / 3.45 / 13.3 |
 | MiniMax-M3.1-Flash NVFP4/MXFP8 | 4 | 28.8-48.2 | 85.7-99.7 | 2.176 / 7.816 / 33.341 |
+| Inkling 2 Mini NVFP4/MXFP8 | 1 | 40-64 | 123-181 | 0.86 / 2.72 / 13.3 |
+| Inkling 2 Mini NVFP4/MXFP8 | 2 | 56-105 | 215-306 | 0.68 / 2.30 / 10.1 |
+| Inkling 2 Mini NVFP4/MXFP8 | 4 | 90-151 | 316-435 | 0.61 / 2.18 / 9.21 |
 
 Rows with every cell filled were measured on the shipped templates at the
 current scheduler defaults. Rows with an empty C8 cell were measured
@@ -157,6 +160,7 @@ mechanism and depth the template ships with.
 | [MiniMax M3.1 Flash](docs/model_cards/MiniMax-M3.1-Flash.md) | [MiniMaxAI/MiniMax-M3.1-Flash](https://huggingface.co/MiniMaxAI/MiniMax-M3.1-Flash) | NVFP4 experts, MXFP8 dense | [4](deploy/cluster_minimax-m3.1-flash_nvfp4-mxfp8_w4.example.json) | 1M | DSpark adaptive 1/3/5/7 | yes |
 | [MiMo-V2.6-Flash](docs/model_cards/MiMo-V2.6-Flash.md) | [XiaomiMiMo/MiMo-V2.6-Flash-RL](https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Flash-RL) | MXFP4 experts, FP8 dense | [2](deploy/cluster_mimo-v2.6-flash_mxfp4-fp8_w2.example.json), [4](deploy/cluster_mimo-v2.6-flash_mxfp4-fp8_w4.example.json) | 256K on two, 128K on four | MTP 1 | |
 | [Flint](docs/model_cards/Flint-FP8-NVFP4.md) | [HawkBearPig/flint-FP8-NVFP4](https://huggingface.co/HawkBearPig/flint-FP8-NVFP4) | FP8 and NVFP4 experts, BF16 rest | [1](deploy/cluster_flint_fp8-nvfp4_w1.example.json), [2](deploy/cluster_flint_fp8-nvfp4_w2.example.json), [4](deploy/cluster_flint_fp8-nvfp4_w4.example.json) | 256K | none | |
+| [Inkling 2 Mini](docs/model_cards/Inkling-2-Mini.md) | [thinkingmachines/Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) | NVFP4 and MXFP8 experts, BF16 rest | [1](deploy/cluster_inkling-2-mini_nvfp4-mxfp8_w1.example.json), [2](deploy/cluster_inkling-2-mini_nvfp4-mxfp8_w2.example.json), [4](deploy/cluster_inkling-2-mini_nvfp4-mxfp8_w4.example.json) | 384K on one, 768K on two, 1M on four | DSpark adaptive 0-7 | yes |
 | [Dory1.0-4B](docs/model_cards/Dory1.0-4B-NVFP4.md) | [nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-NVFP4](https://huggingface.co/nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-NVFP4) | NVFP4 W4A16 | [1](deploy/cluster_dory1.0-4b_nvfp4_w1.example.json) | 256K | none | |
 
 Templates are named `cluster_<model>_<quant>_w<nodes>.example.json`. Copy
@@ -355,7 +359,7 @@ commands.
 | `src/serve/` | the HTTP server, the OpenAI-compatible service, the admission journal, the image and file frontends, metrics |
 | `src/sched/` | the scheduler, the prefix cache index and the NVMe tier's disk cache |
 | `src/engine/` | the session and engine interfaces every model implements, the eager and graph engines, speculative decoding, prefill tasks and batches, memory plans, prefix arenas |
-| `src/models/` | one directory per family: `glm` (GLM-5.3-Flash), `glm_dsa` (GLM-5.3), `glm4` (GLM-4.7), `qwen` (Qwen3.8-Flash-Next, Qwen3.8-27B, Qwen3.5-122B-A10B), `dsv41`, `dsv4`, `mimo`, `flint` and the `dflash2` drafter, with the KDA and DSA layer libraries they share |
+| `src/models/` | one directory per family: `glm` (GLM-5.3-Flash), `glm_dsa` (GLM-5.3), `glm4` (GLM-4.7), `qwen` (Qwen3.8-Flash-Next, Qwen3.8-27B, Qwen3.5-122B-A10B), `dsv41`, `dsv4`, `mimo`, `flint`, `inkling2` and the `dflash2` drafter, with the KDA and DSA layer libraries they share |
 | `src/kernels/` | the CUDA kernels: GEMV and GEMM for each weight format, attention, MoE, norms, speculative selection and the sampler |
 | `src/net/` | the RoCE collective bus, TCP coordination and the roster |
 | `src/text/` | the tokenizer, the Jinja chat template, the tool and JSON Schema grammars and their parsers |
@@ -395,7 +399,7 @@ commands.
 | [Benchmark procedures](docs/benchmarking.md) | the platform, kernel and transport probes |
 | [YaRN release check](docs/qwen_yarn_release_check.md) | the long-context acceptance run |
 | [Model cards](docs/model_cards/) | per-checkpoint serving notes and measurements |
-| Model notes | architecture and port records per family: [GLM-5.3-Flash NVFP4](docs/nvfp4_plan.md), [GLM-5.3](docs/glm53_plan.md), [GLM-4.7](docs/glm47_plan.md), [Qwen3.8-Flash-Next](docs/qwen38_flash_next_plan.md), [Qwen3.5-122B-A10B](docs/qwen35_122b_moe_nvfp4_plan.md), [DeepSeek-V4.1-Flash](docs/deepseek_v41_flash_plan.md), [DeepSeek EXL3](docs/deepseek_v41_flash_exl3_plan.md), [MiMo-V2.6-Flash](docs/mimo_v26_flash_plan.md), [Flint](docs/flint_plan.md) |
+| Model notes | architecture and port records per family: [GLM-5.3-Flash NVFP4](docs/nvfp4_plan.md), [GLM-5.3](docs/glm53_plan.md), [GLM-4.7](docs/glm47_plan.md), [Qwen3.8-Flash-Next](docs/qwen38_flash_next_plan.md), [Qwen3.5-122B-A10B](docs/qwen35_122b_moe_nvfp4_plan.md), [DeepSeek-V4.1-Flash](docs/deepseek_v41_flash_plan.md), [DeepSeek EXL3](docs/deepseek_v41_flash_exl3_plan.md), [MiMo-V2.6-Flash](docs/mimo_v26_flash_plan.md), [Flint](docs/flint_plan.md), [Inkling 2 Mini](docs/inkling2_mini_plan.md) |
 | [Testing](docs/testing.md) | the suites and what each proves |
 | [Adding a model](docs/adding_a_model.md) | the checklist for a new family |
 | [DESIGN.md](DESIGN.md) | the serving architecture and its contracts |
@@ -417,8 +421,8 @@ for the GB10. Bug reports, model requests and feature requests have
 ## Credits
 
 The engine serves checkpoints published by Zhipu AI (GLM), the Qwen
-team, DeepSeek, Xiaomi MiMo, RecursiveSI (Flint) and NVIDIA, and
-quantized exports by Unsloth, dabsLabs, RadixArk, Saren,
+team, DeepSeek, Xiaomi MiMo, RecursiveSI (Flint), Thinking Machines
+(Inkling 2) and NVIDIA, and quantized exports by Unsloth, dabsLabs, RadixArk, Saren,
 local-inference-lab, kaushikvira, LibertAIDAI and HawkBearPig. The
 DFlash2 drafter for Qwen3.8-27B is published by z-lab. The EXL3 weight
 format comes from exllamav3. Image decoding uses the vendored stb_image

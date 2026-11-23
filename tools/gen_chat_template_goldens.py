@@ -820,6 +820,197 @@ FLINT_CASES = [
 ]
 
 
+# The Inkling 2 template: every turn is typed blocks,
+# ROLE[NAME]<|content_KIND|>BODY<|end_message|>, with no whitespace between
+# them. The tools are declared first as compact JSON with sorted keys, a
+# system block states the thinking effort level (a name mapped through a
+# dict literal, or a number) before the first turn that is not a system one,
+# an assistant turn writes its reasoning, its text and its calls as blocks
+# and closes with the end-of-sampling marker, a call's arguments are sorted
+# by key at the top level only, and a tool turn's header names the tool. The
+# template reads no add_generation_prompt: the prompt ends where the turns do.
+def inkling_tool(name="get_weather"):
+    return {"type": "function", "function": {
+        "name": name,
+        "description": "Get the current weather for a city (城市天气查询).",
+        "parameters": {
+            "type": "object",
+            "required": ["city"],
+            "properties": {
+                "days": {"type": "integer", "minimum": 0, "maximum": 14},
+                "city": {"type": "string", "description": "City name"},
+                "units": {"enum": ["metric", "imperial"], "type": "string"},
+                "threshold": {"type": "number", "minimum": 0.5},
+            },
+        },
+    }}
+
+
+INKLING_CASES = [
+    ("inkling_simple_user", {
+        "messages": [{"role": "user", "content": "The capital of France is"}],
+    }),
+    ("inkling_system_user", {
+        "messages": [
+            {"role": "system", "content": "You are a concise geography assistant."},
+            {"role": "user", "content": "What is the capital of France?"},
+        ],
+    }),
+    ("inkling_two_systems_then_user", {
+        "messages": [
+            {"role": "system", "content": "Rule one."},
+            {"role": "system", "content": "Rule two."},
+            {"role": "user", "content": "Go."},
+        ],
+    }),
+    ("inkling_only_system", {
+        "messages": [{"role": "system", "content": "You are helpful."}],
+    }),
+    ("inkling_chinese_user", {
+        "messages": [{"role": "user", "content": "写一首关于秋天的诗。"}],
+    }),
+] + [
+    ("inkling_effort_" + name, {
+        "messages": [{"role": "user", "content": "Think about it."}],
+        "reasoning_effort": name,
+    }) for name in ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+] + [
+    ("inkling_effort_padded_name", {
+        "messages": [{"role": "user", "content": "Think about it."}],
+        "reasoning_effort": "  low \n",
+    }),
+    ("inkling_effort_null", {
+        "messages": [{"role": "user", "content": "Think about it."}],
+        "reasoning_effort": None,
+    }),
+    ("inkling_effort_number", {
+        "messages": [{"role": "user", "content": "Think about it."}],
+        "reasoning_effort": 0.35,
+    }),
+    ("inkling_effort_integer_zero", {
+        "messages": [{"role": "user", "content": "Think about it."}],
+        "reasoning_effort": 0,
+    }),
+    ("inkling_effort_number_top", {
+        "messages": [{"role": "user", "content": "Think about it."}],
+        "reasoning_effort": 0.99,
+    }),
+    ("inkling_multi_turn", {
+        "messages": [
+            {"role": "user", "content": "Hi"},
+            {"role": "assistant", "content": "Hello! How can I help?"},
+            {"role": "user", "content": "Tell me a joke."},
+            {"role": "assistant", "content": "Why did the chicken cross the road?"},
+            {"role": "user", "content": "Why?"},
+        ],
+    }),
+    ("inkling_assistant_reasoning", {
+        "messages": [
+            {"role": "user", "content": "2 + 2?"},
+            {"role": "assistant", "reasoning_content": "Simple arithmetic.", "content": "4"},
+            {"role": "user", "content": "And 3 + 3?"},
+        ],
+        "reasoning_effort": "low",
+    }),
+    ("inkling_assistant_reasoning_only", {
+        "messages": [
+            {"role": "user", "content": "Hmm"},
+            {"role": "assistant", "reasoning_content": "Thinking...", "content": ""},
+            {"role": "user", "content": "Well?"},
+        ],
+    }),
+    ("inkling_assistant_empty_content", {
+        "messages": [
+            {"role": "user", "content": "Say nothing."},
+            {"role": "assistant", "content": ""},
+            {"role": "user", "content": "Good."},
+        ],
+    }),
+    ("inkling_tools_declared", {
+        "messages": [{"role": "user", "content": "巴黎天气？"}],
+        "tools": [inkling_tool()],
+    }),
+    ("inkling_tools_bare_and_wrapped", {
+        "messages": [
+            {"role": "system", "content": "Use tools."},
+            {"role": "user", "content": "Weather and time?"},
+        ],
+        "tools": [inkling_tool(), {"name": "get_time", "parameters": {"type": "object", "properties": {}}},
+                  {"type": "function", "function": {"name": "noop"}}],
+        "reasoning_effort": "medium",
+    }),
+    ("inkling_tool_call_round_trip", {
+        "messages": [
+            {"role": "user", "content": "Weather in Paris for 3 days?"},
+            {"role": "assistant", "reasoning_content": "I should call the tool.", "content": "",
+             "tool_calls": [call("call_1", "get_weather", {"days": 3, "city": "Paris", "Units": "metric"})]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "{\"temp\": 21, \"sky\": \"clear\"}"},
+            {"role": "assistant", "content": "It is 21 degrees and clear."},
+            {"role": "user", "content": "Thanks."},
+        ],
+        "tools": [inkling_tool()],
+    }),
+    ("inkling_parallel_calls_named_tool_turns", {
+        "messages": [
+            {"role": "user", "content": "Paris and 東京?"},
+            {"role": "assistant", "content": "Checking both.",
+             "tool_calls": [call("a", "get_weather", {"city": "Paris"}),
+                            call("b", "get_weather", {"city": "東京", "days": 2})]},
+            {"role": "tool", "name": "get_weather", "content": "sunny"},
+            {"role": "tool", "name": "get_weather", "tool_call_id": "b", "content": "雨"},
+        ],
+        "tools": [inkling_tool()],
+    }),
+    ("inkling_call_nested_arguments", {
+        "messages": [
+            {"role": "user", "content": "Run it."},
+            {"role": "assistant", "content": "",
+             "tool_calls": [call("c", "run", {"zeta": {"b": 1, "a": [1, 2.5, None, True, {"y": "é", "x": "\"q\""}]},
+                                               "alpha": "line\nbreak", "Beta": 0.1, "empty": {}, "list": []})]},
+            {"role": "tool", "tool_call_id": "c", "content": "done"},
+        ],
+    }),
+    ("inkling_call_without_arguments", {
+        "messages": [
+            {"role": "user", "content": "Ping."},
+            {"role": "assistant", "content": "", "tool_calls": [call("p", "ping", {})]},
+            {"role": "tool", "tool_call_id": "p", "content": "pong"},
+        ],
+    }),
+    ("inkling_assistant_name", {
+        "messages": [
+            {"role": "user", "content": "Who are you?"},
+            {"role": "assistant", "name": "helper", "content": "A helper."},
+            {"role": "user", "content": "Ok."},
+        ],
+    }),
+    ("inkling_content_parts", {
+        "messages": [
+            {"role": "user", "content": [
+                {"type": "text", "text": "Describe"},
+                {"type": "image_url", "image_url": {"url": "x"}},
+                "plain string part",
+                {"type": "input_text", "text": "and compare."},
+                {"text": "untyped"},
+            ]},
+        ],
+    }),
+    ("inkling_tool_result_with_image", {
+        "messages": [
+            {"role": "user", "content": "Screenshot?"},
+            {"role": "assistant", "content": "", "tool_calls": [call("s", "screenshot", {})]},
+            {"role": "tool", "tool_call_id": "s", "content": [{"type": "image"}, {"type": "text", "text": "the screen"}]},
+        ],
+    }),
+    ("inkling_whitespace_and_markup_in_text", {
+        "messages": [
+            {"role": "system", "content": "  leading and trailing  \n"},
+            {"role": "user", "content": "a {{ b }} {% c %} <|not_a_token|>\n\n\tend "},
+        ],
+    }),
+]
+
+
 def main():
     import argparse
     ap = argparse.ArgumentParser()
@@ -834,8 +1025,10 @@ def main():
     is_glm4 = "GLM-4" in model
     is_mimo = "MiMo" in model
     is_flint = "flint" in model.lower()
-    cases = FLINT_CASES if is_flint else MIMO_CASES if is_mimo else QWEN_CASES if is_qwen else GLM4_CASES if is_glm4 else CASES
+    is_inkling = "inkling" in model.lower()
+    cases = INKLING_CASES if is_inkling else FLINT_CASES if is_flint else MIMO_CASES if is_mimo else QWEN_CASES if is_qwen else GLM4_CASES if is_glm4 else CASES
     out_path = args.out_opt or args.out or (
+        "tests/data/inkling2_chat_template_goldens.jsonl" if is_inkling else
         "tests/data/flint_chat_template_goldens.jsonl" if is_flint else
         "tests/data/mimo_chat_template_goldens.jsonl" if is_mimo else
         "tests/data/qwen_chat_template_goldens.jsonl" if is_qwen else
@@ -850,7 +1043,7 @@ def main():
     tok_raw = pathlib.Path(tok_path).read_bytes()
     template_hash = f"{fnv1a64(tpl_raw):016x}"
     tok_hash = f"{fnv1a64(tok_raw):016x}"
-    if not is_qwen and not is_glm4 and not is_mimo and not is_flint and tok_hash != "700b4469fc43f23b":
+    if not is_qwen and not is_glm4 and not is_mimo and not is_flint and not is_inkling and tok_hash != "700b4469fc43f23b":
         sys.exit(f"unexpected tokenizer revision {tok_hash} — the tokenizer "
                  "goldens are keyed to 700b4469fc43f23b")
 

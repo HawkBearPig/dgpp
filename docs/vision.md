@@ -1,6 +1,6 @@
 # Image inputs
 
-GLM-5.3-Flash, Qwen3.8-Flash-Next, Qwen3.8-27B and MiniMax-M3.1-Flash accept images through
+GLM-5.3-Flash, Qwen3.8-Flash-Next, Qwen3.8-27B, MiniMax-M3.1-Flash and Inkling 2 Mini accept images through
 `POST /v1/chat/completions`. The engine loads the checkpoint's BF16 vision
 encoder and projects image features into the language model's prompt. It
 supports the FP8 and hybrid NVFP4/FP8 checkpoints, streaming, multiple choices
@@ -51,7 +51,7 @@ print(json.load(urlopen(request))["choices"][0]["message"])
 | Size | Up to 20 MiB of decoded PNG/JPEG/WebP file bytes, 32 megapixels and 16,384 pixels per source dimension |
 | History | Image tokens use the ordinary context budget; no separate image-count or aggregate visual-token cap |
 | Decoded data | Up to 256 MiB of resized RGB pixels per request, independently of compressed upload size |
-| Detail | `auto` and `high` allow up to 1,024 visual tokens per image (576 for MiniMax); `low` allows 256 |
+| Detail | `auto` and `high` allow up to 1,024 visual tokens per image (576 for MiniMax); `low` allows 256. Inkling 2 Mini keeps an image's own size at every setting, up to 1,024 tokens |
 | Preprocessing | RGB conversion and an aspect-preserving antialiased bicubic resize onto the family's visual-token grid, then the checkpoint's own normalization — see [per-family preprocessing](#per-family-preprocessing) |
 | Usage | Each merged patch block contributes one prompt token; image delimiters also count. Normal context and admission limits still apply |
 | Prefix cache | Identical image content, geometry and token positions can reuse prompt and generated-continuation snapshots; `cached_tokens` reports reuse |
@@ -84,6 +84,23 @@ Image delimiters are `]<]start of image[>[`, `]<]image[>[` and
 the target embedding; DSpark receives the resulting target features.
 Its language-model positions stay one-dimensional, as in the published
 MiniMax decoder.
+
+Inkling 2 Mini uses a 40-pixel grid (patch 20 x merge 2) and does not
+resize. An image keeps its own size and is padded on the right and bottom to
+whole cells, and the tower reads the processor's padding value there whatever
+the canvas holds. Past 1,024 tokens the image is scaled down to the largest
+size that fits, keeping its aspect. Transparency is composited on the
+processor's 8-pixel gray checkerboard. Its 23-block tower has LayerNorm, a
+GELU MLP with biases, a learned scale on every sublayer output, full
+attention with a rotary embedding along columns and rows, a 32 x 32 position
+table resampled bilinearly, a class token and no final norm. A two-layer
+projector turns the four patches of a cell into one row at the language
+model's width. The checkpoint's template renders the image block itself
+(`<|content_image|>`, one `<|unused_200054|>` placeholder, `<|end_message|>`),
+so the frontend leaves image parts to the template and expands each
+placeholder to its image's tokens. A row enters in place of the placeholder's
+normed embedding, and the draft model reads the states that follow like any
+other token's.
 
 MiniMax also accepts user content parts of the form
 `{"type":"video_url","video_url":{"url":"data:video/mp4;base64,...","fps":1}}`.
@@ -184,6 +201,16 @@ For segments above 9,216 patch rows, attention softmax follows the reference's
 four-value reduction order, including its shared-memory cutoff and scalar
 tail. The shorter still-image reduction cannot be extended unchanged to
 16,384 patch rows without accumulating full-depth error.
+
+Inkling 2 Mini reserves 0.61 GiB of visual weights and 0.33 GiB of workspace
+per rank, with a cache of four encoded images keyed on pixels, canvas and
+content region. Its attention keeps scores and probabilities in FP32 and
+rounds the output, as the released kernel does. `inkling2_vision_test`
+compares the tower stage by stage with `tools/inkling2_vision_reference.py`
+on a small synthetic tower, and with `--foreign` it takes dumps of the image
+rows another implementation wrote from the release. Against transformers the
+engine's rows sit 2 to 3 percent from the FP32 tower, which is where
+transformers' own BF16 tower sits.
 
 For the MiniMax encoder, build `minimax_vision_check` and run the real-weight
 regressions on an idle GPU (the oracle requires NumPy and PyTorch):

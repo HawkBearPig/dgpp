@@ -23,8 +23,10 @@
 #include "engine/prefix_arena.hpp"
 #include "dory_fixture.hpp"
 #include "flint_fixture.hpp"
+#include "inkling2_fixture.hpp"
 #include "mimo_fixture.hpp"
 #include "models/flint/forward.hpp"
+#include "models/inkling2/forward.hpp"
 #include "models/dory/forward.hpp"
 #include "models/mimo/forward.hpp"
 #include "models/qwen/model35.hpp"
@@ -194,6 +196,15 @@ int main() {
       dgpp::FlintModel m(cfg, dir, /*max_tokens=*/128, /*max_cache_tokens=*/512, dgpp::FlintResidency::Resident,
                          nullptr, 0, 1, /*max_requests=*/2, /*mtp=*/false);
       check_tier(m, cfg.vocab_size, "Flint", base + "/flint-slab");
+    }
+    {
+      // A snapshot carries the convolution rings' last three positions.
+      const std::string dir = base + "/inkling2";
+      const dgpp::Inkling2Config cfg = ink2fx::tiny_config();
+      ink2fx::write_fixture(dir);
+      dgpp::Inkling2Model m(cfg, dir, /*max_tokens=*/128, /*max_cache_tokens=*/512, dgpp::Inkling2Residency::Resident,
+                            nullptr, 0, 1, /*max_requests=*/2, /*mtp=*/false);
+      check_tier(m, cfg.vocab_size, "Inkling 2", base + "/inkling2-slab");
     }
     {
       const std::string dir = base + "/qwen35";

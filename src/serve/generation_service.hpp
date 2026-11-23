@@ -170,6 +170,16 @@ class ModelFrontend {
   // turns of one conversation cut at the same positions. Empty: no
   // boundaries (the cache still cuts at chunk multiples).
   virtual std::vector<int64_t> boundary_token_ids() const { return {}; }
+  // A template that writes no generation prompt (Inkling 2): the model
+  // opens its turn with its own role marker, so a prompt carries no marker
+  // at its end and a finished answer stops one token short of the next
+  // speaker's marker. Such a frontend names the model's marker (one of its
+  // boundary tokens). The service then cuts one token before every change
+  // of speaker, and at the last token of a prompt the model will answer:
+  // the positions a prompt's prefill and an answer's close snapshot stand
+  // at, so the next turn and a repeated prompt attach there. -1: the
+  // template writes the generation prompt and the markers are the cuts.
+  virtual int64_t self_opened_turn_marker() const { return -1; }
 };
 
 struct ServiceConfig {
@@ -679,7 +689,10 @@ class GenerationService : public HttpHandler,
   // A request got its slot: the queue-time / prefill-time split.
   void on_admit(const std::string& id, int slot) override;
   // The prompt's structural boundaries: every position (>= 1) holding one
-  // of the frontend's boundary tokens.
+  // of the frontend's boundary tokens. Under a self-opened turn marker
+  // (ModelFrontend::self_opened_turn_marker) a marker that changes the
+  // speaker counts one position earlier, and so does the end of a prompt
+  // the model will answer.
   std::vector<int64_t> prompt_boundaries(const std::vector<int64_t>& prompt) const;
 
   // idle()'s record pump: flushes deltas, finishes done records.
@@ -709,6 +722,7 @@ class GenerationService : public HttpHandler,
   const ModelFrontend* frontend_;
   dgpp::text::ChatMarkers markers_;
   std::vector<int64_t> boundary_ids_;  // the frontend's, sorted (M7)
+  int64_t turn_marker_id_ = -1;        // the frontend's self-opened turn marker, or -1
   dgpp::sched::Scheduler sched_;  // engine thread only (except try_submit
                                  // under the lock via engine_pass)
   // Engine-thread-only (set once before the loop, read in the observer
