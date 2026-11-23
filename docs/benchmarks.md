@@ -18,6 +18,7 @@ change again, keep each row's recorded configuration with its numbers.
 
 | Measurement set | Date (UTC) | Source revision | Scope |
 |---|---|---|---|
+| Inkling 2 Mini NVFP4/MXFP8 | 2026-11-23 | `ceafe571` plus the Inkling 2 working tree (binary `067b296ace594be5`) | The three templates as shipped (one, two and four nodes), every row from one `serve_campaign.py run` per template (four nodes 03:41 to 04:12 UTC, two nodes 04:12 to 04:55, one node 04:55 to 05:49): five classes at C1/C2/C4/C8, twelve cold prefill probes, the context matrix to each pool's limit, the 564-item quality set at eight slots, the API check, the transcript checks with a boot without the draft model, and the plain and full-block mode boots. The bundled draft model with its scheduled verify depth, under the checkpoint's native activation recipe |
 | MiniMax-M3.1-Flash NVFP4/MXFP8, four nodes | 2026-11-05 | `a40e587a8608` (binary `718a59bf8356b19c7d3ec63cd5bba644561cee2069ab4d3ac7fabb682ba6dbe3`) | One shipped-template campaign (18:34–20:18 UTC): native DSpark with adaptive verification and eight slots, five classes at C1/C2/C4/C8, twelve cold prefill probes, context timing through 512K, 164 HumanEval / 300 GSM8K / 100 extraction cases plus capped-response retries, API and transcript isolation, and fresh plain/full-seven C1 controls. All four boots ran the recorded binary with zero swap on every rank (head swap disabled for the window; swap-limited serving scopes), all cold probes had zero cached tokens, operation streams matched, the fabric was otherwise idle, and production and head swap were restored once after validation. Replaces the earlier sixteen-slot plain template's row set. |
 | GLM-5.3-Flash NVFP4/FP8, four nodes | 2026-10-29 | `11fe1807`, the 0.1.0 release build (binary `1960b127b308e83e`), tree at `8216f398` (documentation commits only beyond the build) | The four-node template as shipped, every row from one `serve_campaign.py run` (00:59 to 01:51 UTC): five classes at C1/C2/C4/C8, three cold probes each at 512/2K/8K/32K, the context matrix through 512K on the 768K pool, the 300-item quality set, the API, greedy-transcript and isolation checks, and the plain boot (5/5 classes matched). Every rank at zero swap before and after, zero cached tokens in the twelve cold probes, matching operation streams. Replaces the 2026-10-06/07 and 2026-10-13 rows, which ran with fixed prefill budgets and kept only the C1 decode rate |
 | GLM-5.3-Flash NVFP4/FP8, two nodes | 2026-10-28/29 | `11fe1807`, the 0.1.0 release build (binary `1960b127b308e83e`), tree at `acd81cf1` (documentation commits only beyond the build) | The two-node template as shipped, every row from one `serve_campaign.py run` (23:21 to 00:15 UTC): five classes at C1/C2/C4/C8, three cold probes each at 512/2K/8K/32K, the context matrix to the 160K pool, the 300-item quality set, the API, greedy-transcript and isolation checks, and the plain boot (5/5 classes matched). Both ranks at zero swap before and after, zero cached tokens in the twelve cold probes, matching operation streams. Replaces the 2026-10-06/07 row, which ran with fixed prefill budgets and kept only its C1 decode rate |
@@ -93,6 +94,22 @@ The shared QSA scorer now reuses key stripes beyond L2 capacity; the indexer's
 underlying quadratic cold-prefill work remains (see the
 [checkpoint and shared-path notes](fp4local_plan.md)).
 
+The Inkling 2 Mini rows use the three templates as shipped at `ceafe571` plus
+the Inkling 2 working tree, checkpoint
+`b85c3cfa615fc413cc9af3379f491b963f3b586a` and server SHA-256
+`067b296ace594be53bec9656efa3e4e97f285c08e51f3a316b3b746677b4b569`.
+The model decodes with its bundled draft model under its native activation
+recipe: a step commits between one and eight tokens, and the schedule
+chooses how many proposals each step verifies. The decode columns of the
+long-context table are therefore a time per step and the tokens per second
+those steps committed. Its template has no thinking switch, so every probe
+ran at the template's default effort. The fabric was otherwise idle, every
+cold probe had zero cached tokens, every rank held zero swap on the binary
+under test, the ranks' operation streams matched at teardown, and production
+was restored after the campaigns. The one-node pool seats 393,216 tokens, so
+its 512K context bucket reads Limit. See the
+[checkpoint and serving notes](model_cards/Inkling-2-Mini.md).
+
 <!-- BEGIN serving -->
 
 | Model / weights | Nodes | Options | C1 decode tok/s | C2 decode tok/s | C4 decode tok/s | C8 decode tok/s | Cold prefill s: ~2K / ~8K / ~32K |
@@ -140,6 +157,9 @@ underlying quadratic cold-prefill work remains (see the
 | Flint FP8/NVFP4 | 1 | 512K BF16 KV, 8 slots | 56.2–58.0 | 99.9–101.2 | 146.2–148.0 | 197.8–204.0 | 0.484 / 1.951 / 12.077 |
 | Flint FP8/NVFP4 | 2 | 512K BF16 KV, 8 slots | 104.3–105.2 | 175.1–177.5 | 253.7–258.0 | 342.5–352.5 | 0.413 / 1.570 / 8.661 |
 | Flint FP8/NVFP4 | 4 | 512K BF16 KV, 8 slots | 154.8–158.9 | 256.2–260.8 | 393.9–399.7 | 524.8–542.9 | 0.358 / 1.297 / 6.468 |
+| Inkling 2 Mini NVFP4/MXFP8 | 1 | native activations, DSpark adaptive 0–7, 384K BF16 KV, 8 slots | 40.2–63.7 | 62.2–93.0 | 87.6–115.1 | 123.0–180.6 | 0.857 / 2.724 / 13.294 |
+| Inkling 2 Mini NVFP4/MXFP8 | 2 | native activations, DSpark adaptive 0–7, 768K BF16 KV, 8 slots | 56.1–104.5 | 96.6–148.5 | 141.5–189.6 | 215.4–305.7 | 0.679 / 2.303 / 10.050 |
+| Inkling 2 Mini NVFP4/MXFP8 | 4 | native activations, DSpark adaptive 0–7, 1.5M BF16 KV, 8 slots | 90.2–151.4 | 148.4–204.4 | 216.1–270.8 | 315.8–434.6 | 0.605 / 2.184 / 9.213 |
 
 <!-- END serving -->
 
@@ -192,6 +212,9 @@ Request wall throughput, the service-level view: total completed output over the
 | Flint FP8/NVFP4 | 1 | 512K BF16 KV, 8 slots | 54.8–56.9 | 97.0–99.1 | 142.7–144.7 | 193.1–199.5 |
 | Flint FP8/NVFP4 | 2 | 512K BF16 KV, 8 slots | 101.2–101.8 | 169.4–171.9 | 247.0–251.2 | 333.5–344.0 |
 | Flint FP8/NVFP4 | 4 | 512K BF16 KV, 8 slots | 149.1–152.6 | 245.9–250.2 | 381.8–387.3 | 511.5–528.4 |
+| Inkling 2 Mini NVFP4/MXFP8 | 1 | native activations, DSpark adaptive 0–7, 384K BF16 KV, 8 slots | 39.3–61.5 | 60.2–87.9 | 83.9–108.6 | 120.0–164.6 |
+| Inkling 2 Mini NVFP4/MXFP8 | 2 | native activations, DSpark adaptive 0–7, 768K BF16 KV, 8 slots | 54.9–99.5 | 93.1–139.7 | 135.6–178.6 | 202.5–278.3 |
+| Inkling 2 Mini NVFP4/MXFP8 | 4 | native activations, DSpark adaptive 0–7, 1.5M BF16 KV, 8 slots | 87.2–143.2 | 141.6–191.0 | 206.7–256.2 | 295.3–399.1 |
 
 <!-- END wall -->
 
@@ -292,6 +315,9 @@ a row exactly.
 | Flint FP8/NVFP4 | 1 | 512K BF16 KV, 8 slots | 8 | 524,288 | bf16 | 3 | adaptive (default) | plain | [JSON](../deploy/cluster_flint_fp8-nvfp4_w1.example.json) |
 | Flint FP8/NVFP4 | 2 | 512K BF16 KV, 8 slots | 8 | 524,288 | bf16 | 3 | adaptive (default) | plain | [JSON](../deploy/cluster_flint_fp8-nvfp4_w2.example.json) |
 | Flint FP8/NVFP4 | 4 | 512K BF16 KV, 8 slots | 8 | 524,288 | bf16 | 3 | adaptive (default) | plain | [JSON](../deploy/cluster_flint_fp8-nvfp4_w4.example.json) |
+| Inkling 2 Mini NVFP4/MXFP8 | 1 | native activations, DSpark adaptive 0–7, 384K BF16 KV, 8 slots | 8 | 393,216 | bf16 | 3 | adaptive (default) | DSpark adaptive 0–7 | [JSON](../deploy/cluster_inkling-2-mini_nvfp4-mxfp8_w1.example.json) |
+| Inkling 2 Mini NVFP4/MXFP8 | 2 | native activations, DSpark adaptive 0–7, 768K BF16 KV, 8 slots | 8 | 786,432 | bf16 | 3 | adaptive (default) | DSpark adaptive 0–7 | [JSON](../deploy/cluster_inkling-2-mini_nvfp4-mxfp8_w2.example.json) |
+| Inkling 2 Mini NVFP4/MXFP8 | 4 | native activations, DSpark adaptive 0–7, 1.5M BF16 KV, 8 slots | 8 | 1,572,864 | bf16 | 3 | adaptive (default) | DSpark adaptive 0–7 | [JSON](../deploy/cluster_inkling-2-mini_nvfp4-mxfp8_w4.example.json) |
 
 <!-- END config -->
 
@@ -320,8 +346,8 @@ a row exactly.
 | Output budget | 256 tokens per request | 256 tokens per request |
 | Repetitions | Three per class and concurrency | One cold request, then two identical requests |
 | Sampling | Greedy, temperature zero | Greedy, temperature zero |
-| Thinking | Disabled where supported; full GLM-5.3 uses its reasoning mode | Server default |
-| Cold-prefill thinking | Disabled where supported; GLM and MiniMax probes use the recorded server default | Server default |
+| Thinking | Disabled where supported; full GLM-5.3 uses its reasoning mode, and Inkling 2 has no switch and runs at its template default | Server default |
+| Cold-prefill thinking | Disabled where supported; GLM, MiniMax and Inkling 2 probes use the recorded server default | Server default |
 | Prefix cache | Enabled; repetitions reuse prompts | Enabled; first request must report zero cached tokens |
 | Concurrency | C1/C2/C4/C8, plus C16 on 16-slot templates; mode comparisons use C1 | C1 |
 | Summary | Range across five class medians | Median across three requests; cold prefill is the first request |
@@ -413,6 +439,9 @@ Engine tokens/s, greedy; median of three repetitions.
 | Flint FP8/NVFP4 | 1 | 512K BF16 KV, 8 slots | 58.0 | 57.5 | 57.2 | 56.2 | 56.6 |
 | Flint FP8/NVFP4 | 2 | 512K BF16 KV, 8 slots | 104.3 | 105.2 | 105.1 | 104.8 | 104.5 |
 | Flint FP8/NVFP4 | 4 | 512K BF16 KV, 8 slots | 155.3 | 156.9 | 154.8 | 158.9 | 158.8 |
+| Inkling 2 Mini NVFP4/MXFP8 | 1 | native activations, DSpark adaptive 0–7, 384K BF16 KV, 8 slots | 40.7 | 63.7 | 45.6 | 58.5 | 40.2 |
+| Inkling 2 Mini NVFP4/MXFP8 | 2 | native activations, DSpark adaptive 0–7, 768K BF16 KV, 8 slots | 56.1 | 104.5 | 69.6 | 100.2 | 71.1 |
+| Inkling 2 Mini NVFP4/MXFP8 | 4 | native activations, DSpark adaptive 0–7, 1.5M BF16 KV, 8 slots | 92.4 | 151.4 | 97.4 | 147.7 | 90.2 |
 
 <!-- END classes -->
 
@@ -508,6 +537,33 @@ The new campaign measures the corrected implementation. The
 [implementation record](minimax_m31_flash_plan.md) preserves the defect and
 its validation history.
 
+### Inkling 2 Mini DSpark
+
+The templates ship the bundled draft model with eight slots and a scheduled
+verify depth of zero to seven proposals. The three modes of a row use the
+same executable, eight-slot configuration and five-class C1 sweep from the
+campaign recorded above. The plain control uses `--no-mtp`. Full-seven uses
+`--no-mtp-schedule`.
+
+| Model / weights | Nodes | Options | Default | Plain | DSpark full 7 | DSpark adaptive |
+| --- | --- | --- | --- | --- | --- | --- |
+| Inkling 2 Mini NVFP4/MXFP8 | 1 | native activations, 384K BF16 KV, 8 slots | DSpark adaptive 0–7 | 35.3–35.4 | 31.0–56.1 | 40.2–63.7 |
+| Inkling 2 Mini NVFP4/MXFP8 | 2 | native activations, 768K BF16 KV, 8 slots | DSpark adaptive 0–7 | 50.5 | 45.4–96.5 | 56.1–104.5 |
+| Inkling 2 Mini NVFP4/MXFP8 | 4 | native activations, 1.5M BF16 KV, 8 slots | DSpark adaptive 0–7 | 65.4–67.5 | 72.5–143.2 | 90.2–151.4 |
+
+Adaptive verification is faster than both controls in every measured C1
+class: 1.14–1.80× the plain rate on one node, 1.11–2.07× on two and
+1.34–2.26× on four. The smallest gains are on prose and chat and the largest
+on code and math. Verifying all seven proposals every step is slower than
+plain decoding on prose and chat at one and two nodes, because every verify
+row reads its own experts. All fifteen replies of each template's boot
+without the draft model match the adaptive sweep exactly: a verify row is
+the plain step at its position. The serving table retains the adaptive
+templates' complete C1–C8 sweeps. This comparison does not establish an
+optimum for every workload or slot count. See
+[the draft model's notes](mtp.md#inkling-2-minis-bundled-draft-model) for
+the schedule and its measured costs.
+
 <!-- END modes -->
 
 ## Quality and correctness
@@ -564,6 +620,9 @@ These are the original campaigns' quality results, retained separately from the 
 | Flint FP8/NVFP4 | 1 | 512K BF16 KV, 8 slots | 137/164 | 255/300 | 94/100 | 73 | 65 (60 pass) |
 | Flint FP8/NVFP4 | 2 | 512K BF16 KV, 8 slots | 133/164 | 257/300 | 96/100 | 77 | 63 (55 pass) |
 | Flint FP8/NVFP4 | 4 | 512K BF16 KV, 8 slots | 137/164 | 255/300 | 100/100 | 72 | 59 (53 pass) |
+| Inkling 2 Mini NVFP4/MXFP8 | 1 | native activations, DSpark adaptive 0–7, 384K BF16 KV, 8 slots | 159/164 | 292/300 | 100/100 | 4 | 2 (2 pass) |
+| Inkling 2 Mini NVFP4/MXFP8 | 2 | native activations, DSpark adaptive 0–7, 768K BF16 KV, 8 slots | 160/164 | 292/300 | 100/100 | 4 | 3 (3 pass) |
+| Inkling 2 Mini NVFP4/MXFP8 | 4 | native activations, DSpark adaptive 0–7, 1.5M BF16 KV, 8 slots | 156/164 | 293/300 | 100/100 | 6 | 4 (4 pass) |
 
 Swift 1.5 received a smaller serving smoke evaluation on 2026-10-17 using
 the two-node configuration above: 19/20 GSM8K problems and 20/20 schema
@@ -598,6 +657,18 @@ sums again. An earlier run of the
 same template counted answers the scorer salvaged from thinking text that
 leaked into content (HumanEval 145, GSM8K 276): that was the model-opened
 `<think>` defect fixed in `b3f9b538`, and those numbers are not tabled.
+
+The Inkling 2 Mini rows ran at the eval's low reasoning effort, which the
+template writes into the prompt as its thinking level. Four to six items a
+row reached a standard cap while the model was still thinking, and 9 of
+those 14 completed at the retry cap, all nine correct. The three rows differ
+by a few items in each direction because the tensor-parallel split reorders
+every projection's sums. The solo and batched greedy texts differ for a
+related reason: a pass that holds several requests' rows takes its sums in
+another order than a request decoding alone, and the native recipe's
+quantizers can turn a last-place difference into another block scale. One
+request's own rows keep the order of a plain step, which is why its text is
+the same with and without the draft model.
 
 The FP4-Local HumanEval result is 162/164 after rechecking all 164 unchanged
 saved answers with the scorer fix in `9b7439b5`. The original scorer reported
@@ -646,6 +717,9 @@ DeepSeek-V4's strict HumanEval scores count responses with unclosed code fences 
 | Flint FP8/NVFP4 | 1 | 512K BF16 KV, 8 slots | 9/9 | — | different |
 | Flint FP8/NVFP4 | 2 | 512K BF16 KV, 8 slots | 9/9 | — | different |
 | Flint FP8/NVFP4 | 4 | 512K BF16 KV, 8 slots | 9/9 | — | different |
+| Inkling 2 Mini NVFP4/MXFP8 | 1 | native activations, DSpark adaptive 0–7, 384K BF16 KV, 8 slots | 9/9 | 5/5 classes | different |
+| Inkling 2 Mini NVFP4/MXFP8 | 2 | native activations, DSpark adaptive 0–7, 768K BF16 KV, 8 slots | 9/9 | 5/5 classes | different |
+| Inkling 2 Mini NVFP4/MXFP8 | 4 | native activations, DSpark adaptive 0–7, 1.5M BF16 KV, 8 slots | 9/9 | 5/5 classes | different |
 
 | Check | What it establishes |
 |---|---|
@@ -759,6 +833,9 @@ The original matrix refresh fixed the three bottlenecks below. The completion ca
 | Flint FP8/NVFP4 | 1 | 512K BF16 KV, 8 slots | 262,144 | 11.720 | 17.37 | 57.6 | 21.03 | 47.5 | 25.23 | 39.6 | 34.03 | 29.4 | 51.46 | 19.4 | Limit | Limit |
 | Flint FP8/NVFP4 | 2 | 512K BF16 KV, 8 slots | 262,144 | 8.510 | 9.58 | 104.4 | 11.93 | 83.8 | 14.16 | 70.6 | 18.38 | 54.4 | 26.79 | 37.3 | Limit | Limit |
 | Flint FP8/NVFP4 | 4 | 512K BF16 KV, 8 slots | 262,144 | 6.308 | 6.48 | 154.4 | 7.87 | 127.1 | 9.06 | 110.3 | 11.17 | 89.5 | 15.40 | 64.9 | Limit | Limit |
+| Inkling 2 Mini NVFP4/MXFP8 | 1 | native activations, DSpark adaptive 0–7, 384K BF16 KV, 8 slots | 393,216 | 12.100 | 50.89 | 64.2 | 77.50 | 70.0 | 91.00 | 59.6 | 116.71 | 35.2 | 163.65 | 19.0 | Limit | Limit |
+| Inkling 2 Mini NVFP4/MXFP8 | 2 | native activations, DSpark adaptive 0–7, 768K BF16 KV, 8 slots | — | 9.708 | 32.04 | 81.3 | 48.94 | 115.8 | 56.28 | 96.5 | 68.27 | 58.2 | 104.05 | 33.5 | 167.29 | 19.8 |
+| Inkling 2 Mini NVFP4/MXFP8 | 4 | native activations, DSpark adaptive 0–7, 1.5M BF16 KV, 8 slots | — | 8.890 | 22.32 | 115.7 | 32.79 | 178.7 | 35.53 | 135.4 | 45.46 | 107.3 | 62.60 | 48.7 | 106.30 | 31.2 |
 
 <!-- END context -->
 
@@ -810,6 +887,9 @@ Engine prefill seconds at each context bucket, one uncached sample per cell:
 | Flint FP8/NVFP4 | 1 | 512K BF16 KV, 8 slots | 0.128 | 11.720 | 36.445 | 133.208 | 503.100 | Limit |
 | Flint FP8/NVFP4 | 2 | 512K BF16 KV, 8 slots | 0.088 | 8.510 | 24.437 | 78.201 | 276.200 | Limit |
 | Flint FP8/NVFP4 | 4 | 512K BF16 KV, 8 slots | 0.064 | 6.308 | 16.485 | 47.691 | 153.814 | Limit |
+| Inkling 2 Mini NVFP4/MXFP8 | 1 | native activations, DSpark adaptive 0–7, 384K BF16 KV, 8 slots | 0.171 | 12.100 | 30.333 | 82.781 | 271.548 | Limit |
+| Inkling 2 Mini NVFP4/MXFP8 | 2 | native activations, DSpark adaptive 0–7, 768K BF16 KV, 8 slots | 0.087 | 9.708 | 22.298 | 55.482 | 162.274 | 577.815 |
+| Inkling 2 Mini NVFP4/MXFP8 | 4 | native activations, DSpark adaptive 0–7, 1.5M BF16 KV, 8 slots | 0.070 | 8.890 | 19.512 | 45.273 | 114.955 | 359.224 |
 
 <!-- END context-prefill -->
 

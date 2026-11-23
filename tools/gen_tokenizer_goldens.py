@@ -284,6 +284,42 @@ FLINT_CASES = [c for c in CASES if c != EOS and EOS not in c] + [
 ]
 
 
+# The Inkling 2 corpus: one Split of the o200k case-class pattern (upper
+# runs before lower runs with the contraction suffix, number runs of at most
+# three, a punctuation tail that takes line ends and "/") under Isolated,
+# and the model's own added tokens: the message headers, the content kinds
+# and the end markers its chat template writes.
+INK = lambda name: "<|" + name + "|>"  # noqa: E731
+INKLING_CASES = [c for c in CASES if c != EOS and EOS not in c] + [
+    INK("message_user"), INK("message_model"), INK("message_system"), INK("message_tool"),
+    INK("content_text"), INK("content_thinking"), INK("content_image"), INK("content_xml"),
+    INK("content_invoke_tool_json"), INK("end_message"), INK("content_model_end_sampling"),
+    INK("endoftext"), INK("begin_of_text"), INK("unused_200054"),
+    INK("message_system") + INK("content_text") + "Thinking effort level: 0.9" + INK("end_message"),
+    INK("message_user") + INK("content_text") + "What is 2 + 2?" + INK("end_message"),
+    INK("message_model") + INK("content_thinking") + "Simple sum." + INK("end_message") +
+    INK("message_model") + INK("content_text") + "4" + INK("end_message") + INK("content_model_end_sampling"),
+    INK("message_model") + "get_weather" + INK("content_invoke_tool_json") +
+    '{"name":"get_weather","args":{"city":"Paris"}}' + INK("end_message"),
+    INK("message_tool") + "get_weather" + INK("content_text") + '{"temp": 21}' + INK("end_message"),
+    INK("message_system") + "tool_declare" + INK("content_xml") + '[{"description":"","name":"f","parameters":{},"type":"function"}]' +
+    INK("end_message"),
+    INK("message_user") + INK("content_image") + INK("unused_200054") + INK("end_message"),
+    # The case classes and their seams.
+    "HELLO World hello WORLD's ISN'T MacDonald's", "ABCdef abcDEF AbCdEf", "ǅungla ǈubav",
+    "ﬁne ﬂow", "x\u02b0y ʰ ʳ", "สวัสดี ครับ", "مرحباً بكم", "a\u0301b\u0302c", "\u0301abc", "x\u20dd y",
+    "ÀÉÎÕÜ àéîõü Ñandú", "Straße STRASSE", "中文English混合Text日本語テキスト", "abc123def 12345678 x9y",
+    "I'M 'LL 'rE 'VE we'D", "ΑΒΓ αβγ Αβγ", "ПРИВЕТ Привет привет",
+    "\u0e17ABC", "A\u0e17B", "ABC\u0e17", "\u0e17\u0e17AB\u0e17", "\u0301ABC", "\u0301\u0302x", "\u0301!",
+    "ISN'T aBc ÀBc ǅx xǅ ǅ", " ÀB", " \u0e17A", "x\u0e17y", "ABC'S abc's",
+    "a.b,c;d:e", "x->y => z", "(a) [b] {c}", "#tag @user $5 50%",
+    # Number runs of one to three, and the punctuation tail's line ends and slashes.
+    "1 12 123 1234 12345 123456 1234567", "3.14159 1,000,000 0x1F 1e-9", "v1.2.3-rc4",
+    "a/b/c //x ///", "path/to/file.txt\nnext", "end.\n\nNext", "!!!\r\n???", "http://example.com/a/b?c=d&e=f",
+    "x =\n  y +\n    z;\n", "tabs\t\there", "   leading and trailing   ", "\n\n\n",
+]
+
+
 def main():
     import argparse
     ap = argparse.ArgumentParser()
@@ -295,12 +331,14 @@ def main():
     model = args.model
     is_mimo = "MiMo" in model
     is_flint = "flint" in model.lower()
+    is_inkling = "inkling" in model.lower()
     is_qwen = "Qwen" in model or is_mimo  # NFC tokenizers
     is_dsv4 = "DeepSeek-V4-" in model  # DeepSeek-V4-Flash-0731 (model_type deepseek_v4), not V4.1
     is_dsv41 = "DeepSeek-V4" in model and not is_dsv4
-    cases = (FLINT_CASES if is_flint else DSV4_CASES if is_dsv4 else DSV41_CASES if is_dsv41 else MIMO_CASES if is_mimo
+    cases = (INKLING_CASES if is_inkling else FLINT_CASES if is_flint else DSV4_CASES if is_dsv4 else DSV41_CASES if is_dsv41 else MIMO_CASES if is_mimo
              else QWEN_CASES if is_qwen else CASES)
     out_path = args.out_opt or args.out or (
+        "tests/data/inkling2_tokenizer_goldens.jsonl" if is_inkling else
         "tests/data/flint_tokenizer_goldens.jsonl" if is_flint else
         "tests/data/dsv4_tokenizer_goldens.jsonl" if is_dsv4 else
         "tests/data/dsv41_tokenizer_goldens.jsonl" if is_dsv41 else

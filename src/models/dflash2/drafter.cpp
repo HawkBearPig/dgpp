@@ -16,6 +16,7 @@
 #include "common/cuda_check.hpp"
 #include "common/dtypes.hpp"
 #include "engine/decode_outputs.hpp"
+#include "kernels/add_rmsnorm.hpp"
 #include "kernels/dflash2.hpp"
 #include "kernels/dsv41_dspark.hpp"
 #include "kernels/gemm.hpp"
@@ -47,6 +48,13 @@ void validate_host(const DFlash2Config& cfg, const DFlash2Host& h) {
         "DFlash2: the drafter's heads / kv heads / MLP rows must divide across the world");
   if (h.world > 1 && (!h.boundary || h.boundary() == nullptr))
     throw std::invalid_argument("DFlash2: a TP world needs the host's current boundary reducer");
+  if (cfg.backbone == DFlash2Config::Backbone::Inkling2) {
+    if (!h.store_step_feature || !h.load_step_feature)
+      throw std::invalid_argument("DFlash2: the Inkling 2 draft needs the host's per-position feature store");
+    if (cfg.target_layer_ids.empty() || static_cast<int>(cfg.target_layer_ids.size()) > kInk2DraftMaxTaps ||
+        cfg.selector_rank > kInk2DraftMaxRank || cfg.head_dim != 128 || cfg.conv_taps != 0)
+      throw std::invalid_argument("DFlash2: the Inkling 2 draft's taps, rank or head width are past the kernels'");
+  }
 }
 }  // namespace
 
@@ -119,8 +127,24 @@ void DFlash2Drafter::init(const DFlash2Host& h, const DFlash2Config& cfg, DFlash
     DGPP_CUDA_OK(cudaMalloc(&df_native_codes_, elements));
     DGPP_CUDA_OK(cudaMalloc(&df_native_scales_, elements / 32));
   }
-  DGPP_CUDA_OK(cudaMalloc(&df_acc_, MT * H * 4));
-  DGPP_CUDA_OK(cudaMalloc(&df_t32_, MT * H * 4));
+  const bool ink = cfg_.backbone == DFlash2Config::Backbone::Inkling2;
+  if (ink) {
+    // The tapped states themselves: each draft layer mixes them on its own.
+    DGPP_CUDA_OK(cudaMalloc(&df_taps_, cfg_.target_layer_ids.size() * MT * H * 2));
+    DGPP_CUDA_OK(cudaMalloc(&df_frnn_, static_cast<size_t>(df_batch_) * H * 2));
+    DGPP_CUDA_OK(cudaMalloc(&df_ctx_, static_cast<size_t>(BD) * 3 * cfg_.selector_rank * 4));
+    DGPP_CUDA_OK(cudaMalloc(&df_state_, static_cast<size_t>(df_batch_) * cfg_.selector_rank * 2));
+    DGPP_CUDA_OK(cudaMalloc(&df_latent_, static_cast<size_t>(df_batch_) * cfg_.selector_rank * 2));
+    DGPP_CUDA_OK(cudaMalloc(&df_raw_, static_cast<size_t>(df_batch_) * 3 * cfg_.selector_rank * 4));
+    DGPP_CUDA_OK(cudaMalloc(&df_stop_, 16));
+    DGPP_CUDA_OK(cudaMemset(df_stop_, 0, 16));
+    DGPP_CUDA_OK(cudaMalloc(&df_surv_, static_cast<size_t>(std::max(df_batch_, 32)) * 4));
+    DGPP_CUDA_OK(cudaMallocHost(&df_floor_h_, static_cast<size_t>(h.max_requests + 1) * 4));
+    std::fill(df_floor_h_, df_floor_h_ + h.max_requests + 1, 0.0f);
+  } else {
+    DGPP_CUDA_OK(cudaMalloc(&df_acc_, MT * H * 4));
+    DGPP_CUDA_OK(cudaMalloc(&df_t32_, MT * H * 4));
+  }
   DGPP_CUDA_OK(cudaMalloc(&df_norm_, static_cast<size_t>(CR) * H * 2));
   DGPP_CUDA_OK(cudaMalloc(&df_kv_, static_cast<size_t>(CR) * 2 * df_kvr_ * 2));
   DGPP_CUDA_OK(cudaMalloc(&df_resid_, static_cast<size_t>(BR) * H * 2));
@@ -147,7 +171,7 @@ void DFlash2Drafter::init(const DFlash2Host& h, const DFlash2Config& cfg, DFlash
   df_topk_ws_bytes_ = dflash2_topk_ws_bytes(h.vocab_count, BR, cfg_.selector_top_k);
   DGPP_CUDA_OK(cudaMalloc(&df_topk_ws_, df_topk_ws_bytes_));
   DGPP_CUDA_OK(cudaMalloc(&df_hidden32_, static_cast<size_t>(BR) * cfg_.selector_rank * 4));
-  if (cfg_.backbone == DFlash2Config::Backbone::MiniMaxM3) {
+  if (cfg_.backbone == DFlash2Config::Backbone::MiniMaxM3 || ink) {
     DGPP_CUDA_OK(
         cudaMalloc(&df_markov_logits_, static_cast<size_t>(df_batch_) * h.vocab_count * 4));
     DGPP_CUDA_OK(
@@ -182,6 +206,24 @@ void DFlash2Drafter::free() {
   cudaFree(df_native_scales_);
   df_native_codes_ = nullptr;
   df_native_scales_ = nullptr;
+  cudaFree(df_taps_);
+  cudaFree(df_frnn_);
+  cudaFree(df_ctx_);
+  cudaFree(df_state_);
+  cudaFree(df_latent_);
+  cudaFree(df_raw_);
+  cudaFree(df_stop_);
+  cudaFree(df_surv_);
+  cudaFreeHost(df_floor_h_);
+  df_raw_ = nullptr;
+  df_stop_ = nullptr;
+  df_surv_ = nullptr;
+  df_floor_h_ = nullptr;
+  df_taps_ = nullptr;
+  df_frnn_ = nullptr;
+  df_ctx_ = nullptr;
+  df_state_ = nullptr;
+  df_latent_ = nullptr;
   cudaFree(df_inv_freq_);
   cudaFree(df_acc_);
   cudaFree(df_t32_);
@@ -270,6 +312,12 @@ int DFlash2Drafter::tap(int layer) const {
   return tap_[layer];
 }
 
+uint16_t* DFlash2Drafter::tap_rows(int tap) const {
+  if (df_taps_ == nullptr || tap < 0 || tap >= static_cast<int>(cfg_.target_layer_ids.size()))
+    throw std::out_of_range("DFlash2Drafter: tap rows");
+  return df_taps_ + static_cast<size_t>(tap) * static_cast<size_t>(h_.max_tokens) * static_cast<size_t>(h_.hidden);
+}
+
 const int32_t* DFlash2Drafter::drafts_host(int req) const {
   return df_mirror_h_ + static_cast<size_t>(req) * static_cast<size_t>(cfg_.drafts());
 }
@@ -311,9 +359,12 @@ void DFlash2Drafter::plan_entries(const DFlash2Config& cfg, int world, int decod
                      "rest bf16)"
                    : "dflash2 drafter weights (this rank's slices)",
        native_weight_bytes ? native_weight_bytes : dflash2_weights_bytes(cfg, world, weights_fp8)});
-  // acc + tap F32, norm/kv scratch, rope table.
-  out->push_back({"dflash2 feature path", 2 * M * H * 4 + CR * H * 2 + CR * 2 * KV * 2 +
-                                              static_cast<size_t>(cfg.head_dim) / 2 * 4});
+  // acc + tap F32 (Inkling 2: the tapped states themselves), norm/kv
+  // scratch, rope table.
+  const bool ink = cfg.backbone == DFlash2Config::Backbone::Inkling2;
+  out->push_back({"dflash2 feature path",
+                  (ink ? cfg.target_layer_ids.size() * M * H * 2 : 2 * M * H * 4) + CR * H * 2 + CR * 2 * KV * 2 +
+                      static_cast<size_t>(cfg.head_dim) / 2 * 4});
   // resid, x, xc, o, h; mlp, gate, up; qkv; q, attn; the conv deltas; the
   // block's positions and tokens; the zero requests; the split-key partials.
   out->push_back({"dflash2 block scratch",
@@ -327,6 +378,10 @@ void DFlash2Drafter::plan_entries(const DFlash2Config& cfg, int world, int decod
                   dflash2_topk_ws_bytes(V, BR, K) + BR * (RANK * 4 + 2 * K * 4) + BD * 4});
   if (cfg.backbone == DFlash2Config::Backbone::MiniMaxM3)
     out->push_back({"MiniMax full-vocabulary Markov step", BW * (V * 4 + K * 8 + 8)});
+  if (ink)
+    out->push_back({"Inkling 2 recurrent head (a step's logits, the context terms, the states)",
+                    BW * (V * 4 + K * 8 + 8) + BW * H * 2 + BD * 3 * RANK * 4 + 2 * BW * RANK * 2 +
+                        BW * 3 * RANK * 4});
   // The pinned readbacks and staging (the recorded drafts' mirrors, the
   // walked candidates) and the fold table at world > 1.
   out->push_back({"dflash2 pinned staging",
@@ -341,6 +396,10 @@ void DFlash2Drafter::plan_entries(const DFlash2Config& cfg, int world, int decod
 // ---- the feature path ----------------------------------------------------------
 
 void DFlash2Drafter::store_features(int T, const int32_t* d_req, const int64_t* d_pos) {
+  if (cfg_.backbone == DFlash2Config::Backbone::Inkling2) {
+    inkling2_store_features(T, d_req, d_pos);
+    return;
+  }
   const int H = h_.hidden;
   const int L = cfg_.num_hidden_layers, KV = df_kvr_;
   const int KVH = df_kvh_, HD = cfg_.head_dim;
@@ -387,11 +446,131 @@ void DFlash2Drafter::store_features(int T, const int32_t* d_req, const int64_t* 
   }
 }
 
+// Inkling 2: every draft layer mixes the run's tapped states with its own
+// row of weights, normalizes the mix and projects it to that layer's context
+// keys and values. One more mix is the recurrent head's feature, which the
+// host keeps per position.
+void DFlash2Drafter::inkling2_store_features(int T, const int32_t* d_req, const int64_t* d_pos) {
+  const int H = h_.hidden, L = cfg_.num_hidden_layers, KV = df_kvr_, KVH = df_kvh_, HD = cfg_.head_dim;
+  const int taps = static_cast<int>(cfg_.target_layer_ids.size());
+  const size_t MT = static_cast<size_t>(h_.max_tokens);
+  for (int off = 0; off < T; off += rows_cap()) {
+    const int rows = std::min(rows_cap(), T - off);
+    Ink2DraftMixArgs mix;
+    for (int t = 0; t < taps; ++t) mix.tap[t] = df_taps_ + (static_cast<size_t>(t) * MT + off) * H;
+    mix.taps = taps;
+    mix.out = df_norm_;
+    mix.rows = rows;
+    mix.hidden = H;
+    mix.eps = cfg_.rms_norm_eps;
+    for (int l = 0; l < L; ++l) {
+      const auto& w = w_.layers[l];
+      mix.alpha = w_.ink.fuse_alpha + static_cast<size_t>(l) * taps;
+      mix.w = w.dflare_norm;
+      ink2_draft_mix_norm(mix, h_.stream);
+      h_.gemm->matmul(df_norm_, w.kv_ctx, df_kv_, rows, 2 * KV, H, DType::BF16, GemmOut::BF16,
+                      static_cast<size_t>(H), h_.gemm_ws, h_.gemm_ws_bytes, h_.stream);
+      ink2_draft_norm_rope(df_kv_, 2 * KV, w.k_norm_ctx, d_pos + off, df_inv_freq_, df_kv_, 2 * KV, rows, KVH,
+                           cfg_.rms_norm_eps, h_.stream);
+      const auto plane = h_.plane(l);
+      qsa_kv_append(df_kv_, 2 * KV, df_kv_ + KV, 2 * KV, d_req + off, d_pos + off, rows, h_.device_tables,
+                    h_.total_blocks, h_.block_tokens, KVH, HD, plane.k, plane.v, nullptr, nullptr, h_.stream);
+    }
+    mix.alpha = w_.ink.fuse_alpha + static_cast<size_t>(L) * taps;
+    mix.w = w_.ink.feature_norm;
+    ink2_draft_mix_norm(mix, h_.stream);
+    h_.store_step_feature(df_norm_, rows, d_req + off, d_pos + off);
+  }
+}
+
 // ---- the block forward ----------------------------------------------------------
+
+// The stacked blocks' input rows. Inkling 2 has no mask token: the anchor
+// row is the target's normed embedding and every other row a learned row.
+void DFlash2Drafter::embed_block(int rows) {
+  const int H = h_.hidden;
+  if (cfg_.backbone != DFlash2Config::Backbone::Inkling2) {
+    embed_gather_bf16(h_.embed, df_tokens_, df_resid_, rows, H, h_.stream);
+    return;
+  }
+  embed_gather_bf16(h_.embed, df_tokens_, df_xc_, rows, H, h_.stream);
+  add_rmsnorm_bf16_one(df_xc_, nullptr, w_.ink.embed_norm, df_resid_, rows, H, cfg_.rms_norm_eps, h_.stream);
+  ink2_draft_mask_rows(w_.ink.mask_embed, df_resid_, rows, cfg_.query_rows(), H, h_.stream);
+}
+
+// Inkling 2's layers: pre-norm, each residual add fused with the norm that
+// follows it (the norm reads the sum before it is rounded), per-head norms
+// on q and k ahead of the rotation, and a window that ends at the block's
+// last row.
+void DFlash2Drafter::inkling2_block_layers(int slots, const int* reqs, bool capture) {
+  const int H = h_.hidden, QR = cfg_.query_rows(), R = slots * QR;
+  const int L = cfg_.num_hidden_layers, QW = df_qw_, KV = df_kvr_, I = df_i_;
+  const int KVH = df_kvh_, HD = cfg_.head_dim, NH = df_nh_;
+  const float eps = cfg_.rms_norm_eps;
+  const size_t S = static_cast<size_t>(QW) + 2 * KV;
+  const float scale = 1.0f / std::sqrt(static_cast<float>(HD));
+  BoundaryReducer* boundary = h_.boundary ? h_.boundary() : nullptr;
+  const auto stage = [&]() -> uint16_t* {
+    uint16_t* s = boundary ? boundary->stage(R, H) : nullptr;
+    if (boundary && s == nullptr && capture)
+      throw std::runtime_error("inkling2 draft: a capture fold does not fit the recorder's staged buffer");
+    return s ? s : df_o_;
+  };
+  const auto fold = [&](uint16_t* buf) {
+    if (!boundary) return;
+    if (!capture) DGPP_CUDA_OK(cudaStreamSynchronize(h_.stream));  // the host-driven fold's contract
+    boundary->reduce(buf, R, H);
+  };
+  const auto gemm = [&](const uint16_t* x, const uint16_t* w, uint16_t* y, int n, int k) {
+    h_.gemm->matmul(x, w, y, R, n, k, DType::BF16, GemmOut::BF16, static_cast<size_t>(k), h_.gemm_ws,
+                    h_.gemm_ws_bytes, h_.stream);
+  };
+  const uint16_t* pending = nullptr;
+  for (int l = 0; l < L; ++l) {
+    const DFlash2LayerWeights& w = w_.layers[l];
+    if (pending)
+      ink2_draft_add_norm(df_resid_, pending, w.input_norm, df_x_, R, H, eps, h_.stream);
+    else
+      add_rmsnorm_bf16_one(df_resid_, nullptr, w.input_norm, df_x_, R, H, eps, h_.stream);
+    gemm(df_x_, w.qkv, df_qkv_, static_cast<int>(S), H);
+    ink2_draft_norm_rope(df_qkv_, static_cast<int64_t>(S), w.q_norm, df_pos_, df_inv_freq_, df_q_, QW, R, NH, eps,
+                         h_.stream);
+    ink2_draft_norm_rope(df_qkv_ + QW, static_cast<int64_t>(S), w.k_norm, df_pos_, df_inv_freq_, df_qkv_ + QW,
+                         static_cast<int64_t>(S), R, KVH, eps, h_.stream);
+    const auto plane = h_.plane(l);
+    for (int k = 0; k < slots; ++k) {
+      const size_t ro = static_cast<size_t>(k) * QR;
+      const int32_t* table = h_.device_tables + static_cast<size_t>(reqs[k]) * h_.total_blocks;
+      const uint16_t* krow = df_qkv_ + ro * S + QW;
+      qsa_kv_append(krow, S, krow + KV, S, df_zero_, df_pos_ + ro, QR, table, 1, h_.block_tokens, KVH, HD,
+                    plane.k, plane.v, nullptr, nullptr, h_.stream);
+      dflash2_block_attn_split(df_q_ + ro * QW, QW, plane.k, plane.v, table, h_.block_tokens, h_.total_blocks, QR,
+                               cfg_.layer_window(l), df_pos_ + ro, QR, NH, KVH, HD, scale,
+                               df_attn_part_ + ro * static_cast<size_t>(NH) * dflash2_block_attn_splits() * 130,
+                               df_attn_ + ro * QW, h_.stream, /*fp32_p=*/false, /*block_window=*/true);
+    }
+    uint16_t* ao = stage();
+    gemm(df_attn_, w.o, ao, H, QW);
+    fold(ao);
+    ink2_draft_add_norm(df_resid_, ao, w.post_norm, df_x_, R, H, eps, h_.stream);
+    gemm(df_x_, w.gate, df_gate_, I, H);
+    gemm(df_x_, w.up, df_up_, I, H);
+    swiglu_limit_bf16(df_gate_, df_up_, df_mlp_, static_cast<int64_t>(R) * I, INFINITY, h_.stream);
+    uint16_t* mo = stage();
+    gemm(df_mlp_, w.down, mo, H, I);
+    fold(mo);
+    pending = mo;
+  }
+  ink2_draft_add_norm(df_resid_, pending, w_.norm, df_h_, R, H, eps, h_.stream);
+}
 
 void DFlash2Drafter::block_layers(int slots, const int* reqs, bool capture) {
   if (cfg_.backbone == DFlash2Config::Backbone::MiniMaxM3) {
     minimax_block_layers(slots, reqs, capture);
+    return;
+  }
+  if (cfg_.backbone == DFlash2Config::Backbone::Inkling2) {
+    inkling2_block_layers(slots, reqs, capture);
     return;
   }
   const int H = h_.hidden;
@@ -613,6 +792,10 @@ void DFlash2Drafter::block_select(int slots, const int* reqs, bool capture) {
     minimax_select(slots, reqs, capture);
     return;
   }
+  if (cfg_.backbone == DFlash2Config::Backbone::Inkling2) {
+    inkling2_select(slots, reqs, capture);
+    return;
+  }
   dflash2_topk_f32(df_logits_, df_ids_, df_sc_, V, R, topk, h_.stream, df_topk_ws_, df_topk_ws_bytes_);
   gather_candidates(R, df_ids_, df_sc_, capture);
   h_.gemm->matmul(df_h_, w_.hidden_projection, df_hidden32_, R, rank, H, DType::BF16, GemmOut::F32,
@@ -688,11 +871,70 @@ void DFlash2Drafter::minimax_select(int slots, const int* reqs, bool capture) {
   }
 }
 
+// Inkling 2's recurrent head: the mask rows' base logits are corrected one
+// proposal after another. A step's state comes from the previous proposal
+// and from terms fixed for the block (its hidden rows and the feature of
+// the last committed position), and its latent biases the whole vocabulary
+// through the folded head. The corrected top-K meets across the ranks once
+// per step, as MiniMax's does, so every rank takes the same predecessor.
+void DFlash2Drafter::inkling2_select(int slots, const int* reqs, bool capture) {
+  if (reqs == nullptr) throw std::invalid_argument("inkling2 draft: the select needs its slots' requests");
+  const int H = h_.hidden, QR = cfg_.query_rows(), D = cfg_.drafts();
+  const int offset = cfg_.proposal_row_offset();
+  const int K = cfg_.selector_top_k, rank = cfg_.selector_rank;
+  const int64_t V = h_.vocab_count;
+  const bool sampled = capture && df_specs_ != nullptr;
+  const DFlash2Inkling2Weights& ink = w_.ink;
+  for (int k = 0; k < slots; ++k)
+    h_.load_step_feature(reqs[k], df_pos_ + static_cast<size_t>(k) * QR, df_frnn_ + static_cast<size_t>(k) * H);
+  ink2_draft_markov_context(df_h_, QR, offset, df_frnn_, ink.rnn_w, ink.rnn_bias, df_ctx_, slots, D, H, rank,
+                            h_.stream);
+  // The head stops once no later proposal can be verified: the pass's floor
+  // (the first slot's cell, written by the engine before the pass) against
+  // the slots' mean survival. A stopped step launches and returns at once.
+  ink2_draft_stop_reset(df_stop_, df_surv_, slots, h_.stream);
+  // An eager draft (a slot's first block, a host re-draft) is verified
+  // whole, so it reads the cell past the requests', zero in serving.
+  const float* floor = df_floor_h_ + (capture ? reqs[0] : h_.max_requests);
+  const bool gated = slots <= 16 && mma_gemv_shape_ok(ink.fold_w, df_latent_, static_cast<size_t>(rank), slots, rank);
+  for (int step = 0; step < D; ++step) {
+    ink2_draft_markov_step(df_ctx_, D, step, ink.rnn_w, H, ink.markov_w1, step == 0 ? df_tokens_ : df_markov_prev_,
+                           step == 0 ? QR : 1, df_state_, df_latent_, df_raw_, df_stop_, slots, rank, h_.stream);
+    // The latent through the folded head: one read of the folded matrix
+    // for every slot, then the released add and cap in place.
+    if (gated)
+      launch_mma_gemv_bf16_f32_gated(df_latent_, static_cast<size_t>(rank), ink.fold_w, df_markov_logits_, slots,
+                                     static_cast<int>(V), rank, static_cast<size_t>(V), df_stop_, h_.stream);
+    else
+      h_.gemm->matmul(df_latent_, ink.fold_w, df_markov_logits_, slots, static_cast<int>(V), rank, DType::BF16,
+                      GemmOut::F32, static_cast<size_t>(rank), h_.gemm_ws, h_.gemm_ws_bytes, h_.stream);
+    ink2_draft_markov_logits(df_logits_ + static_cast<size_t>(offset + step) * V, static_cast<int64_t>(QR) * V, V,
+                             ink.fold_b, cfg_.logit_softcap, df_markov_logits_, df_stop_, slots, h_.stream);
+    dflash2_topk_f32(df_markov_logits_, df_markov_ids_, df_markov_scores_, V, slots, K, h_.stream, df_topk_ws_,
+                     df_topk_ws_bytes_, df_stop_);
+    gather_candidates(slots, df_markov_ids_, df_markov_scores_, capture);
+    for (int k = 0; k < slots; ++k) {
+      const size_t ro = static_cast<size_t>(k) * QR;
+      const size_t po = sampled ? static_cast<size_t>(reqs[k]) * df_props_stride_ + step : 0;
+      dflash2_sample_candidates(
+          df_markov_ids_ + k * K, df_markov_scores_ + k * K, K, step, df_tok_ + k * D + step, df_markov_prev_ + k,
+          df_ids_ + (ro + step + offset) * K, h_.stream, sampled ? df_pos_ + ro + step + offset : nullptr,
+          sampled ? df_specs_ + reqs[k] : nullptr, sampled ? df_props_ + po : nullptr,
+          sampled && df_props_h_ != nullptr ? df_props_h_ + po : nullptr, 1 - offset);
+      // The draft has no confidence head: a proposal's own mass among the
+      // step's candidates is its acceptance estimate.
+      ink2_draft_confidence(df_markov_scores_ + k * K, df_markov_ids_ + k * K, df_tok_ + k * D + step, K,
+                            conf_fit_, df_conf_ + static_cast<size_t>(reqs[k]) * D + step, df_stop_, df_surv_ + k,
+                            sampled ? df_specs_ + reqs[k] : nullptr, h_.stream);
+    }
+    if (step + 1 < D) ink2_draft_stop(df_surv_, slots, floor, df_stop_, h_.stream);
+  }
+}
+
 // ---- the eager (re)drafts ---------------------------------------------------------
 
 bool DFlash2Drafter::draft(int req, int64_t bonus, std::vector<int32_t>* drafts) {
   if (!on_) throw std::logic_error("dflash2_draft: no drafter loaded");
-  const int H = h_.hidden;
   const int QR = cfg_.query_rows(), D = cfg_.drafts();
   const int64_t pos = h_.session_position(req);
   if (pos < 0 || pos + D + 1 > h_.max_context) return false;
@@ -707,7 +949,7 @@ bool DFlash2Drafter::draft(int req, int64_t bonus, std::vector<int32_t>* drafts)
   }
   DGPP_CUDA_OK(cudaMemcpyAsync(df_pos_, df_io64_h_, QR * 8, cudaMemcpyHostToDevice, h_.stream));
   DGPP_CUDA_OK(cudaMemcpyAsync(df_tokens_, df_io64_h_ + QR, QR * 8, cudaMemcpyHostToDevice, h_.stream));
-  embed_gather_bf16(h_.embed, df_tokens_, df_resid_, QR, H, h_.stream);
+  embed_block(QR);
   h_.gemm_rows(QR, true);
   const int reqs[1] = {req};
   block_layers(1, reqs, /*capture=*/false);
@@ -736,7 +978,6 @@ void DFlash2Drafter::draft_batch(const std::vector<int>& reqs, const std::vector
   const int S = static_cast<int>(reqs.size());
   if (S > df_batch_)
     throw std::invalid_argument("dflash2_draft_batch: batch exceeds the stacked scratch");
-  const int H = h_.hidden;
   const int QR = cfg_.query_rows(), D = cfg_.drafts();
   drafts->assign(static_cast<size_t>(S), {});
   // Admission first (no shared state touched): positions and block growth
@@ -770,7 +1011,7 @@ void DFlash2Drafter::draft_batch(const std::vector<int>& reqs, const std::vector
                                h_.stream));
   DGPP_CUDA_OK(cudaMemcpyAsync(df_tokens_, df_io64_h_ + static_cast<size_t>(df_batch_) * QR,
                                static_cast<size_t>(R) * 8, cudaMemcpyHostToDevice, h_.stream));
-  embed_gather_bf16(h_.embed, df_tokens_, df_resid_, R, H, h_.stream);
+  embed_block(R);
   h_.gemm_rows(R, true);
   block_layers(NS, creqs.data(), /*capture=*/false);
   block_select(NS, creqs.data(), /*capture=*/false);
@@ -791,7 +1032,6 @@ void DFlash2Drafter::capture_block_draft(int req, const PickVerdict* verdict, co
   if (verdict == nullptr) throw std::invalid_argument("session_graph_capture_block_draft: null verdict");
   if (!cap.graph_device_positions || !cap.graph_device_tokens)
     throw std::logic_error("session_graph_capture_block_draft: the step must be captured with device positions and tokens");
-  const int H = h_.hidden;
   const int QR = cfg_.query_rows(), D = cfg_.drafts();
   if ((cap.graph_feed_rows > 0 ? cap.graph_feed_rows : cap.decode_rows) != D + 1)
     throw std::logic_error("session_graph_capture_block_draft: the token feed is [next, drafts] (T = query rows)");
@@ -800,7 +1040,7 @@ void DFlash2Drafter::capture_block_draft(int req, const PickVerdict* verdict, co
   // follow (positions past the context -1: no state write).
   dflash2_stage_block(verdict, h_.session_pos + req, cfg_.mask_token_id, QR, h_.max_context, df_pos_,
                       df_tokens_, h_.stream);
-  embed_gather_bf16(h_.embed, df_tokens_, df_resid_, QR, H, h_.stream);
+  embed_block(QR);
   h_.gemm_rows(QR, true);
   const int reqs[1] = {req};
   block_layers(1, reqs, /*capture=*/true);
@@ -824,7 +1064,6 @@ void DFlash2Drafter::capture_block_draft_batch(const PickVerdict* verdicts, int 
     throw std::logic_error("session_graph_capture_block_draft_batch: requires the device-driven fixed batch of these slots");
   if (cap.graph_batch_map_source != nullptr)
     throw std::logic_error("session_graph_capture_block_draft_batch: the block draft takes slot q as request q (no compaction)");
-  const int H = h_.hidden;
   const int QR = cfg_.query_rows(), D = cfg_.drafts();
   // The persistent feed is the whole block per slot ([next, drafts] at
   // query rows); a reduced-row verify (engine.dflash_batch_rows) reads it
@@ -835,7 +1074,7 @@ void DFlash2Drafter::capture_block_draft_batch(const PickVerdict* verdicts, int 
   const int R = requests * QR;
   dflash2_stage_block_batched(verdicts, h_.session_pos, cfg_.mask_token_id, QR, requests, h_.max_context,
                               df_pos_, df_tokens_, h_.stream);
-  embed_gather_bf16(h_.embed, df_tokens_, df_resid_, R, H, h_.stream);
+  embed_block(R);
   h_.gemm_rows(R, true);
   std::vector<int> reqs(static_cast<size_t>(requests));
   for (int q = 0; q < requests; ++q) reqs[static_cast<size_t>(q)] = q;

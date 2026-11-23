@@ -1,7 +1,7 @@
 # DGPP Engine Design
 
 This document describes the implemented serving architecture. The
-shared runtime supports the GLM, Qwen, DeepSeek, MiMo, MiniMax, Flint and Dory architectures listed
+shared runtime supports the GLM, Qwen, DeepSeek, MiMo, MiniMax, Flint, Inkling 2 and Dory architectures listed
 in the [supported-model guide](README.md), with resident loading, tensor
 parallelism, decode graphs, sampling, prefix caching and speculative decoding.
 World size and memory requirements depend on the model

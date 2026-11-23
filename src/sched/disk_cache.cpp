@@ -10,7 +10,8 @@ namespace dgpp::sched {
 namespace {
 bool same_image(const ImageInput& a, const ImageInput& b) {
   return a.offset == b.offset && a.tokens == b.tokens && a.width == b.width &&
-         a.height == b.height && a.grid == b.grid && a.rgb == b.rgb;
+         a.height == b.height && a.grid == b.grid && a.valid_width == b.valid_width &&
+         a.valid_height == b.valid_height && a.rgb == b.rgb;
 }
 bool same_image_key(const PrefixCache::ImageKey& a, const PrefixCache::ImageKey& b) {
   return a.input == b.input || (a.hash == b.hash && same_image(*a.input, *b.input));

@@ -59,10 +59,15 @@ ModelArchitecture detect_architecture(const minijson::Value& root) {
   if (arch == "MiniMaxM3SparseForConditionalGeneration" ||
       (arch.empty() && type == "minimax_m3_vl"))
     return ModelArchitecture::MinimaxM3;
+  // Inkling 2 Mini (docs/inkling2_mini_plan.md): `Inkling2LoopForConditionalGeneration`
+  // / `inkling2_loop`, the looped model. The loop-free `inkling2` checkpoints
+  // are another architecture.
+  if (arch.rfind("Inkling2Loop", 0) == 0 || (arch.empty() && type == "inkling2_loop"))
+    return ModelArchitecture::Inkling2Loop;
   throw std::runtime_error(
       "config.json: unsupported architecture '" + arch + "' (model_type '" + type +
       "'); the engine implements Glm5*, Qwen4Exp*, Glm4Moe*, GlmMoeDsa*, DeepseekV41*, "
-      "DeepseekV4*, MiMoV2*, Qwen3_5*, Flint*, MiniMaxM3Sparse* and Dory*");
+      "DeepseekV4*, MiMoV2*, Qwen3_5*, Flint*, MiniMaxM3Sparse*, Inkling2Loop* and Dory*");
 }
 
 ModelArchitecture detect_architecture_file(const std::string& path) {

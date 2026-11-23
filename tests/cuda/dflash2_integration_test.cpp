@@ -16,6 +16,8 @@
 #include "engine/nvme_tier.hpp"
 #include "engine/prefix_arena.hpp"
 #include "engine/tp_bus.hpp"
+#include "inkling2_fixture.hpp"
+#include "models/inkling2/forward.hpp"
 #include "models/minimax/forward.hpp"
 #include "models/qwen/forward.hpp"
 #include "models/qwen/model35.hpp"
@@ -52,6 +54,8 @@ auto draft_plane(Model& model, int layer) {
       uint16_t* v_cache;
     };
     return Plane{v.k, v.v};
+  } else if constexpr (std::is_same_v<Model, dgpp::Inkling2Model>) {
+    return model.pool().view(model.config().num_visits() + layer);  // the draft's planes follow the visits'
   } else if constexpr (requires { model.pool().draft_view(layer); })
     return model.pool().draft_view(layer);
   else
@@ -62,7 +66,8 @@ template <class Model>
 std::vector<uint16_t> context(Model& model, int req) {
   DGPP_CUDA_OK(cudaStreamSynchronize(model.stream()));
   const int rows = static_cast<int>(model.session_position(req));
-  constexpr int width = std::is_same_v<Model, dgpp::MinimaxModel> ? 4 * 128 : 2 * 128;
+  constexpr int width =
+      std::is_same_v<Model, dgpp::MinimaxModel> || std::is_same_v<Model, dgpp::Inkling2Model> ? 4 * 128 : 2 * 128;
   const auto* table = model.pool().request_table_row(req);
   const int block = model.kv_block_tokens();
   std::vector<uint16_t> out;
@@ -158,11 +163,13 @@ auto check_graph(Factory make, uint16_t port, bool sampled = false, bool screene
         dgpp::GraphEngineAdapter<Model> engine(model.get(), buses[rank].get(), rank, world,
                                                scratch, 512, 60000, 2, prefix, gather);
         require(model->dflash2_proposals_armed() == sampled, "engine did not arm sampled draft proposals");
-        engine.configure_verify_schedule(true, 8.f, 0.045f, 1, 28.f, false, 3);
+        // A block drafter's schedule may verify no draft at all: the
+        // pending token alone, then the next block.
+        engine.configure_verify_schedule(true, 8.f, 0.045f, 0, 28.f, false, 3);
         int tick = 0;
         engine.set_verify_depth_hook([&](int, int, const float*, int) {
-          const int depths[] = {1, 4, 7};
-          return depths[tick++ % 3];
+          const int depths[] = {0, 1, 4, 7};
+          return depths[tick++ % 4];
         });
         arrived = true;
         ready.arrive_and_wait();
@@ -241,6 +248,98 @@ auto check_graph(Factory make, uint16_t port, bool sampled = false, bool screene
   return transcripts[0];
 }
 
+// One request at a time through the recorded passes, with and without the
+// draft: the committed tokens must be the same, whatever depth a pass
+// verified. Two requests share the slot one after the other, the second with
+// a shorter prompt, so the second decodes over positions the first left
+// behind. A verify row is the plain step at its position bit for bit, or a
+// draft would change what the model writes.
+template <class Model, class DraftFactory, class PlainFactory>
+void check_graph_matches_plain(DraftFactory make_draft, PlainFactory make_plain, uint16_t port) {
+  constexpr int world = 2, tokens = 40;
+  const auto run = [&](auto make, bool draft) {
+    std::vector<std::unique_ptr<dgpp::net::CollectiveBus>> buses;
+    for (int rank = 0; rank < world; ++rank) {
+      dgpp::net::BusOptions o;
+      o.world_size = world;
+      o.my_rank = rank;
+      o.rendezvous_port = port;
+      o.rendezvous_host = rank ? "127.0.0.1" : "";
+      o.rendezvous_timeout_ms = 20000;
+      o.lat_slots = o.bulk_slots = 8;
+      o.lat_slot_bytes = o.bulk_slot_bytes = 262144;
+      o.qp_depth = 1024;
+      o.completion_timeout_ms = 10000;
+      o.consumer_deadline_s = 60;
+      o.launch_consumers = false;
+      buses.push_back(std::make_unique<dgpp::net::CollectiveBus>(o));
+    }
+    std::vector<std::string> errors(world);
+    std::vector<std::thread> workers;
+    for (int rank = 0; rank < world; ++rank)
+      workers.emplace_back([&, rank] { (void)buses[rank]->start(&errors[rank]); });
+    for (auto& worker : workers) worker.join();
+    for (const auto& error : errors) require(error.empty(), "start bus: " + error);
+    workers.clear();
+    std::barrier ready(world);
+    std::vector<std::vector<std::vector<int32_t>>> transcripts(world);
+    for (int rank = 0; rank < world; ++rank) workers.emplace_back([&, rank] {
+      uint16_t* scratch = nullptr;
+      bool arrived = false;
+      try {
+        dgpp::BusBoundaryReducer reducer(*buses[rank]);
+        auto model = make(&reducer, rank, world);
+        DGPP_CUDA_OK(cudaHostAlloc(&scratch, sizeof(uint16_t) * dgpp::kPickScratchElems(world), cudaHostAllocDefault));
+        {
+          dgpp::GraphEngineAdapter<Model> engine(model.get(), buses[rank].get(), rank, world, scratch, 512, 60000, 2,
+                                                 nullptr, nullptr);
+          int tick = 0;
+          if (draft) {
+            engine.configure_verify_schedule(true, 8.f, 0.045f, 0, 28.f, false, 6);
+            engine.set_verify_depth_hook([&](int, int, const float*, int) {
+              const int depths[] = {7, 4, 0, 1, 5, 2, 6, 3};
+              return depths[tick++ % 8];
+            });
+          }
+          arrived = true;
+          ready.arrive_and_wait();
+          engine.warm_captures(prompt(4, 0));
+          for (const int length : {61, 37, 44}) {
+            std::vector<int32_t> out{engine.prefill(0, prompt(length, 3 + length))};
+            while (static_cast<int>(out.size()) < tokens) {
+              engine.reserve(0, model->session_position(0) + 8);
+              const auto generated = engine.step_batch(std::vector<int>{0});
+              engine.drain();
+              require(!generated[0].empty(), "graph made no progress");
+              out.insert(out.end(), generated[0].begin(), generated[0].end());
+            }
+            engine.close(0);
+            out.resize(tokens);
+            transcripts[rank].push_back(std::move(out));
+          }
+        }
+      } catch (const std::exception& e) {
+        errors[rank] = e.what();
+        if (!arrived) ready.arrive_and_wait();
+      }
+      if (scratch) cudaFreeHost(scratch);
+    });
+    for (auto& worker : workers) worker.join();
+    for (auto& bus : buses) bus->stop();
+    for (const auto& error : errors) require(error.empty(), error);
+    require(transcripts[0] == transcripts[1], "ranks produced different transcripts");
+    return transcripts[0];
+  };
+  const auto plain = run(make_plain, false);
+  const auto drafted = run(make_draft, true);
+  for (size_t r = 0; r < plain.size(); ++r) {
+    size_t agree = 0;
+    while (agree < plain[r].size() && plain[r][agree] == drafted[r][agree]) ++agree;
+    require(agree == plain[r].size(), "request " + std::to_string(r) + ": the draft model changed the committed tokens after " +
+                                          std::to_string(agree) + " of " + std::to_string(plain[r].size()));
+  }
+}
+
 auto minimax_factory(bool draft = true, int slots = 2, bool native = false) {
   const std::string dir = "minimax_dspark_target_fixture";
   const auto cfg = dgpp::MinimaxConfig::from_json_file(dir + "/config.json");
@@ -249,6 +348,18 @@ auto minimax_factory(bool draft = true, int slots = 2, bool native = false) {
                                                 dgpp::LoaderResidency::Resident, reducer, rank,
                                                 world, slots, draft, slots * 8,
                                                 dgpp::LatentFormat::kBf16, false, native);
+  };
+}
+// Inkling 2's bundled draft model on the tiny release (all 512 rows served:
+// the prompts here draw over 512 ids).
+auto inkling_factory(int slots = 2, bool native = false, bool draft = true) {
+  const std::string dir = "inkling2_dflash2_fixture";
+  const auto cfg = ink2fx::draft_config(/*full_vocabulary=*/true);
+  ink2fx::write_draft_fixture(dir, /*full_vocabulary=*/true);
+  return [=](dgpp::BoundaryReducer* reducer, int rank, int world) {
+    return std::make_unique<dgpp::Inkling2Model>(cfg, dir, 128, 1024, dgpp::Inkling2Residency::Resident, reducer,
+                                                 rank, world, slots, /*mtp=*/draft, slots * 8,
+                                                 dgpp::LatentFormat::kBf16, false, native);
   };
 }
 auto flash_factory() {
@@ -508,6 +619,29 @@ DGPP_TEST(minimax_dspark_eager_transcripts_match_plain) {
     return out;
   };
   require(transcript(true) == transcript(false), "DSpark changes the greedy transcript");
+}
+
+DGPP_TEST(inkling2_draft_prefix_snapshot) { check_prefix<dgpp::Inkling2Model>(inkling_factory()); }
+DGPP_TEST(inkling2_draft_prefix_tier) { check_prefix_tier<dgpp::Inkling2Model>(inkling_factory(), "inkling2"); }
+DGPP_TEST(inkling2_draft_graph_matches_plain) {
+  check_graph_matches_plain<dgpp::Inkling2Model>(inkling_factory(1, false, true), inkling_factory(1, false, false), 29980);
+}
+DGPP_TEST(inkling2_draft_native_graph_matches_plain) {
+  check_graph_matches_plain<dgpp::Inkling2Model>(inkling_factory(1, true, true), inkling_factory(1, true, false), 29980);
+}
+DGPP_TEST(inkling2_draft_graph_reducer_tp) { check_graph<dgpp::Inkling2Model>(inkling_factory(), 29980); }
+DGPP_TEST(inkling2_draft_sampled_graph_tp) { check_graph<dgpp::Inkling2Model>(inkling_factory(), 29980, true); }
+DGPP_TEST(inkling2_draft_four_slot_graph_tp) {
+  check_graph<dgpp::Inkling2Model>(inkling_factory(4), 29980, false, false, nullptr, 4);
+}
+DGPP_TEST(inkling2_draft_eight_slot_graph_tp) {
+  check_graph<dgpp::Inkling2Model>(inkling_factory(8), 29980, false, false, nullptr, 8);
+}
+DGPP_TEST(inkling2_draft_eight_slot_sampled_graph_tp) {
+  check_graph<dgpp::Inkling2Model>(inkling_factory(8), 29980, true, false, nullptr, 8);
+}
+DGPP_TEST(inkling2_draft_native_eight_slot_graph_tp) {
+  check_graph<dgpp::Inkling2Model>(inkling_factory(8, true), 29980, false, false, nullptr, 8);
 }
 
 DGPP_TEST(dflash2_flash_next_prefix_snapshot) { check_prefix<dgpp::QwenModel>(flash_factory()); }

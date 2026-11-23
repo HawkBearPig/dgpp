@@ -5,6 +5,70 @@ project procedures and design guidance live in `docs/`.
 
 ## Unreleased
 
+- **Inkling 2 Mini** (`thinkingmachines/Inkling-2-Mini`, `inkling2_loop`): a
+  new family on the shared engine, served as shipped on one, two and four
+  nodes. The model is a looped transformer: 24 layers of weights with layers
+  6 to 17 walked three times, attention residuals over blocks of six in place
+  of a residual stream, loop messages blended by low-rank controllers, a
+  learned relative bias with a sink column and a gated output in attention,
+  short causal convolutions on four streams of every visit, and NVFP4 and
+  MXFP8 routed experts. `engine.activations` selects the expert input recipe:
+  `native` is the checkpoint's own (NVFP4 inputs with the four-over-six block
+  scale choice, MXFP8 inputs on the last four layers) and `bf16` is the
+  arithmetic of the transformers reference. Every visit owns a plane of the
+  K/V pool, convolution inputs live in a ring indexed by position so a
+  rolled-back row copies nothing, and a prefix snapshot carries the three
+  positions before its cut. Prefill attention is query-tiled on the tensor
+  cores and the NVFP4 experts of prefill rows run with both operands in four
+  bits. The text side reads the release's tokenizer and chat template
+  (float and dict literals, list concatenation, `float`, `dictsort` and the
+  `json.dumps` arguments of `tojson` are new to the template engine), parses
+  the model's typed reply blocks into reasoning, content and tool calls, and
+  constrains `tool_choice` and `response_format` over the same blocks. The
+  template writes no generation prompt, so the prefix cache cuts one token
+  before every change of speaker and at a prompt's last token
+  (`ModelFrontend::self_opened_turn_marker`), which is where a repeated
+  prompt and the next turn attach. The bundled draft model runs on the
+  shared block drafter (`engine.mtp`, on in the templates): seven proposals
+  a step from a three-layer model that reads four of the target's states,
+  with a recurrent head that corrects the whole vocabulary step by step and
+  stops once no later proposal could be verified, a verify depth scheduled
+  from a calibrated acceptance estimate that may verify nothing
+  (`engine.mtp_schedule_min_depth` 0), and verify passes of several requests
+  that read each attention matrix once (`"bf16_weights": "bf12+bf16"`). A
+  verify row is the plain step at its position bit for bit through a
+  request's eight rows, so greedy output is the same with and without the
+  draft. The vision tower is served: an image
+  keeps its size at one token per 40 x 40 pixel cell, and its rows take the
+  place of the placeholder tokens' embeddings. Templates
+  `deploy/cluster_inkling-2-mini_nvfp4-mxfp8_w{1,2,4}.example.json`, notes in
+  `docs/model_cards/Inkling-2-Mini.md` and `docs/inkling2_mini_plan.md`.
+- **The packed tensor-core GEMV takes widths with a tail**
+  (`kernels/mma_gemv`): the 12-bit form's launches read a matrix whose width
+  is whole 1,024-value blocks followed by whole 256-column steps (2,304,
+  2,560), bit for bit the BF16 launch. The GEMM interface's own rule is
+  unchanged, whole blocks only, because the form pays on a matrix whose
+  stream dominates the launch: Inkling 2 uses it for its vocabulary head
+  from nine to 32 rows, 2.9 ms against 4.0. A gated launch
+  (`launch_mma_gemv_bf16_f32_gated`) and a gate on `dflash2_topk_f32` let a
+  recorded pass skip a step whose result nothing will read.
+- **Padding rows read no experts** (`launch_moe_segment`'s `positions`):
+  given the rows' positions, the device-side segment builder leaves a
+  padding row (a closed slot's rows in a row batch, a row past the context)
+  in no expert's row list, so an expert only padding rows selected is not
+  read. Inkling 2 passes them: with five or seven requests decoding on one
+  node, plain decoding gained 10 to 13 percent and decoding with the draft 3
+  to 7 percent. The other routed-expert families do not pass positions yet.
+- **A schedule's minimum depth may be zero for a block drafter**
+  (`engine.mtp_schedule_min_depth`): a step then feeds the pending token
+  alone when its first proposal is not worth a verify row.
+- **A recorded copy takes any size and alignment**
+  (`kernels/device_copy.hpp`): the kernel copy every family's decode graph
+  uses moved out of `kernels/glm_spec` and picks 16-byte units, 4-byte words
+  or bytes from the span it is given. The verify snapshot of a sampled
+  request copied whole 16-byte units only, which an odd number of logits rows
+  of a vocabulary that is not a multiple of four values is not: a scheduled
+  verify depth on Inkling 2's 200,058 ids refused to capture.
 - **A scheduled step verifies only the drafts its request holds, with a
   single scheduled depth too** (issue #193): with
   `engine.mtp_schedule_options` 1 the policy's only option is the full

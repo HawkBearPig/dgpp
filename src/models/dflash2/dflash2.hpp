@@ -11,7 +11,8 @@
 // so block tables, prefix sharing and rollback ride the existing protocol
 // (models/dflash2/draft_planes.hpp). The DFlash2 parser enforces the Qwen3
 // checkpoint architecture. MiniMax supplies a separately validated native
-// DSpark configuration and weights through models/minimax/dspark.hpp.
+// DSpark configuration and weights through models/minimax/dspark.hpp, and
+// Inkling 2 its bundled draft model through models/inkling2/draft.hpp.
 // The host owns the feature tap locations, output head and pool planes;
 // models/dflash2/drafter.hpp carries eager, batched and graph execution.
 #include <cstdint>
@@ -36,7 +37,7 @@ struct DFlash2TargetShape {
 };
 
 struct DFlash2Config {
-  enum class Backbone { Qwen3, MiniMaxM3 };
+  enum class Backbone { Qwen3, MiniMaxM3, Inkling2 };
   Backbone backbone = Backbone::Qwen3;
   int rotary_dim = 128;
   float swiglu_alpha = 1.702f, swiglu_limit = 7.0f;
@@ -61,6 +62,15 @@ struct DFlash2Config {
   double rope_theta = 1e7;
   int64_t sliding_window = 2048;  // INT64_MAX when the backbone is not sliding
   int64_t max_position_embeddings = 262144;
+  // Inkling 2: the layers that slide (empty: every layer does), and the cap
+  // on the head's logits (0: none). Its window ends at the block's last row
+  // and counts the block's own rows, the same span for every row.
+  std::vector<uint8_t> local_layer;
+  float logit_softcap = 0.0f;
+  int64_t layer_window(int l) const {
+    return local_layer.empty() || local_layer[static_cast<size_t>(l)] != 0 ? sliding_window : INT64_MAX;
+  }
+  bool block_window() const { return backbone == Backbone::Inkling2; }
 
   static DFlash2Config from_json_file(const std::string& path);
   static DFlash2Config parse(const minijson::Value& root);
@@ -130,6 +140,26 @@ struct DFlash2LayerWeights {
   // Native MiniMax MXFP8 uses one E8M0 byte per row and 32 columns.
   const uint8_t *qkv_e8m0 = nullptr, *o_e8m0 = nullptr, *gate_e8m0 = nullptr, *up_e8m0 = nullptr,
                 *down_e8m0 = nullptr;
+  // Inkling 2: the context features take their own norm, K/V projection
+  // ([2*KW, H], the key rows first) and key norm.
+  const uint16_t* dflare_norm = nullptr;  // [H]
+  const uint16_t* kv_ctx = nullptr;       // [2*KW, H]
+  const uint16_t* k_norm_ctx = nullptr;   // [head_dim]
+};
+
+// Inkling 2's own pieces around the shared layers: the feature mix, the
+// learned mask row and the recurrent head with the target's head folded
+// through its output projection (models/inkling2/draft.hpp builds them).
+struct DFlash2Inkling2Weights {
+  const float* fuse_alpha = nullptr;       // F32 [(layers + 1), taps]: a mix per draft layer, then the head's
+  const uint16_t* mask_embed = nullptr;    // [H]
+  const uint16_t* embed_norm = nullptr;    // [H], the target's (not owned)
+  const uint16_t* feature_norm = nullptr;  // [H], the head's norm of its context feature
+  const uint16_t* markov_w1 = nullptr;     // [padded vocab, rank]
+  const uint16_t* rnn_w = nullptr;         // [3 rank, 2 rank + 2 H]
+  const float* rnn_bias = nullptr;         // F32 [3 rank]
+  const uint16_t* fold_w = nullptr;        // [served vocab rows, rank]
+  const uint16_t* fold_b = nullptr;        // [served vocab rows]
 };
 
 struct DFlash2Weights {
@@ -142,6 +172,7 @@ struct DFlash2Weights {
   const uint16_t* hidden_projection = nullptr;  // [rank, H]
   const float* confidence_weight = nullptr;     // [hidden + selector_rank]
   const float* confidence_bias = nullptr;       // [1]
+  DFlash2Inkling2Weights ink;
   void* arena = nullptr;
   size_t bytes = 0;
   void* fp8_arena = nullptr;  // the fp8 payloads + scales (engine.dflash_weights fp8)
@@ -160,6 +191,7 @@ struct DFlash2Weights {
         hidden_projection(o.hidden_projection),
         confidence_weight(o.confidence_weight),
         confidence_bias(o.confidence_bias),
+        ink(o.ink),
         arena(o.arena),
         bytes(o.bytes),
         fp8_arena(o.fp8_arena),
@@ -182,6 +214,7 @@ struct DFlash2Weights {
       hidden_projection = o.hidden_projection;
       confidence_weight = o.confidence_weight;
       confidence_bias = o.confidence_bias;
+      ink = o.ink;
       arena = o.arena;
       bytes = o.bytes;
       fp8_arena = o.fp8_arena;

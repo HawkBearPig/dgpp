@@ -631,15 +631,17 @@ DGPP_TEST(mma_gemv_split_k_small_n_sites) {
 // The bf12 form (the lm head's 12-bit companion under the tensor-core
 // chain): bitwise the bf16 launch at every decode width, f32 and bf16
 // outputs, on a matrix with escapes and rows the encoder kept raw; a
-// partial last block; k of one and five super-blocks. The form declines a
-// tail (k not whole super-blocks) and the widths above the decode forms.
+// partial last block; k of one and five super-blocks, and k with each tail
+// of whole steps (a full unit: 2304; a pair unit: 2560; both: 1792), which
+// the launches take and the GEMM interface's own rule does not. The form
+// declines a tail with a partial step and the widths above the decode forms.
 DGPP_TEST(mma_gemv_bf12_form_is_bitwise_the_bf16_form) {
   std::mt19937_64 rng(2026);
   std::uniform_real_distribution<float> uf(-1.f, 1.f);
   std::uniform_int_distribution<int> ex(-4, 4);
   std::uniform_int_distribution<int> outlier(0, 199);
   std::uniform_real_distribution<float> mag(0.5f, 1.f);
-  for (auto [n, k] : std::vector<std::pair<int, int>>{{1032, 1024}, {4104, 5120}}) {
+  for (auto [n, k] : std::vector<std::pair<int, int>>{{1032, 1024}, {4104, 5120}, {2056, 2304}, {1032, 2560}, {520, 1792}}) {
     std::vector<uint16_t> w(size_t(n) * k);
     // Nine exponents inside the row's fifteen-code window, one element in
     // two hundred far outside it: escapes on most rows, under the row budget.
@@ -666,7 +668,8 @@ DGPP_TEST(mma_gemv_bf12_form_is_bitwise_the_bf16_form) {
     DGPP_CUDA_OK(cudaMalloc(&o1, size_t(32) * n * 4)); DGPP_CUDA_OK(cudaMalloc(&o2, size_t(32) * n * 4));
     DGPP_CUDA_OK(cudaMalloc(&b1, size_t(32) * n * 2)); DGPP_CUDA_OK(cudaMalloc(&b2, size_t(32) * n * 2));
     for (int m : {1, 3, 8, 16, 17, 32}) {
-      require(dgpp::mma_gemv_bf12_accepts(pm, m), "bf12 form: accepts the decode width");
+      require(dgpp::mma_gemv_bf12_accepts(pm, m) == (k % 1024 == 0),
+              "bf12 form: the interface's rule takes whole super-blocks at the decode widths, and only those");
       DGPP_CUDA_OK(cudaMemset(o2, 0xFF, size_t(32) * n * 4)); DGPP_CUDA_OK(cudaMemset(b2, 0xFF, size_t(32) * n * 2));
       dgpp::launch_mma_gemv_bf16_f32(da, k, dw, o1, m, n, k, n, nullptr);
       require(dgpp::launch_mma_gemv_bf12_f32(da, k, pm, o2, m, n, k, n, nullptr), "bf12 form: the f32 launch applies");
@@ -686,11 +689,15 @@ DGPP_TEST(mma_gemv_bf12_form_is_bitwise_the_bf16_form) {
     cudaFree(o1); cudaFree(o2); cudaFree(b1); cudaFree(b2);
   }
   {
-    // A companion with a tail (k = 2560: two super-blocks and 512 columns) is declined.
-    dgpp::Bf12Matrix pm; pm.n = 64; pm.k = 2560;
+    // A companion whose tail ends in a partial step (k = 1344: a super-block, a full step and 64 columns) is declined.
+    dgpp::Bf12Matrix pm; pm.n = 64; pm.k = 1344;
     pm.packed = reinterpret_cast<const uint8_t*>(1); pm.rows = reinterpret_cast<const uint32_t*>(1);
     pm.esc = reinterpret_cast<const uint32_t*>(1); pm.raw = reinterpret_cast<const uint16_t*>(1);
-    require(!dgpp::mma_gemv_bf12_accepts(pm, 4), "bf12 form: declines a tail");
+    require(!dgpp::mma_gemv_bf12_accepts(pm, 4), "bf12 form: declines a partial step");
+    uint16_t* da; float* o2;
+    DGPP_CUDA_OK(cudaMalloc(&da, size_t(4) * 1344 * 2)); DGPP_CUDA_OK(cudaMalloc(&o2, size_t(4) * 64 * 4));
+    require(!dgpp::launch_mma_gemv_bf12_f32(da, 1344, pm, o2, 4, 64, 1344, 64, nullptr), "bf12 form: a partial step is not launched");
+    cudaFree(da); cudaFree(o2);
   }
 }
 

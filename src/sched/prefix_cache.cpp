@@ -11,6 +11,7 @@ namespace {
 bool same_image(const ImageInput& a, const ImageInput& b) {
   return a.offset == b.offset && a.tokens == b.tokens && a.width == b.width &&
          a.height == b.height && a.grid == b.grid && a.frames == b.frames &&
+         a.valid_width == b.valid_width && a.valid_height == b.valid_height &&
          a.frame_offsets == b.frame_offsets && a.rgb == b.rgb;
 }
 bool same_image_key(const PrefixCache::ImageKey& a, const PrefixCache::ImageKey& b) {
@@ -51,6 +52,13 @@ PrefixCache::Images PrefixCache::image_keys(const std::vector<ImageInput>& image
     if (image.is_video()) {
       h = extend_hash(h, image.frames);
       for (int64_t at : image.frame_offsets) h = extend_hash(h, at);
+    }
+    // A padded canvas: the content region is part of what the tower reads.
+    // An image without one keeps the key it always had.
+    if (image.valid_width > 0) {
+      h = extend_hash(h, -2);
+      h = extend_hash(h, image.valid_width);
+      h = extend_hash(h, image.valid_height);
     }
     for (uint8_t byte : image.rgb) h = (h ^ byte) * 0x100000001b3ull;
     std::shared_ptr<const ImageInput> input;

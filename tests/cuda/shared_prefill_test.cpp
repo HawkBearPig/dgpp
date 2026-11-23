@@ -18,6 +18,7 @@
 #include "dsv4_fixture.hpp"
 #include "glm4_fixture.hpp"
 #include "glm_dsa_fixture.hpp"
+#include "inkling2_fixture.hpp"
 #include "mimo_fixture.hpp"
 #include "models/dsv4/model.hpp"
 #include "models/dsv41/model.hpp"
@@ -25,6 +26,7 @@
 #include "models/glm/route_audit.hpp"
 #include "models/glm4/forward.hpp"
 #include "models/glm_dsa/model.hpp"
+#include "models/inkling2/forward.hpp"
 #include "models/mimo/forward.hpp"
 #include "models/minimax/forward.hpp"
 #include "models/qwen/model35.hpp"
@@ -512,6 +514,21 @@ DGPP_TEST(shared_prefill_minimax) {
                                               nullptr, 0, 1, 4, mtp, 32);
       },
       cfg.vocab_size, 1, true, false, false);
+}
+// Inkling 2 keeps three positions of convolution input per visit and stream
+// in per-request rings: a yielded prefill and a neighbour's decode steps must
+// leave them alone. Once per expert activation recipe.
+DGPP_TEST(shared_prefill_inkling2) {
+  const std::string dir = "shared_inkling2_fixture";
+  ink2fx::write_fixture(dir);
+  const auto cfg = ink2fx::tiny_config();
+  for (const bool native : {false, true})
+    check<Inkling2Model>(
+        [&](bool mtp, bool compact) {
+          return std::make_unique<Inkling2Model>(cfg, dir, 256, 2048, LoaderResidency::Resident, nullptr, 0, 1, 4, mtp,
+                                                 16, LatentFormat::kBf16, compact, native);
+        },
+        cfg.vocab_size, 1, true, false, false);
 }
 template <class Factory>
 void check_short_reader_recipe(Factory make, int vocab, const char* label) {

@@ -42,8 +42,10 @@ constexpr const char* kSplitPatternQwen2 =
 constexpr const char* kSplitPatternNemotron =
     "[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]*[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]+|[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]+[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]*|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
 // MiniMax adds contraction suffixes and three-digit runs to these case
-// classes. Removed+invert retains regex matches; the pattern covers every
-// codepoint, so there are no unmatched gaps to remove.
+// classes. The pattern covers every codepoint, so a text has no unmatched
+// gaps: Removed with invert (MiniMax: keep the matches, drop the gaps) and
+// Isolated without invert (Inkling 2: every match and every gap its own
+// piece) cut the same pieces.
 constexpr const char* kSplitPatternMinimax =
     "[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]*[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]+(?i:'"
     "s|'t|'re|'ve|'m|'ll|'d)?|[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]+[\\p{Ll}"
@@ -758,9 +760,11 @@ Tokenizer Tokenizer::load(const std::string& path, size_t word_cache_entries) {
     const bool minimax = splits == 1 && want_string(field(pres[k], "pattern", "Split"), "Regex",
                                                     "Split.pattern") == kSplitPatternMinimax;
     if (minimax) {
-      if (want_string(pres[k], "behavior", "Split") != "Removed" ||
-          !want_bool(pres[k], "invert", "Split"))
-        reject("MiniMax Split requires Removed with invert=true");
+      const std::string_view behavior = want_string(pres[k], "behavior", "Split");
+      const minijson::Value* inv = pres[k].find("invert");
+      const bool invert = inv && inv->kind() == minijson::Value::Kind::Bool && inv->as_bool();
+      if (!((behavior == "Removed" && invert) || (behavior == "Isolated" && !invert)))
+        reject("this Split pattern requires Removed with invert=true or Isolated with invert=false");
       continue;
     }
     if (want_string(pres[k], "behavior", "Split") != "Isolated") reject("Split behavior is not Isolated");

@@ -535,8 +535,11 @@ void CublasLtGemm::matmul(const void* act, const void* weight, void* out,
     // form, 2026-10-20: the chain of the bf16 launch at three quarters of
     // its bytes — the lm head, read twice a pass); a shape or width the
     // form declines runs the bf16 launch below.
+    // The interface's own rule (mma_gemv_bf12_accepts): whole super-blocks.
+    // The launches also take a tailed matrix, for a caller that picks the
+    // form for a matrix of its own.
     if (const Impl::Bf12Entry* packed12 = m <= kMmaGemvMaxRows ? impl_->bf12_for(weight, n, k) : nullptr;
-        packed12 != nullptr) {
+        packed12 != nullptr && mma_gemv_bf12_accepts(packed12->m, m)) {
       const bool took = out_dtype == GemmOut::F32
                             ? launch_mma_gemv_bf12_f32(x, act_row_stride, packed12->m, reinterpret_cast<float*>(y), m, n, k,
                                                        static_cast<size_t>(n), stream, split_ws, split_bytes)

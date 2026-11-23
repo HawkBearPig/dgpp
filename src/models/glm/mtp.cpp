@@ -25,6 +25,7 @@
 
 #include "common/cuda_check.hpp"
 #include "common/log.hpp"
+#include "kernels/device_copy.hpp"
 #include "kernels/glm_norm.hpp"
 #include "kernels/glm_spec.hpp"
 #include "kernels/kernels.hpp"
@@ -308,9 +309,9 @@ void GlmDiagnosticModel::chain_ring_copy(int req, bool restore) {
                    static_cast<size_t>(req) * ring;
   uint16_t* snap = mtp_chain_ring_ + static_cast<size_t>(req) * ring;
   if (restore)
-    glm_device_copy(live, snap, ring * 2, stream_);
+    device_copy(live, snap, ring * 2, stream_);
   else
-    glm_device_copy(snap, live, ring * 2, stream_);
+    device_copy(snap, live, ring * 2, stream_);
 }
 
 bool GlmDiagnosticModel::session_draft_chain_fits(int req, int index) const {
@@ -353,7 +354,7 @@ GlmDiagnosticModel::Outputs GlmDiagnosticModel::session_draft_chain(
   DGPP_CUDA_OK(cudaMemcpyAsync(d_tokens_, h_token_, sizeof(int64_t),
                                cudaMemcpyHostToDevice, stream_));
   // The block's previous output row is the row's hidden, at its position.
-  glm_device_copy(mtp_hidden_cache(req) + static_cast<size_t>(pos) * H,
+  device_copy(mtp_hidden_cache(req) + static_cast<size_t>(pos) * H,
                   mtp_x_ + static_cast<size_t>(mtp_draft_last_row_) * H,
                   static_cast<size_t>(H) * 2, stream_);
   mtp_run_rows(req, pos, /*T=*/1, /*decode_row=*/true, /*capture_mode=*/false);
@@ -476,7 +477,7 @@ void GlmDiagnosticModel::session_graph_capture_draft_batch(
 
 void GlmDiagnosticModel::snapshot_draft_ring(int req) {
   const size_t ring = spec_tail_ring_elems();
-  glm_device_copy(mtp_ring_snapshot_ + static_cast<size_t>(req) * ring,
+  device_copy(mtp_ring_snapshot_ + static_cast<size_t>(req) * ring,
                   static_cast<const uint16_t*>(pool_.tail(main_dsa_layers_)) +
                       static_cast<size_t>(req) * ring,
                   ring * 2, stream_);

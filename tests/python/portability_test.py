@@ -322,6 +322,7 @@ class PortabilityTest(unittest.TestCase):
             "nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-NVFP4": "dory1.0-4b_nvfp4",
             "HawkBearPig/flint-FP8-NVFP4": "flint_fp8-nvfp4",
             "MiniMaxAI/MiniMax-M3.1-Flash": "minimax-m3.1-flash_nvfp4-mxfp8",
+            "thinkingmachines/Inkling-2-Mini": "inkling-2-mini_nvfp4-mxfp8",
         }
         # Families whose checkpoint ships no draft layer: their templates run
         # plain (the spec keys are refused by name at boot, not merely off) —

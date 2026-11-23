@@ -195,6 +195,15 @@ std::string encode_journal_tick(const GenerationService::PassEvents& events) {
           out += ',';
           append_json_int(&out, im.grid);
           out += ',';
+          // A padded canvas names its content region. An image without one
+          // keeps the entry it always had.
+          if (im.valid_width > 0) {
+            out += '[';
+            append_json_int(&out, im.valid_width);
+            out += ',';
+            append_json_int(&out, im.valid_height);
+            out += "],";
+          }
           if (im.is_video()) {
             append_json_int(&out, im.frames);
             out += ",[";
@@ -1141,11 +1150,12 @@ JournalRecord decode_journal_line(std::string_view line) {
           throw std::runtime_error("journal: invalid image list");
         size_t image_bytes = 0;
         for (const auto& entry : images->items()) {
-          if (!entry.is_array() ||
-              (entry.items().size() != 5 && entry.items().size() != 6 && entry.items().size() != 8))
+          if (!entry.is_array() || entry.items().size() < 5 || entry.items().size() > 8)
             throw std::runtime_error("journal: invalid image entry");
           const auto& a = entry.items();
-          const size_t scalars = a.size() == 8 ? 6 : a.size() - 1;
+          // Five fields predate the pixel grid, six carry it, seven add a
+          // still image's content region [width, height], eight are a video.
+          const size_t scalars = a.size() == 8 ? 6 : a.size() == 7 ? 5 : a.size() - 1;
           for (size_t j = 0; j < scalars; ++j)
             if (!a[j].is_number() || !std::isfinite(a[j].as_double()) || a[j].as_double() < 0 ||
                 a[j].as_double() > INT32_MAX || a[j].as_double() != std::floor(a[j].as_double()))
@@ -1158,6 +1168,16 @@ JournalRecord decode_journal_line(std::string_view line) {
           im.height = static_cast<int>(a[3].as_int());
           // A five-field entry predates the per-family pixel grid.
           im.grid = a.size() >= 6 ? static_cast<int>(a[4].as_int()) : 28;
+          if (a.size() == 7) {
+            if (!a[5].is_array() || a[5].items().size() != 2)
+              throw std::runtime_error("journal: invalid image content region");
+            for (const auto& side : a[5].items())
+              if (side.kind() != minijson::Value::Kind::Int || side.as_int() < 1 ||
+                  side.as_int() > INT32_MAX)
+                throw std::runtime_error("journal: invalid image content region");
+            im.valid_width = static_cast<int>(a[5].items()[0].as_int());
+            im.valid_height = static_cast<int>(a[5].items()[1].as_int());
+          }
           if (a.size() == 8) {
             im.frames = static_cast<int>(a[5].as_int());
             if (!a[6].is_array() || a[6].items().size() > 4)

@@ -101,6 +101,41 @@ ImageInput resize_image(const uint8_t* rgb, int width, int height, const ImagePr
     throw std::invalid_argument("image dimensions or token budget exceed supported limits");
   ImageInput out;
   out.grid = g;
+  if (pp.native_size) {
+    // The content keeps its size. Past the token ceiling it is the largest
+    // aspect-preserving size whose padded grid fits (the same search as the
+    // padded GLM canvas below).
+    const auto align = [g](int n) { return (n + g - 1) / g * g; };
+    const int64_t max_pixels = static_cast<int64_t>(pp.max_tokens) * g * g;
+    int ch = height, cw = width;
+    if (static_cast<int64_t>(align(height)) * align(width) > max_pixels) {
+      int low = 1, high = height;
+      ch = cw = 1;
+      while (low <= high) {
+        const int h = (low + high) / 2;
+        const int w = std::max(1, static_cast<int>(static_cast<int64_t>(width) * h / height));
+        if (static_cast<int64_t>(align(h)) * align(w) <= max_pixels) {
+          ch = h;
+          cw = w;
+          low = h + 1;
+        } else
+          high = h - 1;
+      }
+    }
+    const int th = align(ch), tw = align(cw);
+    if (static_cast<int64_t>(th) * tw > max_pixels)
+      throw std::invalid_argument("image does not fit the token budget at any size");
+    out.width = tw;
+    out.height = th;
+    out.tokens = (tw / g) * (th / g);
+    if (cw != tw || ch != th) {
+      out.valid_width = cw;
+      out.valid_height = ch;
+    }
+    out.rgb.resize(static_cast<size_t>(tw) * th * 3, 0);
+    resample(rgb, width, height, out.rgb.data(), cw, ch, tw);
+    return out;
+  }
   if (pp.pad_to_grid) {
     if (pp.min_tokens < 16 || pp.max_tokens < 16)
       throw std::invalid_argument("image token budget must cover a 16-token canvas");
@@ -174,9 +209,21 @@ ImageInput resize_glm_image(const uint8_t* rgb, int width, int height, int max_t
   pp.max_tokens = max_tokens;
   return resize_image(rgb, width, height, pp);
 }
-// Decode a WebP bitstream to packed 8-bit RGB, compositing alpha on white.
+void composite_on_checkerboard(const uint8_t* rgba, int width, int height, uint8_t* rgb) {
+  for (int y = 0; y < height; ++y)
+    for (int x = 0; x < width; ++x) {
+      const size_t i = static_cast<size_t>(y) * width + x;
+      const uint32_t a = rgba[i * 4 + 3];
+      const uint32_t square = ((x / 8 + y / 8) % 2 == 0) ? 204 : 153;
+      for (int c = 0; c < 3; ++c)
+        rgb[i * 3 + c] = static_cast<uint8_t>((rgba[i * 4 + c] * a + square * (255 - a) + 127) / 255);
+    }
+}
+// Decode a WebP bitstream to packed 8-bit RGB, compositing alpha on white,
+// or on the checkerboard for a family whose processor does.
 namespace {
-void decode_webp_rgb(const std::string& data, std::vector<uint8_t>* rgb, int* width, int* height) {
+void decode_webp_rgb(const std::string& data, std::vector<uint8_t>* rgb, int* width, int* height,
+                     bool checkerboard) {
   simplewebp* image = nullptr;
   if (simplewebp_load_from_memory(const_cast<char*>(data.data()), data.size(), nullptr, &image) !=
           SIMPLEWEBP_NO_ERROR ||
@@ -197,6 +244,12 @@ void decode_webp_rgb(const std::string& data, std::vector<uint8_t>* rgb, int* wi
     throw std::invalid_argument("cannot decode WebP image");
 
   rgb->resize(static_cast<size_t>(w) * h * 3);
+  if (checkerboard) {
+    composite_on_checkerboard(rgba.data(), static_cast<int>(w), static_cast<int>(h), rgb->data());
+    *width = static_cast<int>(w);
+    *height = static_cast<int>(h);
+    return;
+  }
   for (size_t i = 0, n = static_cast<size_t>(w) * h; i < n; ++i) {
     const uint32_t a = rgba[i * 4 + 3];
     for (int c = 0; c < 3; ++c) {
@@ -242,17 +295,26 @@ ImageInput prepare_image(const minijson::Value& value, const std::string& param,
     int w = 0, h = 0, channels = 0;
     if (webp) {
       std::vector<uint8_t> rgb;
-      decode_webp_rgb(data, &rgb, &w, &h);
+      decode_webp_rgb(data, &rgb, &w, &h, spec.checkerboard_alpha);
       return resize_image(rgb.data(), w, h, spec);
     }
     const auto* bytes = reinterpret_cast<const stbi_uc*>(data.data());
     if (!stbi_info_from_memory(bytes, static_cast<int>(data.size()), &w, &h, &channels) || w < 1 ||
         h < 1 || static_cast<int64_t>(w) * h > 32 * 1024 * 1024)
       throw std::invalid_argument("invalid image or image exceeds 32 megapixels");
+    // A PNG may carry transparency (an alpha channel, or a tRNS chunk the
+    // header probe does not report): decode it with alpha and composite.
+    const bool with_alpha = png && spec.checkerboard_alpha;
     std::unique_ptr<stbi_uc, decltype(&stbi_image_free)> pixels(
-        stbi_load_from_memory(bytes, static_cast<int>(data.size()), &w, &h, &channels, 3),
+        stbi_load_from_memory(bytes, static_cast<int>(data.size()), &w, &h, &channels, with_alpha ? 4 : 3),
         stbi_image_free);
     if (!pixels) throw std::invalid_argument("cannot decode image");
+    if (with_alpha) {
+      std::vector<uint8_t> rgb(static_cast<size_t>(w) * h * 3);
+      composite_on_checkerboard(pixels.get(), w, h, rgb.data());
+      pixels.reset();
+      return resize_image(rgb.data(), w, h, spec);
+    }
     return resize_image(pixels.get(), w, h, spec);
   } catch (const std::invalid_argument& e) {
     throw ImageInputError(e.what(), param + ".url");

@@ -1,0 +1,32 @@
+{
+  "model": "thinkingmachines/Inkling-2-Mini",
+  "world_size": 4,
+  "release": "",
+  "engine": {
+    "max_concurrency": 8,
+    "kv_capacity": 1572864,
+    "kv_dtype": "bf16",
+    "bf16_weights": "bf12+bf16",
+    "activations": "native",
+    "default_max_tokens": 32768,
+    "queue_limit": 8,
+    "max_connections": 64,
+    "decode_graph": true,
+    "mtp": true,
+    "mtp_depth": 7,
+    "mtp_schedule": true,
+    "mtp_schedule_min_depth": 0,
+    "mtp_schedule_row_ms": 1.4,
+    "mtp_schedule_base_ms": 18.2,
+    "mtp_schedule_lambda": 0,
+    "mtp_schedule_adapt": true,
+    "prefix_cache_gib": 3,
+    "admission": "full",
+    "admission_window": 256,
+    "sampling_candidates": 128,
+    "stats_interval_s": 10
+  },
+  "paths": {
+    "resident_cache": ""
+  }
+}

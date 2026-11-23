@@ -61,6 +61,7 @@
 namespace dgpp::text {
 class Tokenizer;
 class MiniMaxToolGrammar;
+class InklingToolGrammar;
 }  // namespace dgpp::text
 
 namespace dgpp::text {
@@ -385,6 +386,9 @@ class GrammarState {
   JsonMachine value_json_; // a kJson argument's machine
   // Immutable when shared by speculative copies; advance detaches its cursor.
   std::shared_ptr<MiniMaxToolGrammar> minimax_;
+  // Inkling 2's typed blocks: the whole grammar, every mode (text/
+  // inkling_tool_grammar.hpp). Shared by copies as minimax_ is.
+  std::shared_ptr<InklingToolGrammar> inkling_;
   // The compiled schemas of every kJson argument, [tool][arg] (null
   // where the argument is not kJson).
   std::vector<std::vector<std::shared_ptr<const JsonSchema>>> arg_schemas_;

@@ -37,6 +37,7 @@ struct Expr {
   enum class Tag {
     Const,     // value
     ListLit,   // kids[] as elements
+    DictLit,   // kids[] as key, value, key, value, ...
     Name,      // name
     Getattr,   // kids[0].name
     Getitem,   // kids[0][kids[1]]
@@ -297,6 +298,8 @@ std::vector<Tok> lex(std::string_view src) {
     // Whitespace after the tag: the explicit marker strips everything;
     // trim_blocks (block tags) strips exactly one newline; output tags
     // trim only with the marker.
+    for (size_t k = i; k < body_end; ++k)
+      if (src[k] == '\n') ++line;
     i = body_end + 2;
     if (rtrim) {
       while (i < src.size() && (src[i] == ' ' || src[i] == '\t' ||
@@ -323,9 +326,10 @@ std::vector<Tok> lex(std::string_view src) {
 // ---------------------------------------------------------------------------
 
 struct ETok {
-  enum class T { Ident, Int, Str, Sym, End } t;
+  enum class T { Ident, Int, Str, Sym, End, Float } t;
   std::string s;
   int64_t i = 0;
+  double d = 0.0;
 };
 
 std::vector<ETok> lex_expr(std::string_view s, size_t line) {
@@ -409,6 +413,19 @@ std::vector<ETok> lex_expr(std::string_view s, size_t line) {
       int64_t v = 0;
       const auto res = std::from_chars(s.data() + start, s.data() + s.size(), v);
       if (res.ec != std::errc()) fail(line, "bad number literal");
+      // A float literal is digits, a point and digits (Jinja's rule: `1.`
+      // and `.5` are not literals, and `foo.0` stays an attribute).
+      const size_t after = static_cast<size_t>(res.ptr - s.data());
+      if (after + 1 < s.size() && s[after] == '.' && s[after + 1] >= '0' && s[after + 1] <= '9') {
+        double d = 0.0;
+        const auto fres = std::from_chars(s.data() + start, s.data() + s.size(), d);
+        if (fres.ec != std::errc()) fail(line, "bad number literal");
+        i = fres.ptr - s.data();
+        ETok tok{ETok::T::Float, "", 0};
+        tok.d = c == '-' ? -d : d;
+        out.push_back(std::move(tok));
+        continue;
+      }
       if (c == '-') v = -v;
       i = res.ptr - s.data();
       out.push_back({ETok::T::Int, "", v});
@@ -422,7 +439,7 @@ std::vector<ETok> lex_expr(std::string_view s, size_t line) {
       i += 2;
       continue;
     }
-    if (std::strchr("()[],.+-~|<>=:", c)) {
+    if (std::strchr("()[]{},.+-~|<>=:", c)) {
       out.push_back({ETok::T::Sym, std::string(1, c), 0});
       ++i;
       continue;
@@ -622,7 +639,7 @@ class ExprParser {
       if (e->name != "capitalize" && e->name != "tojson" &&
           e->name != "replace" && e->name != "length" && e->name != "trim" &&
           e->name != "default" && e->name != "string" && e->name != "safe" &&
-          e->name != "items")
+          e->name != "items" && e->name != "float" && e->name != "dictsort")
         fail(line_, "unsupported filter '" + e->name + "'");
       a = std::move(e);
     }
@@ -631,10 +648,10 @@ class ExprParser {
 
   ExprPtr unary() {
     if (accept_sym("-")) {
-      if (peek().t != ETok::T::Int)
-        fail(line_, "unary '-' is only supported on int literals");
+      if (peek().t != ETok::T::Int && peek().t != ETok::T::Float)
+        fail(line_, "unary '-' is only supported on number literals");
       ExprPtr e = make(Expr::Tag::Const);
-      e->value = Value::integer(-peek().i);
+      e->value = peek().t == ETok::T::Int ? Value::integer(-peek().i) : Value::number(-peek().d);
       ++pos_;
       return e;
     }
@@ -711,6 +728,12 @@ class ExprParser {
       ++pos_;
       return e;
     }
+    if (t.t == ETok::T::Float) {
+      ExprPtr e = make(Expr::Tag::Const);
+      e->value = Value::number(t.d);
+      ++pos_;
+      return e;
+    }
     if (t.t == ETok::T::Ident) {
       if (t.s == "true" || t.s == "True") {
         ++pos_;
@@ -741,6 +764,19 @@ class ExprParser {
           expect_sym("]", "list literal");
           break;
         }
+      }
+      return e;
+    }
+    if (accept_sym("{")) {
+      // A dict literal ('{"k": v, ...}', a trailing comma allowed).
+      ExprPtr e = make(Expr::Tag::DictLit);
+      while (!accept_sym("}")) {
+        e->kids.push_back(ternary());
+        expect_sym(":", "dict literal");
+        e->kids.push_back(ternary());
+        if (accept_sym(",")) continue;
+        expect_sym("}", "dict literal");
+        break;
       }
       return e;
     }
@@ -1276,6 +1312,12 @@ static void json_escape(std::string_view s, std::string& out,
 }
 
 std::string Value::to_json(bool ensure_ascii) const {
+  JsonStyle style;
+  style.ensure_ascii = ensure_ascii;
+  return to_json(style);
+}
+
+std::string Value::to_json(const JsonStyle& style) const {
   switch (kind_) {
     case Kind::Undefined:
       throw std::runtime_error("chat-template: tojson of an undefined value");
@@ -1291,25 +1333,32 @@ std::string Value::to_json(bool ensure_ascii) const {
       return format_double(d_);
     case Kind::String: {
       std::string out;
-      json_escape(s_, out, ensure_ascii);
+      json_escape(s_, out, style.ensure_ascii);
       return out;
     }
     case Kind::List: {
       std::string out = "[";
       for (size_t k = 0; k < list_.size(); ++k) {
-        if (k) out += ", ";
-        out += list_[k].to_json(ensure_ascii);
+        if (k) out += style.item_separator;
+        out += list_[k].to_json(style);
       }
       out += "]";
       return out;
     }
     case Kind::Map: {
+      // sort_keys: Python compares the keys as strings, by code point,
+      // which is the byte order of their UTF-8.
+      std::vector<const std::pair<std::string, Value>*> order;
+      order.reserve(object_->size());
+      for (const auto& m : *object_) order.push_back(&m);
+      if (style.sort_keys)
+        std::stable_sort(order.begin(), order.end(), [](const auto* x, const auto* y) { return x->first < y->first; });
       std::string out = "{";
-      for (size_t k = 0; k < object_->size(); ++k) {
-        if (k) out += ", ";
-        json_escape((*object_)[k].first, out, ensure_ascii);
-        out += ": ";
-        out += (*object_)[k].second.to_json(ensure_ascii);
+      for (size_t k = 0; k < order.size(); ++k) {
+        if (k) out += style.item_separator;
+        json_escape(order[k]->first, out, style.ensure_ascii);
+        out += style.key_separator;
+        out += order[k]->second.to_json(style);
       }
       out += "}";
       return out;
@@ -1621,11 +1670,102 @@ struct Renderer {
     if (name == "tojson") {
       // transformers' override: tojson(x, ensure_ascii=False, ...) — the
       // template always passes ensure_ascii=False (raw UTF-8 output).
-      bool ensure_ascii = false;
-      for (const auto& [k, v] : e.kwargs) {
-        if (k == "ensure_ascii") ensure_ascii = eval(*v).truthy();
+      // sort_keys and separators are json.dumps' own. An argument this
+      // does not implement (indent) is refused: ignoring it would print
+      // another string than the reference.
+      Value::JsonStyle style;
+      for (const auto& [k, kv] : e.kwargs) {
+        if (k == "ensure_ascii") {
+          style.ensure_ascii = eval(*kv).truthy();
+        } else if (k == "sort_keys") {
+          style.sort_keys = eval(*kv).truthy();
+        } else if (k == "separators") {
+          const Value seps = eval(*kv);
+          if (seps.kind() == Value::Kind::Null) continue;
+          if (seps.kind() != Value::Kind::List || seps.as_list().size() != 2 ||
+              seps.as_list()[0].kind() != Value::Kind::String || seps.as_list()[1].kind() != Value::Kind::String)
+            fail(ctx_.line, "tojson: separators is not a pair of strings");
+          style.item_separator = seps.as_list()[0].as_string();
+          style.key_separator = seps.as_list()[1].as_string();
+        } else if (k == "indent") {
+          if (eval(*kv).kind() != Value::Kind::Null) fail(ctx_.line, "tojson: indent is not supported");
+        } else {
+          fail(ctx_.line, "tojson: unsupported argument '" + k + "'");
+        }
       }
-      return Value::string_value(v.to_json(ensure_ascii));
+      if (!args.empty()) fail(ctx_.line, "tojson: positional arguments are not supported");
+      return Value::string_value(v.to_json(style));
+    }
+    if (name == "float") {
+      // Jinja's float filter: float(x), and 0.0 for what float() refuses.
+      switch (v.kind()) {
+        case Value::Kind::Double: return v;
+        case Value::Kind::Int: return Value::number(static_cast<double>(v.as_int()));
+        case Value::Kind::Bool: return Value::number(v.truthy() ? 1.0 : 0.0);
+        case Value::Kind::String: {
+          // Python accepts surrounding whitespace and a leading '+'.
+          const std::string& text = v.as_string();
+          const char* ws = " \t\n\r\x0b\x0c";
+          const size_t b = text.find_first_not_of(ws);
+          if (b == std::string::npos) return Value::number(0.0);
+          const size_t last = text.find_last_not_of(ws);
+          std::string_view body(text.data() + b, last - b + 1);
+          if (!body.empty() && body[0] == '+') body.remove_prefix(1);
+          double d = 0.0;
+          const auto res = std::from_chars(body.data(), body.data() + body.size(), d);
+          if (res.ec != std::errc() || res.ptr != body.data() + body.size()) return Value::number(0.0);
+          return Value::number(d);
+        }
+        default: return Value::number(0.0);
+      }
+    }
+    if (name == "dictsort") {
+      // The map's items as [key, value] pairs sorted by key. Jinja folds
+      // case unless case_sensitive is set. Folding here is ASCII: a key
+      // outside ASCII under the folding order is refused, not guessed.
+      if (v.kind() != Value::Kind::Map) fail(ctx_.line, "dictsort: not a map");
+      bool case_sensitive = !args.empty() && args[0].truthy();
+      bool reverse = args.size() > 2 && args[2].truthy();
+      if (args.size() > 1 && !(args[1].kind() == Value::Kind::String && args[1].as_string() == "key"))
+        fail(ctx_.line, "dictsort: only by='key' is supported");
+      if (args.size() > 3) fail(ctx_.line, "dictsort: too many arguments");
+      for (const auto& [k, kv] : e.kwargs) {
+        if (k == "case_sensitive") {
+          case_sensitive = eval(*kv).truthy();
+        } else if (k == "reverse") {
+          reverse = eval(*kv).truthy();
+        } else if (k == "by") {
+          const Value by = eval(*kv);
+          if (!(by.kind() == Value::Kind::String && by.as_string() == "key"))
+            fail(ctx_.line, "dictsort: only by='key' is supported");
+        } else {
+          fail(ctx_.line, "dictsort: unsupported argument '" + k + "'");
+        }
+      }
+      std::vector<std::pair<std::string, const std::pair<std::string, Value>*>> order;
+      order.reserve(v.as_members()->size());
+      for (const auto& m : *v.as_members()) {
+        std::string key = m.first;
+        if (!case_sensitive)
+          for (char& ch : key) {
+            if (static_cast<unsigned char>(ch) >= 0x80)
+              fail(ctx_.line, "dictsort: a key outside ASCII needs case_sensitive=true");
+            if (ch >= 'A' && ch <= 'Z') ch = static_cast<char>(ch + 32);
+          }
+        order.emplace_back(std::move(key), &m);
+      }
+      std::stable_sort(order.begin(), order.end(),
+                       [](const auto& x, const auto& y) { return x.first < y.first; });
+      if (reverse) std::reverse(order.begin(), order.end());
+      std::vector<Value> out;
+      out.reserve(order.size());
+      for (const auto& [key, m] : order) {
+        std::vector<Value> pair;
+        pair.push_back(Value::string_value(m->first));
+        pair.push_back(m->second);
+        out.push_back(Value::list_value(std::move(pair)));
+      }
+      return Value::list_value(std::move(out));
     }
     if (name == "replace") {
       if (v.kind() != Value::Kind::String || args.size() != 2 ||
@@ -1727,6 +1867,26 @@ struct Renderer {
         items.reserve(e.kids.size());
         for (const auto& k : e.kids) items.push_back(eval(*k));
         return Value::list_value(std::move(items));
+      }
+      case Expr::Tag::DictLit: {
+        // Python's dict: a repeated key keeps its first position and takes
+        // the last value.
+        Value::Members members;
+        members.reserve(e.kids.size() / 2);
+        for (size_t k = 0; k + 1 < e.kids.size(); k += 2) {
+          const Value key = eval(*e.kids[k]);
+          if (key.kind() != Value::Kind::String) fail(ctx_.line, "dict literal: a key is not a string");
+          Value value = eval(*e.kids[k + 1]);
+          bool replaced = false;
+          for (auto& m : members)
+            if (m.first == key.as_string()) {
+              m.second = value;
+              replaced = true;
+              break;
+            }
+          if (!replaced) members.emplace_back(key.as_string(), std::move(value));
+        }
+        return Value::map_value(std::move(members));
       }
       case Expr::Tag::Name: {
         const Value* v = ctx_.find(e.name);
@@ -1876,13 +2036,19 @@ struct Renderer {
           out += b.as_string();
           return Value::string_value(std::move(out));
         }
+        // '+' with two lists concatenates into a new list.
+        if (e.name == "+" && a.kind() == Value::Kind::List && b.kind() == Value::Kind::List) {
+          std::vector<Value> items = a.as_list();
+          items.insert(items.end(), b.as_list().begin(), b.as_list().end());
+          return Value::list_value(std::move(items));
+        }
         const bool a_num =
             a.kind() == Value::Kind::Int || a.kind() == Value::Kind::Double;
         const bool b_num =
             b.kind() == Value::Kind::Int || b.kind() == Value::Kind::Double;
         if (!a_num || !b_num)
           fail(ctx_.line, std::string("'") + e.name +
-                         "' needs two numbers (or, for '+', two strings)");
+                         "' needs two numbers (or, for '+', two strings or two lists)");
         if (e.name == "+") {
           if (a.kind() == Value::Kind::Int && b.kind() == Value::Kind::Int) {
             int64_t result;

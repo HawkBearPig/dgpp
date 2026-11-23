@@ -81,7 +81,9 @@ void dflash2_block_attn(const uint16_t* q, int64_t q_row_stride, const uint16_t*
 // (dflash2_block_attn_partials_bytes(rows, heads) bytes), merged by a
 // combine pass — the serial walk over a 2K window cost ~2 ms a layer. One
 // rescaling point differs from the serial form (tolerance-equal, not
-// bitwise); deterministic on every rank.
+// bitwise); deterministic on every rank. `block_window` (Inkling 2's draft)
+// measures the window from the block's last row instead of the query: every
+// row sees the same `window` positions, the block's own among them.
 int dflash2_block_attn_splits();
 size_t dflash2_block_attn_partials_bytes(int rows, int heads);
 void dflash2_block_attn_split(const uint16_t* q, int64_t q_row_stride, const uint16_t* k_cache,
@@ -89,14 +91,16 @@ void dflash2_block_attn_split(const uint16_t* q, int64_t q_row_stride, const uin
                               int blocks_per_request, int block_rows, int64_t window,
                               const int64_t* pos, int rows, int heads, int kv_heads, int dim,
                               float scale, float* partials, uint16_t* out, cudaStream_t stream,
-                              bool fp32_p = false);
+                              bool fp32_p = false, bool block_window = false);
 
 // Per-row top-K of fp32 logits (descending by score, ties to the lower id):
 // the candidate sets the selector walks. K <= 32.
 // The partials workspace the chunked top-K needs for `rows` rows of `vocab`.
 size_t dflash2_topk_ws_bytes(int64_t vocab, int rows, int k);
+// `gate` (nullable): when *gate is nonzero at execution the launches return
+// at once and the lists keep what they held.
 void dflash2_topk_f32(const float* logits, int32_t* ids, float* scores, int64_t vocab, int rows,
-                      int k, cudaStream_t stream, void* ws, size_t ws_bytes);
+                      int k, cudaStream_t stream, void* ws, size_t ws_bytes, const int32_t* gate = nullptr);
 
 // The DFlash2 candidate path selector: the scores[l][p][c] table
 // unary[l][c] + <pred_code[id(l-1, p)] * hidden[l], succ_code[id(l, c)]>

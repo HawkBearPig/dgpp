@@ -7,6 +7,7 @@
 #include <utility>
 
 #include "loaders/minijson.hpp"
+#include "text/inkling_tool_grammar.hpp"
 #include "text/minimax_tool_grammar.hpp"
 #include "text/tokenizer.hpp"
 
@@ -297,6 +298,14 @@ GrammarState::GrammarState(const GrammarVocab* vocab, GrammarSpec spec,
                            bool prompt_opens_thinking, bool model_may_open_thinking)
     : vocab_(vocab), spec_(std::move(spec)) {
   if (!spec_.active()) return;
+  if (vocab_ != nullptr && vocab_->markers().tool_format() == ToolFormat::kInkling) {
+    // The reply is typed blocks from its first id: one grammar for the tool
+    // modes and the JSON modes alike.
+    if (vocab_->eos_ids().empty())
+      throw std::invalid_argument("GrammarState: an active grammar needs a vocabulary with an EOS id");
+    inkling_ = std::make_shared<InklingToolGrammar>(vocab_, spec_);
+    return;
+  }
   think_openable_ = model_may_open_thinking && !prompt_opens_thinking && vocab_ != nullptr &&
                     vocab_->markers().think_open.available() && vocab_->markers().think_close.available();
   if (spec_.has_json()) {
@@ -377,6 +386,7 @@ const GrammarArg* GrammarState::current_arg() const {
 
 const char* GrammarState::state_name() const {
   if (!active()) return dead_ ? "dead" : "inactive";
+  if (inkling_) return inkling_->state_name();
   if (minimax_ && state_ == State::kTop) return minimax_->state_name();
   switch (state_) {
     case State::kThink: return "think";
@@ -940,6 +950,10 @@ void GrammarState::list_mask(TokenMask* out,
 void GrammarState::mask(TokenMask* out) const {
   out->allowed = 0;
   if (!active()) return;
+  if (inkling_) {
+    inkling_->mask(out);
+    return;
+  }
   if (compact_xml_text_state()) {
     compact_xml_mask(out);
     return;
@@ -1239,6 +1253,7 @@ bool GrammarState::keys_possible_for(const std::string& name) const {
 
 bool GrammarState::allows(int64_t id) const {
   if (!active()) return true;
+  if (inkling_) return inkling_->allows(id);
   if (compact_xml_text_state()) {
     TokenMask m;
     mask(&m);
@@ -1293,6 +1308,13 @@ void GrammarState::advance(int64_t id) {
   if (!active()) return;
   if (!allows(id)) {
     dead_ = true;
+    return;
+  }
+  if (inkling_) {
+    if (inkling_.use_count() != 1) inkling_ = std::make_shared<InklingToolGrammar>(*inkling_);
+    inkling_->advance(id);
+    calls_ = inkling_->calls();
+    if (inkling_->done()) state_ = State::kDone;
     return;
   }
   if (compact_xml_text_state()) {

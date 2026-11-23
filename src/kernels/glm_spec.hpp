@@ -161,13 +161,6 @@ void glm_spec_draft_rows_batched(const PickVerdict* verdicts, int requests, int 
                                  int64_t* next_out, cudaStream_t stream,
                                  const int32_t* request_map = nullptr);
 
-// A plain device-to-device copy as a KERNEL (a memcpy node may not enter
-// the captured decode graph): `bytes` a multiple of 16, both pointers
-// 16-byte aligned. The in-graph draft snapshots its DSA tail ring with it
-// before its rows run, so a fallback decided on the host can roll the block
-// back (GlmDiagnosticModel::session_draft_rollback).
-void glm_device_copy(void* dst, const void* src, size_t bytes,
-                     cudaStream_t stream);
 // Two bytes stored by a one-thread kernel (a kernel node where a memset
 // node is not allowed: the kernels-only decode graph).
 void glm_device_store_u8x2(uint8_t* dst, uint8_t a, uint8_t b, cudaStream_t stream);

@@ -131,9 +131,21 @@ void launch_dense_mma_f32(const uint16_t* act, size_t act_stride,
 // + j] = the gathered row of token t's j-th slot; segs[e] = {row0, rows
 // (possibly 0), e} for every expert and segs[E] = the shared segment. One
 // block; top_k <= 16; n_experts <= 1024.
+//
+// `positions` (nullable, one per token): padding rows read no experts. A
+// decode pass has a fixed row count and some of its rows may be padding
+// (position < 0: a closed slot's rows, a row past the context). Their output
+// is never read, but a routed row makes the grouped launches read the
+// experts it selected, which is most of a decode row's cost. With positions
+// given, a padding token is in no expert's row list, so an expert only
+// padding tokens selected has no rows and is not read. Its slots take the
+// gathered rows behind the experts' lists, in token order (slot_row and
+// rows[] as for a routed slot), so every routed slot still names a gathered
+// row of its own. No launch computes those rows: the caller treats a
+// padding token's expert output as zero.
 void launch_moe_segment(const int32_t* ids, int tokens, int top_k,
                         int n_experts, int32_t* rows, int32_t* slot_row,
-                        MoeSegment* segs, cudaStream_t stream);
+                        MoeSegment* segs, cudaStream_t stream, const int64_t* positions = nullptr);
 
 // The compact tile list (2026-09-29, the hybrid's 8K prefill profile): a
 // grouped launch whose grid is n_segs x ceil(max_rows / tile_rows) sizes

@@ -5136,6 +5136,45 @@ DGPP_TEST(prefix_cache_image_identity_and_partial_prefixes) {
           "eviction releases entries without invalidating a request's image key");
 }
 
+DGPP_TEST(prefix_cache_image_content_region_is_part_of_the_identity) {
+  using Cache = dgpp::sched::PrefixCache;
+  Cache cache({8, 1, 4});
+  const std::vector<int64_t> ids(24, 200054);
+  // An Inkling canvas: 53 x 31 pixels of content on 80 x 40.
+  dgpp::ImageInput padded;
+  padded.offset = 8;
+  padded.tokens = 2;
+  padded.width = 80;
+  padded.height = 40;
+  padded.grid = dgpp::kInklingImageGrid;
+  padded.rgb.assign(80 * 40 * 3, 123);
+  padded.valid_width = 53;
+  padded.valid_height = 31;
+  std::vector<dgpp::ImageInput> images{padded};
+  const auto keys = cache.image_keys(images);
+  const auto hash = [&](int64_t n, const Cache::Images& with) {
+    return Cache::with_images(Cache::hash_prefix(ids.data(), n), n, with);
+  };
+  const int after = cache.insert(ids.data(), 16, cache.take_free_slot(), 1, keys);
+  const auto repeated = cache.image_keys(images);
+  require(repeated[0].input == keys[0].input && cache.find_exact(ids.data(), 16, hash(16, repeated), repeated) == after,
+          "an identical padded image attaches");
+  // The same canvas bytes with the content ending elsewhere, or with no
+  // padding at all, are other inputs to the tower.
+  images[0].valid_width = 54;
+  auto wider = cache.image_keys(images);
+  require(wider[0].hash != keys[0].hash && cache.find_exact(ids.data(), 16, hash(16, wider), wider) < 0,
+          "the content region participates in the image key");
+  images[0].valid_width = images[0].valid_height = 0;
+  const auto whole = cache.image_keys(images);
+  require(whole[0].hash != keys[0].hash && cache.find_exact(ids.data(), 16, hash(16, whole), whole) < 0,
+          "a canvas read whole is not the padded image");
+  // A forced hash collision: the comparison of the regions still refuses.
+  wider[0].hash = keys[0].hash;
+  require(cache.find_exact(ids.data(), 16, hash(16, wider), wider) < 0,
+          "a hash collision cannot attach another content region");
+}
+
 DGPP_TEST(prefix_cache_video_future_frames_key_every_segment_token) {
   using Cache = dgpp::sched::PrefixCache;
   Cache cache({8, 1, 4});

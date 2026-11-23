@@ -126,3 +126,6 @@ flint_tp_fixture/
 flint_engine_fixture/
 flint_engine_cap_fixture/
 flint_decode_fixture/
+
+# The Inkling 2 tests write these fixtures into their working directory
+inkling2_*_fixture/
