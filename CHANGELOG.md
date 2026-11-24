@@ -3,7 +3,7 @@
 The history by milestone. `PLAN.md` has the milestones' exit gates;
 project procedures and design guidance live in `docs/`.
 
-## Unreleased
+## v0.2.0 — 2026-11-24
 
 - **Inkling 2 Mini** (`thinkingmachines/Inkling-2-Mini`, `inkling2_loop`): a
   new family on the shared engine, served as shipped on one, two and four
