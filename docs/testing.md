@@ -739,10 +739,14 @@ build. The suites cover:
   `inkling2_tp_test --loop-check` repeats the gates on worlds of 2 and 4
   (ports 30080 to 30120) with the ranks' vocabulary slices put back together.
   `DGPP_TEST_INK2_LOOP="guidance=1,strength=0.3"` runs the session, engine and
-  draft tests of this family under guidance, where `inkling2_decode_test` also
-  runs two slots at different strengths against their solo runs. `serve_test`
-  and `fabric_serve_test` cover the request field, its refusal on a
-  deployment without guidance and the strength's place in a submit record.
+  draft tests of this family under guidance, and the suite's `_guided` entries
+  set it. There `inkling2_decode_test` also runs two slots at different
+  strengths against their solo runs. With and without guidance it runs random
+  schedules of two slots, each a random order of single steps, verifies whose
+  last rows are rejected and snapshots, and requires every accepted row
+  bitwise the slot's solo run. `serve_test` and `fabric_serve_test` cover the
+  request field, its refusal on a deployment without guidance and the
+  strength's place in a submit record, each under random values as well.
   On the release, run `inkling2_draft_test --graph` with that variable after
   any change to the second run. `inkling2_vision_test`
   compares the vision tower stage by stage with
