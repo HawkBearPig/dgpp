@@ -551,6 +551,54 @@ void test_padding_segments() {
   std::printf("[ OK ] padding rows are in no expert's row list\n");
 }
 
+// ---- loop guidance --------------------------------------------------------------------
+// The guided logits against the host statement, bit for bit, each row at
+// its own request's strength (0 leaves a row untouched, -1 returns the
+// earlier logit).
+void test_loop_guidance() {
+  const int kRows = 6, kRequests = 4;
+  const int64_t kVocab = 4099;  // not a multiple of the kernel's threads
+  Rng rng(29);
+  std::vector<float> z(static_cast<size_t>(kRows) * kVocab), zr(z.size());
+  for (int r = 0; r < kRows; ++r)
+    for (int64_t v = 0; v < kVocab; ++v) {
+      const size_t i = static_cast<size_t>(r) * kVocab + v;
+      // Row 0 is close to uniform, row 1 has one dominant token, row 2 a tie
+      // of two, the others a spread.
+      float value = 6.0f * rng.normal3();
+      if (r == 0) value = 0.01f * rng.unit();
+      if (r == 1 && v == 17) value = 25.0f;
+      if (r == 2 && (v == 5 || v == 4000)) value = 20.0f;
+      z[i] = value;
+      zr[i] = value + 2.0f * rng.normal3();
+    }
+  // Rows 0 to 5 belong to requests 0, 1, 2, 3, 1 and one outside the table.
+  const std::vector<int32_t> row_request = {0, 1, 2, 3, 1, 9};
+  const std::vector<float> strength = {0.0f, -1.0f, 0.3f, 1.0f};
+  const auto row_strength = [&](int r) {
+    const int q = row_request[static_cast<size_t>(r)];
+    return q >= 0 && q < kRequests ? strength[static_cast<size_t>(q)] : 0.0f;
+  };
+  Dev<int32_t> d_request(row_request);
+  Dev<float> d_strength(strength);
+  {
+    Dev<float> d_z(z), d_ref(zr);
+    dgpp::ink2_logits_guide(d_z.p, d_ref.p, kRows, kVocab, d_request.p, d_strength.p, kRequests, nullptr);
+    DGPP_CUDA_OK(cudaDeviceSynchronize());
+    const std::vector<float> got = d_z.download();
+    for (int r = 0; r < kRows; ++r) {
+      const float w = row_strength(r);
+      for (int64_t v = 0; v < kVocab; ++v) {
+        const size_t i = static_cast<size_t>(r) * kVocab + v;
+        const float want = w == 0.0f ? z[i] : dgpp::ink2_guided_value_host(w, z[i], zr[i]);
+        require(std::memcmp(&got[i], &want, 4) == 0, "loop guidance: a guided logit differs from the host statement");
+        if (w == -1.0f) require(std::memcmp(&got[i], &zr[i], 4) == 0, "loop guidance: strength -1 is not the earlier logit");
+      }
+    }
+  }
+  std::printf("[ OK ] loop guidance: every row at its own request's strength\n");
+}
+
 int main(int argc, char** argv) {
   try {
     std::string dump;
@@ -565,6 +613,7 @@ int main(int argc, char** argv) {
     test_mix();
     test_device_copy();
     test_padding_segments();
+    test_loop_guidance();
     std::printf("inkling2 kernels: PASS\n");
     return 0;
   } catch (const std::exception& e) {

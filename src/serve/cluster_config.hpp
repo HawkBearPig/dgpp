@@ -201,6 +201,12 @@ struct ClusterConfig {
     // recipe). Independent of kv_dtype, so both precision controls can be
     // measured.
     std::string activations = "bf16";
+    // Inkling 2: loop guidance (models/inkling2/config.hpp). The layers after
+    // the core run a second time on the first pass's states and a request's
+    // logits move away from that readout's by its strength.
+    // loop_guidance_strength is the strength of a request that names none.
+    bool loop_guidance = false;
+    double loop_guidance_strength = 0.0;
     std::string prefill_attention = "bf16";
     // Flash-Next QSA decode arithmetic over its fp8 pool. Independent of
     // prefill_attention so either phase can retain bf16 compute.

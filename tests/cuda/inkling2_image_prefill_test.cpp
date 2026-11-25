@@ -209,7 +209,7 @@ bool refused(Call&& call) {
 }
 
 int run(const std::string& dir) {
-  const Inkling2Config cfg = Inkling2Config::from_checkpoint_dir(dir);
+  const Inkling2Config cfg = ink2fx::with_test_loop(Inkling2Config::from_checkpoint_dir(dir));
   Inkling2Model m(cfg, dir, 128, 1024, Inkling2Residency::Resident, nullptr, 0, 1, 2);
   require(m.supports_images() && m.vision_digest() != 0, "the model does not report its tower");
   require(m.image_tokens().pad == kPlaceholder, "the model does not report the placeholder token");
@@ -401,7 +401,7 @@ int run(const std::string& dir) {
 
 // A release without a tower refuses images.
 void run_text_only(const std::string& dir) {
-  const Inkling2Config cfg = Inkling2Config::from_checkpoint_dir(dir);
+  const Inkling2Config cfg = ink2fx::with_test_loop(Inkling2Config::from_checkpoint_dir(dir));
   Inkling2Model m(cfg, dir, 64, 256, Inkling2Residency::Resident, nullptr, 0, 1, 1);
   require(!m.supports_images() && m.vision_digest() == 0, "a release without a tower reports one");
   const std::vector<ImageInput> images{image(2, 1, 1, 5)};

@@ -729,7 +729,26 @@ build. The suites cover:
   tier carry the draft's planes, two-rank graph replays of two, four and
   eight slots record the proposals the eager draft makes, and one request at
   a time through recorded passes of every depth commits the tokens of the
-  same world without the draft. `inkling2_vision_test`
+  same world without the draft. Loop guidance (`engine.loop_guidance`) is
+  held to the unguided walk: `inkling2_forward_test --loop-check` requires
+  the unguided states and logits bit for bit at strength 0, the logits of a
+  one-pass walk bit for bit at strength -1 (the first pass read out alone),
+  every guided logit equal to its host statement, and a request's strength on
+  its slot equal to a deployment's default. The one-pass walk is itself
+  compared with the reference (`inkling2_one_pass_test`), and
+  `inkling2_tp_test --loop-check` repeats the gates on worlds of 2 and 4
+  (ports 30080 to 30120) with the ranks' vocabulary slices put back together.
+  `DGPP_TEST_INK2_LOOP="guidance=1,strength=0.3"` runs the session, engine and
+  draft tests of this family under guidance, and the suite's `_guided` entries
+  set it. There `inkling2_decode_test` also runs two slots at different
+  strengths against their solo runs. With and without guidance it runs random
+  schedules of two slots, each a random order of single steps, verifies whose
+  last rows are rejected and snapshots, and requires every accepted row
+  bitwise the slot's solo run. `serve_test` and `fabric_serve_test` cover the
+  request field, its refusal on a deployment without guidance and the
+  strength's place in a submit record, each under random values as well.
+  On the release, run `inkling2_draft_test --graph` with that variable after
+  any change to the second run. `inkling2_vision_test`
   compares the vision tower stage by stage with
   `tools/inkling2_vision_reference.py` on a synthetic tower, and
   `inkling2_image_prefill_test` holds an image prefill to the text prefill's

@@ -26,6 +26,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <optional>
+#include <random>
 #include <poll.h>
 #include <stdexcept>
 #include <string>
@@ -87,8 +88,13 @@ int32_t fake_token(size_t prompt_len, int index) {
 bool fake_eos_second(size_t prompt_len) { return prompt_len % 4 == 3; }
 bool fake_eos_prefill(size_t prompt_len) { return prompt_len % 4 == 2; }
 
+// A test switches the fake engine's loop guidance on before it builds a rig
+// (the service reads the capability once, at construction).
+std::atomic<bool> g_fake_loop_guidance{false};
+
 class FakeEngine : public SchedulerEngine {
  public:
+  bool supports_loop_guidance() const override { return g_fake_loop_guidance; }
   std::atomic<bool> report_decode_batch{false};
   DecodeBatchStats decode_batch_stats() const override {
     if (!report_decode_batch) return {};
@@ -2378,6 +2384,133 @@ DGPP_TEST(serve_sampling_validationNamesTheField) {
   const auto armed = rig.engine.armed();
   require(armed.size() == 1 && armed[0].params.top_k == 1 && armed[0].params.top_p == 1.0f,
           "only the valid top_p zero request reached the engine, as a singleton nucleus");
+}
+
+DGPP_TEST(serve_loopGuidance_strengthIsARequestFieldOfAGuidedDeployment) {
+  // GIVEN an engine without loop guidance,
+  {
+    ServiceRig rig(/*queue_limit=*/8, dgpp::sample::greedy_params(), /*can_sample=*/true);
+    Client models(rig.port());
+    models.send_all("GET /v1/models HTTP/1.1\r\nHost: t\r\n\r\n");
+    require(models.read_available(800).find("loop_guidance_strength") == std::string::npos,
+            "a deployment without loop guidance advertises no strength");
+    // THEN a request that asks for it is refused by capability,
+    const std::string refused = post_chat(rig, chat_body("abcd", 2, ",\"loop_guidance_strength\":0.3"));
+    require(refused.find("400 ") != std::string::npos &&
+                refused.find("\"code\":\"loop_guidance_unsupported\"") != std::string::npos &&
+                refused.find("\"param\":\"loop_guidance_strength\"") != std::string::npos,
+            "guidance refused by capability: " + refused.substr(0, 300));
+    // a strength of zero is the model's own output and is served,
+    const std::string zero = post_chat(rig, chat_body("abcd", 2, ",\"loop_guidance_strength\":0"), "usage");
+    require(zero.find("\"object\":\"chat.completion\"") != std::string::npos, "strength 0 is served");
+    // and a field-less request leaves the strength to the deployment.
+    const std::string plain = post_chat(rig, chat_body("abcd", 2), "usage");
+    require(plain.find("\"object\":\"chat.completion\"") != std::string::npos, "the field-less request is served");
+    const auto armed = rig.engine.armed();
+    require(armed.size() == 2 && armed[0].params.loop_guidance == 0.0f && armed[1].params.loop_guidance < 0.0f,
+            "an explicit zero and an unset strength reach the engine as such");
+  }
+  // GIVEN an engine with loop guidance and a deployment strength of 0.25,
+  g_fake_loop_guidance = true;
+  struct Reset {
+    ~Reset() { g_fake_loop_guidance = false; }
+  } reset;
+  dgpp::sample::Params defaults = dgpp::sample::greedy_params();
+  defaults.loop_guidance = 0.25f;
+  ServiceRig rig(/*queue_limit=*/8, defaults, /*can_sample=*/true);
+  Client models(rig.port());
+  models.send_all("GET /v1/models HTTP/1.1\r\nHost: t\r\n\r\n");
+  const std::string ml = models.read_available(800);
+  require(ml.find("\"loop_guidance_strength\":0.25") != std::string::npos,
+          "the deployment's strength is advertised: " + ml.substr(0, 400));
+  // THEN a field-less request inherits it, a request's own value replaces
+  // it, and zero switches guidance off for that request.
+  for (const char* extra : {"", ",\"loop_guidance_strength\":0.5", ",\"loop_guidance_strength\":0"}) {
+    const std::string ok = post_chat(rig, chat_body("abcd", 2, extra), "usage");
+    require(ok.find("\"object\":\"chat.completion\"") != std::string::npos, std::string("served: ") + extra);
+  }
+  const auto armed = rig.engine.armed();
+  require(armed.size() == 3 && armed[0].params.loop_guidance == 0.25f && armed[1].params.loop_guidance == 0.5f &&
+              armed[2].params.loop_guidance == 0.0f,
+          "the deployment's strength, a request's own and zero reach the engine");
+  // The range is the field's own.
+  for (const char* extra : {",\"loop_guidance_strength\":2.5", ",\"loop_guidance_strength\":-0.1",
+                            ",\"loop_guidance_strength\":\"high\""}) {
+    const std::string resp = post_chat(rig, chat_body("abcd", 2, extra));
+    require(resp.find("400 ") != std::string::npos &&
+                resp.find("\"param\":\"loop_guidance_strength\"") != std::string::npos,
+            std::string("expected a 400 naming loop_guidance_strength: ") + resp.substr(0, 300));
+  }
+}
+
+DGPP_TEST(serve_fuzz_loopGuidanceStrengthNeverBreaksARequest) {
+  // Random values in the request's loop_guidance_strength, beside random
+  // valid sampling fields: a finite number in [0, 2] reaches the engine as
+  // sent, an absent or null field as the deployment's strength, and every
+  // other value is a 400 that names the field. The server answers every one.
+  g_fake_loop_guidance = true;
+  struct Reset {
+    ~Reset() { g_fake_loop_guidance = false; }
+  } reset;
+  dgpp::sample::Params defaults = dgpp::sample::greedy_params();
+  defaults.loop_guidance = 0.25f;
+  ServiceRig rig(/*queue_limit=*/8, defaults, /*can_sample=*/true);
+  std::mt19937_64 rng(20261125);
+  struct Case {
+    std::string json;  // the field's value as written; empty: no field
+    bool ok;
+    float want;        // the strength the engine must see
+  };
+  const std::vector<Case> fixed = {
+      {"", true, 0.25f},          {"null", true, 0.25f},     {"0", true, 0.0f},        {"-0.0", true, 0.0f},
+      {"2", true, 2.0f},          {"2.0", true, 2.0f},       {"1e-9", true, 1e-9f},    {"0.30000000000000004", true, 0.3f},
+      {"2.0000001", false, 0.0f}, {"-1e-9", false, 0.0f},    {"-1", false, 0.0f},      {"1e300", false, 0.0f},
+      {"\"0.3\"", false, 0.0f},   {"true", false, 0.0f},     {"false", false, 0.0f},   {"[0.3]", false, 0.0f},
+      {"{\"s\":0.3}", false, 0.0f}, {"\"\"", false, 0.0f},   {"[]", false, 0.0f},      {"{}", false, 0.0f},
+  };
+  int accepted = 0, refused = 0;
+  for (int i = 0; i < 240; ++i) {
+    Case c;
+    if (i < static_cast<int>(fixed.size())) {
+      c = fixed[static_cast<size_t>(i)];
+    } else {
+      // A random number around the range's edges and inside it.
+      const double u = static_cast<double>(rng() >> 11) / 9007199254740992.0;
+      const double value = (rng() & 1) ? u * 2.0 : (u - 0.5) * 8.0;
+      char text[64];
+      std::snprintf(text, sizeof text, "%.17g", value);
+      c.json = text;
+      c.ok = value >= 0.0 && value <= 2.0;
+      c.want = static_cast<float>(value);
+    }
+    std::string extra;
+    if (!c.json.empty()) extra += ",\"loop_guidance_strength\":" + c.json;
+    // Valid fields beside it, in a random subset.
+    const uint64_t pick = rng();
+    if (pick & 1) extra += ",\"temperature\":0.7,\"seed\":" + std::to_string(rng() % 100000);
+    if (pick & 2) extra += ",\"top_k\":40";
+    if (pick & 4) extra += ",\"repetition_penalty\":1.1";
+    if (pick & 8) extra += ",\"presence_penalty\":0.5";
+    const size_t before = rig.engine.armed().size();
+    const std::string resp = post_chat(rig, chat_body("abcd", 2, extra), c.ok ? "usage" : "\"param\"");
+    if (c.ok) {
+      require(resp.find("\"object\":\"chat.completion\"") != std::string::npos,
+              "fuzz: a valid strength was not served: " + c.json + " -> " + resp.substr(0, 200));
+      const auto armed = rig.engine.armed();
+      require(armed.size() == before + 1 && armed.back().params.loop_guidance == c.want,
+              "fuzz: the engine did not see the strength " + c.json);
+      ++accepted;
+    } else {
+      require(resp.find("400 ") != std::string::npos &&
+                  resp.find("\"param\":\"loop_guidance_strength\"") != std::string::npos,
+              "fuzz: expected a 400 naming loop_guidance_strength for " + c.json + ": " + resp.substr(0, 200));
+      require(rig.engine.armed().size() == before, "fuzz: a refused strength reached the engine: " + c.json);
+      ++refused;
+    }
+  }
+  require(accepted > 60 && refused > 60, "fuzz: both verdicts were exercised");
+  const std::string after = post_chat(rig, chat_body("abcd", 2), "usage");
+  require(after.find("\"object\":\"chat.completion\"") != std::string::npos, "after the fuzz a completion still answers");
 }
 
 DGPP_TEST(serve_sampling_greedyEngineCollapsesDefaultsLoudly) {

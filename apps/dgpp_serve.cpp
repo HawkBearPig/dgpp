@@ -1169,12 +1169,19 @@ struct Inkling2Family final : ServeFamily {
   dgpp::LatentFormat kv_format = dgpp::LatentFormat::kBf16;
   bool native_activations = false;
   std::unique_ptr<dgpp::Inkling2Model> model;
-  Inkling2Family(const std::string& checkpoint, dgpp::LatentFormat fmt, bool native)
+  Inkling2Family(const std::string& checkpoint, dgpp::LatentFormat fmt, bool native,
+                 const dgpp::Inkling2LoopOptions& loop)
       : cfg(dgpp::Inkling2Config::from_checkpoint_dir(checkpoint)), ckpt(checkpoint), kv_format(fmt),
         native_activations(native) {
     if (kv_format != dgpp::LatentFormat::kBf16)
       throw std::invalid_argument(std::string("engine.kv_dtype ") + dgpp::latent_format_name(kv_format) +
                                   " is not implemented for the Inkling 2 K/V cache (bf16)");
+    // The deployment's loop guidance: the memory plan, the cache geometry
+    // and the model all follow the config from here.
+    cfg.apply_loop_options(loop);
+    if (cfg.loop_guidance)
+      DGPP_LOG_INFO("inkling2: loop guidance on: {} reference visits a token beside the model's {}, default strength {}",
+                    cfg.reference_visits(), cfg.num_visits(), cfg.loop_guidance_strength);
   }
   const char* name() const override { return "inkling2_loop"; }
   int64_t vocab_size() const override { return cfg.vocab_size; }
@@ -1453,14 +1460,18 @@ std::unique_ptr<ServeFamily> make_family(const std::string& ckpt, int world,
                                          dgpp::LatentFormat kv_format,
                                          const std::optional<dgpp::RopeScaling>& rope_scaling,
                                          bool fp8_head_mma, int index_topk, int candidate_topk_blocks,
-                                         int candidate_block_size, const std::string& activations) {
+                                         int candidate_block_size, const std::string& activations,
+                                         const dgpp::Inkling2LoopOptions& loop) {
   const dgpp::ModelArchitecture arch =
       dgpp::detect_architecture_file((fs::path(ckpt) / "config.json").string());
   if (activations != "bf16" && activations != "native")
     throw std::invalid_argument("engine.activations must be bf16 or native");
-  if (activations == "native" && arch != dgpp::ModelArchitecture::MinimaxM3 &&
-      arch != dgpp::ModelArchitecture::Inkling2Loop)
-    throw std::invalid_argument("engine.activations native is supported only for MiniMax and Inkling 2");
+  // Loop guidance is a looped family's: no other family runs its layers more
+  // than once, so a key that names it there is a misconfiguration.
+  if (arch != dgpp::ModelArchitecture::Inkling2Loop && (loop.guidance || loop.strength != 0.0f))
+    throw std::invalid_argument(
+        "engine.loop_guidance* are the looped family's (inkling2_loop); this checkpoint's family runs every layer "
+        "once");
   if (arch == dgpp::ModelArchitecture::DeepseekV41)
     return std::make_unique<Dsv41Family>(ckpt, index_topk, candidate_topk_blocks, candidate_block_size);
   // The index budget is the DeepSeek-V4.1 indexer's: no other family has a
@@ -1476,7 +1487,7 @@ std::unique_ptr<ServeFamily> make_family(const std::string& ckpt, int world,
   if (arch == dgpp::ModelArchitecture::MinimaxM3)
     return std::make_unique<MinimaxFamily>(ckpt, kv_format, activations == "native");
   if (arch == dgpp::ModelArchitecture::Inkling2Loop)
-    return std::make_unique<Inkling2Family>(ckpt, kv_format, activations == "native");
+    return std::make_unique<Inkling2Family>(ckpt, kv_format, activations == "native", loop);
   if (arch == dgpp::ModelArchitecture::Qwen4Exp)
     return std::make_unique<QwenFamily>(ckpt, rope_scaling, fp8_head_mma, kv_format);
   if (arch == dgpp::ModelArchitecture::Qwen3_5)
@@ -2042,6 +2053,9 @@ int main(int argc, char** argv) {
   bool prefill_fp8_per_tensor = false;  // the Qwen3.8-27B per-tensor prefill recipe (opt-in)
   std::string prefill_activations = "bf16";  // "native": the checkpoint's activation recipe on prefill rows
   std::string activations = "bf16";  // MiniMax target: every row, including decode
+  // Inkling 2's loop guidance (engine.loop_guidance*).
+  bool loop_guidance = false;
+  float loop_guidance_strength = 0.0f;
   std::string prefill_attention = "bf16";    // Qwen3.5 / Flash-Next attention over an fp8 pool
   std::string decode_attention = "bf16";     // Flash-Next QSA: bf16 or native fp8 compute
   std::string expert_gemm = "wide";         // the packed expert GEMM's form and companions (engine.expert_*)
@@ -2210,6 +2224,8 @@ int main(int argc, char** argv) {
     prefill_fp8_per_tensor = e.prefill_fp8_per_tensor;
     prefill_activations = e.prefill_activations;
     activations = e.activations;
+    loop_guidance = e.loop_guidance;
+    loop_guidance_strength = static_cast<float>(e.loop_guidance_strength);
     prefill_attention = e.prefill_attention;
     decode_attention = e.decode_attention;
     expert_gemm = e.expert_gemm;
@@ -2808,6 +2824,8 @@ int main(int argc, char** argv) {
         ws.prefill_fp8_per_tensor = prefill_fp8_per_tensor;
         ws.prefill_activations = prefill_activations;
         ws.activations = activations;
+        ws.loop_guidance = loop_guidance;
+        ws.loop_guidance_strength = loop_guidance_strength;
         ws.prefill_attention = prefill_attention;
         ws.decode_attention = decode_attention;
         ws.dflash_model = dflash_model;
@@ -2935,6 +2953,8 @@ int main(int argc, char** argv) {
         prefill_fp8_gemm = ws.prefill_fp8_gemm;
         prefill_fp8_per_tensor = ws.prefill_fp8_per_tensor;
         activations = ws.activations;
+        loop_guidance = ws.loop_guidance;
+        loop_guidance_strength = ws.loop_guidance_strength;
         prefill_attention = ws.prefill_attention;
         decode_attention = ws.decode_attention;
         dflash_model = ws.dflash_model;
@@ -3493,9 +3513,12 @@ int main(int argc, char** argv) {
     const auto t_boot = std::chrono::steady_clock::now();
     // The family from config.json's architecture (loaders/architecture.hpp):
     // everything below the engine interface comes from it.
+    dgpp::Inkling2LoopOptions loop_options;
+    loop_options.guidance = loop_guidance;
+    loop_options.strength = loop_guidance_strength;
     std::unique_ptr<ServeFamily> family =
         make_family(ckpt, world, kv_format, rope_scaling, fp8_head == "mma", index_topk, candidate_topk_blocks,
-                    candidate_block_size, activations);
+                    candidate_block_size, activations, loop_options);
     if (runtime_adapters) {
       const auto* glm = dynamic_cast<GlmDsaFamily*>(family.get());
       if (!glm) throw std::runtime_error("runtime adapter requires GLM DSA");
@@ -3724,6 +3747,8 @@ int main(int argc, char** argv) {
       sampling_defaults.repetition_penalty = *repetition_penalty;
     if (frequency_penalty) sampling_defaults.frequency_penalty = *frequency_penalty;
     if (presence_penalty) sampling_defaults.presence_penalty = *presence_penalty;
+    // A deployment with loop guidance gives a request that names no strength its own.
+    if (loop_guidance) sampling_defaults.loop_guidance = loop_guidance_strength;
     try {
       dgpp::sample::validate_params(sampling_defaults);
     } catch (const std::invalid_argument& e) {

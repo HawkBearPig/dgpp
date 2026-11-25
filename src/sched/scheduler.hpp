@@ -195,6 +195,11 @@ class SchedulerEngine {
       throw std::logic_error(
           "SchedulerEngine: this engine samples greedily only");
   }
+  // Loop guidance: an engine whose model moves a request's logits away from
+  // an earlier pass's readout takes the strength with the sampling spec
+  // (sampling.loop_guidance). The default engine has none, and the
+  // scheduler refuses a request that asks at submit.
+  virtual bool supports_loop_guidance() const { return false; }
   // Logprobs: an engine that reports them returns, after each prefill/step,
   // one Result per token that op returned (in order) for a slot whose spec
   // asked (sampling.logprobs >= 0 through configure_sampling with

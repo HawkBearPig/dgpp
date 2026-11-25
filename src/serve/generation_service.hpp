@@ -21,7 +21,10 @@
 //                               temperature, top_p, presence_penalty,
 //                               frequency_penalty, seed (the OpenAI
 //                               fields) plus top_k, min_p and
-//                               repetition_penalty (HF extensions) —
+//                               repetition_penalty (HF extensions) and
+//                               loop_guidance_strength (a looped model
+//                               under engine.loop_guidance; 0 is the
+//                               model's own logits) —
 //                               every omitted field takes the model's
 //                               generation_config.json default (M6 6b,
 //                               DESIGN §10); temperature 0 is the exact
@@ -764,6 +767,7 @@ class GenerationService : public HttpHandler,
                                  static_cast<uint64_t>(std::random_device{}())};
   Stats stats_;  // written under mutex_ (cheap, exact)
   bool sampling_available_ = false;
+  bool loop_guidance_available_ = false;  // the engine's model takes a per-request guidance strength
   std::mt19937_64 seed_rng_;  // HTTP thread only (prepared request handoff)
   std::mt19937_64 obfuscation_rng_{std::random_device{}()};  // independent of sampler seeds
 

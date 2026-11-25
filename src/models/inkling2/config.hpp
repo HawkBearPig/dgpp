@@ -69,6 +69,25 @@ struct Inkling2Visit {
   int pass = 0;
 };
 
+// Loop guidance (engine.loop_guidance, arXiv 2610.02185). Every pass over the
+// core hands on the same states: the blocks it completed after its first and
+// its partial state, which the layers after the core read. Guidance runs
+// those layers a second time on the first pass's states, over K/V planes and
+// convolution rings of their own, and moves a row's logits away from that
+// readout's:
+//   guided = (1 + w) * last - w * first-pass readout.
+// The model's own walk is untouched, so its keys, values, convolution state
+// and the draft model's inputs are what they are without guidance, and a
+// request's strength w chooses its output without touching another's or the
+// prefix cache.
+struct Inkling2LoopOptions {
+  bool guidance = false;
+  // The strength of a request that names none (a request sets its own:
+  // Inkling2Model::configure_loop_guidance). Tests read out the first pass
+  // alone at -1.
+  float strength = 0.0f;
+};
+
 struct Inkling2Config {
   // --- model shape -------------------------------------------------------
   int hidden_size = 2304;
@@ -88,6 +107,9 @@ struct Inkling2Config {
   int core_end = 18;
   int num_passes = 3;
   int gate_rank = 64;
+  // Loop guidance as the deployment sets it (apply_loop_options).
+  bool loop_guidance = false;
+  float loop_guidance_strength = 0.0f;
 
   // --- attention -----------------------------------------------------------
   int num_attention_heads = 24;
@@ -129,9 +151,20 @@ struct Inkling2Config {
   }
   bool layer_mxfp8(int l) const { return format_of(l, 0) == Inkling2ExpertFormat::Mxfp8; }
 
+  // Applies a deployment's loop guidance. Throws std::invalid_argument naming
+  // the engine key on a value the walk cannot run.
+  void apply_loop_options(const Inkling2LoopOptions& options);
+
   int core_layers() const { return core_end - core_start; }
+  // The layers after the core.
+  int coda_layers() const { return num_hidden_layers - core_end; }
   // Layer executions per token: the prelude, every pass of the core, the coda.
   int num_visits() const { return num_hidden_layers + (num_passes - 1) * core_layers(); }
+  // The second run of the layers after the core under loop guidance: its
+  // visits follow the model's own and keep planes and rings of their own.
+  int reference_visits() const { return loop_guidance ? coda_layers() : 0; }
+  // Visits in [num_visits(), num_visits() + reference_visits()) are the
+  // reference readout's, in layer order.
   Inkling2Visit visit(int v) const;
   int visit_of(int layer, int pass) const;
   // The bias extent of layer l's attention.

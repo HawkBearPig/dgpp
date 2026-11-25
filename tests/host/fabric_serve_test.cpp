@@ -32,6 +32,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <map>
 #include <stdexcept>
 #include <string>
@@ -1058,6 +1059,23 @@ void test_journal_codec() {
                 bits_equal(b.sampling.presence_penalty, 1.0e-7f) &&
                 b.sampling.logprobs == 3 && b.seed == 0xfedcba9876543210ull,
             "codec: sampling spec must round-trip bitwise");
+    // The loop guidance strength rides beside the sampling spec, only when a
+    // request names one: a greedy guided submit carries no spec, an unset
+    // strength no field, and an explicit zero stays a zero.
+    require(greedy_line.find("\"lg\"") == std::string::npos, "codec: an unset loop guidance strength rides nowhere");
+    for (const float strength : {0.3f, 0.0f}) {
+      GenerationService::PassEvents guided;
+      dgpp::sched::SchedulerRequest gs = submit;
+      gs.sampling.loop_guidance = strength;
+      guided.submits.push_back(gs);
+      const std::string line = dgpp::serve::encode_journal_tick(guided);
+      require(line.find("\"lg\"") != std::string::npos && line.find("\"g\"") == std::string::npos,
+              "codec: a greedy guided submit carries its strength and no sampling spec");
+      const dgpp::serve::JournalRecord back = dgpp::serve::decode_journal_line(line);
+      require(back.submits.size() == 1 && bits_equal(back.submits[0].sampling.loop_guidance, strength),
+              "codec: the loop guidance strength must round-trip bitwise");
+    }
+    require(got.submits[0].sampling.loop_guidance < 0.0f, "codec: a submit without a strength decodes as unset");
     bool bad = false;
     try {
       // top_p bits of 2.0f: a spec no rank may apply.
@@ -2288,6 +2306,94 @@ DGPP_TEST(journal_greedy_penalties_reach_every_rank_without_logprobs) {
     dgpp::sample::apply_context_penalties(peer.data(), 4, 0, got, context);
     require(std::memcmp(leader.data(), peer.data(), leader.size() * sizeof(float)) == 0,
             "leader and peer apply identical penalty arithmetic");
+  }
+}
+
+DGPP_TEST(journal_sampling_specs_roundtrip_under_fuzz) {
+  // Whatever combination of sampling fields a submit carries, a peer applies
+  // the leader's values bit for bit: the spec rides exactly when the submit
+  // needs one, and the loop guidance strength exactly when the request named
+  // one, beside the spec or without it.
+  std::mt19937_64 rng(20261125);
+  const auto unit = [&] { return static_cast<float>(static_cast<double>(rng() >> 11) / 9007199254740992.0); };
+  const auto same = [](float a, float b) { return std::memcmp(&a, &b, sizeof(a)) == 0; };
+  int with_spec = 0, with_strength = 0;
+  for (int i = 0; i < 4000; ++i) {
+    GenerationService::PassEvents events;
+    dgpp::sched::SchedulerRequest r;
+    r.id = "fuzz" + std::to_string(i);
+    r.prompt = {1, 2, 3};
+    r.max_steps = 2;
+    dgpp::sample::Params& p = r.sampling;
+    const uint64_t pick = rng();
+    if (pick & 1) {
+      p.temperature = 0.05f + 1.9f * unit();
+      r.seed = rng();
+    }
+    if (pick & 2) p.top_p = 0.01f + 0.99f * unit();
+    if (pick & 4) p.top_k = static_cast<int>(rng() % 200);
+    if (pick & 8) p.min_p = unit();
+    if (pick & 16) p.repetition_penalty = 0.5f + unit();
+    if (pick & 32) p.frequency_penalty = 4.0f * unit() - 2.0f;
+    if (pick & 64) p.presence_penalty = 4.0f * unit() - 2.0f;
+    if (pick & 128) p.logprobs = r.logprobs = static_cast<int>(rng() % 21);
+    switch ((pick >> 8) % 5) {
+      case 1: p.loop_guidance = 0.0f; break;
+      case 2: p.loop_guidance = -0.0f; break;
+      case 3: p.loop_guidance = 2.0f * unit(); break;
+      case 4: p.loop_guidance = 2.0f; break;
+      default: break;  // unset: the deployment's strength
+    }
+    events.submits.push_back(r);
+    const std::string line = dgpp::serve::encode_journal_tick(events);
+    const bool spec = p.temperature > 0.0f || r.logprobs >= 0 || dgpp::sample::needs_context_penalties(p);
+    const bool named = p.loop_guidance >= 0.0f;
+    with_spec += spec ? 1 : 0;
+    with_strength += named ? 1 : 0;
+    require((line.find("\"g\":{") != std::string::npos) == spec, "fuzz: the spec rides exactly when the submit needs one");
+    require((line.find("\"lg\":") != std::string::npos) == named, "fuzz: the strength rides exactly when the request names one");
+    const dgpp::serve::JournalRecord back = dgpp::serve::decode_journal_line(line);
+    require(back.submits.size() == 1 && back.submits[0].id == r.id, "fuzz: one submit comes back");
+    const dgpp::sched::SchedulerRequest& b = back.submits[0];
+    // Without a spec a peer runs the greedy defaults, as the leader does.
+    dgpp::sample::Params want = spec ? p : dgpp::sample::greedy_params();
+    want.loop_guidance = p.loop_guidance;
+    require(same(b.sampling.temperature, want.temperature) && same(b.sampling.top_p, want.top_p) &&
+                b.sampling.top_k == want.top_k && same(b.sampling.min_p, want.min_p) &&
+                same(b.sampling.repetition_penalty, want.repetition_penalty) &&
+                same(b.sampling.frequency_penalty, want.frequency_penalty) &&
+                same(b.sampling.presence_penalty, want.presence_penalty) && b.sampling.logprobs == want.logprobs &&
+                b.logprobs == r.logprobs && (!spec || b.seed == r.seed),
+            "fuzz: submit " + std::to_string(i) + " lost a sampling field on the wire");
+    require(named ? same(b.sampling.loop_guidance, p.loop_guidance) : b.sampling.loop_guidance < 0.0f,
+            "fuzz: submit " + std::to_string(i) + " lost its loop guidance strength on the wire");
+  }
+  require(with_spec > 1000 && with_spec < 3990 && with_strength > 1000 && with_strength < 3990,
+          "fuzz: the cases cover submits with and without a spec and a strength");
+  // A strength outside the field's range is refused at decode, as a bad spec is.
+  for (const float bad : {2.5f, -0.5f, std::numeric_limits<float>::infinity(), std::numeric_limits<float>::quiet_NaN()}) {
+    GenerationService::PassEvents events;
+    dgpp::sched::SchedulerRequest r;
+    r.id = "bad";
+    r.prompt = {1};
+    r.sampling.loop_guidance = 1.0f;
+    events.submits.push_back(r);
+    std::string line = dgpp::serve::encode_journal_tick(events);
+    uint32_t good_bits, bad_bits;
+    const float good = 1.0f;
+    std::memcpy(&good_bits, &good, 4);
+    std::memcpy(&bad_bits, &bad, 4);
+    const std::string from = "\"lg\":" + std::to_string(good_bits), to = "\"lg\":" + std::to_string(bad_bits);
+    const size_t at = line.find(from);
+    require(at != std::string::npos, "fuzz: the strength's bits are in the record");
+    line.replace(at, from.size(), to);
+    bool refused = false;
+    try {
+      (void)dgpp::serve::decode_journal_line(line);
+    } catch (const std::exception&) {
+      refused = true;
+    }
+    require(refused, "fuzz: a strength outside [0, 2] is refused at decode");
   }
 }
 

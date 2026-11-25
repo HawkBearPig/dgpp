@@ -192,6 +192,42 @@ is read once in its 12-bit form for up to 32 rows.
 on this model. The recurrent head moves tokens that a shortlist taken from
 the uncorrected logits leaves out, so the draft reads the exact head.
 
+## Loop guidance
+
+`engine.loop_guidance` is an optional decoding mode for this model, off in the
+templates that carry no `_guided` suffix. It follows the contrastive decoding
+of looped transformers described in arXiv 2610.02185.
+
+**What it does.** Each pass over the core layers leaves the states the last
+six layers read. The model's answer comes from the third pass. Under guidance
+the last six layers run a second time on the first pass's states, which gives
+a weaker reading of the same position, and the request's logits move away
+from that reading: `(1 + s) * logits - s * readout` at strength `s`, before
+penalties, bias, grammar and temperature. A guided output is not the
+checkpoint's own. At strength 0 it is.
+
+**What a request controls.** `loop_guidance_strength` on a chat request sets
+`s` for that request, from 0 to 2. An omitted field takes the deployment's
+`engine.loop_guidance_strength`. Requests at different strengths share a pass.
+
+**What stays as it is.** The second run reads and writes K/V planes and
+convolution state of its own, six of each, after the draft model's. The
+model's own keys, values and convolution state and the draft model's inputs
+are bit for bit what they are without guidance. A prefix-cache entry
+therefore serves every strength, and the draft model's proposals are checked
+against the guided choice, so the output with the draft model on is the
+output without it.
+
+**What it costs.** The second run happens for every prompt and generated
+token of a guided deployment, whatever a request's strength: six more layer
+visits on top of 48, about 12 percent more K/V memory per token, and one more
+read of the vocabulary head per row. See [benchmarks](../benchmarks.md) for
+the measured rates of the guided template.
+
+**Fewer passes.** Running the core fewer than three times is not offered. The
+checkpoint is trained at exactly three passes and stops completing its
+reasoning at two.
+
 ## Images
 
 The vision tower is served. An image part of a chat request is kept at its

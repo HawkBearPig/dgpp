@@ -310,7 +310,7 @@ bool same(const std::vector<float>& a, const std::vector<float>& b) {
 }
 
 int run_checks(const std::string& dir, bool native) {
-  const Inkling2Config cfg = ink2fx::draft_config();
+  const Inkling2Config cfg = ink2fx::with_test_loop(ink2fx::draft_config());
   const int B = cfg.draft.block_size;
   constexpr int kMaxTokens = 128;
   constexpr int64_t kCache = 512;
@@ -465,7 +465,7 @@ int run_checks(const std::string& dir, bool native) {
 int run_graph_gate(const std::string& dir, const std::vector<int64_t>& ids, const std::vector<int64_t>& before, int steps,
                    bool native, int depth, uint16_t port, int world, int slots, bool warm, int forward_rows,
                    int64_t pool_tokens) {
-  const Inkling2Config cfg = Inkling2Config::from_checkpoint_dir(dir);
+  const Inkling2Config cfg = ink2fx::with_test_loop(Inkling2Config::from_checkpoint_dir(dir));
   const int B = cfg.draft.block_size;
   const int max_tokens = forward_rows > 0 ? forward_rows : std::max(256, static_cast<int>(std::max(ids.size(), before.size())));
   const int64_t cache = pool_tokens > 0 ? pool_tokens
@@ -586,7 +586,7 @@ int run_graph_gate(const std::string& dir, const std::vector<int64_t>& ids, cons
 // Whatever it leaves in the slot must not change the transcript.
 int run_release(const std::string& dir, const std::vector<int64_t>& ids, int steps, bool native,
                 const std::vector<float>& fit, const std::string& conf_out, const std::vector<int64_t>& before) {
-  const Inkling2Config cfg = Inkling2Config::from_checkpoint_dir(dir);
+  const Inkling2Config cfg = ink2fx::with_test_loop(Inkling2Config::from_checkpoint_dir(dir));
   require(cfg.draft.present, "the checkpoint bundles no draft model");
   const int B = cfg.draft.block_size;
   const int max_tokens = std::max(256, static_cast<int>(std::max(ids.size(), before.size())));
@@ -721,7 +721,7 @@ int main(int argc, char** argv) {
     }
     if (!fixture.empty() && dump.empty()) return run_checks(fixture, native);
     if (!fixture.empty()) {
-      const Inkling2Config cfg = ink2fx::draft_config();
+      const Inkling2Config cfg = ink2fx::with_test_loop(ink2fx::draft_config());
       const std::vector<Case> cases = fixture_cases();
       const std::vector<int64_t> ids = smoke_tokens(cfg, 96, 0x9E3779B97F4A7C15ull);
       write_dump(dump, cfg, world,
@@ -732,7 +732,7 @@ int main(int argc, char** argv) {
       std::fprintf(stderr, "inkling2_draft_test: --write-fixture, --fixture or --checkpoint-dir\n");
       return 2;
     }
-    const Inkling2Config cfg = Inkling2Config::from_checkpoint_dir(checkpoint);
+    const Inkling2Config cfg = ink2fx::with_test_loop(Inkling2Config::from_checkpoint_dir(checkpoint));
     if (!dump.empty()) {
       const std::vector<int64_t> ids = ids_path.empty() ? smoke_tokens(cfg, 2200, 0x9E3779B97F4A7C15ull)
                                                         : ink2ref::read_ids(ids_path);

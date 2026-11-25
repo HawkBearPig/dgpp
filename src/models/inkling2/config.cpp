@@ -278,7 +278,24 @@ Inkling2Visit Inkling2Config::visit(int v) const {
   if (v < core_start) return {v, 0};
   const int core = core_layers();
   if (v < core_start + num_passes * core) return {core_start + (v - core_start) % core, (v - core_start) / core};
-  return {v - (num_passes - 1) * core, 0};
+  if (v < num_visits()) return {v - (num_passes - 1) * core, 0};
+  // The reference readout repeats the layers after the core.
+  return {core_end + (v - num_visits()), 0};
+}
+
+void Inkling2Config::apply_loop_options(const Inkling2LoopOptions& o) {
+  const auto bad = [](const char* key, const std::string& why) {
+    throw std::invalid_argument(std::string("engine.") + key + ": " + why);
+  };
+  if (!o.guidance) {
+    if (o.strength != 0.0f) bad("loop_guidance_strength", "set without engine.loop_guidance");
+    return;
+  }
+  if (num_passes < 2) bad("loop_guidance", "the loop runs once: there is no earlier pass to read out");
+  if (!std::isfinite(o.strength) || o.strength < -1.0f || o.strength > 4.0f)
+    bad("loop_guidance_strength", "must be in [-1, 4]");
+  loop_guidance = true;
+  loop_guidance_strength = o.strength;
 }
 
 int Inkling2Config::visit_of(int layer, int pass) const {

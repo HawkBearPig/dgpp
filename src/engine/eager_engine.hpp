@@ -92,9 +92,18 @@ class EagerEngineAdapter : public sched::SchedulerEngine {
   bool supports_logprobs() const override {
     return static_cast<bool>(sample_);
   }
+  bool supports_loop_guidance() const override {
+    if constexpr (requires { model_->loop_guidance(); }) return model_->loop_guidance();
+    return false;
+  }
   void configure_sampling(int req, const sample::Params& sampling,
                           uint64_t seed) override {
     sample::validate_params(sampling);
+    if constexpr (requires { model_->configure_loop_guidance(req, 0.0f); })
+      model_->configure_loop_guidance(
+          req, sampling.loop_guidance < 0.0f ? model_->loop_guidance_default() : sampling.loop_guidance);
+    else if (sampling.loop_guidance > 0.0f)
+      throw std::logic_error("generation engine: this family has no loop guidance");
     if (sampling.temperature > 0.0f && !sample_)
       throw std::logic_error(
           "generation engine: no sampler bound — this engine is greedy-only");

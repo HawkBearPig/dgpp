@@ -238,6 +238,15 @@ void run_window_gate(const Inkling2Config& cfg, const std::string& dir) {
 // split count of the attention and the GEMV against the batched GEMM. The
 // steps cross the pool's block boundary, the window, the relative extent and
 // the ring's wrap.
+//
+// The fixture's routers sit near ties, so a difference of a few bf16 units in
+// the expert input can route a row to another expert: that row's state is
+// then another expert's output and says nothing about the decode forms, and
+// neither do the next rows the MLP convolution carries it into. The flips
+// are counted against the same budget as the forward test's (5 % of the
+// slots) and those rows' state is left out of the comparison. Which tokens
+// hit a tie depends on the transcript, so a run under loop guidance meets
+// other ties than a run without.
 void run_trace_gate(const Inkling2Config& cfg, const std::string& dir, const char* what) {
   const int P = 23, steps = 60, H = cfg.hidden_size, V = cfg.num_visits();
   const std::vector<int64_t> prompt = smoke_tokens(cfg, P, 0x9E3779B97F4A7C15ull);
@@ -245,6 +254,7 @@ void run_trace_gate(const Inkling2Config& cfg, const std::string& dir, const cha
   m->set_decode_row_traces(true);
   struct Step {
     std::vector<std::vector<uint16_t>> attn, in, state;
+    std::vector<int32_t> routes;  // visit 0
   };
   std::vector<Step> trace;
   std::vector<int64_t> all(prompt);
@@ -254,7 +264,8 @@ void run_trace_gate(const Inkling2Config& cfg, const std::string& dir, const cha
     all.push_back(token);
     o = m->session_step(0, token);
     require(static_cast<int>(o.layer_states.size()) == V, "trace gate: a step records every visit");
-    trace.push_back(Step{m->visit_attention(), m->visit_mlp_input(), o.layer_states});
+    require(static_cast<int>(o.route_ids.size()) == V, "trace gate: a step records every visit's routes");
+    trace.push_back(Step{m->visit_attention(), m->visit_mlp_input(), o.layer_states, o.route_ids[0]});
   }
   m->session_close(0);
   m->set_decode_row_traces(false);
@@ -272,13 +283,35 @@ void run_trace_gate(const Inkling2Config& cfg, const std::string& dir, const cha
     return std::sqrt(d2 / (w2 + 1e-30));
   };
   std::vector<double> worst_attn(static_cast<size_t>(V), 0.0), worst_in(static_cast<size_t>(V), 0.0), worst_state(static_cast<size_t>(V), 0.0);
-  for (int s = 0; s < steps; ++s)
+  // The slots of a step's first visit whose expert the re-forward did not pick.
+  const int K = cfg.num_experts_per_tok;
+  const auto flipped = [&](const std::vector<int32_t>& row, int pos) {
+    const std::vector<int32_t>& plane = f.route_ids[0];
+    int n = 0;
+    for (int k = 0; k < K; ++k) {
+      bool found = false;
+      for (int j = 0; j < K; ++j) found = found || row[static_cast<size_t>(k)] == plane[static_cast<size_t>(pos) * K + j];
+      n += found ? 0 : 1;
+    }
+    return n;
+  };
+  // A flipped row's expert output also enters the MLP convolution of the
+  // rows after it, as far as the taps reach.
+  int flips = 0, flipped_rows = 0, last_flip = -cfg.sconv_kernel_size;
+  for (int s = 0; s < steps; ++s) {
+    const int row_flips = flipped(trace[static_cast<size_t>(s)].routes, P + s);
+    flips += row_flips;
+    if (row_flips > 0) last_flip = s;
+    const bool carried = s - last_flip < cfg.sconv_kernel_size;
+    flipped_rows += carried ? 1 : 0;
     for (int v = 0; v < V; ++v) {
       const size_t i = static_cast<size_t>(v);
       worst_attn[i] = std::max(worst_attn[i], rel(trace[static_cast<size_t>(s)].attn[i], f_attn[i], P + s));
       worst_in[i] = std::max(worst_in[i], rel(trace[static_cast<size_t>(s)].in[i], f_in[i], P + s));
+      if (v == 0 && carried) continue;
       worst_state[i] = std::max(worst_state[i], rel(trace[static_cast<size_t>(s)].state[i], f.layer_states[i], P + s));
     }
+  }
   std::string later;
   for (int v = 1; v < V; ++v) {
     char buf[40];
@@ -289,6 +322,10 @@ void run_trace_gate(const Inkling2Config& cfg, const std::string& dir, const cha
               "input %.5f, state %.5f\n",
               what, steps, cfg.is_local_layer(0) ? "local" : "full", worst_attn[0], worst_in[0], worst_state[0]);
   std::printf("[ .. ] %s: later visits' states (reported):%s\n", what, later.c_str());
+  std::printf("[ .. ] %s: %d of %d first-visit slots routed to another expert than the re-forward's (%d rows that carry "
+              "one, their state not compared)\n",
+              what, flips, steps * K, flipped_rows);
+  require(flips * 20 <= steps * K, std::string(what) + ": routing flips at the first visit exceed 5 % of the slots");
   require(worst_attn[0] < 1e-2, std::string(what) + ": a decode row's first attention differs from the re-forward's");
   require(worst_in[0] < 2e-2, std::string(what) + ": a decode row's first expert input differs from the re-forward's");
   if (!g_native) require(worst_state[0] < 5e-2, std::string(what) + ": a decode row's first state differs from the re-forward's");
@@ -337,7 +374,7 @@ void run_prefix_gate(const Inkling2Config& cfg, const std::string& dir) {
 }
 
 int run_fixture(const std::string& dir) {
-  const Inkling2Config cfg = Inkling2Config::from_checkpoint_dir(dir);
+  const Inkling2Config cfg = ink2fx::with_test_loop(Inkling2Config::from_checkpoint_dir(dir));
   const std::vector<int64_t> A = smoke_tokens(cfg, 23, 0x9E3779B97F4A7C15ull);
   const std::vector<int64_t> B = smoke_tokens(cfg, 17, 0xD1B54A32D192ED03ull);
   run_prefix_gate(cfg, dir);
@@ -478,6 +515,135 @@ int run_fixture(const std::string& dir) {
     std::printf("[ OK ] two interleaved slots reproduce their solo transcripts bitwise\n");
   }
 
+  // 3b. Under loop guidance a slot runs at its own request's strength: slot
+  //     1 at another strength than slot 0, interleaved, reproduces the solo
+  //     run at that strength, and slot 0 its own.
+  if (cfg.loop_guidance) {
+    const float own = m.loop_guidance_default(), other = own + 0.4f;
+    m.configure_loop_guidance(0, other);
+    const Transcript tB2 = greedy(m, 0, B, 8);
+    m.session_close(0);
+    m.configure_loop_guidance(0, own);
+    m.configure_loop_guidance(1, other);
+    Inkling2Model::Outputs oa = m.session_prefill(0, A);
+    Inkling2Model::Outputs ob = m.session_prefill(1, B);
+    require(bitwise(oa.logits, tA.rows[0]) && bitwise(ob.logits, tB2.rows[0]),
+            "guided slots: a prefill differs from the solo run at the slot's strength");
+    int64_t pa = tA.tokens[0], pb = tB2.tokens[0];
+    for (int s = 0; s < 8; ++s) {
+      oa = m.session_step(0, pa);
+      ob = m.session_step(1, pb);
+      require(bitwise(oa.logits, tA.rows[static_cast<size_t>(s) + 1]) &&
+                  bitwise(ob.logits, tB2.rows[static_cast<size_t>(s) + 1]),
+              "guided slots: step " + std::to_string(s) + " differs from the solo run at the slot's strength");
+      pa = argmax(oa.logits.data(), V);
+      pb = argmax(ob.logits.data(), V);
+    }
+    require(!bitwise(tB2.rows[0], tB.rows[0]), "guided slots: another strength left the logits unmoved");
+    m.session_close(0);
+    m.session_close(1);
+    m.configure_loop_guidance(1, own);
+    std::printf("[ OK ] two slots at their own guidance strengths (%.2f and %.2f) reproduce their solo transcripts\n",
+                static_cast<double>(own), static_cast<double>(other));
+  }
+
+  // 3c. Random schedules. Two slots, each with a prompt of its own and,
+  //     under loop guidance, a strength of its own, advance in a random
+  //     order. A slot advances by one scalar step or by a verify of two to
+  //     eight rows, of which a random count is accepted and the rest rolled
+  //     back with wrong tokens in them, sometimes under a snapshot taken
+  //     first. Every accepted row is bitwise the solo run's at that slot's
+  //     strength: nothing a rejected row, the other slot or a snapshot
+  //     leaves in the cache, the rings or the readout's planes reaches a
+  //     later row.
+  {
+    const int kSchedules = 24, kTokens = 20;
+    const size_t snap_bytes = m.session_snapshot_bytes();
+    uint8_t* arena = nullptr;
+    require(cudaMalloc(reinterpret_cast<void**>(&arena), snap_bytes) == cudaSuccess, "random schedules: snapshot arena");
+    const float strengths[] = {0.0f, 0.2f, 0.5f, 1.0f};
+    uint64_t rng = 0xA5A5F00D2026ull;
+    const auto next = [&rng] {
+      rng ^= rng << 13;
+      rng ^= rng >> 7;
+      rng ^= rng << 17;
+      return rng;
+    };
+    int verifies = 0, rejected = 0, snapshots = 0;
+    for (int schedule = 0; schedule < kSchedules; ++schedule) {
+      std::vector<int64_t> prompt[2];
+      float strength[2] = {0.0f, 0.0f};
+      Transcript solo[2];
+      for (int i = 0; i < 2; ++i) {
+        prompt[i] = smoke_tokens(cfg, 5 + static_cast<int>(next() % 26), next());
+        if (cfg.loop_guidance) {
+          strength[i] = (next() % 5 == 0) ? m.loop_guidance_default() : strengths[next() % 4];
+          m.configure_loop_guidance(0, strength[i]);
+        }
+        solo[i] = greedy(m, 0, prompt[i], kTokens);
+        m.session_close(0);
+      }
+      if (cfg.loop_guidance)
+        for (int i = 0; i < 2; ++i) m.configure_loop_guidance(i, strength[i]);
+      int done[2] = {0, 0};  // steps taken: the next input is solo.tokens[done]
+      for (int i = 0; i < 2; ++i) {
+        const Inkling2Model::Outputs o = m.session_prefill(i, prompt[i]);
+        require(bitwise(o.logits, solo[i].rows[0]), "random schedules: a prefill differs from the solo run");
+      }
+      bool snapped = false;
+      Inkling2Model::SessionSnapshotMeta meta;
+      while (done[0] < kTokens || done[1] < kTokens) {
+        int i = static_cast<int>(next() % 2);
+        if (done[i] >= kTokens) i ^= 1;
+        const std::string where = "random schedules: schedule " + std::to_string(schedule) + ", slot " + std::to_string(i) +
+                                  ", step " + std::to_string(done[i]);
+        if (next() % 5 == 0) {
+          if (snapped) m.session_release_snapshot(meta);
+          meta = m.session_snapshot(i, arena);
+          snapped = true;
+          ++snapshots;
+        }
+        const int left = kTokens - done[i];
+        if (left >= 2 && next() % 2 == 0) {
+          const int T = 2 + static_cast<int>(next() % static_cast<uint64_t>(std::min(left, Inkling2Model::kRequestRows) - 1));
+          const int accept = 1 + static_cast<int>(next() % static_cast<uint64_t>(T));
+          std::vector<int64_t> ids(solo[i].tokens.begin() + done[i], solo[i].tokens.begin() + done[i] + T);
+          // The rows past the accepted ones carry tokens the solo run never saw.
+          for (int r = accept; r < T; ++r) ids[static_cast<size_t>(r)] = (ids[static_cast<size_t>(r)] + 1 + static_cast<int64_t>(next() % 7)) % V;
+          const Inkling2Model::Outputs v = m.session_verify(i, ids);
+          require(v.logits.size() == static_cast<size_t>(T) * V, where + ": a verify's rows");
+          for (int r = 0; r < accept; ++r) {
+            const std::vector<float> row(v.logits.begin() + static_cast<size_t>(r) * V,
+                                         v.logits.begin() + static_cast<size_t>(r + 1) * V);
+            require(bitwise(row, solo[i].rows[static_cast<size_t>(done[i] + r) + 1]),
+                    where + ": accepted row " + std::to_string(r) + " of " + std::to_string(T) + " differs from the solo run");
+          }
+          if (accept < T) {
+            m.session_rollback(i, accept, T);
+            ++rejected;
+          }
+          done[i] += accept;
+          ++verifies;
+        } else {
+          const Inkling2Model::Outputs o = m.session_step(i, solo[i].tokens[static_cast<size_t>(done[i])]);
+          require(bitwise(o.logits, solo[i].rows[static_cast<size_t>(done[i]) + 1]), where + ": a step differs from the solo run");
+          done[i] += 1;
+        }
+        require(m.session_position(i) == static_cast<int64_t>(prompt[i].size()) + done[i], where + ": the slot's position");
+      }
+      if (snapped) m.session_release_snapshot(meta);
+      m.session_close(0);
+      m.session_close(1);
+      require(m.kv_blocks_in_use() == 0, "random schedules: every block released");
+    }
+    if (cfg.loop_guidance)
+      for (int i = 0; i < 2; ++i) m.configure_loop_guidance(i, m.loop_guidance_default());
+    cudaFree(arena);
+    std::printf("[ OK ] %d random schedules of two slots (%d verifies, %d with rejected rows, %d snapshots) reproduce the solo "
+                "transcripts bitwise\n",
+                kSchedules, verifies, rejected, snapshots);
+  }
+
   // 4. Chunked prefill (chunk == max_tokens == 8) agrees with the one-shot:
   //    every chunk's rows read the three positions before the chunk from
   //    the rings.
@@ -602,14 +768,14 @@ int run_fixture(const std::string& dir) {
   {
     const std::string full = (fs::path(dir).parent_path() / (fs::path(dir).filename().string() + "_full_first")).string();
     ink2fx::write_full_first_fixture(full);
-    run_trace_gate(Inkling2Config::from_checkpoint_dir(full), full, "decode trace, full-attention first layer");
+    run_trace_gate(ink2fx::with_test_loop(Inkling2Config::from_checkpoint_dir(full)), full, "decode trace, full-attention first layer");
   }
   std::printf("inkling2 decode (%s activations): PASS\n", g_native ? "native" : "bf16");
   return 0;
 }
 
 int run_checkpoint(const std::string& dir, const std::vector<int64_t>& ids, int steps) {
-  const Inkling2Config cfg = Inkling2Config::from_checkpoint_dir(dir);
+  const Inkling2Config cfg = ink2fx::with_test_loop(Inkling2Config::from_checkpoint_dir(dir));
   const int P = static_cast<int>(ids.size());
   auto m = model(cfg, dir, P + steps, P + steps + 64, 1, Inkling2Residency::Streaming);
   const Transcript t = greedy(*m, 0, ids, steps);
@@ -630,7 +796,7 @@ int run_checkpoint(const std::string& dir, const std::vector<int64_t>& ids, int 
 // `shape`: 0 one slot of the test's shape. 1 the server's model: eight slots,
 // 64 decode rows, the draft model loaded. 2 that with serving logits.
 int run_verify_diag(const std::string& dir, const std::vector<int64_t>& ids, int T, int shape) {
-  const Inkling2Config cfg = Inkling2Config::from_checkpoint_dir(dir);
+  const Inkling2Config cfg = ink2fx::with_test_loop(Inkling2Config::from_checkpoint_dir(dir));
   const int P = static_cast<int>(ids.size()), H = cfg.hidden_size, V = cfg.num_visits();
   require(T >= 1 && T <= dgpp::kSpecRows, "--verify-diag takes 1..kSpecRows rows");
   auto m = shape == 0 ? model(cfg, dir, 2 * P + 64, 2 * P + 256, 1, Inkling2Residency::Resident)

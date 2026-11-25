@@ -53,6 +53,9 @@ MimoKvPoolShape pool_shape(const Inkling2Config& cfg, int local_kv_heads, int ma
   if (mtp)
     shape.kv_heads.insert(shape.kv_heads.end(), static_cast<size_t>(cfg.draft.num_hidden_layers),
                           draft_kv_heads(cfg, world));
+  // The reference readout's visits (logit guidance) follow, so the planes
+  // before them sit where they do without guidance.
+  shape.kv_heads.insert(shape.kv_heads.end(), static_cast<size_t>(cfg.reference_visits()), local_kv_heads);
   shape.k_dim = kInk2HeadDim;
   shape.v_dim = kInk2HeadDim;
   shape.block_tokens = 64;
@@ -67,9 +70,10 @@ int64_t ring_visit_width(const Inkling2Config& cfg, int local_kv_heads) {
 }
 
 // A ring slot: every visit's convolution inputs, then the draft model's
-// feature row of that position.
+// feature row of that position, then the reference readout's visits.
 int64_t ring_slot_stride(const Inkling2Config& cfg, int local_kv_heads, bool mtp) {
-  return ring_visit_width(cfg, local_kv_heads) * cfg.num_visits() + (mtp ? cfg.hidden_size : 0);
+  return ring_visit_width(cfg, local_kv_heads) * (cfg.num_visits() + cfg.reference_visits()) +
+         (mtp ? cfg.hidden_size : 0);
 }
 
 size_t snapshot_bytes_of(const Inkling2Config& cfg, int local_kv_heads, bool mtp) {
@@ -80,10 +84,14 @@ size_t snapshot_bytes_of(const Inkling2Config& cfg, int local_kv_heads, bool mtp
 size_t activation_bytes(const Inkling2Config& cfg, int max_tokens) {
   const size_t M = static_cast<size_t>(max_tokens), H = static_cast<size_t>(cfg.hidden_size);
   const size_t planes = static_cast<size_t>(cfg.max_blocks() + 1 + cfg.bank_rows());
-  return planes * M * H * 2      // the stack
-         + 6 * M * H * 2         // the normed inputs, the sublayer output, the attention contribution
-         + 7 * M * H * 4         // the FP32 mixes and messages
-         + M * 2 * H * 2 + M * static_cast<size_t>(cfg.gate_rank) * 2 + M * 2 * H * 4;  // the controllers
+  size_t bytes = planes * M * H * 2      // the stack
+                 + 6 * M * H * 2         // the normed inputs, the sublayer output, the attention contribution
+                 + 7 * M * H * 4         // the FP32 mixes and messages
+                 + M * 2 * H * 2 + M * static_cast<size_t>(cfg.gate_rank) * 2 + M * 2 * H * 4;  // the controllers
+  // Loop guidance: the first pass's states and the readout's hidden rows
+  // (plan_memory adds its logits).
+  if (cfg.loop_guidance) bytes += static_cast<size_t>(cfg.bank_rows() + 1) * M * H * 2;
+  return bytes;
 }
 
 }  // namespace
@@ -153,6 +161,9 @@ Inkling2Model::Inkling2Model(const Inkling2Config& cfg, const std::string& check
   visits_ = cfg_.num_visits();
   bank_rows_ = cfg_.bank_rows();
   max_blocks_ = cfg_.max_blocks();
+  ref_visits_ = cfg_.reference_visits();
+  draft_planes_ = mtp ? cfg_.draft.num_hidden_layers : 0;
+  if (cfg_.loop_guidance) keep_visit_ = cfg_.visit_of(cfg_.core_end - 1, 0);
   pool_.init(pool_shape(cfg_, geo.local_kv_heads, max_requests_, max_cache_tokens_, kv_format, mtp, tp_world));
   ring_visit_width_ = ring_visit_width(cfg_, geo.local_kv_heads);
   ring_draft_offset_ = ring_visit_width_ * visits_;
@@ -164,6 +175,17 @@ Inkling2Model::Inkling2Model(const Inkling2Config& cfg, const std::string& check
   // Zeroed: a padding row of a fixed batch reads its own untouched rows.
   const size_t M = static_cast<size_t>(max_tokens_), Hs = static_cast<size_t>(H);
   stack_ = dev_alloc_zero<uint16_t>(static_cast<size_t>(max_blocks_ + 1 + bank_rows_) * M * Hs);
+  if (cfg_.loop_guidance) {
+    reference_ = dev_alloc_zero<uint16_t>(static_cast<size_t>(bank_rows_) * M * Hs);
+    reference_hidden_ = dev_alloc_zero<uint16_t>(M * Hs);
+    reference_logits_ =
+        dev_alloc_zero<float>(static_cast<size_t>(kReferenceLogitRows) * static_cast<size_t>(lm_vocab_count_));
+    // Every slot starts at the deployment's strength.
+    guidance_strength_host_.assign(static_cast<size_t>(max_requests_), cfg_.loop_guidance_strength);
+    guidance_strength_ = dev_alloc_zero<float>(static_cast<size_t>(max_requests_));
+    DGPP_CUDA_OK(cudaMemcpy(guidance_strength_, guidance_strength_host_.data(),
+                            guidance_strength_host_.size() * sizeof(float), cudaMemcpyHostToDevice));
+  }
   for (auto& x : x_) x = dev_alloc_zero<uint16_t>(M * Hs);
   xm_ = dev_alloc_zero<uint16_t>(M * Hs);
   y_ = dev_alloc_zero<uint16_t>(M * Hs);
@@ -291,6 +313,10 @@ Inkling2Model::~Inkling2Model() {
   df_.free();
   cudaFree(ring_);
   cudaFree(stack_);
+  cudaFree(reference_);
+  cudaFree(reference_hidden_);
+  cudaFree(reference_logits_);
+  cudaFree(guidance_strength_);
   for (auto* x : x_) cudaFree(x);
   cudaFree(xm_);
   cudaFree(y_);
@@ -397,6 +423,9 @@ Inkling2Model::MemoryPlan Inkling2Model::plan_memory(const Inkling2Config& cfg, 
     plan.add("activations (session core, block stack, sublayer io, controllers)",
              core_dev + activation_bytes(cfg, max_tokens), core_pin);
   }
+  if (cfg.loop_guidance)
+    plan.add("loop guidance (the first-pass readout's logits, the requests' strengths)",
+             static_cast<size_t>(kReferenceLogitRows) * V * 4 + static_cast<size_t>(max_requests) * 4);
   plan.add("layer objects (attention)",
            Inkling2AttentionLayer::scratch_bytes(cfg, geo, max_tokens, rows, n_split));
   plan.add("moe scratch (routes, expert io, view tables)",
@@ -440,7 +469,9 @@ Inkling2Ring Inkling2Model::ring_of(int visit) const {
   ring.base = ring_;
   ring.request_stride = static_cast<int64_t>(kInk2RingSlots) * ring_slot_stride_;
   ring.slot_stride = ring_slot_stride_;
-  ring.visit_offset = static_cast<int64_t>(visit) * ring_visit_width_;
+  // The reference readout's entries follow the draft's feature row.
+  ring.visit_offset = static_cast<int64_t>(visit) * ring_visit_width_ +
+                      (visit >= visits_ && draft_planes_ > 0 ? cfg_.hidden_size : 0);
   ring.kv_width = static_cast<int64_t>(loader_.geometry().local_kv_heads) * kInk2HeadDim;
   ring.hidden = cfg_.hidden_size;
   return ring;
@@ -551,8 +582,9 @@ void Inkling2Model::visit(int v, Walk& w, Outputs* capture_out) {
   const int bank_parity = (p - 1) & 1;
   const Inkling2Ring ring = ring_of(v);
   const int nq = r.attn_query_count;
-  // The draft model reads the partial state at this visit's entry.
-  if (df_.on()) {
+  // The draft model reads the partial state at this visit's entry. It reads
+  // the model's own walk, never the reference readout.
+  if (df_.on() && !w.reference) {
     const int tap = df_.tap(v);
     if (tap >= 0) copy_rows_bf16(df_.tap_rows(tap), partial, T, H, stream_);
   }
@@ -618,7 +650,7 @@ void Inkling2Model::visit(int v, Walk& w, Outputs* capture_out) {
     rows.req_ids = w.req_ids + row0;
     rows.pos = w.pos + row0;
     rows.decode = decode;
-    attn_->enqueue(r.attn, xq, xk, xv, count, rows, pool_.view(v), ring, attn_out + off, stream_);
+    attn_->enqueue(r.attn, xq, xk, xv, count, rows, pool_.view(plane_of(v)), ring, attn_out + off, stream_);
   });
   fold(attn_out, T, H, w.capture);
 
@@ -744,7 +776,12 @@ Inkling2Model::Outputs Inkling2Model::run_rows(const RowRun& run) {
     visit_attn_.clear();
     visit_mlp_in_.clear();
   }
-  for (int v = 0; v < visits_; ++v) visit(v, w, trace ? &out : nullptr);
+  for (int v = 0; v < visits_; ++v) {
+    visit(v, w, trace ? &out : nullptr);
+    // Loop guidance: the first pass's states, kept as its last core layer
+    // leaves them.
+    if (v == keep_visit_) keep_reference(w);
+  }
   // The output: one more mix through the final norm.
   {
     Ink2MixArgs m;
@@ -780,7 +817,88 @@ Inkling2Model::Outputs Inkling2Model::run_rows(const RowRun& run) {
     draft_gemm_.set_decode_mma(run.decode);
     df_.store_features(T, in.req_ids, in.pos);
   }
+  // Loop guidance, after everything that reads the model's own walk.
+  if (cfg_.loop_guidance) reference_readout(run, w);
   return finish_run(run, std::move(out), packed_logits);
+}
+
+// ---------------------------------------------------------------------------
+// Loop guidance (engine.loop_guidance).
+// ---------------------------------------------------------------------------
+void Inkling2Model::configure_loop_guidance(int req, float strength) {
+  if (req < 0 || req >= max_requests_) throw std::out_of_range("configure_loop_guidance: request slot");
+  if (!loop_guidance()) {
+    if (strength != 0.0f)
+      throw std::logic_error("configure_loop_guidance: this deployment runs without engine.loop_guidance");
+    return;
+  }
+  if (!std::isfinite(strength) || strength < -1.0f || strength > 4.0f)
+    throw std::invalid_argument("loop_guidance_strength must be in [-1, 4]");
+  guidance_strength_host_[static_cast<size_t>(req)] = strength;
+  DGPP_CUDA_OK(cudaMemcpyAsync(guidance_strength_ + req, &guidance_strength_host_[static_cast<size_t>(req)],
+                               sizeof(float), cudaMemcpyHostToDevice, stream_));
+  DGPP_CUDA_OK(cudaStreamSynchronize(stream_));
+}
+
+// The states a pass hands on sit in the core's stack slots of its parity:
+// the blocks it completed after its first, then its partial.
+void Inkling2Model::keep_reference(const Walk& w) {
+  const int core0 = cfg_.core_start / cfg_.block_layers + 1;
+  const size_t plane = static_cast<size_t>(max_tokens_) * static_cast<size_t>(cfg_.hidden_size);
+  for (int j = 0; j < bank_rows_; ++j)
+    copy_rows_bf16(reference_ + static_cast<size_t>(j) * plane, slot(core0 + j, 0), w.T, cfg_.hidden_size, stream_);
+}
+
+// The stack is a walk's scratch and the model's own output is taken, so the
+// kept states take the last pass's slots and the layers after the core run
+// from there as they did the first time, over the readout's own planes and
+// ring entries. Every row of the walk takes part: a later row's readout
+// attends over the keys and values this one leaves.
+void Inkling2Model::reference_readout(const RowRun& run, Walk& w) {
+  const int T = run.T, H = cfg_.hidden_size;
+  const int core0 = cfg_.core_start / cfg_.block_layers + 1;
+  const int parity = (cfg_.num_passes - 1) & 1;
+  const size_t plane = static_cast<size_t>(max_tokens_) * static_cast<size_t>(H);
+  for (int j = 0; j < bank_rows_; ++j)
+    copy_rows_bf16(slot(core0 + j, parity), reference_ + static_cast<size_t>(j) * plane, T, H, stream_);
+  w.reference = true;
+  w.parity = parity;
+  w.num_blocks = core0 + bank_rows_ - 1;  // the blocks at the core's exit: its partial is the next index
+  for (int v = visits_; v < visits_ + ref_visits_; ++v) visit(v, w, nullptr);
+  {
+    Ink2MixArgs m;
+    for (int n = 0; n < w.num_blocks; ++n) m.stack[n] = slot(n, w.parity);
+    m.n_stack = w.num_blocks;
+    m.last = slot(w.num_blocks, w.parity);
+    m.queries = globals_.output_query;
+    m.n_queries = 1;
+    m.norm_w[0] = globals_.final_norm;
+    m.out_bf16[0] = reference_hidden_;
+    m.norm_eps = cfg_.rms_norm_eps;
+    m.rows = T;
+    m.hidden = H;
+    ink2_mix(m, stream_);
+  }
+  // The rows the model's head projected, through the same head in the same
+  // launches, then the contrast in place on the model's logits, each row by
+  // its request's strength.
+  project_head_rows(run, [&](int input_row, int output_row, int n) {
+    const bool decode = run.decode || input_row < run.decode_rows();
+    for (int done = 0; done < n; done += kReferenceLogitRows) {
+      const int rows = std::min(kReferenceLogitRows, n - done);
+      const uint16_t* hidden = reference_hidden_ + static_cast<size_t>(input_row + done) * H;
+      float* logits = logits_ + static_cast<size_t>(output_row + done) * lm_vocab_count_;
+      decode_gemm(decode);
+      if (!(decode && packed_head_wide(hidden, reference_logits_, rows)))
+        gemm_.matmul(hidden, globals_.unembed, reference_logits_, rows, lm_vocab_count_, H, DType::BF16, GemmOut::F32,
+                     static_cast<size_t>(H), gemm_ws_, gemm_ws_bytes_, stream_);
+      if (cfg_.final_logit_softcapping > 0.0f)
+        ink2_logits_softcap(reference_logits_, static_cast<int64_t>(rows) * lm_vocab_count_,
+                            cfg_.final_logit_softcapping, stream_);
+      ink2_logits_guide(logits, reference_logits_, rows, lm_vocab_count_, w.req_ids + input_row + done,
+                        guidance_strength_, max_requests_, stream_);
+    }
+  });
 }
 
 // ---------------------------------------------------------------------------

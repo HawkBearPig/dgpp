@@ -2067,6 +2067,39 @@ foreach(INK2_ACT bf16 native)
   set_tests_properties(inkling2_forward_test_${INK2_ACT} PROPERTIES DEPENDS inkling2_forward_generate_teacher_${INK2_ACT})
 endforeach()
 
+# Loop guidance (engine.loop_guidance): against the checkpoint's own walk on
+# the fixture (inkling2_forward_test --loop-check), which holds the first
+# pass's readout to a walk of one pass, and the same reference chain as above
+# for that one-pass walk.
+foreach(INK2_ACT bf16 native)
+  add_test(NAME inkling2_loop_check_${INK2_ACT}
+    COMMAND inkling2_forward_test --loop-check ${INKLING2_FORWARD_FIXTURE} --activations ${INK2_ACT})
+  set_tests_properties(inkling2_loop_check_${INK2_ACT} PROPERTIES DEPENDS inkling2_forward_fixture)
+  add_test(NAME inkling2_one_pass_generate_${INK2_ACT}
+    COMMAND ${DSV41_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/tools/inkling2_reference_dump.py
+            gen-pure --checkpoint-dir ${INKLING2_FORWARD_FIXTURE} --activations ${INK2_ACT} --passes 1
+            --out ${CMAKE_CURRENT_BINARY_DIR}/inkling2_one_pass_ref_${INK2_ACT}.idump)
+  set_tests_properties(inkling2_one_pass_generate_${INK2_ACT} PROPERTIES DEPENDS inkling2_forward_fixture)
+  add_test(NAME inkling2_one_pass_test_e2e_${INK2_ACT}
+    COMMAND ${CMAKE_COMMAND} -E env
+            DGPP_INKLING2_DUMP_ENGINE_STATES=${CMAKE_CURRENT_BINARY_DIR}/inkling2_one_pass_states_${INK2_ACT}.bin
+            $<TARGET_FILE:inkling2_forward_test> --checkpoint-dir ${INKLING2_FORWARD_FIXTURE}
+            --dump-file ${CMAKE_CURRENT_BINARY_DIR}/inkling2_one_pass_ref_${INK2_ACT}.idump
+            --activations ${INK2_ACT} --relaxed --passes 1)
+  set_tests_properties(inkling2_one_pass_test_e2e_${INK2_ACT} PROPERTIES DEPENDS inkling2_one_pass_generate_${INK2_ACT})
+  add_test(NAME inkling2_one_pass_generate_teacher_${INK2_ACT}
+    COMMAND ${DSV41_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/tools/inkling2_reference_dump.py
+            gen-pure --checkpoint-dir ${INKLING2_FORWARD_FIXTURE} --activations ${INK2_ACT} --passes 1
+            --out ${CMAKE_CURRENT_BINARY_DIR}/inkling2_one_pass_teacher_${INK2_ACT}.idump
+            --teacher ${CMAKE_CURRENT_BINARY_DIR}/inkling2_one_pass_states_${INK2_ACT}.bin)
+  set_tests_properties(inkling2_one_pass_generate_teacher_${INK2_ACT} PROPERTIES DEPENDS inkling2_one_pass_test_e2e_${INK2_ACT})
+  add_test(NAME inkling2_one_pass_test_${INK2_ACT}
+    COMMAND inkling2_forward_test --checkpoint-dir ${INKLING2_FORWARD_FIXTURE}
+            --dump-file ${CMAKE_CURRENT_BINARY_DIR}/inkling2_one_pass_teacher_${INK2_ACT}.idump
+            --activations ${INK2_ACT} --passes 1)
+  set_tests_properties(inkling2_one_pass_test_${INK2_ACT} PROPERTIES DEPENDS inkling2_one_pass_generate_teacher_${INK2_ACT})
+endforeach()
+
 # The Inkling 2 tensor-parallel forwards (docs/inkling2_mini_plan.md section
 # 2): loopback worlds of 2 and 4 ranks, bitwise across ranks and
 # teacher-forced against the reference at that world, once per activation
@@ -2105,6 +2138,22 @@ foreach(INK2_ACT bf16 native)
     list(APPEND INKLING2_TP_TESTS inkling2_tp_states_${INK2_TAG} inkling2_tp_test_${INK2_TAG})
   endforeach()
 endforeach()
+# Loop guidance on the same worlds (engine.loop_guidance): five worlds in turn
+# per entry, on ports 30080 to 30120.
+foreach(INK2_ACT bf16 native)
+  foreach(INK2_WORLD 2 4)
+    if(INK2_ACT STREQUAL "native")
+      math(EXPR INK2_PORT "30096 + ${INK2_WORLD} * 5")
+    else()
+      math(EXPR INK2_PORT "30070 + ${INK2_WORLD} * 5")
+    endif()
+    add_test(NAME inkling2_tp_loop_check_w${INK2_WORLD}_${INK2_ACT}
+      COMMAND inkling2_tp_test --checkpoint-dir ${INKLING2_FORWARD_FIXTURE} --loop-check
+              --world ${INK2_WORLD} --port ${INK2_PORT} --activations ${INK2_ACT})
+    set_tests_properties(inkling2_tp_loop_check_w${INK2_WORLD}_${INK2_ACT} PROPERTIES DEPENDS inkling2_forward_fixture)
+    list(APPEND INKLING2_TP_TESTS inkling2_tp_loop_check_w${INK2_WORLD}_${INK2_ACT})
+  endforeach()
+endforeach()
 set_tests_properties(${INKLING2_TP_TESTS} PROPERTIES LABELS "gpu;rdma" RUN_SERIAL TRUE)
 
 # The Inkling 2 engines (docs/inkling2_mini_plan.md G5): the eager and graph
@@ -2127,6 +2176,19 @@ foreach(INK2_ACT bf16 native)
     COMMAND inkling2_decode_test --fixture ${CMAKE_CURRENT_BINARY_DIR}/inkling2_decode_fixture --activations ${INK2_ACT})
 endforeach()
 set_tests_properties(inkling2_decode_test_native PROPERTIES DEPENDS inkling2_decode_test_bf16)
+
+# The same session and engine gates under loop guidance (engine.loop_guidance,
+# tests/cuda/inkling2_fixture.hpp): the engine compared with itself, a slot
+# at its own strength, the readout's planes and rings under rollback.
+foreach(INK2_ACT bf16 native)
+  add_test(NAME inkling2_decode_test_guided_${INK2_ACT}
+    COMMAND inkling2_decode_test --fixture ${CMAKE_CURRENT_BINARY_DIR}/inkling2_decode_fixture --activations ${INK2_ACT})
+  set_tests_properties(inkling2_decode_test_guided_${INK2_ACT} PROPERTIES
+    ENVIRONMENT "DGPP_TEST_INK2_LOOP=guidance=1,strength=0.3" DEPENDS inkling2_decode_test_native)
+endforeach()
+add_test(NAME inkling2_engine_test_guided COMMAND inkling2_engine_test)
+set_tests_properties(inkling2_engine_test_guided PROPERTIES
+  ENVIRONMENT "DGPP_TEST_INK2_LOOP=guidance=1,strength=0.3" LABELS "gpu;rdma" RUN_SERIAL TRUE DEPENDS inkling2_engine_test)
 
 # The Inkling 2 draft model (docs/inkling2_mini_plan.md section 1.7): the
 # structural checks once per activation recipe, then the draft's context
@@ -2158,6 +2220,13 @@ foreach(INK2_WORLD 1 2 4)
             --dump ${CMAKE_CURRENT_BINARY_DIR}/inkling2_draft_w${INK2_WORLD}.bin)
   set_tests_properties(inkling2_draft_reference_w${INK2_WORLD} PROPERTIES DEPENDS inkling2_draft_cases_w${INK2_WORLD})
   list(APPEND INKLING2_DRAFT_TESTS inkling2_draft_cases_w${INK2_WORLD})
+endforeach()
+foreach(INK2_ACT bf16 native)
+  add_test(NAME inkling2_draft_test_guided_${INK2_ACT}
+    COMMAND inkling2_draft_test --fixture ${INKLING2_DRAFT_FIXTURE} --activations ${INK2_ACT})
+  set_tests_properties(inkling2_draft_test_guided_${INK2_ACT} PROPERTIES
+    ENVIRONMENT "DGPP_TEST_INK2_LOOP=guidance=1,strength=0.3" DEPENDS inkling2_draft_fixture)
+  list(APPEND INKLING2_DRAFT_TESTS inkling2_draft_test_guided_${INK2_ACT})
 endforeach()
 set_tests_properties(${INKLING2_DRAFT_TESTS} PROPERTIES LABELS "gpu;rdma" RUN_SERIAL TRUE)
 

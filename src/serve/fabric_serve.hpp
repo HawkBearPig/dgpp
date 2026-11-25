@@ -146,6 +146,9 @@ struct WorldSettings {
   bool prefill_fp8_per_tensor = false;  // the Qwen3.8-27B per-tensor prefill recipe (opt-in)
   std::string prefill_activations = "bf16";  // "native": the checkpoint's activation recipe on prefill rows
   std::string activations = "bf16";  // MiniMax and Inkling 2 targets: every row, including decode
+  // Inkling 2's loop guidance (engine.loop_guidance*).
+  bool loop_guidance = false;
+  float loop_guidance_strength = 0.0f;
   std::string prefill_attention = "bf16";    // Qwen3.5 / Flash-Next attention over an fp8 pool
   std::string decode_attention = "bf16";     // Flash-Next QSA: bf16 or native fp8 compute
   std::string dflash_model;             // the DFlash2 drafter (Qwen3.8-27B, world 1); empty: none

@@ -284,6 +284,12 @@ ClusterConfig parse_cluster_config(const std::string& json, const std::string& w
           e.activations = text(x, ek, what);
           if (e.activations != "bf16" && e.activations != "native")
             fail(what, "'" + ek + "' must be \"bf16\" or \"native\"");
+        } else if (p.key == "loop_guidance") {
+          e.loop_guidance = boolean(x, ek, what);
+        } else if (p.key == "loop_guidance_strength") {
+          e.loop_guidance_strength = number(x, ek, what);
+          if (!(e.loop_guidance_strength >= 0.0 && e.loop_guidance_strength <= 2.0))
+            fail(what, "'" + ek + "' must be in [0, 2]");
         } else if (p.key == "prefill_attention") {
           e.prefill_attention = text(x, ek, what);
           if (e.prefill_attention != "bf16" && e.prefill_attention != "fp8")
