@@ -24,6 +24,7 @@
 #include <utility>
 #include <vector>
 
+#include "common/cpu_wait.hpp"
 #include "common/log.hpp"
 #include "common/process_memory.hpp"
 #include "engine/decode_outputs.hpp"
@@ -2701,14 +2702,18 @@ class GraphEngineAdapter final : public sched::SchedulerEngine {
     const auto deadline = std::chrono::steady_clock::now() +
                           std::chrono::milliseconds(pick_timeout_ms_);
     uint64_t spins = 0;
-    while (__atomic_load_n(h_conf_seq_ + req, __ATOMIC_ACQUIRE) <
-           conf_seq_[static_cast<size_t>(req)]) {
-      if ((++spins & 255) == 0) {
+    const bool park = cpu_wait::enabled();
+    for (uint64_t seen; (seen = __atomic_load_n(h_conf_seq_ + req, __ATOMIC_ACQUIRE)) <
+                        conf_seq_[static_cast<size_t>(req)];) {
+      if (park || (++spins & 255) == 0) {
         if (std::chrono::steady_clock::now() > deadline)
           throw std::runtime_error(
               "graph engine: the replay's confidence did not publish within "
               "the pick timeout");
-        std::this_thread::yield();
+        if (park)
+          cpu_wait::park_while_equal(h_conf_seq_ + req, seen, park_deadline(deadline));
+        else
+          std::this_thread::yield();
       }
     }
     return h_conf_ + static_cast<size_t>(req) * conf_rows_;
@@ -2960,6 +2965,15 @@ class GraphEngineAdapter final : public sched::SchedulerEngine {
         rows_per_request_, rows, mtp ? ", MTP" : "", batch_min_live_);
   }
 
+  // One park's CNTVCT deadline: a wait slice, cut to what is left of the
+  // pick timeout so the timeout check is not pushed past it.
+  static uint64_t park_deadline(std::chrono::steady_clock::time_point deadline) {
+    const auto left = std::chrono::duration_cast<std::chrono::microseconds>(
+                          deadline - std::chrono::steady_clock::now())
+                          .count();
+    return cpu_wait::deadline_in_us(static_cast<uint64_t>(
+        std::clamp<int64_t>(left, 1, static_cast<int64_t>(cpu_wait::kWaitSliceUs))));
+  }
   // Polls the slot's pinned verdict sequence until the replay's verdict
   // node published it (the verify's pick is done; the tail runs on).
   void wait_verdict(const Replay& r) const {
@@ -2968,14 +2982,18 @@ class GraphEngineAdapter final : public sched::SchedulerEngine {
     const auto deadline = std::chrono::steady_clock::now() +
                           std::chrono::milliseconds(pick_timeout_ms_);
     uint64_t spins = 0;
-    while (__atomic_load_n(h_verdict_seq_ + index, __ATOMIC_ACQUIRE) <
-           r.verdict_seq) {
-      if ((++spins & 255) == 0) {
+    const bool park = cpu_wait::enabled();
+    for (uint64_t seen; (seen = __atomic_load_n(h_verdict_seq_ + index, __ATOMIC_ACQUIRE)) <
+                        r.verdict_seq;) {
+      if (park || (++spins & 255) == 0) {
         if (std::chrono::steady_clock::now() > deadline)
           throw std::runtime_error(
               "graph engine: the replay's verdict did not publish within the "
               "pick timeout");
-        std::this_thread::yield();
+        if (park)
+          cpu_wait::park_while_equal(h_verdict_seq_ + index, seen, park_deadline(deadline));
+        else
+          std::this_thread::yield();
       }
     }
   }

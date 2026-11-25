@@ -14,6 +14,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cerrno>
 #include <cstdlib>
 #include <cstring>
 #include <format>
@@ -26,6 +27,7 @@
 #include <unordered_set>
 
 #include "common/log.hpp"
+#include "common/cpu_wait.hpp"
 #include "common/cuda_wait.hpp"
 #include "net/bus_types.hpp"
 #include "net/tcp.hpp"
@@ -48,6 +50,16 @@ constexpr int kMaxPollPerCq = 32;        // CQEs drained per CQ per iteration
 // never a latency mechanism.
 constexpr int kEngineSpinIterations = 2000;
 constexpr int kEngineIdleSleepUs = 50;
+// Opt-in quiet park once a decode graph exists (cpu_wait.hpp):
+// DGPP_BUS_WFE_PARK_US=n (1..1000) parks the engine in WFET, armed on its
+// kick word and bounded by n microseconds, whenever it has nothing queued,
+// in flight or live. Every CPU-side hand-off (a queued send or collective,
+// a stream issue, a window arm, stop) bumps the kick, which ends the park
+// (a wake can still be lost to a preemption; the bound covers it); anything else (a peer's traffic, a completion that lands after
+// this pass's poll) waits for the park to end and the next pass to poll
+// it: up to n us plus a pass, longer if the thread is preempted. Unset or
+// 0 keeps the stock hot spin.
+constexpr int kEngineParkUs = 0;
 constexpr size_t kMaxLatencySamples = 100000;
 // Spin before entering the scheduler on a request wait. LONG on purpose
 //: the decode step's eager pick (two ~150us collectives
@@ -150,6 +162,18 @@ inline void cpu_relax() {
 #endif
 }
 
+// One step of a wait on an engine-published word last read as `seen`:
+// a bounded WFET park until the word changes where available
+// (cpu_wait.hpp), else the spin hint. The caller re-checks its exit
+// conditions after each step.
+template <class T>
+inline void relax_on(const std::atomic<T>& word, T seen) {
+  if (cpu_wait::enabled())
+    cpu_wait::park_while_equal(word, seen, cpu_wait::deadline_in_us(cpu_wait::kWaitSliceUs));
+  else
+    cpu_relax();
+}
+
 struct CollectiveBus::Impl {
   struct SendSlot {
     uint32_t gen = 0;          // last generation posted into this slot
@@ -206,6 +230,17 @@ struct CollectiveBus::Impl {
   uint64_t next_id = 1;
 
   std::atomic<bool> stopping{false};
+  // Bumped (release) after every CPU-side hand-off to the engine; the
+  // engine's quiet park waits on it. Alone on its lines: other writers
+  // would only add early returns.
+  alignas(256) std::atomic<uint32_t> engine_kick{0};
+  char engine_kick_pad_[256 - sizeof(std::atomic<uint32_t>)];
+  // The quiet park's bound in us, 0 = off; set in start() before the engine
+  // thread exists and never changed, so hand-offs pay the kick only when on.
+  int engine_park_us = 0;
+  void kick_engine() {
+    if (engine_park_us > 0) engine_kick.fetch_add(1, std::memory_order_release);
+  }
   std::mutex stop_mu;  // serializes quiesce()/stop() for one instance
   bool quiesced = false;
   bool stopped = false;
@@ -727,7 +762,7 @@ struct CollectiveBus::Impl {
         Clock::now() + std::chrono::microseconds(kWaitSpinUs);
     while (!req->done_flag.load(std::memory_order_acquire)) {
       if (Clock::now() > deadline) break;
-      cpu_relax();
+      relax_on(req->done_flag, false);  // the flag only goes false -> true
     }
     if (req->done_flag.load(std::memory_order_acquire)) return true;
     std::unique_lock<std::mutex> lock(req->mu);
@@ -2845,8 +2880,54 @@ struct CollectiveBus::Impl {
     DGPP_LOG_INFO("bus engine: rank {} pinned to cpu {}", opt.my_rank, cpu);
   }
 
+  // The quiet park's predicate: nothing queued, in flight or live, so the
+  // engine's next work is a hand-off (which kicks). try_lock: a contended
+  // lock means a hand-off is under way, and the engine must not sleep in
+  // the futex (the scheduler-displacement story in engine_loop).
+  bool engine_quiet() {
+    if (stopping.load(std::memory_order_relaxed)) return false;
+    if (coll.req || graph_window_live() || stream_outstanding()) return false;
+    {
+      std::unique_lock<std::mutex> l(lat_q_mu, std::try_to_lock);
+      if (!l.owns_lock() || !lat_q.empty()) return false;
+    }
+    {
+      std::unique_lock<std::mutex> l(bulk_q_mu, std::try_to_lock);
+      if (!l.owns_lock() || !bulk_q.empty()) return false;
+    }
+    {
+      std::unique_lock<std::mutex> l(coll_mu, std::try_to_lock);
+      if (!l.owns_lock() || !coll_q.empty()) return false;
+    }
+    std::unique_lock<std::mutex> l(registry_mu, std::try_to_lock);
+    if (!l.owns_lock()) return false;
+    for (const auto& entry : registry) {
+      const BusRequest* req = entry.second.get();
+      if (!req->done && (req->outstanding != 0 || req->offset < req->len)) return false;
+    }
+    return true;
+  }
+
+  static int park_us_from_env() {
+    if (!cpu_wait::enabled()) return 0;
+    long us = kEngineParkUs;
+    if (const char* env = std::getenv("DGPP_BUS_WFE_PARK_US")) {
+      char* end = nullptr;
+      errno = 0;
+      const long v = std::strtol(env, &end, 10);
+      if (errno == 0 && end != env && *end == '\0') us = v;
+      else DGPP_LOG_WARN("bus engine: DGPP_BUS_WFE_PARK_US={} is not a number; park off", env);
+    }
+    return static_cast<int>(std::clamp(us, 0L, 1000L));
+  }
+
   void engine_loop() {
     pin_engine_thread();
+    const int park_us = engine_park_us;
+    // One line per rank: the host waits' mode (cpu_wait.hpp) and the quiet park.
+    DGPP_LOG_INFO("bus engine: rank {} host waits: {}; quiet park: {}", opt.my_rank,
+                  cpu_wait::enabled() ? "WFET" : "spin",
+                  park_us > 0 ? std::to_string(park_us) + " us" : std::string("off (spin)"));
     int idle = 0;
     for (;;) {
       if (stopping.load(std::memory_order_relaxed) && drained()) break;
@@ -2882,6 +2963,15 @@ struct CollectiveBus::Impl {
         // while serving is the dedicated poller's contract anyway.
         std::this_thread::sleep_for(
             std::chrono::microseconds(kEngineIdleSleepUs));
+      } else if (park_us > 0 && idle > kEngineSpinIterations &&
+                 graph.recorded.load(std::memory_order_relaxed)) {
+        // Quiet with a decode graph recorded: park in WFET instead of the
+        // hot spin below. The thread stays on its core, so the
+        // displacement that retired the nap here cannot happen; the kick
+        // (read before the predicate) ends the park on any hand-off.
+        const uint32_t kick = engine_kick.load(std::memory_order_acquire);
+        if (engine_quiet())
+          cpu_wait::park_while_equal(engine_kick, kick, cpu_wait::deadline_in_us(park_us));
       }
       // else: hot spin — the loop body is the poll. sched_yield here was
       // measured at ~2.2 ms of poll latency per idle stretch (the collective
@@ -3581,6 +3671,7 @@ bool CollectiveBus::start(std::string* error) {
     impl.consumers_launched = true;
   }
 
+  impl.engine_park_us = Impl::park_us_from_env();
   impl.engine = std::thread([&impl] { impl.engine_loop(); });
   DGPP_LOG_INFO(
       "bus: rank {} up — {} peer(s) x {} lane(s), lat {}x{}B, bulk {}x{}B, "
@@ -3642,6 +3733,7 @@ uint64_t CollectiveBus::send(int peer_rank, const void* data, size_t bytes,
     std::lock_guard<std::mutex> lock(impl.bulk_q_mu);
     impl.bulk_q.push_back(std::move(req));
   }
+  impl.kick_engine();
   return id;
 }
 
@@ -3824,6 +3916,7 @@ uint64_t CollectiveBus::allreduce_staged(size_t bf16_elems,
     std::lock_guard<std::mutex> lock(impl.coll_mu);
     impl.coll_q.push_back(std::move(req));
   }
+  impl.kick_engine();
   DGPP_LOG_DEBUG("allreduce_staged: queued id={} gen={}", id, staged_gen);
   return id;
 }
@@ -3910,6 +4003,7 @@ uint64_t CollectiveBus::allreduce(const void* device_src, void* device_dst,
     std::lock_guard<std::mutex> lock(impl.coll_mu);
     impl.coll_q.push_back(std::move(req));
   }
+  impl.kick_engine();
   return id;
 }
 
@@ -4008,6 +4102,7 @@ uint64_t CollectiveBus::allreduce_bulk(const void* device_src, void* device_dst,
     std::lock_guard<std::mutex> lock(impl.coll_mu);
     impl.coll_q.push_back(std::move(req));
   }
+  impl.kick_engine();
   DGPP_LOG_DEBUG("allreduce_bulk: queued id={} elems={} stripes={} segs={}",
                  id, bf16_elems, C, seg_count);
   return id;
@@ -4053,9 +4148,10 @@ uint64_t CollectiveBus::allreduce_stream(cudaStream_t stream, const void* device
   {
     const auto deadline =
         Clock::now() + std::chrono::milliseconds(std::max(options_.completion_timeout_ms + 5000, 30000));
-    while (impl.strm.issued.load(std::memory_order_relaxed) -
-               impl.strm.walked.load(std::memory_order_acquire) >=
-           static_cast<uint64_t>(kBusStreamRing)) {
+    for (uint64_t walked;
+         impl.strm.issued.load(std::memory_order_relaxed) -
+             (walked = impl.strm.walked.load(std::memory_order_acquire)) >=
+         static_cast<uint64_t>(kBusStreamRing);) {
       if (impl.graph.failed.load(std::memory_order_relaxed)) {
         std::lock_guard<std::mutex> lock(impl.coll_mu);
         *error = "graph era failed: " + impl.graph.error;
@@ -4069,7 +4165,7 @@ uint64_t CollectiveBus::allreduce_stream(cudaStream_t stream, const void* device
         *error = "stream ring backstop: the engine did not walk the ring's oldest generation";
         return 0;
       }
-      cpu_relax();
+      relax_on(impl.strm.walked, walked);
     }
   }
   uint64_t gen = 0;
@@ -4138,6 +4234,7 @@ uint64_t CollectiveBus::allreduce_stream(cudaStream_t stream, const void* device
     impl.strm.fifo.push_back(Impl::StreamState::Gen{gen, cell_idx, static_cast<uint32_t>(bf16_elems)});
     impl.strm.issued.store(gen, std::memory_order_release);
   }
+  impl.kick_engine();
   BusAllReduceGraphView v{};
   int vi = 0;
   for (size_t p = 0; p < impl.peer_ranks.size(); ++p)
@@ -4175,7 +4272,7 @@ bool CollectiveBus::allreduce_settle(int timeout_ms, std::string* error) {
   const uint64_t need = impl.strm.issued.load(std::memory_order_acquire);
   if (need == 0) return true;
   const auto deadline = Clock::now() + std::chrono::milliseconds(timeout_ms);
-  while (impl.strm.walked.load(std::memory_order_acquire) < need) {
+  for (uint64_t walked; (walked = impl.strm.walked.load(std::memory_order_acquire)) < need;) {
     if (impl.graph.failed.load(std::memory_order_relaxed)) {
       std::lock_guard<std::mutex> lock(impl.coll_mu);
       *error = "graph era failed: " + impl.graph.error;
@@ -4190,7 +4287,7 @@ bool CollectiveBus::allreduce_settle(int timeout_ms, std::string* error) {
                "flight watchdog should have failed the era first)";
       return false;
     }
-    cpu_relax();
+    relax_on(impl.strm.walked, walked);
   }
   if (impl.graph.failed.load(std::memory_order_relaxed)) {
     std::lock_guard<std::mutex> lock(impl.coll_mu);
@@ -4347,7 +4444,7 @@ bool CollectiveBus::graph_replay_arm(std::string* error, int variant) {
     const auto deadline =
         Clock::now() + std::chrono::milliseconds(std::max(
                            options_.completion_timeout_ms + 5000, 30000));
-    while (impl.graph.walk_pub.load(std::memory_order_acquire) < need) {
+    for (uint64_t pub; (pub = impl.graph.walk_pub.load(std::memory_order_acquire)) < need;) {
       if (impl.graph.failed.load(std::memory_order_relaxed)) {
         *error = "graph era failed while arming: " + impl.graph.error;
         return false;
@@ -4360,7 +4457,7 @@ bool CollectiveBus::graph_replay_arm(std::string* error, int variant) {
         *error = "arm backstop: engine did not walk the previous window";
         return false;
       }
-      cpu_relax();
+      relax_on(impl.graph.walk_pub, pub);
     }
 
     // Reserve the window's generations from the SHARED collective
@@ -4425,6 +4522,7 @@ bool CollectiveBus::graph_replay_arm(std::string* error, int variant) {
     impl.graph.window_first.store(first, std::memory_order_relaxed);
     impl.graph.window_count.fetch_add(1, std::memory_order_release);
   }
+  impl.kick_engine();
   return true;
 }
 
@@ -4476,7 +4574,7 @@ bool CollectiveBus::graph_replay_finish(int timeout_ms, std::string* error) {
     need = w.first + w.gens;
   }
   const auto deadline = Clock::now() + std::chrono::milliseconds(timeout_ms);
-  while (impl.graph.walk_pub.load(std::memory_order_acquire) < need) {
+  for (uint64_t pub; (pub = impl.graph.walk_pub.load(std::memory_order_acquire)) < need;) {
     if (impl.graph.failed.load(std::memory_order_relaxed)) {
       std::lock_guard<std::mutex> lock(impl.coll_mu);
       *error = "graph era failed: " + impl.graph.error;
@@ -4491,7 +4589,7 @@ bool CollectiveBus::graph_replay_finish(int timeout_ms, std::string* error) {
                "watchdog should have failed the era first)";
       return false;
     }
-    cpu_relax();
+    relax_on(impl.graph.walk_pub, pub);
   }
   // The window is walked: retire it (the era's eager gate reopens with
   // the last live window; coll_mu-serialized with the eager submissions
@@ -4776,6 +4874,7 @@ void CollectiveBus::quiesce() {
   }
 
   impl.stopping.store(true, std::memory_order_relaxed);
+  impl.kick_engine();
   if (impl.engine.joinable()) impl.engine.join();
 
   // A still-running collective kernel must exit before the stream sync:
@@ -4827,6 +4926,7 @@ void CollectiveBus::stop() {
   if (!impl.quiesced) {
     impl.quiesced = true;
     impl.stopping.store(true, std::memory_order_relaxed);
+    impl.kick_engine();
     if (impl.engine.joinable()) impl.engine.join();
 
     if (impl.coll.req) impl.poison_collective(*impl.coll.req);
