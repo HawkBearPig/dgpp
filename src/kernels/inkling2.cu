@@ -701,6 +701,34 @@ __global__ void __launch_bounds__(kThreads) logits_softcap_kernel(float* __restr
   }
 }
 
+// (1 + w) * last - w * earlier with one rounding: exactly `last` at w = 0 and
+// exactly `earlier` at w = -1.
+DGPP_HD inline float guided_value(float w, float last, float earlier) {
+#ifdef __CUDA_ARCH__
+  return fmaf(1.0f + w, last, -q_mul(w, earlier));
+#else
+  return std::fmaf(1.0f + w, last, -q_mul(w, earlier));
+#endif
+}
+
+// One block per row, at its request's strength.
+__global__ void __launch_bounds__(kThreads) logits_guide_kernel(float* __restrict__ logits,
+                                                                const float* __restrict__ reference, int64_t vocab,
+                                                                const int32_t* __restrict__ row_request,
+                                                                const float* __restrict__ request_strength,
+                                                                int requests) {
+  dgpp_pdl_wait();
+  float* z = logits + static_cast<int64_t>(blockIdx.x) * vocab;
+  const float* r = reference + static_cast<int64_t>(blockIdx.x) * vocab;
+  const int request = row_request ? row_request[blockIdx.x] : 0;
+  const float w = request >= 0 && request < requests ? request_strength[request] : 0.0f;
+  if (w == 0.0f) return;
+  for (int64_t i = threadIdx.x; i < vocab; i += kThreads) {
+    const float v = z[i], e = r[i];
+    if (isfinite(v) && isfinite(e)) z[i] = guided_value(w, v, e);
+  }
+}
+
 int flat_blocks(int64_t total) {
   int64_t blocks = (total + kThreads - 1) / kThreads;
   if (blocks > 65535) blocks = 65535;
@@ -851,6 +879,17 @@ void ink2_logits_softcap(float* logits, int64_t count, float cap, cudaStream_t s
   logits_softcap_kernel<<<flat_blocks(count), kThreads, 0, stream>>>(logits, count, cap);
   DGPP_CUDA_OK(cudaGetLastError());
 }
+
+void ink2_logits_guide(float* logits, const float* reference, int rows, int64_t vocab, const int32_t* row_request,
+                       const float* request_strength, int requests, cudaStream_t stream) {
+  if (rows <= 0) return;
+  if (!logits || !reference || !request_strength || vocab <= 0 || requests <= 0)
+    throw std::invalid_argument("ink2_logits_guide: null buffer");
+  logits_guide_kernel<<<rows, kThreads, 0, stream>>>(logits, reference, vocab, row_request, request_strength, requests);
+  DGPP_CUDA_OK(cudaGetLastError());
+}
+
+float ink2_guided_value_host(float strength, float last, float earlier) { return guided_value(strength, last, earlier); }
 
 void ink2_quantize_nvfp4_host(const uint16_t* x, int k, uint16_t* inner, float* outer) {
   if (k <= 0 || k % 16 != 0) throw std::invalid_argument("ink2_quantize_nvfp4_host: k");

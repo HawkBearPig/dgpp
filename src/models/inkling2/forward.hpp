@@ -31,6 +31,13 @@
 // and the recurrent head's feature of every position lives in the ring's
 // slots beside the convolution inputs, so rollback and prefix snapshots
 // cover it without a protocol of their own.
+//
+// Loop guidance (engine.loop_guidance, config.hpp Inkling2LoopOptions) runs
+// the layers after the core twice per row, the second time on the first
+// pass's states as visits past the model's own, with planes and ring entries
+// of their own after the draft's. Every row takes that second run, prompt
+// rows included, so a later row's readout attends over what this one left,
+// and a request's strength only chooses how far its logits move.
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -112,6 +119,13 @@ class Inkling2Model : public SessionModel<Inkling2Model> {
   using Base::session_snapshot_bytes;
 
   const Inkling2Config& config() const { return cfg_; }
+
+  // ---- loop guidance (engine.loop_guidance) ------------------------------------
+  // A request's strength, set before its prefill. A slot starts at the
+  // deployment's strength and keeps the last one set.
+  bool loop_guidance() const { return cfg_.loop_guidance; }
+  float loop_guidance_default() const { return cfg_.loop_guidance_strength; }
+  void configure_loop_guidance(int req, float strength);
   const MimoKvPool& kv_pool() const { return pool_; }
   LatentFormat kv_format() const { return pool_.shape().format; }
   bool native_activations() const { return native_; }
@@ -216,7 +230,19 @@ class Inkling2Model : public SessionModel<Inkling2Model> {
     int num_blocks = 0;      // completed blocks
     int prelude_blocks = 0;  // completed blocks at the core's entry
     int parity = 0;          // the stack set the core-range slots read and write
+    bool reference = false;  // the second run of the layers after the core (logit guidance)
   };
+  // ---- loop guidance (engine.loop_guidance, models/inkling2/config.hpp) --------
+  // A pass hands on bank_rows_ states: the blocks it completed after its
+  // first, then its partial. keep_reference copies the first pass's before
+  // the third overwrites them. reference_readout runs after the model's own
+  // logits: the layers after the core again on the kept states, over their
+  // own planes and rings, then every projected row's logits move away from
+  // that readout's by the row's strength.
+  void keep_reference(const Walk& w);
+  void reference_readout(const RowRun& run, Walk& w);
+  // The K/V plane of a visit: the reference readout's follow the draft's.
+  int plane_of(int visit) const { return visit < visits_ ? visit : visit + draft_planes_; }
   // The stack slot of block index n: the core's slots alternate between two
   // sets by pass parity, so a pass reads the previous pass's states while it
   // writes its own.
@@ -264,6 +290,11 @@ class Inkling2Model : public SessionModel<Inkling2Model> {
   int visits_ = 0;
   int bank_rows_ = 0;
   int max_blocks_ = 0;
+  int ref_visits_ = 0;        // the reference readout's visits (loop guidance)
+  int draft_planes_ = 0;      // the draft model's planes, between the visits' and the readout's
+  int keep_visit_ = -1;       // the first pass's last core visit (-1: no guidance)
+  // The reference readout's logits, a chunk of rows at a time.
+  static constexpr int kReferenceLogitRows = 64;
 
   std::unique_ptr<Inkling2AttentionLayer> attn_;
   std::unique_ptr<Inkling2MoeLayer> moe_;
@@ -277,6 +308,11 @@ class Inkling2Model : public SessionModel<Inkling2Model> {
 
   // Activations [M rows].
   uint16_t* stack_ = nullptr;  // [max_blocks + 1 + bank_rows][M, H]
+  uint16_t* reference_ = nullptr;        // [bank_rows][M, H]: the first pass's states (guidance)
+  uint16_t* reference_hidden_ = nullptr; // [M, H]: the readout's final-norm output
+  float* reference_logits_ = nullptr;    // [kReferenceLogitRows, vocabulary share]
+  float* guidance_strength_ = nullptr;   // [max_requests]: each request's strength
+  std::vector<float> guidance_strength_host_;
   uint16_t* x_[3] = {nullptr, nullptr, nullptr};  // the normed attention inputs (q, k, v)
   uint16_t* xm_ = nullptr;     // the normed MLP input
   uint16_t* y_ = nullptr;      // a sublayer's output (the fold's fallback)

@@ -262,6 +262,13 @@ std::string encode_journal_tick(const GenerationService::PassEvents& events) {
         append_json_int(&out, g.logprobs);
         out += ",\"s\":\"" + hex64(r.seed) + "\"}";
       }
+      // The loop guidance strength rides on its own, only when the request
+      // names one (a deployment with loop guidance resolves every request's):
+      // a greedy guided request carries no sampling spec.
+      if (r.sampling.loop_guidance >= 0.0f) {
+        out += ",\"lg\":";
+        append_json_int(&out, float_bits(r.sampling.loop_guidance));
+      }
       // The grammar (M6 6g) rides only when active: mode, the parallel
       // flag, the named function, the tools with their closed key sets.
       if (r.grammar.active()) {
@@ -521,6 +528,7 @@ std::string encode_journal_settings(const WorldSettings& s) {
   append_json_string(&out, s.prefill_activations);
   out += ",\"act\":";
   append_json_string(&out, s.activations);
+  out += std::format(",\"lpg\":{},\"lpgw\":{}", s.loop_guidance ? 1 : 0, float_bits(s.loop_guidance_strength));
   out += ",\"pfattn\":";
   append_json_string(&out, s.prefill_attention);
   out += ",\"dcattn\":";
@@ -862,6 +870,9 @@ JournalRecord decode_journal_line(std::string_view line) {
     if (const dgpp::minijson::Value* a = v.find("act")) s.activations = std::string(a->as_string());
     if (s.activations != "bf16" && s.activations != "native")
       throw std::runtime_error("journal: settings record with invalid activation recipe");
+    // Loop guidance (2026-11-25): records before it carry none (off).
+    if (v.find("lpg")) s.loop_guidance = flag("lpg");
+    if (v.find("lpgw")) s.loop_guidance_strength = float_from_bits(static_cast<uint32_t>(num("lpgw").as_int()));
     // The prefill attention's arithmetic (2026-10-16): records before it carry none (bf16).
     if (const dgpp::minijson::Value* pt = v.find("pfattn")) s.prefill_attention = std::string(pt->as_string());
     if (const dgpp::minijson::Value* dt = v.find("dcattn")) s.decode_attention = std::string(dt->as_string());
@@ -1267,6 +1278,14 @@ JournalRecord decode_journal_line(std::string_view line) {
         if (r.logprobs >= 0 && p.logprobs != r.logprobs)
           throw std::runtime_error("journal: submit '" + r.id +
                                    "' logprobs fields disagree");
+      }
+      if (const dgpp::minijson::Value* lg = item.find("lg")) {
+        if (!lg->is_number() || lg->as_int() < 0 || lg->as_int() > 0xFFFFFFFFll)
+          throw std::runtime_error("journal: submit '" + r.id + "' has a bad loop guidance strength");
+        r.sampling.loop_guidance = float_from_bits(static_cast<uint32_t>(lg->as_int()));
+        if (!std::isfinite(r.sampling.loop_guidance) || r.sampling.loop_guidance < 0.0f ||
+            r.sampling.loop_guidance > 2.0f)
+          throw std::runtime_error("journal: submit '" + r.id + "' carries an invalid loop guidance strength");
       }
       if (const dgpp::minijson::Value* gr = item.find("gr")) {
         if (!gr->is_object())

@@ -354,7 +354,7 @@ auto minimax_factory(bool draft = true, int slots = 2, bool native = false) {
 // the prompts here draw over 512 ids).
 auto inkling_factory(int slots = 2, bool native = false, bool draft = true) {
   const std::string dir = "inkling2_dflash2_fixture";
-  const auto cfg = ink2fx::draft_config(/*full_vocabulary=*/true);
+  const auto cfg = ink2fx::with_test_loop(ink2fx::draft_config(/*full_vocabulary=*/true));
   ink2fx::write_draft_fixture(dir, /*full_vocabulary=*/true);
   return [=](dgpp::BoundaryReducer* reducer, int rank, int world) {
     return std::make_unique<dgpp::Inkling2Model>(cfg, dir, 128, 1024, dgpp::Inkling2Residency::Resident, reducer,

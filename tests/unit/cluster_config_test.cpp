@@ -322,6 +322,21 @@ DGPP_TEST(cluster_config_parses_fills_defaults_and_derives_the_world) {
     } catch (const std::exception&) { refused = true; }
     require(refused, "unsupported target activation recipe rejected");
   }
+  // The looped family's loop guidance (2026-11-25): the switch and the strength of a request that names none.
+  const auto lp = dgpp::serve::parse_cluster_config(
+      R"({"model":"m","nodes":["h"],"engine":{"loop_guidance":true,"loop_guidance_strength":0.25}})", "t");
+  require(lp.engine.loop_guidance && lp.engine.loop_guidance_strength == 0.25, "the loop guidance keys parse");
+  require(!all_rows.engine.loop_guidance && all_rows.engine.loop_guidance_strength == 0.0,
+          "loop guidance is off unless asked");
+  for (const auto* bad : {R"("loop_guidance":"logits")", R"("loop_guidance_strength":2.5)", R"("loop_guidance_strength":-0.1)",
+                          R"("loop_guidance_adaptive":true)"}) {
+    bool refused = false;
+    try {
+      (void)dgpp::serve::parse_cluster_config(
+          std::string(R"({"model":"m","nodes":["h"],"engine":{)") + bad + "}}", "t");
+    } catch (const std::exception&) { refused = true; }
+    require(refused, "an unsupported loop guidance value is rejected");
+  }
   // The prefill attention's arithmetic on the fp8 K/V pool (2026-10-16): "bf16" (the default) or "fp8".
   const auto pa = dgpp::serve::parse_cluster_config(
       R"({"model":"m","nodes":["h"],"engine":{"kv_dtype":"fp8","prefill_attention":"fp8"}})", "t");

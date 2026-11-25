@@ -107,6 +107,10 @@ struct Params {
   float frequency_penalty = 0.0f;   // additive per context count
   float presence_penalty = 0.0f;    // additive once for seen ids
   int logprobs = 0;                 // report top-N (id, logprob) pairs
+  // Loop guidance (a looped family under engine.loop_guidance): how far the
+  // logits move away from the first pass's readout, before every stage
+  // above. 0 = the model's own logits, negative = the deployment's strength.
+  float loop_guidance = -1.0f;
 };
 
 struct Candidate {
@@ -159,6 +163,8 @@ inline void validate_params(const Params& p) {
   if (!std::isfinite(p.frequency_penalty) || !std::isfinite(p.presence_penalty))
     throw std::invalid_argument("penalties must be finite");
   if (p.logprobs < 0) throw std::invalid_argument("logprobs must be >= 0");
+  if (!std::isfinite(p.loop_guidance) || p.loop_guidance > 2.0f)
+    throw std::invalid_argument("loop_guidance_strength must be in [0, 2]");
 }
 
 // ---------------------------------------------------------------------------

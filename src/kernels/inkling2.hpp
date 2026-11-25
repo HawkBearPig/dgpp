@@ -177,6 +177,20 @@ void ink2_requantize_mxfp8(const uint16_t* x, int64_t x_stride, int rows, int k,
 // left as it is.
 void ink2_logits_softcap(float* logits, int64_t count, float cap, cudaStream_t stream);
 
+// Loop guidance (engine.loop_guidance): a logit of the last pass moved away
+// from the same logit read out of an earlier pass,
+//   guided = (1 + w) * last - w * earlier,
+// in one rounding, so w = 0 returns `last` and w = -1 returns `earlier` bit
+// for bit.
+//
+// In place over [rows, vocab]. A row's w is request_strength[row_request[r]]
+// (null row_request: request 0; a request outside [0, requests) leaves the
+// row as it is). A non-finite value is left as it is. One block per row:
+// rows <= 65535. The host statement is the kernel's arithmetic.
+void ink2_logits_guide(float* logits, const float* reference, int rows, int64_t vocab, const int32_t* row_request,
+                       const float* request_strength, int requests, cudaStream_t stream);
+float ink2_guided_value_host(float strength, float last, float earlier);
+
 // Host statements of the two quantizers (the kernels' arithmetic operation
 // for operation), for tests and tools.
 void ink2_quantize_nvfp4_host(const uint16_t* x, int k, uint16_t* inner, float* outer);

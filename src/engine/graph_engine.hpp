@@ -1103,10 +1103,21 @@ class GraphEngineAdapter final : public sched::SchedulerEngine {
 
   bool supports_sampling() const override { return sampling_; }
   bool supports_logprobs() const override { return sampling_; }
+  bool supports_loop_guidance() const override {
+    if constexpr (requires { model_->loop_guidance(); }) return model_->loop_guidance();
+    return false;
+  }
   void configure_sampling(int req, const sample::Params& sampling,
                           uint64_t seed) override {
     check_req(req);
     sample::validate_params(sampling);
+    // A looped family's guidance strength reaches the slot with the spec,
+    // before the prefill: the model applies it to the logits every pick reads.
+    if constexpr (requires { model_->configure_loop_guidance(req, 0.0f); })
+      model_->configure_loop_guidance(
+          req, sampling.loop_guidance < 0.0f ? model_->loop_guidance_default() : sampling.loop_guidance);
+    else if (sampling.loop_guidance > 0.0f)
+      throw std::logic_error("graph engine: this family has no loop guidance");
     if (sampling.temperature > 0.0f && !sampling_)
       throw std::logic_error(
           "graph engine: no device sampler (engines without the sampler "

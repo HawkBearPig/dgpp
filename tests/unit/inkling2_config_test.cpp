@@ -85,6 +85,42 @@ DGPP_TEST(inkling2_config_derives_the_visits) {
           "vision");
 }
 
+DGPP_TEST(inkling2_config_applies_loop_guidance) {
+  using dgpp::Inkling2LoopOptions;
+  const dgpp::Inkling2Config release = parse(inkling2_test::config_json());
+  const auto with = [&](bool guidance, float strength) {
+    dgpp::Inkling2Config c = release;
+    Inkling2LoopOptions o;
+    o.guidance = guidance;
+    o.strength = strength;
+    c.apply_loop_options(o);
+    return c;
+  };
+  const auto refused = [&](bool guidance, float strength) {
+    try {
+      (void)with(guidance, strength);
+    } catch (const std::invalid_argument& e) {
+      return std::string(e.what());
+    }
+    return std::string();
+  };
+  // Off is the checkpoint's own walk.
+  const dgpp::Inkling2Config off = with(false, 0.0f);
+  require(!off.loop_guidance && off.num_visits() == 48 && off.reference_visits() == 0, "guidance is off by default");
+  // On: the layers after the core run a second time, as visits past the model's own.
+  const dgpp::Inkling2Config on = with(true, 0.3f);
+  require(on.loop_guidance && on.loop_guidance_strength == 0.3f, "the options are kept");
+  require(on.num_visits() == 48 && on.coda_layers() == 6 && on.reference_visits() == 6, "the readout's visits");
+  for (int i = 0; i < 6; ++i)
+    require(on.visit(48 + i).layer == 18 + i && on.visit(48 + i).pass == 0, "a readout visit names its layer");
+  require(on.draft.target_layer_ids == release.draft.target_layer_ids, "the draft's taps stay on the model's walk");
+  // A deployment may switch guidance on with a default strength of zero: requests then choose.
+  require(with(true, 0.0f).reference_visits() == 6, "guidance without a default strength");
+  // Refusals name the engine key.
+  require(has(refused(true, 5.0f), "loop_guidance_strength"), "a strength out of range");
+  require(has(refused(false, 0.3f), "loop_guidance_strength"), "a strength without guidance");
+}
+
 DGPP_TEST(inkling2_config_refuses_unsupported_shapes_by_name) {
   using inkling2_test::config_json;
   require(has(refusal(config_json("\"model_type\": \"inkling2_loop\"", "\"model_type\": \"inkling2\"")), "model_type"),

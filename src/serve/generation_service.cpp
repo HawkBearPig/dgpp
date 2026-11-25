@@ -412,7 +412,7 @@ std::string model_object(const ServiceConfig& scfg, const std::string& model_id,
                          bool sampling_available, const sample::Params& d, bool tools_available,
                          bool constraints_available, bool reasoning_in_content,
                          const ModelFrontend& frontend, bool images_available,
-                         bool video_available) {
+                         bool video_available, bool loop_guidance_available) {
   std::string out;
   out.append("{\"id\":");
   append_json_string(&out, model_id);
@@ -434,6 +434,11 @@ std::string model_object(const ServiceConfig& scfg, const std::string& model_id,
   append_json_float(&out, d.frequency_penalty);
   out.append(",\"presence_penalty\":");
   append_json_float(&out, d.presence_penalty);
+  // A deployment with loop guidance names the strength a request inherits.
+  if (loop_guidance_available) {
+    out.append(",\"loop_guidance_strength\":");
+    append_json_float(&out, d.loop_guidance < 0.0f ? 0.0f : d.loop_guidance);
+  }
   out.append("}},\"tools\":{\"available\":");
   out.append(tools_available ? "true" : "false");
   out.append(",\"constrained\":");
@@ -607,6 +612,9 @@ GenerationService::GenerationService(const ServiceConfig& cfg,
   // — loudly — rather than a stochastic mode it would silently ignore.
   sample::validate_params(cfg_.sampling_defaults);
   sampling_available_ = engine_->supports_sampling();
+  loop_guidance_available_ = engine_->supports_loop_guidance();
+  if (!loop_guidance_available_ && cfg_.sampling_defaults.loop_guidance > 0.0f)
+    throw std::invalid_argument("GenerationService: a default loop guidance strength needs an engine with loop guidance");
   if (!sampling_available_ && cfg_.sampling_defaults.temperature > 0.0f) {
     DGPP_LOG_WARN(
         "serve: the bound engine cannot sample yet — the model's default "
@@ -1098,8 +1106,17 @@ bool GenerationService::parse_sampling(const dgpp::minijson::Value& body,
       !field("presence_penalty", -2.0, 2.0, false,
              [&](double x) { p.presence_penalty = static_cast<float>(x); }) ||
       !field("frequency_penalty", -2.0, 2.0, false,
-             [&](double x) { p.frequency_penalty = static_cast<float>(x); }))
+             [&](double x) { p.frequency_penalty = static_cast<float>(x); }) ||
+      !field("loop_guidance_strength", 0.0, 2.0, false,
+             [&](double x) { p.loop_guidance = static_cast<float>(x); }))
     return false;
+  if (p.loop_guidance > 0.0f && !loop_guidance_available_) {
+    respond_error(w, 400,
+                  "loop_guidance_strength moves the logits away from an earlier pass of a looped model; this "
+                  "deployment runs without engine.loop_guidance. Omit the field or set it to 0",
+                  "invalid_request_error", "loop_guidance_strength", "loop_guidance_unsupported");
+    return false;
+  }
   if (const auto* s = optional_field(body, "seed")) {
     if (s->kind() != minijson::Value::Kind::Int) {
       respond_error(w, 400, "seed must be a signed 64-bit integer", "invalid_request_error", "seed");
@@ -2713,7 +2730,7 @@ void GenerationService::route_models(const HttpRequest& req,
             model_object(cfg_, cfg_.model_id, created, sampling_available_, cfg_.sampling_defaults,
                          tool_calls_available(), constraints_available(), cfg_.reasoning_in_content,
                          *frontend_, frontend_->supports_images() && engine_->supports_images(),
-                         frontend_->supports_video() && engine_->supports_video()) +
+                         frontend_->supports_video() && engine_->supports_video(), loop_guidance_available_) +
             "]}");
     return;
   }
@@ -2724,7 +2741,7 @@ void GenerationService::route_models(const HttpRequest& req,
         model_object(cfg_, id, created, sampling_available_, cfg_.sampling_defaults,
                      tool_calls_available(), constraints_available(), cfg_.reasoning_in_content,
                      *frontend_, frontend_->supports_images() && engine_->supports_images(),
-                     frontend_->supports_video() && engine_->supports_video()));
+                     frontend_->supports_video() && engine_->supports_video(), loop_guidance_available_));
     return;
   }
   respond_error(w, 404, "the model '" + id + "' does not exist",

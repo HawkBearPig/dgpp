@@ -495,6 +495,10 @@ void Scheduler::validate_new(const SchedulerRequest& request) const {
     throw std::invalid_argument(
         "Scheduler: request '" + request.id +
         "' asks for stochastic sampling but the engine is greedy-only");
+  if (request.sampling.loop_guidance > 0.0f && !engine_->supports_loop_guidance())
+    throw std::invalid_argument(
+        "Scheduler: request '" + request.id +
+        "' asks for loop guidance but the engine has none");
   if (request.logprobs >= 0 && !engine_->supports_logprobs())
     throw std::invalid_argument(
         "Scheduler: request '" + request.id +

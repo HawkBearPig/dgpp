@@ -617,6 +617,8 @@ def read_dump_tokens(path):
 
 def gen_pure(args):
     cfg = text_config(args.checkpoint_dir)
+    if args.passes:
+        cfg["passes"] = args.passes
     entries = read_index(args.checkpoint_dir)
     if args.tokens_from:
         tokens = read_dump_tokens(args.tokens_from)
@@ -987,6 +989,9 @@ def main(argv=None):
     g.add_argument("--activations", choices=("bf16", "native"), default="bf16")
     g.add_argument("--teacher", help="the engine's partial states per visit: every visit past the first is fed "
                    "the engine's state after the visit before it")
+    g.add_argument("--passes", type=int, default=0,
+                   help="walk the core this many times instead of the checkpoint's count: the one-pass walk is "
+                        "what the engine's loop guidance tests hold the first pass's readout to")
     g.set_defaults(func=gen_pure)
     q = sub.add_parser("check-quant")
     q.add_argument("--dump", required=True)

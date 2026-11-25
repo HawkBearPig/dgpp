@@ -266,7 +266,7 @@ void rank_work(int r, const Inkling2Config& cfg, const std::string& dir, const s
 }  // namespace
 
 DGPP_TEST(inkling2_model_rejects_decode_rows_above_family_cap) {
-  const auto cfg = ink2fx::tiny_config();
+  const auto cfg = ink2fx::with_test_loop(ink2fx::tiny_config());
   const std::string dir = "inkling2_engine_cap_fixture";
   ink2fx::write_fixture(dir);
   require(Inkling2Model::decode_rows_cap() == 64, "the family's decode row cap");
@@ -289,7 +289,7 @@ DGPP_TEST(inkling2_model_rejects_decode_rows_above_family_cap) {
 }
 
 static void run_engines(bool native, uint16_t port) {
-  const Inkling2Config cfg = ink2fx::tiny_config();
+  const Inkling2Config cfg = ink2fx::with_test_loop(ink2fx::tiny_config());
   const std::string dir = "inkling2_engine_fixture";
   ink2fx::write_fixture(dir);
   const std::vector<int64_t> A = smoke_tokens(cfg, 23, 0x9E3779B97F4A7C15ull);

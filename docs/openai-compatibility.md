@@ -32,10 +32,17 @@ extensions. Model sampling defaults come from the checkpoint configuration.
 | Unsupported features | Stored-completion CRUD and `store: true`; remote media URLs, audio inputs and audio outputs; video on frontends without that modality; web search; predicted output; moderation configuration; explicit cache breakpoints/TTL/retention controls; verbosity; deprecated function-call API. Known unsupported API features return an error naming the field. |
 
 DGPP also accepts existing extensions: `top_k`, `min_p`,
-`repetition_penalty`, `prefix_cache`, `chat_template_kwargs`, object-valued
+`repetition_penalty`, `loop_guidance_strength`, `prefix_cache`,
+`chat_template_kwargs`, object-valued
 historical tool arguments, flat function definitions, and template-specific
 tool output lists. These extensions should not be assumed portable to OpenAI.
 Historical function arguments must be valid JSON objects for DGPP's templates.
+`loop_guidance_strength` (0 to 2) is a looped model's guidance strength on a
+deployment with `engine.loop_guidance`: an omitted field takes the
+deployment's strength, which `/v1/models` reports among the sampling
+defaults, and 0 asks for the model's own output. A deployment without loop
+guidance accepts 0 and refuses a larger value with
+`loop_guidance_unsupported`.
 `prefix_cache: false` opts one request out of the prefix cache: it attaches
 to no entry and publishes none, in memory or on NVMe. It prefills along the
 same structural cuts a cached prompt does: opting out changes what is kept,

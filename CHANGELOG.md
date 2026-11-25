@@ -3,6 +3,27 @@
 The history by milestone. `PLAN.md` has the milestones' exit gates;
 project procedures and design guidance live in `docs/`.
 
+## Unreleased
+
+- **Loop guidance for Inkling 2 Mini** (`engine.loop_guidance`, after arXiv
+  2610.02185): an optional decoding mode that runs the last six layers a
+  second time for every token, on the states the first pass over the looped
+  core left, and moves a request's logits away from that weaker readout's by
+  the request's strength. The second run has K/V planes and convolution state
+  of its own, so the model's own keys, values and the draft model's inputs do
+  not change, a prefix-cache entry serves every strength, and the output with
+  the draft model on is the output without it. `loop_guidance_strength` is a
+  request field (0 to 2, 0 for the model's own output) whose default is the
+  deployment's `engine.loop_guidance_strength`, reported by `/v1/models`. A
+  deployment without loop guidance refuses a nonzero strength with
+  `loop_guidance_unsupported`. `cluster_inkling-2-mini_nvfp4-mxfp8_w4_guided`
+  is the four-node template with guidance at strength 0.3.
+- The Inkling 2 decode test's first-visit state gate no longer fails on a
+  transcript that meets a router near-tie: rows whose routing differs from
+  the re-forward's, and the rows the MLP convolution carries them into, are
+  counted against a budget of 5 percent of the slots and left out of the
+  state comparison.
+
 ## v0.2.0 — 2026-11-24
 
 - **Inkling 2 Mini** (`thinkingmachines/Inkling-2-Mini`, `inkling2_loop`): a

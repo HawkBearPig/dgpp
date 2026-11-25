@@ -10,9 +10,11 @@
 // gates leave the linear range, routers with clear top-k margins, NVFP4
 // experts with random E2M1 nibbles and MXFP8 experts with random E4M3 codes
 // at about 0.05 rms.
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <stdexcept>
@@ -326,6 +328,36 @@ inline Inkling2Config draft_config(bool full_vocabulary = false) {
   const auto c = dgpp::minijson::parse(config);
   const auto q = dgpp::minijson::parse(quant);
   return Inkling2Config::parse(c.root, q.root);
+}
+
+// A test run under loop guidance (engine.loop_guidance): DGPP_TEST_INK2_LOOP
+// names it as "guidance=1,strength=0.3", either or both. The session,
+// engine and draft gates compare the engine with itself, so they hold under
+// guidance too, and a run of them with the variable set is how guidance is
+// held to them. Unset, a config is returned as it is.
+inline dgpp::Inkling2LoopOptions test_loop_options() {
+  dgpp::Inkling2LoopOptions o;
+  const char* spec = std::getenv("DGPP_TEST_INK2_LOOP");
+  if (spec == nullptr || *spec == 0) return o;
+  std::string s(spec);
+  size_t at = 0;
+  while (at < s.size()) {
+    const size_t end = std::min(s.find(',', at), s.size());
+    const std::string item = s.substr(at, end - at);
+    at = end + 1;
+    const size_t eq = item.find('=');
+    if (eq == std::string::npos) throw std::runtime_error("DGPP_TEST_INK2_LOOP: expected key=value, got " + item);
+    const std::string key = item.substr(0, eq), value = item.substr(eq + 1);
+    if (key == "guidance") o.guidance = value == "1";
+    else if (key == "strength") o.strength = std::stof(value);
+    else throw std::runtime_error("DGPP_TEST_INK2_LOOP: unknown item " + item);
+  }
+  return o;
+}
+
+inline Inkling2Config with_test_loop(Inkling2Config cfg) {
+  cfg.apply_loop_options(test_loop_options());
+  return cfg;
 }
 
 inline void write_draft_fixture(const std::string& dir, bool full_vocabulary = false) {

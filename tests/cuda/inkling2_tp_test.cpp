@@ -4,6 +4,10 @@
 //
 //   --checkpoint-dir DIR --dump-file FILE --world W --port P
 //       [--activations bf16|native] [--relaxed | --report]
+//   --checkpoint-dir DIR --loop-check --world W --port P [--activations bf16|native]
+//       loop guidance (engine.loop_guidance) on a world of W ranks, held as
+//       the world-1 forward test holds it: the gates are listed at
+//       loop_check(). Five worlds in turn, on ports P to P + 4.
 //
 // Asserted:
 //   * the geometry: a rank holds whole key/value heads with their query
@@ -23,6 +27,8 @@
 // teacher. The ctest chain per world and recipe: this test with --report on
 // the world-1 dump (writes the states) -> the reference with --teacher and
 // --world -> this test, strict.
+#include <algorithm>
+#include <cmath>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
@@ -40,6 +46,7 @@
 #include "common/log.hpp"
 #include "engine/tp_bus.hpp"
 #include "inkling2_reference_compare.hpp"
+#include "kernels/inkling2.hpp"
 #include "kernels/latent_format.hpp"
 #include "models/inkling2/binding.hpp"
 #include "models/inkling2/config.hpp"
@@ -174,6 +181,100 @@ bool bits_equal(const std::vector<uint16_t>& a, const std::vector<uint16_t>& b) 
   return a.size() == b.size() && (a.empty() || std::memcmp(a.data(), b.data(), a.size() * 2) == 0);
 }
 
+// One forward of `tokens` on a loopback world of `world` ranks: every rank's outcome.
+std::vector<RankOutcome> forward_world(const std::string& dir, const Inkling2Config& cfg,
+                                       const std::vector<int64_t>& tokens, int world, uint16_t port, bool native) {
+  std::vector<std::unique_ptr<CollectiveBus>> buses = start_world(world, port);
+  require(!buses.empty(), "tp bus world failed to start");
+  std::vector<RankOutcome> ranks(static_cast<size_t>(world));
+  ConstructBarrier barrier(world);
+  std::vector<std::thread> workers;
+  for (int r = 0; r < world; ++r)
+    workers.emplace_back(rank_work, r, world, dir, std::cref(cfg), std::cref(tokens), native, buses[static_cast<size_t>(r)].get(),
+                         &barrier, &ranks[static_cast<size_t>(r)]);
+  for (auto& t : workers) t.join();
+  for (int r = 0; r < world; ++r) require(ranks[static_cast<size_t>(r)].error.empty(), ranks[static_cast<size_t>(r)].error);
+  return ranks;
+}
+
+// The ranks' vocabulary slices put back together: [T, vocabulary].
+std::vector<float> joined_logits(const std::vector<RankOutcome>& ranks, const Inkling2Config& cfg, int T) {
+  std::vector<float> logits(static_cast<size_t>(T) * cfg.vocab_size, 0.0f);
+  int covered = 0;
+  for (const RankOutcome& r : ranks) {
+    const int begin = r.out.lm_vocab_begin, count = r.out.lm_vocab_count;
+    require(begin >= 0 && begin + count <= cfg.vocab_size && r.out.logits.size() == static_cast<size_t>(T) * count,
+            "a rank's logits are not its vocabulary slice");
+    for (int t = 0; t < T; ++t)
+      std::memcpy(logits.data() + static_cast<size_t>(t) * cfg.vocab_size + begin,
+                  r.out.logits.data() + static_cast<size_t>(t) * count, static_cast<size_t>(count) * 4);
+    covered += count;
+  }
+  require(covered == cfg.vocab_size, "the ranks' logits do not cover the vocabulary");
+  return logits;
+}
+
+// Loop guidance on a world of ranks, with the ranks' logits put back
+// together. The gates are the world-1 forward test's, at this world:
+//   - at strength 0 a guided world gives the unguided world's states and
+//     logits bit for bit: the readout's own folds touch nothing the model's
+//     walk reads;
+//   - at strength -1 the logits are those of a walk of one pass, bit for
+//     bit: the readout's visits fold as the model's do;
+//   - a guided logit is the host statement of the model's logit and the
+//     readout's, bit for bit, every rank moving its own share.
+int loop_check(const std::string& dir, int world, uint16_t port, bool native) {
+  const Inkling2Config base = Inkling2Config::from_checkpoint_dir(dir);
+  const int T = 48;
+  std::vector<int64_t> tokens(static_cast<size_t>(T));
+  uint64_t seed = 0x9E3779B97F4A7C15ull;
+  for (int i = 0; i < T; ++i) {
+    seed ^= seed << 13;
+    seed ^= seed >> 7;
+    seed ^= seed << 17;
+    tokens[static_cast<size_t>(i)] = static_cast<int64_t>(seed % static_cast<uint64_t>(base.vocab_size));
+  }
+  check_geometry(base, world);
+  int next_port = port;
+  const auto run_world = [&](bool guidance, float strength, int passes = 0) {
+    Inkling2Config cfg = base;
+    if (passes > 0) cfg.num_passes = passes;
+    dgpp::Inkling2LoopOptions o;
+    o.guidance = guidance;
+    o.strength = strength;
+    cfg.apply_loop_options(o);
+    return forward_world(dir, cfg, tokens, world, static_cast<uint16_t>(next_port++), native);
+  };
+  const auto same_bits = [](const std::vector<float>& a, const std::vector<float>& b) {
+    return a.size() == b.size() && std::memcmp(a.data(), b.data(), a.size() * 4) == 0;
+  };
+  const std::vector<RankOutcome> plain_ranks = run_world(false, 0.0f);
+  const std::vector<float> plain = joined_logits(plain_ranks, base, T);
+
+  const std::vector<RankOutcome> zero_ranks = run_world(true, 0.0f);
+  for (int r = 0; r < world; ++r)
+    require(zero_ranks[static_cast<size_t>(r)].out.layer_states == plain_ranks[static_cast<size_t>(r)].out.layer_states,
+            "loop check: guidance moved a state of the model's walk on rank " + std::to_string(r));
+  require(same_bits(joined_logits(zero_ranks, base, T), plain), "loop check: guidance at strength 0 moved a logit");
+
+  const std::vector<float> one_pass = joined_logits(run_world(false, 0.0f, 1), base, T);
+  const std::vector<float> readout = joined_logits(run_world(true, -1.0f), base, T);
+  require(same_bits(readout, one_pass), "loop check: the first pass's readout is not the one-pass walk's logits");
+  require(!same_bits(readout, plain), "loop check: the first pass reads out as the last one");
+
+  const float w = 0.5f;
+  const std::vector<float> guided = joined_logits(run_world(true, w), base, T);
+  for (size_t i = 0; i < guided.size(); ++i) {
+    const float want = dgpp::ink2_guided_value_host(w, plain[i], readout[i]);
+    require(std::memcmp(&guided[i], &want, 4) == 0, "loop check: a guided logit is not its statement");
+  }
+
+  std::printf("inkling2 tp loop check, world %d (%s activations): strength 0, the first pass's readout and the guided "
+              "statement over the joined vocabulary\n",
+              world, native ? "native" : "bf16");
+  return 0;
+}
+
 // With `ids_path` the run is the teacher-forced likelihood of that token
 // file at this world size (a measurement, written to `nll_out` position by
 // position); otherwise it is the comparison with the reference dump.
@@ -193,16 +294,7 @@ int run(const std::string& dir, const std::string& dump_path, int world, uint16_
   }
   const int T = static_cast<int>(tokens.size()), V = cfg.num_visits();
   check_geometry(cfg, world);
-  std::vector<std::unique_ptr<CollectiveBus>> buses = start_world(world, port);
-  require(!buses.empty(), "tp bus world failed to start");
-  std::vector<RankOutcome> ranks(static_cast<size_t>(world));
-  ConstructBarrier barrier(world);
-  std::vector<std::thread> workers;
-  for (int r = 0; r < world; ++r)
-    workers.emplace_back(rank_work, r, world, dir, std::cref(cfg), std::cref(tokens), native, buses[static_cast<size_t>(r)].get(),
-                         &barrier, &ranks[static_cast<size_t>(r)]);
-  for (auto& t : workers) t.join();
-  for (int r = 0; r < world; ++r) require(ranks[static_cast<size_t>(r)].error.empty(), ranks[static_cast<size_t>(r)].error);
+  const std::vector<RankOutcome> ranks = forward_world(dir, cfg, tokens, world, port, native);
 
   // ---- cross-rank bitwise ---------------------------------------------------------
   const RankOutcome& a = ranks[0];
@@ -230,18 +322,7 @@ int run(const std::string& dir, const std::string& dump_path, int world, uint16_
   er.mlp_input = a.mlp_input;
   er.route_ids = a.out.route_ids;
   er.final_hidden = a.out.final_hidden_bits;
-  er.logits.assign(static_cast<size_t>(T) * cfg.vocab_size, 0.0f);
-  int covered = 0;
-  for (const RankOutcome& r : ranks) {
-    const int begin = r.out.lm_vocab_begin, count = r.out.lm_vocab_count;
-    require(begin >= 0 && begin + count <= cfg.vocab_size && r.out.logits.size() == static_cast<size_t>(T) * count,
-            "a rank's logits are not its vocabulary slice");
-    for (int t = 0; t < T; ++t)
-      std::memcpy(er.logits.data() + static_cast<size_t>(t) * cfg.vocab_size + begin,
-                  r.out.logits.data() + static_cast<size_t>(t) * count, static_cast<size_t>(count) * 4);
-    covered += count;
-  }
-  require(covered == cfg.vocab_size, "the ranks' logits do not cover the vocabulary");
+  er.logits = joined_logits(ranks, cfg, T);
   if (const char* path = std::getenv("DGPP_INKLING2_DUMP_ENGINE_STATES")) ink2ref::write_states(path, er, T, cfg.hidden_size);
   if (measure) {
     const std::string what =
@@ -258,7 +339,7 @@ int main(int argc, char** argv) {
   try {
     std::string dir, dump, ids, nll_out;
     int world = 0, port = 0;
-    bool native = false, relaxed = false, report = false;
+    bool native = false, relaxed = false, report = false, loop = false;
     for (int i = 1; i < argc; ++i) {
       const std::string a = argv[i];
       auto next = [&]() -> std::string {
@@ -271,6 +352,7 @@ int main(int argc, char** argv) {
       else if (a == "--nll-out") nll_out = next();
       else if (a == "--world") world = std::stoi(next());
       else if (a == "--port") port = std::stoi(next());
+      else if (a == "--loop-check") loop = true;
       else if (a == "--relaxed") relaxed = true;
       else if (a == "--report") report = relaxed = true;
       else if (a == "--activations") {
@@ -278,6 +360,11 @@ int main(int argc, char** argv) {
         require(v == "bf16" || v == "native", "--activations takes bf16 or native");
         native = v == "native";
       } else throw std::runtime_error("unknown argument " + a);
+    }
+    if (loop) {
+      require(!dir.empty() && (world == 2 || world == 4) && port > 0,
+              "usage: --checkpoint-dir DIR --loop-check --world 2|4 --port P [--activations bf16|native]");
+      return loop_check(dir, world, static_cast<uint16_t>(port), native);
     }
     require(!dir.empty() && (!dump.empty() || !ids.empty()) && (world == 2 || world == 4) && port > 0,
             "usage: --checkpoint-dir DIR (--dump-file FILE | --ids FILE [--nll-out FILE]) --world 2|4 --port P "

@@ -521,7 +521,7 @@ DGPP_TEST(shared_prefill_minimax) {
 DGPP_TEST(shared_prefill_inkling2) {
   const std::string dir = "shared_inkling2_fixture";
   ink2fx::write_fixture(dir);
-  const auto cfg = ink2fx::tiny_config();
+  const auto cfg = ink2fx::with_test_loop(ink2fx::tiny_config());
   for (const bool native : {false, true})
     check<Inkling2Model>(
         [&](bool mtp, bool compact) {
