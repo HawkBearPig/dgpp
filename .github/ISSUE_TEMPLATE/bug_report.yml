@@ -22,7 +22,7 @@ body:
     attributes:
       label: Server version
       description: The output of `dgpp-serve --version`, or the source revision and whether the tree was clean.
-      placeholder: 0.2.0+gba3fbed9d998
+      placeholder: 0.2.1+g649aa0c36b4d
     validations:
       required: true
   - type: input

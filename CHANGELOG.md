@@ -3,7 +3,7 @@
 The history by milestone. `PLAN.md` has the milestones' exit gates;
 project procedures and design guidance live in `docs/`.
 
-## Unreleased
+## v0.2.1 — 2026-11-25
 
 - **Loop guidance for Inkling 2 Mini** (`engine.loop_guidance`, after arXiv
   2610.02185): an optional decoding mode that runs the last six layers a
