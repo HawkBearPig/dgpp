@@ -829,6 +829,11 @@ struct Dsv41Family final : ServeFamily {
       throw std::invalid_argument(
           "the EXL3 pack ships no Engram tables: set engine.engram_source to the base release "
           "(deepseek-ai/DeepSeek-V4.1-Flash-1017) whose shards hold them (docs/deepseek_v41_flash_exl3_plan.md §1.3)");
+    if (cfg.weights_exl3 && dgpp::Dsv41Model::default_prefill_act_native())
+      throw std::invalid_argument(
+          "engine.prefill_activations native is the DeepSeek release's recipe (fp8 activations in front of its fp8 and "
+          "fp4 multiplies); an EXL3 pack's multiplies rotate the activation row and define no such quantization: "
+          "leave the key at bf16 for this pack");
     model = std::make_unique<dgpp::Dsv41Model>(
         cfg, ckpt, forward_rows, pool_tokens,
         fabric ? dgpp::Dsv41Residency::Resident : dgpp::Dsv41Residency::Streaming, reducer,
@@ -2764,7 +2769,11 @@ int main(int argc, char** argv) {
                    : std::string("off")) +
            (nvme_cache_reuse_binding.empty() ? std::string()
                                              : " nvme_reuse=" + nvme_cache_reuse_binding) +
-           (runtime_adapter_id.empty() ? "" : " runtime_adapter=" + runtime_adapter_id);
+           (runtime_adapter_id.empty() ? "" : " runtime_adapter=" + runtime_adapter_id) +
+           // Prefill rows computed under the checkpoint's activation recipe
+           // are not the BF16 chain's rows: the recipe is part of the
+           // world's identity (and of what a cache binding names).
+           (prefill_activations == "bf16" ? std::string() : " pfact=" + prefill_activations);
   };
   // Dory1.0-4B is a one-rank family (the reference refuses
   // tensor_parallel_size != 1; docs/dory_plan.md §2): refuse a world > 1
@@ -2957,6 +2966,7 @@ int main(int argc, char** argv) {
         prefill_fp8_gemm = ws.prefill_fp8_gemm;
         prefill_fp8_per_tensor = ws.prefill_fp8_per_tensor;
         activations = ws.activations;
+        prefill_activations = ws.prefill_activations;
         loop_guidance = ws.loop_guidance;
         loop_guidance_strength = ws.loop_guidance_strength;
         prefill_attention = ws.prefill_attention;
@@ -3242,6 +3252,7 @@ int main(int argc, char** argv) {
   dgpp::Qwen35Model::set_dense_weights_fp8(dense_weights == "fp8");
   // The checkpoint's activation recipe on prefill rows (engine.prefill_activations).
   dgpp::Qwen35Model::set_native_activations(prefill_activations == "native");
+  dgpp::Dsv41Model::set_default_prefill_act_native(prefill_activations == "native");
   // The prefill attention's arithmetic on the fp8 pool (engine.prefill_attention).
   dgpp::Qwen35Model::set_fp8_attention(prefill_attention == "fp8");
   dgpp::QwenModel::set_native_attention(prefill_attention == "fp8", decode_attention == "fp8");
@@ -3676,9 +3687,10 @@ int main(int argc, char** argv) {
                     decode_attention, family->name());
       return 2;
     }
-    if (prefill_activations != "bf16" && std::string(family->name()) != "qwen3_5") {
-      DGPP_LOG_ERROR("serve: engine.prefill_activations {} is the Qwen3.5 family's lever (the checkpoint's activation "
-                     "recipe on prefill rows); the {} family's prefill chain has its own keys",
+    if (prefill_activations != "bf16" && std::string(family->name()) != "qwen3_5" &&
+        std::string(family->name()) != "deepseek_v41") {
+      DGPP_LOG_ERROR("serve: engine.prefill_activations {} is the Qwen3.5 and DeepSeek-V4.1 families' lever (the "
+                     "checkpoint's activation recipe on prefill rows); the {} family's prefill chain has its own keys",
                      prefill_activations, family->name());
       return 2;
     }

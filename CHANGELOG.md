@@ -5,6 +5,22 @@ project procedures and design guidance live in `docs/`.
 
 ## Unreleased
 
+- **The release's activation recipe on DeepSeek-V4.1 prompt rows**
+  (`engine.prefill_activations: native`, on in the DeepSeek-V4.1-Flash-1017
+  template). The checkpoint's reference code quantizes the input of every
+  FP8 and MXFP4 multiply to FP8 with a power-of-two scale per 32 values, and
+  weighs an expert's SwiGLU product by its route before the down
+  projection. Prompt rows now do the same through a rounding kernel in front
+  of the BF16-activation multiplies. Against the release's own layer code on
+  the real weights the engine's layer outputs sit closer with the recipe
+  than without it (0.0058 / 0.0032 / 0.0020 / 0.0020 relative L2 on the
+  first four layers against 0.0100 / 0.0036 / 0.0025 / 0.0025) and more rows
+  route to the reference's experts. The quality set reads 158/164, 292/300
+  and 100/100 with the recipe against 156/164, 294/300 and 100/100 without.
+  Decode rows, the draft stages and EXL3 packs keep BF16 activations. The key
+  joins the world's settings identity when it is not `bf16`, which gives a
+  Qwen3.8-27B deployment that already set it a new cache binding once.
+
 - **Host waits park on the GB10.** A thread that waits for a word another
   agent writes no longer polls it at the full clock. On a CPU with `WFET`
   (the GB10's cores) the serving thread parks on the verdict and confidence

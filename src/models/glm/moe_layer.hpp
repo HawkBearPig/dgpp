@@ -172,6 +172,17 @@ class GlmMoeLayer {
   float* hidden_code_scales() const { return d_hidden_qs_; }
   void mark_hidden_codes_ready(bool ready) { hidden_codes_ready_ = ready; }
 
+  // The DeepSeek release's activation recipe on the prefill chain
+  // (kernels/act_quant.hpp): the token rows quantize-dequantized to fp8
+  // block-32 before the gate and up projections, the SwiGLU product weighted
+  // by its route and quantize-dequantized before the down projection, and
+  // the down rows accumulated unweighted — the order of the release's
+  // Expert.forward. Decode rows (enqueue_decode) keep the BF16 chain. Takes
+  // the device-segmented prefill chain with a shared expert, equal routed
+  // and shared intermediate widths and fp32 down rows.
+  void set_act_qdq_fp8_block(bool on) { act_qdq_ = on; }
+  bool act_qdq_fp8_block() const { return act_qdq_; }
+
   // Fills graph slot `table_slot`'s device expert-view table from the
   // CURRENT binding (an async H2D on `stream`; the caller syncs before
   // capturing). Must run OUTSIDE stream capture, once per slot, before
@@ -270,7 +281,8 @@ class GlmMoeLayer {
                             const MoeSegment* shared_seg, int tokens,
                             size_t rows_total, cudaStream_t stream,
                             const MoeTile* tiles = nullptr,
-                            const int32_t* tile_count = nullptr, int tile_cap = 0);
+                            const int32_t* tile_count = nullptr, int tile_cap = 0,
+                            bool device_routes = false);
   // Whether the routed chain's tensor-core launches take the tile list: the
   // wide packed int4 kernel (engine.expert_tile_list = false keeps the max_rows grid).
   bool packq_tile_list() const;
@@ -317,6 +329,17 @@ class GlmMoeLayer {
   size_t q_rows_cap_ = 0, q_k_cap_ = 0;
   bool down_bf16_ = false;  // the last chain wrote bf16 down rows into d_down_ (W4A4, no shared segment)
   void ensure_w4a4(size_t rows, int k);
+  // The fp8 block activation recipe (set_act_qdq_fp8_block): the token rows'
+  // quantize-dequantized copy, each grouped row's route weight (1 on the
+  // shared rows) and the unit weights of the unweighted accumulation, grown
+  // on first use (eager prefill only, never under capture).
+  bool act_qdq_ = false;
+  uint16_t* d_hidden_qdq_ = nullptr;  // [max_tokens, hidden]
+  float* d_act_row_w_ = nullptr;      // [max_tokens * (top_k + 1)]
+  float* d_unit_w_ = nullptr;         // [max_tokens * top_k]
+  size_t chain_route_offset_ = 0;     // prefill_chain's offset into d_slot_row_ / d_weights_
+  void ensure_act_qdq(cudaStream_t stream);
+  const float* accum_weights() const { return act_qdq_ ? d_unit_w_ : d_weights_; }
   float* d_acc_ = nullptr;   // [max_tokens, hidden] the fp32 chain
 
   // decode-slot scratch (cudaMalloc; sized to decode_slots*(top_k+1) rows —

@@ -48,8 +48,9 @@ measurement below prices 2048 against it on the same binary.
 
 Four DGX Spark nodes, tensor parallel, the V4.1-Flash template's shape: six
 request slots at DSpark depth 4 with the confidence-scheduled verify depth,
-the bounded prefill (the model's own SWA-replay recipe), the full
-1M-token context. The tokenizer, prompt renderer (`encoding/encoding.py`,
+the bounded prefill (the model's own SWA-replay recipe) with the release's
+activation recipe on prompt rows (`engine.prefill_activations: native`), the
+full 1M-token context. The tokenizer, prompt renderer (`encoding/encoding.py`,
 no Jinja template) and DSML tool-call format are V4.1-Flash's.
 
 ## The expert slot launches (2026-11-10)
@@ -785,6 +786,56 @@ B's projection, B's under A's gate and attention; bitwise): 0.413 /
 little work: a block's fold of hidden x 2 bytes per row moves at about
 7 GB/s per rank on the paced bulk path, and block B's accumulation is
 shorter than block A's fold.
+
+## The release's activation recipe on prompt rows (2026-11-26)
+
+The checkpoint's `inference/model.py` quantizes the input of every FP8 and
+MXFP4 projection before it multiplies: FP8 e4m3 values with a power-of-two
+scale per 32 values of the row. The template sets
+`engine.prefill_activations: native`, and every prompt row then takes that
+recipe. The hidden rows are rounded once for `wq_a` and `wkv`, the normed
+low-rank query once for `wq_b` and the indexer's `wq_b`, the attention
+output before `wo_a`, the `wo_a` rows before `wo_b`, the gathered Engram
+rows before `wkv`, and the token rows before each expert's gate and up
+projections. An expert's SwiGLU product takes its route weight, one BF16
+rounding and the same quantization before the down projection, so the
+accumulation adds unweighted rows, which is the order of the release's
+`Expert.forward`. The router, the compressors, the indexer's
+`weights_proj` and the head read unquantized rows, as in the release.
+Decode rows and the draft stages keep BF16 activations. An EXL3 pack has no
+such recipe and is refused with the key at `native`.
+
+The rounding runs as its own kernel in front of the BF16-activation
+multiplies (`kernels/act_quant.hpp`). Every scale is a power of two and the
+release accumulates in FP32, so each product is the release's up to the
+order of the sum.
+
+Against the release's own layer code on the real weights
+(`tools/dsv41_torch_reference.py` over the engine's dump from
+`dsv41_forward_check`, with `--act-quant` and `--act-native` for the
+recipe), 192 text tokens through the first four layers on one rank, as the
+relative L2 of a layer's output over the rows that route alike:
+
+| Engine prompt rows | Reference | Layer 0 | Layer 1 | Layer 2 | Layer 3 | Rows routed alike |
+|---|---|---|---|---|---|---|
+| BF16 | activation quantization off | 0.0100 | 0.0036 | 0.0025 | 0.0025 | 165 to 178 of 192 |
+| `native` | activation quantization on | 0.0058 | 0.0032 | 0.0020 | 0.0020 | 186 to 189 |
+| `native` | activation quantization off | 0.0179 | 0.0192 | 0.0112 | 0.0093 | 159 to 179 |
+| BF16 | activation quantization on | 0.0193 | 0.0199 | 0.0096 | 0.0083 | 159 to 173 |
+
+The quality set on four nodes, one binary (source `ce34f867` plus this
+change, binary `2a9ad6e4152ebdcd`), the template with `index_topk` 2048 and
+the key the only difference, every rank at zero swap:
+
+| | BF16 | `native` |
+|---|---|---|
+| HumanEval | 156/164 | 158/164 |
+| GSM8K | 294/300 | 292/300 |
+| Extraction | 100/100 | 100/100 |
+
+Four items passed under BF16 only and four under `native` only. In this
+form the recipe adds 2 to 3 % to a cold prefill of 2K to 33K tokens, the
+cost of the rounding launches.
 
 ## Measured (2026-10-20, four nodes): the campaign of record
 

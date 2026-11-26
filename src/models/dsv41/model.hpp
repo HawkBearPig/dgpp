@@ -132,6 +132,26 @@ class Dsv41Model : public SessionModel<Dsv41Model> {
     prefill_dense_tile_ = on;
     if (csa2_) csa2_->set_prefill_dense_tile(on);
   }
+  // The prefill rows' activations (engine.prefill_activations): BF16 as the
+  // weights decode (false, the default), or the release's own recipe (true:
+  // "native") — the input of every fp8 and fp4 projection quantized to fp8
+  // e4m3 with a power-of-two scale per 32 values, as the checkpoint's
+  // inference/model.py linear() does before fp8_gemm and fp4_gemm, here as a
+  // quantize-dequantize in front of the BF16-activation kernels
+  // (kernels/act_quant.hpp: the release's multiply up to the order of its
+  // fp32 sum). Covers the CSA2 projections, the attention output before
+  // wo_a, the Engram projection and the routed and shared experts, whose
+  // SwiGLU product takes its route weight before the down projection as in
+  // Expert.forward. Decode rows and the draft stages keep the BF16 chain.
+  // Every model built from here on takes the default.
+  static void set_default_prefill_act_native(bool on) { s_default_prefill_act_native = on; }
+  static bool default_prefill_act_native() { return s_default_prefill_act_native; }
+  void set_prefill_act_native(bool on) {
+    prefill_act_native_ = on;
+    if (csa2_) csa2_->set_prefill_act_qdq(on);
+    if (moe_) moe_->set_act_qdq_fp8_block(on);
+  }
+  bool prefill_act_native() const { return prefill_act_native_; }
   // The prefill walk's window attention (engine.prefill_window): the flash
   // listed kernel (true, the default) or the scalar partial kernel the
   // decode window runs. Every model built from here on takes the default.
@@ -479,6 +499,8 @@ class Dsv41Model : public SessionModel<Dsv41Model> {
   bool prefill_bounded_ = s_default_prefill_bounded;
   static inline bool s_default_prefill_dense_tile = true;
   bool prefill_dense_tile_ = s_default_prefill_dense_tile;
+  static inline bool s_default_prefill_act_native = false;
+  bool prefill_act_native_ = s_default_prefill_act_native;
   static inline bool s_default_prefill_window_flash = true;
   bool prefill_window_flash_ = s_default_prefill_window_flash;
   static inline bool s_default_decode_window_flash = true;

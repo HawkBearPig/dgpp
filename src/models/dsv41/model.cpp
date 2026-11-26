@@ -617,6 +617,7 @@ void Dsv41Model::build_layer_objects(const Dsv41LayerResident& r) {
   // layer's staging is recycled under them.
   csa2_->set_prefetcher(loader_.residency() == Dsv41Residency::Resident ? &prefetch_ : nullptr);
   csa2_->set_prefill_dense_tile(prefill_dense_tile_);
+  csa2_->set_prefill_act_qdq(prefill_act_native_);
   csa2_->set_prefill_window_flash(prefill_window_flash_);
   csa2_->set_decode_window_flash(decode_window_flash_);
   if (decode_window_beside_) csa2_->set_decode_side(attn_side_, attn_fork_, attn_join_);
@@ -633,6 +634,7 @@ void Dsv41Model::build_layer_objects(const Dsv41LayerResident& r) {
   if (!moe_) {
     const int slots = loader_.residency() == Dsv41Residency::Resident ? cfg_.num_hidden_layers : 0;
     moe_ = std::make_unique<GlmMoeLayer>(moe_view(r.moe), moe_cfg_, max_tokens_, max_decode_rows_, slots);
+    moe_->set_act_qdq_fp8_block(prefill_act_native_);
   } else {
     moe_->rebind(moe_view(r.moe));
   }
@@ -1259,13 +1261,13 @@ void Dsv41Model::enqueue_layer_overlap(const Dsv41LayerResident& r, int layer, i
     prestage_after_embed(r.engram.table_index);
     ew = engram_view(r.engram);
     const int W = (cfg_.hc_mult + 1) * H;
-    engram_->project(ew, TA, engram_kv, stream_, /*prefill_tile=*/prefill_dense_tile_, 0);
+    engram_->project(ew, TA, engram_kv, stream_, /*prefill_tile=*/prefill_dense_tile_, 0, prefill_act_native_);
     DGPP_CUDA_OK(cudaEventRecord(ov_ev_[4], stream_));
     // The previous layer's block-B MoE fold, if pending, runs under the two
     // projections and lands before the Engram folds begin (the reducer
     // holds one fold at a time); then every row's streams stand in cur_.
     if (ffn_b_pending_) begin_pending_fold();
-    engram_->project(ew, TB, engram_kv, stream_, /*prefill_tile=*/prefill_dense_tile_, TA);
+    engram_->project(ew, TB, engram_kv, stream_, /*prefill_tile=*/prefill_dense_tile_, TA, prefill_act_native_);
     DGPP_CUDA_OK(cudaEventRecord(ov_ev_[5], stream_));
     flush_overlap();
     const bool fold_ka = begin_fold_after(engram_kv, 0, TA, ov_ev_[4], W);  // under B's projection
@@ -1402,7 +1404,8 @@ void Dsv41Model::enqueue_layer(const Dsv41LayerResident& r, int layer, int T, co
     prestage_after_embed(r.engram.table_index);
     const Dsv41EngramLayerWeights ew = engram_view(r.engram);
     uint16_t* kv = stage(engram_kv_, T, 5 * H, rows.capture);
-    engram_->project(ew, T, kv, stream_, /*prefill_tile=*/!rows.decode && prefill_dense_tile_);
+    engram_->project(ew, T, kv, stream_, /*prefill_tile=*/!rows.decode && prefill_dense_tile_, 0,
+                     !rows.decode && prefill_act_native_);
     if (pf) {  // this layer's attention side under the Engram fold
       prefetch_.open_window(stream_, 0, prefetch_.boundary_rate());  // the budget: engine.l2_prefetch_window_mib
       prefetch_attention_weights(r, T);

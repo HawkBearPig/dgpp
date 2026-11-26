@@ -170,6 +170,7 @@ add_library(dgpp_kernels STATIC
   src/kernels/fp8_dequant.cu
   src/kernels/fp8_gemm.cu
   src/kernels/mxfp8_gemm.cu
+  src/kernels/act_quant.cu
   src/kernels/fp8w_gemm.cu
   src/kernels/fp4w_gemm.cu
   src/kernels/fp8_per_tensor.cu
@@ -2922,6 +2923,12 @@ set_tests_properties(glm_pick_test PROPERTIES SKIP_RETURN_CODE 2)
 
 # MoE module parity (M4): router vs oracle at real geometry, expert path on
 # small geometry, swiglu clamps, accumulation order, determinism.
+add_executable(act_quant_test tests/cuda/act_quant_test.cu)
+target_link_libraries(act_quant_test PRIVATE dgpp_kernels CUDA::cudart)
+dgpp_set_common(act_quant_test)
+add_test(NAME act_quant_test COMMAND act_quant_test)
+set_tests_properties(act_quant_test PROPERTIES SKIP_RETURN_CODE 2 LABELS "cuda")
+
 add_executable(mxfp8_gemm_test tests/cuda/mxfp8_gemm_test.cu)
 target_link_libraries(mxfp8_gemm_test PRIVATE dgpp_kernels CUDA::cudart)
 dgpp_set_common(mxfp8_gemm_test)
