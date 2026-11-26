@@ -42,24 +42,23 @@ using Clock = std::chrono::steady_clock;
 constexpr int kMaxIntakeLatency = 64;    // latency requests per iteration
 constexpr int kMaxIntakeBulkPosts = 16;  // bulk stripes per iteration
 constexpr int kMaxPollPerCq = 32;        // CQEs drained per CQ per iteration
-// Hot-spin iterations before the 50us-sleep phase. Large on purpose: the
-// engine is a dedicated poller (§6.1), and a round trip (send: ~25us of
-// credit latency; collective: the kernel launch tail) must land inside
-// the hot phase or the sleep cadence (~50-110us) shows up in every
-// measurement. The sleep phase is a power courtesy for genuine idles —
-// never a latency mechanism.
+// Empty passes before the engine rests. Large on purpose: the engine is a
+// dedicated poller (§6.1), and a round trip (send: ~25us of credit
+// latency; collective: the kernel launch tail) must land inside the hot
+// phase or the resting cadence shows up in every measurement. Resting is a
+// power courtesy for genuine idles, never a latency mechanism.
 constexpr int kEngineSpinIterations = 2000;
+// Before a decode graph exists a resting engine sleeps this long at a time.
 constexpr int kEngineIdleSleepUs = 50;
-// Opt-in quiet park once a decode graph exists (cpu_wait.hpp):
-// DGPP_BUS_WFE_PARK_US=n (1..1000) parks the engine in WFET, armed on its
-// kick word and bounded by n microseconds, whenever it has nothing queued,
-// in flight or live. Every CPU-side hand-off (a queued send or collective,
-// a stream issue, a window arm, stop) bumps the kick, which ends the park
-// (a wake can still be lost to a preemption; the bound covers it); anything else (a peer's traffic, a completion that lands after
-// this pass's poll) waits for the park to end and the next pass to poll
-// it: up to n us plus a pass, longer if the thread is preempted. Unset or
-// 0 keeps the stock hot spin.
-constexpr int kEngineParkUs = 0;
+// Once a decode graph exists a resting engine parks on its kick word
+// (cpu_wait.hpp) for at most this long at a time, where the CPU parks.
+// Every hand-off from a CPU thread (a queued send or collective, a stream
+// issue, a window arm, stop) bumps the kick and ends the park at once. The
+// bound is how late the engine notices what arrives without a kick: a
+// peer's point-to-point message, or a hand-off whose wake a preemption
+// lost. At 50 us a parked engine makes about one pass in fifty
+// microseconds, a few percent of a core.
+constexpr int kEngineQuietParkUs = 50;
 constexpr size_t kMaxLatencySamples = 100000;
 // Spin before entering the scheduler on a request wait. LONG on purpose
 //: the decode step's eager pick (two ~150us collectives
@@ -152,28 +151,6 @@ struct BusRequest {
   std::string error;
 };
 
-// Cheap spin hint (not the sched_yield syscall — that surrenders the
-// timeslice; the engine measured 2.2ms poll latency doing it).
-inline void cpu_relax() {
-#if defined(__aarch64__)
-  asm volatile("yield" ::: "memory");
-#elif defined(__x86_64__)
-  asm volatile("pause" ::: "memory");
-#endif
-}
-
-// One step of a wait on an engine-published word last read as `seen`:
-// a bounded WFET park until the word changes where available
-// (cpu_wait.hpp), else the spin hint. The caller re-checks its exit
-// conditions after each step.
-template <class T>
-inline void relax_on(const std::atomic<T>& word, T seen) {
-  if (cpu_wait::enabled())
-    cpu_wait::park_while_equal(word, seen, cpu_wait::deadline_in_us(cpu_wait::kWaitSliceUs));
-  else
-    cpu_relax();
-}
-
 struct CollectiveBus::Impl {
   struct SendSlot {
     uint32_t gen = 0;          // last generation posted into this slot
@@ -230,17 +207,18 @@ struct CollectiveBus::Impl {
   uint64_t next_id = 1;
 
   std::atomic<bool> stopping{false};
-  // Bumped (release) after every CPU-side hand-off to the engine; the
-  // engine's quiet park waits on it. Alone on its lines: other writers
-  // would only add early returns.
+  // The engine parks when it is quiet (engine_loop) where the CPU can park.
+  const bool park_when_quiet = cpu_wait::supported();
+  // Bumped (release) after every hand-off from a CPU thread to the engine.
+  // A quiet engine parks on it. It sits alone on its lines, because any
+  // other write to them would end a park early.
   alignas(256) std::atomic<uint32_t> engine_kick{0};
   char engine_kick_pad_[256 - sizeof(std::atomic<uint32_t>)];
-  // The quiet park's bound in us, 0 = off; set in start() before the engine
-  // thread exists and never changed, so hand-offs pay the kick only when on.
-  int engine_park_us = 0;
   void kick_engine() {
-    if (engine_park_us > 0) engine_kick.fetch_add(1, std::memory_order_release);
+    if (park_when_quiet) engine_kick.fetch_add(1, std::memory_order_release);
   }
+  // Quiet parks so far (stats() and the engine's exit line report it).
+  std::atomic<uint64_t> engine_parks{0};
   std::mutex stop_mu;  // serializes quiesce()/stop() for one instance
   bool quiesced = false;
   bool stopped = false;
@@ -762,7 +740,7 @@ struct CollectiveBus::Impl {
         Clock::now() + std::chrono::microseconds(kWaitSpinUs);
     while (!req->done_flag.load(std::memory_order_acquire)) {
       if (Clock::now() > deadline) break;
-      relax_on(req->done_flag, false);  // the flag only goes false -> true
+      cpu_wait::wait_step(req->done_flag, false);  // the flag only goes false -> true
     }
     if (req->done_flag.load(std::memory_order_acquire)) return true;
     std::unique_lock<std::mutex> lock(req->mu);
@@ -2880,10 +2858,11 @@ struct CollectiveBus::Impl {
     DGPP_LOG_INFO("bus engine: rank {} pinned to cpu {}", opt.my_rank, cpu);
   }
 
-  // The quiet park's predicate: nothing queued, in flight or live, so the
-  // engine's next work is a hand-off (which kicks). try_lock: a contended
-  // lock means a hand-off is under way, and the engine must not sleep in
-  // the futex (the scheduler-displacement story in engine_loop).
+  // True when the engine has nothing queued, in flight or live, so that its
+  // next work can only come from a hand-off, and a hand-off kicks. The
+  // locks are only tried: a held lock means a hand-off is under way, and
+  // the engine must not sleep in the futex behind it (engine_loop explains
+  // what a sleeping engine costs).
   bool engine_quiet() {
     if (stopping.load(std::memory_order_relaxed)) return false;
     if (coll.req || graph_window_live() || stream_outstanding()) return false;
@@ -2908,26 +2887,15 @@ struct CollectiveBus::Impl {
     return true;
   }
 
-  static int park_us_from_env() {
-    if (!cpu_wait::enabled()) return 0;
-    long us = kEngineParkUs;
-    if (const char* env = std::getenv("DGPP_BUS_WFE_PARK_US")) {
-      char* end = nullptr;
-      errno = 0;
-      const long v = std::strtol(env, &end, 10);
-      if (errno == 0 && end != env && *end == '\0') us = v;
-      else DGPP_LOG_WARN("bus engine: DGPP_BUS_WFE_PARK_US={} is not a number; park off", env);
-    }
-    return static_cast<int>(std::clamp(us, 0L, 1000L));
-  }
-
   void engine_loop() {
     pin_engine_thread();
-    const int park_us = engine_park_us;
-    // One line per rank: the host waits' mode (cpu_wait.hpp) and the quiet park.
-    DGPP_LOG_INFO("bus engine: rank {} host waits: {}; quiet park: {}", opt.my_rank,
-                  cpu_wait::enabled() ? "WFET" : "spin",
-                  park_us > 0 ? std::to_string(park_us) + " us" : std::string("off (spin)"));
+    if (park_when_quiet)
+      DGPP_LOG_INFO("bus engine: rank {} parks when quiet (WFET on its kick word, {} us at a time)",
+                    opt.my_rank, kEngineQuietParkUs);
+    else
+      DGPP_LOG_INFO("bus engine: rank {} spins when quiet (this CPU has no WFET)", opt.my_rank);
+    // Empty passes in a row. It stops counting one past the threshold: only
+    // the threshold matters, and a quiet engine passes here for days.
     int idle = 0;
     for (;;) {
       if (stopping.load(std::memory_order_relaxed) && drained()) break;
@@ -2949,37 +2917,46 @@ struct CollectiveBus::Impl {
       if (graph_worked || stream_worked || coll_worked || worked || polled ||
           recycled || credited || watched) {
         idle = 0;
-      } else if (++idle > kEngineSpinIterations && !graph_window_live() &&
-                 !stream_outstanding() &&
-                 !graph.recorded.load(std::memory_order_relaxed)) {
-        // The nap is for the pre-serving idle only. Once a decode graph
-        // exists this thread never sleeps: a 50 us nap between
-        // windows made its core look idle, the scheduler parked another
-        // runnable thread there (the main thread's sync spin, a driver
-        // thread), and the wake-up waited out that thread's CFS slice —
-        // 7-10 ms, PREEMPT_NONE/HZ=250 — exactly when the next window's
-        // first generation needed the post. Every other rank then waited
-        // at gen 0; the fabric's p99 was one core-share. One core at 100%
-        // while serving is the dedicated poller's contract anyway.
-        std::this_thread::sleep_for(
-            std::chrono::microseconds(kEngineIdleSleepUs));
-      } else if (park_us > 0 && idle > kEngineSpinIterations &&
-                 graph.recorded.load(std::memory_order_relaxed)) {
-        // Quiet with a decode graph recorded: park in WFET instead of the
-        // hot spin below. The thread stays on its core, so the
-        // displacement that retired the nap here cannot happen; the kick
-        // (read before the predicate) ends the park on any hand-off.
-        const uint32_t kick = engine_kick.load(std::memory_order_acquire);
-        if (engine_quiet())
-          cpu_wait::park_while_equal(engine_kick, kick, cpu_wait::deadline_in_us(park_us));
+        continue;
       }
-      // else: hot spin — the loop body is the poll. sched_yield here was
-      // measured at ~2.2 ms of poll latency per idle stretch (the collective
-      // path idles between engine events while kernels wait on doorbells,
-      // and every yield surrendered the timeslice); the sleep phase polls
-      // strictly faster than the "spin" phase did. No syscalls on the hot
-      // path — including this one.
+      // The hot phase: the loop body is the poll, with no system call in
+      // it. A sched_yield here cost about 2.2 ms of poll latency per idle
+      // stretch, because the collective path idles between engine events
+      // while kernels wait on doorbells and every yield gave the timeslice
+      // away.
+      if (idle <= kEngineSpinIterations) ++idle;
+      if (idle <= kEngineSpinIterations) continue;
+      if (!graph.recorded.load(std::memory_order_relaxed)) {
+        // Before a decode graph exists the engine sleeps.
+        if (!graph_window_live() && !stream_outstanding())
+          std::this_thread::sleep_for(std::chrono::microseconds(kEngineIdleSleepUs));
+      } else if (park_when_quiet) {
+        // Once a decode graph exists the engine never sleeps. A sleeping
+        // engine makes its core look idle, the scheduler puts another
+        // runnable thread there (the main thread's sync spin, a driver
+        // thread), and the engine's wake-up then waits out that thread's
+        // CFS slice: 7-10 ms (PREEMPT_NONE, HZ=250), exactly when the next
+        // window's first generation needs its post. Every other rank waits
+        // at that generation, so the fabric's p99 becomes one thread's
+        // share of a core.
+        //
+        // A park is not a sleep. The thread stays on its core and stays
+        // runnable, so the scheduler has no idle core to give away. The
+        // kick is read before the predicate, and every hand-off publishes
+        // its work before it bumps the kick. A hand-off that lands after
+        // the predicate has therefore changed the kick, and the park
+        // returns at once.
+        const uint32_t kick = engine_kick.load(std::memory_order_acquire);
+        if (engine_quiet()) {
+          engine_parks.fetch_add(1, std::memory_order_relaxed);
+          cpu_wait::park_while_equal(engine_kick, kick,
+                                     cpu_wait::deadline_in_us(kEngineQuietParkUs));
+        }
+      }
+      // A CPU that cannot park keeps polling here.
     }
+    DGPP_LOG_INFO("bus engine: rank {} stopped after {} quiet parks", opt.my_rank,
+                  engine_parks.load(std::memory_order_relaxed));
   }
 
   // ---- rendezvous ----------------------------------------------------------
@@ -3671,7 +3648,6 @@ bool CollectiveBus::start(std::string* error) {
     impl.consumers_launched = true;
   }
 
-  impl.engine_park_us = Impl::park_us_from_env();
   impl.engine = std::thread([&impl] { impl.engine_loop(); });
   DGPP_LOG_INFO(
       "bus: rank {} up — {} peer(s) x {} lane(s), lat {}x{}B, bulk {}x{}B, "
@@ -4165,7 +4141,7 @@ uint64_t CollectiveBus::allreduce_stream(cudaStream_t stream, const void* device
         *error = "stream ring backstop: the engine did not walk the ring's oldest generation";
         return 0;
       }
-      relax_on(impl.strm.walked, walked);
+      cpu_wait::wait_step(impl.strm.walked, walked);
     }
   }
   uint64_t gen = 0;
@@ -4287,7 +4263,7 @@ bool CollectiveBus::allreduce_settle(int timeout_ms, std::string* error) {
                "flight watchdog should have failed the era first)";
       return false;
     }
-    relax_on(impl.strm.walked, walked);
+    cpu_wait::wait_step(impl.strm.walked, walked);
   }
   if (impl.graph.failed.load(std::memory_order_relaxed)) {
     std::lock_guard<std::mutex> lock(impl.coll_mu);
@@ -4457,7 +4433,7 @@ bool CollectiveBus::graph_replay_arm(std::string* error, int variant) {
         *error = "arm backstop: engine did not walk the previous window";
         return false;
       }
-      relax_on(impl.graph.walk_pub, pub);
+      cpu_wait::wait_step(impl.graph.walk_pub, pub);
     }
 
     // Reserve the window's generations from the SHARED collective
@@ -4589,7 +4565,7 @@ bool CollectiveBus::graph_replay_finish(int timeout_ms, std::string* error) {
                "watchdog should have failed the era first)";
       return false;
     }
-    relax_on(impl.graph.walk_pub, pub);
+    cpu_wait::wait_step(impl.graph.walk_pub, pub);
   }
   // The window is walked: retire it (the era's eager gate reopens with
   // the last live window; coll_mu-serialized with the eager submissions
@@ -5015,6 +4991,7 @@ BusStats CollectiveBus::stats() const {
   Impl& impl = *impl_;
   std::lock_guard<std::mutex> lock(impl.stats_mu);
   BusStats out = impl.stats_store;
+  out.engine_parks = impl.engine_parks.load(std::memory_order_relaxed);
   for (auto& peer_lanes : impl.peers)
     for (auto& lane : peer_lanes) out.lanes.push_back(lane.stats);
   return out;

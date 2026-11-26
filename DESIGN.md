@@ -552,8 +552,13 @@ Loop discipline (the anti-jitter contract, since one thread serves latency
 and bulk traffic): each iteration is bounded — at most N posts and M
 completion drains, in priority order (GPU-ready latency flags first, bulk
 stripes after); per-QP watchdog timestamps are checked once per iteration;
-the thread spins through a fixed grace period when idle before sleeping, so
-back-to-back decode steps never reach the sleep path.
+the thread spins through a fixed grace period when idle before resting, so
+back-to-back decode steps never reach the resting path. Before a decode
+graph exists a resting engine sleeps. Once one exists it parks instead: it
+stays on its core and waits in `WFET` on a word that every hand-off from
+another thread bumps, for at most 50 µs at a time. A hand-off ends the park
+at once, and the bound covers what arrives without one. A CPU without `WFET`
+keeps polling.
 
 The bus uses one engine thread for latency and bulk traffic. Per-lane
 sender threads are not implemented; any change to that ownership model
@@ -910,8 +915,14 @@ condition-variable waits pay a CFS-timeslice wake against the hot
 engine (fixed: spin-then-futex on a release-published done flag — spun
 before the mutex, since spinning under it deadlocks the completer). The
 same fixes took the harness send path from 16.5 to 12.1 µs p50. The
-engine also never naps once a graph is recorded, and it pins itself to a
-fast core (the GB10's big.LITTLE mix put it on an A725 at times).
+engine also never sleeps once a graph is recorded, because the scheduler
+gives a sleeping engine's core to another thread and the wake-up then waits
+out that thread's timeslice. A quiet engine parks on its kick word instead
+where the CPU has `WFET`, which keeps the thread on its core, and polls
+elsewhere. Threads that wait for a word the engine or the GPU publishes
+park on that word in the same way (`src/common/cpu_wait.hpp`). The engine
+pins itself to a fast core (the GB10's big.LITTLE mix put it on an A725 at
+times).
 
 **What a kernel may believe about NIC-written memory (the pick-path race,
 2026-09-01 — three bugs deep, all in the record):**

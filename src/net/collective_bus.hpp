@@ -132,6 +132,9 @@ struct BusStats {
   // live proof the race is real; a large one is a wire-side stall).
   uint64_t bulk_segments = 0;
   uint64_t bulk_gate_redos = 0;
+  // Times the engine parked because it had nothing queued, in flight or
+  // live. It stays 0 on a CPU that cannot park and in a world of one.
+  uint64_t engine_parks = 0;
 };
 
 struct BusSendResult {

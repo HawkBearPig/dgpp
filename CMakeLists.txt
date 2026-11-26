@@ -1132,7 +1132,7 @@ target_link_libraries(unit_tests PRIVATE CUDA::cudart dgpp_loaders dgpp_adapters
 target_compile_definitions(unit_tests PRIVATE DGPP_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
 dgpp_set_common(unit_tests)
 add_test(NAME unit_tests COMMAND unit_tests)
-target_sources(unit_tests PRIVATE tests/unit/site_options_test.cpp)
+target_sources(unit_tests PRIVATE tests/unit/site_options_test.cpp tests/unit/cpu_wait_test.cpp)
 
 # The vLLM YaRN oracle, offline (2026-09-19): tests/python/qwen_yarn_oracle.py
 # --emit records the recipe's rope goldens — the YaRN table, the attention
