@@ -24,6 +24,7 @@
 #include <utility>
 #include <vector>
 
+#include "common/cpu_wait.hpp"
 #include "common/log.hpp"
 #include "common/process_memory.hpp"
 #include "engine/decode_outputs.hpp"
@@ -2698,19 +2699,11 @@ class GraphEngineAdapter final : public sched::SchedulerEngine {
   // replay's publication (the pinned sequence).
   const float* wait_confidence(int req) {
     if (conf_stale_[static_cast<size_t>(req)] || (sampled_slot(req) && !sampled_slots_scheduled())) return nullptr;
-    const auto deadline = std::chrono::steady_clock::now() +
-                          std::chrono::milliseconds(pick_timeout_ms_);
-    uint64_t spins = 0;
-    while (__atomic_load_n(h_conf_seq_ + req, __ATOMIC_ACQUIRE) <
-           conf_seq_[static_cast<size_t>(req)]) {
-      if ((++spins & 255) == 0) {
-        if (std::chrono::steady_clock::now() > deadline)
-          throw std::runtime_error(
-              "graph engine: the replay's confidence did not publish within "
-              "the pick timeout");
-        std::this_thread::yield();
-      }
-    }
+    if (!cpu_wait::wait_until_at_least(h_conf_seq_ + req, conf_seq_[static_cast<size_t>(req)],
+                                       std::chrono::milliseconds(pick_timeout_ms_)))
+      throw std::runtime_error(
+          "graph engine: the replay's confidence did not publish within "
+          "the pick timeout");
     return h_conf_ + static_cast<size_t>(req) * conf_rows_;
   }
   // The option index a step replays: the policy's lowest option covering k
@@ -2960,24 +2953,17 @@ class GraphEngineAdapter final : public sched::SchedulerEngine {
         rows_per_request_, rows, mtp ? ", MTP" : "", batch_min_live_);
   }
 
-  // Polls the slot's pinned verdict sequence until the replay's verdict
-  // node published it (the verify's pick is done; the tail runs on).
+  // Waits on the slot's pinned verdict sequence until the replay's verdict
+  // node published it (the verify's pick is done; the tail runs on). The
+  // thread parks on the sequence where the CPU can (cpu_wait.hpp).
   void wait_verdict(const Replay& r) const {
     const size_t index =
         static_cast<size_t>(r.batched ? batch_index(r.family) : r.req);
-    const auto deadline = std::chrono::steady_clock::now() +
-                          std::chrono::milliseconds(pick_timeout_ms_);
-    uint64_t spins = 0;
-    while (__atomic_load_n(h_verdict_seq_ + index, __ATOMIC_ACQUIRE) <
-           r.verdict_seq) {
-      if ((++spins & 255) == 0) {
-        if (std::chrono::steady_clock::now() > deadline)
-          throw std::runtime_error(
-              "graph engine: the replay's verdict did not publish within the "
-              "pick timeout");
-        std::this_thread::yield();
-      }
-    }
+    if (!cpu_wait::wait_until_at_least(h_verdict_seq_ + index, r.verdict_seq,
+                                       std::chrono::milliseconds(pick_timeout_ms_)))
+      throw std::runtime_error(
+          "graph engine: the replay's verdict did not publish within the "
+          "pick timeout");
   }
   cudaEvent_t end_event(const Replay& r) const {
     return r.batched ? families_[static_cast<size_t>(r.family)]

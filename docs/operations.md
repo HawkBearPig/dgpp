@@ -623,6 +623,22 @@ needed for rollback.
   connect retrying within the same 120 s window. `up` encodes that order:
   the head, then the peers as soon as the journal listens.
 
+### CPU use of a serving rank
+
+Each rank keeps two threads on cores of their own: the bus engine, pinned to
+a fast core, and the serving thread while it decodes. On a GB10 both wait
+with `WFET`, a processor instruction that holds the core in a low-power
+state until the word the thread waits for is written. The thread never
+leaves its core, so `top` and `/proc` report it at 100 % whether it is
+working or parked. `perf stat -e cycles -t <tid>` tells the two apart: a
+parked thread runs a few percent of the core's cycles.
+
+An idle rank's engine parks once the decode graphs are captured. Every rank
+logs `host waits: park on the awaited word (WFET)` at startup, and its
+engine logs how many times it parked when it stops. On a CPU without `WFET`
+both threads poll instead and the startup line says so. The engine then
+holds a core at its full clock for as long as the rank runs.
+
 ### Memory on a serving node
 
 For prefix caching, size the snapshot arena and KV pool separately. Startup

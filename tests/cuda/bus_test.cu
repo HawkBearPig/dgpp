@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -20,6 +21,7 @@
 
 #include <cuda_runtime.h>
 
+#include "common/cpu_wait.hpp"
 #include "common/log.hpp"
 #include "net/bus_kernel.hpp"
 #include "net/collective_bus.hpp"
@@ -2014,6 +2016,306 @@ void scenario_allreduce_stream() {
   g_failures += failures;
 }
 
+// ---- quiet rounds ----------------------------------------------------------
+//
+// Once a decode graph is recorded, an engine with nothing to do parks on its
+// kick word instead of polling (where the CPU parks; collective_bus.cpp,
+// engine_loop). Every hand-off must end that park: a window arm, an eager
+// collective, a stream generation. The rounds below hand work to engines in
+// every state. A gap of a few hundred microseconds finds the engine still
+// polling, a gap of a few milliseconds finds it about to park or just
+// parked, and a long gap finds it parked for good. In the first half every
+// rank starts a round at the same instant, which makes a round's duration a
+// measurement of what the park costs. In the second half each rank adds a
+// delay of its own, so one rank's window is live while its peers are still
+// parked.
+
+enum class QuietKind { kWindow, kEager, kStream };
+
+struct QuietRound {
+  QuietKind kind = QuietKind::kWindow;
+  double gap_us = 0;  // quiet time before the round, the same on every rank
+};
+
+struct QuietShared {
+  int world = 0;
+  std::vector<QuietRound> rounds;
+  int aligned_rounds = 0;  // the first rounds start on every rank at one instant
+  std::atomic<int> finished{0};  // rounds finished, summed over the ranks
+  std::vector<std::atomic<int64_t>> finish_ns;  // per rank: when its last round ended
+  std::atomic<bool> abort{false};
+  explicit QuietShared(int w) : world(w), finish_ns(static_cast<size_t>(w)) {}
+};
+
+struct QuietRankBuffers {
+  cudaStream_t stream = nullptr;
+  uint16_t* dev_src = nullptr;
+  uint16_t* dev_dst = nullptr;
+  float* warm_buf = nullptr;
+};
+
+// One sample of the aligned half: the quiet time before a window and how
+// long the window took from arm to finish.
+struct QuietSample {
+  double gap_us = 0;
+  double window_us = 0;
+};
+
+int64_t quiet_now_ns() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
+std::vector<QuietRound> quiet_schedule(int rounds, uint64_t seed) {
+  std::mt19937_64 rng(seed);
+  std::vector<QuietRound> out(static_cast<size_t>(rounds));
+  for (QuietRound& round : out) {
+    const uint64_t kind = rng() % 10;
+    round.kind = kind < 6 ? QuietKind::kWindow : kind < 8 ? QuietKind::kEager : QuietKind::kStream;
+    const uint64_t gap_class = rng() % 100;
+    const double unit = static_cast<double>(rng() % 1000000) / 1e6;
+    if (gap_class < 30) round.gap_us = 0;                               // back to back
+    else if (gap_class < 45) round.gap_us = 300.0 * unit;               // still polling
+    else if (gap_class < 75) round.gap_us = 300.0 + 5700.0 * unit;      // about to park, or just parked
+    else if (gap_class < 97) round.gap_us = 10000.0 + 30000.0 * unit;   // parked
+    else round.gap_us = 100000.0 + 150000.0 * unit;                     // parked for long
+  }
+  return out;
+}
+
+// One rank's share of the quiet rounds. The device buffers come from the
+// scenario: an allocation in a rank's thread would wait on a peer's
+// spinning collective kernel.
+int quiet_rank_work(CollectiveBus& bus, QuietShared& shared, int my_rank, size_t elems,
+                    int gens_per_window, uint64_t seed, const QuietRankBuffers& buf,
+                    const std::vector<uint16_t>* want, std::vector<QuietSample>* samples) {
+  int failures = 0;
+  auto fail = [&](const std::string& why) {
+    DGPP_LOG_ERROR("rank {}: {}", my_rank, why);
+    ++failures;
+    shared.abort.store(true, std::memory_order_release);
+  };
+  std::vector<uint16_t> host_src;
+  fill_rank_bf16(&host_src, elems, my_rank);
+  if (cudaMemcpyAsync(buf.dev_src, host_src.data(), elems * 2, cudaMemcpyHostToDevice,
+                      buf.stream) != cudaSuccess ||
+      cudaMemsetAsync(buf.warm_buf, 0, 256 * 4, buf.stream) != cudaSuccess ||
+      cudaStreamSynchronize(buf.stream) != cudaSuccess) {
+    fail("quiet rounds H2D failed");
+    return failures;
+  }
+
+  // Record one window. From here on the engine parks when it is quiet.
+  std::string error;
+  cudaGraph_t graph = nullptr;
+  cudaGraphExec_t exec = nullptr;
+  if (!bus.graph_record_begin(&error)) {
+    fail("graph_record_begin rejected: " + error);
+  } else {
+    if (cudaStreamBeginCapture(buf.stream, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
+      fail("stream capture begin failed");
+    } else {
+      for (int g = 0; g < gens_per_window; ++g) {
+        dgpp::net::launch_bus_warm_work(buf.stream, buf.warm_buf, 4000);
+        if (!bus.allreduce_record(buf.stream, buf.dev_src, buf.dev_dst, elems, &error)) {
+          fail("allreduce_record rejected: " + error);
+          break;
+        }
+      }
+      dgpp::net::launch_bus_warm_work(buf.stream, buf.warm_buf, 4000);
+      if (cudaStreamEndCapture(buf.stream, &graph) != cudaSuccess || graph == nullptr)
+        fail("stream capture end failed");
+    }
+    std::string end_error;
+    if (!bus.graph_record_end(&end_error) && failures == 0)
+      fail("graph_record_end rejected: " + end_error);
+  }
+  if (failures == 0 && cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0) != cudaSuccess)
+    fail("graph instantiate failed");
+
+  // This rank's own delays in the second half.
+  std::mt19937_64 own(seed * 0x9E3779B97F4A7C15ull + static_cast<uint64_t>(my_rank) + 1);
+  std::vector<uint16_t> got(elems, 0);
+  const int total = static_cast<int>(shared.rounds.size());
+  for (int r = 0; r < total && failures == 0; ++r) {
+    const QuietRound& round = shared.rounds[static_cast<size_t>(r)];
+    // The round starts gap_us after the last rank finished the round before.
+    while (shared.finished.load(std::memory_order_acquire) < r * shared.world) {
+      if (shared.abort.load(std::memory_order_acquire)) break;
+      dgpp::cpu_wait::spin_hint();
+    }
+    if (shared.abort.load(std::memory_order_acquire)) break;
+    int64_t start = 0;
+    for (const auto& f : shared.finish_ns) start = std::max(start, f.load(std::memory_order_relaxed));
+    if (start == 0) start = quiet_now_ns();
+    start += static_cast<int64_t>(round.gap_us * 1000.0) + 100000;  // 100 us for every rank to get here
+    if (r >= shared.aligned_rounds) start += static_cast<int64_t>(own() % 3000000);
+    // Sleep through most of a long gap, as an idle forward thread does, and
+    // poll the clock for the rest so the ranks start together.
+    const int64_t ahead = start - quiet_now_ns();
+    if (ahead > 2000000)
+      std::this_thread::sleep_for(std::chrono::nanoseconds(ahead - 1000000));
+    while (quiet_now_ns() < start) dgpp::cpu_wait::spin_hint();
+
+    const auto t0 = std::chrono::steady_clock::now();
+    if (round.kind == QuietKind::kWindow) {
+      if (!bus.graph_replay_arm(&error)) {
+        fail("round " + std::to_string(r) + ": arm rejected: " + error);
+        break;
+      }
+      if (cudaGraphLaunch(exec, buf.stream) != cudaSuccess ||
+          cudaStreamSynchronize(buf.stream) != cudaSuccess) {
+        fail("round " + std::to_string(r) + ": replay failed");
+        break;
+      }
+      if (!bus.graph_replay_finish(30000, &error)) {
+        fail("round " + std::to_string(r) + ": finish rejected: " + error);
+        bus.dump_graph_cells("quiet round finish");
+        break;
+      }
+    } else if (round.kind == QuietKind::kEager) {
+      const uint64_t id = bus.allreduce(buf.dev_src, buf.dev_dst, elems, &error);
+      if (id == 0) {
+        fail("round " + std::to_string(r) + ": eager collective rejected: " + error);
+        break;
+      }
+      const dgpp::net::BusAllReduceResult result = bus.wait_allreduce(id, 30000);
+      if (!result.ok) {
+        fail("round " + std::to_string(r) + ": eager collective failed: " + result.error);
+        break;
+      }
+    } else {
+      if (bus.allreduce_stream(buf.stream, buf.dev_src, buf.dev_dst, elems, &error) == 0) {
+        fail("round " + std::to_string(r) + ": stream collective rejected: " + error);
+        break;
+      }
+      if (!bus.allreduce_settle(30000, &error)) {
+        fail("round " + std::to_string(r) + ": settle failed: " + error);
+        break;
+      }
+      if (cudaStreamSynchronize(buf.stream) != cudaSuccess) {
+        fail("round " + std::to_string(r) + ": stream sync failed");
+        break;
+      }
+    }
+    const double us =
+        std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+    if (cudaMemcpyAsync(got.data(), buf.dev_dst, elems * 2, cudaMemcpyDeviceToHost, buf.stream) !=
+            cudaSuccess ||
+        cudaStreamSynchronize(buf.stream) != cudaSuccess) {
+      fail("round " + std::to_string(r) + ": D2H failed");
+      break;
+    }
+    if (std::memcmp(got.data(), want->data(), elems * 2) != 0) {
+      fail("round " + std::to_string(r) + " diverged from the canonical-chain oracle");
+      break;
+    }
+    if (round.kind == QuietKind::kWindow && r < shared.aligned_rounds)
+      samples->push_back({round.gap_us, us});
+    shared.finish_ns[static_cast<size_t>(my_rank)].store(quiet_now_ns(), std::memory_order_relaxed);
+    shared.finished.fetch_add(1, std::memory_order_release);
+  }
+  if (exec != nullptr) cudaGraphExecDestroy(exec);
+  if (graph != nullptr) cudaGraphDestroy(graph);
+  return failures;
+}
+
+// `rounds` quiet rounds in one world, half aligned and half with each
+// rank's own delay. Returns the failures.
+int quiet_rounds_world(int world, uint16_t port, int rounds, uint64_t seed) {
+  const size_t elems = 4096;
+  const int gens_per_window = 4;
+  std::vector<std::unique_ptr<CollectiveBus>> buses = start_world(world, port);
+  if (buses.empty()) {
+    DGPP_LOG_ERROR("quiet rounds: world {} failed to start", world);
+    return 1;
+  }
+  std::vector<std::vector<uint16_t>> all_src(static_cast<size_t>(world));
+  for (int r = 0; r < world; ++r) fill_rank_bf16(&all_src[static_cast<size_t>(r)], elems, r);
+  std::vector<uint16_t> want(elems, 0);
+  for (size_t i = 0; i < elems; ++i) {
+    float acc = 0.0f;
+    for (int r = 0; r < world; ++r) acc += dgpp::net::bf16_to_f32(all_src[static_cast<size_t>(r)][i]);
+    want[i] = dgpp::net::bf16_from_f32_rne(acc);
+  }
+  int failures = 0;
+  std::vector<QuietRankBuffers> bufs(static_cast<size_t>(world));
+  for (QuietRankBuffers& b : bufs) {
+    if (cudaStreamCreateWithFlags(&b.stream, cudaStreamNonBlocking) != cudaSuccess ||
+        cudaMalloc(&b.dev_src, elems * 2) != cudaSuccess ||
+        cudaMalloc(&b.dev_dst, elems * 2) != cudaSuccess ||
+        cudaMalloc(&b.warm_buf, 256 * 4) != cudaSuccess) {
+      DGPP_LOG_ERROR("quiet rounds: device allocation failed");
+      ++failures;
+    }
+  }
+  if (failures == 0) {
+    QuietShared shared(world);
+    shared.rounds = quiet_schedule(rounds, seed);
+    shared.aligned_rounds = rounds / 2;
+    std::vector<int> rank_failures(static_cast<size_t>(world), 0);
+    std::vector<std::vector<QuietSample>> samples(static_cast<size_t>(world));
+    std::vector<std::thread> workers;
+    for (int r = 0; r < world; ++r)
+      workers.emplace_back([&, r] {
+        rank_failures[static_cast<size_t>(r)] = quiet_rank_work(
+            *buses[static_cast<size_t>(r)], shared, r, elems, gens_per_window, seed,
+            bufs[static_cast<size_t>(r)], &want, &samples[static_cast<size_t>(r)]);
+      });
+    for (auto& t : workers) t.join();
+    for (int r = 0; r < world; ++r) failures += rank_failures[static_cast<size_t>(r)];
+
+    // Every engine parked where the CPU parks, and none did elsewhere.
+    for (int r = 0; r < world; ++r) {
+      const uint64_t parks = buses[static_cast<size_t>(r)]->stats().engine_parks;
+      if (dgpp::cpu_wait::supported() ? parks == 0 : parks != 0) {
+        DGPP_LOG_ERROR("quiet rounds: rank {} counted {} engine parks on a CPU that {}", r, parks,
+                       dgpp::cpu_wait::supported() ? "parks" : "cannot park");
+        ++failures;
+      }
+    }
+    // What the aligned windows took, by the quiet time before them.
+    std::vector<double> polling, edge, parked;
+    for (const auto& rank_samples : samples)
+      for (const QuietSample& sample : rank_samples)
+        (sample.gap_us < 300.0 ? polling : sample.gap_us < 10000.0 ? edge : parked)
+            .push_back(sample.window_us);
+    DGPP_LOG_INFO(
+        "quiet rounds ({}, world {}, seed {}): {} rounds, {} failures; window us p50/p99/max "
+        "after under 0.3 ms quiet {:.1f}/{:.1f}/{:.1f} (n={}), after 0.3-6 ms {:.1f}/{:.1f}/{:.1f} "
+        "(n={}), after 10 ms or more {:.1f}/{:.1f}/{:.1f} (n={}); engine parks on rank 0: {}",
+        transport_name(), world, seed, rounds, failures, percentile(polling, 0.5),
+        percentile(polling, 0.99), percentile(polling, 1.0), polling.size(), percentile(edge, 0.5),
+        percentile(edge, 0.99), percentile(edge, 1.0), edge.size(), percentile(parked, 0.5),
+        percentile(parked, 0.99), percentile(parked, 1.0), parked.size(),
+        buses[0]->stats().engine_parks);
+  }
+  for (auto& bus : buses) bus->quiesce();
+  for (auto& bus : buses) bus->stop();
+  for (QuietRankBuffers& b : bufs) {
+    if (b.dev_src) cudaFree(b.dev_src);
+    if (b.dev_dst) cudaFree(b.dev_dst);
+    if (b.warm_buf) cudaFree(b.warm_buf);
+    if (b.stream) cudaStreamDestroy(b.stream);
+  }
+  return failures;
+}
+
+// Both worlds under both latency transports.
+void scenario_quiet_rounds(int rounds, uint64_t seed) {
+  const BusLatencyTransport before = g_transport;
+  int failures = 0;
+  for (const BusLatencyTransport transport : {BusLatencyTransport::kSend, BusLatencyTransport::kWrite}) {
+    g_transport = transport;
+    failures += quiet_rounds_world(2, 29861, rounds, seed);
+    failures += quiet_rounds_world(4, 29862, rounds, seed + 1);
+  }
+  g_transport = before;
+  CHECK(failures == 0, "quiet rounds had " + std::to_string(failures) + " failures");
+  DGPP_LOG_INFO("scenario quiet_rounds: {} rounds a world, {} failures", rounds, failures);
+}
+
 void scenario_idle_gap_collective() {
   // The real-mesh shape, found by the M5 exit-gate fabric run:
   // buses sit IDLE for seconds while a host loads weights (a cold peer's
@@ -2219,6 +2521,22 @@ int main(int argc, char** argv) {
     return 2;
   }
 
+  // bus_test --quiet-rounds N [--seed S]: the quiet rounds alone, N a world,
+  // for long runs over many schedules.
+  if (argc > 1 && std::string(argv[1]) == "--quiet-rounds") {
+    try {
+      if (argc != 3 && !(argc == 5 && std::string(argv[3]) == "--seed"))
+        throw std::invalid_argument("use --quiet-rounds N [--seed S]");
+      const int rounds = std::stoi(argv[2]);
+      const uint64_t seed = argc == 5 ? std::stoull(argv[4]) : 1;
+      if (rounds < 2) throw std::invalid_argument("at least two rounds");
+      scenario_quiet_rounds(rounds, seed);
+      return g_failures == 0 ? 0 : 1;
+    } catch (const std::exception& e) {
+      DGPP_LOG_ERROR("quiet rounds: {}", e.what());
+      return 2;
+    }
+  }
   if (argc > 1) {
     int rank = -1, world = 0, port = 29924;
     std::string peer;
@@ -2262,6 +2580,10 @@ int main(int argc, char** argv) {
     scenario_allreduce_stream();
     return g_failures == 0 ? 0 : 1;
   }
+  if (const char* f = std::getenv("DGPP_TEST_FILTER"); f && std::string(f) == "quiet_rounds") {
+    scenario_quiet_rounds(200, 1);
+    return g_failures == 0 ? 0 : 1;
+  }
   if (const char* f = std::getenv("DGPP_TEST_FILTER");
       f && std::string(f) == "allreduce_graph_rows") {
     scenario_allreduce_graph_rows();
@@ -2299,6 +2621,7 @@ int main(int argc, char** argv) {
   scenario_allreduce_graph_rows();
   scenario_allreduce_stream();
   g_transport = BusLatencyTransport::kSend;
+  scenario_quiet_rounds(200, 1);
   scenario_idle_gap_collective();
   scenario_geometry_mismatch();
   scenario_stop_releases_waiters();

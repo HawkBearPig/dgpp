@@ -63,6 +63,7 @@
 #include "adapters/bus_sum.hpp"
 #include "adapters/sha256.hpp"
 #include "common/bf16_residency.hpp"
+#include "common/cpu_wait.hpp"
 #include "common/cuda_check.hpp"
 #include "common/log.hpp"
 #include "common/process_memory.hpp"
@@ -1876,6 +1877,9 @@ int main(int argc, char** argv) {
     }
   }
   DGPP_LOG_INFO("dgpp-serve {} (git {})", DGPP_VERSION, DGPP_GIT_SHA);
+  DGPP_LOG_INFO("host waits: {}", dgpp::cpu_wait::supported()
+                                      ? "park on the awaited word (WFET)"
+                                      : "poll (this CPU has no WFET)");
 
   static constexpr const char* kUsage =
       "usage: dgpp-serve --config CLUSTER.json --rank R | --model ORG/NAME | --checkpoint-dir DIR\n"

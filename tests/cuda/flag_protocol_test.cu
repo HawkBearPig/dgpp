@@ -15,8 +15,35 @@
 #include <thread>
 #include <vector>
 
+#include "common/cpu_wait.hpp"
 #include "common/test.hpp"
 #include "kernels/flag_protocol.cuh"
+
+// Acks every new start sequence `delay_cycles` of the device clock after it
+// saw it, so that a host thread waiting for the ack has parked by the time
+// the ack is stored.
+__global__ void flag_delayed_ack_kernel(uint32_t* start, dgpp::FlagAck* ack,
+                                        uint64_t delay_cycles, uint64_t deadline_cycles) {
+  dgpp_pdl_wait();
+  uint64_t idle_since = clock64();
+  uint32_t last_seen = 0;
+  for (;;) {
+    uint32_t s = dgpp::flag_load_acquire(start);
+    while (s == last_seen) {
+      if (clock64() - idle_since > deadline_cycles) return;
+      dgpp::flag_poll_pause();
+      s = dgpp::flag_load_acquire(start);
+    }
+    if (s == dgpp::kFlagStopSequence) return;
+    last_seen = s;
+    const uint64_t seen_at = clock64();
+    while (clock64() - seen_at < delay_cycles) dgpp::flag_poll_pause();
+    ack->cycles = clock64();
+    ack->hash = 0;
+    dgpp::flag_store_release(&ack->seq, s);
+    idle_since = clock64();
+  }
+}
 
 namespace {
 
@@ -244,6 +271,78 @@ DGPP_TEST(flag_protocol_with_dead_wakeup_times_out_and_device_remains_usable) {
   if (back[123] != 0x3F || back.back() != 0x3F)
     throw std::runtime_error("device unusable after watchdog exit");
   cudaFree(probe);
+}
+
+DGPP_TEST(flag_protocol_gpu_release_store_ends_a_host_park) {
+  // The serving thread parks on words the GPU publishes (the verdict and
+  // confidence sequences) where the CPU can park. That a store from another
+  // core ends a park is architectural. That a GPU store into pinned host
+  // memory does is a property of this platform, and this case measures it.
+  if (!dgpp::cpu_wait::supported()) dgpp::test::skip("this CPU has no WFET");
+  Fixture f;
+  int clock_khz = 0;
+  if (cudaDeviceGetAttribute(&clock_khz, cudaDevAttrClockRate, 0) != cudaSuccess || clock_khz <= 0)
+    throw std::runtime_error("device clock unavailable");
+  // The device holds every ack back 300 us: the host is in its wait long
+  // before the store, in both forms of the wait.
+  constexpr int kDelayUs = 300;
+  constexpr int kTrips = 300;
+  const uint64_t delay_cycles = static_cast<uint64_t>(clock_khz) * kDelayUs / 1000;
+  flag_delayed_ack_kernel<<<1, 1, 0, f.stream>>>(&f.start->seq, f.ack, delay_cycles,
+                                                 kDeadlineCycles);
+
+  using Clock = std::chrono::steady_clock;
+  auto pause_us = [](double us) {
+    const auto t0 = Clock::now();
+    while (std::chrono::duration<double, std::micro>(Clock::now() - t0).count() < us) cpu_pause();
+  };
+  // One round trip: the host's start store, the device's delayed ack, the
+  // host seeing the ack. Only the last leg differs between the two forms.
+  auto round_trip_us = [&](uint32_t seq, bool park) {
+    const auto t0 = Clock::now();
+    __atomic_store_n(&f.start->seq, seq, __ATOMIC_RELEASE);
+    if (park) {
+      // One long park: the store, an event or the deadline ends it.
+      const uint64_t deadline = dgpp::cpu_wait::deadline_in_us(2000000);
+      for (uint32_t seen; (seen = __atomic_load_n(&f.ack->seq, __ATOMIC_ACQUIRE)) != seq;) {
+        if (dgpp::cpu_wait::ticks() >= deadline) throw std::runtime_error("parked wait: ack missing");
+        dgpp::cpu_wait::park_while_equal(&f.ack->seq, seen, deadline);
+      }
+    } else if (!wait_ack(*f.ack, seq)) {
+      throw std::runtime_error("polling wait: ack missing");
+    }
+    return std::chrono::duration<double, std::micro>(Clock::now() - t0).count();
+  };
+
+  std::vector<double> polled, parked;
+  uint32_t seq = 0;
+  for (int i = 0; i < 16; ++i) round_trip_us(++seq, (i & 1) != 0);  // warm both forms
+  for (int i = 0; i < kTrips; ++i) {
+    // A different phase against the timer event stream every trip.
+    pause_us(static_cast<double>((i * 37) % 100));
+    polled.push_back(round_trip_us(++seq, /*park=*/false));
+    pause_us(static_cast<double>((i * 53) % 100));
+    parked.push_back(round_trip_us(++seq, /*park=*/true));
+  }
+  stop_and_sync(f);
+
+  std::sort(polled.begin(), polled.end());
+  std::sort(parked.begin(), parked.end());
+  auto at = [](const std::vector<double>& v, double frac) {
+    return v[std::min(v.size() - 1, static_cast<size_t>(frac * static_cast<double>(v.size())))];
+  };
+  std::printf(
+      "host wake after a GPU release-store (%d round trips each, the device holding its ack "
+      "%d us): polling p50 %.2f p90 %.2f p99 %.2f us, parked p50 %.2f p90 %.2f p99 %.2f us; "
+      "parking adds %.2f us at the median\n",
+      kTrips, kDelayUs, at(polled, 0.5), at(polled, 0.9), at(polled, 0.99), at(parked, 0.5),
+      at(parked, 0.9), at(parked, 0.99), at(parked, 0.5) - at(polled, 0.5));
+  // A park the store does not end lasts until the timer event stream's
+  // next tick, about 50 us later at the median, or until the deadline.
+  if (at(parked, 0.5) - at(polled, 0.5) > 10.0)
+    throw std::runtime_error("a GPU release-store no longer ends a host park promptly (median)");
+  if (at(parked, 0.9) - at(polled, 0.9) > 50.0)
+    throw std::runtime_error("a GPU release-store no longer ends a host park promptly (p90)");
 }
 
 int main() {

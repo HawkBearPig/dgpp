@@ -3,6 +3,20 @@
 The history by milestone. `PLAN.md` has the milestones' exit gates;
 project procedures and design guidance live in `docs/`.
 
+## Unreleased
+
+- **Host waits park on the GB10.** A thread that waits for a word another
+  agent writes no longer polls it at the full clock. On a CPU with `WFET`
+  (the GB10's cores) the serving thread parks on the verdict and confidence
+  sequences the GPU publishes, the bus's waiters park on the words the
+  engine publishes, and the bus engine parks on a kick word whenever it has
+  nothing queued, in flight or live once the decode graphs are captured. A
+  parked thread stays on its core, so the scheduler cannot give the core
+  away, and a hand-off ends the engine's park at once. Other CPUs keep the
+  polling loops. Every rank logs the form it uses at startup and its
+  engine's park count when it stops (issue #203, from jetnet's patch and
+  measurements).
+
 ## v0.2.1 — 2026-11-25
 
 - **Loop guidance for Inkling 2 Mini** (`engine.loop_guidance`, after arXiv
