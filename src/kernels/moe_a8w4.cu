@@ -20,6 +20,13 @@
 //      An E2M1 code sits in bits 2..5 of its byte (0b00ABCD00).
 //   sfa: the E8M0 scale of row q + 8 * (lane & 1); sfb: of column q.
 //   C: c0, c1 = row q cols 2t, 2t + 1; c2, c3 = row q + 8.
+//
+// The FP8-weight form (W8, 2026-11-27): the same tile against E4M3 weight
+// bytes [n, k] with power-of-two scales on a 32 x 32 grid, the release's
+// fp8_gemm (its shared expert and dense projections). A weight row's stage
+// is 64 code bytes, the footprint of the 32 packed bytes in their cells, so
+// the ring is unchanged. The grid's scales are stored as F32 powers of two
+// and the instruction takes an E8M0 byte, which is the F32's exponent field.
 #include "kernels/moe_a8w4.hpp"
 #include "kernels/pdl.cuh"
 
@@ -46,6 +53,7 @@ constexpr size_t kBScales = size_t(BN) * 2;
 constexpr size_t kSlot = kACodes + kBCodes + kAScales + kBScales;  // 15,744
 constexpr size_t kSmem = kStages * kSlot;                          // 47,232: two blocks an SM (102,400 B)
 constexpr int kPrefetchStages = 4;  // a weight row's next 128-byte line: four stages of packed codes
+constexpr int kW8ScaleBlock = 32;   // the FP8 weights' scale grid along the rows
 static_assert(kSlot % 16 == 0, "16-byte aligned slots");
 static_assert(BM * (BK / 16) == kThreads, "one 16-byte activation copy per thread");
 static_assert(BN * 2 == kThreads, "two 8-byte weight copies per thread");
@@ -99,6 +107,23 @@ __device__ __forceinline__ void mma_a8w4(float (&c)[4], const uint32_t (&a)[4], 
         "h"(static_cast<uint16_t>(0)), "h"(static_cast<uint16_t>(0)));
 }
 
+__device__ __forceinline__ void mma_a8w8(float (&c)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1,
+                                         uint32_t sfa, uint32_t sfb) {
+  asm volatile(
+      "mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X."
+      "m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 "
+      "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3}, "
+      "{%10}, {%11,%12}, {%13}, {%14,%15};\n"
+      : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(sfa),
+        "h"(static_cast<uint16_t>(0)), "h"(static_cast<uint16_t>(0)), "r"(sfb),
+        "h"(static_cast<uint16_t>(0)), "h"(static_cast<uint16_t>(0)));
+}
+
+// The E8M0 byte of a power-of-two F32 scale: its exponent field (2^-127,
+// the byte 0, is the F32 subnormal whose field is 0 as well).
+__device__ __forceinline__ uint32_t e8m0_of_pow2(float s) { return (__float_as_uint(s) >> 23) & 0xFFu; }
+
 __device__ __forceinline__ void store_out(uint16_t* p, float v) {
   const __nv_bfloat16 b = __float2bfloat16_rn(v);
   *p = *reinterpret_cast<const uint16_t*>(&b);
@@ -123,8 +148,10 @@ __device__ __forceinline__ void store_pair(float* p, float a, float b) {
 // tile's n-tiles run together (its activation rows enter L2 once and a long
 // segment's 1.5 MB of weights stay there across its tiles), and the blocks
 // past *tile_count exit. Without one, block (x, y) is segment y's m-tile
-// x % m_tiles of n-tile x / m_tiles.
-template <typename OutT>
+// x % m_tiles of n-tile x / m_tiles, or with m_tiles 0 its n-tile
+// x % n_tiles of m-tile x / n_tiles (the rows outermost: a long segment's
+// activation rows enter L2 once and its weights stay there).
+template <typename OutT, bool W8>
 __global__ __launch_bounds__(a8w4::kThreads, 2) void moe_grouped_a8w4_kernel(
     const uint8_t* __restrict__ a_codes, size_t a_code_stride, const uint8_t* __restrict__ a_scales,
     size_t a_scale_stride, const int32_t* __restrict__ act_rows, const MoeSegment* __restrict__ segs,
@@ -142,6 +169,10 @@ __global__ __launch_bounds__(a8w4::kThreads, 2) void moe_grouped_a8w4_kernel(
     seg = segs[tl.seg];
     m0 = tl.m0;
     n_tile = static_cast<int>(blockIdx.x) % n_tiles;
+  } else if (m_tiles == 0) {
+    seg = segs[blockIdx.y];
+    m0 = (static_cast<int>(blockIdx.x) / n_tiles) * BM;
+    n_tile = static_cast<int>(blockIdx.x) % n_tiles;
   } else {
     seg = segs[blockIdx.y];
     m0 = (static_cast<int>(blockIdx.x) % m_tiles) * BM;
@@ -151,7 +182,7 @@ __global__ __launch_bounds__(a8w4::kThreads, 2) void moe_grouped_a8w4_kernel(
   const int m_rows = min(BM, seg.rows - m0);
   const MoeExpertView v = views[seg.expert * 3 + which];
   const int n0 = n_tile * BN;
-  const size_t w_code_stride = static_cast<size_t>(k) / 2;
+  const size_t w_code_stride = W8 ? static_cast<size_t>(k) : static_cast<size_t>(k) / 2;
   const size_t w_scale_stride = static_cast<size_t>(k) / 32;
   const int tid = static_cast<int>(threadIdx.x);
   const int warp = tid >> 5, lane = tid & 31;
@@ -182,7 +213,16 @@ __global__ __launch_bounds__(a8w4::kThreads, 2) void moe_grouped_a8w4_kernel(
   const bool b_ok = n0 + b_row < n;
   const uint8_t* b_line = v.payload + static_cast<size_t>(b_ok ? n0 + b_row : 0) * w_code_stride;
   const bool bs_ok = tid < BN && n0 + tid < n;
-  const uint8_t* bs_src = v.fp4_scales + static_cast<size_t>(bs_ok ? n0 + tid : 0) * w_scale_stride;
+  // The weight row's scales: its own E8M0 bytes (MXFP4), or its 32-row
+  // block's F32 powers of two (FP8).
+  const uint8_t* bs_src = nullptr;
+  const float* bs_src_f = nullptr;
+  if constexpr (W8)
+    bs_src_f = v.scales + static_cast<size_t>((bs_ok ? n0 + tid : 0) / kW8ScaleBlock) * w_scale_stride;
+  else
+    bs_src = v.fp4_scales + static_cast<size_t>(bs_ok ? n0 + tid : 0) * w_scale_stride;
+  (void)bs_src;
+  (void)bs_src_f;
 
   auto slot_ptr = [&](int slot) { return smem + static_cast<size_t>(slot) * kSlot; };
 
@@ -197,7 +237,22 @@ __global__ __launch_bounds__(a8w4::kThreads, 2) void moe_grouped_a8w4_kernel(
       if (a_ok && a_chunk == 0 && (s & 1) == 0) asm volatile("prefetch.global.L2::evict_last [%0];" ::"l"(src));
       cp_async16(base + a_row * kARow + a_chunk * 16, a_ok ? src : a_codes, a_ok ? 16 : 0);
     }
-    {
+    if constexpr (W8) {
+      // 64 code bytes of the weight row: this thread's half, two 16-byte copies.
+      const uint8_t* src = b_line + static_cast<size_t>(s) * BK + b_half * 32;
+      uint8_t* dst = base + kACodes + b_row * kBRow + b_half * 32;
+      cp_async16(dst, b_ok ? src : v.payload, b_ok ? 16 : 0);
+      cp_async16(dst + 16, b_ok ? src + 16 : v.payload, b_ok ? 16 : 0);
+      // A stage reads 64 bytes of each weight row, rows k bytes apart: the
+      // 128-byte line four stages on into L2 whole, ahead of the ring.
+      if (b_half == 0 && b_ok && (s & 1) == 0) {
+        const int ns = s + kPrefetchStages;
+        if (ns < stages) {
+          const uint8_t* line = b_line + static_cast<size_t>(ns) * BK;
+          asm volatile("prefetch.global.L2 [%0];" ::"l"(line));
+        }
+      }
+    } else {
       const uint8_t* src = b_line + static_cast<size_t>(s) * (BK / 2) + b_half * 16;
       uint8_t* dst = base + kACodes + b_row * kBRow + b_half * 32;
       cp_async8(dst, b_ok ? src : v.payload, b_ok ? 8 : 0);
@@ -219,7 +274,12 @@ __global__ __launch_bounds__(a8w4::kThreads, 2) void moe_grouped_a8w4_kernel(
     }
     if (tid < BN) {
       uint32_t w = 0;
-      if (bs_ok) w = static_cast<uint32_t>(bs_src[2 * s]) | (static_cast<uint32_t>(bs_src[2 * s + 1]) << 8);
+      if (bs_ok) {
+        if constexpr (W8)
+          w = e8m0_of_pow2(bs_src_f[2 * s]) | (e8m0_of_pow2(bs_src_f[2 * s + 1]) << 8);
+        else
+          w = static_cast<uint32_t>(bs_src[2 * s]) | (static_cast<uint32_t>(bs_src[2 * s + 1]) << 8);
+      }
       *reinterpret_cast<uint16_t*>(base + kACodes + kBCodes + kAScales + tid * 2) = static_cast<uint16_t>(w);
     }
   };
@@ -267,16 +327,26 @@ __global__ __launch_bounds__(a8w4::kThreads, 2) void moe_grouped_a8w4_kernel(
       for (int jp = 0; jp < 2; ++jp) {
         // matrices: n8 tiles 2 jp / 2 jp + 1 (lm >> 1) x the block's two
         // 16-code groups (lm & 1) -> b0, b1 of each tile.
+        // E4M3 weight bytes load as they lie: a matrix is a weight row's 16
+        // bytes of the block's first or second half (the same offsets).
         uint32_t bf[4];
         const int col = wn * 32 + (jp * 2 + (lm >> 1)) * 8 + lr;
-        ldmatrix_fp4_x4(bf, bb + col * kBRow + (kh * 2 + (lm & 1)) * 16);
+        if constexpr (W8)
+          ldmatrix_x4(bf, bb + col * kBRow + (kh * 2 + (lm & 1)) * 16);
+        else
+          ldmatrix_fp4_x4(bf, bb + col * kBRow + (kh * 2 + (lm & 1)) * 16);
 #pragma unroll
         for (int h = 0; h < 2; ++h) {
           const int j = jp * 2 + h;
-          const uint32_t b0 = bf[2 * h] << 2, b1 = bf[2 * h + 1] << 2;
           const uint32_t sfb = (sb2[j] >> (8 * kh)) & 0xFFu;
+          if constexpr (W8) {
 #pragma unroll
-          for (int i = 0; i < 2; ++i) mma_a8w4(acc[i][j], af[i], b0, b1, sfa[i], sfb);
+            for (int i = 0; i < 2; ++i) mma_a8w8(acc[i][j], af[i], bf[2 * h], bf[2 * h + 1], sfa[i], sfb);
+          } else {
+            const uint32_t b0 = bf[2 * h] << 2, b1 = bf[2 * h + 1] << 2;
+#pragma unroll
+            for (int i = 0; i < 2; ++i) mma_a8w4(acc[i][j], af[i], b0, b1, sfa[i], sfb);
+          }
         }
       }
     }
@@ -305,11 +375,12 @@ __global__ __launch_bounds__(a8w4::kThreads, 2) void moe_grouped_a8w4_kernel(
   }
 }
 
-template <typename OutT>
+template <typename OutT, bool W8>
 void launch_a8w4(const uint8_t* codes, size_t code_stride, const uint8_t* scales, size_t scale_stride,
                  const int32_t* act_rows, const MoeSegment* segs, int n_segs, int max_rows,
                  const MoeExpertView* views, int which, OutT* out, size_t out_stride, int n, int k,
-                 cudaStream_t stream, const MoeTile* tiles, const int32_t* tile_count, int tile_cap) {
+                 cudaStream_t stream, const MoeTile* tiles, const int32_t* tile_count, int tile_cap,
+                 bool rows_outer = false) {
   using namespace a8w4;
   if (n_segs <= 0 || n <= 0) return;
   if (!codes || !scales || !segs || !views || !out) throw std::invalid_argument("moe a8w4: null pointer");
@@ -321,7 +392,7 @@ void launch_a8w4(const uint8_t* codes, size_t code_stride, const uint8_t* scales
     throw std::invalid_argument("moe a8w4: a tile list with its count and capacity, or max_rows");
   // The dynamic shared memory opt-in at this instantiation's first launch.
   static const bool opted = [] {
-    DGPP_CUDA_OK(cudaFuncSetAttribute(moe_grouped_a8w4_kernel<OutT>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+    DGPP_CUDA_OK(cudaFuncSetAttribute(moe_grouped_a8w4_kernel<OutT, W8>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                       static_cast<int>(kSmem)));
     return true;
   }();
@@ -333,10 +404,11 @@ void launch_a8w4(const uint8_t* codes, size_t code_stride, const uint8_t* scales
   // Column pairs as one store when the rows allow it.
   const int pairs = (out_stride % 2 == 0 && reinterpret_cast<uintptr_t>(out) % (2 * sizeof(OutT)) == 0) ? 1 : 0;
   const dim3 grid(static_cast<unsigned>(grid_x), tiles != nullptr ? 1u : static_cast<unsigned>(n_segs), 1u);
-  moe_grouped_a8w4_kernel<OutT><<<grid, kThreads, kSmem, stream>>>(codes, code_stride, scales, scale_stride, act_rows,
-                                                                  segs, views, which, out, out_stride, n, k, m_tiles,
-                                                                  pairs, tiles, tile_count,
-                                                                  static_cast<int>(n_tiles));
+  // The kernel's m_tiles: 0 selects the rows-outermost raster of the segment grid.
+  const int raster = (tiles == nullptr && rows_outer) ? 0 : m_tiles;
+  moe_grouped_a8w4_kernel<OutT, W8><<<grid, kThreads, kSmem, stream>>>(
+      codes, code_stride, scales, scale_stride, act_rows, segs, views, which, out, out_stride, n, k, raster, pairs,
+      tiles, tile_count, static_cast<int>(n_tiles));
   DGPP_CUDA_OK(cudaGetLastError());
 }
 }  // namespace
@@ -346,8 +418,8 @@ void launch_moe_grouped_a8w4_bf16(const uint8_t* codes, size_t code_stride, cons
                                   int max_rows, const MoeExpertView* views, int which, uint16_t* out,
                                   size_t out_stride, int n, int k, cudaStream_t stream, const MoeTile* tiles,
                                   const int32_t* tile_count, int tile_cap) {
-  launch_a8w4<uint16_t>(codes, code_stride, scales, scale_stride, act_rows, segs, n_segs, max_rows, views, which, out,
-                        out_stride, n, k, stream, tiles, tile_count, tile_cap);
+  launch_a8w4<uint16_t, false>(codes, code_stride, scales, scale_stride, act_rows, segs, n_segs, max_rows, views,
+                               which, out, out_stride, n, k, stream, tiles, tile_count, tile_cap);
 }
 
 void launch_moe_grouped_a8w4_f32(const uint8_t* codes, size_t code_stride, const uint8_t* scales,
@@ -355,7 +427,23 @@ void launch_moe_grouped_a8w4_f32(const uint8_t* codes, size_t code_stride, const
                                  int max_rows, const MoeExpertView* views, int which, float* out, size_t out_stride,
                                  int n, int k, cudaStream_t stream, const MoeTile* tiles, const int32_t* tile_count,
                                  int tile_cap) {
-  launch_a8w4<float>(codes, code_stride, scales, scale_stride, act_rows, segs, n_segs, max_rows, views, which, out,
-                     out_stride, n, k, stream, tiles, tile_count, tile_cap);
+  launch_a8w4<float, false>(codes, code_stride, scales, scale_stride, act_rows, segs, n_segs, max_rows, views, which,
+                            out, out_stride, n, k, stream, tiles, tile_count, tile_cap);
+}
+
+void launch_moe_grouped_a8w8_bf16(const uint8_t* codes, size_t code_stride, const uint8_t* scales,
+                                  size_t scale_stride, const int32_t* act_rows, const MoeSegment* segs, int n_segs,
+                                  int max_rows, const MoeExpertView* views, int which, uint16_t* out,
+                                  size_t out_stride, int n, int k, cudaStream_t stream) {
+  launch_a8w4<uint16_t, true>(codes, code_stride, scales, scale_stride, act_rows, segs, n_segs, max_rows, views,
+                              which, out, out_stride, n, k, stream, nullptr, nullptr, 0, /*rows_outer=*/true);
+}
+
+void launch_moe_grouped_a8w8_f32(const uint8_t* codes, size_t code_stride, const uint8_t* scales,
+                                 size_t scale_stride, const int32_t* act_rows, const MoeSegment* segs, int n_segs,
+                                 int max_rows, const MoeExpertView* views, int which, float* out, size_t out_stride,
+                                 int n, int k, cudaStream_t stream) {
+  launch_a8w4<float, true>(codes, code_stride, scales, scale_stride, act_rows, segs, n_segs, max_rows, views, which,
+                           out, out_stride, n, k, stream, nullptr, nullptr, 0, /*rows_outer=*/true);
 }
 }  // namespace dgpp

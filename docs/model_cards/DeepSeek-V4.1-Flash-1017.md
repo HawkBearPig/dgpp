@@ -811,13 +811,18 @@ instruction for FP8 against FP4 operands (`kernels/moe_a8w4.hpp`): the
 activation's E4M3 codes and scale bytes against the checkpoint's MXFP4
 codes and scale bytes, accumulated in FP32, which is the release's
 `fp4_gemm`. The kernel takes widths that are multiples of 64, which covers
-this checkpoint at one, two and four ranks. The other multiplies read the
-same quantized values through a rounding kernel in front of the
-BF16-activation kernels (`kernels/act_quant.hpp`). Every scale is a power of
-two and the release accumulates in FP32, so each product is the release's
-up to the order of the sum. `moe_a8w4_test` holds the routed kernel to an
-FP64 sum of the same operands and to the BF16-activation kernel on the
-rounded rows.
+this checkpoint at one, two and four ranks. The shared expert's three
+projections run on the same instruction for FP8 against FP8 operands, the
+release's `fp8_gemm`: the same codes against the checkpoint's E4M3 weights,
+whose scales the loader stores as powers of two on a 32 by 32 grid. On one
+GPU at 16,384 rows its gate or up projection takes 1.56 ms against 4.08 ms
+on the BF16-activation kernel, and its down projection 1.82 ms against
+3.45 ms. The other multiplies read the same quantized values through a
+rounding kernel in front of the BF16-activation kernels
+(`kernels/act_quant.hpp`). Every scale is a power of two and the release
+accumulates in FP32, so each product is the release's up to the order of
+the sum. `moe_a8w4_test` holds both forms to an FP64 sum of the same
+operands and to the BF16-activation kernels on the rounded rows.
 
 The routed launches run over a list of the tiles that hold rows. In most
 layers of this model one expert is among the routes of nearly every token,
@@ -878,6 +883,8 @@ engine prefill time):
 The first prompt of a boot at a length pays for pages and table rows no
 later prompt pays for. Five further cold prompts of 2,067 tokens on each
 boot had medians of 0.91 s, 0.91 s and 0.88 s.
+
+That binary ran the shared expert on the BF16-activation kernel.
 
 With `index_topk` 2048 and a 14 GiB prefix cache the same binary under
 `native` with `prefill_bf16_partials` read 1.08 s, 3.10 s, 12.17 s and

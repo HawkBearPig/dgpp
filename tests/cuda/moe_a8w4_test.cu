@@ -14,13 +14,17 @@
 //     routing and with one expert in every token's routes (the shape of a
 //     DeepSeek-V4.1 layer, where the segment grid is mostly empty blocks);
 //  7. speed at prefill shapes against launch_moe_grouped_mma_fp4_*, both
-//     grids, both routings.
+//     grids, both routings;
+//  8. the FP8-weight form (the shared expert's shapes, one segment of every
+//     token) against the fp64 dot, the BF16-activation fp8 kernel and its
+//     own BF16 output, with speed.
 //   moe_a8w4_test [--tokens T] [--experts E] [--topk K] [--no-speed]
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <initializer_list>
 #include <random>
 #include <string>
 #include <vector>
@@ -425,6 +429,137 @@ int run(int tokens, int experts, int topk, int n, int k, bool check_all, bool sp
   return fails;
 }
 
+// The FP8-weight form: one segment of `tokens` rows against an [n, k] E4M3
+// matrix with power-of-two F32 scales on the 32 x 32 grid.
+int run_w8(int tokens, int n, int k, bool check_all, bool speed, const char* label) {
+  std::mt19937 rng(977u + static_cast<uint32_t>(n + k));
+  std::normal_distribution<float> nd(0.f, 1.f);
+  std::uniform_int_distribution<int> byte(0, 255);
+  std::uniform_int_distribution<int> expo(-15, -3);
+  std::vector<uint16_t> act_h(static_cast<size_t>(tokens) * k);
+  for (auto& v : act_h) {
+    float x = nd(rng);
+    const int roll = byte(rng);
+    if (roll == 0) x *= 20.f;
+    if (roll == 1) x = 0.f;
+    v = bf16(x);
+  }
+  std::vector<uint8_t> w_h(static_cast<size_t>(n) * k);
+  for (auto& b : w_h) {
+    int c = byte(rng);
+    if ((c & 0x7F) == 0x7F) c ^= 1;  // no NaN codes
+    b = static_cast<uint8_t>(c);
+  }
+  const int sr = (n + 31) / 32, sc = k / 32;
+  std::vector<float> ws_h(static_cast<size_t>(sr) * sc);
+  for (auto& v : ws_h) v = std::ldexp(1.0f, expo(rng));
+  const std::vector<MoeSegment> segs_h{MoeSegment{0, tokens, 0}};
+  uint16_t* act = dev(act_h);
+  uint8_t* w = dev(w_h);
+  float* ws = dev(ws_h);
+  MoeSegment* segs = dev(segs_h);
+  std::vector<MoeExpertView> views_h(3);
+  views_h[0] = MoeExpertView{w, ws, nullptr, nullptr, 5, 5};
+  MoeExpertView* views = dev(views_h);
+  const size_t ss = act_fp8_block_scale_stride(k);
+  const size_t os = static_cast<size_t>(n);
+  auto* codes = dev_alloc<uint8_t>(static_cast<size_t>(tokens) * k);
+  auto* scales = dev_alloc<uint8_t>(static_cast<size_t>(tokens) * ss);
+  auto* qdq = dev_alloc<uint16_t>(static_cast<size_t>(tokens) * k);
+  auto* out8 = dev_alloc<float>(static_cast<size_t>(tokens) * os);
+  auto* out8b = dev_alloc<uint16_t>(static_cast<size_t>(tokens) * os);
+  auto* out16 = dev_alloc<float>(static_cast<size_t>(tokens) * os);
+  int fails = 0;
+  auto gemm8 = [&] {
+    launch_moe_grouped_a8w8_f32(codes, k, scales, ss, nullptr, segs, 1, tokens, views, 0, out8, os, n, k, nullptr);
+  };
+  auto gemm8b = [&] {
+    launch_moe_grouped_a8w8_bf16(codes, k, scales, ss, nullptr, segs, 1, tokens, views, 0, out8b, os, n, k, nullptr);
+  };
+  auto gemm16 = [&] {
+    launch_moe_grouped_mma_f32(qdq, k, segs, 1, tokens, 128, views, 0, out16, os, n, k, nullptr);
+  };
+  launch_act_quant_fp8_block(act, k, codes, k, scales, ss, tokens, k, nullptr, qdq, k);
+  gemm8();
+  gemm8b();
+  gemm16();
+  DGPP_CUDA_OK(cudaDeviceSynchronize());
+  const auto qc = host(codes, static_cast<size_t>(tokens) * k);
+  const auto qs = host(scales, static_cast<size_t>(tokens) * ss);
+  const auto o8 = host(out8, static_cast<size_t>(tokens) * os);
+  const auto o8b = host(out8b, static_cast<size_t>(tokens) * os);
+  const auto o16 = host(out16, static_cast<size_t>(tokens) * os);
+  {
+    double worst = 0;
+    size_t checked = 0;
+    const int row_step = check_all ? 1 : std::max(1, tokens / 5);
+    const int col_step = check_all ? 1 : 37;
+    for (int r = 0; r < tokens; r += row_step)
+      for (int col = 0; col < n; col += col_step) {
+        double dot = 0, mag = 0;
+        for (int kk = 0; kk < k; ++kk) {
+          const double a = e4m3(qc[static_cast<size_t>(r) * k + kk]) * e8m0(qs[static_cast<size_t>(r) * ss + kk / 32]);
+          const double wv = e4m3(w_h[static_cast<size_t>(col) * k + kk]) *
+                            static_cast<double>(ws_h[static_cast<size_t>(col / 32) * sc + kk / 32]);
+          dot += a * wv;
+          mag += std::fabs(a * wv);
+        }
+        worst = std::max(worst, std::fabs(o8[static_cast<size_t>(r) * os + col] - dot) / (mag + 1e-30));
+        ++checked;
+      }
+    std::printf("[ .. ] %s layouts: worst |got - fp64| / sum|terms| = %.3g over %zu outputs\n", label, worst, checked);
+    if (!(worst < 1e-5)) {
+      std::printf("[FAIL] %s: the fp8-weight kernel does not compute the quantized dot\n", label);
+      ++fails;
+    }
+  }
+  {
+    size_t bad = 0;
+    double num = 0, den = 0;
+    for (size_t i = 0; i < o8.size(); ++i) {
+      bad += o8b[i] != bf16(o8[i]);
+      num += (static_cast<double>(o8[i]) - o16[i]) * (static_cast<double>(o8[i]) - o16[i]);
+      den += static_cast<double>(o16[i]) * o16[i];
+    }
+    const double rel = std::sqrt(num / (den + 1e-300));
+    std::printf("[ .. ] %s bf16 output: %zu of %zu differ from the rounded fp32 form; against the BF16-activation "
+                "kernel: relative l2 %.3g\n", label, bad, o8.size(), rel);
+    if (bad || !(rel < 1e-5)) {
+      std::printf("[FAIL] %s: the fp8-weight kernel's forms disagree\n", label);
+      ++fails;
+    }
+  }
+  if (speed) {
+    cudaEvent_t e0, e1;
+    cudaEventCreate(&e0);
+    cudaEventCreate(&e1);
+    auto time = [&](auto f) {
+      for (int i = 0; i < 3; ++i) f();
+      cudaEventRecord(e0);
+      for (int i = 0; i < 20; ++i) f();
+      cudaEventRecord(e1);
+      cudaEventSynchronize(e1);
+      float ms = 0;
+      cudaEventElapsedTime(&ms, e0, e1);
+      return ms / 20;
+    };
+    auto gemm16b = [&] {
+      launch_moe_grouped_mma_bf16(qdq, k, segs, 1, tokens, 128, views, 0, reinterpret_cast<uint16_t*>(out16), os, n, k,
+                                  nullptr);
+    };
+    const float t16 = time(gemm16), t16b = time(gemm16b), t8 = time(gemm8), t8b = time(gemm8b);
+    const double flop = 2.0 * tokens * n * k;
+    std::printf("[ .. ] %s %d rows x n %d x k %d: BF16 activations f32 out %.3f ms (%.1f TF), bf16 out %.3f ms (%.1f TF); "
+                "E4M3 activations f32 out %.3f ms (%.1f TF), bf16 out %.3f ms (%.1f TF); speedup f32 %.2fx, bf16 %.2fx\n",
+                label, tokens, n, k, t16, flop / t16 / 1e9, t16b, flop / t16b / 1e9, t8, flop / t8 / 1e9, t8b,
+                flop / t8b / 1e9, t16 / t8, t16b / t8b);
+    cudaEventDestroy(e0);
+    cudaEventDestroy(e1);
+  }
+  for (void* q : std::initializer_list<void*>{act, w, ws, segs, views, codes, scales, qdq, out8, out8b, out16}) cudaFree(q);
+  return fails;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -456,6 +591,11 @@ int main(int argc, char** argv) {
   fails += run(tokens, experts, topk, 5120, 576, false, speed, "down");
   fails += run(tokens, experts, topk, 576, 5120, false, speed, "gate/up hot", true);
   fails += run(tokens, experts, topk, 5120, 576, false, speed, "down hot", true);
+  // The FP8-weight form: a ragged shape with every output checked, then
+  // the shared expert's shapes at four ranks.
+  fails += run_w8(150, 192, 320, true, false, "fp8 ragged");
+  fails += run_w8(tokens, 576, 5120, false, speed, "fp8 gate/up");
+  fails += run_w8(tokens, 5120, 576, false, speed, "fp8 down");
   if (fails) {
     std::printf("[FAIL] moe_a8w4_test: %d check(s) failed\n", fails);
     return 1;

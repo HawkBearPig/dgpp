@@ -360,9 +360,17 @@ class GlmMoeLayer {
   bool act_native_mma_ = true;
   uint8_t* d_a8_hidden_codes_ = nullptr;   // [max_tokens, hidden]
   uint8_t* d_a8_hidden_scales_ = nullptr;  // [max_tokens, hidden / 32, padded to four]
-  uint8_t* d_a8_act_codes_ = nullptr;      // [max_tokens * top_k, a8_act_stride_]
+  uint8_t* d_a8_act_codes_ = nullptr;      // [max_tokens * (top_k + 1), a8_act_stride_]: routed rows, then shared
   uint8_t* d_a8_act_scales_ = nullptr;
   size_t a8_act_stride_ = 0;
+  // The shared expert on the same instruction against its FP8 weights
+  // (launch_moe_grouped_a8w8_*): taken where its three matrices carry F32
+  // scales on the 32 x 32 grid and 16-byte aligned payloads, and the first
+  // layer checked holds powers of two alone (the instruction's scale is a
+  // power of two: any other grid keeps the BF16-activation kernel).
+  bool a8w8_checked_ = false;
+  bool a8w8_pow2_ = false;
+  bool shared_a8w8_ok(int inter);
   // The routed segments' real tiles (launch_moe_tile_list at the kernel's
   // rows a tile): the launches' grid, whatever the longest segment.
   MoeTile* d_a8_tiles_ = nullptr;      // [a8_tiles_cap_]

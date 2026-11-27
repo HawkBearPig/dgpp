@@ -21,6 +21,8 @@ project procedures and design guidance live in `docs/`.
   first four layers against 0.0100 / 0.0036 / 0.0025 / 0.0025) and more rows
   route to the reference's experts. The quality set reads 158/164, 292/300
   and 100/100 with the recipe against 156/164, 294/300 and 100/100 without.
+  The shared expert multiplies the same codes against its FP8 weights on
+  the instruction's FP8 by FP8 form (the release's `fp8_gemm`).
   The routed launches run over a list of the tiles that hold rows, because
   one expert is among the routes of nearly every token in most layers and a
   grid sized by the longest expert is almost all empty blocks.

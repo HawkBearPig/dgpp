@@ -49,4 +49,19 @@ void launch_moe_grouped_a8w4_f32(const uint8_t* codes, size_t code_stride, const
                                  int n, int k, cudaStream_t stream, const MoeTile* tiles = nullptr,
                                  const int32_t* tile_count = nullptr, int tile_cap = 0);
 
+// The same product against FP8 weights, the release's fp8_gemm (its shared
+// expert): the views are E4M3 payloads [n, k] (16-byte aligned rows) with
+// F32 scales that are powers of two on a 32 x 32 grid (scale_shift_rows and
+// scale_shift_cols 5, as the DeepSeek-V4.1 loader stores them), read as
+// their E8M0 exponents. A segment's tiles run rows outermost. Segment, view
+// and out conventions as above; k % 64 == 0.
+void launch_moe_grouped_a8w8_bf16(const uint8_t* codes, size_t code_stride, const uint8_t* scales,
+                                  size_t scale_stride, const int32_t* act_rows, const MoeSegment* segs, int n_segs,
+                                  int max_rows, const MoeExpertView* views, int which, uint16_t* out,
+                                  size_t out_stride, int n, int k, cudaStream_t stream);
+void launch_moe_grouped_a8w8_f32(const uint8_t* codes, size_t code_stride, const uint8_t* scales,
+                                 size_t scale_stride, const int32_t* act_rows, const MoeSegment* segs, int n_segs,
+                                 int max_rows, const MoeExpertView* views, int which, float* out, size_t out_stride,
+                                 int n, int k, cudaStream_t stream);
+
 }  // namespace dgpp
