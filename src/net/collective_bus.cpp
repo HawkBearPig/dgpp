@@ -50,15 +50,57 @@ constexpr int kMaxPollPerCq = 32;        // CQEs drained per CQ per iteration
 constexpr int kEngineSpinIterations = 2000;
 // Before a decode graph exists a resting engine sleeps this long at a time.
 constexpr int kEngineIdleSleepUs = 50;
-// Once a decode graph exists a resting engine parks on its kick word
-// (cpu_wait.hpp) for at most this long at a time, where the CPU parks.
-// Every hand-off from a CPU thread (a queued send or collective, a stream
-// issue, a window arm, stop) bumps the kick and ends the park at once. The
-// bound is how late the engine notices what arrives without a kick: a
-// peer's point-to-point message, or a hand-off whose wake a preemption
-// lost. At 50 us a parked engine makes about one pass in fifty
-// microseconds, a few percent of a core.
-constexpr int kEngineQuietParkUs = 50;
+// Once a decode graph exists the engine parks (cpu_wait.hpp) for at most
+// this long at a time, where the CPU parks, in two places.
+//
+// When it is quiet it parks on its kick word. Every hand-off from a CPU
+// thread (a queued send or collective, a stream issue, a window arm, stop)
+// bumps the kick and ends the park at once.
+//
+// While a generation is in flight on the write transport it parks on the
+// block record that generation waits for (BusWriteBlockRecord: `ready`
+// before the posts, `done` before the walk advances). The GPU writes a
+// record with a system-scope release, and that store ends the park.
+//
+// The bound is how late the engine notices what does not end its park: a
+// peer's point-to-point message, a send completion, a hand-off during a
+// flight, the watchdog clocks, a wake a preemption lost. At 50 us a parked
+// engine makes about one pass in fifty microseconds, a few percent of a
+// core.
+constexpr int kEngineParkUs = 50;
+// The flight park's breaker (engine_loop). A store that lands during a
+// park ends it, so a park that ran to its bound although the record changed
+// is a late wake. Only a store that lands in a park's last instants does
+// that on a platform that wakes the engine, well under one park in a
+// hundred. The engine judges kFlightBreakerWindow such parks at a time and
+// stops parking in flights when more than one in kFlightBreakerOneIn of a
+// window woke late: at that rate the parks cost about a microsecond a
+// collective.
+constexpr uint32_t kFlightBreakerWindow = 4096;
+constexpr uint32_t kFlightBreakerOneIn = 32;
+// Where the engine waits for a generation's `ready` store.
+//
+// The posts follow that store, and every rank's kernel waits for every
+// peer's rows, so each collective takes as long as the slowest engine of the
+// world needs to notice its kernel. A park notices a store about a
+// microsecond later than a poll does: the core has to leave WFET and its
+// first work afterwards runs slower. With the engine parked on the record,
+// that was 0.35 % of a prose decode step on four nodes (2026-11-27, 93
+// collectives a step).
+//
+// The kernel stamps its cell's gt_start when it starts and stores `ready`
+// when its row is copied to the staging area and fenced, 2.5 to 3 us later
+// at decode's row lengths. The engine therefore parks on the stamp while
+// the kernel has not started and polls the records once it has, so the
+// wake's cost falls inside the kernel's copy. A kernel has started when its
+// stamp is later than the last generation's done stamp: the graph runs a
+// collective's kernel after everything before it. If the records are still
+// outstanding kEngineParkUs after the start (megabytes of row take that
+// long to copy), the engine parks on them.
+//
+// The `done` store is in no collective's time: the next thing the engine
+// owes is the next generation's post, a compute away. It parks through that
+// wait.
 constexpr size_t kMaxLatencySamples = 100000;
 // Spin before entering the scheduler on a request wait. LONG on purpose
 //: the decode step's eager pick (two ~150us collectives
@@ -207,7 +249,8 @@ struct CollectiveBus::Impl {
   uint64_t next_id = 1;
 
   std::atomic<bool> stopping{false};
-  // The engine parks when it is quiet (engine_loop) where the CPU can park.
+  // Where the CPU can park, the engine parks when it is quiet and while a
+  // write-transport generation is in flight (engine_loop).
   const bool park_when_quiet = cpu_wait::supported();
   // Bumped (release) after every hand-off from a CPU thread to the engine.
   // A quiet engine parks on it. It sits alone on its lines, because any
@@ -219,6 +262,49 @@ struct CollectiveBus::Impl {
   }
   // Quiet parks so far (stats() and the engine's exit line report it).
   std::atomic<uint64_t> engine_parks{0};
+  // The block record the flight pass of this engine iteration left its
+  // generation waiting on, and the value it read there (engine thread only:
+  // engine_loop clears it before the passes, gen_flight_pass sets it, and
+  // engine_loop parks on it after them).
+  struct FlightWait {
+    const uint32_t* word = nullptr;  // the record's `ready` or `done`
+    uint32_t seen = 0;
+    // While the generation's kernel has not started: its cell's gt_start,
+    // which the engine parks on in place of the record (kEngineParkUs).
+    const uint64_t* start_word = nullptr;
+    uint64_t start_seen = 0;
+    bool poll = false;  // the kernel has started and its `ready` is due: no park
+  } flight_wait;
+  const uint64_t park_ticks = static_cast<uint64_t>(kEngineParkUs) * cpu_wait::ticks_hz() / 1000000;
+  // The done stamp (%globaltimer) of the last generation the walks
+  // completed: a kernel's start stamp after it belongs to the generation in
+  // flight. Engine thread only.
+  uint64_t last_gt_done = 0;
+  // True during the passes that follow a flight park (engine thread only).
+  bool pass_follows_park = false;
+  // Flight parks so far, and how they ended (the engine thread counts,
+  // stats() and the engine's exit line report). A park that ran to its
+  // bound with the record unchanged is a timeout: the kernel had nothing to
+  // store yet. A park during which the record changed is a store park, and
+  // one of those that ran to its bound all the same is a late wake.
+  std::atomic<uint64_t> engine_flight_parks{0};
+  std::atomic<uint64_t> engine_flight_park_timeouts{0};
+  std::atomic<uint64_t> engine_flight_store_parks{0};
+  std::atomic<uint64_t> engine_flight_late_wakes{0};
+  // Write-transport generations posted while the engine parks in flights,
+  // and those of them whose `ready` store the first pass after a park
+  // found: the engine was not polling when it landed.
+  std::atomic<uint64_t> engine_flight_posts{0};
+  std::atomic<uint64_t> engine_flight_post_wakes{0};
+  // The breaker's current window (engine thread only) and its verdict. Once
+  // it trips the engine polls during flights for the bus's lifetime.
+  uint32_t flight_window_store_parks = 0;
+  uint32_t flight_window_late_wakes = 0;
+  std::atomic<bool> flight_parks_off{false};
+  // Fault injection (BusOptions::debug_flight_park_decoy): the word the
+  // engine parks on in place of the record. Nothing writes it or its lines.
+  alignas(256) uint32_t flight_park_decoy = 0;
+  char flight_park_decoy_pad_[256 - sizeof(uint32_t)];
   std::mutex stop_mu;  // serializes quiesce()/stop() for one instance
   bool quiesced = false;
   bool stopped = false;
@@ -306,20 +392,42 @@ struct CollectiveBus::Impl {
       return write_recs + static_cast<size_t>(cell - graph_cells) * kBusWriteMaxBlocks;
     return write_recs_of_stream(static_cast<int>(cell - strm.cells));
   }
+  // What a write-transport generation still waits for, per phase: the first
+  // block record that has not staged and the first that has not finished,
+  // each with the value read there. A word is null once every block has
+  // stored the generation.
+  struct WriteWait {
+    const uint32_t* ready_word = nullptr;
+    const uint32_t* done_word = nullptr;
+    uint32_t ready_seen = 0;
+    uint32_t done_seen = 0;
+  };
   // The write transport's aggregate of a generation's block records: every
   // block staged (post) / every block done (complete; the cell's stamps and
-  // status are filled from the records).
-  void write_aggregate(BusAllReduceCtl* cell, uint32_t seq, uint32_t elems, bool* ready_all, bool* done_all) {
+  // status are filled from the records). `wait` takes what is outstanding.
+  void write_aggregate(BusAllReduceCtl* cell, uint32_t seq, uint32_t elems, bool* ready_all, bool* done_all,
+                       WriteWait* wait) {
     const BusWriteBlockRecord* recs = write_recs_of_cell(cell);
     const uint32_t blocks = bus_write_blocks(bus_write_chunks(elems));
-    bool ready = true, done = true;
     for (uint32_t b = 0; b < blocks; ++b) {
-      ready = ready && acquire_u32(&recs[b].ready) == seq;
-      done = done && acquire_u32(&recs[b].done) == seq;
+      if (wait->ready_word == nullptr) {
+        const uint32_t ready = acquire_u32(&recs[b].ready);
+        if (ready != seq) {
+          wait->ready_word = &recs[b].ready;
+          wait->ready_seen = ready;
+        }
+      }
+      if (wait->done_word == nullptr) {
+        const uint32_t done = acquire_u32(&recs[b].done);
+        if (done != seq) {
+          wait->done_word = &recs[b].done;
+          wait->done_seen = done;
+        }
+      }
     }
-    *ready_all = ready;
-    *done_all = done;
-    if (!done) return;
+    *ready_all = wait->ready_word == nullptr;
+    *done_all = wait->done_word == nullptr;
+    if (!*done_all) return;
     uint64_t stage = 0, finish = 0, first = 0, last = 0;
     uint32_t status = 0;
     uint64_t claim[kBusMaxPeers] = {};
@@ -535,6 +643,7 @@ struct CollectiveBus::Impl {
       uint64_t posted_bits = 0;   // bit p once peer p's pair is posted
       Clock::time_point progressed_at{};
       Clock::time_point started_at{};
+      uint64_t entered_ticks = 0;  // cpu_wait::ticks() when the engine first saw the kernel started (0: not yet)
       bool active = false;
     } flight;
     int stall_dumps = 0;  // TEMP bring-up: rate control for the walk dump
@@ -1665,9 +1774,10 @@ struct CollectiveBus::Impl {
     // staged, completion when every block is done (the poison path still
     // goes through done_seq).
     bool write_ready = false;
+    WriteWait write_wait;
     if (write_transport()) {
       bool write_done = false;
-      write_aggregate(cell, seq, elems, &write_ready, &write_done);
+      write_aggregate(cell, seq, elems, &write_ready, &write_done, &write_wait);
       if (write_done) done = seq;
     }
 
@@ -1684,6 +1794,7 @@ struct CollectiveBus::Impl {
       graph.flight.posted_bits = 0;
       graph.flight.started_at = Clock::now();
       graph.flight.progressed_at = Clock::now();
+      graph.flight.entered_ticks = 0;
       graph.flight.active = true;
       worked = true;
     }
@@ -1698,6 +1809,7 @@ struct CollectiveBus::Impl {
         return true;
       }
       if (graph.flight.posted_bits == all_peers_mask()) {
+        last_gt_done = std::max(last_gt_done, cell->gt_done);
         accumulate_timeline(*tl, *cell);
         record_latency(BusMessageClass::kLatency,
                        elapsed_us(graph.flight.started_at));
@@ -1763,6 +1875,11 @@ struct CollectiveBus::Impl {
       // (bus_types.hpp). Signaled every 16th post per lane so the SQ
       // retires and errors surface.
       const auto post_t0 = Clock::now();
+      if (park_when_quiet) {
+        // Whether a poll noticed the store, or the first pass after a park.
+        engine_flight_posts.fetch_add(1, std::memory_order_relaxed);
+        if (pass_follows_park) engine_flight_post_wakes.fetch_add(1, std::memory_order_relaxed);
+      }
       const uint32_t row = static_cast<uint32_t>((gen - 1) % kBusWriteRing);
       const uint8_t* src_row = stage_buf(0, static_cast<int>((gen - 1) % Impl::kStageRing));
       const uint32_t chunks = bus_write_chunks(elems);
@@ -1858,6 +1975,31 @@ struct CollectiveBus::Impl {
                  " stalled (no engine progress for " +
                  std::to_string(opt.completion_timeout_ms) + " ms)");
       return true;
+    }
+    // Nothing moved in this pass, so the generation waits for its kernel. On
+    // the write transport the kernel's next step is a store into the block
+    // record found above: the first that has not staged while the posts are
+    // outstanding, the first that has not finished after them. The engine
+    // may park there (engine_loop). The send transport's posts can also
+    // wait for a peer's credit, which no kernel of ours writes.
+    if (!worked && write_transport()) {
+      const bool posted = graph.flight.posted_bits == all_peers_mask();
+      flight_wait = {};
+      flight_wait.word = posted ? write_wait.done_word : write_wait.ready_word;
+      flight_wait.seen = posted ? write_wait.done_seen : write_wait.ready_seen;
+      if (!posted && park_when_quiet) {
+        // The `ready` wait (kEngineParkUs): on the kernel's start stamp
+        // until it has started, then a poll while the store is due.
+        const uint64_t start = acquire_u64(&cell->gt_start);
+        if (start > last_gt_done) {
+          const uint64_t now = cpu_wait::ticks();
+          if (graph.flight.entered_ticks == 0) graph.flight.entered_ticks = now;
+          flight_wait.poll = now - graph.flight.entered_ticks < park_ticks;
+        } else {
+          flight_wait.start_word = &cell->gt_start;
+          flight_wait.start_seen = start;
+        }
+      }
     }
     return worked;
   }
@@ -2864,8 +3006,15 @@ struct CollectiveBus::Impl {
   // the engine must not sleep in the futex behind it (engine_loop explains
   // what a sleeping engine costs).
   bool engine_quiet() {
+    if (graph_window_live() || stream_outstanding()) return false;
+    return nothing_but_walks();
+  }
+  // No work of the engine's own besides the graph and stream walks: not
+  // stopping, no eager collective, nothing queued, no registered request
+  // with posts or bytes outstanding. Same try-lock rule as engine_quiet.
+  bool nothing_but_walks() {
     if (stopping.load(std::memory_order_relaxed)) return false;
-    if (coll.req || graph_window_live() || stream_outstanding()) return false;
+    if (coll.req) return false;
     {
       std::unique_lock<std::mutex> l(lat_q_mu, std::try_to_lock);
       if (!l.owns_lock() || !lat_q.empty()) return false;
@@ -2887,11 +3036,53 @@ struct CollectiveBus::Impl {
     return true;
   }
 
+  // One park of a write-transport flight, on the word its pass left it
+  // waiting on (engine_loop): the record, or the kernel's start stamp.
+  // Counts how the park ended and runs the breaker.
+  void flight_park() {
+    const uint64_t deadline = cpu_wait::ticks() + park_ticks;
+    const bool on_start = flight_wait.start_word != nullptr;
+    if (opt.debug_flight_park_decoy)
+      cpu_wait::park_while_equal(&flight_park_decoy, flight_park_decoy, deadline);
+    else if (on_start)
+      cpu_wait::park_while_equal(flight_wait.start_word, flight_wait.start_seen, deadline);
+    else
+      cpu_wait::park_while_equal(flight_wait.word, flight_wait.seen, deadline);
+    const bool on_bound = cpu_wait::ticks() >= deadline;
+    const bool changed = on_start ? acquire_u64(flight_wait.start_word) != flight_wait.start_seen
+                                  : acquire_u32(flight_wait.word) != flight_wait.seen;
+    engine_flight_parks.fetch_add(1, std::memory_order_relaxed);
+    if (!changed) {
+      // Other writes to the record's line (its stamps) and the kernel's
+      // timer events end parks early too. Only the bound is counted.
+      if (on_bound) engine_flight_park_timeouts.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+    engine_flight_store_parks.fetch_add(1, std::memory_order_relaxed);
+    ++flight_window_store_parks;
+    if (on_bound) {
+      engine_flight_late_wakes.fetch_add(1, std::memory_order_relaxed);
+      ++flight_window_late_wakes;
+    }
+    if (flight_window_store_parks < kFlightBreakerWindow) return;
+    if (flight_window_late_wakes * kFlightBreakerOneIn > flight_window_store_parks) {
+      flight_parks_off.store(true, std::memory_order_relaxed);
+      DGPP_LOG_WARN("bus engine: rank {} stops parking in write-transport flights: of the last {} parks "
+                    "during which its kernel stored, {} ran to their {} us bound all the same (more than "
+                    "one in {}), so the stores do not end its parks; it polls during flights from here on",
+                    opt.my_rank, flight_window_store_parks, flight_window_late_wakes, kEngineParkUs,
+                    kFlightBreakerOneIn);
+    }
+    flight_window_store_parks = 0;
+    flight_window_late_wakes = 0;
+  }
+
   void engine_loop() {
     pin_engine_thread();
     if (park_when_quiet)
-      DGPP_LOG_INFO("bus engine: rank {} parks when quiet (WFET on its kick word, {} us at a time)",
-                    opt.my_rank, kEngineQuietParkUs);
+      DGPP_LOG_INFO("bus engine: rank {} parks in WFET, {} us at a time: on its kick word when quiet{}",
+                    opt.my_rank, kEngineParkUs,
+                    write_transport() ? ", on its kernel's block record while a generation is in flight" : "");
     else
       DGPP_LOG_INFO("bus engine: rank {} spins when quiet (this CPU has no WFET)", opt.my_rank);
     // Empty passes in a row. It stops counting one past the threshold: only
@@ -2900,6 +3091,7 @@ struct CollectiveBus::Impl {
     for (;;) {
       if (stopping.load(std::memory_order_relaxed) && drained()) break;
       const auto loop_t0 = Clock::now();
+      flight_wait.word = nullptr;
       const bool graph_worked = graph_pass();
       const bool stream_worked = stream_pass();
       const bool coll_worked = collective_pass();
@@ -2908,6 +3100,8 @@ struct CollectiveBus::Impl {
       const bool recycled = recycle_pass();
       const bool credited = credits_pass();
       const bool watched = watchdog_pass();
+      pass_follows_park = false;
+      // The loop histogram times the passes only; parks are not in it.
       {
         const double it_us = elapsed_us(loop_t0);
         ++loop_n;
@@ -2918,6 +3112,35 @@ struct CollectiveBus::Impl {
           recycled || credited || watched) {
         idle = 0;
         continue;
+      }
+      // A generation in flight that waits for its kernel (its pass left the
+      // word in flight_wait): park there right away, with no hot phase
+      // first, unless the kernel has started and its `ready` is due
+      // (kEngineParkUs): then the passes above are the poll, and the post
+      // follows the store by one of them. A store that ends a park is
+      // noticed about a microsecond later. One that landed between the
+      // pass's read and the park has changed the word, and the park returns
+      // at once.
+      //
+      // Only when the walk is all the engine has. Anything else it serves
+      // (an eager collective, a queued send, a registered request, stop)
+      // keeps it polling, because none of those ends this park. A hand-off
+      // that arrives during one waits out the bound: while a walk is live
+      // the bus admits only a window arm, a stream issue and a stop, and
+      // none of them needs the engine sooner.
+      //
+      // The completion queues are polled in every pass, after the walk's
+      // posts. Parking puts at most one generation's writes between two
+      // polls, one in sixteen of them signaled, against a send queue of
+      // qp_depth entries.
+      if (flight_wait.word != nullptr && park_when_quiet &&
+          !flight_parks_off.load(std::memory_order_relaxed)) {
+        if (flight_wait.poll) continue;
+        if (nothing_but_walks()) {
+          flight_park();
+          pass_follows_park = true;
+          continue;
+        }
       }
       // The hot phase: the loop body is the poll, with no system call in
       // it. A sched_yield here cost about 2.2 ms of poll latency per idle
@@ -2949,14 +3172,22 @@ struct CollectiveBus::Impl {
         const uint32_t kick = engine_kick.load(std::memory_order_acquire);
         if (engine_quiet()) {
           engine_parks.fetch_add(1, std::memory_order_relaxed);
-          cpu_wait::park_while_equal(engine_kick, kick,
-                                     cpu_wait::deadline_in_us(kEngineQuietParkUs));
+          cpu_wait::park_while_equal(engine_kick, kick, cpu_wait::deadline_in_us(kEngineParkUs));
         }
       }
       // A CPU that cannot park keeps polling here.
     }
-    DGPP_LOG_INFO("bus engine: rank {} stopped after {} quiet parks", opt.my_rank,
-                  engine_parks.load(std::memory_order_relaxed));
+    DGPP_LOG_INFO("bus engine: rank {} stopped after {} quiet parks and {} flight parks: {} ran to the "
+                  "bound with nothing stored, its kernel stored during {} and {} of those woke late; the "
+                  "first pass after a park found the ready store of {} of {} generations{}",
+                  opt.my_rank, engine_parks.load(std::memory_order_relaxed),
+                  engine_flight_parks.load(std::memory_order_relaxed),
+                  engine_flight_park_timeouts.load(std::memory_order_relaxed),
+                  engine_flight_store_parks.load(std::memory_order_relaxed),
+                  engine_flight_late_wakes.load(std::memory_order_relaxed),
+                  engine_flight_post_wakes.load(std::memory_order_relaxed),
+                  engine_flight_posts.load(std::memory_order_relaxed),
+                  flight_parks_off.load(std::memory_order_relaxed) ? "; flight parks were turned off" : "");
   }
 
   // ---- rendezvous ----------------------------------------------------------
@@ -4992,6 +5223,13 @@ BusStats CollectiveBus::stats() const {
   std::lock_guard<std::mutex> lock(impl.stats_mu);
   BusStats out = impl.stats_store;
   out.engine_parks = impl.engine_parks.load(std::memory_order_relaxed);
+  out.engine_flight_parks = impl.engine_flight_parks.load(std::memory_order_relaxed);
+  out.engine_flight_park_timeouts = impl.engine_flight_park_timeouts.load(std::memory_order_relaxed);
+  out.engine_flight_store_parks = impl.engine_flight_store_parks.load(std::memory_order_relaxed);
+  out.engine_flight_late_wakes = impl.engine_flight_late_wakes.load(std::memory_order_relaxed);
+  out.engine_flight_posts = impl.engine_flight_posts.load(std::memory_order_relaxed);
+  out.engine_flight_post_wakes = impl.engine_flight_post_wakes.load(std::memory_order_relaxed);
+  out.engine_flight_parks_off = impl.flight_parks_off.load(std::memory_order_relaxed);
   for (auto& peer_lanes : impl.peers)
     for (auto& lane : peer_lanes) out.lanes.push_back(lane.stats);
   return out;

@@ -86,6 +86,11 @@ struct BusOptions {
   // whose peers already posted can finish before its own engine has
   // posted. Production leaves it 0.
   int debug_pass_delay_us = 0;
+  // Fault injection for the tests: in a write-transport flight the engine
+  // parks on a word nothing writes instead of on its kernel's block
+  // record, which is how a platform whose GPU stores do not end a park
+  // behaves. Production leaves it false.
+  bool debug_flight_park_decoy = false;
 
   BusLatencyTransport latency_transport = BusLatencyTransport::kSend;
   // Optional extra graph nodes, for model extensions that record additional
@@ -135,6 +140,28 @@ struct BusStats {
   // Times the engine parked because it had nothing queued, in flight or
   // live. It stays 0 on a CPU that cannot park and in a world of one.
   uint64_t engine_parks = 0;
+  // Times the engine parked on a block record of a write-transport
+  // generation in flight, waiting for its kernel's store there. It stays 0
+  // on the send transport and on a CPU that cannot park.
+  uint64_t engine_flight_parks = 0;
+  // How those parks ended. A timeout ran to its bound with the record
+  // unchanged: the kernel had nothing to store yet. A store park is one
+  // during which the record changed, and a late wake is a store park that
+  // ran to its bound all the same, which a store that ends the park does
+  // only when it lands in the park's last instants.
+  uint64_t engine_flight_park_timeouts = 0;
+  uint64_t engine_flight_store_parks = 0;
+  uint64_t engine_flight_late_wakes = 0;
+  // Write-transport generations the engine posted while it parks in
+  // flights, and those of them whose `ready` store the first pass after a
+  // park found. The engine polls once a generation's kernel has started,
+  // so a poll notices nearly all of them.
+  uint64_t engine_flight_posts = 0;
+  uint64_t engine_flight_post_wakes = 0;
+  // True once too many wakes came late and the engine stopped parking in
+  // flights (the breaker in engine_loop). It polls during flights from
+  // then on.
+  bool engine_flight_parks_off = false;
 };
 
 struct BusSendResult {
