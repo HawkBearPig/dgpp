@@ -8,7 +8,11 @@
 //
 //   dsv41_forward_check --model ORG/NAME | --checkpoint-dir DIR --out FILE
 //                       (--ids 1,2,3 | --text FILE [--no-bos] | --tokens N [--seed S])
-//                       [--layers N] [--bounded]
+//                       [--layers N] [--bounded] [--act-native]
+//
+// --act-native: the release's activation recipe on the walk's rows
+// (engine.prefill_activations native), the engine's side of the torch
+// reference's --act-quant.
 //
 // The dump: "DSV41ST3", int32 L T H4, bf16 states [L][T][H4] (every walked
 // layer's output streams, [4, H] per row), fp32 pre [L][T][4] (the collapse
@@ -41,7 +45,7 @@ int main(int argc, char** argv) {
   std::string model_id, ckpt, out, ids_text, text_path;
   int tokens = 0, layers = 0;
   uint64_t seed = 7;
-  bool bos = true, bounded = false;
+  bool bos = true, bounded = false, act_native = false;
   const auto next = [&](int& i) {
     if (i + 1 >= argc) throw std::runtime_error("missing value after " + std::string(argv[i]));
     return argv[++i];
@@ -59,6 +63,7 @@ int main(int argc, char** argv) {
       else if (a == "--layers") layers = std::stoi(next(i));
       else if (a == "--no-bos") bos = false;
       else if (a == "--bounded") bounded = true;
+      else if (a == "--act-native") act_native = true;
       else throw std::runtime_error("unknown argument " + a);
     }
     if (ckpt.empty()) {
@@ -103,12 +108,14 @@ int main(int argc, char** argv) {
     }
     const int T = static_cast<int>(ids.size());
     if (T < 1) throw std::runtime_error("an empty prompt");
-    DGPP_LOG_INFO("dsv41_forward_check: {} tokens{}, {} layers, {} prefill", T, bounded ? "" : "",
-                  layers > 0 ? layers : cfg.num_hidden_layers, bounded ? "bounded" : "exact");
+    DGPP_LOG_INFO("dsv41_forward_check: {} tokens{}, {} layers, {} prefill, {} activations", T, bounded ? "" : "",
+                  layers > 0 ? layers : cfg.num_hidden_layers, bounded ? "bounded" : "exact",
+                  act_native ? "the release's fp8 block" : "bf16");
     const auto t0 = std::chrono::steady_clock::now();
     dgpp::Dsv41Model model(cfg, ckpt, /*max_tokens=*/std::max({T, cfg.sliding_window, 16}), /*max_cache_tokens=*/std::max(T + 256, 1024),
                            dgpp::Dsv41Residency::Streaming, nullptr, 0, 1, 1);
     model.set_prefill_bounded(bounded);
+    model.set_prefill_act_native(act_native);
     if (layers > 0) model.set_debug_layer_limit(layers);
     const dgpp::Dsv41Model::Outputs o = model.forward(ids, /*capture_layers=*/true);
     const std::vector<std::vector<float>> pre = model.debug_layer_pre();

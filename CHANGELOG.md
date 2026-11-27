@@ -5,6 +5,39 @@ project procedures and design guidance live in `docs/`.
 
 ## Unreleased
 
+- **The release's activation recipe on DeepSeek-V4.1 prompt rows**
+  (`engine.prefill_activations: native`, on in the DeepSeek-V4.1-Flash-1017
+  template). The checkpoint's reference code quantizes the input of every
+  FP8 and MXFP4 multiply to FP8 with a power-of-two scale per 32 values, and
+  weighs an expert's SwiGLU product by its route before the down
+  projection. Prompt rows now do the same. The routed experts multiply the
+  FP8 activation codes against the MXFP4 weight codes on the GB10's
+  block-scaled tensor-core instruction (`kernels/moe_a8w4.hpp`, FP32
+  accumulation, the release's `fp4_gemm`), and the other multiplies read
+  the rounded values through a rounding kernel in front of the
+  BF16-activation kernels. Against the release's own layer code on
+  the real weights the engine's layer outputs sit closer with the recipe
+  than without it (0.0058 / 0.0032 / 0.0020 / 0.0020 relative L2 on the
+  first four layers against 0.0100 / 0.0036 / 0.0025 / 0.0025) and more rows
+  route to the reference's experts. The quality set reads 158/164, 292/300
+  and 100/100 with the recipe against 156/164, 294/300 and 100/100 without.
+  The shared expert and the attention's dense projections multiply their
+  input's codes against FP8 weights on the instruction's FP8 by FP8 form
+  (the release's `fp8_gemm`).
+  The routed launches run over a list of the tiles that hold rows, because
+  one expert is among the routes of nearly every token in most layers and a
+  grid sized by the longest expert is almost all empty blocks.
+  A cold 33K prompt reads 10.52 s with the recipe against 10.82 s without
+  on four nodes at the template's `index_topk`, and a 2K prompt 1.04 s
+  either way. `engine.prefill_bf16_partials` under the recipe keeps every
+  down row in BF16, the release's rounding point applied to a rank's share
+  of an expert: 9.81 s and 0.95 s with the shared expert and the dense
+  projections on the instruction. The template leaves that key off until
+  the quality set has run with it.
+  Decode rows, the draft stages and EXL3 packs keep BF16 activations. The key
+  joins the world's settings identity when it is not `bf16`, which gives a
+  Qwen3.8-27B deployment that already set it a new cache binding once.
+
 - **Host waits park on the GB10.** A thread that waits for a word another
   agent writes no longer polls it at the full clock. On a CPU with `WFET`
   (the GB10's cores) the serving thread parks on the verdict and confidence

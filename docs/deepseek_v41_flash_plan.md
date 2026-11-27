@@ -904,9 +904,11 @@ checkpoint's own `inference/model.py`. Its rounding points (fp32 mHC,
 fp32 gate softmax in the compressor, one bf16 rounding after rope, fp32
 Engram gate, fp32 router, bf16 index dots) are mirrored where the engine's
 kernels can (the pure-python reference dump follows the engine's chains);
-its MXFP8 activation quantization is NOT mirrored (the engine is more
-precise there) and the cross-check tolerance absorbs it, as the
-GLM-4.7/5.3 cross-checks absorb the same class of difference. `hc_fn` in
+its MXFP8 activation quantization is mirrored on prompt rows under
+`engine.prefill_activations: native`, which the release template sets, and
+not on decode rows or under `bf16`, where the engine is more precise and
+the cross-check tolerance absorbs the difference, as the GLM-4.7/5.3
+cross-checks absorb the same class of difference. `hc_fn` in
 bf16 and the router in fp8 are levers behind `engine.hc_weights` /
 `engine.router_weights` knobs, off by default, decided by
 `fabric_logprob.py` and `serve_eval.py`. The end-to-end quality bar is the

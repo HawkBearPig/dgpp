@@ -1672,16 +1672,16 @@ void launch_moe_accum_ordered_f32(float* out, const float* down,
 void launch_moe_accum_ordered_bf16down(uint16_t* out, const uint16_t* down, size_t down_stride,
                                       const int32_t* slot_row, const int32_t* slot_ids,
                                       const float* slot_w, int tokens, int top_k, int hidden,
-                                      cudaStream_t stream) {
-  launch_accum_ordered_t<uint16_t, uint16_t>(out, down, down_stride, slot_row, slot_ids, slot_w, -1,
+                                      cudaStream_t stream, int shared_row0) {
+  launch_accum_ordered_t<uint16_t, uint16_t>(out, down, down_stride, slot_row, slot_ids, slot_w, shared_row0,
                                              tokens, top_k, hidden, stream);
 }
 
 void launch_moe_accum_ordered_f32_bf16down(float* out, const uint16_t* down, size_t down_stride,
                                            const int32_t* slot_row, const int32_t* slot_ids,
                                            const float* slot_w, int tokens, int top_k, int hidden,
-                                           cudaStream_t stream) {
-  launch_accum_ordered_t<float, uint16_t>(out, down, down_stride, slot_row, slot_ids, slot_w, -1, tokens,
+                                           cudaStream_t stream, int shared_row0) {
+  launch_accum_ordered_t<float, uint16_t>(out, down, down_stride, slot_row, slot_ids, slot_w, shared_row0, tokens,
                                           top_k, hidden, stream);
 }
 

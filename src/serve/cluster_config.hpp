@@ -159,6 +159,9 @@ struct ClusterConfig {
     //     written in bf16 and its per-expert partials summed from bf16
     //     (half the bytes a chunk writes and reads back; the reference
     //     stack's form). Default: fp32 partials in the ordered chain.
+    //     DeepSeek-V4.1 under prefill_activations native takes the same
+    //     form on its block-scaled expert chain, the shared expert's rows
+    //     included (the release's projections return bf16).
     //   prefill_fold_scales: the wide packed expert GEMM with each
     //     group's scale folded into the bf16 weight values and one fp32
     //     accumulator across K (Marlin's form; no per-group fma).
@@ -182,7 +185,11 @@ struct ClusterConfig {
     //     the products on the block-scaled fp4 tensor cores, and its
     //     channel-FP8 projections and late MLPs from per-token e4m3 rows on
     //     the e4m3 tensor cores; the FP8 release's blockwise product; decode
-    //     rows keep bf16 activations).
+    //     rows keep bf16 activations. DeepSeek-V4.1's release: the input of
+    //     every fp8 and fp4 multiply quantized to fp8 e4m3 with an e8m0
+    //     scale per 32 values as its inference/model.py linear() does, and
+    //     the SwiGLU product weighted by its route before the down
+    //     projection; an EXL3 pack is refused).
     //   prefill_attention: "bf16" (the default: the attention products in
     //     bf16 — on an fp8 K/V pool the codes widened exactly) or "fp8"
     //     (2026-10-16, the Qwen3.5 family on engine.kv_dtype fp8: the

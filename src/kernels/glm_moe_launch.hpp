@@ -191,16 +191,19 @@ void launch_moe_accum_ordered_f32(float* out, const float* down,
                                   int shared_row0, int tokens, int top_k,
                                   int hidden, cudaStream_t stream);
 
-// The same chain over bf16 down rows (the W4A4 grouped chain; no shared row),
-// rounded to bf16 or left in fp32 for a caller that continues the sum.
+// The same chain over bf16 down rows, rounded to bf16 or left in fp32 for a
+// caller that continues the sum. shared_row0 < 0: no shared row (the W4A4
+// grouped chain); otherwise the shared expert's bf16 rows sit at
+// shared_row0 + t and close the chain with weight 1 (the DeepSeek-V4.1
+// activation recipe, whose every projection leaves bf16 rows).
 void launch_moe_accum_ordered_bf16down(uint16_t* out, const uint16_t* down, size_t down_stride,
                                        const int32_t* slot_row, const int32_t* slot_ids,
                                        const float* slot_w, int tokens, int top_k, int hidden,
-                                       cudaStream_t stream);
+                                       cudaStream_t stream, int shared_row0 = -1);
 void launch_moe_accum_ordered_f32_bf16down(float* out, const uint16_t* down, size_t down_stride,
                                            const int32_t* slot_row, const int32_t* slot_ids,
                                            const float* slot_w, int tokens, int top_k, int hidden,
-                                           cudaStream_t stream);
+                                           cudaStream_t stream, int shared_row0 = -1);
 
 // out[i] = bf16(acc[i]) — the chain's single rounding, as the sum leaves for
 // the FFN all-reduce (bf16 on the wire).

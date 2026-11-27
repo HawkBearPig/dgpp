@@ -97,7 +97,7 @@ the memory plan follows that choice.
 | `engine.admission`, `engine.admission_window` | when and how much KV space a request reserves | `full` reserves prompt plus requested output; `grow` reserves incrementally and can shed a request on exhaustion. These settings do not select prefill grouping |
 | `engine.prefill_group` | grouping compatible cold prompts into shared execution | amortizes model walks; batch geometry can change floating-point rounding |
 | `engine.prefill` (DeepSeek) | `bounded` (the model's own recipe) or `exact` | about half the prefill work against parity with the full walk |
-| `engine.prefill_bf16_partials` (Qwen AutoRound hybrid) | the packed expert chain's down projection in bf16, partials summed from bf16 | −3 to −7 % cold prefill (2K to 32K); not bitwise the fp32 chain |
+| `engine.prefill_bf16_partials` (Qwen AutoRound hybrid, DeepSeek-V4.1 under `prefill_activations: native`) | the expert chain's down projection in bf16, partials summed from bf16 | Qwen: −3 to −7 % cold prefill (2K to 32K). DeepSeek-V4.1: −3 % (2K to 66K). Not bitwise the fp32 chain |
 | `engine.prefill_fp8_gemm` (Qwen with `dense_weights` fp8) | the dense stack's prefill GEMMs on the fp8 tensor cores from per-token e4m3 activations | 0 to −3 %; not bitwise the dequantized chain |
 | `engine.prefill_fold_scales` (Qwen AutoRound hybrid) | the expert GEMM's group scales folded into the bf16 weight values | measured no gain (+3 % at 32K); kept for completeness, leave it off |
 

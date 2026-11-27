@@ -172,6 +172,20 @@ class GlmMoeLayer {
   float* hidden_code_scales() const { return d_hidden_qs_; }
   void mark_hidden_codes_ready(bool ready) { hidden_codes_ready_ = ready; }
 
+  // The DeepSeek release's activation recipe on the prefill chain
+  // (kernels/act_quant.hpp): the token rows quantize-dequantized to fp8
+  // block-32 before the gate and up projections, the SwiGLU product weighted
+  // by its route and quantize-dequantized before the down projection, and
+  // the down rows accumulated unweighted — the order of the release's
+  // Expert.forward. Decode rows (enqueue_decode) keep the BF16 chain. Takes
+  // the device-segmented prefill chain with a shared expert, equal routed
+  // and shared intermediate widths and fp32 down rows.
+  void set_act_qdq_fp8_block(bool on) { act_qdq_ = on; }
+  // The recipe's routed multiplies on the block-scaled tensor cores (on by
+  // default) or on the BF16-activation kernels over the dequantized rows.
+  void set_act_native_mma(bool on) { act_native_mma_ = on; }
+  bool act_qdq_fp8_block() const { return act_qdq_; }
+
   // Fills graph slot `table_slot`'s device expert-view table from the
   // CURRENT binding (an async H2D on `stream`; the caller syncs before
   // capturing). Must run OUTSIDE stream capture, once per slot, before
@@ -203,6 +217,14 @@ class GlmMoeLayer {
   // default and unsupported shapes need no W4A4 workspace.
   static size_t w4a4_scratch_bytes(const GlmMoeConfig& cfg, int max_tokens,
                                    bool calibrated = false);
+
+  // The lazy workspace of the fp8 block activation recipe
+  // (set_act_qdq_fp8_block) at this shape: the dequantized token rows, the
+  // routes' row weights and the unit weights, and the block-scaled
+  // kernel's codes and scale bytes for the token rows and the routed
+  // SwiGLU rows and its tile list. cfg.inter is the routed width on this
+  // rank.
+  static size_t act_recipe_bytes(const GlmMoeConfig& cfg, int max_tokens);
 
   // Hash routing for the NEXT enqueues (DeepSeek-V4-Flash's first layers):
   // a token's experts come from `tid2eid` (int32 [vocab, top_k], rows
@@ -270,7 +292,8 @@ class GlmMoeLayer {
                             const MoeSegment* shared_seg, int tokens,
                             size_t rows_total, cudaStream_t stream,
                             const MoeTile* tiles = nullptr,
-                            const int32_t* tile_count = nullptr, int tile_cap = 0);
+                            const int32_t* tile_count = nullptr, int tile_cap = 0,
+                            bool device_routes = false);
   // Whether the routed chain's tensor-core launches take the tile list: the
   // wide packed int4 kernel (engine.expert_tile_list = false keeps the max_rows grid).
   bool packq_tile_list() const;
@@ -315,8 +338,46 @@ class GlmMoeLayer {
   uint8_t* d_q_scales_ = nullptr;
   float* d_q_gs_ = nullptr;
   size_t q_rows_cap_ = 0, q_k_cap_ = 0;
-  bool down_bf16_ = false;  // the last chain wrote bf16 down rows into d_down_ (W4A4, no shared segment)
+  // The last chain wrote bf16 down rows into d_down_: the W4A4 and the
+  // packed chains without a shared segment, and the activation recipe's
+  // block-scaled chain, whose shared rows are bf16 too.
+  bool down_bf16_ = false;
   void ensure_w4a4(size_t rows, int k);
+  // The fp8 block activation recipe (set_act_qdq_fp8_block): the token rows'
+  // quantize-dequantized copy, each grouped row's route weight (1 on the
+  // shared rows) and the unit weights of the unweighted accumulation, grown
+  // on first use (eager prefill only, never under capture).
+  bool act_qdq_ = false;
+  uint16_t* d_hidden_qdq_ = nullptr;  // [max_tokens, hidden]
+  float* d_act_row_w_ = nullptr;      // [max_tokens * (top_k + 1)]
+  float* d_unit_w_ = nullptr;         // [max_tokens * top_k]
+  size_t chain_route_offset_ = 0;     // prefill_chain's offset into d_slot_row_ / d_weights_
+  void ensure_act_qdq(cudaStream_t stream);
+  // The recipe's routed multiplies on the block-scaled tensor cores
+  // (kernels/moe_a8w4.hpp), taken where the shapes allow: the token rows'
+  // and the routed SwiGLU rows' E4M3 codes and scale bytes. Off: the
+  // BF16-activation kernels on the dequantized rows (the tests' twin).
+  bool act_native_mma_ = true;
+  uint8_t* d_a8_hidden_codes_ = nullptr;   // [max_tokens, hidden]
+  uint8_t* d_a8_hidden_scales_ = nullptr;  // [max_tokens, hidden / 32, padded to four]
+  uint8_t* d_a8_act_codes_ = nullptr;      // [max_tokens * (top_k + 1), a8_act_stride_]: routed rows, then shared
+  uint8_t* d_a8_act_scales_ = nullptr;
+  size_t a8_act_stride_ = 0;
+  // The shared expert on the same instruction against its FP8 weights
+  // (launch_moe_grouped_a8w8_*): taken where its three matrices carry F32
+  // scales on the 32 x 32 grid and 16-byte aligned payloads, and the first
+  // layer checked holds powers of two alone (the instruction's scale is a
+  // power of two: any other grid keeps the BF16-activation kernel).
+  bool a8w8_checked_ = false;
+  bool a8w8_pow2_ = false;
+  bool shared_a8w8_ok(int inter);
+  // The routed segments' real tiles (launch_moe_tile_list at the kernel's
+  // rows a tile): the launches' grid, whatever the longest segment.
+  MoeTile* d_a8_tiles_ = nullptr;      // [a8_tiles_cap_]
+  int32_t* d_a8_tile_count_ = nullptr;
+  int a8_tiles_cap_ = 0;
+  void ensure_a8w4(int routed_inter);
+  const float* accum_weights() const { return act_qdq_ ? d_unit_w_ : d_weights_; }
   float* d_acc_ = nullptr;   // [max_tokens, hidden] the fp32 chain
 
   // decode-slot scratch (cudaMalloc; sized to decode_slots*(top_k+1) rows —
@@ -431,7 +492,8 @@ class GlmMoeLayer {
   // chain; process-wide. bf16_partials: the packed tensor-core chain's
   // down projection written in bf16 and its per-expert partials summed
   // from bf16 (half the bytes a chunk writes and reads back; the reference
-  // stack's form). fold_scales: the wide packed GEMM with each group's
+  // stack's form), and the fp8 block activation recipe's block-scaled chain
+  // likewise, its shared rows included. fold_scales: the wide packed GEMM with each group's
   // scale folded into the bf16 weight values and one fp32 accumulator
   // (kernels/packq_gemm variant 3).
   // tile_list (engine.expert_tile_list, default on): the compact tile list

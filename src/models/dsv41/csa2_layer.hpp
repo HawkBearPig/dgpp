@@ -102,6 +102,17 @@ class Csa2Layer {
   Csa2Layer(IGemm& gemm, const Csa2Config& cfg, int max_tokens, int64_t max_cache_tokens, void* scratch,
             size_t scratch_capacity, void* gemm_workspace, size_t gemm_ws_bytes, int max_decode_rows = 16,
             int decode_n_split = 32, size_t dot_budget = 64ull << 20);
+  // The activation recipe's copy of the hidden rows is the layer's own
+  // allocation (act_hidden); everything else lives in the caller's scratch.
+  ~Csa2Layer() {
+    cudaFree(act_h_);
+    cudaFree(act_codes_);
+    cudaFree(act_scales_);
+    cudaFree(qr_codes_);
+    cudaFree(qr_scales_);
+  }
+  Csa2Layer(const Csa2Layer&) = delete;
+  Csa2Layer& operator=(const Csa2Layer&) = delete;
   static size_t scratch_bytes(const Csa2Config& cfg, int max_tokens, int64_t max_cache_tokens,
                               int max_decode_rows = 16, int decode_n_split = 32,
                               size_t dot_budget = 64ull << 20);
@@ -116,6 +127,13 @@ class Csa2Layer {
   // prefill_tile): the fp8-weight tile GEMM (true) or the streaming decode
   // form (false) for every projection a prefill enqueue runs.
   void set_prefill_dense_tile(bool on) { prefill_dense_tile_ = on; }
+  // The release's activation recipe on prefill rows (kernels/act_quant.hpp):
+  // the input of every fp8 projection quantize-dequantized to fp8 block-32
+  // as the release's linear() does it (wq_a and wkv read one copy of the
+  // hidden rows; wq_b and the indexer's wq_b the normed low-rank query; wo_b
+  // the wo_a rows), and the attention output before wo_a as its forward
+  // does. Decode and draft rows keep the BF16 chain.
+  void set_prefill_act_qdq(bool on) { prefill_act_qdq_ = on; }
   // The prefill's window source on the flash listed kernel (true, the
   // default; engine.prefill_window flash) or the scalar partial kernel
   // (scalar, the decode window's kernel: the decode audit's form).
@@ -291,6 +309,28 @@ class Csa2Layer {
   // rows keep the streaming form. Set by the prefill entry points.
   bool prefill_tile_ = false;
   bool prefill_dense_tile_ = true;  // the configured form (set_prefill_dense_tile)
+  bool act_qdq_ = false;            // this enqueue's rows take the release's activation recipe
+  bool prefill_act_qdq_ = false;    // the configured recipe (set_prefill_act_qdq)
+  uint16_t* act_h_ = nullptr;       // [T, hidden] the quantize-dequantized hidden rows (own allocation, first use)
+  const uint16_t* act_hidden(const uint16_t* h, int tokens, cudaStream_t stream);
+  // The recipe's dense multiplies on the block-scaled tensor cores
+  // (launch_dense_a8w8_bf16, the release's fp8_gemm): a projection's input
+  // rows as E4M3 codes and scale bytes against its FP8 weights, where the
+  // layer's matrices carry F32 scales on the 32 x 32 grid, 16-byte aligned
+  // payloads and widths that are whole 64-wide stages. One code buffer
+  // serves the hidden rows, the attention output and the wo_a rows in turn
+  // (each is consumed before the next is written, in stream order) and the
+  // low-rank query has its own, which the indexer's wq_b reads too. Off:
+  // the rounding kernel in front of the BF16-activation GEMMs.
+  bool act_native_dense_ = true;
+  uint8_t* act_codes_ = nullptr;   // [T, max(hidden, local heads x 512, local groups x o_lora)]
+  uint8_t* act_scales_ = nullptr;  // [T, that width / 32]
+  uint8_t* qr_codes_ = nullptr;    // [T, q_lora]
+  uint8_t* qr_scales_ = nullptr;   // [T, q_lora / 32]
+  bool native_dense(int tokens);
+  void quant_hidden(const uint16_t* h, int tokens, cudaStream_t stream);
+  void project_kv_rows(const uint16_t* h, int tokens, const int64_t* pos, cudaStream_t stream,
+                       bool from_codes = false);
   bool prefill_window_flash_ = true;  // set_prefill_window_flash
   // A prefill tile's rows are consecutive positions of one request: their
   // windows overlap by all but one key and their selections mostly agree,

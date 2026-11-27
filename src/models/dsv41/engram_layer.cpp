@@ -7,6 +7,7 @@
 
 #include "common/cuda_check.hpp"
 #include "common/log.hpp"
+#include "kernels/act_quant.hpp"
 #include "kernels/exl3_gemv.hpp"
 #include "kernels/scale_gemm.hpp"
 
@@ -330,7 +331,7 @@ void Dsv41EngramLayer::embed(int table_index, int rows, cudaStream_t stream) {
 }
 
 void Dsv41EngramLayer::project(const Dsv41EngramLayerWeights& w, int rows, uint16_t* kv_dst, cudaStream_t stream,
-                               bool prefill_tile, int r0) {
+                               bool prefill_tile, int r0, bool act_qdq) {
   if (rows <= 0) return;
   const int K = width_local();
   const int N = (cfg_.hc_mult + 1) * cfg_.hidden_size;
@@ -345,6 +346,9 @@ void Dsv41EngramLayer::project(const Dsv41EngramLayerWeights& w, int rows, uint1
                           exl3_ws_, exl3_ws_bytes_);
     return;
   }
+  if (act_qdq)
+    launch_act_qdq_fp8_block(e_ + static_cast<size_t>(r0) * K, static_cast<size_t>(K), e_ + static_cast<size_t>(r0) * K,
+                             static_cast<size_t>(K), rows, K, stream);
   launch_scale_gemm_grid_bf16(e_ + static_cast<size_t>(r0) * K, static_cast<size_t>(K), w.wkv.payload, w.wkv.scales, dst,
                               rows, N, K, stream, 0, 5, 5, dense_mma_, nullptr, 0, prefill_tile);
 }

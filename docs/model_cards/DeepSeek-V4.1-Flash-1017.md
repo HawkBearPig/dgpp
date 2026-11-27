@@ -48,8 +48,9 @@ measurement below prices 2048 against it on the same binary.
 
 Four DGX Spark nodes, tensor parallel, the V4.1-Flash template's shape: six
 request slots at DSpark depth 4 with the confidence-scheduled verify depth,
-the bounded prefill (the model's own SWA-replay recipe), the full
-1M-token context. The tokenizer, prompt renderer (`encoding/encoding.py`,
+the bounded prefill (the model's own SWA-replay recipe) with the release's
+activation recipe on prompt rows (`engine.prefill_activations: native`), the
+full 1M-token context. The tokenizer, prompt renderer (`encoding/encoding.py`,
 no Jinja template) and DSML tool-call format are V4.1-Flash's.
 
 ## The expert slot launches (2026-11-10)
@@ -785,6 +786,119 @@ B's projection, B's under A's gate and attention; bitwise): 0.413 /
 little work: a block's fold of hidden x 2 bytes per row moves at about
 7 GB/s per rank on the paced bulk path, and block B's accumulation is
 shorter than block A's fold.
+
+## The release's activation recipe on prompt rows (2026-11-26)
+
+The checkpoint's `inference/model.py` quantizes the input of every FP8 and
+MXFP4 projection before it multiplies: FP8 e4m3 values with a power-of-two
+scale per 32 values of the row. The template sets
+`engine.prefill_activations: native`, and every prompt row then takes that
+recipe. The hidden rows are rounded once for `wq_a` and `wkv`, the normed
+low-rank query once for `wq_b` and the indexer's `wq_b`, the attention
+output before `wo_a`, the `wo_a` rows before `wo_b`, the gathered Engram
+rows before `wkv`, and the token rows before each expert's gate and up
+projections. An expert's SwiGLU product takes its route weight, one BF16
+rounding and the same quantization before the down projection, so the
+accumulation adds unweighted rows, which is the order of the release's
+`Expert.forward`. The router, the compressors, the indexer's
+`weights_proj` and the head read unquantized rows, as in the release.
+Decode rows and the draft stages keep BF16 activations. An EXL3 pack has no
+such recipe and is refused with the key at `native`.
+
+The routed experts multiply the quantized operands as they are stored.
+Their three projections run on the GB10's block-scaled tensor-core
+instruction for FP8 against FP4 operands (`kernels/moe_a8w4.hpp`): the
+activation's E4M3 codes and scale bytes against the checkpoint's MXFP4
+codes and scale bytes, accumulated in FP32, which is the release's
+`fp4_gemm`. The kernel takes widths that are multiples of 64, which covers
+this checkpoint at one, two and four ranks. The shared expert's three
+projections run on the same instruction for FP8 against FP8 operands, the
+release's `fp8_gemm`: the same codes against the checkpoint's E4M3 weights,
+whose scales the loader stores as powers of two on a 32 by 32 grid. On one
+GPU at 16,384 rows its gate or up projection takes 1.56 ms against 4.08 ms
+on the BF16-activation kernel, and its down projection 1.82 ms against
+3.45 ms. The attention's dense projections (`wq_a`, `wkv`, `wq_b`, the
+indexer's `wq_b`, `wo_a` and `wo_b`) take the same form over their input's
+codes. In isolation that is 2 to 20 % faster than the tile GEMM over
+rounded BF16 rows, since both run near the 65 TFLOP/s this tile shape can
+be fed at, and it writes one byte a value where the rounding kernel wrote
+two. The Engram projection reads its rounded rows through the rounding
+kernel in front of the BF16-activation GEMM (`kernels/act_quant.hpp`).
+Every scale is a power of two and the release accumulates in FP32, so each
+product is the release's up to the order of the sum. `moe_a8w4_test` holds
+every form to an FP64 sum of the same operands and to the BF16-activation
+kernels on the rounded rows.
+
+The routed launches run over a list of the tiles that hold rows. In most
+layers of this model one expert is among the routes of nearly every token,
+so a grid sized by the longest expert is almost all empty blocks: at 16,384
+tokens 3.8 million blocks for the down projection, under 2 % of them with
+rows. On one GPU at that size the down projection takes 16.2 ms over the
+tile list against 20.0 ms over the grid, and gate or up 10.2 ms against
+11.7 ms. The outputs are bitwise the same.
+
+`engine.prefill_bf16_partials` selects the form of the down projection's
+rows under the recipe. Off, a rank keeps each route's rows in FP32 and
+rounds the token's sum once. On, each route's rows and the shared expert's
+are rounded to BF16 before the sum, which is where the release rounds (its
+`fp4_gemm` and `fp8_gemm` return BF16), applied here to a rank's share of
+the expert. That halves the 2 GB a 16,384-token pass writes and reads back
+per layer, and the down projection takes 12.2 ms. The template leaves the
+key off: the quality set has not been run with it.
+
+Against the release's own layer code on the real weights
+(`tools/dsv41_torch_reference.py` over the engine's dump from
+`dsv41_forward_check`, with `--act-quant` and `--act-native` for the
+recipe), 192 text tokens through the first four layers on one rank, as the
+relative L2 of a layer's output over the rows that route alike:
+
+| Engine prompt rows | Reference | Layer 0 | Layer 1 | Layer 2 | Layer 3 | Rows routed alike |
+|---|---|---|---|---|---|---|
+| BF16 | activation quantization off | 0.0100 | 0.0036 | 0.0025 | 0.0025 | 165 to 178 of 192 |
+| `native` | activation quantization on | 0.0058 | 0.0032 | 0.0020 | 0.0020 | 186 to 189 |
+| `native` | activation quantization off | 0.0179 | 0.0192 | 0.0112 | 0.0093 | 159 to 179 |
+| BF16 | activation quantization on | 0.0193 | 0.0199 | 0.0096 | 0.0083 | 159 to 173 |
+
+The quality set on four nodes, one binary (source `ce34f867` plus this
+change, binary `2a9ad6e4152ebdcd`), the template with `index_topk` 2048 and
+the key the only difference, every rank at zero swap:
+
+| | BF16 | `native` |
+|---|---|---|
+| HumanEval | 156/164 | 158/164 |
+| GSM8K | 294/300 | 292/300 |
+| Extraction | 100/100 | 100/100 |
+
+Four items passed under BF16 only and four under `native` only. That
+binary ran every multiply of the recipe through the rounding kernel. The
+routed kernel computes the same sums in another order.
+
+Cold prefill on four nodes (source `195acafa` plus the tile list and the
+BF16 rows, binary `3a6c58a8af644d65`, `index_topk` 512 as in the template
+with a 2 GiB prefix cache, one sample a length, every rank at zero swap,
+engine prefill time):
+
+| Prompt tokens | BF16 | `native` | `native` with `prefill_bf16_partials` |
+|---|---|---|---|
+| 2,067 | 1.04 s | 1.04 s | 1.00 s |
+| 8,306 | 2.94 s | 2.87 s | 2.81 s |
+| 33,320 | 10.82 s | 10.52 s | 10.21 s |
+| 66,608 | 22.25 s | 21.65 s | 21.01 s |
+
+The first prompt of a boot at a length pays for pages and table rows no
+later prompt pays for. Five further cold prompts of 2,067 tokens on each
+boot had medians of 0.91 s, 0.91 s and 0.88 s.
+
+That binary ran the shared expert and the dense projections on the
+BF16-activation kernels. With both on the block-scaled instruction (source
+`71a55c41` plus the dense projections, binary `d029c280740c9bf8`), `native`
+with `prefill_bf16_partials` reads 0.95 s, 2.70 s, 9.81 s and 20.30 s on
+the same shape, and five further 2,067-token prompts a median of 0.84 s.
+
+With `index_topk` 2048 and a 14 GiB prefix cache that binary reads 0.98 s,
+3.17 s, 11.85 s and 25.61 s. On that boot the engine recalled 8 of 8 codes
+planted through a 53,843-token document and passed 100 of 100 extraction
+items.
 
 ## Measured (2026-10-20, four nodes): the campaign of record
 

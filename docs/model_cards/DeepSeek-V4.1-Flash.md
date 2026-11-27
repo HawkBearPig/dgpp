@@ -14,9 +14,12 @@ nibbles with an e8m0 scale per 32 along K); the dense and attention
 projections are FP8 e4m3 with e8m0 scales on 32×32 blocks; the two Engram
 n-gram tables are FP8 e4m3 with an e8m0 scale per 32 (94.56 GiB each,
 mapped read-only from the NVMe rather than resident); the embedding and
-LM head are BF16. The engine decodes every code exactly into BF16 and runs
-activations in BF16; the KV caches keep the trained fp4/fp8 formats. There
-is no `kv_dtype` knob for this family.
+LM head are BF16. The engine decodes every code exactly into BF16. Decode
+rows run BF16 activations. Prompt rows follow `engine.prefill_activations`:
+BF16, or with `native` the release's own recipe, which rounds the input of
+every FP8 and MXFP4 multiply to FP8 with a power-of-two scale per 32
+values. The KV caches keep the trained fp4/fp8 formats. There is no
+`kv_dtype` knob for this family.
 
 ## Architecture
 

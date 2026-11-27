@@ -170,6 +170,7 @@ add_library(dgpp_kernels STATIC
   src/kernels/fp8_dequant.cu
   src/kernels/fp8_gemm.cu
   src/kernels/mxfp8_gemm.cu
+  src/kernels/act_quant.cu
   src/kernels/fp8w_gemm.cu
   src/kernels/fp4w_gemm.cu
   src/kernels/fp8_per_tensor.cu
@@ -194,6 +195,7 @@ add_library(dgpp_kernels STATIC
   src/kernels/glm_mhc.cu
   src/kernels/glm_moe.cu
   src/kernels/moe_w4a4.cu
+  src/kernels/moe_a8w4.cu
   src/kernels/gdn_chunk.cu
   src/kernels/glm_vision.cu
   src/kernels/qwen_vision.cu
@@ -2922,6 +2924,12 @@ set_tests_properties(glm_pick_test PROPERTIES SKIP_RETURN_CODE 2)
 
 # MoE module parity (M4): router vs oracle at real geometry, expert path on
 # small geometry, swiglu clamps, accumulation order, determinism.
+add_executable(act_quant_test tests/cuda/act_quant_test.cu)
+target_link_libraries(act_quant_test PRIVATE dgpp_kernels CUDA::cudart)
+dgpp_set_common(act_quant_test)
+add_test(NAME act_quant_test COMMAND act_quant_test)
+set_tests_properties(act_quant_test PROPERTIES SKIP_RETURN_CODE 2 LABELS "cuda")
+
 add_executable(mxfp8_gemm_test tests/cuda/mxfp8_gemm_test.cu)
 target_link_libraries(mxfp8_gemm_test PRIVATE dgpp_kernels CUDA::cudart)
 dgpp_set_common(mxfp8_gemm_test)
@@ -2949,6 +2957,13 @@ add_test(NAME minimax_native_moe_test COMMAND ${DSV41_PYTHON}
   ${CMAKE_CURRENT_SOURCE_DIR}/tools/minimax_native_moe_regression.py
   --app $<TARGET_FILE:minimax_native_moe_test>)
 set_tests_properties(minimax_native_moe_test PROPERTIES LABELS "cuda")
+
+add_executable(moe_a8w4_test tests/cuda/moe_a8w4_test.cu)
+target_include_directories(moe_a8w4_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(moe_a8w4_test PRIVATE dgpp_models_glm_loader dgpp_models_glm CUDA::cudart)
+dgpp_set_common(moe_a8w4_test)
+add_test(NAME moe_a8w4_test COMMAND moe_a8w4_test --tokens 1024 --experts 64 --no-speed)
+set_tests_properties(moe_a8w4_test PROPERTIES SKIP_RETURN_CODE 2 LABELS "cuda")
 
 add_executable(moe_w4a4_test tests/cuda/moe_w4a4_test.cu)
 target_include_directories(moe_w4a4_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
