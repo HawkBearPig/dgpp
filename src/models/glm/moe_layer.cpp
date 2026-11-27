@@ -16,6 +16,7 @@
 #include "kernels/mma_gemv.hpp"
 #include "kernels/exl3_gemv.hpp"
 #include "kernels/hadamard32.hpp"
+#include "kernels/moe_a8w4.hpp"
 #include "kernels/moe_w4a4.hpp"
 #include "kernels/packq_gemm.hpp"
 #include "kernels/scale_gemm.hpp"
@@ -340,6 +341,10 @@ GlmMoeLayer::~GlmMoeLayer() {
   cudaFree(d_q_scales_);
   cudaFree(d_q_gs_);
   cudaFree(d_hidden_qdq_);
+  cudaFree(d_a8_hidden_codes_);
+  cudaFree(d_a8_hidden_scales_);
+  cudaFree(d_a8_act_codes_);
+  cudaFree(d_a8_act_scales_);
   cudaFree(d_act_row_w_);
   cudaFree(d_unit_w_);
   cudaFree(d_down_);
@@ -1021,6 +1026,17 @@ void GlmMoeLayer::ensure_act_qdq(cudaStream_t stream) {
   launch_fill_f32(d_unit_w_, static_cast<int>(T * K), 1.0f, stream);
 }
 
+void GlmMoeLayer::ensure_a8w4(int routed_inter) {
+  if (d_a8_hidden_codes_ != nullptr) return;
+  const size_t T = static_cast<size_t>(max_tokens_), K = static_cast<size_t>(cfg_.top_k);
+  const int H = static_cast<int>(cfg_.hidden);
+  a8_act_stride_ = (static_cast<size_t>(routed_inter) + 15) / 16 * 16;
+  DGPP_CUDA_OK(cudaMalloc(&d_a8_hidden_codes_, T * static_cast<size_t>(H)));
+  DGPP_CUDA_OK(cudaMalloc(&d_a8_hidden_scales_, T * act_fp8_block_scale_stride(H)));
+  DGPP_CUDA_OK(cudaMalloc(&d_a8_act_codes_, T * K * a8_act_stride_));
+  DGPP_CUDA_OK(cudaMalloc(&d_a8_act_scales_, T * K * act_fp8_block_scale_stride(routed_inter)));
+}
+
 void GlmMoeLayer::ensure_w4a4(size_t rows, int k) {
   if (rows <= q_rows_cap_ && static_cast<size_t>(k) <= q_k_cap_) return;
   const size_t r = std::max(rows, q_rows_cap_), kk = std::max(static_cast<size_t>(k), q_k_cap_);
@@ -1119,6 +1135,15 @@ void GlmMoeLayer::grouped_expert_chain(MoeExpertKernel kernel,
                            stream);
     routed_hidden = d_gather_;
   }
+  const int fp4_group = fp4_group_of(w_);
+  // The recipe's routed multiplies on the block-scaled tensor cores
+  // (kernels/moe_a8w4.hpp): E4M3 activation codes against the MXFP4 weights
+  // as stored, where the three routed projections are MXFP4 and both widths
+  // are whole 64-wide stages. Other shapes keep the BF16-activation kernels
+  // on the dequantized rows: the same sums in another order.
+  const bool a8w4 = act_qdq_ && act_native_mma_ && fp4 && fp4_group == kMxfp4Group &&
+                    kernel == MoeExpertKernel::kMma && w_.fp4_of(0) && w_.fp4_of(1) && w_.fp4_of(2) &&
+                    moe_grouped_a8w4_supported(H) && moe_grouped_a8w4_supported(I_r);
   if (act_qdq_) {
     // The release's linear() quantizes the input of its fp4 and fp8
     // projections alike: one quantize-dequantized copy of the token rows
@@ -1127,7 +1152,18 @@ void GlmMoeLayer::grouped_expert_chain(MoeExpertKernel kernel,
       throw std::logic_error("GlmMoeLayer: the fp8 block activation recipe takes the device-segmented prefill chain "
                              "over the release's routed and shared experts of one width");
     ensure_act_qdq(stream);
-    launch_act_qdq_fp8_block(hidden, static_cast<size_t>(H), d_hidden_qdq_, static_cast<size_t>(H), tokens, H, stream);
+    if (a8w4) {
+      // The routed multiplies read the codes; the shared expert's (FP8
+      // weights, the BF16-activation kernel) the dequantized rows. One
+      // pass writes both.
+      ensure_a8w4(I_r);
+      launch_act_quant_fp8_block(hidden, static_cast<size_t>(H), d_a8_hidden_codes_, static_cast<size_t>(H),
+                                 d_a8_hidden_scales_, act_fp8_block_scale_stride(H), tokens, H, stream, d_hidden_qdq_,
+                                 static_cast<size_t>(H));
+    } else {
+      launch_act_qdq_fp8_block(hidden, static_cast<size_t>(H), d_hidden_qdq_, static_cast<size_t>(H), tokens, H,
+                               stream);
+    }
     hidden = d_hidden_qdq_;
     routed_hidden = hidden;
   }
@@ -1138,7 +1174,6 @@ void GlmMoeLayer::grouped_expert_chain(MoeExpertKernel kernel,
     launch_hadamard32_quant_int8_rows(hidden, static_cast<size_t>(H), d_hidden_q_, static_cast<size_t>(H),
                                       d_hidden_qs_, static_cast<size_t>(H / 128), tokens, H, 0, stream);
   hidden_codes_ready_ = false;
-  const int fp4_group = fp4_group_of(w_);
   const size_t I_max = static_cast<size_t>(std::max(I_r, I_s));
   const bool w4a4 = fp4 && !packq && !w_.weight_only_fp4 && fp4_group == kFp4Group &&
                     kernel == MoeExpertKernel::kMma && moe_w4a4_eligible(H, I_r, rows_total);
@@ -1257,6 +1292,10 @@ void GlmMoeLayer::grouped_expert_chain(MoeExpertKernel kernel,
     else if (w4a4 && routed_arg)
       launch_moe_grouped_w4a4_bf16(d_q_codes_, d_q_scales_, d_q_gs_, d_rows_, sg, ns, mr, d_views_prefill_, which, out,
                                    I_max, n, H, stream);
+    else if (a8w4 && routed_arg)
+      launch_moe_grouped_a8w4_bf16(d_a8_hidden_codes_, static_cast<size_t>(H), d_a8_hidden_scales_,
+                                   act_fp8_block_scale_stride(H), d_rows_, sg, ns, mr, d_views_prefill_, which, out,
+                                   I_max, n, H, stream);
     else if (mma && fp4_w)
       launch_moe_grouped_mma_fp4_bf16(hidden, H, sg, ns, mr, split, d_views_prefill_,
                                       which, out, I_max, n, H, stream, d_rows_, fp4_group);
@@ -1312,6 +1351,9 @@ void GlmMoeLayer::grouped_expert_chain(MoeExpertKernel kernel,
     else if (w4a4 && routed_arg)
       launch_moe_grouped_w4a4_f32(d_q_codes_, d_q_scales_, d_q_gs_, nullptr, sg, ns, mr, d_views_prefill_, 2, d_down_, H, H,
                                   k, stream);
+    else if (a8w4 && routed_arg)
+      launch_moe_grouped_a8w4_f32(d_a8_act_codes_, a8_act_stride_, d_a8_act_scales_, act_fp8_block_scale_stride(k),
+                                  nullptr, sg, ns, mr, d_views_prefill_, 2, d_down_, H, H, k, stream);
     else if (mma && fp4_w)
       launch_moe_grouped_mma_fp4_f32(d_act_, I_max, sg, ns, mr, split, d_views_prefill_,
                                      2, d_down_, H, H, k, stream, nullptr, fp4_group);
@@ -1362,8 +1404,18 @@ void GlmMoeLayer::grouped_expert_chain(MoeExpertKernel kernel,
     launch_scatter_row_weights(d_slot_row_ + chain_route_offset_, d_weights_ + chain_route_offset_,
                                static_cast<int>(tk), d_act_row_w_, stream);
     launch_fill_f32(d_act_row_w_ + tk, tokens, 1.0f, stream);
-    launch_swiglu_weight_act_qdq_fp8_block(d_gate_, d_up_, I_max, d_act_, static_cast<int>(rows_total), I_r,
-                                           cfg_.swiglu_limit, d_act_row_w_, stream);
+    if (a8w4) {
+      // The routed rows as the down multiply's codes; the shared rows
+      // (the BF16-activation kernel) dequantized.
+      launch_swiglu_weight_act_quant_fp8_block(d_gate_, d_up_, I_max, d_a8_act_codes_, a8_act_stride_,
+                                               d_a8_act_scales_, act_fp8_block_scale_stride(I_r),
+                                               static_cast<int>(tk), I_r, cfg_.swiglu_limit, d_act_row_w_, stream);
+      launch_swiglu_weight_act_qdq_fp8_block(d_gate_ + tk * I_max, d_up_ + tk * I_max, I_max, d_act_ + tk * I_max,
+                                             tokens, I_r, cfg_.swiglu_limit, d_act_row_w_ + tk, stream);
+    } else {
+      launch_swiglu_weight_act_qdq_fp8_block(d_gate_, d_up_, I_max, d_act_, static_cast<int>(rows_total), I_r,
+                                             cfg_.swiglu_limit, d_act_row_w_, stream);
+    }
   } else {
     launch_moe_swiglu_clamp(d_gate_, d_up_, d_act_,
                             static_cast<int64_t>(rows_total) * I_max,

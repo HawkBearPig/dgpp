@@ -21,10 +21,15 @@ __device__ inline float sigmoidf_acc(float x) {
 // Eight lanes cooperate on each group of 32; each lane holds four adjacent
 // values. kSwiglu: the values are the release's SwiGLU product of the gate
 // and up rows, weighted, rounded once to BF16.
+// y (BF16 rows of the dequantized values) and codes with scales (the E4M3
+// bytes and one E8M0 byte per group) are each written when given: the two
+// forms of one quantization.
 template <bool kSwiglu>
 __global__ void act_qdq_fp8_block_kernel(const uint16_t* __restrict__ x, size_t x_stride, uint16_t* __restrict__ y,
                                          size_t y_stride, int k, int row0, const uint16_t* __restrict__ up,
-                                         const float* __restrict__ row_weight, float limit) {
+                                         const float* __restrict__ row_weight, float limit,
+                                         uint8_t* __restrict__ codes, size_t code_stride,
+                                         uint8_t* __restrict__ scales, size_t scale_stride) {
   dgpp_pdl_wait();
   const int row = row0 + static_cast<int>(blockIdx.y);
   const int column = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x) * 4;
@@ -51,14 +56,26 @@ __global__ void act_qdq_fp8_block_kernel(const uint16_t* __restrict__ x, size_t 
   const unsigned active = __activemask();
 #pragma unroll
   for (int offset = 4; offset; offset >>= 1) amax = fmaxf(amax, __shfl_xor_sync(active, amax, offset, 8));
-  const float s = e8m0_byte_to_float(latent_fp8_block_scale_byte(amax));
-  uint16_t o[4];
+  const uint8_t scale_byte = latent_fp8_block_scale_byte(amax);
+  const float s = e8m0_byte_to_float(scale_byte);
+  uint8_t c[4];
 #pragma unroll
-  for (int i = 0; i < 4; ++i) o[i] = latent_fp8_block_decode_bf16(latent_fp8_block_encode(v[i], s), s);
-  uint2 out;
-  out.x = static_cast<uint32_t>(o[0]) | (static_cast<uint32_t>(o[1]) << 16);
-  out.y = static_cast<uint32_t>(o[2]) | (static_cast<uint32_t>(o[3]) << 16);
-  *reinterpret_cast<uint2*>(y + static_cast<size_t>(row) * y_stride + column) = out;
+  for (int i = 0; i < 4; ++i) c[i] = latent_fp8_block_encode(v[i], s);
+  if (codes != nullptr) {
+    *reinterpret_cast<uint32_t*>(codes + static_cast<size_t>(row) * code_stride + column) =
+        static_cast<uint32_t>(c[0]) | (static_cast<uint32_t>(c[1]) << 8) | (static_cast<uint32_t>(c[2]) << 16) |
+        (static_cast<uint32_t>(c[3]) << 24);
+    if ((threadIdx.x & 7) == 0) scales[static_cast<size_t>(row) * scale_stride + column / 32] = scale_byte;
+  }
+  if (y != nullptr) {
+    uint16_t o[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) o[i] = latent_fp8_block_decode_bf16(c[i], s);
+    uint2 out;
+    out.x = static_cast<uint32_t>(o[0]) | (static_cast<uint32_t>(o[1]) << 16);
+    out.y = static_cast<uint32_t>(o[2]) | (static_cast<uint32_t>(o[3]) << 16);
+    *reinterpret_cast<uint2*>(y + static_cast<size_t>(row) * y_stride + column) = out;
+  }
 }
 
 __global__ void scatter_row_weights_kernel(const int32_t* __restrict__ slot_row, const float* __restrict__ weights, int n,
@@ -80,7 +97,16 @@ void check_rows(const char* what, size_t stride, int k) {
   if (k <= 0 || k % 32 || stride < static_cast<size_t>(k) || stride % 4)
     throw std::invalid_argument(std::string(what) + ": requires 32-wide groups and rows aligned to four values");
 }
+void check_codes(const char* what, const uint8_t* codes, size_t code_stride, const uint8_t* scales,
+                 size_t scale_stride, int k) {
+  if (!codes || !scales) throw std::invalid_argument(std::string(what) + ": null codes");
+  if (reinterpret_cast<uintptr_t>(codes) % 4 || code_stride % 4 || code_stride < static_cast<size_t>(k) ||
+      scale_stride < static_cast<size_t>(k / 32))
+    throw std::invalid_argument(std::string(what) + ": code rows must be aligned to four bytes and hold the row");
+}
 }  // namespace
+
+size_t act_fp8_block_scale_stride(int k) { return (static_cast<size_t>(k) / 32 + 3) / 4 * 4; }
 
 void launch_act_qdq_fp8_block(const uint16_t* x, size_t x_stride, uint16_t* y, size_t y_stride, int rows, int k,
                               cudaStream_t stream) {
@@ -92,7 +118,24 @@ void launch_act_qdq_fp8_block(const uint16_t* x, size_t x_stride, uint16_t* y, s
   for (int r0 = 0; r0 < rows; r0 += kRowsPerLaunch) {
     const dim3 grid(gx, static_cast<unsigned>(std::min(kRowsPerLaunch, rows - r0)));
     act_qdq_fp8_block_kernel<false><<<grid, kThreads, 0, stream>>>(x, x_stride, y, y_stride, k, r0, nullptr, nullptr,
-                                                                 0.0f);
+                                                                 0.0f, nullptr, 0, nullptr, 0);
+    DGPP_CUDA_OK(cudaGetLastError());
+  }
+}
+
+void launch_act_quant_fp8_block(const uint16_t* x, size_t x_stride, uint8_t* codes, size_t code_stride,
+                                uint8_t* scales, size_t scale_stride, int rows, int k, cudaStream_t stream,
+                                uint16_t* y, size_t y_stride) {
+  if (rows <= 0) return;
+  if (!x) throw std::invalid_argument("act_quant_fp8_block: null rows");
+  check_rows("act_quant_fp8_block", x_stride, k);
+  if (y != nullptr) check_rows("act_quant_fp8_block", y_stride, k);
+  check_codes("act_quant_fp8_block", codes, code_stride, scales, scale_stride, k);
+  const unsigned gx = static_cast<unsigned>((k + 4 * kThreads - 1) / (4 * kThreads));
+  for (int r0 = 0; r0 < rows; r0 += kRowsPerLaunch) {
+    const dim3 grid(gx, static_cast<unsigned>(std::min(kRowsPerLaunch, rows - r0)));
+    act_qdq_fp8_block_kernel<false><<<grid, kThreads, 0, stream>>>(x, x_stride, y, y_stride, k, r0, nullptr, nullptr,
+                                                                 0.0f, codes, code_stride, scales, scale_stride);
     DGPP_CUDA_OK(cudaGetLastError());
   }
 }
@@ -108,7 +151,24 @@ void launch_swiglu_weight_act_qdq_fp8_block(const uint16_t* gate, const uint16_t
   for (int r0 = 0; r0 < rows; r0 += kRowsPerLaunch) {
     const dim3 grid(gx, static_cast<unsigned>(std::min(kRowsPerLaunch, rows - r0)));
     act_qdq_fp8_block_kernel<true><<<grid, kThreads, 0, stream>>>(gate, stride, act, stride, k, r0, up, row_weight,
-                                                                limit);
+                                                                limit, nullptr, 0, nullptr, 0);
+    DGPP_CUDA_OK(cudaGetLastError());
+  }
+}
+
+void launch_swiglu_weight_act_quant_fp8_block(const uint16_t* gate, const uint16_t* up, size_t stride, uint8_t* codes,
+                                              size_t code_stride, uint8_t* scales, size_t scale_stride, int rows,
+                                              int k, float limit, const float* row_weight, cudaStream_t stream) {
+  if (rows <= 0) return;
+  if (!gate || !up) throw std::invalid_argument("swiglu_weight_act_quant_fp8_block: null rows");
+  if (!(limit > 0.0f)) throw std::invalid_argument("swiglu_weight_act_quant_fp8_block: the clamp limit must be positive");
+  check_rows("swiglu_weight_act_quant_fp8_block", stride, k);
+  check_codes("swiglu_weight_act_quant_fp8_block", codes, code_stride, scales, scale_stride, k);
+  const unsigned gx = static_cast<unsigned>((k + 4 * kThreads - 1) / (4 * kThreads));
+  for (int r0 = 0; r0 < rows; r0 += kRowsPerLaunch) {
+    const dim3 grid(gx, static_cast<unsigned>(std::min(kRowsPerLaunch, rows - r0)));
+    act_qdq_fp8_block_kernel<true><<<grid, kThreads, 0, stream>>>(gate, stride, nullptr, 0, k, r0, up, row_weight,
+                                                                limit, codes, code_stride, scales, scale_stride);
     DGPP_CUDA_OK(cudaGetLastError());
   }
 }

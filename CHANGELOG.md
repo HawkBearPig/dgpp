@@ -10,13 +10,19 @@ project procedures and design guidance live in `docs/`.
   template). The checkpoint's reference code quantizes the input of every
   FP8 and MXFP4 multiply to FP8 with a power-of-two scale per 32 values, and
   weighs an expert's SwiGLU product by its route before the down
-  projection. Prompt rows now do the same through a rounding kernel in front
-  of the BF16-activation multiplies. Against the release's own layer code on
+  projection. Prompt rows now do the same. The routed experts multiply the
+  FP8 activation codes against the MXFP4 weight codes on the GB10's
+  block-scaled tensor-core instruction (`kernels/moe_a8w4.hpp`, FP32
+  accumulation, the release's `fp4_gemm`), and the other multiplies read
+  the rounded values through a rounding kernel in front of the
+  BF16-activation kernels. Against the release's own layer code on
   the real weights the engine's layer outputs sit closer with the recipe
   than without it (0.0058 / 0.0032 / 0.0020 / 0.0020 relative L2 on the
   first four layers against 0.0100 / 0.0036 / 0.0025 / 0.0025) and more rows
   route to the reference's experts. The quality set reads 158/164, 292/300
   and 100/100 with the recipe against 156/164, 294/300 and 100/100 without.
+  A cold 33K prompt reads 12.59 s with the recipe against 12.86 s without
+  on four nodes, and a 2K prompt 1.12 s against 1.07 s.
   Decode rows, the draft stages and EXL3 packs keep BF16 activations. The key
   joins the world's settings identity when it is not `bf16`, which gives a
   Qwen3.8-27B deployment that already set it a new cache binding once.

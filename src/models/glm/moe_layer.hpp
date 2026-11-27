@@ -181,6 +181,9 @@ class GlmMoeLayer {
   // the device-segmented prefill chain with a shared expert, equal routed
   // and shared intermediate widths and fp32 down rows.
   void set_act_qdq_fp8_block(bool on) { act_qdq_ = on; }
+  // The recipe's routed multiplies on the block-scaled tensor cores (on by
+  // default) or on the BF16-activation kernels over the dequantized rows.
+  void set_act_native_mma(bool on) { act_native_mma_ = on; }
   bool act_qdq_fp8_block() const { return act_qdq_; }
 
   // Fills graph slot `table_slot`'s device expert-view table from the
@@ -339,6 +342,17 @@ class GlmMoeLayer {
   float* d_unit_w_ = nullptr;         // [max_tokens * top_k]
   size_t chain_route_offset_ = 0;     // prefill_chain's offset into d_slot_row_ / d_weights_
   void ensure_act_qdq(cudaStream_t stream);
+  // The recipe's routed multiplies on the block-scaled tensor cores
+  // (kernels/moe_a8w4.hpp), taken where the shapes allow: the token rows'
+  // and the routed SwiGLU rows' E4M3 codes and scale bytes. Off: the
+  // BF16-activation kernels on the dequantized rows (the tests' twin).
+  bool act_native_mma_ = true;
+  uint8_t* d_a8_hidden_codes_ = nullptr;   // [max_tokens, hidden]
+  uint8_t* d_a8_hidden_scales_ = nullptr;  // [max_tokens, hidden / 32, padded to four]
+  uint8_t* d_a8_act_codes_ = nullptr;      // [max_tokens * top_k, a8_act_stride_]
+  uint8_t* d_a8_act_scales_ = nullptr;
+  size_t a8_act_stride_ = 0;
+  void ensure_a8w4(int routed_inter);
   const float* accum_weights() const { return act_qdq_ ? d_unit_w_ : d_weights_; }
   float* d_acc_ = nullptr;   // [max_tokens, hidden] the fp32 chain
 

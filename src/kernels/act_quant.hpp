@@ -32,6 +32,20 @@ void launch_swiglu_weight_act_qdq_fp8_block(const uint16_t* gate, const uint16_t
                                             int rows, int k, float limit, const float* row_weight,
                                             cudaStream_t stream);
 
+// The same two quantizations as the operands of the block-scaled tensor-core
+// multiplies (kernels/moe_a8w4.hpp): codes are the E4M3 bytes [rows,
+// code_stride] and scales one E8M0 byte per group of 32 [rows, scale_stride]
+// (value = code * 2^(scale - 127)). Code rows are aligned to four bytes;
+// act_fp8_block_scale_stride(k) is k / 32 rounded up to four. y, when given,
+// also receives the dequantized BF16 rows: bitwise launch_act_qdq_fp8_block.
+size_t act_fp8_block_scale_stride(int k);
+void launch_act_quant_fp8_block(const uint16_t* x, size_t x_stride, uint8_t* codes, size_t code_stride,
+                                uint8_t* scales, size_t scale_stride, int rows, int k, cudaStream_t stream,
+                                uint16_t* y = nullptr, size_t y_stride = 0);
+void launch_swiglu_weight_act_quant_fp8_block(const uint16_t* gate, const uint16_t* up, size_t stride, uint8_t* codes,
+                                              size_t code_stride, uint8_t* scales, size_t scale_stride, int rows,
+                                              int k, float limit, const float* row_weight, cudaStream_t stream);
+
 // row_weight[slot_row[i]] = weights[i] for i in [0, n): the routes' weights
 // by grouped row (slot_row is the segmentation's (token, slot) -> row map).
 void launch_scatter_row_weights(const int32_t* slot_row, const float* weights, int n, float* row_weight,

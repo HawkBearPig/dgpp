@@ -195,6 +195,7 @@ add_library(dgpp_kernels STATIC
   src/kernels/glm_mhc.cu
   src/kernels/glm_moe.cu
   src/kernels/moe_w4a4.cu
+  src/kernels/moe_a8w4.cu
   src/kernels/gdn_chunk.cu
   src/kernels/glm_vision.cu
   src/kernels/qwen_vision.cu
@@ -2956,6 +2957,13 @@ add_test(NAME minimax_native_moe_test COMMAND ${DSV41_PYTHON}
   ${CMAKE_CURRENT_SOURCE_DIR}/tools/minimax_native_moe_regression.py
   --app $<TARGET_FILE:minimax_native_moe_test>)
 set_tests_properties(minimax_native_moe_test PROPERTIES LABELS "cuda")
+
+add_executable(moe_a8w4_test tests/cuda/moe_a8w4_test.cu)
+target_include_directories(moe_a8w4_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(moe_a8w4_test PRIVATE dgpp_models_glm_loader dgpp_models_glm CUDA::cudart)
+dgpp_set_common(moe_a8w4_test)
+add_test(NAME moe_a8w4_test COMMAND moe_a8w4_test --tokens 1024 --experts 64 --no-speed)
+set_tests_properties(moe_a8w4_test PROPERTIES SKIP_RETURN_CODE 2 LABELS "cuda")
 
 add_executable(moe_w4a4_test tests/cuda/moe_w4a4_test.cu)
 target_include_directories(moe_w4a4_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)

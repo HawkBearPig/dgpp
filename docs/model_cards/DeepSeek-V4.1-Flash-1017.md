@@ -805,10 +805,19 @@ accumulation adds unweighted rows, which is the order of the release's
 Decode rows and the draft stages keep BF16 activations. An EXL3 pack has no
 such recipe and is refused with the key at `native`.
 
-The rounding runs as its own kernel in front of the BF16-activation
-multiplies (`kernels/act_quant.hpp`). Every scale is a power of two and the
-release accumulates in FP32, so each product is the release's up to the
-order of the sum.
+The routed experts multiply the quantized operands as they are stored.
+Their three projections run on the GB10's block-scaled tensor-core
+instruction for FP8 against FP4 operands (`kernels/moe_a8w4.hpp`): the
+activation's E4M3 codes and scale bytes against the checkpoint's MXFP4
+codes and scale bytes, accumulated in FP32, which is the release's
+`fp4_gemm`. The kernel takes widths that are multiples of 64, which covers
+this checkpoint at one, two and four ranks. The other multiplies read the
+same quantized values through a rounding kernel in front of the
+BF16-activation kernels (`kernels/act_quant.hpp`). Every scale is a power of
+two and the release accumulates in FP32, so each product is the release's
+up to the order of the sum. `moe_a8w4_test` holds the routed kernel to an
+FP64 sum of the same operands and to the BF16-activation kernel on the
+rounded rows.
 
 Against the release's own layer code on the real weights
 (`tools/dsv41_torch_reference.py` over the engine's dump from
@@ -833,9 +842,24 @@ the key the only difference, every rank at zero swap:
 | GSM8K | 294/300 | 292/300 |
 | Extraction | 100/100 | 100/100 |
 
-Four items passed under BF16 only and four under `native` only. In this
-form the recipe adds 2 to 3 % to a cold prefill of 2K to 33K tokens, the
-cost of the rounding launches.
+Four items passed under BF16 only and four under `native` only. That
+binary ran every multiply of the recipe through the rounding kernel. The
+routed kernel computes the same sums in another order.
+
+Cold prefill on four nodes with the routed kernel (binary
+`ba3d55fc172e1f5e`, `index_topk` 2048, one sample a length, every rank at
+zero swap, engine prefill time):
+
+| Prompt tokens | BF16 | `native` |
+|---|---|---|
+| 2,067 | 1.07 s | 1.12 s |
+| 8,306 | 3.31 s | 3.26 s |
+| 33,320 | 12.86 s | 12.59 s |
+| 66,608 | 27.54 s | 27.10 s |
+
+A second 33K prompt read 12.87 s and 12.65 s. On that boot the engine
+recalled 8 of 8 codes planted through a 53,843-token document and passed
+100 of 100 extraction items.
 
 ## Measured (2026-10-20, four nodes): the campaign of record
 
