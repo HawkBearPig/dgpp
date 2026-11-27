@@ -27,13 +27,14 @@ project procedures and design guidance live in `docs/`.
   The routed launches run over a list of the tiles that hold rows, because
   one expert is among the routes of nearly every token in most layers and a
   grid sized by the longest expert is almost all empty blocks.
-  A cold 33K prompt reads 10.52 s with the recipe against 10.82 s without
+  A cold 33K prompt reads 10.17 s with the recipe against 10.87 s without
   on four nodes at the template's `index_topk`, and a 2K prompt 1.04 s
   either way. `engine.prefill_bf16_partials` under the recipe keeps every
   down row in BF16, the release's rounding point applied to a rank's share
-  of an expert: 9.81 s and 0.95 s with the shared expert and the dense
-  projections on the instruction. The template leaves that key off until
-  the quality set has run with it.
+  of an expert: 9.81 s and 0.95 s. The template turns that key on. On the
+  first 60 HumanEval items, the first 150 GSM8K items and the 100
+  extraction items it reads 58, 147 and 100, against 57, 146 and 100 for
+  BF16 prompt rows.
   Decode rows, the draft stages and EXL3 packs keep BF16 activations. The key
   joins the world's settings identity when it is not `bf16`, which gives a
   Qwen3.8-27B deployment that already set it a new cache binding once.

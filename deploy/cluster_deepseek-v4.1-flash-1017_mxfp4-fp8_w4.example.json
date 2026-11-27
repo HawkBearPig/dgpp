@@ -8,6 +8,7 @@
     "bf16_weights": "bf12",
     "prefill": "bounded",
     "prefill_activations": "native",
+    "prefill_bf16_partials": true,
     "index_topk": 512,
     "default_max_tokens": 32768,
     "queue_limit": 8,
