@@ -345,6 +345,8 @@ GlmMoeLayer::~GlmMoeLayer() {
   cudaFree(d_a8_hidden_scales_);
   cudaFree(d_a8_act_codes_);
   cudaFree(d_a8_act_scales_);
+  cudaFree(d_a8_tiles_);
+  cudaFree(d_a8_tile_count_);
   cudaFree(d_act_row_w_);
   cudaFree(d_unit_w_);
   cudaFree(d_down_);
@@ -712,10 +714,10 @@ void GlmMoeLayer::accumulate_grouped(uint16_t* out_bf16, float* out_f32, int sha
     const auto* down = reinterpret_cast<const uint16_t*>(d_down_);
     if (out_bf16)
       launch_moe_accum_ordered_bf16down(out_bf16, down, H, d_slot_row_, d_ids_, accum_weights(), tokens,
-                                        K, H, stream);
+                                        K, H, stream, shared_row0);
     else
       launch_moe_accum_ordered_f32_bf16down(out_f32, down, H, d_slot_row_, d_ids_, accum_weights(),
-                                            tokens, K, H, stream);
+                                            tokens, K, H, stream, shared_row0);
   } else if (out_bf16)
     launch_moe_accum_ordered(out_bf16, d_down_, H, d_slot_row_, d_ids_,
                              accum_weights(), shared_row0, tokens, K,
@@ -882,7 +884,7 @@ void GlmMoeLayer::enqueue_prefill_phased(const uint16_t* hidden, int tokens, cud
     if (decode_prefix < tokens) {
       step_timing::Scope tick(step_timing::kMoe);
       if (!hidden) throw std::invalid_argument("GlmMoeLayer: null pointer");
-      if (!has_shared() || down_bf16_) throw std::logic_error("GlmMoeLayer: phased prefill requires fp32 shared rows");
+      if (!has_shared()) throw std::logic_error("GlmMoeLayer: the phased prefill takes a shared expert");
       check_expert_geometry();
       hidden_codes_ready_ = false;
       prefill_chain(hidden + static_cast<size_t>(decode_prefix) * cfg_.hidden,
@@ -899,7 +901,6 @@ void GlmMoeLayer::enqueue_prefill_phased(const uint16_t* hidden, int tokens, cud
   if (!has_shared()) throw std::logic_error("GlmMoeLayer: the phased prefill takes a shared expert");
   if (tokens > max_tokens_) throw std::invalid_argument("GlmMoeLayer: tokens exceed max_tokens");
   if (!hidden) throw std::invalid_argument("GlmMoeLayer: null pointer");
-  if (down_bf16_) throw std::logic_error("GlmMoeLayer: the phased prefill takes the fp32 down rows");
   check_expert_geometry();
   prefill_chain(hidden, tokens, stream);
 }
@@ -915,10 +916,16 @@ void GlmMoeLayer::accumulate_prefill_rows(uint16_t* out, int tokens, int r0, int
   rows -= skip;
   if (rows <= 0) return;
   const size_t H = cfg_.hidden, K = static_cast<size_t>(cfg_.top_k), R = static_cast<size_t>(r0);
-  launch_moe_accum_ordered(out + R * H, d_down_, H, d_slot_row_ + R * K, d_ids_ + R * K, accum_weights() + R * K,
-                           static_cast<int>(static_cast<size_t>(tokens - decode_prefix) * K) + r0 - decode_prefix,
-                           rows, static_cast<int>(K),
-                           static_cast<int>(H), stream);
+  const int shared_row0 = static_cast<int>(static_cast<size_t>(tokens - decode_prefix) * K) + r0 - decode_prefix;
+  // The chain's rows: fp32, or bf16 with the shared rows behind the routed
+  // ones (the activation recipe's block-scaled chain).
+  if (down_bf16_)
+    launch_moe_accum_ordered_bf16down(out + R * H, reinterpret_cast<const uint16_t*>(d_down_), H, d_slot_row_ + R * K,
+                                      d_ids_ + R * K, accum_weights() + R * K, rows, static_cast<int>(K),
+                                      static_cast<int>(H), stream, shared_row0);
+  else
+    launch_moe_accum_ordered(out + R * H, d_down_, H, d_slot_row_ + R * K, d_ids_ + R * K, accum_weights() + R * K,
+                             shared_row0, rows, static_cast<int>(K), static_cast<int>(H), stream);
 }
 
 // The chain behind the router: the segmentation, the expert views, the
@@ -1026,6 +1033,17 @@ void GlmMoeLayer::ensure_act_qdq(cudaStream_t stream) {
   launch_fill_f32(d_unit_w_, static_cast<int>(T * K), 1.0f, stream);
 }
 
+size_t GlmMoeLayer::act_recipe_bytes(const GlmMoeConfig& cfg, int max_tokens) {
+  const size_t T = static_cast<size_t>(max_tokens), K = static_cast<size_t>(cfg.top_k);
+  const size_t H = static_cast<size_t>(cfg.hidden);
+  const size_t act_stride = (static_cast<size_t>(cfg.inter) + 15) / 16 * 16;
+  const size_t tiles = static_cast<size_t>(
+      moe_tile_list_capacity(cfg.n_experts, static_cast<int>(T * K), kMoeA8w4TileRows));
+  return T * H * sizeof(uint16_t) + T * (K + 1) * sizeof(float) + T * K * sizeof(float) +
+         T * H + T * act_fp8_block_scale_stride(cfg.hidden) + T * K * act_stride +
+         T * K * act_fp8_block_scale_stride(cfg.inter) + tiles * sizeof(MoeTile) + sizeof(int32_t);
+}
+
 void GlmMoeLayer::ensure_a8w4(int routed_inter) {
   if (d_a8_hidden_codes_ != nullptr) return;
   const size_t T = static_cast<size_t>(max_tokens_), K = static_cast<size_t>(cfg_.top_k);
@@ -1035,6 +1053,9 @@ void GlmMoeLayer::ensure_a8w4(int routed_inter) {
   DGPP_CUDA_OK(cudaMalloc(&d_a8_hidden_scales_, T * act_fp8_block_scale_stride(H)));
   DGPP_CUDA_OK(cudaMalloc(&d_a8_act_codes_, T * K * a8_act_stride_));
   DGPP_CUDA_OK(cudaMalloc(&d_a8_act_scales_, T * K * act_fp8_block_scale_stride(routed_inter)));
+  a8_tiles_cap_ = moe_tile_list_capacity(cfg_.n_experts, static_cast<int>(T * K), kMoeA8w4TileRows);
+  DGPP_CUDA_OK(cudaMalloc(&d_a8_tiles_, static_cast<size_t>(a8_tiles_cap_) * sizeof(MoeTile)));
+  DGPP_CUDA_OK(cudaMalloc(&d_a8_tile_count_, sizeof(int32_t)));
 }
 
 void GlmMoeLayer::ensure_w4a4(size_t rows, int k) {
@@ -1144,6 +1165,8 @@ void GlmMoeLayer::grouped_expert_chain(MoeExpertKernel kernel,
   const bool a8w4 = act_qdq_ && act_native_mma_ && fp4 && fp4_group == kMxfp4Group &&
                     kernel == MoeExpertKernel::kMma && w_.fp4_of(0) && w_.fp4_of(1) && w_.fp4_of(2) &&
                     moe_grouped_a8w4_supported(H) && moe_grouped_a8w4_supported(I_r);
+  // The block-scaled launches' grid: the routed segments' real tiles.
+  int a8_tile_cap = 0;
   if (act_qdq_) {
     // The release's linear() quantizes the input of its fp4 and fp8
     // projections alike: one quantize-dequantized copy of the token rows
@@ -1160,6 +1183,10 @@ void GlmMoeLayer::grouped_expert_chain(MoeExpertKernel kernel,
       launch_act_quant_fp8_block(hidden, static_cast<size_t>(H), d_a8_hidden_codes_, static_cast<size_t>(H),
                                  d_a8_hidden_scales_, act_fp8_block_scale_stride(H), tokens, H, stream, d_hidden_qdq_,
                                  static_cast<size_t>(H));
+      a8_tile_cap = moe_tile_list_capacity(n_segs, static_cast<int>(rows_total - static_cast<size_t>(tokens)),
+                                           kMoeA8w4TileRows);
+      if (a8_tile_cap > a8_tiles_cap_) throw std::logic_error("GlmMoeLayer: the recipe's tile list outgrew its buffer");
+      launch_moe_tile_list(segs, n_segs, kMoeA8w4TileRows, d_a8_tiles_, d_a8_tile_count_, stream);
     } else {
       launch_act_qdq_fp8_block(hidden, static_cast<size_t>(H), d_hidden_qdq_, static_cast<size_t>(H), tokens, H,
                                stream);
@@ -1192,9 +1219,16 @@ void GlmMoeLayer::grouped_expert_chain(MoeExpertKernel kernel,
   // folded-scale form (variant 3) for every packed tensor-core launch of
   // this chain; -1 is the default variant (engine.expert_gemm).
   const int packq_variant = g_prefill_fold_scales && routed_bits == 4 && !a8 ? 3 : -1;
-  down_bf16_ = (w4a4 || packq_mma_bf16_down) && shared_seg == nullptr && !f32_down;
-  if (act_qdq_ && (w4a4 || down_bf16_))
-    throw std::logic_error("GlmMoeLayer: the fp8 block activation recipe takes the BF16-activation kernels and fp32 down rows");
+  // The recipe's block-scaled chain under the same key: every down row in
+  // bf16, the routed ones and the shared expert's. The release rounds each
+  // projection's output to bf16 (its fp4_gemm and fp8_gemm return bf16) and
+  // sums the experts' rows in fp32; a rank's rows here are its slice's
+  // partials, rounded the same way. Half the 2 GB a 16,384-token pass
+  // writes and reads back per layer; not bitwise the fp32 rows' chain.
+  const bool a8w4_bf16_down = a8w4 && g_prefill_bf16_partials && !shared_fp4;
+  down_bf16_ = ((w4a4 || packq_mma_bf16_down) && shared_seg == nullptr && !f32_down) || a8w4_bf16_down;
+  if (act_qdq_ && w4a4)
+    throw std::logic_error("GlmMoeLayer: the fp8 block activation recipe does not take the NVFP4 activation chain");
   if (w4a4) {
     static const bool logged = [&] {
       DGPP_LOG_INFO(
@@ -1295,7 +1329,7 @@ void GlmMoeLayer::grouped_expert_chain(MoeExpertKernel kernel,
     else if (a8w4 && routed_arg)
       launch_moe_grouped_a8w4_bf16(d_a8_hidden_codes_, static_cast<size_t>(H), d_a8_hidden_scales_,
                                    act_fp8_block_scale_stride(H), d_rows_, sg, ns, mr, d_views_prefill_, which, out,
-                                   I_max, n, H, stream);
+                                   I_max, n, H, stream, d_a8_tiles_, d_a8_tile_count_, a8_tile_cap);
     else if (mma && fp4_w)
       launch_moe_grouped_mma_fp4_bf16(hidden, H, sg, ns, mr, split, d_views_prefill_,
                                       which, out, I_max, n, H, stream, d_rows_, fp4_group);
@@ -1351,9 +1385,18 @@ void GlmMoeLayer::grouped_expert_chain(MoeExpertKernel kernel,
     else if (w4a4 && routed_arg)
       launch_moe_grouped_w4a4_f32(d_q_codes_, d_q_scales_, d_q_gs_, nullptr, sg, ns, mr, d_views_prefill_, 2, d_down_, H, H,
                                   k, stream);
+    else if (a8w4 && routed_arg && a8w4_bf16_down)
+      launch_moe_grouped_a8w4_bf16(d_a8_act_codes_, a8_act_stride_, d_a8_act_scales_, act_fp8_block_scale_stride(k),
+                                   nullptr, sg, ns, mr, d_views_prefill_, 2, reinterpret_cast<uint16_t*>(d_down_), H,
+                                   H, k, stream, d_a8_tiles_, d_a8_tile_count_, a8_tile_cap);
     else if (a8w4 && routed_arg)
       launch_moe_grouped_a8w4_f32(d_a8_act_codes_, a8_act_stride_, d_a8_act_scales_, act_fp8_block_scale_stride(k),
-                                  nullptr, sg, ns, mr, d_views_prefill_, 2, d_down_, H, H, k, stream);
+                                  nullptr, sg, ns, mr, d_views_prefill_, 2, d_down_, H, H, k, stream, d_a8_tiles_,
+                                  d_a8_tile_count_, a8_tile_cap);
+    else if (a8w4_bf16_down && mma && !fp4_w)
+      // The shared expert's rows behind the routed ones, bf16 like them.
+      launch_moe_grouped_mma_bf16(d_act_, I_max, sg, ns, mr, split, d_views_prefill_, 2,
+                                  reinterpret_cast<uint16_t*>(d_down_), H, H, k, stream);
     else if (mma && fp4_w)
       launch_moe_grouped_mma_fp4_f32(d_act_, I_max, sg, ns, mr, split, d_views_prefill_,
                                      2, d_down_, H, H, k, stream, nullptr, fp4_group);

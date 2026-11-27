@@ -49,6 +49,7 @@ constexpr int kPrefetchStages = 4;  // a weight row's next 128-byte line: four s
 static_assert(kSlot % 16 == 0, "16-byte aligned slots");
 static_assert(BM * (BK / 16) == kThreads, "one 16-byte activation copy per thread");
 static_assert(BN * 2 == kThreads, "two 8-byte weight copies per thread");
+static_assert(BM == kMoeA8w4TileRows, "the tile list's rows are the kernel's m-tile");
 }  // namespace a8w4
 
 __device__ __forceinline__ void cp_async16(void* dst, const void* src, int src_bytes) {
@@ -111,25 +112,41 @@ __device__ __forceinline__ void store_pair(float* p, float a, float b) {
   *reinterpret_cast<float2*>(p) = make_float2(a, b);
 }
 
-// One 64 x 128 output tile per block, the m-tile the fastest grid index (a
-// long segment's m-tiles run together and re-read its weight slice through
-// L2). Eight warps as 2 (m32) x 4 (n32): a warp's k32 step is two
-// ldmatrix.x4 for A, two unpacking ldmatrix.x4 for B and eight
-// instructions. A three-slot cp.async ring carries the stage's activation
-// bytes and the weights' packed codes; the scale bytes follow by plain loads.
+// One 64 x 128 output tile per block. Eight warps as 2 (m32) x 4 (n32): a
+// warp's k32 step is two ldmatrix.x4 for A, two unpacking ldmatrix.x4 for B
+// and eight instructions. A three-slot cp.async ring carries the stage's
+// activation bytes and the weights' packed codes; the scale bytes follow by
+// plain loads.
+//
+// The grid, two forms (moe_a8w4.hpp). With a tile list (`tiles` set) it is
+// one-dimensional: block b is n-tile b % n_tiles of tile b / n_tiles, so a
+// tile's n-tiles run together (its activation rows enter L2 once and a long
+// segment's 1.5 MB of weights stay there across its tiles), and the blocks
+// past *tile_count exit. Without one, block (x, y) is segment y's m-tile
+// x % m_tiles of n-tile x / m_tiles.
 template <typename OutT>
 __global__ __launch_bounds__(a8w4::kThreads, 2) void moe_grouped_a8w4_kernel(
     const uint8_t* __restrict__ a_codes, size_t a_code_stride, const uint8_t* __restrict__ a_scales,
     size_t a_scale_stride, const int32_t* __restrict__ act_rows, const MoeSegment* __restrict__ segs,
     const MoeExpertView* __restrict__ views, int which, OutT* __restrict__ out, size_t out_stride, int n, int k,
-    int m_tiles, int pairs) {
+    int m_tiles, int pairs, const MoeTile* __restrict__ tiles, const int32_t* __restrict__ tile_count, int n_tiles) {
   dgpp_pdl_wait();
   using namespace a8w4;
   extern __shared__ __align__(16) uint8_t smem[];
-  const MoeSegment seg = segs[blockIdx.y];
-  const int m_tile = static_cast<int>(blockIdx.x) % m_tiles;
-  const int n_tile = static_cast<int>(blockIdx.x) / m_tiles;
-  const int m0 = m_tile * BM;
+  MoeSegment seg;
+  int m0 = 0, n_tile = 0;
+  if (tiles != nullptr) {
+    const int tile = static_cast<int>(blockIdx.x) / n_tiles;
+    if (tile >= *tile_count) return;  // past the list (no barrier yet)
+    const MoeTile tl = tiles[tile];
+    seg = segs[tl.seg];
+    m0 = tl.m0;
+    n_tile = static_cast<int>(blockIdx.x) % n_tiles;
+  } else {
+    seg = segs[blockIdx.y];
+    m0 = (static_cast<int>(blockIdx.x) % m_tiles) * BM;
+    n_tile = static_cast<int>(blockIdx.x) / m_tiles;
+  }
   if (m0 >= seg.rows) return;  // beyond this segment's rows (no barrier yet)
   const int m_rows = min(BM, seg.rows - m0);
   const MoeExpertView v = views[seg.expert * 3 + which];
@@ -292,7 +309,7 @@ template <typename OutT>
 void launch_a8w4(const uint8_t* codes, size_t code_stride, const uint8_t* scales, size_t scale_stride,
                  const int32_t* act_rows, const MoeSegment* segs, int n_segs, int max_rows,
                  const MoeExpertView* views, int which, OutT* out, size_t out_stride, int n, int k,
-                 cudaStream_t stream) {
+                 cudaStream_t stream, const MoeTile* tiles, const int32_t* tile_count, int tile_cap) {
   using namespace a8w4;
   if (n_segs <= 0 || n <= 0) return;
   if (!codes || !scales || !segs || !views || !out) throw std::invalid_argument("moe a8w4: null pointer");
@@ -300,7 +317,8 @@ void launch_a8w4(const uint8_t* codes, size_t code_stride, const uint8_t* scales
   if (reinterpret_cast<uintptr_t>(codes) % 16 != 0 || code_stride % 16 != 0 || code_stride < static_cast<size_t>(k))
     throw std::invalid_argument("moe a8w4: activation code rows must be 16-byte aligned and hold k bytes");
   if (scale_stride < static_cast<size_t>(k) / 32) throw std::invalid_argument("moe a8w4: activation scale rows");
-  if (max_rows <= 0) throw std::invalid_argument("moe a8w4: max_rows");
+  if (tiles != nullptr ? (tile_count == nullptr || tile_cap <= 0) : max_rows <= 0)
+    throw std::invalid_argument("moe a8w4: a tile list with its count and capacity, or max_rows");
   // The dynamic shared memory opt-in at this instantiation's first launch.
   static const bool opted = [] {
     DGPP_CUDA_OK(cudaFuncSetAttribute(moe_grouped_a8w4_kernel<OutT>, cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -308,15 +326,17 @@ void launch_a8w4(const uint8_t* codes, size_t code_stride, const uint8_t* scales
     return true;
   }();
   (void)opted;
-  const int m_tiles = (max_rows + BM - 1) / BM;
+  const int m_tiles = tiles != nullptr ? 1 : (max_rows + BM - 1) / BM;
   const unsigned n_tiles = static_cast<unsigned>((n + BN - 1) / BN);
-  if (static_cast<size_t>(n_tiles) * m_tiles > 0x7fffffffu) throw std::invalid_argument("moe a8w4: grid too large");
+  const size_t grid_x = static_cast<size_t>(n_tiles) * static_cast<size_t>(tiles != nullptr ? tile_cap : m_tiles);
+  if (grid_x > 0x7fffffffu) throw std::invalid_argument("moe a8w4: grid too large");
   // Column pairs as one store when the rows allow it.
   const int pairs = (out_stride % 2 == 0 && reinterpret_cast<uintptr_t>(out) % (2 * sizeof(OutT)) == 0) ? 1 : 0;
-  const dim3 grid(n_tiles * static_cast<unsigned>(m_tiles), static_cast<unsigned>(n_segs), 1u);
+  const dim3 grid(static_cast<unsigned>(grid_x), tiles != nullptr ? 1u : static_cast<unsigned>(n_segs), 1u);
   moe_grouped_a8w4_kernel<OutT><<<grid, kThreads, kSmem, stream>>>(codes, code_stride, scales, scale_stride, act_rows,
                                                                   segs, views, which, out, out_stride, n, k, m_tiles,
-                                                                  pairs);
+                                                                  pairs, tiles, tile_count,
+                                                                  static_cast<int>(n_tiles));
   DGPP_CUDA_OK(cudaGetLastError());
 }
 }  // namespace
@@ -324,16 +344,18 @@ void launch_a8w4(const uint8_t* codes, size_t code_stride, const uint8_t* scales
 void launch_moe_grouped_a8w4_bf16(const uint8_t* codes, size_t code_stride, const uint8_t* scales,
                                   size_t scale_stride, const int32_t* act_rows, const MoeSegment* segs, int n_segs,
                                   int max_rows, const MoeExpertView* views, int which, uint16_t* out,
-                                  size_t out_stride, int n, int k, cudaStream_t stream) {
+                                  size_t out_stride, int n, int k, cudaStream_t stream, const MoeTile* tiles,
+                                  const int32_t* tile_count, int tile_cap) {
   launch_a8w4<uint16_t>(codes, code_stride, scales, scale_stride, act_rows, segs, n_segs, max_rows, views, which, out,
-                        out_stride, n, k, stream);
+                        out_stride, n, k, stream, tiles, tile_count, tile_cap);
 }
 
 void launch_moe_grouped_a8w4_f32(const uint8_t* codes, size_t code_stride, const uint8_t* scales,
                                  size_t scale_stride, const int32_t* act_rows, const MoeSegment* segs, int n_segs,
                                  int max_rows, const MoeExpertView* views, int which, float* out, size_t out_stride,
-                                 int n, int k, cudaStream_t stream) {
+                                 int n, int k, cudaStream_t stream, const MoeTile* tiles, const int32_t* tile_count,
+                                 int tile_cap) {
   launch_a8w4<float>(codes, code_stride, scales, scale_stride, act_rows, segs, n_segs, max_rows, views, which, out,
-                     out_stride, n, k, stream);
+                     out_stride, n, k, stream, tiles, tile_count, tile_cap);
 }
 }  // namespace dgpp

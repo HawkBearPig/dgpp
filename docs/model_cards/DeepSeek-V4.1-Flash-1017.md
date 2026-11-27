@@ -819,6 +819,23 @@ up to the order of the sum. `moe_a8w4_test` holds the routed kernel to an
 FP64 sum of the same operands and to the BF16-activation kernel on the
 rounded rows.
 
+The routed launches run over a list of the tiles that hold rows. In most
+layers of this model one expert is among the routes of nearly every token,
+so a grid sized by the longest expert is almost all empty blocks: at 16,384
+tokens 3.8 million blocks for the down projection, under 2 % of them with
+rows. On one GPU at that size the down projection takes 16.2 ms over the
+tile list against 20.0 ms over the grid, and gate or up 10.2 ms against
+11.7 ms. The outputs are bitwise the same.
+
+`engine.prefill_bf16_partials` selects the form of the down projection's
+rows under the recipe. Off, a rank keeps each route's rows in FP32 and
+rounds the token's sum once. On, each route's rows and the shared expert's
+are rounded to BF16 before the sum, which is where the release rounds (its
+`fp4_gemm` and `fp8_gemm` return BF16), applied here to a rank's share of
+the expert. That halves the 2 GB a 16,384-token pass writes and reads back
+per layer, and the down projection takes 12.2 ms. The template leaves the
+key off: the quality set has not been run with it.
+
 Against the release's own layer code on the real weights
 (`tools/dsv41_torch_reference.py` over the engine's dump from
 `dsv41_forward_check`, with `--act-quant` and `--act-native` for the
@@ -846,20 +863,26 @@ Four items passed under BF16 only and four under `native` only. That
 binary ran every multiply of the recipe through the rounding kernel. The
 routed kernel computes the same sums in another order.
 
-Cold prefill on four nodes with the routed kernel (binary
-`ba3d55fc172e1f5e`, `index_topk` 2048, one sample a length, every rank at
-zero swap, engine prefill time):
+Cold prefill on four nodes (source `195acafa` plus the tile list and the
+BF16 rows, binary `3a6c58a8af644d65`, `index_topk` 512 as in the template
+with a 2 GiB prefix cache, one sample a length, every rank at zero swap,
+engine prefill time):
 
-| Prompt tokens | BF16 | `native` |
-|---|---|---|
-| 2,067 | 1.07 s | 1.12 s |
-| 8,306 | 3.31 s | 3.26 s |
-| 33,320 | 12.86 s | 12.59 s |
-| 66,608 | 27.54 s | 27.10 s |
+| Prompt tokens | BF16 | `native` | `native` with `prefill_bf16_partials` |
+|---|---|---|---|
+| 2,067 | 1.04 s | 1.04 s | 1.00 s |
+| 8,306 | 2.94 s | 2.87 s | 2.81 s |
+| 33,320 | 10.82 s | 10.52 s | 10.21 s |
+| 66,608 | 22.25 s | 21.65 s | 21.01 s |
 
-A second 33K prompt read 12.87 s and 12.65 s. On that boot the engine
-recalled 8 of 8 codes planted through a 53,843-token document and passed
-100 of 100 extraction items.
+The first prompt of a boot at a length pays for pages and table rows no
+later prompt pays for. Five further cold prompts of 2,067 tokens on each
+boot had medians of 0.91 s, 0.91 s and 0.88 s.
+
+With `index_topk` 2048 and a 14 GiB prefix cache the same binary under
+`native` with `prefill_bf16_partials` read 1.08 s, 3.10 s, 12.17 s and
+26.28 s. On that boot the engine recalled 8 of 8 codes planted through a
+53,843-token document and passed 100 of 100 extraction items.
 
 ## Measured (2026-10-20, four nodes): the campaign of record
 

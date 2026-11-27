@@ -25,13 +25,28 @@ inline bool moe_grouped_a8w4_supported(int k) { return k > 0 && k % 64 == 0; }
 // view and out conventions as launch_moe_grouped_mma_fp4_{bf16,f32};
 // k % 64 == 0. Every output is the sum of its k32 blocks' products in
 // ascending k, each block one tensor-core instruction.
+//
+// The grid. Without `tiles` it is n-tiles x ceil(max_rows / 64) by n_segs:
+// every segment is sized by the longest one and the blocks past a segment's
+// rows exit. A DeepSeek-V4.1 layer routes nearly every token of a pass to
+// one expert, so at 16,384 tokens that grid is 0.5 M blocks for gate or up
+// and 3.8 M for down, of which under 2 % have rows: 2.5 and 8.5 ms a launch
+// in blocks that only exit (2026-11-27, a serving profile). With `tiles`
+// (launch_moe_tile_list over the same segments at kMoeA8w4TileRows rows a
+// tile, `tile_cap` its capacity, *tile_count its entries) the grid is the
+// real tiles alone and max_rows is not read; a tile's n-tiles run together,
+// so its activation rows enter L2 once. The outputs are the same either way.
+inline constexpr int kMoeA8w4TileRows = 64;
 void launch_moe_grouped_a8w4_bf16(const uint8_t* codes, size_t code_stride, const uint8_t* scales,
                                   size_t scale_stride, const int32_t* act_rows, const MoeSegment* segs, int n_segs,
                                   int max_rows, const MoeExpertView* views, int which, uint16_t* out,
-                                  size_t out_stride, int n, int k, cudaStream_t stream);
+                                  size_t out_stride, int n, int k, cudaStream_t stream,
+                                  const MoeTile* tiles = nullptr, const int32_t* tile_count = nullptr,
+                                  int tile_cap = 0);
 void launch_moe_grouped_a8w4_f32(const uint8_t* codes, size_t code_stride, const uint8_t* scales,
                                  size_t scale_stride, const int32_t* act_rows, const MoeSegment* segs, int n_segs,
                                  int max_rows, const MoeExpertView* views, int which, float* out, size_t out_stride,
-                                 int n, int k, cudaStream_t stream);
+                                 int n, int k, cudaStream_t stream, const MoeTile* tiles = nullptr,
+                                 const int32_t* tile_count = nullptr, int tile_cap = 0);
 
 }  // namespace dgpp

@@ -504,6 +504,12 @@ Dsv41Model::MemoryPlan Dsv41Model::plan_memory(const Dsv41TextConfig& cfg, int m
     size_t moe_pinned = 0;
     const size_t moe_dev = GlmMoeLayer::scratch_bytes(moe_cfg, max_tokens, rows, slots, &moe_pinned);
     plan.add("moe scratch (routed slots, shared expert, graph tables)", moe_dev, moe_pinned);
+    if (s_default_prefill_act_native)
+      // engine.prefill_activations native: the attention's dequantized
+      // copy of the prompt rows and the expert chain's workspace, each
+      // allocated at the first prompt walk.
+      plan.add("prefill activation recipe (the prompt rows' FP8 codes and their dequantized copies)",
+               M * H * sizeof(uint16_t) + GlmMoeLayer::act_recipe_bytes(moe_cfg, max_tokens));
     if (mtp) {
       const GlmMoeConfig draft_cfg = cfg.moe_config(static_cast<int>(geo.local_inter), true);
       const int draft_slots = residency == Dsv41Residency::Resident ? cfg.num_nextn_predict_layers : 0;

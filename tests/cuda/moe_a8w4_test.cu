@@ -10,8 +10,12 @@
 //  4. against the BF16-activation kernel on the dequantized rows (the same
 //     real sums in another order);
 //  5. the SwiGLU producer's codes against its quantize-dequantize form;
-//  6. speed at prefill shapes against launch_moe_grouped_mma_fp4_*.
-//   moe_a8w4_test [--tokens T] [--experts E] [--topk K]
+//  6. the tile-list grid against the segment grid (bitwise), on even
+//     routing and with one expert in every token's routes (the shape of a
+//     DeepSeek-V4.1 layer, where the segment grid is mostly empty blocks);
+//  7. speed at prefill shapes against launch_moe_grouped_mma_fp4_*, both
+//     grids, both routings.
+//   moe_a8w4_test [--tokens T] [--experts E] [--topk K] [--no-speed]
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -86,7 +90,8 @@ struct Case {
   int max_rows = 0;
 };
 
-Case make_case(int tokens, int experts, int topk, int n, int k, uint32_t seed) {
+// hot: expert 0 is one of every token's routes.
+Case make_case(int tokens, int experts, int topk, int n, int k, uint32_t seed, bool hot) {
   std::mt19937 rng(seed);
   std::normal_distribution<float> nd(0.f, 1.f);
   std::uniform_int_distribution<int> byte(0, 255);
@@ -117,6 +122,7 @@ Case make_case(int tokens, int experts, int topk, int n, int k, uint32_t seed) {
   std::uniform_int_distribution<int> pick(0, experts - 1);
   for (int t = 0; t < tokens; ++t) {
     std::vector<int> chosen;
+    if (hot) chosen.push_back(0);
     while (static_cast<int>(chosen.size()) < std::min(topk, experts)) {
       const int e = pick(rng);
       bool dup = false;
@@ -158,8 +164,9 @@ Device upload(const Case& c) {
   return d;
 }
 
-int run(int tokens, int experts, int topk, int n, int k, bool check_all, bool speed, const char* label) {
-  const Case c = make_case(tokens, experts, topk, n, k, 4321u + static_cast<uint32_t>(n + k));
+int run(int tokens, int experts, int topk, int n, int k, bool check_all, bool speed, const char* label,
+        bool hot = false) {
+  const Case c = make_case(tokens, experts, topk, n, k, 4321u + static_cast<uint32_t>(n + k), hot);
   const Device d = upload(c);
   const int rows = static_cast<int>(c.act_rows.size());
   const int ns = static_cast<int>(c.segs.size());
@@ -175,6 +182,11 @@ int run(int tokens, int experts, int topk, int n, int k, bool check_all, bool sp
   auto* out8 = dev_alloc<float>(static_cast<size_t>(rows) * out_stride);
   auto* out8b = dev_alloc<uint16_t>(static_cast<size_t>(rows) * out_stride);
   auto* out16 = dev_alloc<float>(static_cast<size_t>(rows) * out_stride);
+  auto* out8t = dev_alloc<float>(static_cast<size_t>(rows) * out_stride);
+  auto* out8bt = dev_alloc<uint16_t>(static_cast<size_t>(rows) * out_stride);
+  const int tile_cap = moe_tile_list_capacity(ns, rows, kMoeA8w4TileRows);
+  auto* tiles = dev_alloc<MoeTile>(static_cast<size_t>(tile_cap));
+  auto* tile_count = dev_alloc<int32_t>(1);
   int fails = 0;
 
   auto quant = [&] { launch_act_quant_fp8_block(act, k, codes, k, scales, ss, tokens, k, nullptr, qdq, k); };
@@ -190,11 +202,23 @@ int run(int tokens, int experts, int topk, int n, int k, bool check_all, bool sp
     launch_moe_grouped_mma_fp4_f32(qdq, k, segs, ns, c.max_rows, 0, d.views, 0, out16, out_stride, n, k, nullptr,
                                    act_rows, kMxfp4Group);
   };
+  // The tile-list grid (max_rows is not read).
+  auto gemm8t = [&] {
+    launch_moe_grouped_a8w4_f32(codes, k, scales, ss, act_rows, segs, ns, 0, d.views, 0, out8t, out_stride, n, k,
+                                nullptr, tiles, tile_count, tile_cap);
+  };
+  auto gemm8bt = [&] {
+    launch_moe_grouped_a8w4_bf16(codes, k, scales, ss, act_rows, segs, ns, 0, d.views, 0, out8bt, out_stride, n, k,
+                                 nullptr, tiles, tile_count, tile_cap);
+  };
   quant();
   launch_act_qdq_fp8_block(act, k, qdq_ref, k, tokens, k, nullptr);
+  launch_moe_tile_list(segs, ns, kMoeA8w4TileRows, tiles, tile_count, nullptr);
   gemm8();
   gemm8b();
   gemm16();
+  gemm8t();
+  gemm8bt();
   DGPP_CUDA_OK(cudaDeviceSynchronize());
   const auto qc = host(codes, static_cast<size_t>(tokens) * k);
   const auto qs = host(scales, static_cast<size_t>(tokens) * ss);
@@ -203,6 +227,8 @@ int run(int tokens, int experts, int topk, int n, int k, bool check_all, bool sp
   const auto o8 = host(out8, static_cast<size_t>(rows) * out_stride);
   const auto o8b = host(out8b, static_cast<size_t>(rows) * out_stride);
   const auto o16 = host(out16, static_cast<size_t>(rows) * out_stride);
+  const auto o8t = host(out8t, static_cast<size_t>(rows) * out_stride);
+  const auto o8bt = host(out8bt, static_cast<size_t>(rows) * out_stride);
 
   // 1. the quantizer against the host helpers; its BF16 rows against the qdq launch.
   {
@@ -327,7 +353,22 @@ int run(int tokens, int experts, int topk, int n, int k, bool check_all, bool sp
     cudaFree(py);
   }
 
-  // 6. speed.
+  // 6. the tile-list grid: the segment grid's outputs, every one.
+  {
+    const int count = host(tile_count, 1)[0];
+    int want = 0;
+    for (const MoeSegment& sg : c.segs) want += (sg.rows + kMoeA8w4TileRows - 1) / kMoeA8w4TileRows;
+    const bool f32_same = std::memcmp(o8t.data(), o8.data(), o8.size() * sizeof(float)) == 0;
+    const bool bf16_same = std::memcmp(o8bt.data(), o8b.data(), o8b.size() * sizeof(uint16_t)) == 0;
+    std::printf("[ .. ] %s tile list: %d tiles (%d expected, capacity %d); fp32 rows %s, bf16 rows %s\n", label, count,
+                want, tile_cap, f32_same ? "bitwise" : "DIFFER", bf16_same ? "bitwise" : "DIFFER");
+    if (count != want || count > tile_cap || !f32_same || !bf16_same) {
+      std::printf("[FAIL] %s: the tile-list grid is not the segment grid's result\n", label);
+      ++fails;
+    }
+  }
+
+  // 7. speed.
   if (speed) {
     cudaEvent_t e0, e1;
     cudaEventCreate(&e0);
@@ -350,6 +391,7 @@ int run(int tokens, int experts, int topk, int n, int k, bool check_all, bool sp
                                       kMxfp4Group);
     };
     const float t16 = time(gemm16), t16b = time(gemm16b), t8 = time(gemm8), t8b = time(gemm8b);
+    const float t8t = time(gemm8t), t8bt = time(gemm8bt);
     const float tq = time(quant_only), tqdq = time(qdq_only);
     const double flop = 2.0 * rows * n * k;
     std::printf("[ .. ] %s %d rows (%d segments, longest %d) x n %d x k %d:\n", label, rows, ns, c.max_rows, n, k);
@@ -357,7 +399,10 @@ int run(int tokens, int experts, int topk, int n, int k, bool check_all, bool sp
                 flop / t16 / 1e9, t16b, flop / t16b / 1e9, tqdq);
     std::printf("[ .. ]   E4M3 activations: f32 out %.3f ms (%.1f TF), bf16 out %.3f ms (%.1f TF); quantize %.3f ms\n",
                 t8, flop / t8 / 1e9, t8b, flop / t8b / 1e9, tq);
-    std::printf("[ .. ]   speedup f32 %.2fx, bf16 %.2fx\n", t16 / t8, t16b / t8b);
+    std::printf("[ .. ]   E4M3 activations, tile list: f32 out %.3f ms (%.1f TF), bf16 out %.3f ms (%.1f TF)\n", t8t,
+                flop / t8t / 1e9, t8bt, flop / t8bt / 1e9);
+    std::printf("[ .. ]   speedup f32 %.2fx, bf16 %.2fx; tile list over the BF16 kernel f32 %.2fx, bf16 %.2fx\n",
+                t16 / t8, t16b / t8b, t16 / t8t, t16b / t8bt);
     cudaEventDestroy(e0);
     cudaEventDestroy(e1);
   }
@@ -373,6 +418,10 @@ int run(int tokens, int experts, int topk, int n, int k, bool check_all, bool sp
   cudaFree(out8);
   cudaFree(out8b);
   cudaFree(out16);
+  cudaFree(out8t);
+  cudaFree(out8bt);
+  cudaFree(tiles);
+  cudaFree(tile_count);
   return fails;
 }
 
@@ -399,9 +448,14 @@ int main(int argc, char** argv) {
   fails += run(301, 7, 3, 200, 320, true, false, "ragged");
   // One stage, one short segment.
   fails += run(5, 2, 1, 128, 64, true, false, "one stage");
-  // The DeepSeek-V4.1 shapes at four ranks: gate and up, then down.
+  // One expert in every token's routes: a segment of several m-tiles beside short ones.
+  fails += run(301, 7, 3, 200, 320, true, false, "ragged hot", true);
+  // The DeepSeek-V4.1 shapes at four ranks: gate and up, then down, on even
+  // routing and with the hot expert a served layer has.
   fails += run(tokens, experts, topk, 576, 5120, false, speed, "gate/up");
   fails += run(tokens, experts, topk, 5120, 576, false, speed, "down");
+  fails += run(tokens, experts, topk, 576, 5120, false, speed, "gate/up hot", true);
+  fails += run(tokens, experts, topk, 5120, 576, false, speed, "down hot", true);
   if (fails) {
     std::printf("[FAIL] moe_a8w4_test: %d check(s) failed\n", fails);
     return 1;

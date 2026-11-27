@@ -159,6 +159,9 @@ struct ClusterConfig {
     //     written in bf16 and its per-expert partials summed from bf16
     //     (half the bytes a chunk writes and reads back; the reference
     //     stack's form). Default: fp32 partials in the ordered chain.
+    //     DeepSeek-V4.1 under prefill_activations native takes the same
+    //     form on its block-scaled expert chain, the shared expert's rows
+    //     included (the release's projections return bf16).
     //   prefill_fold_scales: the wide packed expert GEMM with each
     //     group's scale folded into the bf16 weight values and one fp32
     //     accumulator across K (Marlin's form; no per-group fma).
