@@ -4,6 +4,7 @@ from contextlib import ExitStack, contextmanager, redirect_stdout
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import io
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -154,7 +155,8 @@ class ReconciliationTest(unittest.TestCase):
 
 
 @contextmanager
-def serving_fixture(delayed):
+def serving_fixture(delayed, isolation_change=None, require_default_thinking=False, *,
+                    counter_overshoot_at=None, thinking_fallback_requests=0):
     """Publish the final two tokens only on the third metrics read after work."""
     lock = threading.Lock()
     state = {"current": snapshot(), "pending_reads": 0, "requests": []}
@@ -188,12 +190,29 @@ def serving_fixture(delayed):
 
         def do_POST(self):
             request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-            tokens = request["max_tokens"]
             with lock:
+                fallback = require_default_thinking or len(state["requests"]) < thinking_fallback_requests
+            if fallback and "chat_template_kwargs" in request:
+                self.send_error(400, "enable_thinking is unsupported")
+                return
+            tokens = request["max_tokens"]
+            text = "fixture answer"
+            with lock:
+                if isolation_change:
+                    text = "answer 雪\n  exact whitespace"
+                    if state["requests"]:
+                        if isolation_change == "text":
+                            text = "answer 雪\n  changed whitespace"
+                        elif isolation_change == "prefix":
+                            text += " extended"
+                        elif isolation_change == "tokens":
+                            tokens -= 1
                 state["requests"].append(request)
                 m = state["current"]
                 m["prompts_prefilled"] += 1
                 m["tokens_generated"] += tokens
+                if len(state["requests"]) == counter_overshoot_at:
+                    m["tokens_generated"] += 1
                 m["step_ms"] += (tokens - 1) * 2
                 m["decode_steps"] += tokens - 1
                 m["decode_rows"] += tokens - 1
@@ -202,7 +221,7 @@ def serving_fixture(delayed):
                 m["prompt_tokens_computed"] += 20
                 state["pending_reads"] = 2 if delayed else 0
             events = [
-                {"choices": [{"delta": {"content": "fixture answer"}, "finish_reason": None}]},
+                {"choices": [{"delta": {"content": text}, "finish_reason": None}]},
                 {"choices": [{"delta": {}, "finish_reason": "length"}],
                  "usage": {"prompt_tokens": 20, "completion_tokens": tokens}},
             ]
@@ -230,6 +249,7 @@ class TimedLoadCliTest(unittest.TestCase):
                 "--json-out", str(output)], cwd=directory, text=True, capture_output=True, timeout=20)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             report = json.loads(output.read_text())
+            self.assertNotIn("isolation", report)
             self.assertEqual(len(state["requests"]), 5)
             self.assertEqual([p["class"] for p in report["phases"]], ["mixed", "mixed"])
             self.assertEqual([p["engine"]["tokens_per_s"] for p in report["phases"]], [500, 500])
@@ -248,6 +268,12 @@ class TimedLoadCliTest(unittest.TestCase):
                         "--json-out", str(output)], cwd=directory, text=True, capture_output=True, timeout=20)
                     self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                     report = json.loads(output.read_text())
+                    isolation = report["isolation"]
+                    self.assertTrue(isolation["matched"])
+                    self.assertTrue(isolation["text_match"])
+                    self.assertTrue(isolation["token_count_match"])
+                    self.assertIsNone(isolation["first_difference_char"])
+                    self.assertEqual(len(isolation["batched"]), 4)
                     self.assertEqual(len(report["phases"]), 8)
                     self.assertEqual(len(state["requests"]), 26)
                     if script.name == "timed_load.py":
@@ -259,6 +285,106 @@ class TimedLoadCliTest(unittest.TestCase):
                     # Arrival order across worker threads is intentionally unconstrained.
                     runs.append(sorted(json.dumps(r, sort_keys=True) for r in state["requests"]))
             self.assertEqual(runs[0], runs[1])
+
+    def test_isolation_failure_saves_complete_diagnostics_before_exit(self):
+        for script in ("serve_load.py", "timed_load.py"):
+            for change in ("text", "prefix", "tokens"):
+                with self.subTest(script=script, change=change), tempfile.TemporaryDirectory() as directory:
+                    fallback = change == "text"
+                    with serving_fixture(False, change, fallback) as (port, state):
+                        output = Path(directory) / "failed.json"
+                        result = subprocess.run([
+                            sys.executable, str(ROOT / "scripts" / script), "127.0.0.1", str(port),
+                            "--warm", "0", "--isolation", "2", "--concurrency", "1",
+                            "--max-tokens", "8", "--temperature", "0.7", "--json-out", str(output)],
+                            cwd=directory, text=True, capture_output=True, encoding="utf-8", timeout=20,
+                            env={**os.environ, "PYTHONIOENCODING": "utf-8"})
+                        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                        self.assertIn("transcript isolation failed", result.stderr)
+                        report = json.loads(output.read_text())
+                        self.assertEqual(report["schema_version"], 1)
+                        self.assertEqual(report["phases"], [])
+                        self.assertEqual(report["temperature"], .7)
+                        self.assertFalse(report["thinking"])
+                        self.assertFalse(report["thinking_requested"])
+                        self.assertFalse(report["thinking_switch_unsupported"])
+                        self.assertEqual(len(state["requests"]), 3)
+                        isolation = report["isolation"]
+                        self.assertFalse(isolation["matched"])
+                        self.assertEqual(isolation["concurrency"], 2)
+                        self.assertEqual(isolation["text_match"], change == "tokens")
+                        self.assertEqual(isolation["token_count_match"], change != "tokens")
+                        alone = isolation["alone"]
+                        batched = isolation["batched"]
+                        self.assertEqual(alone["text"], "answer 雪\n  exact whitespace")
+                        expected = {"text": "answer 雪\n  changed whitespace",
+                                    "prefix": alone["text"] + " extended", "tokens": alone["text"]}[change]
+                        self.assertEqual(batched[0]["text"], expected)
+                        self.assertEqual(batched[0]["tokens"], 7 if change == "tokens" else 8)
+                        self.assertEqual(isolation["first_difference_char"],
+                                         {"text": 11, "prefix": len(alone["text"]), "tokens": None}[change])
+                        captured = [r["request"] for r in [alone] + batched]
+                        self.assertEqual(sorted(map(json.dumps, captured)),
+                                         sorted(map(json.dumps, state["requests"])))
+                        self.assertTrue(all(r["temperature"] == 0 for r in captured))
+                        self.assertEqual("chat_template_kwargs" in captured[0], not fallback)
+                        for response in [alone] + batched:
+                            self.assertEqual(response["thinking"], "server_default" if fallback else False)
+                            self.assertEqual(response.get("thinking_switch_unsupported", False), fallback)
+
+    def test_isolation_counter_failure_preserves_comparison_and_reason(self):
+        for change in (None, "text"):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as directory:
+                with serving_fixture(False, change, counter_overshoot_at=3) as (port, state):
+                    output = Path(directory) / "counters.json"
+                    result = subprocess.run([
+                        sys.executable, str(ROOT / "scripts/timed_load.py"), "127.0.0.1", str(port),
+                        "--warm", "0", "--isolation", "2", "--concurrency", "1",
+                        "--max-tokens", "8", "--json-out", str(output)],
+                        cwd=directory, text=True, capture_output=True, encoding="utf-8", timeout=20,
+                        env={**os.environ, "PYTHONIOENCODING": "utf-8"})
+                    self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                    self.assertIn("scheduler counters include unexpected requests or tokens", result.stderr)
+                    report = json.loads(output.read_text())
+                    self.assertEqual(report["phases"], [])
+                    isolation = report["isolation"]
+                    self.assertEqual(isolation["matched"], change is None)
+                    self.assertIn(isolation["counter_reconciliation_error"], result.stderr)
+                    responses = [isolation["alone"]] + isolation["batched"]
+                    self.assertEqual(len(state["requests"]), 3)
+                    self.assertEqual(sorted(map(json.dumps, [r["request"] for r in responses])),
+                                     sorted(map(json.dumps, state["requests"])))
+                    self.assertTrue(all(r["tokens"] == 8 and r["text"] for r in responses))
+
+    def test_isolation_thinking_fallback_does_not_change_phase_summary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with serving_fixture(False, thinking_fallback_requests=3) as (port, state):
+                output = Path(directory) / "thinking.json"
+                result = subprocess.run([
+                    sys.executable, str(ROOT / "scripts/timed_load.py"), "127.0.0.1", str(port),
+                    "--warm", "0", "--isolation", "2", "--concurrency", "1",
+                    "--max-tokens", "8", "--json-out", str(output)],
+                    cwd=directory, text=True, capture_output=True, timeout=20)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                report = json.loads(output.read_text())
+                self.assertFalse(report["thinking"])
+                self.assertFalse(report["thinking_switch_unsupported"])
+                self.assertTrue(report["isolation"]["alone"]["thinking_switch_unsupported"])
+                self.assertEqual(len(report["phases"]), 1)
+                self.assertEqual(len(state["requests"]), 4)
+
+    def test_nonfinite_temperature_is_rejected_before_contacting_server(self):
+        for script in ("serve_load.py", "timed_load.py"):
+            for temperature in ("nan", "inf", "-inf"):
+                with self.subTest(script=script, temperature=temperature), tempfile.TemporaryDirectory() as directory:
+                    output = Path(directory) / "invalid.json"
+                    result = subprocess.run([
+                        sys.executable, str(ROOT / "scripts" / script), "127.0.0.1", "0",
+                        "--isolation", "2", f"--temperature={temperature}", "--json-out", str(output)],
+                        cwd=directory, text=True, capture_output=True, timeout=20)
+                    self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                    self.assertIn("--temperature must be finite", result.stderr)
+                    self.assertFalse(output.exists())
 
 
 if __name__ == "__main__":

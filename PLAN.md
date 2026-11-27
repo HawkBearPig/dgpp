@@ -24,6 +24,11 @@ and the default-off feature gates.
 
 ## Serving status
 
+Load-client JSON reports preserve solo and batched isolation responses and
+effective request bodies before a mismatch exits. Local HTTP fixture tests
+cover text and token-count mismatches and successful comparisons. This
+diagnostic coverage does not establish model-level batching equivalence.
+
 MiniMax M3.1 Flash is implemented on the shared engine with its published
 NVFP4/MXFP8 weights, native activations and Q8KV4 attention, seven-proposal
 DSpark, recursive tools, images and native video. BF16 activations and caches
