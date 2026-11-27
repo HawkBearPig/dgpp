@@ -583,22 +583,26 @@ DGPP_TEST(min_p_drops_tail_never_sampled) {
 }
 
 DGPP_TEST(top_p_keeps_the_crossing_token) {
-  // Crafted so only two tokens can survive top-p; assert the third is
-  // never chosen and never appears in the logprobs list.
+  // The first two tokens carry less than 0.9 of the mass. Token 2
+  // crosses the cutoff and must stay; token 3 is outside the nucleus.
   std::vector<float> v{5.0f, 4.0f, 3.0f, 2.0f};
   Params p;
   p.temperature = 1.0f;
   p.top_k = 4;
   p.top_p = 0.9f;
   p.logprobs = 4;
+  bool sampled_crossing_token = false;
   for (int seed = 0; seed < 200; ++seed) {
     Rng rng{static_cast<uint64_t>(seed), 0};
     const Result r = select_from_sorted(sort_slice(v.data(), v.size(), 0), p, rng);
-    require(r.token < 3, "top-p tail must be unsampleable");
-    for (const auto& lp : r.top_logprobs) {
-      require(lp.first < 3, "top-p must drop the tail from logprobs");
-    }
+    require(r.token >= 0 && r.token < 3, "top-p must sample from the retained tokens");
+    sampled_crossing_token |= r.token == 2;
+    std::vector<int32_t> retained;
+    for (const auto& lp : r.top_logprobs) retained.push_back(lp.first);
+    require(retained == std::vector<int32_t>{0, 1, 2},
+            "top-p logprobs must retain the crossing token and exclude the tail");
   }
+  require(sampled_crossing_token, "top-p must be able to sample the crossing token");
 }
 
 DGPP_TEST(temperature_zero_equals_greedy) {
