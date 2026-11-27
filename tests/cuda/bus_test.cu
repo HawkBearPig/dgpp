@@ -452,7 +452,8 @@ __global__ void staged_fill_kernel(uint16_t* dst, size_t elems, int rank) {
 // implicit-sync call in the workers into a hang).
 std::vector<std::unique_ptr<CollectiveBus>> start_world(
     int world, uint16_t port, bool one_lane = false,
-    int rank0_pass_delay_us = 0, size_t lat_slot_bytes = 8192) {
+    int rank0_pass_delay_us = 0, size_t lat_slot_bytes = 8192,
+    bool rank0_flight_park_decoy = false) {
   std::vector<std::unique_ptr<CollectiveBus>> out;
   for (int r = 0; r < world; ++r) {
     BusOptions o = base_options(r, port);
@@ -463,6 +464,9 @@ std::vector<std::unique_ptr<CollectiveBus>> start_world(
     // Fault injection (scenario_allreduce_done_before_posted): rank 0's
     // engine dawdles between its control-cell reads.
     if (r == 0) o.debug_pass_delay_us = rank0_pass_delay_us;
+    // Fault injection (the flight park's breaker): rank 0's engine parks
+    // beside its kernel's block records.
+    if (r == 0) o.debug_flight_park_decoy = rank0_flight_park_decoy;
     out.push_back(std::make_unique<CollectiveBus>(o));
   }
   std::vector<std::string> errors(world);
@@ -2029,6 +2033,13 @@ void scenario_allreduce_stream() {
 // measurement of what the park costs. In the second half each rank adds a
 // delay of its own, so one rank's window is live while its peers are still
 // parked.
+//
+// On the write transport the engine also parks while a generation is in
+// flight, on the block record its kernel stores next. The same rounds cover
+// that park: a window's and a stream collective's generations each wait for
+// the kernel twice, and in the second half a rank's kernel waits on peers
+// that have not started. The row length sets how many blocks a generation
+// has, and so how many records the engine parks on in turn.
 
 enum class QuietKind { kWindow, kEager, kStream };
 
@@ -2044,6 +2055,12 @@ struct QuietShared {
   std::atomic<int> finished{0};  // rounds finished, summed over the ranks
   std::vector<std::atomic<int64_t>> finish_ns;  // per rank: when its last round ended
   std::atomic<bool> abort{false};
+  // Every rank stops before this round until `resume` is set, so that the
+  // scenario can read the buses while no collective is in flight (-1: no
+  // pause). `paused` counts the ranks that have arrived.
+  int pause_round = -1;
+  std::atomic<int> paused{0};
+  std::atomic<bool> resume{false};
   explicit QuietShared(int w) : world(w), finish_ns(static_cast<size_t>(w)) {}
 };
 
@@ -2146,6 +2163,12 @@ int quiet_rank_work(CollectiveBus& bus, QuietShared& shared, int my_rank, size_t
       dgpp::cpu_wait::spin_hint();
     }
     if (shared.abort.load(std::memory_order_acquire)) break;
+    if (r == shared.pause_round) {
+      shared.paused.fetch_add(1, std::memory_order_release);
+      while (!shared.resume.load(std::memory_order_acquire) && !shared.abort.load(std::memory_order_acquire))
+        std::this_thread::sleep_for(std::chrono::microseconds(200));
+      if (shared.abort.load(std::memory_order_acquire)) break;
+    }
     int64_t start = 0;
     for (const auto& f : shared.finish_ns) start = std::max(start, f.load(std::memory_order_relaxed));
     if (start == 0) start = quiet_now_ns();
@@ -2221,12 +2244,26 @@ int quiet_rank_work(CollectiveBus& bus, QuietShared& shared, int my_rank, size_t
   return failures;
 }
 
+// The shape of the quiet rounds' collectives. `decoy` puts rank 0's engine
+// on the fault injection of the flight park (it parks beside the records),
+// so its breaker turns the flight parks off somewhere in the schedule.
+struct QuietShape {
+  size_t elems = 4096;
+  int gens_per_window = 4;
+  bool decoy = false;
+};
+
 // `rounds` quiet rounds in one world, half aligned and half with each
 // rank's own delay. Returns the failures.
-int quiet_rounds_world(int world, uint16_t port, int rounds, uint64_t seed) {
-  const size_t elems = 4096;
-  const int gens_per_window = 4;
-  std::vector<std::unique_ptr<CollectiveBus>> buses = start_world(world, port);
+int quiet_rounds_world(int world, uint16_t port, int rounds, uint64_t seed, const QuietShape& shape) {
+  const size_t elems = shape.elems;
+  const int gens_per_window = shape.gens_per_window;
+  // The suite's 4096-element rows fit the default slot. A longer row takes
+  // the row scenario's geometry.
+  const size_t lat_slot_bytes =
+      elems <= 4096 ? 8192 : std::max<size_t>(98304, (elems * 2 + 63) / 64 * 64);
+  std::vector<std::unique_ptr<CollectiveBus>> buses =
+      start_world(world, port, /*one_lane=*/false, /*rank0_pass_delay_us=*/0, lat_slot_bytes, shape.decoy);
   if (buses.empty()) {
     DGPP_LOG_ERROR("quiet rounds: world {} failed to start", world);
     return 1;
@@ -2275,6 +2312,44 @@ int quiet_rounds_world(int world, uint16_t port, int rounds, uint64_t seed) {
         ++failures;
       }
     }
+    // Flight parks. On the write transport, where the CPU parks, every
+    // engine parked while its generations walked and none turned the parks
+    // off. A rank on the decoy is the exception: it has to turn them off
+    // once enough of its kernel's stores have landed during its parks.
+    // Elsewhere no engine parks in a flight.
+    int walked_rounds = 0;
+    for (const QuietRound& round : shared.rounds) walked_rounds += round.kind != QuietKind::kEager ? 1 : 0;
+    const bool flight_parks = dgpp::cpu_wait::supported() && g_transport == BusLatencyTransport::kWrite;
+    uint64_t store_parks = 0, late_wakes = 0, posts = 0, post_wakes = 0;
+    for (int r = 0; r < world; ++r) {
+      const dgpp::net::BusStats st = buses[static_cast<size_t>(r)]->stats();
+      const bool on_decoy = shape.decoy && r == 0;
+      if (!on_decoy) {
+        store_parks += st.engine_flight_store_parks;
+        late_wakes += st.engine_flight_late_wakes;
+        posts += st.engine_flight_posts;
+        post_wakes += st.engine_flight_post_wakes;
+      }
+      if (!flight_parks && st.engine_flight_parks != 0) {
+        DGPP_LOG_ERROR("quiet rounds: rank {} counted {} flight parks where no engine parks in a flight", r,
+                       st.engine_flight_parks);
+        ++failures;
+      }
+      if (flight_parks && walked_rounds >= 16 && st.engine_flight_parks == 0) {
+        DGPP_LOG_ERROR("quiet rounds: rank {} never parked in a flight over {} walked rounds", r, walked_rounds);
+        ++failures;
+      }
+      if (st.engine_flight_parks_off && !on_decoy) {
+        DGPP_LOG_ERROR("quiet rounds: rank {} turned its flight parks off ({} late wakes over {} store parks)",
+                       r, st.engine_flight_late_wakes, st.engine_flight_store_parks);
+        ++failures;
+      }
+      if (on_decoy && flight_parks && st.engine_flight_store_parks >= 2 * 4096 && !st.engine_flight_parks_off) {
+        DGPP_LOG_ERROR("quiet rounds: rank {} on the decoy kept its flight parks on ({} late wakes over {} "
+                       "store parks)", r, st.engine_flight_late_wakes, st.engine_flight_store_parks);
+        ++failures;
+      }
+    }
     // What the aligned windows took, by the quiet time before them.
     std::vector<double> polling, edge, parked;
     for (const auto& rank_samples : samples)
@@ -2282,14 +2357,19 @@ int quiet_rounds_world(int world, uint16_t port, int rounds, uint64_t seed) {
         (sample.gap_us < 300.0 ? polling : sample.gap_us < 10000.0 ? edge : parked)
             .push_back(sample.window_us);
     DGPP_LOG_INFO(
-        "quiet rounds ({}, world {}, seed {}): {} rounds, {} failures; window us p50/p99/max "
+        "quiet rounds ({}, world {}, seed {}, {} elems, {} gens a window{}): {} rounds, {} failures; "
+        "window us p50/p99/max "
         "after under 0.3 ms quiet {:.1f}/{:.1f}/{:.1f} (n={}), after 0.3-6 ms {:.1f}/{:.1f}/{:.1f} "
-        "(n={}), after 10 ms or more {:.1f}/{:.1f}/{:.1f} (n={}); engine parks on rank 0: {}",
-        transport_name(), world, seed, rounds, failures, percentile(polling, 0.5),
+        "(n={}), after 10 ms or more {:.1f}/{:.1f}/{:.1f} (n={}); engine parks on rank 0: {} quiet, "
+        "{} in flights; the world's kernels stored during {} flight parks, {} of them woke late; the first "
+        "pass after a park found the ready store of {} of {} generations",
+        transport_name(), world, seed, elems, gens_per_window, shape.decoy ? ", rank 0 on the decoy" : "",
+        rounds, failures, percentile(polling, 0.5),
         percentile(polling, 0.99), percentile(polling, 1.0), polling.size(), percentile(edge, 0.5),
         percentile(edge, 0.99), percentile(edge, 1.0), edge.size(), percentile(parked, 0.5),
         percentile(parked, 0.99), percentile(parked, 1.0), parked.size(),
-        buses[0]->stats().engine_parks);
+        buses[0]->stats().engine_parks, buses[0]->stats().engine_flight_parks, store_parks, late_wakes,
+        post_wakes, posts);
   }
   for (auto& bus : buses) bus->quiesce();
   for (auto& bus : buses) bus->stop();
@@ -2303,17 +2383,135 @@ int quiet_rounds_world(int world, uint16_t port, int rounds, uint64_t seed) {
 }
 
 // Both worlds under both latency transports.
-void scenario_quiet_rounds(int rounds, uint64_t seed) {
+void scenario_quiet_rounds(int rounds, uint64_t seed, const QuietShape& shape = {}) {
   const BusLatencyTransport before = g_transport;
   int failures = 0;
   for (const BusLatencyTransport transport : {BusLatencyTransport::kSend, BusLatencyTransport::kWrite}) {
     g_transport = transport;
-    failures += quiet_rounds_world(2, 29861, rounds, seed);
-    failures += quiet_rounds_world(4, 29862, rounds, seed + 1);
+    failures += quiet_rounds_world(2, 29861, rounds, seed, shape);
+    failures += quiet_rounds_world(4, 29862, rounds, seed + 1, shape);
   }
   g_transport = before;
   CHECK(failures == 0, "quiet rounds had " + std::to_string(failures) + " failures");
   DGPP_LOG_INFO("scenario quiet_rounds: {} rounds a world, {} failures", rounds, failures);
+}
+
+// ---- the flight park's breaker ---------------------------------------------
+//
+// While a write-transport generation is in flight the engine parks on the
+// block record its kernel stores next, and that store ends the park
+// (collective_bus.cpp, engine_loop). That a GPU store ends a host park is a
+// property of the platform. On one that lost it, every such park would run
+// to its bound and every collective would wait for it. Rank 0 runs as that
+// platform here: its engine parks on a word nothing writes. Its breaker has
+// to turn the flight parks off, every window has to stay exact before and
+// after, the engine must not park in a flight again, and rank 1, which
+// parks on the records, has to keep its parks.
+void scenario_flight_park_breaker() {
+  if (!dgpp::cpu_wait::supported()) {
+    DGPP_LOG_INFO("scenario flight_park_breaker: skipped (this CPU cannot park)");
+    return;
+  }
+  constexpr int world = 2;
+  const size_t elems = 4096;
+  const int gens_per_window = 16;
+  const int windows = 800;
+  const BusLatencyTransport before = g_transport;
+  g_transport = BusLatencyTransport::kWrite;
+  std::vector<std::unique_ptr<CollectiveBus>> buses =
+      start_world(world, 29863, /*one_lane=*/false, /*rank0_pass_delay_us=*/0, 8192,
+                  /*rank0_flight_park_decoy=*/true);
+  g_transport = before;
+  if (buses.empty()) {
+    CHECK(false, "flight park breaker: the world failed to start");
+    return;
+  }
+  std::vector<std::vector<uint16_t>> all_src(static_cast<size_t>(world));
+  for (int r = 0; r < world; ++r) fill_rank_bf16(&all_src[static_cast<size_t>(r)], elems, r);
+  std::vector<uint16_t> want(elems, 0);
+  for (size_t i = 0; i < elems; ++i) {
+    float acc = 0.0f;
+    for (int r = 0; r < world; ++r) acc += dgpp::net::bf16_to_f32(all_src[static_cast<size_t>(r)][i]);
+    want[i] = dgpp::net::bf16_from_f32_rne(acc);
+  }
+  int failures = 0;
+  std::vector<QuietRankBuffers> bufs(static_cast<size_t>(world));
+  for (QuietRankBuffers& b : bufs) {
+    if (cudaStreamCreateWithFlags(&b.stream, cudaStreamNonBlocking) != cudaSuccess ||
+        cudaMalloc(&b.dev_src, elems * 2) != cudaSuccess ||
+        cudaMalloc(&b.dev_dst, elems * 2) != cudaSuccess ||
+        cudaMalloc(&b.warm_buf, 256 * 4) != cudaSuccess) {
+      DGPP_LOG_ERROR("flight park breaker: device allocation failed");
+      ++failures;
+    }
+  }
+  if (failures == 0) {
+    // Windows only, back to back, every rank starting a window together.
+    // The ranks pause once, late in the run, with no collective in flight.
+    // By then rank 0's kernel has stored during several times the parks its
+    // breaker judges at a time: its start stamp and its `done` store of
+    // every generation land during a park.
+    const int pause_round = windows - 100;
+    QuietShared shared(world);
+    shared.rounds.assign(static_cast<size_t>(windows), QuietRound{QuietKind::kWindow, 0.0});
+    shared.aligned_rounds = windows;
+    shared.pause_round = pause_round;
+    std::vector<int> rank_failures(static_cast<size_t>(world), 0);
+    std::vector<std::vector<QuietSample>> samples(static_cast<size_t>(world));
+    std::vector<std::thread> workers;
+    for (int r = 0; r < world; ++r)
+      workers.emplace_back([&, r] {
+        rank_failures[static_cast<size_t>(r)] = quiet_rank_work(
+            *buses[static_cast<size_t>(r)], shared, r, elems, gens_per_window, /*seed=*/1,
+            bufs[static_cast<size_t>(r)], &want, &samples[static_cast<size_t>(r)]);
+      });
+    while (shared.paused.load(std::memory_order_acquire) < world &&
+           !shared.abort.load(std::memory_order_acquire))
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    const dgpp::net::BusStats decoy_at_pause = buses[0]->stats();
+    const dgpp::net::BusStats peer_at_pause = buses[1]->stats();
+    shared.resume.store(true, std::memory_order_release);
+    for (auto& t : workers) t.join();
+    for (int r = 0; r < world; ++r) failures += rank_failures[static_cast<size_t>(r)];
+    const dgpp::net::BusStats decoy = buses[0]->stats();
+    const dgpp::net::BusStats peer = buses[1]->stats();
+    CHECK(failures == 0, "flight park breaker: " + std::to_string(failures) + " window failures");
+    CHECK(decoy_at_pause.engine_flight_parks_off,
+          "flight park breaker: rank 0 on the decoy kept its flight parks on over " +
+              std::to_string(pause_round) + " windows (" +
+              std::to_string(decoy_at_pause.engine_flight_late_wakes) + " late wakes over " +
+              std::to_string(decoy_at_pause.engine_flight_store_parks) + " store parks)");
+    CHECK(decoy.engine_flight_parks == decoy_at_pause.engine_flight_parks,
+          "flight park breaker: rank 0 parked in a flight after its breaker tripped (" +
+              std::to_string(decoy_at_pause.engine_flight_parks) + " parks at the pause, " +
+              std::to_string(decoy.engine_flight_parks) + " at the end)");
+    CHECK(!peer.engine_flight_parks_off && peer.engine_flight_parks > peer_at_pause.engine_flight_parks &&
+              peer_at_pause.engine_flight_parks != 0,
+          "flight park breaker: rank 1 parks on the records and should have kept parking (" +
+              std::to_string(peer_at_pause.engine_flight_parks) + " parks at the pause, " +
+              std::to_string(peer.engine_flight_parks) + " at the end, " +
+              std::to_string(peer.engine_flight_late_wakes) + " late wakes over " +
+              std::to_string(peer.engine_flight_store_parks) + " store parks)");
+    DGPP_LOG_INFO(
+        "scenario flight_park_breaker: {} windows of {} generations, {} failures; rank 0 (decoy) turned its "
+        "flight parks off after {} parks ({} late wakes over {} store parks) and walked the last {} windows "
+        "without one; rank 1 parked {} times ({} late wakes over {} store parks; the first pass after a park "
+        "found the ready store of {} of {} generations)",
+        windows, gens_per_window, failures, decoy.engine_flight_parks, decoy.engine_flight_late_wakes,
+        decoy.engine_flight_store_parks, windows - pause_round, peer.engine_flight_parks,
+        peer.engine_flight_late_wakes, peer.engine_flight_store_parks, peer.engine_flight_post_wakes,
+        peer.engine_flight_posts);
+  } else {
+    CHECK(false, "flight park breaker: setup failed");
+  }
+  for (auto& bus : buses) bus->quiesce();
+  for (auto& bus : buses) bus->stop();
+  for (QuietRankBuffers& b : bufs) {
+    if (b.dev_src) cudaFree(b.dev_src);
+    if (b.dev_dst) cudaFree(b.dev_dst);
+    if (b.warm_buf) cudaFree(b.warm_buf);
+    if (b.stream) cudaStreamDestroy(b.stream);
+  }
 }
 
 void scenario_idle_gap_collective() {
@@ -2521,16 +2719,33 @@ int main(int argc, char** argv) {
     return 2;
   }
 
-  // bus_test --quiet-rounds N [--seed S]: the quiet rounds alone, N a world,
-  // for long runs over many schedules.
+  // bus_test --quiet-rounds N [--seed S] [--elems E] [--gens G] [--decoy]:
+  // the quiet rounds alone, N a world, for long runs over many schedules
+  // and shapes. E is the row length (it sets the blocks a generation has),
+  // G the generations of a window, and --decoy puts rank 0's engine on the
+  // flight park's fault injection.
   if (argc > 1 && std::string(argv[1]) == "--quiet-rounds") {
     try {
-      if (argc != 3 && !(argc == 5 && std::string(argv[3]) == "--seed"))
-        throw std::invalid_argument("use --quiet-rounds N [--seed S]");
+      const char* usage = "use --quiet-rounds N [--seed S] [--elems E] [--gens G] [--decoy]";
+      if (argc < 3) throw std::invalid_argument(usage);
       const int rounds = std::stoi(argv[2]);
-      const uint64_t seed = argc == 5 ? std::stoull(argv[4]) : 1;
+      uint64_t seed = 1;
+      QuietShape shape;
+      for (int i = 3; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (arg == "--decoy") { shape.decoy = true; continue; }
+        if (i + 1 >= argc) throw std::invalid_argument(usage);
+        const std::string value = argv[++i];
+        if (arg == "--seed") seed = std::stoull(value);
+        else if (arg == "--elems") shape.elems = std::stoull(value);
+        else if (arg == "--gens") shape.gens_per_window = std::stoi(value);
+        else throw std::invalid_argument(usage);
+      }
       if (rounds < 2) throw std::invalid_argument("at least two rounds");
-      scenario_quiet_rounds(rounds, seed);
+      if (shape.elems < 1 || shape.elems > 768000) throw std::invalid_argument("--elems from 1 to 768000");
+      if (shape.gens_per_window < 1 || shape.gens_per_window > 64)
+        throw std::invalid_argument("--gens from 1 to 64");
+      scenario_quiet_rounds(rounds, seed, shape);
       return g_failures == 0 ? 0 : 1;
     } catch (const std::exception& e) {
       DGPP_LOG_ERROR("quiet rounds: {}", e.what());
@@ -2584,6 +2799,10 @@ int main(int argc, char** argv) {
     scenario_quiet_rounds(200, 1);
     return g_failures == 0 ? 0 : 1;
   }
+  if (const char* f = std::getenv("DGPP_TEST_FILTER"); f && std::string(f) == "flight_park_breaker") {
+    scenario_flight_park_breaker();
+    return g_failures == 0 ? 0 : 1;
+  }
   if (const char* f = std::getenv("DGPP_TEST_FILTER");
       f && std::string(f) == "allreduce_graph_rows") {
     scenario_allreduce_graph_rows();
@@ -2622,6 +2841,7 @@ int main(int argc, char** argv) {
   scenario_allreduce_stream();
   g_transport = BusLatencyTransport::kSend;
   scenario_quiet_rounds(200, 1);
+  scenario_flight_park_breaker();
   scenario_idle_gap_collective();
   scenario_geometry_mismatch();
   scenario_stop_releases_waiters();

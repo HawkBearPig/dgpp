@@ -557,28 +557,46 @@ back-to-back decode steps never reach the resting path. Before a decode
 graph exists a resting engine sleeps. Once one exists it parks instead: it
 stays on its core and waits in `WFET` on a word that every hand-off from
 another thread bumps, for at most 50 µs at a time. A hand-off ends that
-park at once, and the bound covers what arrives without one. A generation in
-flight on the write transport parks too, with no grace period, when the
-walk is all the engine has (no eager collective, queued send or registered
-request in flight, not stopping): its next event is the kernel's store into
-a block record (`ready` before the posts, `done` before the walk advances),
-so the engine parks on the first record still outstanding and, on the
-GB10, the GPU's store ends the park (a measured property of the platform,
-not something the release/acquire ordering itself guarantees). Each park
-also asks for a 50 µs deadline, a timer request rather than a wall-clock
-promise, which covers what arrives without such a store: send completions
-(one in sixteen write posts is signaled; the engine polls the completion
-queues as soon as a park ends, before the pass that may post), kicks and
-the watchdog clocks. During such a park the engine waits on the record's
-line, not the kick word, so a hand-off can wait out the bound. A breaker
-turns these parks off, with a warning, if the walk moves while the parked
-record does not hold the generation (the engine waited on the wrong word;
-eight such moves) or if most parks ended by the store they waited for still
-ran to their deadline (the platform stopped waking it; judged over windows
-of 4,096 such parks). It assumes the engine keeps
-its core, which its pinning provides: an engine preempted during most of
-its parks would trip the second test too. The engine then polls during
-windows as before. A CPU without `WFET` keeps polling.
+park at once, and the bound covers what arrives without one. A CPU without
+`WFET` keeps polling.
+
+The engine also parks while a generation is in flight on the write
+transport. Such a generation waits only for its own kernel: every block's
+record must carry the generation in `ready` before the engine posts the
+rows, and in `done` before the walk advances. The flight pass that finds
+nothing to do hands back the first record still outstanding, and the engine
+parks on it at once, for at most 50 µs. The kernel's store ends the park and
+the next pass posts or advances. That a GPU store ends a host park is a
+property of the GB10, which `flag_protocol_test` measures. The engine parks
+this way only when the walk is all it has, with no eager collective, queued
+send or registered request in flight and no stop pending. A window arm or
+a stream issue that arrives during such a park waits out the bound, and
+neither needs the engine before the generation in flight completes.
+
+The wait for `ready` gets one more step. Every rank's kernel waits for every
+peer's rows, so a collective takes as long as the slowest engine of the
+world needs to notice its kernel's `ready`, and a park notices a store about
+a microsecond later than a poll does. On four nodes that was 0.35 % of a
+decode step. The kernel stamps its cell's `gt_start` when it starts and
+stores `ready` when its row is copied and fenced, 2.5 to 3 µs later at
+decode's row lengths. The engine therefore parks on the stamp until the
+kernel has started and polls the records from then on, so the wake's cost
+falls inside the kernel's copy. A kernel has started when its stamp is later
+than the last generation's done stamp. If the records are still outstanding
+50 µs after the start, as with a row of megabytes, the engine parks on them.
+The `done` store is in no collective's time, and the engine parks through
+that wait.
+
+A breaker guards the property the flight park depends on. A park that ran to
+its bound although the word it waited on changed during it woke late, which
+a store that ends the park does only when it lands in the park's last
+instants. The
+engine judges 4,096 such parks at a time. When more than one in 32 woke
+late it logs a warning and polls during flights for the rest of the bus's
+life. An engine that loses its core during its parks trips the breaker too.
+`BusStats` and the engine's stop line carry the park counts, the late wakes
+among them, and how many generations' `ready` store the engine found only
+after a park.
 
 The bus uses one engine thread for latency and bulk traffic. Per-lane
 sender threads are not implemented; any change to that ownership model

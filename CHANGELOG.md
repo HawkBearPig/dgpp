@@ -39,6 +39,23 @@ project procedures and design guidance live in `docs/`.
   joins the world's settings identity when it is not `bf16`, which gives a
   Qwen3.8-27B deployment that already set it a new cache binding once.
 
+- **The bus engine parks while a decode window walks.** On the write
+  transport a collective in flight waits only for its own kernel, which
+  stores into a pinned record when its row is staged and again when the
+  fold is written. The engine polled those records at the full clock for the
+  whole decode step. It now parks in `WFET` on the record its last pass
+  found outstanding, for at most 50 µs at a time, and the kernel's store
+  ends the park. A park notices a store about a microsecond later than a
+  poll, and the rows a kernel stages are in every collective's time, so
+  the engine waits for a kernel's start stamp in the park and polls from
+  there to the staged row, the 2.5 to 3 µs the kernel spends copying it.
+  The engine parks only when the walk is all it has, and it stops parking
+  in flights, with a warning, if more than one in 32 of the stores fail to
+  end a park in time. The send transport, the prefill's bulk collectives
+  and CPUs without `WFET` keep polling. Every rank's stop line reports the
+  parks, the late wakes among them and how many posts followed a park
+  (issue #206, from jetnet's patch and measurements).
+
 - **Host waits park on the GB10.** A thread that waits for a word another
   agent writes no longer polls it at the full clock. On a CPU with `WFET`
   (the GB10's cores) the serving thread parks on the verdict and confidence
