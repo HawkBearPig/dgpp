@@ -64,4 +64,15 @@ void launch_moe_grouped_a8w8_f32(const uint8_t* codes, size_t code_stride, const
                                  int max_rows, const MoeExpertView* views, int which, float* out, size_t out_stride,
                                  int n, int k, cudaStream_t stream);
 
+// The dense form of the FP8-weight product, the release's fp8_gemm on a
+// projection: out[m, n] = act[m, k] . W[n, k]^T, W an E4M3 payload [n, k]
+// (16-byte aligned rows) with F32 power-of-two scales on the 32 x 32 grid,
+// the activation rows' codes and scale bytes as above (row r at r * stride),
+// out rows of out_stride BF16 elements. k % 64 == 0. m_group: the m-tiles
+// that share one pass over the weights (their rows stay in L2 for it).
+inline constexpr int kDenseA8w8Group = 8;
+void launch_dense_a8w8_bf16(const uint8_t* codes, size_t code_stride, const uint8_t* scales, size_t scale_stride,
+                            const uint8_t* w, const float* w_scales, uint16_t* out, size_t out_stride, int m, int n,
+                            int k, cudaStream_t stream, int m_group = kDenseA8w8Group);
+
 }  // namespace dgpp

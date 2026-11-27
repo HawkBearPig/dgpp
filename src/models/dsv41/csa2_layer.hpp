@@ -104,7 +104,13 @@ class Csa2Layer {
             int decode_n_split = 32, size_t dot_budget = 64ull << 20);
   // The activation recipe's copy of the hidden rows is the layer's own
   // allocation (act_hidden); everything else lives in the caller's scratch.
-  ~Csa2Layer() { cudaFree(act_h_); }
+  ~Csa2Layer() {
+    cudaFree(act_h_);
+    cudaFree(act_codes_);
+    cudaFree(act_scales_);
+    cudaFree(qr_codes_);
+    cudaFree(qr_scales_);
+  }
   Csa2Layer(const Csa2Layer&) = delete;
   Csa2Layer& operator=(const Csa2Layer&) = delete;
   static size_t scratch_bytes(const Csa2Config& cfg, int max_tokens, int64_t max_cache_tokens,
@@ -307,7 +313,24 @@ class Csa2Layer {
   bool prefill_act_qdq_ = false;    // the configured recipe (set_prefill_act_qdq)
   uint16_t* act_h_ = nullptr;       // [T, hidden] the quantize-dequantized hidden rows (own allocation, first use)
   const uint16_t* act_hidden(const uint16_t* h, int tokens, cudaStream_t stream);
-  void project_kv_rows(const uint16_t* h, int tokens, const int64_t* pos, cudaStream_t stream);
+  // The recipe's dense multiplies on the block-scaled tensor cores
+  // (launch_dense_a8w8_bf16, the release's fp8_gemm): a projection's input
+  // rows as E4M3 codes and scale bytes against its FP8 weights, where the
+  // layer's matrices carry F32 scales on the 32 x 32 grid, 16-byte aligned
+  // payloads and widths that are whole 64-wide stages. One code buffer
+  // serves the hidden rows, the attention output and the wo_a rows in turn
+  // (each is consumed before the next is written, in stream order) and the
+  // low-rank query has its own, which the indexer's wq_b reads too. Off:
+  // the rounding kernel in front of the BF16-activation GEMMs.
+  bool act_native_dense_ = true;
+  uint8_t* act_codes_ = nullptr;   // [T, max(hidden, local heads x 512, local groups x o_lora)]
+  uint8_t* act_scales_ = nullptr;  // [T, that width / 32]
+  uint8_t* qr_codes_ = nullptr;    // [T, q_lora]
+  uint8_t* qr_scales_ = nullptr;   // [T, q_lora / 32]
+  bool native_dense(int tokens);
+  void quant_hidden(const uint16_t* h, int tokens, cudaStream_t stream);
+  void project_kv_rows(const uint16_t* h, int tokens, const int64_t* pos, cudaStream_t stream,
+                       bool from_codes = false);
   bool prefill_window_flash_ = true;  // set_prefill_window_flash
   // A prefill tile's rows are consecutive positions of one request: their
   // windows overlap by all but one key and their selections mostly agree,

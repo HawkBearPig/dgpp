@@ -817,12 +817,17 @@ release's `fp8_gemm`: the same codes against the checkpoint's E4M3 weights,
 whose scales the loader stores as powers of two on a 32 by 32 grid. On one
 GPU at 16,384 rows its gate or up projection takes 1.56 ms against 4.08 ms
 on the BF16-activation kernel, and its down projection 1.82 ms against
-3.45 ms. The other multiplies read the same quantized values through a
-rounding kernel in front of the BF16-activation kernels
-(`kernels/act_quant.hpp`). Every scale is a power of two and the release
-accumulates in FP32, so each product is the release's up to the order of
-the sum. `moe_a8w4_test` holds both forms to an FP64 sum of the same
-operands and to the BF16-activation kernels on the rounded rows.
+3.45 ms. The attention's dense projections (`wq_a`, `wkv`, `wq_b`, the
+indexer's `wq_b`, `wo_a` and `wo_b`) take the same form over their input's
+codes. In isolation that is 2 to 20 % faster than the tile GEMM over
+rounded BF16 rows, since both run near the 65 TFLOP/s this tile shape can
+be fed at, and it writes one byte a value where the rounding kernel wrote
+two. The Engram projection reads its rounded rows through the rounding
+kernel in front of the BF16-activation GEMM (`kernels/act_quant.hpp`).
+Every scale is a power of two and the release accumulates in FP32, so each
+product is the release's up to the order of the sum. `moe_a8w4_test` holds
+every form to an FP64 sum of the same operands and to the BF16-activation
+kernels on the rounded rows.
 
 The routed launches run over a list of the tiles that hold rows. In most
 layers of this model one expert is among the routes of nearly every token,
@@ -884,12 +889,16 @@ The first prompt of a boot at a length pays for pages and table rows no
 later prompt pays for. Five further cold prompts of 2,067 tokens on each
 boot had medians of 0.91 s, 0.91 s and 0.88 s.
 
-That binary ran the shared expert on the BF16-activation kernel.
+That binary ran the shared expert and the dense projections on the
+BF16-activation kernels. With both on the block-scaled instruction (source
+`71a55c41` plus the dense projections, binary `d029c280740c9bf8`), `native`
+with `prefill_bf16_partials` reads 0.95 s, 2.70 s, 9.81 s and 20.30 s on
+the same shape, and five further 2,067-token prompts a median of 0.84 s.
 
-With `index_topk` 2048 and a 14 GiB prefix cache the same binary under
-`native` with `prefill_bf16_partials` read 1.08 s, 3.10 s, 12.17 s and
-26.28 s. On that boot the engine recalled 8 of 8 codes planted through a
-53,843-token document and passed 100 of 100 extraction items.
+With `index_topk` 2048 and a 14 GiB prefix cache that binary reads 0.98 s,
+3.17 s, 11.85 s and 25.61 s. On that boot the engine recalled 8 of 8 codes
+planted through a 53,843-token document and passed 100 of 100 extraction
+items.
 
 ## Measured (2026-10-20, four nodes): the campaign of record
 

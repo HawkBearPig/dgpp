@@ -17,7 +17,10 @@
 //     grids, both routings;
 //  8. the FP8-weight form (the shared expert's shapes, one segment of every
 //     token) against the fp64 dot, the BF16-activation fp8 kernel and its
-//     own BF16 output, with speed.
+//     own BF16 output, with speed;
+//  9. the dense launcher (the attention projections' shapes) against the
+//     grouped launch of the same product (bitwise) and, with speed, the
+//     fp8-weight tile GEMM the BF16 rows take.
 //   moe_a8w4_test [--tokens T] [--experts E] [--topk K] [--no-speed]
 #include <algorithm>
 #include <cmath>
@@ -39,6 +42,7 @@
 #include "kernels/glm_moe_launch.hpp"
 #include "kernels/latent_format.hpp"
 #include "kernels/moe_a8w4.hpp"
+#include "kernels/scale_gemm.hpp"
 
 using namespace dgpp;
 
@@ -431,7 +435,9 @@ int run(int tokens, int experts, int topk, int n, int k, bool check_all, bool sp
 
 // The FP8-weight form: one segment of `tokens` rows against an [n, k] E4M3
 // matrix with power-of-two F32 scales on the 32 x 32 grid.
-int run_w8(int tokens, int n, int k, bool check_all, bool speed, const char* label) {
+// grouped_ref: also against the BF16-activation grouped kernel (the shared
+// expert's shapes). The dense launcher is checked on every shape.
+int run_w8(int tokens, int n, int k, bool check_all, bool speed, const char* label, bool grouped_ref = true) {
   std::mt19937 rng(977u + static_cast<uint32_t>(n + k));
   std::normal_distribution<float> nd(0.f, 1.f);
   std::uniform_int_distribution<int> byte(0, 255);
@@ -469,7 +475,15 @@ int run_w8(int tokens, int n, int k, bool check_all, bool speed, const char* lab
   auto* out8 = dev_alloc<float>(static_cast<size_t>(tokens) * os);
   auto* out8b = dev_alloc<uint16_t>(static_cast<size_t>(tokens) * os);
   auto* out16 = dev_alloc<float>(static_cast<size_t>(tokens) * os);
+  auto* outd = dev_alloc<uint16_t>(static_cast<size_t>(tokens) * os);
+  auto* outt = dev_alloc<uint16_t>(static_cast<size_t>(tokens) * os);
   int fails = 0;
+  auto dense = [&](int group) {
+    launch_dense_a8w8_bf16(codes, k, scales, ss, w, ws, outd, os, tokens, n, k, nullptr, group);
+  };
+  auto tile16 = [&] {
+    launch_scale_gemm_grid_bf16(qdq, k, w, ws, outt, tokens, n, k, nullptr, os, 5, 5, false, nullptr, 0, true);
+  };
   auto gemm8 = [&] {
     launch_moe_grouped_a8w8_f32(codes, k, scales, ss, nullptr, segs, 1, tokens, views, 0, out8, os, n, k, nullptr);
   };
@@ -482,13 +496,38 @@ int run_w8(int tokens, int n, int k, bool check_all, bool speed, const char* lab
   launch_act_quant_fp8_block(act, k, codes, k, scales, ss, tokens, k, nullptr, qdq, k);
   gemm8();
   gemm8b();
-  gemm16();
+  if (grouped_ref) gemm16();
+  dense(kDenseA8w8Group);
+  // The tile GEMM on the shapes the attention runs through it.
+  const bool tile_ref = !grouped_ref;
+  if (tile_ref) tile16();
   DGPP_CUDA_OK(cudaDeviceSynchronize());
   const auto qc = host(codes, static_cast<size_t>(tokens) * k);
   const auto qs = host(scales, static_cast<size_t>(tokens) * ss);
   const auto o8 = host(out8, static_cast<size_t>(tokens) * os);
   const auto o8b = host(out8b, static_cast<size_t>(tokens) * os);
-  const auto o16 = host(out16, static_cast<size_t>(tokens) * os);
+  const auto o16 = grouped_ref ? host(out16, static_cast<size_t>(tokens) * os) : o8;
+  const auto od = host(outd, static_cast<size_t>(tokens) * os);
+  const auto ot = tile_ref ? host(outt, static_cast<size_t>(tokens) * os) : od;
+  {
+    // The dense launcher: the grouped launch's BF16 rows, bit for bit; and
+    // the tile GEMM over the rounded rows, the same sums in another order
+    // (both rounded to BF16: a last-place difference is 2^-8 of a value).
+    const bool same = std::memcmp(od.data(), o8b.data(), od.size() * sizeof(uint16_t)) == 0;
+    double num = 0, den = 0;
+    for (size_t i = 0; i < od.size(); ++i) {
+      const double a = bf16_bits_to_float(od[i]), b = bf16_bits_to_float(ot[i]);
+      num += (a - b) * (a - b);
+      den += b * b;
+    }
+    const double rel = std::sqrt(num / (den + 1e-300));
+    std::printf("[ .. ] %s dense launcher: %s the grouped launch; against the tile GEMM: relative l2 %.3g\n", label,
+                same ? "bitwise" : "DIFFERS FROM", rel);
+    if (!same || !(rel < 2e-3)) {
+      std::printf("[FAIL] %s: the dense launcher is not the grouped product\n", label);
+      ++fails;
+    }
+  }
   {
     double worst = 0;
     size_t checked = 0;
@@ -547,16 +586,26 @@ int run_w8(int tokens, int n, int k, bool check_all, bool speed, const char* lab
       launch_moe_grouped_mma_bf16(qdq, k, segs, 1, tokens, 128, views, 0, reinterpret_cast<uint16_t*>(out16), os, n, k,
                                   nullptr);
     };
-    const float t16 = time(gemm16), t16b = time(gemm16b), t8 = time(gemm8), t8b = time(gemm8b);
     const double flop = 2.0 * tokens * n * k;
-    std::printf("[ .. ] %s %d rows x n %d x k %d: BF16 activations f32 out %.3f ms (%.1f TF), bf16 out %.3f ms (%.1f TF); "
-                "E4M3 activations f32 out %.3f ms (%.1f TF), bf16 out %.3f ms (%.1f TF); speedup f32 %.2fx, bf16 %.2fx\n",
-                label, tokens, n, k, t16, flop / t16 / 1e9, t16b, flop / t16b / 1e9, t8, flop / t8 / 1e9, t8b,
-                flop / t8b / 1e9, t16 / t8, t16b / t8b);
+    if (grouped_ref) {
+      const float t16 = time(gemm16), t16b = time(gemm16b), t8 = time(gemm8), t8b = time(gemm8b);
+      std::printf("[ .. ] %s %d rows x n %d x k %d: BF16 activations f32 out %.3f ms (%.1f TF), bf16 out %.3f ms (%.1f TF); "
+                  "E4M3 activations f32 out %.3f ms (%.1f TF), bf16 out %.3f ms (%.1f TF); speedup f32 %.2fx, bf16 %.2fx\n",
+                  label, tokens, n, k, t16, flop / t16 / 1e9, t16b, flop / t16b / 1e9, t8, flop / t8 / 1e9, t8b,
+                  flop / t8b / 1e9, t16 / t8, t16b / t8b);
+    }
+    // The dense launcher by its raster (m-tiles a pass over the weights; 0: all of them) and the tile GEMM.
+    const float tt = tile_ref ? time(tile16) : 0.f;
+    const float d1 = time([&] { dense(1); }), d8 = time([&] { dense(8); }), d32 = time([&] { dense(32); });
+    const float d0 = time([&] { dense(0); });
+    std::printf("[ .. ] %s dense %d rows x n %d x k %d: tile GEMM (BF16 rows) %.3f ms (%.1f TF); E4M3 codes group 1 "
+                "%.3f ms, 8 %.3f ms (%.1f TF), 32 %.3f ms, all %.3f ms; speedup at 8 %.2fx\n",
+                label, tokens, n, k, tt, flop / tt / 1e9, d1, d8, flop / d8 / 1e9, d32, d0, tt / d8);
     cudaEventDestroy(e0);
     cudaEventDestroy(e1);
   }
-  for (void* q : std::initializer_list<void*>{act, w, ws, segs, views, codes, scales, qdq, out8, out8b, out16}) cudaFree(q);
+  for (void* q : std::initializer_list<void*>{act, w, ws, segs, views, codes, scales, qdq, out8, out8b, out16, outd, outt})
+    cudaFree(q);
   return fails;
 }
 
@@ -596,6 +645,12 @@ int main(int argc, char** argv) {
   fails += run_w8(150, 192, 320, true, false, "fp8 ragged");
   fails += run_w8(tokens, 576, 5120, false, speed, "fp8 gate/up");
   fails += run_w8(tokens, 5120, 576, false, speed, "fp8 down");
+  // The attention's dense projections at four ranks: wq_a, wkv, wq_b, a wo_a group, wo_b.
+  fails += run_w8(tokens, 1280, 5120, false, speed, "fp8 wq_a", false);
+  fails += run_w8(tokens, 512, 5120, false, speed, "fp8 wkv", false);
+  fails += run_w8(tokens, 8192, 1280, false, speed, "fp8 wq_b", false);
+  fails += run_w8(tokens, 1024, 4096, false, speed, "fp8 wo_a", false);
+  fails += run_w8(tokens, 5120, 2048, false, speed, "fp8 wo_b", false);
   if (fails) {
     std::printf("[FAIL] moe_a8w4_test: %d check(s) failed\n", fails);
     return 1;

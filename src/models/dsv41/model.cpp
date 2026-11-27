@@ -505,9 +505,11 @@ Dsv41Model::MemoryPlan Dsv41Model::plan_memory(const Dsv41TextConfig& cfg, int m
     const size_t moe_dev = GlmMoeLayer::scratch_bytes(moe_cfg, max_tokens, rows, slots, &moe_pinned);
     plan.add("moe scratch (routed slots, shared expert, graph tables)", moe_dev, moe_pinned);
     if (s_default_prefill_act_native)
-      // engine.prefill_activations native: the attention's dequantized
-      // copy of the prompt rows and the expert chain's workspace, each
-      // allocated at the first prompt walk.
+      // engine.prefill_activations native: the attention's codes of its
+      // projections' inputs (or the dequantized copy of the prompt rows
+      // where a matrix keeps the BF16-activation GEMM; the codes are the
+      // smaller) and the expert chain's workspace, each allocated at the
+      // first prompt walk.
       plan.add("prefill activation recipe (the prompt rows' FP8 codes and their dequantized copies)",
                M * H * sizeof(uint16_t) + GlmMoeLayer::act_recipe_bytes(moe_cfg, max_tokens));
     if (mtp) {

@@ -21,8 +21,9 @@ project procedures and design guidance live in `docs/`.
   first four layers against 0.0100 / 0.0036 / 0.0025 / 0.0025) and more rows
   route to the reference's experts. The quality set reads 158/164, 292/300
   and 100/100 with the recipe against 156/164, 294/300 and 100/100 without.
-  The shared expert multiplies the same codes against its FP8 weights on
-  the instruction's FP8 by FP8 form (the release's `fp8_gemm`).
+  The shared expert and the attention's dense projections multiply their
+  input's codes against FP8 weights on the instruction's FP8 by FP8 form
+  (the release's `fp8_gemm`).
   The routed launches run over a list of the tiles that hold rows, because
   one expert is among the routes of nearly every token in most layers and a
   grid sized by the longest expert is almost all empty blocks.
@@ -30,7 +31,8 @@ project procedures and design guidance live in `docs/`.
   on four nodes at the template's `index_topk`, and a 2K prompt 1.04 s
   either way. `engine.prefill_bf16_partials` under the recipe keeps every
   down row in BF16, the release's rounding point applied to a rank's share
-  of an expert: 10.21 s and 1.00 s. The template leaves that key off until
+  of an expert: 9.81 s and 0.95 s with the shared expert and the dense
+  projections on the instruction. The template leaves that key off until
   the quality set has run with it.
   Decode rows, the draft stages and EXL3 packs keep BF16 activations. The key
   joins the world's settings identity when it is not `bf16`, which gives a

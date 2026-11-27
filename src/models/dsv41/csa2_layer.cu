@@ -13,6 +13,7 @@
 #include "kernels/dsa.hpp"
 #include "kernels/exl3_gemv.hpp"
 #include "kernels/mma_gemv.hpp"
+#include "kernels/moe_a8w4.hpp"
 #include "kernels/scale_gemm.hpp"
 
 namespace dgpp {
@@ -372,12 +373,56 @@ const uint16_t* Csa2Layer::act_hidden(const uint16_t* h, int tokens, cudaStream_
   return act_h_;
 }
 
+namespace {
+// A matrix the dense block-scaled form takes: F32 scales on the 32 x 32
+// grid and a 16-byte aligned payload (absent matrices pass).
+bool a8w8_matrix(const GlmQuantMatrix& m) {
+  return m.payload == nullptr || (m.scales != nullptr && m.scale_block_rows == 32 && m.scale_block_cols == 32 &&
+                                  reinterpret_cast<uintptr_t>(m.payload) % 16 == 0);
+}
+}  // namespace
+
+bool Csa2Layer::native_dense(int tokens) {
+  if (!act_qdq_ || !act_native_dense_ || !prefill_tile_ || w_.exl3()) return false;
+  const int lg = cfg_.local_groups(), K = cfg_.heads_per_group() * kCsa2Latent;
+  if (cfg_.hidden % 64 != 0 || cfg_.q_lora % 64 != 0 || K % 64 != 0 || (lg * cfg_.o_lora) % 64 != 0) return false;
+  if (!a8w8_matrix(w_.wq_a) || !a8w8_matrix(w_.wkv) || !a8w8_matrix(w_.wq_b) || !a8w8_matrix(w_.wo_a) ||
+      !a8w8_matrix(w_.wo_b) || !a8w8_matrix(w_.idx_wq_b))
+    return false;
+  if (tokens > max_tokens_) throw std::invalid_argument("csa2 layer: activation rows out of range");
+  if (act_codes_ == nullptr) {
+    const size_t T = size_t(max_tokens_);
+    const int wide = std::max({cfg_.hidden, lg * K, lg * cfg_.o_lora});
+    DGPP_CUDA_OK(cudaMalloc(&act_codes_, T * size_t(wide)));
+    DGPP_CUDA_OK(cudaMalloc(&act_scales_, T * act_fp8_block_scale_stride(wide)));
+    DGPP_CUDA_OK(cudaMalloc(&qr_codes_, T * size_t(cfg_.q_lora)));
+    DGPP_CUDA_OK(cudaMalloc(&qr_scales_, T * act_fp8_block_scale_stride(cfg_.q_lora)));
+  }
+  return true;
+}
+
+// The hidden rows as wq_a's and wkv's codes.
+void Csa2Layer::quant_hidden(const uint16_t* h, int tokens, cudaStream_t stream) {
+  launch_act_quant_fp8_block(h, size_t(cfg_.hidden), act_codes_, size_t(cfg_.hidden), act_scales_,
+                             act_fp8_block_scale_stride(cfg_.hidden), tokens, cfg_.hidden, stream);
+}
+
 void Csa2Layer::project_kv(const void* hidden_in, int tokens, const int64_t* pos, cudaStream_t stream) {
+  if (native_dense(tokens)) {
+    quant_hidden(static_cast<const uint16_t*>(hidden_in), tokens, stream);
+    project_kv_rows(nullptr, tokens, pos, stream, /*from_codes=*/true);
+    return;
+  }
   project_kv_rows(act_hidden(static_cast<const uint16_t*>(hidden_in), tokens, stream), tokens, pos, stream);
 }
 
-void Csa2Layer::project_kv_rows(const uint16_t* h, int tokens, const int64_t* pos, cudaStream_t stream) {
-  if (w_.exl3())
+void Csa2Layer::project_kv_rows(const uint16_t* h, int tokens, const int64_t* pos, cudaStream_t stream,
+                                bool from_codes) {
+  if (from_codes)
+    launch_dense_a8w8_bf16(act_codes_, size_t(cfg_.hidden), act_scales_, act_fp8_block_scale_stride(cfg_.hidden),
+                           w_.wkv.payload, w_.wkv.scales, kv_, size_t(kCsa2Latent), tokens, kCsa2Latent, cfg_.hidden,
+                           stream);
+  else if (w_.exl3())
     launch_exl3_gemm_bf16(h, size_t(cfg_.hidden), w_.wkv_x, kv_, tokens, kCsa2Latent, cfg_.hidden, 0, stream, exl3_ws_,
                           exl3_ws_bytes_);
   else
@@ -389,8 +434,28 @@ void Csa2Layer::project_kv_rows(const uint16_t* h, int tokens, const int64_t* po
 }
 
 void Csa2Layer::project_q_kv(const void* hidden_in, int tokens, const int64_t* pos, cudaStream_t stream, bool rope_q) {
-  const uint16_t* h = act_hidden(static_cast<const uint16_t*>(hidden_in), tokens, stream);
   const int lh = cfg_.local_heads();
+  if (native_dense(tokens)) {
+    // The recipe on the block-scaled tensor cores: the hidden rows' codes
+    // for wq_a and wkv, the normed low-rank query's for wq_b (and the
+    // indexer's wq_b, which reads them in indexer_query).
+    quant_hidden(static_cast<const uint16_t*>(hidden_in), tokens, stream);
+    launch_dense_a8w8_bf16(act_codes_, size_t(cfg_.hidden), act_scales_, act_fp8_block_scale_stride(cfg_.hidden),
+                           w_.wq_a.payload, w_.wq_a.scales, qr_, size_t(cfg_.q_lora), tokens, cfg_.q_lora, cfg_.hidden,
+                           stream);
+    csa2_rmsnorm_bf16(qr_, cfg_.q_lora, w_.q_norm, qr_, cfg_.q_lora, tokens, cfg_.q_lora, cfg_.eps, stream);
+    project_kv_rows(nullptr, tokens, pos, stream, /*from_codes=*/true);
+    launch_act_quant_fp8_block(qr_, size_t(cfg_.q_lora), qr_codes_, size_t(cfg_.q_lora), qr_scales_,
+                               act_fp8_block_scale_stride(cfg_.q_lora), tokens, cfg_.q_lora, stream);
+    launch_dense_a8w8_bf16(qr_codes_, size_t(cfg_.q_lora), qr_scales_, act_fp8_block_scale_stride(cfg_.q_lora),
+                           w_.wq_b.payload, w_.wq_b.scales, q_, size_t(lh) * kCsa2Latent, tokens, lh * kCsa2Latent,
+                           cfg_.q_lora, stream);
+    if (rope_q)
+      csa2_rope_apply(q_ + (kCsa2Latent - kCsa2Rope), int64_t(lh) * kCsa2Latent, kCsa2Latent, lh, kCsa2Rope, pos,
+                      w_.inv_freq, false, tokens, stream);
+    return;
+  }
+  const uint16_t* h = act_hidden(static_cast<const uint16_t*>(hidden_in), tokens, stream);
   // wq_a and wkv read the same hidden: one decode launch for both when the
   // pair form holds (mma_gemv_pair_ok: the same split alone, whole blocks),
   // each row's chain its own launch's — one ramp and drain instead of two
@@ -434,7 +499,12 @@ void Csa2Layer::project_q_kv(const void* hidden_in, int tokens, const int64_t* p
 
 void Csa2Layer::indexer_query(const void* hidden_in, int tokens, const int64_t* pos, cudaStream_t stream) {
   const int heads = cfg_.index_heads;
-  if (w_.exl3())
+  if (native_dense(tokens))
+    // The low-rank query's codes, written by this enqueue's project_q_kv.
+    launch_dense_a8w8_bf16(qr_codes_, size_t(cfg_.q_lora), qr_scales_, act_fp8_block_scale_stride(cfg_.q_lora),
+                           w_.idx_wq_b.payload, w_.idx_wq_b.scales, idx_q_, size_t(heads) * kCsa2IndexDim, tokens,
+                           heads * kCsa2IndexDim, cfg_.q_lora, stream);
+  else if (w_.exl3())
     launch_exl3_gemm_bf16(qr_, size_t(cfg_.q_lora), w_.idx_wq_b_x, idx_q_, tokens, heads * kCsa2IndexDim, cfg_.q_lora, 0,
                           stream, exl3_ws_, exl3_ws_bytes_);
   else
@@ -646,6 +716,25 @@ void Csa2Layer::project_out(int tokens, void* out, cudaStream_t stream) {
                             cfg_.o_lora, K, size_t(lg) * cfg_.o_lora, stream, exl3_ws_, exl3_ws_bytes_);
     launch_exl3_gemm_bf16(oa_, size_t(lg) * cfg_.o_lora, w_.wo_b_x, static_cast<uint16_t*>(out), tokens, cfg_.hidden,
                           lg * cfg_.o_lora, 0, stream, exl3_ws_, exl3_ws_bytes_);
+    return;
+  }
+  if (native_dense(tokens)) {
+    // The recipe on the block-scaled tensor cores: the attention output's
+    // codes for wo_a (a group's columns are its own 32-wide scale groups),
+    // then the wo_a rows' codes for wo_b.
+    const size_t ss_o = act_fp8_block_scale_stride(lg * K), oa_stride = size_t(lg) * cfg_.o_lora;
+    launch_act_quant_fp8_block(o_, act_stride, act_codes_, act_stride, act_scales_, ss_o, tokens, lg * K, stream);
+    for (int g = 0; g < lg; ++g) {
+      const size_t row_off = size_t(g) * cfg_.o_lora;
+      launch_dense_a8w8_bf16(act_codes_ + size_t(g) * K, act_stride, act_scales_ + size_t(g) * (K / 32), ss_o,
+                             w_.wo_a.payload + row_off * K, w_.wo_a.scales + (row_off / 32) * (size_t(K) / 32),
+                             oa_ + row_off, oa_stride, tokens, cfg_.o_lora, K, stream);
+    }
+    launch_act_quant_fp8_block(oa_, oa_stride, act_codes_, oa_stride, act_scales_,
+                               act_fp8_block_scale_stride(lg * cfg_.o_lora), tokens, lg * cfg_.o_lora, stream);
+    launch_dense_a8w8_bf16(act_codes_, oa_stride, act_scales_, act_fp8_block_scale_stride(lg * cfg_.o_lora),
+                           w_.wo_b.payload, w_.wo_b.scales, static_cast<uint16_t*>(out), size_t(cfg_.hidden), tokens,
+                           cfg_.hidden, lg * cfg_.o_lora, stream);
     return;
   }
   // The release quantizes the attention output in place before wo_a

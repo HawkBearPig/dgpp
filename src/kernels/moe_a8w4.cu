@@ -147,16 +147,22 @@ __device__ __forceinline__ void store_pair(float* p, float a, float b) {
 // one-dimensional: block b is n-tile b % n_tiles of tile b / n_tiles, so a
 // tile's n-tiles run together (its activation rows enter L2 once and a long
 // segment's 1.5 MB of weights stay there across its tiles), and the blocks
-// past *tile_count exit. Without one, block (x, y) is segment y's m-tile
-// x % m_tiles of n-tile x / m_tiles, or with m_tiles 0 its n-tile
-// x % n_tiles of m-tile x / n_tiles (the rows outermost: a long segment's
-// activation rows enter L2 once and its weights stay there).
+// past *tile_count exit. Without one the m-tiles of a segment (grid row y)
+// go in groups of m_group: block x is, within group x / (n_tiles * m_group),
+// n-tile r / m_group and the group's m-tile r % m_group, r the remainder.
+// A group's rows enter L2 once and each weight slice is read once a group:
+// m_group 1 is the rows outermost (a long segment whose weights stay in
+// L2), m_group the segment's m-tiles the weights outermost.
+//
+// The dense form (segs null): one segment of dense_rows rows from row 0
+// against the matrix dense_w with its scales dense_ws.
 template <typename OutT, bool W8>
 __global__ __launch_bounds__(a8w4::kThreads, 2) void moe_grouped_a8w4_kernel(
     const uint8_t* __restrict__ a_codes, size_t a_code_stride, const uint8_t* __restrict__ a_scales,
     size_t a_scale_stride, const int32_t* __restrict__ act_rows, const MoeSegment* __restrict__ segs,
     const MoeExpertView* __restrict__ views, int which, OutT* __restrict__ out, size_t out_stride, int n, int k,
-    int m_tiles, int pairs, const MoeTile* __restrict__ tiles, const int32_t* __restrict__ tile_count, int n_tiles) {
+    int m_group, int pairs, const MoeTile* __restrict__ tiles, const int32_t* __restrict__ tile_count, int n_tiles,
+    const uint8_t* __restrict__ dense_w, const float* __restrict__ dense_ws, int dense_rows) {
   dgpp_pdl_wait();
   using namespace a8w4;
   extern __shared__ __align__(16) uint8_t smem[];
@@ -169,18 +175,28 @@ __global__ __launch_bounds__(a8w4::kThreads, 2) void moe_grouped_a8w4_kernel(
     seg = segs[tl.seg];
     m0 = tl.m0;
     n_tile = static_cast<int>(blockIdx.x) % n_tiles;
-  } else if (m_tiles == 0) {
-    seg = segs[blockIdx.y];
-    m0 = (static_cast<int>(blockIdx.x) / n_tiles) * BM;
-    n_tile = static_cast<int>(blockIdx.x) % n_tiles;
   } else {
-    seg = segs[blockIdx.y];
-    m0 = (static_cast<int>(blockIdx.x) % m_tiles) * BM;
-    n_tile = static_cast<int>(blockIdx.x) / m_tiles;
+    const int span = n_tiles * m_group;
+    const int group = static_cast<int>(blockIdx.x) / span, r = static_cast<int>(blockIdx.x) % span;
+    n_tile = r / m_group;
+    m0 = (group * m_group + r % m_group) * BM;
+    if (segs != nullptr) {
+      seg = segs[blockIdx.y];
+    } else {
+      seg.row0 = 0;
+      seg.rows = dense_rows;
+      seg.expert = 0;
+    }
   }
   if (m0 >= seg.rows) return;  // beyond this segment's rows (no barrier yet)
   const int m_rows = min(BM, seg.rows - m0);
-  const MoeExpertView v = views[seg.expert * 3 + which];
+  MoeExpertView v;
+  if (segs != nullptr) {
+    v = views[seg.expert * 3 + which];
+  } else {
+    v.payload = dense_w;
+    v.scales = dense_ws;
+  }
   const int n0 = n_tile * BN;
   const size_t w_code_stride = W8 ? static_cast<size_t>(k) : static_cast<size_t>(k) / 2;
   const size_t w_scale_stride = static_cast<size_t>(k) / 32;
@@ -375,15 +391,21 @@ __global__ __launch_bounds__(a8w4::kThreads, 2) void moe_grouped_a8w4_kernel(
   }
 }
 
+// m_group: the segment grid's raster (0: the weights outermost). dense_w set:
+// the dense form, max_rows its rows, with segs and views null.
 template <typename OutT, bool W8>
 void launch_a8w4(const uint8_t* codes, size_t code_stride, const uint8_t* scales, size_t scale_stride,
                  const int32_t* act_rows, const MoeSegment* segs, int n_segs, int max_rows,
                  const MoeExpertView* views, int which, OutT* out, size_t out_stride, int n, int k,
                  cudaStream_t stream, const MoeTile* tiles, const int32_t* tile_count, int tile_cap,
-                 bool rows_outer = false) {
+                 int m_group = 0, const uint8_t* dense_w = nullptr, const float* dense_ws = nullptr) {
   using namespace a8w4;
   if (n_segs <= 0 || n <= 0) return;
-  if (!codes || !scales || !segs || !views || !out) throw std::invalid_argument("moe a8w4: null pointer");
+  const bool dense = dense_w != nullptr;
+  if (!codes || !scales || !out || (dense ? dense_ws == nullptr || segs != nullptr : !segs || !views))
+    throw std::invalid_argument("moe a8w4: null pointer");
+  if (dense && reinterpret_cast<uintptr_t>(dense_w) % 16 != 0)
+    throw std::invalid_argument("moe a8w4: the dense weight rows must be 16-byte aligned");
   if (!moe_grouped_a8w4_supported(k)) throw std::invalid_argument("moe a8w4: k must be a multiple of 64");
   if (reinterpret_cast<uintptr_t>(codes) % 16 != 0 || code_stride % 16 != 0 || code_stride < static_cast<size_t>(k))
     throw std::invalid_argument("moe a8w4: activation code rows must be 16-byte aligned and hold k bytes");
@@ -399,16 +421,17 @@ void launch_a8w4(const uint8_t* codes, size_t code_stride, const uint8_t* scales
   (void)opted;
   const int m_tiles = tiles != nullptr ? 1 : (max_rows + BM - 1) / BM;
   const unsigned n_tiles = static_cast<unsigned>((n + BN - 1) / BN);
-  const size_t grid_x = static_cast<size_t>(n_tiles) * static_cast<size_t>(tiles != nullptr ? tile_cap : m_tiles);
+  // The segment grid in whole groups of m-tiles (the blocks past a segment's rows exit).
+  const int group = (m_group <= 0 || m_group > m_tiles) ? m_tiles : m_group;
+  const int m_slots = (m_tiles + group - 1) / group * group;
+  const size_t grid_x = static_cast<size_t>(n_tiles) * static_cast<size_t>(tiles != nullptr ? tile_cap : m_slots);
   if (grid_x > 0x7fffffffu) throw std::invalid_argument("moe a8w4: grid too large");
   // Column pairs as one store when the rows allow it.
   const int pairs = (out_stride % 2 == 0 && reinterpret_cast<uintptr_t>(out) % (2 * sizeof(OutT)) == 0) ? 1 : 0;
   const dim3 grid(static_cast<unsigned>(grid_x), tiles != nullptr ? 1u : static_cast<unsigned>(n_segs), 1u);
-  // The kernel's m_tiles: 0 selects the rows-outermost raster of the segment grid.
-  const int raster = (tiles == nullptr && rows_outer) ? 0 : m_tiles;
   moe_grouped_a8w4_kernel<OutT, W8><<<grid, kThreads, kSmem, stream>>>(
-      codes, code_stride, scales, scale_stride, act_rows, segs, views, which, out, out_stride, n, k, raster, pairs,
-      tiles, tile_count, static_cast<int>(n_tiles));
+      codes, code_stride, scales, scale_stride, act_rows, segs, views, which, out, out_stride, n, k, group, pairs,
+      tiles, tile_count, static_cast<int>(n_tiles), dense_w, dense_ws, dense ? max_rows : 0);
   DGPP_CUDA_OK(cudaGetLastError());
 }
 }  // namespace
@@ -436,7 +459,7 @@ void launch_moe_grouped_a8w8_bf16(const uint8_t* codes, size_t code_stride, cons
                                   int max_rows, const MoeExpertView* views, int which, uint16_t* out,
                                   size_t out_stride, int n, int k, cudaStream_t stream) {
   launch_a8w4<uint16_t, true>(codes, code_stride, scales, scale_stride, act_rows, segs, n_segs, max_rows, views,
-                              which, out, out_stride, n, k, stream, nullptr, nullptr, 0, /*rows_outer=*/true);
+                              which, out, out_stride, n, k, stream, nullptr, nullptr, 0, /*m_group=*/1);
 }
 
 void launch_moe_grouped_a8w8_f32(const uint8_t* codes, size_t code_stride, const uint8_t* scales,
@@ -444,6 +467,14 @@ void launch_moe_grouped_a8w8_f32(const uint8_t* codes, size_t code_stride, const
                                  int max_rows, const MoeExpertView* views, int which, float* out, size_t out_stride,
                                  int n, int k, cudaStream_t stream) {
   launch_a8w4<float, true>(codes, code_stride, scales, scale_stride, act_rows, segs, n_segs, max_rows, views, which,
-                           out, out_stride, n, k, stream, nullptr, nullptr, 0, /*rows_outer=*/true);
+                           out, out_stride, n, k, stream, nullptr, nullptr, 0, /*m_group=*/1);
+}
+
+void launch_dense_a8w8_bf16(const uint8_t* codes, size_t code_stride, const uint8_t* scales, size_t scale_stride,
+                            const uint8_t* w, const float* w_scales, uint16_t* out, size_t out_stride, int m, int n,
+                            int k, cudaStream_t stream, int m_group) {
+  if (m <= 0) return;
+  launch_a8w4<uint16_t, true>(codes, code_stride, scales, scale_stride, nullptr, nullptr, 1, m, nullptr, 0, out,
+                              out_stride, n, k, stream, nullptr, nullptr, 0, m_group, w, w_scales);
 }
 }  // namespace dgpp
