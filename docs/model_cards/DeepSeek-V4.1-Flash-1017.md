@@ -49,7 +49,8 @@ measurement below prices 2048 against it on the same binary.
 Four DGX Spark nodes, tensor parallel, the V4.1-Flash template's shape: six
 request slots at DSpark depth 4 with the confidence-scheduled verify depth,
 the bounded prefill (the model's own SWA-replay recipe) with the release's
-activation recipe on prompt rows (`engine.prefill_activations: native`), the
+activation recipe on prompt rows (`engine.prefill_activations: native`, with
+`engine.prefill_bf16_partials` for the release's BF16 expert rows), the
 full 1M-token context. The tokenizer, prompt renderer (`encoding/encoding.py`,
 no Jinja template) and DSML tool-call format are V4.1-Flash's.
 
@@ -843,8 +844,8 @@ rounds the token's sum once. On, each route's rows and the shared expert's
 are rounded to BF16 before the sum, which is where the release rounds (its
 `fp4_gemm` and `fp8_gemm` return BF16), applied here to a rank's share of
 the expert. That halves the 2 GB a 16,384-token pass writes and reads back
-per layer, and the down projection takes 12.2 ms. The template leaves the
-key off: the quality set has not been run with it.
+per layer, and the down projection takes 12.2 ms. The template turns the
+key on.
 
 Against the release's own layer code on the real weights
 (`tools/dsv41_torch_reference.py` over the engine's dump from
@@ -871,34 +872,40 @@ the key the only difference, every rank at zero swap:
 
 Four items passed under BF16 only and four under `native` only. That
 binary ran every multiply of the recipe through the rounding kernel. The
-routed kernel computes the same sums in another order.
+block-scaled kernels compute the same sums in another order.
 
-Cold prefill on four nodes (source `195acafa` plus the tile list and the
-BF16 rows, binary `3a6c58a8af644d65`, `index_topk` 512 as in the template
-with a 2 GiB prefix cache, one sample a length, every rank at zero swap,
-engine prefill time):
+The template's own settings, `native` with `prefill_bf16_partials` and the
+multiplies on the block-scaled instruction (source `ef56e03b`, binary
+`6766cae6b6e75804`, the same shape), on the first 60 HumanEval items, the
+first 150 GSM8K items and the extraction items, against the two runs above
+on the same items:
+
+| | BF16 | `native` | `native` with `prefill_bf16_partials` |
+|---|---|---|---|
+| HumanEval, first 60 | 57/60 | 58/60 | 58/60 |
+| GSM8K, first 150 | 146/150 | 146/150 | 147/150 |
+| Extraction | 100/100 | 100/100 | 100/100 |
+
+Cold prefill on four nodes (source `ef56e03b`, binary `6766cae6b6e75804`,
+`index_topk` 512 as in the template with a 2 GiB prefix cache, one sample a
+length, every rank at zero swap, engine prefill time). The third column is
+binary `d029c280740c9bf8`, an earlier build of the same code:
 
 | Prompt tokens | BF16 | `native` | `native` with `prefill_bf16_partials` |
 |---|---|---|---|
-| 2,067 | 1.04 s | 1.04 s | 1.00 s |
-| 8,306 | 2.94 s | 2.87 s | 2.81 s |
-| 33,320 | 10.82 s | 10.52 s | 10.21 s |
-| 66,608 | 22.25 s | 21.65 s | 21.01 s |
+| 2,067 | 1.04 s | 1.04 s | 0.95 s |
+| 8,306 | 3.02 s | 2.78 s | 2.70 s |
+| 33,320 | 10.87 s | 10.17 s | 9.81 s |
+| 66,608 | 22.22 s | 20.98 s | 20.30 s |
 
 The first prompt of a boot at a length pays for pages and table rows no
 later prompt pays for. Five further cold prompts of 2,067 tokens on each
-boot had medians of 0.91 s, 0.91 s and 0.88 s.
+boot had medians of 0.92 s, 0.87 s and 0.84 s.
 
-That binary ran the shared expert and the dense projections on the
-BF16-activation kernels. With both on the block-scaled instruction (source
-`71a55c41` plus the dense projections, binary `d029c280740c9bf8`), `native`
-with `prefill_bf16_partials` reads 0.95 s, 2.70 s, 9.81 s and 20.30 s on
-the same shape, and five further 2,067-token prompts a median of 0.84 s.
-
-With `index_topk` 2048 and a 14 GiB prefix cache that binary reads 0.98 s,
-3.17 s, 11.85 s and 25.61 s. On that boot the engine recalled 8 of 8 codes
-planted through a 53,843-token document and passed 100 of 100 extraction
-items.
+With `index_topk` 2048 and a 14 GiB prefix cache `native` with
+`prefill_bf16_partials` reads 0.98 s, 3.17 s, 11.85 s and 25.61 s on the
+earlier build. On that boot the engine recalled 8 of 8 codes planted
+through a 53,843-token document and passed 100 of 100 extraction items.
 
 ## Measured (2026-10-20, four nodes): the campaign of record
 
