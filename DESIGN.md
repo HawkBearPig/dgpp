@@ -556,9 +556,29 @@ the thread spins through a fixed grace period when idle before resting, so
 back-to-back decode steps never reach the resting path. Before a decode
 graph exists a resting engine sleeps. Once one exists it parks instead: it
 stays on its core and waits in `WFET` on a word that every hand-off from
-another thread bumps, for at most 50 µs at a time. A hand-off ends the park
-at once, and the bound covers what arrives without one. A CPU without `WFET`
-keeps polling.
+another thread bumps, for at most 50 µs at a time. A hand-off ends that
+park at once, and the bound covers what arrives without one. A generation in
+flight on the write transport parks too, with no grace period, when the
+walk is all the engine has (no eager collective, queued send or registered
+request in flight, not stopping): its next event is the kernel's store into
+a block record (`ready` before the posts, `done` before the walk advances),
+so the engine parks on the first record still outstanding and, on the
+GB10, the GPU's store ends the park (a measured property of the platform,
+not something the release/acquire ordering itself guarantees). Each park
+also asks for a 50 µs deadline, a timer request rather than a wall-clock
+promise, which covers what arrives without such a store: send completions
+(one in sixteen write posts is signaled; the engine polls the completion
+queues as soon as a park ends, before the pass that may post), kicks and
+the watchdog clocks. During such a park the engine waits on the record's
+line, not the kick word, so a hand-off can wait out the bound. A breaker
+turns these parks off, with a warning, if the walk moves while the parked
+record does not hold the generation (the engine waited on the wrong word;
+eight such moves) or if most parks ended by the store they waited for still
+ran to their deadline (the platform stopped waking it; judged over windows
+of 4,096 such parks). It assumes the engine keeps
+its core, which its pinning provides: an engine preempted during most of
+its parks would trip the second test too. The engine then polls during
+windows as before. A CPU without `WFET` keeps polling.
 
 The bus uses one engine thread for latency and bulk traffic. Per-lane
 sender threads are not implemented; any change to that ownership model

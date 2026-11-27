@@ -135,6 +135,21 @@ struct BusStats {
   // Times the engine parked because it had nothing queued, in flight or
   // live. It stays 0 on a CPU that cannot park and in a world of one.
   uint64_t engine_parks = 0;
+  // Times the engine parked on a block record of a write-transport
+  // generation in flight, waiting for its kernel's store.
+  uint64_t engine_flight_parks = 0;
+  // Of those, the parks that ended on their bound with the record unchanged.
+  uint64_t engine_flight_park_timeouts = 0;
+  // True once the engine turned its flight parks off (the breaker in
+  // engine_loop: it parked on a word the walk did not wait for, or the
+  // stores stopped ending its parks); it then polls during windows.
+  bool engine_flight_parks_off = false;
+  // The breaker's inputs: walk moves with the parked record not holding
+  // the generation, parks ended by the store they waited for, and those of
+  // them that still ran to the deadline.
+  uint64_t engine_flight_wrong_word = 0;
+  uint64_t engine_flight_store_parks = 0;
+  uint64_t engine_flight_late_store_parks = 0;
 };
 
 struct BusSendResult {
