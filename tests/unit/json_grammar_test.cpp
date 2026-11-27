@@ -950,6 +950,109 @@ DGPP_TEST(json_grammar_openaiReferencesPatternsFormatsAndMultiples) {
   require(actual.allows('A') && !actual.allows('b'), "nested alternatives retain anchored prefix pruning");
 }
 
+DGPP_TEST(json_grammar_freeStringMasksCheckFollowingFields) {
+  const auto schema = compile(
+      R"({"type":"object","properties":{"notes":{"type":"string"},"date":{"type":"string","format":"date"},"n":{"type":"number","multipleOf":0.1}},"required":["notes","date","n"],"additionalProperties":false})");
+  std::vector<std::string> texts = {"tail",
+                                    R"(","date":"2024-02-29","n":0.3})",
+                                    R"(","date":"2025-02-29","n":0.3})",
+                                    R"(","date":"2024-02-29","n":0.31})",
+                                    R"(","date":"2024-02-29"})",
+                                    R"(","notes":"duplicate","date":"2024-02-29","n":0.3})",
+                                    R"(\u0041","date":"2024-02-29","n":0.3})",
+                                    R"(","date":"2024-02-29","n":0.3,"other":1})"};
+  const bool expected[] = {true, true, false, false, false, false, true, false};
+  for (int b = 0; b < 256; ++b) texts.emplace_back(1, static_cast<char>(b));
+  const int eos = static_cast<int>(texts.size());
+  texts.emplace_back();
+  const int marker = static_cast<int>(texts.size());
+  texts.emplace_back("<tool_call>");
+  ChatMarkers markers;
+  markers.tool_call_open = ChatMarker{marker, "<tool_call>"};
+  GrammarVocab v(std::move(texts), markers, {eos}, marker + 1);
+  JsonMachine machine(schema, &v.json_tables());
+  for (unsigned char b : std::string(R"({"notes":"free)")) require(machine.feed(b), "free prefix");
+  const auto exact = [&](const JsonMachine& m) {
+    TokenMask actual, oracle, repeated;
+    m.mask(v, &actual);
+    m.mask_brute_force(v, &oracle);
+    m.mask(v, &repeated);
+    require(actual.words == oracle.words && actual.allowed == oracle.allowed &&
+                actual.vocab == oracle.vocab && actual.words == repeated.words &&
+                actual.allowed == repeated.allowed && actual.vocab == repeated.vocab,
+            "free string masks equal simulation, including a warm cache");
+    return actual;
+  };
+  const auto mask = exact(machine);
+  for (int i = 0; i < 8; ++i) require(mask.allows(i) == expected[i], "following-field constraint");
+  const auto saved = machine;  // Warm-cache copies and rollback must stay independent.
+  for (int b = 0; b < 256; ++b) {
+    machine = saved;
+    machine.feed(static_cast<uint8_t>(b));
+    exact(machine);
+  }
+  for (const auto& suffix : {R"(\uD83D\uDE00)", R"(\u00)", R"(","date":"2024-02-29","n":0.3})"}) {
+    machine = saved;
+    for (unsigned char b : std::string(suffix)) {
+      require(machine.feed(b), "continuation accepted");
+      exact(machine);
+    }
+  }
+  machine = saved;
+  require(exact(machine).words == mask.words, "restored parent mask unchanged");
+
+  dgpp::text::GrammarSpec spec;
+  spec.mode = dgpp::text::GrammarSpec::Mode::kJson;
+  spec.json_schema =
+      R"({"type":"object","properties":{"notes":{"type":"string"},"date":{"type":"string","format":"date"},"n":{"type":"number","multipleOf":0.1}},"required":["notes","date","n"],"additionalProperties":false})";
+  dgpp::text::GrammarState wrapper(&v, spec, false);
+  for (unsigned char b : std::string(R"({"notes":"free)")) wrapper.advance(8 + b);
+  TokenMask wrapped;
+  wrapper.mask(&wrapped);
+  require(!wrapped.allows(eos) && !wrapped.allows(marker), "wrapper withholds EOS and markers");
+  for (int i = 0; i < 8; ++i)
+    require(wrapped.allows(i) == expected[i] && wrapper.allows(i) == expected[i],
+            "wrapper masks and pointwise decisions agree on following fields");
+  auto after = wrapper;
+  after.advance(1);
+  after.mask(&wrapped);
+  require(after.active() && wrapped.allows(eos), "copied wrapper completes and offers EOS");
+  wrapper.mask(&wrapped);
+  require(!wrapped.allows(eos), "draft copy did not advance committed wrapper");
+}
+
+DGPP_TEST(json_grammar_mixedConstraintMasksSurviveStringTransitions) {
+  const std::vector<std::array<std::string, 2>> cases = {
+      {R"({"type":"object","properties":{"free":{"type":"string"},"code":{"type":"string","pattern":"^[A-Z]+$"}},"required":["free","code"],"additionalProperties":false})",
+       R"({"free":"a\"b\u00e9","code":"ABC"})"},
+      {R"({"type":"object","properties":{"free":{"type":"string"},"code":{"enum":["red","blue"]},"n":{"type":"number","multipleOf":0.1}},"additionalProperties":false})",
+       R"({"free":"first","code":"red","n":0.3})"},
+      {R"({"anyOf":[{"type":"object","properties":{"free":{"type":"string"},"date":{"type":"string","format":"date"}}},{"type":"object","properties":{"free":{"type":"string","pattern":"^a.*$"}}}]})",
+       R"({"free":"abc","date":"2024-02-29"})"},
+      {R"({"anyOf":[{"type":"object","properties":{"free":{"type":"string"},"date":{"type":"string","format":"date"}}},{"type":"object","properties":{"free":{"type":"string"},"n":{"type":"number"}}}]})",
+       R"({"free":"abc","n":2})"},
+      {R"({"type":"object","properties":{"free":{"type":"array","items":{"type":"string"}},"date":{"type":"string","format":"date"}}})",
+       R"({"free":["a","b"],"date":"2024-02-29"})"},
+      {R"({"enum":[{"a":[1,{"b":true}],"s":"x"},[false,"z"],null]})",
+       R"({"a": [1, {"b": true}], "s": "x"})"}};
+  for (const auto& c : cases) {
+    JsonMachine machine(compile(c[0]), &tables());
+    for (unsigned char b : c[1]) {
+      TokenMask actual, oracle, warm;
+      machine.mask(vocab(), &actual);
+      machine.mask_brute_force(vocab(), &oracle);
+      machine.mask(vocab(), &warm);
+      require(actual.words == oracle.words && actual.allowed == oracle.allowed &&
+                  actual.vocab == oracle.vocab && actual.words == warm.words &&
+                  actual.allowed == warm.allowed && actual.vocab == warm.vocab,
+              "mixed schema exact mask across keys, escapes, alternatives and constraints");
+      require(actual.allows(b) && machine.feed(b), "document byte allowed: " + c[0] + " document=" +
+                                                       c[1] + " byte=" + std::to_string(b));
+    }
+    require(machine.done(), "mixed document completes");
+  }
+}
+
 DGPP_TEST(json_grammar_customRegexAndLark) {
   using C = dgpp::text::StringConstraint;
   const C regex("[A-Z]+=[0-9]+", C::Syntax::kRegex);
